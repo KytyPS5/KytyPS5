@@ -7721,7 +7721,9 @@ public:
       null_program.stage = ShaderType::Compute;
       null_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource null_resource{};
-      null_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      null_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      null_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       null_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       null_resource.read = true;
@@ -7730,7 +7732,8 @@ public:
       null_volume.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
       null_program.info.images.push_back(null_volume);
       auto null_storage = null_resource;
-      null_storage.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      null_storage.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
       null_storage.read = false;
       null_storage.written = true;
       null_program.info.images.push_back(null_storage);
@@ -7826,8 +7829,9 @@ public:
       storage_program.stage = ShaderType::Vertex;
       storage_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource storage_resource{};
-      storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       storage_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       storage_resource.written = true;
@@ -7870,8 +7874,10 @@ public:
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
       mipped_storage_resource.mip_count = 3;
       auto sampled_overwide_resource = storage_resource;
-      sampled_overwide_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_overwide_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_overwide_resource.numeric_class =
+          Prospero::TextureNumericClass::Uint;
       sampled_overwide_resource.read = true;
       sampled_overwide_resource.written = false;
       auto plain_mipped_storage_binding =
@@ -7979,8 +7985,10 @@ public:
                 srgb_storage_descriptor.dwords.begin());
       srgb_storage_descriptor.dword_count = 8;
       auto srgb_storage_resource = storage_resource;
-      srgb_storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImage;
+      srgb_storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      srgb_storage_resource.numeric_class =
+          Prospero::TextureNumericClass::Float;
       const auto srgb_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(
               executor, srgb_storage_resource, srgb_storage_descriptor);
@@ -8023,8 +8031,9 @@ public:
                 sint_storage_descriptor.dwords.begin());
       sint_storage_descriptor.dword_count = 8;
       auto sint_storage_resource = srgb_storage_resource;
-      sint_storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      sint_storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      sint_storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       const auto sint_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(
               executor, sint_storage_resource, sint_storage_descriptor);
@@ -8105,7 +8114,9 @@ public:
       sampled_program.stage = ShaderType::Pixel;
       sampled_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource sampled_resource{};
-      sampled_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       sampled_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_resource.read = true;
@@ -8551,8 +8562,10 @@ public:
                 sampled_depth_value.dwords.begin());
       sampled_depth_value.dword_count = 8;
       ShaderRecompiler::IR::ImageResource sampled_depth_resource{};
-      sampled_depth_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_depth_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_depth_resource.numeric_class =
+          Prospero::TextureNumericClass::Uint;
       sampled_depth_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_depth_resource.read = true;
@@ -8661,7 +8674,9 @@ public:
       array_program.stage = ShaderType::Compute;
       array_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource array_resource{};
-      array_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      array_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      array_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       array_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       array_resource.read = true;
@@ -9078,7 +9093,9 @@ public:
       program.stage = ShaderType::Compute;
       program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource stencil_resource{};
-      stencil_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      stencil_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      stencil_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       stencil_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       stencil_resource.read = true;
@@ -9151,8 +9168,8 @@ public:
       stencil_storage_program->stage = ShaderType::Compute;
       stencil_storage_program->resource_tracking_complete = true;
       auto stencil_storage_resource = stencil_resource;
-      stencil_storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      stencil_storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
       stencil_storage_resource.read = false;
       stencil_storage_resource.written = true;
       stencil_storage_program->info.images.push_back(stencil_storage_resource);
@@ -20509,7 +20526,8 @@ void CheckIndirectImageKeySwitch() {
   ImageResource root{};
   root.source = 0;
   root.first_use_pc = 0x10f0u;
-  root.kind = ResourceKind::Image;
+  root.resource_class = ImageResourceClass::Sampled;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
   root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   root.read = true;
   root.indirect_root = 0;
@@ -21963,11 +21981,13 @@ void CheckRenderTargetFormatContract() {
     (void)volume.FindView(view);
   } else {
     ShaderRecompiler::IR::ImageResource resource{};
-    resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
     resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
     resource.written = true;
     if (std::strcmp(kind, "storage-kind") == 0) {
-      resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+      resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
     } else if (std::strcmp(kind, "storage-no-write") == 0) {
       resource.written = false;
     } else if (std::strcmp(kind, "storage-nonuint-atomic") == 0) {
@@ -21992,7 +22012,9 @@ void CheckSampledColorViews() {
                                  DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7),
           "RGBA did not select the identity view");
   ShaderRecompiler::IR::ImageResource cube_resource{};
-  cube_resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  cube_resource.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  cube_resource.numeric_class = Prospero::TextureNumericClass::Float;
   cube_resource.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   cube_resource.read = true;
@@ -22164,7 +22186,9 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
           "D32S8 depth target did not select its R001 depth-aspect view");
   ShaderRecompiler::IR::ImageResource storage_resource{};
-  storage_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
+  storage_resource.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Storage;
+  storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
   storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   storage_resource.written = true;
   Require("SampledColorViews", "storage resource",
@@ -22181,7 +22205,7 @@ void CheckSampledColorViews() {
   Require("SampledColorViews", "write-only 2D-array storage resource",
           IsSupportedStorageImageResource(storage_resource),
           "basic write-only 2D-array storage resource was rejected");
-  storage_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
   Require("SampledColorViews", "write-only uint 2D-array storage resource",
           IsSupportedStorageImageResource(storage_resource),
           "basic write-only uint 2D-array storage resource was rejected");
@@ -22237,7 +22261,8 @@ void CheckSampledColorViews() {
 
 void CheckSampledDepthResource() {
   ShaderRecompiler::IR::ImageResource resource{};
-  resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   resource.read = true;
   resource.depth_compare = true;
@@ -22289,7 +22314,7 @@ void CheckSampledDepthResource() {
           static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM),
       "array shader resource accepted a non-array descriptor view");
   resource = basic;
-  resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   Require("SampledDepthResource", "integer read",
           IsSupportedSampledDepthResource(resource),
           "read-only uint depth resource was rejected");
@@ -22310,7 +22335,8 @@ void CheckSampledVideoOutView(RenderContext &renderer) {
   auto &context = renderer.GetGraphics();
   CommandScheduler scheduler(renderer, context);
   ShaderRecompiler::IR::ImageResource resource{};
-  resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   resource.read = true;
 
@@ -22758,7 +22784,9 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
                              Prospero::ImageType::kColor2D));
   cube_image.usage.depth_target = true;
   ShaderRecompiler::IR::ImageResource cube_resource{};
-  cube_resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  cube_resource.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  cube_resource.numeric_class = Prospero::TextureNumericClass::Float;
   cube_resource.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   cube_resource.read = true;
@@ -22845,7 +22873,8 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
 
 ShaderRecompiler::IR::ImageResource BasicStorageTextureResource() {
   ShaderRecompiler::IR::ImageResource resource{};
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
   resource.read = true;
   resource.written = true;
@@ -22903,7 +22932,7 @@ ShaderTextureResource Ppsa01340OverwideMipStorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
   auto resource = BasicBgraStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   return resource;
 }
 
@@ -22940,7 +22969,7 @@ ShaderTextureResource BasicArrayStorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource BasicUintArrayStorageTextureResource() {
   auto resource = BasicArrayStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   return resource;
 }
 
@@ -22975,7 +23004,7 @@ ShaderTextureResource Ppsa10112D16StorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource BasicUintVolumeStorageTextureResource() {
   auto resource = BasicStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   resource.read = false;
   return resource;
 }
@@ -22987,7 +23016,7 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource AtomicStorageTextureResource() {
   auto resource = BasicLinearStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   resource.read = true;
   resource.atomic = true;
   return resource;
@@ -23346,8 +23375,7 @@ void CheckBasicStorageTextureDescriptor() {
       0x00000000u,
   }};
   auto standard256b_resource = BasicBgraStorageTextureResource();
-  standard256b_resource.kind =
-      ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  standard256b_resource.numeric_class = Prospero::TextureNumericClass::Uint;
   TileSizeAlign standard256b_size{};
   TileGetTextureTotalSize(standard256b.Format(), standard256b.Width5() + 1u,
                           standard256b.Height5() + 1u,
@@ -23645,7 +23673,8 @@ void CheckImageSamplerSpecialization() {
   ShaderRecompiler::IR::Program mixed_sampler_program;
   mixed_sampler_program.resource_tracking_complete = true;
   ShaderRecompiler::IR::ImageResource sampled_image;
-  sampled_image.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  sampled_image.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Sampled;
   sampled_image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   sampled_image.read = true;
   mixed_sampler_program.info.images = {sampled_image, sampled_image,
@@ -23739,7 +23768,8 @@ void CheckShaderRecompilerFatalContracts() {
     program.resource_tracking_complete = true;
 
     ShaderRecompiler::IR::ImageResource image;
-    image.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+    image.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    image.numeric_class = Prospero::TextureNumericClass::Uint;
     image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
     image.read = true;
     image.written = true;

@@ -89,17 +89,8 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
-Prospero::TextureNumericClass SampledResourceNumericClass(ResourceKind kind) {
-	switch (kind) {
-		case ResourceKind::Image: return Prospero::TextureNumericClass::Float;
-		case ResourceKind::ImageUint: return Prospero::TextureNumericClass::Uint;
-		case ResourceKind::ImageSint: return Prospero::TextureNumericClass::Sint;
-		default: return Prospero::TextureNumericClass::Unsupported;
-	}
-}
-
 bool RequiresPointSampler(const ImageResource& image) {
-	return image.kind == ResourceKind::ImageSint ||
+	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 
@@ -365,7 +356,8 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			if (image.indirect_root != ImageResource::NoIndirectImage) {
 				const auto root = image.indirect_root;
 				if (root >= program.info.images.size() ||
-				    program.info.images[root].kind != image.kind ||
+				    program.info.images[root].resource_class != image.resource_class ||
+				    program.info.images[root].numeric_class != image.numeric_class ||
 				    program.info.images[root].dimension != image.dimension ||
 				    program.info.images[root].mip_mode != image.mip_mode ||
 				    program.info.images[root].mip_count != image.mip_count ||
@@ -376,13 +368,11 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				continue;
 			}
-			bool canonical_kind =
-			    image.kind == ResourceKind::Image || image.kind == ResourceKind::StorageImage;
-			if (image.atomic) {
-				canonical_kind = image.kind == ResourceKind::StorageImageUint;
-			}
+			const auto canonical_numeric = image.atomic ? Prospero::TextureNumericClass::Uint
+			                                            : Prospero::TextureNumericClass::Float;
 			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
-			    !canonical_kind) {
+			    image.resource_class == ImageResourceClass::None ||
+			    image.numeric_class != canonical_numeric) {
 				return false;
 			}
 			continue;
@@ -392,45 +382,39 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		    DescriptorIsCube(descriptor) != image.cube) {
 			return false;
 		}
-		if (ImageResourceKindMatches(image.kind, ImageResourceClass::Sampled) ||
-		    ImageResourceKindMatches(image.kind, ImageResourceClass::Storage)) {
-			const bool storage = image.kind == ResourceKind::StorageImage ||
-			                     image.kind == ResourceKind::StorageImageUint;
-			const auto format =
-			    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-			if (image.atomic && format != Prospero::BufferFormat::k32UInt) {
+		if (image.resource_class == ImageResourceClass::None) {
+			return false;
+		}
+		const bool storage = image.resource_class == ImageResourceClass::Storage;
+		const auto format =
+		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		if (image.atomic && format != Prospero::BufferFormat::k32UInt) {
+			return false;
+		}
+		const auto conversion_format = ImageConversionFormat(format);
+		if (image.conversion_format != conversion_format) {
+			return false;
+		}
+		if ((storage || conversion_format != Prospero::BufferFormat::kInvalid) &&
+		    image.shader_swizzle != DescriptorImageSwizzle(descriptor)) {
+			return false;
+		}
+		auto numeric_class = Prospero::SampledTextureNumericClass(format);
+		if (storage) {
+			const bool raw_sint = format == Prospero::BufferFormat::k32SInt && image.written &&
+			                      !image.read && !image.atomic;
+			if ((!raw_sint && numeric_class == Prospero::TextureNumericClass::Sint) ||
+			    numeric_class == Prospero::TextureNumericClass::Unsupported) {
 				return false;
 			}
-			const auto conversion_format = ImageConversionFormat(format);
-			if (image.conversion_format != conversion_format) {
-				return false;
+			if (raw_sint) {
+				numeric_class = Prospero::TextureNumericClass::Uint;
 			}
-			if ((storage || conversion_format != Prospero::BufferFormat::kInvalid) &&
-			    image.shader_swizzle != DescriptorImageSwizzle(descriptor)) {
-				return false;
-			}
-			if (storage) {
-				const bool raw_sint = format == Prospero::BufferFormat::k32SInt && image.written &&
-				                      !image.read && !image.atomic;
-				const auto numeric_class = Prospero::SampledTextureNumericClass(format);
-				if ((!raw_sint && numeric_class == Prospero::TextureNumericClass::Sint) ||
-				    numeric_class == Prospero::TextureNumericClass::Unsupported) {
-					return false;
-				}
-				const bool uint_descriptor =
-				    numeric_class == Prospero::TextureNumericClass::Uint || raw_sint;
-				const bool uint_program = image.kind == ResourceKind::StorageImageUint;
-				if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
-					return false;
-				}
-			} else {
-				const auto numeric_class = SampledResourceNumericClass(image.kind);
-				if (numeric_class != Prospero::SampledTextureNumericClass(format) ||
-				    (image.depth_compare &&
-				     numeric_class != Prospero::TextureNumericClass::Float)) {
-					return false;
-				}
-			}
+		} else if (image.depth_compare && numeric_class != Prospero::TextureNumericClass::Float) {
+			return false;
+		}
+		if (image.numeric_class != numeric_class) {
+			return false;
 		}
 	}
 	return true;
@@ -628,24 +612,20 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 	for (uint32_t i = 0; i < next.images.size(); i++) {
 		const auto& descriptor = next_snapshot.images[i];
 		auto&       image      = next.images[i];
+		if (image.resource_class == ImageResourceClass::None ||
+		    (image.atomic && image.resource_class != ImageResourceClass::Storage)) {
+			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
+		}
 		image.mip_count        = StorageMipCount(image, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
 			    fmt::format("storage image descriptor {} has an invalid mip range", i));
 		}
 		if (NullImageDescriptor(descriptor)) {
-			image.dimension = Decoder::ImageDimension::Dim2D;
-			image.cube      = false;
-			switch (image.kind) {
-				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
-				case ResourceKind::ImageSint: image.kind = ResourceKind::Image; break;
-				case ResourceKind::StorageImageUint:
-					if (!image.atomic) {
-						image.kind = ResourceKind::StorageImage;
-					}
-					break;
-				default: break;
-			}
+			image.numeric_class = image.atomic ? Prospero::TextureNumericClass::Uint
+			                                   : Prospero::TextureNumericClass::Float;
+			image.dimension     = Decoder::ImageDimension::Dim2D;
+			image.cube          = false;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, image.dimension);
@@ -666,39 +646,30 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
 		}
-		const bool storage      = image.kind == ResourceKind::StorageImage ||
-		                          image.kind == ResourceKind::StorageImageUint;
+		const bool storage      = image.resource_class == ImageResourceClass::Storage;
 		image.conversion_format = ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              image.written && !image.read && !image.atomic;
-		const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+		image.numeric_class = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
-			if ((!raw_sint_storage && numeric_class == Prospero::TextureNumericClass::Sint) ||
-			    numeric_class == Prospero::TextureNumericClass::Unsupported) {
+			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
+			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
 				return SpecializationFail(
 				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
 				                static_cast<uint32_t>(format)));
 			}
-			if (numeric_class == Prospero::TextureNumericClass::Uint || raw_sint_storage) {
-				image.kind = ResourceKind::StorageImageUint;
+			if (raw_sint_storage) {
+				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
-		} else {
-			switch (numeric_class) {
-				case Prospero::TextureNumericClass::Uint:
-					image.kind = ResourceKind::ImageUint;
-					break;
-				case Prospero::TextureNumericClass::Sint:
-					image.kind = ResourceKind::ImageSint;
-					break;
-				case Prospero::TextureNumericClass::Float: break;
-				case Prospero::TextureNumericClass::Unsupported:
-					return SpecializationFail(
-					    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
-					                static_cast<uint32_t>(format)));
-			}
+		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
+		           (image.depth_compare &&
+		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
+			return SpecializationFail(
+			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
+			                static_cast<uint32_t>(format)));
 		}
 	}
 	for (uint32_t root_index = 0; root_index < next.images.size(); root_index++) {
@@ -733,14 +704,17 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 				continue;
 			}
 			if (NullImageDescriptor(next_snapshot.images[candidate])) {
-				image.kind              = image_class.kind;
+				image.resource_class    = image_class.resource_class;
+				image.numeric_class     = image_class.numeric_class;
 				image.dimension         = image_class.dimension;
 				image.mip_count         = image_class.mip_count;
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
+			if (image.resource_class != image_class.resource_class ||
+			    image.numeric_class != image_class.numeric_class ||
+			    image.dimension != image_class.dimension ||
 			    image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
@@ -824,9 +798,6 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 				    fmt::format("indirect image table at pc 0x{:08x} is used by unsupported {}",
 				                inst.Flags<MemoryFlags>().pc, ValueOpcodeName(inst.GetOpcode())));
 			}
-			memory.kind            = image.kind;
-			memory.image_dimension = image.dimension;
-			memory.image_cube      = image.cube;
 		}
 	}
 	program.info        = std::move(next);

@@ -9794,46 +9794,6 @@ void TestNativeWideValueValidation() {
   }
   {
     auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageRead, {});
-    check_rejected(program, "storage kind for image read was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImageUint;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageQueryDimensions, {});
-    check_rejected(program, "storage uint kind for image query was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::Image;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageWrite, {});
-    check_rejected(program, "sampled image kind for image write was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageSampleRaw, {});
-    check_rejected(program, "storage kind for image sample was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageAtomicIAdd32, {});
-    check_rejected(program, "untyped storage kind for image atomic was accepted");
-  }
-  {
-    auto program = make_program();
     IREmitter ir(program.blocks.front());
     const auto data = ir.Emit(ValueOpcode::CompositeConstructU32x4,
                               {Value(0u), Value(0u), Value(0u), Value(0u)});
@@ -10435,8 +10395,10 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 
   uint32_t float_storage = UINT32_MAX;
   for (uint32_t i = 0; i < result.program.info.images.size(); i++) {
-    if (result.program.info.images[i].kind ==
-        ShaderRecompiler::IR::ResourceKind::StorageImage) {
+    const auto &image = result.program.info.images[i];
+    if (image.resource_class ==
+            ShaderRecompiler::IR::ImageResourceClass::Storage &&
+        image.numeric_class == Prospero::TextureNumericClass::Float) {
       float_storage = i;
       break;
     }

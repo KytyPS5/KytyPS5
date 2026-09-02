@@ -145,11 +145,12 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                   uint32_t first, uint32_t components) {
+	const bool cube = ctx.state.program.info.images.at(mem.resource).cube;
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
 	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
 	                                                   : ZeroF32(ctx.state);
-	if (mem.image_cube) {
+	if (cube) {
 		x = CubeAxis(ctx.state, x);
 		y = CubeAxis(ctx.state, y);
 	}
@@ -158,7 +159,7 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 		auto z = mem.image_address_components > first + 2u
 		             ? AddressF32(ctx, mem, address, first + 2u)
 		             : ZeroF32(ctx.state);
-		if (mem.image_cube) z = CubeLayer(ctx.state, z);
+		if (cube) z = CubeLayer(ctx.state, z);
 		ctx.state.builder.AddFunction(
 		    {OpCompositeConstruct, TypeF32Vector(ctx.state, 3), result, x, y, z});
 	} else {
@@ -284,9 +285,9 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, SampledImageClass i
 
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                          const IR::Inst& address) {
-	const auto  dimension = mem.image_dimension;
+	const auto  dimension = ctx.state.program.info.images.at(mem.resource).dimension;
 	const auto& info      = ImageDimensionInfoFor(dimension);
-	const auto  image     = LoadSampledImageDescriptor(ctx.state, mem, dimension);
+	const auto  image     = LoadSampledImageDescriptor(ctx.state, mem.resource);
 	const auto  size      = ctx.state.builder.AllocateId();
 	if (info.multisampled != 0u) {
 		ctx.state.builder.AddFunction(
@@ -464,7 +465,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
                                     uint32_t coord, SampledImageClass image_class) {
 	auto& state = ctx.state;
 	state.builder.RequireCapability(CapabilityImageQuery);
-	const auto image = LoadSampledImageDescriptor(state, mem, ImageDimension::Dim1D);
+	const auto image = LoadSampledImageDescriptor(state, mem.resource);
 	const auto width = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpImageQuerySizeLod, TypeU32(state), width, image, ConstantU32(state, 0)});
@@ -476,7 +477,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                  Binary(state, OpFMul, TypeF32(state), coord, width_f32),
 	                                  ConstantF32(state, 0x3f000000u))});
 
-	const auto sampled     = MakeSampledImage(state, mem, ImageDimension::Dim1D);
+	const auto sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
 	const auto vector_type = SampledImageVectorType(state, image_class, 4);
 	const auto scalar_type = SampledImageScalarType(state, image_class);
 	const auto component =
@@ -592,6 +593,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem       = ctx.Memory(inst);
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
+	const auto& image   = state.program.info.images.at(mem.resource);
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (address == nullptr) return true;
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
@@ -601,8 +603,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(CapabilityImageQuery);
-		const auto dimension = mem.image_dimension;
-		const auto sampled   = MakeSampledImage(state, mem, dimension);
+		const auto dimension = image.dimension;
+		const auto sampled   = MakeSampledImage(state, mem.resource, mem.sampler);
 		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
@@ -621,27 +623,27 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto  dimension      = mem.image_dimension;
+		const auto  dimension      = image.dimension;
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);
-		const auto  image_class    = SampledImageClassFor(mem.kind);
+		const auto  image_class    = SampledImageClassFor(image.numeric_class);
 		const auto  condition      = ctx.Arg(inst, 2);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
-			        const auto image = LoadSampledImageDescriptor(state, mem, dimension);
-			        const auto color = state.builder.AllocateId();
-			        const auto coord = CoordU32(ctx, mem, *address, dimension);
+			        const auto descriptor = LoadSampledImageDescriptor(state, mem.resource);
+			        const auto color      = state.builder.AllocateId();
+			        const auto coord      = CoordU32(ctx, mem, *address, dimension);
 			        if (dimension_info.multisampled != 0u) {
 				        state.builder.AddFunction(
 				            {OpImageFetch, SampledImageVectorType(state, image_class, 4), color,
-				             image, coord, ImageOperandsSampleMask,
+				             descriptor, coord, ImageOperandsSampleMask,
 				             AddressU32(ctx, mem, *address, dimension_info.coordinate_components)});
 			        } else {
 				        state.builder.AddFunction({OpImageFetch,
 				                                   SampledImageVectorType(state, image_class, 4),
-				                                   color, image, coord, ImageOperandsLodMask,
+				                                   color, descriptor, coord, ImageOperandsLodMask,
 				                                   LodU32(ctx, mem, *address, dimension)});
 			        }
 			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), image_class, false,
@@ -650,8 +652,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageWrite) {
-		const auto uint_image = mem.kind == IR::ResourceKind::StorageImageUint;
-		const auto dimension  = mem.image_dimension;
+		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
+		const auto dimension  = image.dimension;
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
 			const auto mip_lod =
 			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::DynamicStorage
@@ -659,15 +661,15 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			        : 0u;
 			const auto coord = CoordU32(ctx, mem, *address, dimension);
 			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, dimension, mip_lod, coord, texel);
+			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
 		});
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
-		const auto  dimension      = mem.image_dimension;
+		const auto  dimension      = image.dimension;
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);
 		const auto  layout         = Layout(mem, dimension);
-		const auto  image_class    = SampledImageClassFor(mem.kind);
+		const auto  image_class    = SampledImageClassFor(image.numeric_class);
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
@@ -693,7 +695,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				ctx.Fail(inst, "has an unsupported 1D-array gather");
 				return true;
 			}
-			const auto            sampled = MakeSampledImage(state, mem, dimension);
+			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words =
 			    dref ? std::vector<uint32_t> {OpImageDrefGather,
@@ -759,7 +761,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto            sampled = MakeSampledImage(state, mem, dimension, resource);
+			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
 			if (dref) {
@@ -772,7 +774,6 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(words);
 			return sample;
 		};
-		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
@@ -874,14 +875,14 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != 0u) {
-		const auto dimension = mem.image_dimension;
+		const auto dimension = image.dimension;
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
 			           const auto pointer = state.builder.AllocateId();
 			           const auto pointer_type =
 			               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
 			           state.builder.AddFunction(
 			               {OpImageTexelPointer, pointer_type, pointer,
-			                StorageImageDescriptorPointer(state, mem.resource, dimension),
+			                StorageImageDescriptorPointer(state, mem.resource),
 			                CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0)});
 			           const auto old = state.builder.AllocateId();
 			           state.builder.AddFunction({atomic_opcode, TypeU32(state), old, pointer,

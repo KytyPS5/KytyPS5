@@ -236,8 +236,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto sampled_images = std::count_if(
 	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return ShaderRecompiler::IR::ImageResourceKindMatches(
-		        image.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled);
+		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 	    });
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
@@ -265,8 +264,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
 			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
 			     i, image.source, image.written ? "read-write" : "read-only",
-			     ShaderRecompiler::IR::ImageResourceKindMatches(
-			         image.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled)
+			     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
 			         ? "true"
 			         : "false",
 			     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
@@ -347,8 +345,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& image) {
 		                return image.written &&
-		                       (image.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
-		                        image.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint);
+		                       image.resource_class ==
+		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
 	if (has_storage_writes) {

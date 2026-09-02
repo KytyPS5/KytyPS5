@@ -236,11 +236,10 @@ static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageRes
 			break;
 		default: break;
 	}
-	const bool sampled_kind = ShaderRecompiler::IR::ImageResourceKindMatches(
-	    resource.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled);
-	return sampled_kind && supported_dimension &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
-	       !resource.written && !resource.atomic && !resource.depth_compare;
+	return resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+	       resource.numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	       supported_dimension && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
+	       resource.read && !resource.written && !resource.atomic && !resource.depth_compare;
 }
 
 TargetTextureViewInfo ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
@@ -394,15 +393,17 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
 	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
-	     "kind=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
+	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, descriptor_ok, encoding_ok, format_ok, static_cast<uint32_t>(resource.kind),
-	     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-	     resource.read, resource.written, resource.atomic, resource.depth_compare,
-	     static_cast<uint32_t>(descriptor.Format()), descriptor.DstSelXYZW(),
+	     resource_ok, descriptor_ok, encoding_ok, format_ok,
+	     static_cast<uint32_t>(resource.resource_class),
+	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
+	     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
+	     resource.depth_compare, static_cast<uint32_t>(descriptor.Format()),
+	     descriptor.DstSelXYZW(),
 	     image == nullptr ? static_cast<int>(vk::Format::eUndefined)
 	                      : static_cast<int>(image->info.pixel_format),
 	     static_cast<int>(view_format), image == nullptr ? 0u : image->info.resources.layers,
@@ -515,8 +516,7 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
-	const bool uint_resource =
-	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
@@ -530,17 +530,19 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 		return;
 	}
 	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
-	     "kind=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
+	     "class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
 	     "base_level=%u last_level=%u max_mip=%u min_lod=%u base_array=%u bc=%u msaa=%d "
 	     "depth_tile_bpe=%u swizzle_ok=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d "
 	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, descriptor_ok, encoding_ok, format_ok, static_cast<uint32_t>(resource.kind),
-	     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-	     resource.atomic, resource.depth_compare, descriptor.BaseLevel(), descriptor.LastLevel(),
-	     descriptor.MaxMip(), descriptor.MinLod(), descriptor.BaseArray5(), descriptor.BCSwizzle(),
-	     descriptor.MsaaDepth(), Prospero::RenderTargetBytesPerElement(format),
+	     resource_ok, descriptor_ok, encoding_ok, format_ok,
+	     static_cast<uint32_t>(resource.resource_class),
+	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
+	     static_cast<uint32_t>(resource.mip_mode), resource.atomic, resource.depth_compare,
+	     descriptor.BaseLevel(), descriptor.LastLevel(), descriptor.MaxMip(), descriptor.MinLod(),
+	     descriptor.BaseArray5(), descriptor.BCSwizzle(), descriptor.MsaaDepth(),
+	     Prospero::RenderTargetBytesPerElement(format),
 	     IsValidImageSwizzle(descriptor.DstSelXYZW()), descriptor.Base40(), size,
 	     static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	     static_cast<uint32_t>(descriptor.Height5()) + 1u,
@@ -557,13 +559,16 @@ struct NullImageSpec {
 };
 
 static NullImageSpec NullTextureSpec(const ShaderRecompiler::IR::ImageResource& resource) {
-	if (resource.kind == ShaderRecompiler::IR::ResourceKind::ImageSint) {
-		return {vk::Format::eR32Sint, Prospero::BufferFormat::k32SInt};
+	switch (resource.numeric_class) {
+		case Prospero::TextureNumericClass::Float:
+			return {vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float};
+		case Prospero::TextureNumericClass::Uint:
+			return {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt};
+		case Prospero::TextureNumericClass::Sint:
+			return {vk::Format::eR32Sint, Prospero::BufferFormat::k32SInt};
+		case Prospero::TextureNumericClass::Unsupported: break;
 	}
-	const bool uint_image = resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint ||
-	                        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
-	return uint_image ? NullImageSpec {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt}
-	                  : NullImageSpec {vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float};
+	EXIT("null image has unsupported numeric class\n");
 }
 
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
@@ -731,15 +736,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "kind=%u dimension=%u mip_mode=%u read=%d written=%d "
+		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
 		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
 		     base_level, last_level, levels, descriptor.MaxMip(),
 		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
-		     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written,
-		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
-		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
-		     descriptor.fields[7]);
+		     static_cast<uint32_t>(resource.resource_class),
+		     static_cast<uint32_t>(resource.numeric_class),
+		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
+		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		     descriptor.fields[6], descriptor.fields[7]);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
@@ -749,28 +755,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
-	Prospero::TextureNumericClass resource_numeric_class =
-	    Prospero::TextureNumericClass::Unsupported;
-	switch (resource.kind) {
-		case ShaderRecompiler::IR::ResourceKind::Image:
-			resource_numeric_class = Prospero::TextureNumericClass::Float;
-			break;
-		case ShaderRecompiler::IR::ResourceKind::ImageUint:
-			resource_numeric_class = Prospero::TextureNumericClass::Uint;
-			break;
-		case ShaderRecompiler::IR::ResourceKind::ImageSint:
-			resource_numeric_class = Prospero::TextureNumericClass::Sint;
-			break;
-		default: break;
-	}
 	const bool sampled_numeric_class =
-	    storage || resource_numeric_class == Prospero::SampledTextureNumericClass(format);
-	if (!storage &&
-	    ShaderRecompiler::IR::ImageResourceKindMatches(
-	        resource.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled) &&
+	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
+	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
-		EXIT("sampled image numeric class mismatch: kind=%u format=%u addr=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(format), address);
+		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
+		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;

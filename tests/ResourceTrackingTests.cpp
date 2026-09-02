@@ -584,7 +584,7 @@ void TestImagesSamplersAndAliases() {
 
   const auto storage = fixture.Image(image_words, 16);
   MemoryInfo storage_memory;
-  storage_memory.kind = ResourceKind::StorageImageUint;
+  storage_memory.kind = ResourceKind::Image;
   storage_memory.image_dimension = Decoder::ImageDimension::Dim2D;
   fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
                {storage, image_address, Value(1u), Value(true)},
@@ -713,7 +713,7 @@ void TestDynamicStorageMipTracking() {
         {Value(0u), Value(0u), lod, Value(0u), Value(0u), Value(0u), Value(0u),
          Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
     MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
+    memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
     memory.image_address_components = has_mip ? 3u : 2u;
     memory.image_has_mip = has_mip;
@@ -776,7 +776,7 @@ void TestDynamicStorageMipTracking() {
   Program null_program;
   null_program.resource_tracking_complete = true;
   ImageResource null_image;
-  null_image.kind = ResourceKind::StorageImage;
+  null_image.resource_class = ImageResourceClass::Storage;
   null_image.dimension = Decoder::ImageDimension::Dim2D;
   null_image.mip_mode = ImageMipMode::DynamicStorage;
   null_image.written = true;
@@ -1282,40 +1282,6 @@ void TestMalformedMemoryKindsRejected() {
         [&] { TrackResources(fixture.program); },
         "image operation has invalid resource kind",
         "resource tracking accepted an image opcode with address metadata");
-  }
-  {
-    Fixture fixture;
-    const auto image =
-        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-                       Value(0u), Value(0u), Value(0u)},
-                      12);
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    fixture.Emit(ValueOpcode::ImageRead,
-                 {image, fixture.ImageAddress(), Value(true)},
-                 fixture.AddMemory(memory, 12));
-    BuildSrtPlan(fixture.program);
-    CheckFatal(
-        [&] { TrackResources(fixture.program); },
-        "image operation has invalid resource kind",
-        "resource tracking accepted a sampled read with storage metadata");
-  }
-  {
-    Fixture fixture;
-    const auto image =
-        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-                       Value(0u), Value(0u), Value(0u)},
-                      16);
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
-                 {image, fixture.ImageAddress(), Value(1u), Value(true)},
-                 fixture.AddMemory(memory, 16));
-    BuildSrtPlan(fixture.program);
-    CheckFatal(
-        [&] { TrackResources(fixture.program); },
-        "image operation has invalid resource kind",
-        "resource tracking accepted a uint atomic with float storage metadata");
   }
 }
 

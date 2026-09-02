@@ -84,18 +84,7 @@ ResourceKind MemoryKind(const Decoder::Instruction& decoded) {
 		case Decoder::Family::MTBUF: return ResourceKind::Buffer;
 		case Decoder::Family::FLAT: return FlatSegmentResourceKind(decoded.memory_segment);
 		case Decoder::Family::DS: return decoded.gds ? ResourceKind::Gds : ResourceKind::Lds;
-		case Decoder::Family::MIMG:
-			switch (decoded.opcode) {
-				case Decoder::Opcode::IMAGE_STORE:
-				case Decoder::Opcode::IMAGE_STORE_MIP: return ResourceKind::StorageImage;
-				case Decoder::Opcode::IMAGE_ATOMIC_ADD:
-				case Decoder::Opcode::IMAGE_ATOMIC_UMIN:
-				case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
-				case Decoder::Opcode::IMAGE_ATOMIC_AND:
-				case Decoder::Opcode::IMAGE_ATOMIC_OR:
-				case Decoder::Opcode::IMAGE_ATOMIC_XOR: return ResourceKind::StorageImageUint;
-				default: return ResourceKind::Image;
-			}
+		case Decoder::Family::MIMG: return ResourceKind::Image;
 		default: return ResourceKind::None;
 	}
 }
@@ -152,10 +141,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	           decoded.opcode == Decoder::Opcode::DS_WRITE2_B32 ||
 	           decoded.opcode == Decoder::Opcode::DS_WRITE2ST64_B32) {
 		memory.data_dwords = 2u;
-	}
-	if (memory.kind == ResourceKind::StorageImage ||
-	    memory.kind == ResourceKind::StorageImageUint) {
-		memory.sampler = 0;
 	}
 	return memory;
 }
@@ -240,7 +225,10 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		                             decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP ||
 		                             (decoded.opcode >= Decoder::Opcode::IMAGE_ATOMIC_ADD &&
 		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_XOR);
-		return store_or_atomic ? (index == 0u ? decoded.dst : decoded.src0) : decoded.src0;
+		if (store_or_atomic) {
+			return index == 0u ? decoded.dst : decoded.src0;
+		}
+		return decoded.src0;
 	}
 	if (decoded.family == Decoder::Family::DS) {
 		switch (decoded.opcode) {

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
@@ -30,30 +31,12 @@ enum class ResourceKind {
 	Lds,
 	Gds,
 	Image,
-	ImageUint,
-	ImageSint,
-	StorageImage,
-	StorageImageUint,
 	Sampler
 };
 
 [[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
 	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
 	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
-}
-
-[[nodiscard]] constexpr bool ImageResourceKindMatches(ResourceKind       kind,
-                                                      ImageResourceClass resource_class) {
-	switch (resource_class) {
-		case ImageResourceClass::Sampled:
-			return kind == ResourceKind::Image || kind == ResourceKind::ImageUint ||
-			       kind == ResourceKind::ImageSint;
-		case ImageResourceClass::Storage:
-			return kind == ResourceKind::StorageImage || kind == ResourceKind::StorageImageUint;
-		case ImageResourceClass::StorageUint: return kind == ResourceKind::StorageImageUint;
-		case ImageResourceClass::None: return false;
-	}
-	return false;
 }
 
 struct MemoryInfo {
@@ -80,7 +63,6 @@ struct MemoryInfo {
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
-	bool                    image_cube                                            = false;
 	bool                    image_r128                                            = false;
 	bool                    glc                                                   = false;
 	bool                    slc                                                   = false;
@@ -140,24 +122,25 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 
-	uint32_t                source                    = 0;
-	uint32_t                first_use_pc              = 0;
-	ResourceKind            kind                      = ResourceKind::None;
-	Decoder::ImageDimension dimension                 = Decoder::ImageDimension::Unknown;
-	ImageMipMode            mip_mode                  = ImageMipMode::None;
-	uint32_t                mip_count                 = 1;
-	Prospero::BufferFormat  conversion_format         = Prospero::BufferFormat::kInvalid;
-	uint32_t                shader_swizzle            = ShaderImageIdentitySwizzle;
-	bool                    read                      = false;
-	bool                    written                   = false;
-	bool                    atomic                    = false;
-	bool                    depth_compare             = false;
-	bool                    cube                      = false;
-	bool                    r128                      = false;
-	uint32_t                indirect_root             = NoIndirectImage;
-	uint32_t                indirect_mapping_offset   = 0;
-	uint32_t                indirect_mapping_capacity = 0;
-	std::vector<uint32_t>   indirect_resources;
+	uint32_t                      source            = 0;
+	uint32_t                      first_use_pc      = 0;
+	ImageResourceClass            resource_class    = ImageResourceClass::None;
+	Prospero::TextureNumericClass numeric_class     = Prospero::TextureNumericClass::Unsupported;
+	Decoder::ImageDimension       dimension         = Decoder::ImageDimension::Unknown;
+	ImageMipMode                  mip_mode          = ImageMipMode::None;
+	uint32_t                      mip_count         = 1;
+	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
+	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
+	bool                          read              = false;
+	bool                          written           = false;
+	bool                          atomic            = false;
+	bool                          depth_compare     = false;
+	bool                          cube              = false;
+	bool                          r128              = false;
+	uint32_t                      indirect_root     = NoIndirectImage;
+	uint32_t                      indirect_mapping_offset   = 0;
+	uint32_t                      indirect_mapping_capacity = 0;
+	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -335,8 +318,34 @@ DescriptorBindingForImage(const ImageResource& image) {
 	using Dimension = Decoder::ImageDimension;
 	using Kind      = DescriptorBindingKind;
 
-	switch (image.kind) {
-		case ResourceKind::Image:
+	switch (image.resource_class) {
+		case ImageResourceClass::Sampled:
+			switch (image.numeric_class) {
+				case Prospero::TextureNumericClass::Float: break;
+				case Prospero::TextureNumericClass::Uint:
+					switch (image.dimension) {
+						case Dimension::Dim1D: return Kind::SampledUint1D;
+						case Dimension::Dim1DArray: return Kind::SampledUint1DArray;
+						case Dimension::Dim2D: return Kind::SampledUint2D;
+						case Dimension::Dim2DArray: return Kind::SampledUint2DArray;
+						case Dimension::Dim2DMsaa: return Kind::SampledUint2DMsaa;
+						case Dimension::Dim2DMsaaArray: return Kind::SampledUint2DMsaaArray;
+						case Dimension::Dim3D: return Kind::SampledUint3D;
+						default: return std::nullopt;
+					}
+				case Prospero::TextureNumericClass::Sint:
+					switch (image.dimension) {
+						case Dimension::Dim1D: return Kind::SampledSint1D;
+						case Dimension::Dim1DArray: return Kind::SampledSint1DArray;
+						case Dimension::Dim2D: return Kind::SampledSint2D;
+						case Dimension::Dim2DArray: return Kind::SampledSint2DArray;
+						case Dimension::Dim2DMsaa: return Kind::SampledSint2DMsaa;
+						case Dimension::Dim2DMsaaArray: return Kind::SampledSint2DMsaaArray;
+						case Dimension::Dim3D: return Kind::SampledSint3D;
+						default: return std::nullopt;
+					}
+				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
+			}
 			switch (image.dimension) {
 				case Dimension::Dim1D: return Kind::Sampled1D;
 				case Dimension::Dim1DArray: return Kind::Sampled1DArray;
@@ -347,71 +356,45 @@ DescriptorBindingForImage(const ImageResource& image) {
 				case Dimension::Dim3D: return Kind::Sampled3D;
 				default: return std::nullopt;
 			}
-		case ResourceKind::ImageUint:
-			switch (image.dimension) {
-				case Dimension::Dim1D: return Kind::SampledUint1D;
-				case Dimension::Dim1DArray: return Kind::SampledUint1DArray;
-				case Dimension::Dim2D: return Kind::SampledUint2D;
-				case Dimension::Dim2DArray: return Kind::SampledUint2DArray;
-				case Dimension::Dim2DMsaa: return Kind::SampledUint2DMsaa;
-				case Dimension::Dim2DMsaaArray: return Kind::SampledUint2DMsaaArray;
-				case Dimension::Dim3D: return Kind::SampledUint3D;
-				default: return std::nullopt;
-			}
-		case ResourceKind::ImageSint:
-			switch (image.dimension) {
-				case Dimension::Dim1D: return Kind::SampledSint1D;
-				case Dimension::Dim1DArray: return Kind::SampledSint1DArray;
-				case Dimension::Dim2D: return Kind::SampledSint2D;
-				case Dimension::Dim2DArray: return Kind::SampledSint2DArray;
-				case Dimension::Dim2DMsaa: return Kind::SampledSint2DMsaa;
-				case Dimension::Dim2DMsaaArray: return Kind::SampledSint2DMsaaArray;
-				case Dimension::Dim3D: return Kind::SampledSint3D;
-				default: return std::nullopt;
-			}
-		case ResourceKind::StorageImage:
+		case ImageResourceClass::Storage:
 			if (image.atomic) {
-				return std::nullopt;
+				if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
+					return std::nullopt;
+				}
+				switch (image.dimension) {
+					case Dimension::Dim1D: return Kind::StorageAtomic1D;
+					case Dimension::Dim1DArray: return Kind::StorageAtomic1DArray;
+					case Dimension::Dim2D: return Kind::StorageAtomic2D;
+					case Dimension::Dim2DArray: return Kind::StorageAtomic2DArray;
+					case Dimension::Dim3D: return Kind::StorageAtomic3D;
+					default: return std::nullopt;
+				}
 			}
-			switch (image.dimension) {
-				case Dimension::Dim1D: return Kind::Storage1D;
-				case Dimension::Dim1DArray: return Kind::Storage1DArray;
-				case Dimension::Dim2D: return Kind::Storage2D;
-				case Dimension::Dim2DArray: return Kind::Storage2DArray;
-				case Dimension::Dim3D: return Kind::Storage3D;
-				default: return std::nullopt;
+			switch (image.numeric_class) {
+				case Prospero::TextureNumericClass::Float:
+					switch (image.dimension) {
+						case Dimension::Dim1D: return Kind::Storage1D;
+						case Dimension::Dim1DArray: return Kind::Storage1DArray;
+						case Dimension::Dim2D: return Kind::Storage2D;
+						case Dimension::Dim2DArray: return Kind::Storage2DArray;
+						case Dimension::Dim3D: return Kind::Storage3D;
+						default: return std::nullopt;
+					}
+				case Prospero::TextureNumericClass::Uint:
+					switch (image.dimension) {
+						case Dimension::Dim1D: return Kind::StorageUint1D;
+						case Dimension::Dim1DArray: return Kind::StorageUint1DArray;
+						case Dimension::Dim2D: return Kind::StorageUint2D;
+						case Dimension::Dim2DArray: return Kind::StorageUint2DArray;
+						case Dimension::Dim3D: return Kind::StorageUint3D;
+						default: return std::nullopt;
+					}
+				case Prospero::TextureNumericClass::Sint:
+				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
 			}
-		case ResourceKind::StorageImageUint:
-			switch (image.dimension) {
-				case Dimension::Dim1D:
-					if (image.atomic) {
-						return Kind::StorageAtomic1D;
-					}
-					return Kind::StorageUint1D;
-				case Dimension::Dim1DArray:
-					if (image.atomic) {
-						return Kind::StorageAtomic1DArray;
-					}
-					return Kind::StorageUint1DArray;
-				case Dimension::Dim2D:
-					if (image.atomic) {
-						return Kind::StorageAtomic2D;
-					}
-					return Kind::StorageUint2D;
-				case Dimension::Dim2DArray:
-					if (image.atomic) {
-						return Kind::StorageAtomic2DArray;
-					}
-					return Kind::StorageUint2DArray;
-				case Dimension::Dim3D:
-					if (image.atomic) {
-						return Kind::StorageAtomic3D;
-					}
-					return Kind::StorageUint3D;
-				default: return std::nullopt;
-			}
-		default: return std::nullopt;
+		case ImageResourceClass::None: return std::nullopt;
 	}
+	return std::nullopt;
 }
 
 struct DescriptorBinding {

@@ -210,7 +210,7 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
-			return {ImageAccess::Atomic, ImageResourceClass::StorageUint, false};
+			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};
 		default: return {};
 	}
 }

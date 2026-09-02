@@ -103,11 +103,13 @@ SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t
 
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	if (!ShaderRecompiler::IR::ImageResourceKindMatches(
-	        resource.kind, ShaderRecompiler::IR::ImageResourceClass::Sampled)) {
+	if (resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled) {
 		return false;
 	}
-	if (resource.kind != ShaderRecompiler::IR::ResourceKind::Image && resource.depth_compare) {
+	if (resource.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+		return false;
+	}
+	if (resource.numeric_class != Prospero::TextureNumericClass::Float && resource.depth_compare) {
 		return false;
 	}
 	return (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
@@ -128,8 +130,9 @@ inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_fo
 
 [[nodiscard]] inline bool
 IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	return (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
-	        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint) &&
+	return resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage &&
+	       (resource.numeric_class == Prospero::TextureNumericClass::Float ||
+	        resource.numeric_class == Prospero::TextureNumericClass::Uint) &&
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
@@ -141,19 +144,19 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	         resource.mip_count != 0u)) &&
 	       resource.written &&
 	       (!resource.atomic ||
-	        (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
-	         resource.read)) &&
+	        (resource.numeric_class == Prospero::TextureNumericClass::Uint && resource.read)) &&
 	       !resource.depth_compare;
 }
 
 inline void
 ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	if (!IsSupportedStorageImageResource(resource)) {
-		EXIT("unsupported storage color image resource: kind=%u dimension=%u mip=%u "
+		EXIT("unsupported storage color image resource: class=%u numeric=%u dimension=%u mip=%u "
 		     "read=%d written=%d atomic=%d depth_compare=%d\n",
-		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
-		     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written,
-		     resource.atomic, resource.depth_compare);
+		     static_cast<uint32_t>(resource.resource_class),
+		     static_cast<uint32_t>(resource.numeric_class),
+		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+		     resource.read, resource.written, resource.atomic, resource.depth_compare);
 	}
 }
 

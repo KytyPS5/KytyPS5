@@ -450,7 +450,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (!ImageResourceKindMatches(memory.kind, image_info.resource_class)) {
+				if (memory.kind != ResourceKind::Image ||
+				    image_info.resource_class == ImageResourceClass::None) {
 					return Fail(fmt::format("{} has invalid image-memory metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}

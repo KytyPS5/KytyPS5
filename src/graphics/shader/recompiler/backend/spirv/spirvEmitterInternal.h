@@ -482,13 +482,14 @@ struct ImageSampleLayout {
 	uint32_t grad_y = NoImageComponent;
 };
 
-constexpr SampledImageClass SampledImageClassFor(IR::ResourceKind kind) {
-	switch (kind) {
-		case IR::ResourceKind::Image: return SampledImageClass::Float;
-		case IR::ResourceKind::ImageUint: return SampledImageClass::Uint;
-		case IR::ResourceKind::ImageSint: return SampledImageClass::Sint;
-		default: return SampledImageClass::Count;
+constexpr SampledImageClass SampledImageClassFor(Prospero::TextureNumericClass numeric_class) {
+	switch (numeric_class) {
+		case Prospero::TextureNumericClass::Float: return SampledImageClass::Float;
+		case Prospero::TextureNumericClass::Uint: return SampledImageClass::Uint;
+		case Prospero::TextureNumericClass::Sint: return SampledImageClass::Sint;
+		case Prospero::TextureNumericClass::Unsupported: return SampledImageClass::Count;
 	}
+	return SampledImageClass::Count;
 }
 
 constexpr bool IsIntegerSampledImage(SampledImageClass image_class) {
@@ -498,16 +499,6 @@ constexpr bool IsIntegerSampledImage(SampledImageClass image_class) {
 inline uint32_t SampledImageIndex(SampledImageClass image_class, ImageDimension dimension) {
 	return ImageDimensionInfoFor(dimension).ordinal +
 	       static_cast<uint32_t>(image_class) * SampledImageDimensionCount;
-}
-
-constexpr StorageImageClass StorageImageClassFor(bool uint_image, bool atomic) {
-	if (atomic) {
-		return StorageImageClass::AtomicUint;
-	}
-	if (uint_image) {
-		return StorageImageClass::FormatlessUint;
-	}
-	return StorageImageClass::FormatlessFloat;
 }
 
 inline uint32_t StorageImageIndex(StorageImageClass image_class, ImageDimension dimension) {
@@ -667,20 +658,16 @@ uint32_t StorageImageType(EmitterState& state, StorageImageClass image_class,
 uint32_t StorageImagePointerType(EmitterState& state, StorageImageClass image_class,
                                  ImageDimension dimension);
 
-uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem,
-                                    ImageDimension dimension);
+uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, ImageDimension dimension);
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, ImageDimension dimension,
-                          uint32_t image_resource);
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
 
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource,
-                                       ImageDimension dimension);
+uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 
-void EmitStorageImageWrite(EmitterState& state, uint32_t resource, ImageDimension dimension,
-                           uint32_t mip_lod, uint32_t coord, uint32_t texel);
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
+                           uint32_t texel);
 
 uint32_t ExecutionModelForStage(ShaderType stage);
 

@@ -80,17 +80,6 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
 }
 
-bool IsStorageImage(ResourceKind kind) {
-	return kind == ResourceKind::StorageImage || kind == ResourceKind::StorageImageUint;
-}
-
-ImageMipMode MipMode(const MemoryInfo& memory) {
-	if (IsStorageImage(memory.kind) && memory.image_has_mip) {
-		return ImageMipMode::DynamicStorage;
-	}
-	return ImageMipMode::None;
-}
-
 class Tracker {
 public:
 	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
@@ -526,18 +515,16 @@ private:
 	}
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
-		const auto mip   = MipMode(memory);
+		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
+		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
+		                       ? ImageMipMode::DynamicStorage
+		                       : ImageMipMode::None;
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
-			auto&      image           = m_info.images[i];
-			const bool compatible_kind = image.kind == memory.kind || (IsStorageImage(image.kind) &&
-			                                                           IsStorageImage(memory.kind));
-			if (image.source == source && compatible_kind &&
+			auto& image = m_info.images[i];
+			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128) {
-				if (memory.kind == ResourceKind::StorageImageUint) {
-					image.kind = ResourceKind::StorageImageUint;
-				}
 				Merge(image, op, pc);
 				return i;
 			}
@@ -546,13 +533,13 @@ private:
 			return UINT32_MAX;
 		}
 		ImageResource image;
-		image.source        = source;
-		image.first_use_pc  = pc;
-		image.kind          = memory.kind;
-		image.dimension     = memory.image_dimension;
-		image.mip_mode      = mip;
-		image.depth_compare = depth;
-		image.r128          = memory.image_r128;
+		image.source         = source;
+		image.first_use_pc   = pc;
+		image.resource_class = resource_class;
+		image.dimension      = memory.image_dimension;
+		image.mip_mode       = mip;
+		image.depth_compare  = depth;
+		image.r128           = memory.image_r128;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -681,7 +668,8 @@ private:
 			return;
 		}
 
-		if (!ImageResourceKindMatches(memory.kind, image_info.resource_class)) {
+		if (memory.kind != ResourceKind::Image ||
+		    image_info.resource_class == ImageResourceClass::None) {
 			Fail(flags.pc, "image operation has invalid resource kind");
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();

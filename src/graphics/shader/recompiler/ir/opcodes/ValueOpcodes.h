@@ -20,7 +20,7 @@ enum class BufferAccess { None, Read, Write, Atomic };
 enum class SharedAccess { None, Read, Write, Atomic, Append, Consume };
 enum class AddressAccess { None, Read, Write };
 enum class ImageAccess { None, Read, Write, Atomic };
-enum class ImageResourceClass { None, Sampled, Storage, StorageUint };
+enum class ImageResourceClass { None, Sampled, Storage };
 
 struct AddressOpcodeInfo {
 	AddressAccess access    = AddressAccess::None;

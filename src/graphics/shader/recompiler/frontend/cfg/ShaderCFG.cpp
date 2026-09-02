@@ -788,7 +788,9 @@ void ComputePostDominators(Graph& graph) {
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
+		// Post-dominance flows from successors, so a reverse sweep converges in a few passes.
+		for (auto it = graph.blocks.rbegin(); it != graph.blocks.rend(); ++it) {
+			auto&                 block = *it;
 			std::vector<uint32_t> next;
 			if (block.successors.empty()) {
 				next = {block.id};

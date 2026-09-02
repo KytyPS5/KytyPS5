@@ -319,6 +319,84 @@ void TestRuntime64BitDescriptorOps() {
         "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
 
+void TestUniformFirstLaneSamplerLod() {
+  Fixture fixture;
+  const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
+  const auto stale = fixture.Emit(
+      ValueOpcode::GetVectorRegister, {Value(static_cast<VectorReg>(0))});
+  const auto write = [&](Value value, Value previous) {
+    return fixture.Emit(ValueOpcode::SelectU32, {active, value, previous});
+  };
+  const auto user = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(8))});
+  const auto as_float = fixture.Emit(ValueOpcode::ConvertF32U32, {user});
+  const auto initial = write(
+      fixture.Emit(ValueOpcode::BitCastU32F32, {as_float}), stale);
+  const auto initial_float =
+      fixture.Emit(ValueOpcode::BitCastF32U32, {initial});
+  const auto scaled = fixture.Emit(ValueOpcode::FPMul32,
+                                   {Value::F32(256.0f), initial_float});
+  const auto scaled_write = write(
+      fixture.Emit(ValueOpcode::BitCastU32F32, {scaled}), initial);
+  const auto scaled_float =
+      fixture.Emit(ValueOpcode::BitCastF32U32, {scaled_write});
+  const auto nan = fixture.Emit(ValueOpcode::FPIsNan32, {scaled_float});
+  const auto low = fixture.Emit(ValueOpcode::FPOrdLessThanEqual32,
+                                {scaled_float, Value::F32(0.0f)});
+  const auto high = fixture.Emit(ValueOpcode::FPOrdGreaterThanEqual32,
+                                 {scaled_float, Value::F32(4294967296.0f)});
+  const auto truncated = fixture.Emit(ValueOpcode::FPTrunc32, {scaled_float});
+  const auto safe_low = fixture.Emit(
+      ValueOpcode::SelectF32,
+      {fixture.Emit(ValueOpcode::LogicalOr, {nan, low}), Value::F32(0.0f),
+       truncated});
+  const auto safe = fixture.Emit(
+      ValueOpcode::SelectF32,
+      {high, Value::F32(4294967040.0f), safe_low});
+  const auto converted = fixture.Emit(ValueOpcode::ConvertU32F32, {safe});
+  const auto saturated = write(
+      fixture.Emit(ValueOpcode::SelectU32,
+                   {high, Value(UINT32_MAX), converted}),
+      scaled_write);
+  const auto lod = fixture.Emit(ValueOpcode::UMin32,
+                                {saturated, Value(0xfffu)});
+  const auto lod_write = write(lod, saturated);
+  const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                   {lod_write, Value(0xfffu)});
+  const auto masked_write = write(masked, lod_write);
+  const auto packed = write(
+      fixture.Emit(
+          ValueOpcode::BitwiseOr32,
+          {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                        {masked_write, Value(12u)}),
+           masked_write}),
+      masked_write);
+  const auto first = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                  {packed, active});
+  const auto divergent = fixture.Emit(
+      ValueOpcode::ReadFirstLane, {stale, active});
+  fixture.Plan();
+
+  Check(ValidateRuntimeValue(fixture.program, first),
+        "uniform sampler LOD construction was rejected");
+  Check(!ValidateRuntimeValue(fixture.program, divergent),
+        "divergent first-lane value was accepted as uniform");
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {first}, .dword_count = 1});
+
+  std::array<uint32_t, 7> user_data{};
+  user_data[6] = 3u;
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue result;
+  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result) &&
+            result.dwords[0] == 0x00300300u,
+        "uniform sampler LOD evaluated incorrectly");
+  user_data[6] = 20u;
+  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result) &&
+            result.dwords[0] == 0x00ffffffu,
+        "uniform sampler LOD clamp evaluated incorrectly");
+}
+
 void TestConstantBufferBounds() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
@@ -475,6 +553,7 @@ int main() {
     TestInvariantAndDivergentPhi();
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
+    TestUniformFirstLaneSamplerLod();
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();

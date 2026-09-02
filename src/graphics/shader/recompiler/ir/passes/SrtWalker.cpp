@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -74,8 +75,17 @@ bool IsDescriptorHandle(ValueOpcode opcode) {
 	}
 }
 
-bool IsRuntimeIntegerOp(ValueOpcode op) {
+bool IsRuntimeSelect(ValueOpcode op) {
+	return op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
+	       op == ValueOpcode::SelectF32;
+}
+
+bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
@@ -104,6 +114,7 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseNot32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
+		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::UGreaterThan32:
@@ -111,14 +122,20 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
-		case ValueOpcode::LogicalNot: return true;
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPTrunc32: return true;
 		default: return false;
 	}
 }
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const Program& program): m_program(program) {}
+	explicit RuntimeValidator(const Program& program, Value active_mask = {})
+	    : m_program(program), m_active_mask(active_mask.Resolve()) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -132,7 +149,8 @@ private:
 				case Type::U8:
 				case Type::U16:
 				case Type::U32:
-				case Type::U64: return true;
+				case Type::U64:
+				case Type::F32: return true;
 				default: return false;
 			}
 		}
@@ -144,6 +162,10 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
+		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
+		    inst->Arg(0).Resolve() == m_active_mask) {
+			return finish(Validate(inst->Arg(1)));
+		}
 		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
 		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
 		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
@@ -172,6 +194,13 @@ private:
 				return finish(false);
 			}
 			return finish(Validate(invariant));
+		}
+		if (op == ValueOpcode::ReadFirstLane) {
+			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
+			    inst->Arg(1).GetType() != Type::U1) {
+				return finish(false);
+			}
+			return finish(RuntimeValidator(m_program, inst->Arg(1)).Run(inst->Arg(0)));
 		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
@@ -222,7 +251,7 @@ private:
 				return finish(false);
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeIntegerOp(op)) {
+		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
 			return finish(false);
 		}
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
@@ -234,6 +263,7 @@ private:
 	}
 
 	const Program&                  m_program;
+	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 };
 
@@ -386,9 +416,10 @@ private:
 class Evaluator {
 public:
 	Evaluator(const Program& program, const SrtRuntime& runtime,
-	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr)
+	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
+	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -400,6 +431,14 @@ public:
 	}
 
 private:
+	static float Float32(uint64_t bits) {
+		return std::bit_cast<float>(static_cast<uint32_t>(bits));
+	}
+
+	static uint64_t Float32Bits(float value) {
+		return std::bit_cast<uint32_t>(value);
+	}
+
 	bool EvaluateWide(Value value, uint64_t& result) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
@@ -409,12 +448,17 @@ private:
 				case Type::U16: result = value.U16(); return true;
 				case Type::U32: result = value.U32(); return true;
 				case Type::U64: result = value.U64(); return true;
+				case Type::F32: result = Float32Bits(value.F32Value()); return true;
 				default: return false;
 			}
 		}
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
 			return false;
+		}
+		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
+		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
+			return EvaluateWide(inst->Arg(1), result);
 		}
 		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
 			result = found->second;
@@ -560,6 +604,13 @@ private:
 			}
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
+			case ValueOpcode::ReadFirstLane: {
+				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
+				                 inst.Arg(1));
+				return active.EvaluateWide(inst.Arg(0), result);
+			}
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 			case ValueOpcode::CompositeExtractU64:
 			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
 			case ValueOpcode::CompositeConstructU64:
@@ -627,6 +678,53 @@ private:
 			case ValueOpcode::UMin32:
 				if (binary()) {
 					result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+					return true;
+				}
+				return false;
+			case ValueOpcode::ConvertF32U32:
+				if (Arg(inst, 0, a)) {
+					result = Float32Bits(static_cast<float>(static_cast<uint32_t>(a)));
+					return true;
+				}
+				return false;
+			case ValueOpcode::ConvertU32F32:
+				if (Arg(inst, 0, a)) {
+					const auto value = Float32(a);
+					if (!std::isfinite(value) || value < 0.0f ||
+					    static_cast<double>(value) > UINT32_MAX) {
+						return false;
+					}
+					result = static_cast<uint32_t>(value);
+					return true;
+				}
+				return false;
+			case ValueOpcode::FPMul32:
+				if (binary()) {
+					result = Float32Bits(Float32(a) * Float32(b));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FPTrunc32:
+				if (Arg(inst, 0, a)) {
+					result = Float32Bits(std::trunc(Float32(a)));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FPIsNan32:
+				if (Arg(inst, 0, a)) {
+					result = std::isnan(Float32(a));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FPOrdLessThanEqual32:
+				if (binary()) {
+					result = Float32(a) <= Float32(b);
+					return true;
+				}
+				return false;
+			case ValueOpcode::FPOrdGreaterThanEqual32:
+				if (binary()) {
+					result = Float32(a) >= Float32(b);
 					return true;
 				}
 				return false;
@@ -753,6 +851,7 @@ private:
 			}
 			case ValueOpcode::SelectU32:
 			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectF32:
 				if (ternary()) {
 					result = a != 0u ? b : c;
 					return true;
@@ -820,6 +919,7 @@ private:
 	const SrtRuntime&                         m_runtime;
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
+	Value                                     m_active_mask;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 };

@@ -201,6 +201,13 @@ private:
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
 
+// Proves a straight-line uint4 constant-buffer fill without reading guest memory.
+[[nodiscard]] bool ResolveComputeConstantBufferFill(const ShaderComputeInputInfo& input,
+                                                    uint32_t group_x, uint32_t group_y,
+                                                    uint32_t group_z, uint32_t mode,
+                                                    ShaderBufferResource& destination,
+                                                    ShaderBufferResource& constants);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_ */

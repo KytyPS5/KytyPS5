@@ -21,6 +21,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -126,6 +127,144 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+bool ResolveComputeConstantBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                      ShaderBufferResource& destination,
+                                      ShaderBufferResource& constants) {
+	using namespace ShaderRecompiler;
+	using namespace ShaderRecompiler::IR;
+	if (!input.stage.program || !input.stage.resources) {
+		return false;
+	}
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	if (program.dispatcher_fallback || program.block_info.empty() ||
+	    program.info.buffers.size() != 2 || resources.buffers.size() != 2 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
+	    input.threads_num[0] != 64 || input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    input.wave_size != 64 || !input.group_id[0] || input.group_id[1] || input.group_id[2] ||
+	    input.thread_ids_num != 1 || input.tg_size_en || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return false;
+	}
+	// No branches, loops, discard/EXEC predicates, atomics or extra side effects may be skipped.
+	for (size_t i = 0; i < program.block_info.size(); ++i) {
+		const auto& term = program.block_info[i].terminator;
+		if (i + 1 == program.block_info.size()
+		        ? term.kind != CFG::TerminatorKind::Return
+		        : !(term.kind == CFG::TerminatorKind::Branch &&
+		            term.true_block == program.block_info[i + 1].id)) {
+			return false;
+		}
+	}
+	const Inst* store = nullptr;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::Void:
+				case ValueOpcode::Identity:
+				case ValueOpcode::GetUserData:
+				case ValueOpcode::GetBuiltin:
+				case ValueOpcode::GetBufferResource:
+				case ValueOpcode::ShiftLeftLogical32:
+				case ValueOpcode::IAdd32:
+				case ValueOpcode::ReadConstBuffer:
+				case ValueOpcode::CompositeConstructU32x4: break;
+				case ValueOpcode::StoreBufferU32x4:
+					if (store != nullptr) return false;
+					store = &inst;
+					break;
+				default: return false;
+			}
+		}
+	}
+	const auto imm = [](Value value, uint32_t expected) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
+	};
+	const auto memory = [&](const Inst& inst) -> const MemoryInfo* {
+		const auto index = inst.Flags<MemoryFlags>().index;
+		return index < program.memory_info.size() ? &program.memory_info[index] : nullptr;
+	};
+	const auto builtin = [&](Value value, StageInputKind kind) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst && inst->GetOpcode() == ValueOpcode::GetBuiltin &&
+		       imm(inst->Arg(0), static_cast<uint32_t>(kind)) && imm(inst->Arg(1), 0);
+	};
+	if (!store || !imm(store->Arg(2), 0) || !imm(store->Arg(3), 0) ||
+	    store->Arg(5).Resolve() != Value(true))
+		return false;
+	const auto* write = memory(*store);
+	if (!write || write->resource >= 2 || write->offset != 0 || !write->idxen || write->offen ||
+	    !write->formatted || write->data_bits != 32 || write->data_dwords != 4)
+		return false;
+	const auto  dst_index = write->resource;
+	const auto  src_index = 1u - dst_index;
+	const auto& dst_info  = program.info.buffers[dst_index];
+	const auto& src_info  = program.info.buffers[src_index];
+	if (dst_info.read || !dst_info.written || dst_info.atomic || dst_info.scalar ||
+	    !src_info.read || src_info.written || src_info.atomic || !src_info.scalar ||
+	    resources.buffers[dst_index].dword_count != 4 ||
+	    resources.buffers[src_index].dword_count != 4)
+		return false;
+	const auto* index = store->Arg(1).Resolve().TryInstruction();
+	if (!index || index->GetOpcode() != ValueOpcode::IAdd32 ||
+	    !builtin(index->Arg(1), StageInputKind::LocalInvocationId))
+		return false;
+	const auto* shift = index->Arg(0).Resolve().TryInstruction();
+	if (!shift || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 || !imm(shift->Arg(1), 6) ||
+	    !builtin(shift->Arg(0), StageInputKind::WorkgroupId))
+		return false;
+	const auto* values = store->Arg(4).Resolve().TryInstruction();
+	if (!values || values->GetOpcode() != ValueOpcode::CompositeConstructU32x4) return false;
+	for (uint32_t i = 0; i < 4; ++i) {
+		const auto* read = values->Arg(i).Resolve().TryInstruction();
+		if (!read || read->GetOpcode() != ValueOpcode::ReadConstBuffer || !imm(read->Arg(1), 0))
+			return false;
+		const auto* mem = memory(*read);
+		if (!mem || mem->resource != src_index || mem->offset != i * 4 || mem->data_bits != 32 ||
+		    mem->data_dwords != 1 || mem->planning_only)
+			return false;
+	}
+	destination = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[dst_index]);
+	constants   = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[src_index]);
+	const uint64_t records = input.dispatch_thread_dimensions ? group_x : uint64_t {group_x} * 64;
+	const auto     plain   = [](const ShaderBufferResource& descriptor) {
+		return !descriptor.SwizzleEnabled() && descriptor.IndexStride() == 0 &&
+		       !descriptor.AddTid();
+	};
+	return records != 0 && records % 64 == 0 && destination.NumRecords() == records &&
+	       (destination.Base48() & 3u) == 0 && (constants.Base48() & 3u) == 0 &&
+	       destination.Stride() == 16 && dst_info.packed_stride == destination.PackedStride() &&
+	       destination.Format() == Prospero::BufferFormat::k32_32_32_32UInt &&
+	       destination.DstSelXYZW() == ShaderImageIdentitySwizzle && plain(destination) &&
+	       plain(constants) && BufferDescriptorSize(constants) == 16 &&
+	       GuestRange {destination.Base48(), BufferDescriptorSize(destination)}.Valid() &&
+	       GuestRange {constants.Base48(), 16}.Valid() &&
+	       (constants.Base48() + 16 <= destination.Base48() ||
+	        destination.Base48() + BufferDescriptorSize(destination) <= constants.Base48());
+}
+
+static void TrackComputeDccAttachmentFill(const ShaderComputeInputInfo& input,
+                                          CommandBuffer& command, uint32_t group_x,
+                                          uint32_t group_y, uint32_t group_z, uint32_t mode) {
+	ShaderBufferResource destination, constants;
+	if (!ResolveComputeConstantBufferFill(input, group_x, group_y, group_z, mode, destination,
+	                                      constants)) {
+		return;
+	}
+	std::array<uint32_t, 4> value {};
+	// A CPU mirror must not specialize a fill whose constants are still GPU-owned.
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(constants.Base48(), value.data(),
+	                                               sizeof(value)) ||
+	    !std::ranges::all_of(value, [](uint32_t word) { return word == 0x40404040u; })) {
+		return;
+	}
+	(void)command.GetContext().GetTextureCache().TrackFullDccAttachmentFill(
+	    destination.Base48(), BufferDescriptorSize(destination), value[0]);
+	// The original dispatch always runs, including its writes to the metadata buffer.
+}
+
 static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, CommandBuffer& command,
                                         uint32_t group_x, uint32_t group_y, uint32_t group_z,
                                         uint32_t mode) {
@@ -225,6 +364,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	TrackComputeDccAttachmentFill(input_info, buffer, thread_group_x, thread_group_y,
+	                              thread_group_z, mode);
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;

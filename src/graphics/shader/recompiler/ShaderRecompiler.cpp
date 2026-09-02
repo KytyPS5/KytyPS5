@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
 #include <array>
@@ -660,8 +661,22 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	const auto waterfalls = IR::RewriteWaterfallDescriptors(ir);
+	if (waterfalls != 0) {
+		LOGF("%s waterfall descriptor de-scalarization: stage=%s hash=0x%016" PRIx64
+		     " loops=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, waterfalls);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (options.dump_ir && options.early_dump) {
+		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+		     IR::ProgramToString(ir).c_str());
+	}
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {

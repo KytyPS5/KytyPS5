@@ -250,6 +250,30 @@ void TestCarryAndBitFields() {
         "typed carry or bit-field runtime evaluation is incorrect");
 }
 
+void TestBitScanRuntimeOps() {
+  Fixture fixture;
+  const auto pattern = Value(0x00010100u);
+  const auto lsb = fixture.Emit(ValueOpcode::FindILsb32, {pattern});
+  const auto msb = fixture.Emit(ValueOpcode::FindUMsb32, {pattern});
+  const auto count = fixture.Emit(ValueOpcode::BitCount32, {pattern});
+  const auto empty = fixture.Emit(ValueOpcode::FindILsb32, {Value(0u)});
+  fixture.Plan();
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {lsb, msb, count, empty}, .dword_count = 4});
+
+  Check(ValidateRuntimeValue(fixture.program, lsb) &&
+            ValidateRuntimeValue(fixture.program, msb) &&
+            ValidateRuntimeValue(fixture.program, count),
+        "bit-scan values were not accepted as runtime values");
+
+  DescriptorValue result;
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result),
+        "bit-scan descriptor evaluation failed");
+  Check(result.dwords[0] == 8u && result.dwords[1] == 16u &&
+            result.dwords[2] == 2u && result.dwords[3] == 0xffffffffu,
+        "bit-scan runtime evaluation is incorrect");
+}
+
 void TestInvariantAndDivergentPhi() {
   Fixture fixture(3);
   auto &invariant = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi);
@@ -593,6 +617,7 @@ int main() {
     TestNestedSrtWalk();
     TestShaderBaseAndUserData();
     TestCarryAndBitFields();
+    TestBitScanRuntimeOps();
     TestInvariantAndDivergentPhi();
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();

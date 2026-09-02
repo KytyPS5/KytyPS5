@@ -102,6 +102,24 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
+bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
+}
+
+void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+                           const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
+	if (!ok) {
+		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
+		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
+	}
+	if (!report.dropped_summary.empty()) {
+		LOGF("%s indirect image tables: hash=0x%016" PRIx64 " dropped=%" PRIu32 " shapes=%" PRIu32
+		     "%s\n",
+		     label, hash, report.dropped_candidates, report.dropped_shapes,
+		     report.dropped_summary.c_str());
+	}
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -284,6 +302,14 @@ struct PipelineCache::ProgramCache {
 			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 			stage = ShaderType::Compute;
 		}
+		const char* label = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
+			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
+			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
+			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
 
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -297,10 +323,14 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .sync_memory                = SyncShaderGuestMemory,
 		};
+		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			ReportMaterialization(label, stage, params.hash, report,
+			                      ShaderRecompiler::IR::MaterializeResources(
+			                          entry->second.resource_plan, runtime, resources,
+			                          specialization, &report));
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -325,14 +355,6 @@ struct PipelineCache::ProgramCache {
 		} else {
 			stage_input.compute = &input_info;
 		}
-		const char* label = nullptr;
-		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
@@ -356,8 +378,9 @@ struct PipelineCache::ProgramCache {
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			ReportMaterialization(label, stage, params.hash, report,
+			                      ShaderRecompiler::IR::MaterializeResources(
+			                          resource_plan, runtime, resources, specialization, &report));
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
 		entry->second.permutations.push_back(CompilePermutation(

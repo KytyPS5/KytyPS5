@@ -96,6 +96,32 @@ bool HostMemoryIsReadable(uint64_t addr) {
 	return HostMemoryRangeIsReadable(addr, 1);
 }
 
+bool HostMemoryReadableRegion(uint64_t addr, uint64_t& begin, uint64_t& end) {
+	begin = end = 0;
+	if (addr == 0) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION region {};
+	if (::VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), &region,
+	                   sizeof(region)) == 0 ||
+	    (region.State & MEM_COMMIT) == 0 || !IsAccessible(region.Protect, HostMemoryAccess::Read)) {
+		return false;
+	}
+	begin = reinterpret_cast<uint64_t>(region.BaseAddress);
+	end   = begin + region.RegionSize < begin ? UINT64_MAX : begin + region.RegionSize;
+	return end > addr;
+#else
+	uint64_t readable = 0;
+	if (!HostMemoryQueryReadable(addr, 1, readable) || readable == 0) {
+		return false;
+	}
+	begin = addr;
+	end   = addr + 1;
+	return true;
+#endif
+}
+
 bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
 	if (addr == 0 || size == 0 || UINT64_MAX - addr < size) {
 		return false;

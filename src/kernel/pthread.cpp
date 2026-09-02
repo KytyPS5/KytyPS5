@@ -2573,6 +2573,11 @@ int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec) {
 	PRINT_NAME();
 
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
+
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -2585,6 +2590,11 @@ int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec) {
 	PRINT_NAME();
 
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
+
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -2596,6 +2606,11 @@ int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds
 
 int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 	PRINT_NAME();
+
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
 
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;

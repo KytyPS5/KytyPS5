@@ -117,15 +117,15 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 				                             mem.resource,
 				                             "storage buffer descriptor array was not emitted");
 			}
-			const auto binding =
+			const auto array_index =
 			    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
 			access.object_pointer = state.builder.AllocateId();
 			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
 			                           access.object_pointer, state.storage_buffer_variable,
-			                           ConstantU32(state, binding.array_index)});
-			access.index_offset     = EmitBinaryU32(state, OpShiftRightLogical,
-			                                        state.memory_byte_offsets[binding.array_index],
-			                                        ConstantU32(state, 2u));
+			                           ConstantU32(state, array_index)});
+			access.index_offset =
+			    EmitBinaryU32(state, OpShiftRightLogical, state.memory_byte_offsets[array_index],
+			                  ConstantU32(state, 2u));
 			access.add_index_offset = true;
 			break;
 		}

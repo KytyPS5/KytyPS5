@@ -188,36 +188,36 @@ void DefineDescriptorVariables(EmitterState& state) {
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view        = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		const auto image_class = static_cast<SampledImageClass>(i / SampledImageViewKindCount);
-		const auto kind        = SampledBindingKind(image_class, view);
+		const auto dimension   = ImageDimensions[i % SampledImageDimensionCount].dimension;
+		const auto image_class = static_cast<SampledImageClass>(i / SampledImageDimensionCount);
+		const auto kind        = SampledBindingKind(image_class, dimension);
 		if (DescriptorBinding(state, kind) == nullptr) {
 			continue;
 		}
 		const auto count        = ConstantU32(state, DescriptorCount(state, kind));
-		const auto image_type   = ImageViewImageType(state, view, image_class);
+		const auto image_type   = ImageViewImageType(state, dimension, image_class);
 		const auto array_type   = state.builder.Type(OpTypeArray, {image_type, count});
 		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
 		state.sampled_image_variables[i] =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
-		if (view == ImageViewKind::Dim1D || view == ImageViewKind::Dim1DArray) {
+		if (dimension == ImageDimension::Dim1D || dimension == ImageDimension::Dim1DArray) {
 			state.builder.RequireCapability(CapabilitySampled1D);
 		}
 	}
 	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
-		const auto view        = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
-		const auto kind        = StorageBindingKind(image_class, view);
+		const auto dimension   = ImageDimensions[i % StorageImageDimensionCount].dimension;
+		const auto image_class = static_cast<StorageImageClass>(i / StorageImageDimensionCount);
+		const auto kind        = StorageBindingKind(image_class, dimension);
 		if (DescriptorBinding(state, kind) == nullptr) {
 			continue;
 		}
 		const auto count        = ConstantU32(state, DescriptorCount(state, kind));
-		const auto image_type   = StorageImageType(state, image_class, view);
+		const auto image_type   = StorageImageType(state, image_class, dimension);
 		const auto array_type   = state.builder.Type(OpTypeArray, {image_type, count});
 		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
 		state.storage_image_variables[i] =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
-		if (view == ImageViewKind::Dim1D || view == ImageViewKind::Dim1DArray) {
+		if (dimension == ImageDimension::Dim1D || dimension == ImageDimension::Dim1DArray) {
 			state.builder.RequireCapability(CapabilityImage1D);
 		}
 	}
@@ -616,10 +616,10 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "sampled_sint_2d_msaa",
 	                                        "sampled_sint_2d_msaa_array"};
 	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		const auto image_class = static_cast<SampledImageClass>(i / SampledImageViewKindCount);
+		const auto dimension   = ImageDimensions[i % SampledImageDimensionCount].dimension;
+		const auto image_class = static_cast<SampledImageClass>(i / SampledImageDimensionCount);
 		Decorate(state.sampled_image_variables[i], SampledNames[i],
-		         SampledBindingKind(image_class, view));
+		         SampledBindingKind(image_class, dimension));
 	}
 	constexpr const char* StorageNames[] = {"storage_1d",
 	                                        "storage_1d_array",
@@ -637,10 +637,10 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	                                        "storage_atomic_2d_array",
 	                                        "storage_atomic_3d"};
 	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
-		const auto view        = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
+		const auto dimension   = ImageDimensions[i % StorageImageDimensionCount].dimension;
+		const auto image_class = static_cast<StorageImageClass>(i / StorageImageDimensionCount);
 		Decorate(state.storage_image_variables[i], StorageNames[i],
-		         StorageBindingKind(image_class, view));
+		         StorageBindingKind(image_class, dimension));
 	}
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);

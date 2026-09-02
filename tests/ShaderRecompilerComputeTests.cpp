@@ -4273,6 +4273,118 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckDepthSliceGrowth() {
+    constexpr const char *name = "DepthSliceGrowth";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t slice_size = 0x400000;
+    constexpr uint64_t htile_slice_size = 0x20000;
+    constexpr uint64_t allocation_size = 0x2800000;
+    constexpr uint64_t allocation_alignment = 0x200000;
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "slice growth direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "slice growth direct-memory mapping failed");
+
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      auto &texture_cache = resources.GetTextureCache();
+      resources.MapMemory(base, allocation_size);
+
+      ImageDesc sampled{};
+      sampled.type = BindingType::Texture;
+      sampled.info.data = {base, slice_size * 4};
+      sampled.info.pixel_format = vk::Format::eR32Sfloat;
+      sampled.info.guest_format = Prospero::BufferFormat::k32Float;
+      sampled.info.type = Prospero::ImageType::kColor2D;
+      sampled.info.extent = {1024, 1024, 1};
+      sampled.info.resources = {1, 4};
+      sampled.info.pitch = 1024;
+      sampled.info.bytes_per_block = 4;
+      sampled.info.samples = 1;
+      sampled.info.tile_mode = Prospero::TileMode::kDepth;
+      sampled.info.mip_layout[0] = {0, slice_size * 4, 1024, 1024};
+      sampled.view_info.format = sampled.info.pixel_format;
+      sampled.view_info.type = vk::ImageViewType::e2DArray;
+      sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      sampled.view_info.layer_count = 4;
+      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto view_id = texture_cache.FindImage(sampled);
+      Require(name, "sampled array",
+              bool(view_id) &&
+                  texture_cache.GetImage(view_id).info.resources.layers == 4,
+              "the four-slice sampled view was not created");
+
+      ImageDesc slice{};
+      slice.type = BindingType::DepthTarget;
+      slice.info.data = {base, slice_size * 2};
+      slice.info.pixel_format = vk::Format::eD32Sfloat;
+      slice.info.guest_format = Prospero::BufferFormat::k32Float;
+      slice.info.type = Prospero::ImageType::kColor2D;
+      slice.info.extent = {1024, 1024, 1};
+      slice.info.resources = {1, 2};
+      slice.info.pitch = 1024;
+      slice.info.bytes_per_block = 4;
+      slice.info.samples = 1;
+      slice.info.tile_mode = Prospero::TileMode::kDepth;
+      slice.info.mip_layout[0] = {0, slice_size * 2, 1024, 1024};
+      slice.info.metadata.range = {base + slice_size * 4, htile_slice_size * 2};
+      slice.info.metadata.kind = ImageMetadataKind::Htile;
+      slice.view_info.format = slice.info.pixel_format;
+      slice.view_info.type = vk::ImageViewType::e2D;
+      slice.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      slice.view_info.base_layer = 1;
+      slice.view_info.layer_count = 1;
+      slice.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto target_id = texture_cache.FindImage(slice);
+      Require(name, "slice bind", bool(target_id) && target_id != view_id,
+              "the per-slice depth bind did not replace the sampled array");
+      const auto &target = texture_cache.GetImage(target_id).info;
+      Require(name, "grown ranges",
+              target.IsDepth() && target.resources.layers == 4 &&
+                  target.data.size == slice_size * 4 &&
+                  target.mip_layout[0].size == slice_size * 4 &&
+                  target.metadata.range.size == htile_slice_size * 4,
+              "keeping the cached slice count did not stretch the depth and "
+              "HTILE ranges with it");
+
+      auto resampled = sampled;
+      const auto resampled_id = texture_cache.FindImage(resampled);
+      Require(name, "resampled array", resampled_id == target_id,
+              "the sampled array no longer matches the grown depth image");
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "slice growth direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "slice growth direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -25826,6 +25938,14 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA10112 writable D16 depth-plane footprint is incorrect");
   ValidateStorageTexture(BasicArrayStorageTextureResource(), d16_depth_tile,
                          d16_size.size);
+  TileSizeAlign r32_depth_array{};
+  TileGetTextureTotalSize(Prospero::BufferFormat::k32Float, 1024, 1024, 4, 1,
+                          Prospero::TileMode::kDepth, false, r32_depth_array);
+  Require("BasicStorageTexture", "R32F depth-tile 1024x1024x4 footprint",
+          r32_depth_array.size == 0x1000000u,
+          ("R32F depth-tiled 1024x1024x4 footprint is " +
+           std::to_string(r32_depth_array.size) + " bytes, expected 16 MiB")
+              .c_str());
   auto depth_tile_r32 = depth_tile;
   depth_tile_r32.fields[1] =
       (depth_tile_r32.fields[1] & ~(0x1ffu << 20u)) |
@@ -28252,6 +28372,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-slice-growth-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthSliceGrowth();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -28450,6 +28575,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckDepthSliceGrowth();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
   vulkan.CheckBufferCacheDirtyGarbageCollection();

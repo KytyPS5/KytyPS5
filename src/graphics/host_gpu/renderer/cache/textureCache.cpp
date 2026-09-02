@@ -704,6 +704,32 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
+	const auto current = info.resources.layers;
+	if (info.resources.levels != 1 || current == 0 || layers <= current ||
+	    info.mip_layout[0].offset != 0 || info.mip_layout[0].size != info.data.size) {
+		return false;
+	}
+	const auto stretch = [&](GuestRange& range) {
+		if (range.Empty()) {
+			return true;
+		}
+		if (range.size % current != 0) {
+			return false;
+		}
+		range.size = range.size / current * layers;
+		return true;
+	};
+	auto grown = info;
+	if (!stretch(grown.data) || !stretch(grown.stencil) || !stretch(grown.metadata.range)) {
+		return false;
+	}
+	grown.mip_layout[0].size = grown.data.size;
+	grown.resources.layers   = layers;
+	info                     = grown;
+	return true;
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -767,7 +793,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.resources  = cached.info.resources;
 		info.mip_layout = cached.info.mip_layout;
 	} else {
-		info.resources = std::max(requested.resources, cached.info.resources);
+		auto merged = std::max(requested.resources, cached.info.resources);
+		if (merged.layers > requested.resources.layers &&
+		    !GrowImageToLayers(info, merged.layers)) {
+			merged.layers = requested.resources.layers;
+		}
+		info.resources = merged;
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
@@ -1301,6 +1332,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (desc.info.tile_mode == Prospero::TileMode::kDepth &&
+		    (desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+		    (image.info.data.size != desc.info.data.size ||
+		     !(image.info.resources == desc.info.resources))) {
+			LOGF("TextureCache: depth-tiled view matched a differently shaped image: requested"
+			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " levels=%u layers=%u extent=%ux%u,"
+			     " image addr=0x%016" PRIx64 " size=0x%016" PRIx64 " levels=%u layers=%u"
+			     " extent=%ux%u fmt=%u depth=%d usage=%s%s%s%s gpu_modified=%d cpu_dirty=%d"
+			     " view_mip=%d view_layer=%d\n",
+			     desc.info.data.address, desc.info.data.size, desc.info.resources.levels,
+			     desc.info.resources.layers, desc.info.extent.width, desc.info.extent.height,
+			     image.info.data.address, image.info.data.size, image.info.resources.levels,
+			     image.info.resources.layers, image.info.extent.width, image.info.extent.height,
+			     static_cast<uint32_t>(image.info.guest_format), image.info.IsDepth() ? 1 : 0,
+			     image.usage.texture ? "texture " : "", image.usage.storage ? "storage " : "",
+			     image.usage.render_target ? "render_target " : "",
+			     image.usage.depth_target ? "depth_target " : "", image.IsGpuModified() ? 1 : 0,
+			     image.IsCpuDirty() ? 1 : 0, view_mip, view_layer);
+		}
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();

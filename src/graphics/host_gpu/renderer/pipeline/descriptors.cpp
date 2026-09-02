@@ -586,7 +586,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto    image_layers = layered ? depth : 1u;
 	uint32_t      pitch        = 0;
 	TileSizeAlign size {};
-	if (multisampled) {
+	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const char* rejection = nullptr;
+	if (volume ? depth > limits.maxImageDimension3D : image_layers > limits.maxImageArrayLayers) {
+		rejection = "exceeds host image limits";
+	} else if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
 		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
 		                              : TileGetRenderTargetPitch(width, bytes, last_level);
@@ -597,8 +601,43 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		size.size *= image_layers;
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels, tile,
-		                        volume, size);
+		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels,
+		                             tile, volume, size)) {
+			rejection = "footprint exceeds 32 bits";
+		}
+	}
+	if (rejection != nullptr) {
+		const auto report = fmt::format(
+		    "unrepresentable texture ({}): {}x{} depth={} layers={} levels={} format={} tile={} "
+		    "type={} base_array={} array_pitch={} max_mip={} kind={} dimension={} source={} "
+		    "first_use_pc=0x{:08x} indirect_root={} addr=0x{:016x} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    rejection, width, height, depth, image_layers, levels, static_cast<uint32_t>(format),
+		    static_cast<uint32_t>(tile), static_cast<uint32_t>(type), descriptor.BaseArray5(),
+		    descriptor.ArrayPitch(), descriptor.MaxMip(), static_cast<uint32_t>(resource.resource_class),
+		    static_cast<uint32_t>(resource.dimension), resource.source, resource.first_use_pc,
+		    resource.indirect_root, address, descriptor.fields[0], descriptor.fields[1],
+		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		    descriptor.fields[6], descriptor.fields[7]);
+		if (storage) {
+			EXIT("%s\n", report.c_str());
+		}
+		if (m_unrepresentable_textures.insert(address).second) {
+			LOGF("TextureCache: %s, bound as null\n", report.c_str());
+		}
+		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	if (tile == Prospero::TileMode::kDepth && m_depth_tiled_reports.insert(address).second) {
+		LOGF("TextureCache: depth-tiled sampled view: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " %ux%u depth=%u layers=%u levels=%u format=%u type=%u base_array=%u kind=%u"
+		     " storage=%d dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     address, static_cast<uint64_t>(size.size), width, height, depth, image_layers, levels,
+		     static_cast<uint32_t>(format), static_cast<uint32_t>(type), descriptor.BaseArray5(),
+		     static_cast<uint32_t>(resource.resource_class), storage ? 1 : 0, descriptor.fields[0],
+		     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+		     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);

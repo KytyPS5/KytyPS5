@@ -333,7 +333,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
-		m_context.GetGpuResources().PrepareBda();
+		const bool prefetched =
+		    m_context.GetGpuResources().PrepareBdaPointers(bindings.user_data) ||
+		    m_context.GetGpuResources().PrepareBdaPointers(bindings.flattened_srt);
+		if (!prefetched) {
+			m_context.GetGpuResources().PrepareBda();
+		}
 	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);

@@ -12,6 +12,8 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t& readable_size);
 bool HostMemoryIsReadable(uint64_t addr);
 bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size);
+// Bounds of the committed, readable host region containing addr, so callers can cache one query.
+bool HostMemoryReadableRegion(uint64_t addr, uint64_t& begin, uint64_t& end);
 
 } // namespace Libs::Graphics
 

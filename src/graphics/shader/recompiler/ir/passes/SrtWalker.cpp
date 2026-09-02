@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -534,6 +535,11 @@ private:
 				return false;
 			}
 		} else {
+			// The address is derived from guest data, so it can be anything; a descriptor that
+			// does not resolve must fail evaluation rather than fault the emulator.
+			if (!RangeReadable(address, sizeof(word))) {
+				return false;
+			}
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
@@ -816,12 +822,29 @@ private:
 		return false;
 	}
 
-	const Program&                            m_program;
-	const SrtRuntime&                         m_runtime;
-	std::span<const uint8_t>                  m_clean_flat_slots;
-	Evaluator*                                m_clean_evaluator = nullptr;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
+	// One host memory query per region instead of one per word; the same check, cached for this walk.
+	bool RangeReadable(uint64_t address, uint64_t size) {
+		for (const auto& [begin, end]: m_readable_regions) {
+			if (address >= begin && size <= end - address) {
+				return true;
+			}
+		}
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		if (HostMemoryReadableRegion(address, begin, end) && size <= end - address) {
+			m_readable_regions.emplace_back(begin, end);
+			return true;
+		}
+		return HostMemoryRangeIsReadable(address, size);
+	}
+
+	const Program&                                m_program;
+	const SrtRuntime&                             m_runtime;
+	std::span<const uint8_t>                      m_clean_flat_slots;
+	Evaluator*                                    m_clean_evaluator = nullptr;
+	std::unordered_map<const Inst*, uint64_t>     m_cache;
+	std::vector<const Inst*>                      m_visiting;
+	std::vector<std::pair<uint64_t, uint64_t>>    m_readable_regions;
 };
 
 const DescriptorSource* Source(const Program& program, uint32_t source) {

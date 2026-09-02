@@ -1431,6 +1431,15 @@ void TestDenseIndirectImageMaterialization() {
   Check(std::ranges::all_of(candidate_of(stale_snapshot, 2u).dwords,
                             [](uint32_t dword) { return dword == 0u; }),
         "an out-of-range array base was kept as a usable descriptor");
+  memory_image.words[(kTable + 2u * 32u) / 4u + 4u] = 0x84b1b500u;
+  ResourceSnapshot foreign_snapshot;
+  ResourceSpecialization foreign_specialization;
+  Check(MaterializeResources(resource_plan, runtime, foreign_snapshot,
+                             foreign_specialization),
+        "dense indirect image table with a foreign slot did not materialize");
+  Check(std::ranges::all_of(candidate_of(foreign_snapshot, 2u).dwords,
+                            [](uint32_t dword) { return dword == 0u; }),
+        "a slot with reserved texture bits set was kept as a usable descriptor");
   fixture.program.descriptor_sources[fixture.program.info.images[0].source]
       .indirect_image->key_bound = 0x10000u;
   auto unreadable_plan = ExtractResourcePlan(fixture.program);

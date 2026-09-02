@@ -691,7 +691,9 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value) {
 			const auto mask = BallotMask(value);
 			ir.SetExec(value);
 			ir.SetExecLo(mask[0]);
-			ir.SetExecHi(mask[1]);
+			if (current_wave_size == 64u) {
+				ir.SetExecHi(mask[1]);
+			}
 			return;
 		}
 		case Decoder::OperandKind::VccLo:
@@ -699,7 +701,9 @@ void Translator::WriteMask(const Decoder::Operand& operand, IR::U1 value) {
 			const auto mask = BallotMask(value);
 			ir.SetVcc(value);
 			ir.SetVccLo(mask[0]);
-			ir.SetVccHi(mask[1]);
+			if (current_wave_size == 64u) {
+				ir.SetVccHi(mask[1]);
+			}
 			return;
 		}
 		case Decoder::OperandKind::Scc: ir.SetScc(value); return;

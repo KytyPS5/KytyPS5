@@ -97,6 +97,24 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
 }
 
+bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
+}
+
+void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+                           const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
+	if (!ok) {
+		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
+		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
+	}
+	if (!report.dropped_summary.empty()) {
+		LOGF("%s indirect image tables: hash=0x%016" PRIx64 " dropped=%" PRIu32 " shapes=%" PRIu32
+		     "%s\n",
+		     label, hash, report.dropped_candidates, report.dropped_shapes,
+		     report.dropped_summary.c_str());
+	}
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -277,6 +295,17 @@ struct PipelineCache::ProgramCache {
 			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 			stage = ShaderType::Compute;
 		}
+		const char* label = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
+			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
+			case ShaderType::Local: label = "ShaderRecompiler LS"; break;
+			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; break;
+			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; break;
+			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
+			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
@@ -289,11 +318,14 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .sync_memory                = SyncShaderGuestMemory,
 		};
+		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			ReportMaterialization(label, stage, params.hash, report,
+			                      ShaderRecompiler::IR::MaterializeResources(
+			                          entry->second.resource_plan, runtime, entry->second.resources,
+			                          entry->second.specialization, &report));
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -317,17 +349,6 @@ struct PipelineCache::ProgramCache {
 			stage_input.pixel = &input_info;
 		} else {
 			stage_input.compute = &input_info;
-		}
-		const char* label = nullptr;
-		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
-			case ShaderType::Local: label = "ShaderRecompiler LS"; break;
-			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; break;
-			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
-			default: EXIT("invalid pipeline shader stage\n");
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
@@ -353,9 +374,10 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			ReportMaterialization(label, stage, params.hash, report,
+			                      ShaderRecompiler::IR::MaterializeResources(
+			                          entry->second.resource_plan, runtime, entry->second.resources,
+			                          entry->second.specialization, &report));
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));

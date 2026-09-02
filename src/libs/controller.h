@@ -7,11 +7,13 @@ namespace Libs::Controller {
 
 void Initialize();
 void Shutdown();
+void EmergencyShutdown();
 
 struct Lifecycle {
-	static constexpr const char* name       = "Controller";
-	static constexpr auto        initialize = Libs::Controller::Initialize;
-	static constexpr auto        shutdown   = Libs::Controller::Shutdown;
+	static constexpr const char* name               = "Controller";
+	static constexpr auto        initialize         = Libs::Controller::Initialize;
+	static constexpr auto        shutdown           = Libs::Controller::Shutdown;
+	static constexpr auto        emergency_shutdown = Libs::Controller::EmergencyShutdown;
 };
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;

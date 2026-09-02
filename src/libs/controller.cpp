@@ -23,8 +23,8 @@ LIB_NAME("Pad", "Pad");
 constexpr int PAD_ERROR_INVALID_ARG    = -2137915391; /* 0x80920001 */
 constexpr int PAD_ERROR_INVALID_HANDLE = -2137915389; /* 0x80920003 */
 
-// SDL limits rumble commands to 0xffff ms; zero strengths stop immediately.
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
+constexpr uint32_t RELEASE_FLUSH_MS   = 50;
 
 struct PadControllerInformation {
 	float    touch_pixel_density;
@@ -102,6 +102,7 @@ public:
 	void RightStick(int id, int x, int y);
 	void TouchPad(int id, int finger, bool down, float x, float y);
 	void ResetInputState();
+	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
@@ -252,8 +253,15 @@ void Initialize() {
 }
 
 void Shutdown() {
+	EmergencyShutdown();
 	delete g_controller;
 	g_controller = nullptr;
+}
+
+void EmergencyShutdown() {
+	if (g_controller != nullptr) {
+		g_controller->ReleaseHostPads();
+	}
 }
 
 void GameController::Connect(int id) {
@@ -402,6 +410,39 @@ void GameController::ResetInputState() {
 	m_first_state   = 0;
 	m_next_touch_id = 1;
 	AddState();
+}
+
+void GameController::ReleaseHostPads() {
+	Common::LockGuard lock(m_mutex);
+
+	std::vector<SDL_GameController*> pads;
+	for (const auto id: m_connected_ids) {
+		if (id == HOST_INPUT_CONTROLLER_ID) {
+			continue;
+		}
+		if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
+		    pad != nullptr) {
+			if (SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
+				DualSenseEffects effect {};
+				effect.enable_bits     = 0x0c;
+				effect.right_trigger[0] = 0x05;
+				effect.left_trigger[0]  = 0x05;
+				(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
+			}
+			(void)SDL_GameControllerRumble(pad, 0, 0, 0);
+			(void)SDL_GameControllerSetLED(pad, 0, 0, 0);
+			pads.push_back(pad);
+		}
+	}
+
+	if (!pads.empty()) {
+		SDL_Delay(RELEASE_FLUSH_MS);
+		for (auto* pad: pads) {
+			SDL_GameControllerClose(pad);
+		}
+	}
+
+	m_connected_ids.clear();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {

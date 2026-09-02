@@ -373,7 +373,10 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 				const auto mask = BallotMask(IR::U1(value));
 				ir.SetExec(IR::U1(value));
 				ir.SetExecLo(mask[0]);
-				ir.SetExecHi(mask[1]);
+				// In wave32 a lane-mask write touches only the low half; the high half is a free SGPR.
+				if (current_wave_size != 32u) {
+					ir.SetExecHi(mask[1]);
+				}
 				return;
 			}
 			case Decoder::OperandKind::VccLo:
@@ -381,7 +384,9 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 				const auto mask = BallotMask(IR::U1(value));
 				ir.SetVcc(IR::U1(value));
 				ir.SetVccLo(mask[0]);
-				ir.SetVccHi(mask[1]);
+				if (current_wave_size != 32u) {
+					ir.SetVccHi(mask[1]);
+				}
 				return;
 			}
 			default:

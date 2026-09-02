@@ -10,11 +10,6 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr auto     FirstImageBinding = DescriptorBindingKind::Sampled1D;
-constexpr uint32_t ImageBindingCount =
-    static_cast<uint32_t>(DescriptorBindingKind::StorageAtomic3D) -
-    static_cast<uint32_t>(FirstImageBinding) + 1u;
-
 [[noreturn]] void BindingFail(const char* message) {
 	EXIT("shader binding layout failed: %s", message);
 	std::abort();
@@ -107,7 +102,7 @@ void AllocateBindings(Program& program, uint32_t push_constant_offset) {
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);
 		}
-		const auto group = static_cast<uint32_t>(*kind) - static_cast<uint32_t>(FirstImageBinding);
+		const auto group = ImageBindingIndex(*kind);
 		if (group >= image_groups.size()) {
 			EXIT("shader binding layout failed: image %u has an unmapped binding class", i);
 		}
@@ -122,10 +117,8 @@ void AllocateBindings(Program& program, uint32_t push_constant_offset) {
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {
-			AddBinding(
-			    next,
-			    static_cast<DescriptorBindingKind>(static_cast<uint32_t>(FirstImageBinding) + i),
-			    std::move(image_groups[i]));
+			AddBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i),
+			           std::move(image_groups[i]));
 		}
 	}
 

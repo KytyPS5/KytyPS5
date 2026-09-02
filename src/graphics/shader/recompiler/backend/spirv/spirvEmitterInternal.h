@@ -321,7 +321,6 @@ using ImageDimension = Decoder::ImageDimension;
 
 struct ImageDimensionInfo {
 	ImageDimension dimension;
-	uint32_t       ordinal;
 	uint32_t       spirv_dimension;
 	uint32_t       coordinate_components;
 	uint32_t       spatial_components;
@@ -330,28 +329,16 @@ struct ImageDimensionInfo {
 };
 
 constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
-    {ImageDimension::Dim1D, 0, Dim1D, 1, 1, 0, 0},
-    {ImageDimension::Dim1DArray, 1, Dim1D, 2, 1, 1, 0},
-    {ImageDimension::Dim2D, 2, Dim2D, 2, 2, 0, 0},
-    {ImageDimension::Dim2DArray, 3, Dim2D, 3, 2, 1, 0},
-    {ImageDimension::Dim3D, 4, Dim3D, 3, 3, 0, 0},
-    {ImageDimension::Dim2DMsaa, 5, Dim2D, 2, 2, 0, 1},
-    {ImageDimension::Dim2DMsaaArray, 6, Dim2D, 3, 2, 1, 1},
+    {ImageDimension::Dim1D, Dim1D, 1, 1, 0, 0},
+    {ImageDimension::Dim1DArray, Dim1D, 2, 1, 1, 0},
+    {ImageDimension::Dim2D, Dim2D, 2, 2, 0, 0},
+    {ImageDimension::Dim2DArray, Dim2D, 3, 2, 1, 0},
+    {ImageDimension::Dim3D, Dim3D, 3, 3, 0, 0},
+    {ImageDimension::Dim2DMsaa, Dim2D, 2, 2, 0, 1},
+    {ImageDimension::Dim2DMsaaArray, Dim2D, 3, 2, 1, 1},
 }};
 
-constexpr uint32_t SampledImageDimensionCount = ImageDimensions.size();
-constexpr uint32_t StorageImageDimensionCount = 5;
-
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
-
-enum class SampledImageClass : uint32_t { Float, Uint, Sint, Count };
-
-enum class StorageImageClass : uint32_t {
-	FormatlessFloat,
-	FormatlessUint,
-	AtomicUint,
-	Count,
-};
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
@@ -378,12 +365,7 @@ struct EmitterState {
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         scratch_variable        = 0;
-	std::array<uint32_t,
-	           static_cast<uint32_t>(SampledImageClass::Count) * SampledImageDimensionCount>
-	    sampled_image_variables {};
-	std::array<uint32_t,
-	           static_cast<uint32_t>(StorageImageClass::Count) * StorageImageDimensionCount>
-	                           storage_image_variables {};
+	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   entry_label                           = 0;
@@ -482,113 +464,6 @@ struct ImageSampleLayout {
 	uint32_t grad_y = NoImageComponent;
 };
 
-constexpr SampledImageClass SampledImageClassFor(Prospero::TextureNumericClass numeric_class) {
-	switch (numeric_class) {
-		case Prospero::TextureNumericClass::Float: return SampledImageClass::Float;
-		case Prospero::TextureNumericClass::Uint: return SampledImageClass::Uint;
-		case Prospero::TextureNumericClass::Sint: return SampledImageClass::Sint;
-		case Prospero::TextureNumericClass::Unsupported: return SampledImageClass::Count;
-	}
-	return SampledImageClass::Count;
-}
-
-constexpr bool IsIntegerSampledImage(SampledImageClass image_class) {
-	return image_class == SampledImageClass::Uint || image_class == SampledImageClass::Sint;
-}
-
-inline uint32_t SampledImageIndex(SampledImageClass image_class, ImageDimension dimension) {
-	return ImageDimensionInfoFor(dimension).ordinal +
-	       static_cast<uint32_t>(image_class) * SampledImageDimensionCount;
-}
-
-inline uint32_t StorageImageIndex(StorageImageClass image_class, ImageDimension dimension) {
-	return ImageDimensionInfoFor(dimension).ordinal +
-	       static_cast<uint32_t>(image_class) * StorageImageDimensionCount;
-}
-
-constexpr IR::DescriptorBindingKind SampledBindingKind(SampledImageClass image_class,
-                                                       ImageDimension    dimension) {
-	if (image_class == SampledImageClass::Uint) {
-		switch (dimension) {
-			case ImageDimension::Dim1D: return IR::DescriptorBindingKind::SampledUint1D;
-			case ImageDimension::Dim1DArray: return IR::DescriptorBindingKind::SampledUint1DArray;
-			case ImageDimension::Dim2D: return IR::DescriptorBindingKind::SampledUint2D;
-			case ImageDimension::Dim2DArray: return IR::DescriptorBindingKind::SampledUint2DArray;
-			case ImageDimension::Dim3D: return IR::DescriptorBindingKind::SampledUint3D;
-			case ImageDimension::Dim2DMsaa: return IR::DescriptorBindingKind::SampledUint2DMsaa;
-			case ImageDimension::Dim2DMsaaArray:
-				return IR::DescriptorBindingKind::SampledUint2DMsaaArray;
-			default: break;
-		}
-	}
-	if (image_class == SampledImageClass::Sint) {
-		switch (dimension) {
-			case ImageDimension::Dim1D: return IR::DescriptorBindingKind::SampledSint1D;
-			case ImageDimension::Dim1DArray: return IR::DescriptorBindingKind::SampledSint1DArray;
-			case ImageDimension::Dim2D: return IR::DescriptorBindingKind::SampledSint2D;
-			case ImageDimension::Dim2DArray: return IR::DescriptorBindingKind::SampledSint2DArray;
-			case ImageDimension::Dim3D: return IR::DescriptorBindingKind::SampledSint3D;
-			case ImageDimension::Dim2DMsaa: return IR::DescriptorBindingKind::SampledSint2DMsaa;
-			case ImageDimension::Dim2DMsaaArray:
-				return IR::DescriptorBindingKind::SampledSint2DMsaaArray;
-			default: break;
-		}
-	}
-	switch (dimension) {
-		case ImageDimension::Dim1D: return IR::DescriptorBindingKind::Sampled1D;
-		case ImageDimension::Dim1DArray: return IR::DescriptorBindingKind::Sampled1DArray;
-		case ImageDimension::Dim2D: return IR::DescriptorBindingKind::Sampled2D;
-		case ImageDimension::Dim2DArray: return IR::DescriptorBindingKind::Sampled2DArray;
-		case ImageDimension::Dim3D: return IR::DescriptorBindingKind::Sampled3D;
-		case ImageDimension::Dim2DMsaa: return IR::DescriptorBindingKind::Sampled2DMsaa;
-		case ImageDimension::Dim2DMsaaArray: return IR::DescriptorBindingKind::Sampled2DMsaaArray;
-		default: break;
-	}
-	return IR::DescriptorBindingKind::Count;
-}
-
-constexpr IR::DescriptorBindingKind StorageBindingKind(StorageImageClass image_class,
-                                                       ImageDimension    dimension) {
-	switch (image_class) {
-		case StorageImageClass::FormatlessFloat:
-			switch (dimension) {
-				case ImageDimension::Dim1D: return IR::DescriptorBindingKind::Storage1D;
-				case ImageDimension::Dim1DArray: return IR::DescriptorBindingKind::Storage1DArray;
-				case ImageDimension::Dim2D: return IR::DescriptorBindingKind::Storage2D;
-				case ImageDimension::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
-				case ImageDimension::Dim3D: return IR::DescriptorBindingKind::Storage3D;
-				default: break;
-			}
-			break;
-		case StorageImageClass::FormatlessUint:
-			switch (dimension) {
-				case ImageDimension::Dim1D: return IR::DescriptorBindingKind::StorageUint1D;
-				case ImageDimension::Dim1DArray:
-					return IR::DescriptorBindingKind::StorageUint1DArray;
-				case ImageDimension::Dim2D: return IR::DescriptorBindingKind::StorageUint2D;
-				case ImageDimension::Dim2DArray:
-					return IR::DescriptorBindingKind::StorageUint2DArray;
-				case ImageDimension::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
-				default: break;
-			}
-			break;
-		case StorageImageClass::AtomicUint:
-			switch (dimension) {
-				case ImageDimension::Dim1D: return IR::DescriptorBindingKind::StorageAtomic1D;
-				case ImageDimension::Dim1DArray:
-					return IR::DescriptorBindingKind::StorageAtomic1DArray;
-				case ImageDimension::Dim2D: return IR::DescriptorBindingKind::StorageAtomic2D;
-				case ImageDimension::Dim2DArray:
-					return IR::DescriptorBindingKind::StorageAtomic2DArray;
-				case ImageDimension::Dim3D: return IR::DescriptorBindingKind::StorageAtomic3D;
-				default: break;
-			}
-			break;
-		case StorageImageClass::Count: break;
-	}
-	return IR::DescriptorBindingKind::Count;
-}
-
 struct F32Class {
 	uint32_t bits = 0;
 	uint32_t nan  = 0;
@@ -639,24 +514,14 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
                                   const char* variable_name);
 
-uint32_t SampledImageScalarType(EmitterState& state, SampledImageClass image_class);
+uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class);
 
-uint32_t SampledImageVectorType(EmitterState& state, SampledImageClass image_class,
-                                uint32_t components);
+uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass numeric_class,
+                         uint32_t components);
 
-uint32_t ImageViewImageType(EmitterState& state, ImageDimension dimension,
-                            SampledImageClass image_class);
-
-uint32_t ImageViewSampledImageType(EmitterState& state, ImageDimension dimension,
-                                   SampledImageClass image_class);
+uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
-
-uint32_t StorageImageType(EmitterState& state, StorageImageClass image_class,
-                          ImageDimension dimension);
-
-uint32_t StorageImagePointerType(EmitterState& state, StorageImageClass image_class,
-                                 ImageDimension dimension);
 
 uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 

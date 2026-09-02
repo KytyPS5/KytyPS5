@@ -48,67 +48,27 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
-bool IsSampledImage(BindingKind kind) {
-	switch (kind) {
-		case BindingKind::Sampled1D:
-		case BindingKind::Sampled1DArray:
-		case BindingKind::Sampled2D:
-		case BindingKind::Sampled2DArray:
-		case BindingKind::Sampled2DMsaa:
-		case BindingKind::Sampled2DMsaaArray:
-		case BindingKind::Sampled3D:
-		case BindingKind::SampledUint1D:
-		case BindingKind::SampledUint1DArray:
-		case BindingKind::SampledUint2D:
-		case BindingKind::SampledUint2DArray:
-		case BindingKind::SampledUint2DMsaa:
-		case BindingKind::SampledUint2DMsaaArray:
-		case BindingKind::SampledUint3D:
-		case BindingKind::SampledSint1D:
-		case BindingKind::SampledSint1DArray:
-		case BindingKind::SampledSint2D:
-		case BindingKind::SampledSint2DArray:
-		case BindingKind::SampledSint2DMsaa:
-		case BindingKind::SampledSint2DMsaaArray:
-		case BindingKind::SampledSint3D: return true;
-		default: return false;
-	}
-}
-
-bool IsStorageImage(BindingKind kind) {
-	switch (kind) {
-		case BindingKind::Storage1D:
-		case BindingKind::Storage1DArray:
-		case BindingKind::Storage2D:
-		case BindingKind::Storage2DArray:
-		case BindingKind::Storage3D:
-		case BindingKind::StorageUint1D:
-		case BindingKind::StorageUint1DArray:
-		case BindingKind::StorageUint2D:
-		case BindingKind::StorageUint2DArray:
-		case BindingKind::StorageUint3D:
-		case BindingKind::StorageAtomic1D:
-		case BindingKind::StorageAtomic1DArray:
-		case BindingKind::StorageAtomic2D:
-		case BindingKind::StorageAtomic2DArray:
-		case BindingKind::StorageAtomic3D: return true;
-		default: return false;
-	}
-}
-
 } // namespace
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
-	if (kind == BindingKind::Samplers) {
-		return vk::DescriptorType::eSampler;
-	}
-	if (IsSampledImage(kind)) {
+	const auto image_class = ShaderRecompiler::IR::ImageBindingResourceClass(kind);
+	if (image_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
 		return vk::DescriptorType::eSampledImage;
 	}
-	if (IsStorageImage(kind)) {
+	if (image_class == ShaderRecompiler::IR::ImageResourceClass::Storage) {
 		return vk::DescriptorType::eStorageImage;
 	}
-	return vk::DescriptorType::eStorageBuffer;
+	switch (kind) {
+		case BindingKind::Samplers: return vk::DescriptorType::eSampler;
+		case BindingKind::Buffers:
+		case BindingKind::Gds:
+		case BindingKind::BdaPagetable:
+		case BindingKind::FaultBuffer:
+		case BindingKind::FlattenedSrt:
+		case BindingKind::UserData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
+	}
+	EXIT("invalid native descriptor binding kind");
 }
 
 uint32_t NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding) {
@@ -1181,48 +1141,54 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			write.descriptorCount   = NativeDescriptorCount(binding);
 			const auto buffer_start = m_descriptor_buffers.size();
 			const auto image_start  = m_descriptor_images.size();
-			switch (binding.kind) {
-				case BindingKind::Buffers:
-					for (const auto resource: binding.resources) {
-						const auto& view = descriptors.buffers.at(resource);
-						EXIT_IF(view.buffer == nullptr);
-						m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
-					}
-					break;
-				case BindingKind::BdaPagetable:
-				case BindingKind::FaultBuffer: {
-					auto& cache = m_context.GetBufferCache();
-					const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
-					                             ? cache.GetBdaPageTableBuffer()
-					                             : cache.GetFaultBuffer();
-					m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0, bda_buffer->Size());
-					break;
+			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
+			    ShaderRecompiler::IR::ImageResourceClass::None) {
+				for (const auto resource: binding.resources) {
+					m_descriptor_images.push_back(MakeImageInfo(
+					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
 				}
-				case BindingKind::FlattenedSrt:
-				case BindingKind::UserData:
-				case BindingKind::Gds: {
-					const auto& view =
-					    binding.kind == BindingKind::FlattenedSrt ? descriptors.flattened_srt
-					    : binding.kind == BindingKind::UserData   ? descriptors.user_data
-					                                              : descriptors.gds;
-					EXIT_IF(view.buffer == nullptr);
-					m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
-					break;
+			} else {
+				switch (binding.kind) {
+					case BindingKind::Buffers:
+						for (const auto resource: binding.resources) {
+							const auto& view = descriptors.buffers.at(resource);
+							EXIT_IF(view.buffer == nullptr);
+							m_descriptor_buffers.emplace_back(view.buffer, view.offset, view.range);
+						}
+						break;
+					case BindingKind::BdaPagetable:
+					case BindingKind::FaultBuffer: {
+						auto&       cache      = m_context.GetBufferCache();
+						const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
+						                             ? cache.GetBdaPageTableBuffer()
+						                             : cache.GetFaultBuffer();
+						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
+						                                  bda_buffer->Size());
+						break;
+					}
+					case BindingKind::FlattenedSrt:
+					case BindingKind::UserData:
+					case BindingKind::Gds: {
+						const BufferView* view = &descriptors.gds;
+						if (binding.kind == BindingKind::FlattenedSrt) {
+							view = &descriptors.flattened_srt;
+						} else if (binding.kind == BindingKind::UserData) {
+							view = &descriptors.user_data;
+						}
+						EXIT_IF(view->buffer == nullptr);
+						m_descriptor_buffers.emplace_back(view->buffer, view->offset, view->range);
+						break;
+					}
+					case BindingKind::Samplers:
+						for (const auto resource: binding.resources) {
+							const auto sampler = descriptors.samplers.at(resource);
+							EXIT_IF(sampler == nullptr);
+							m_descriptor_images.emplace_back(sampler, nullptr,
+							                                 vk::ImageLayout::eUndefined);
+						}
+						break;
+					case BindingKind::Count: EXIT("invalid descriptor binding kind");
 				}
-				case BindingKind::Samplers:
-					for (const auto resource: binding.resources) {
-						const auto sampler = descriptors.samplers.at(resource);
-						EXIT_IF(sampler == nullptr);
-						m_descriptor_images.emplace_back(sampler, nullptr,
-						                                 vk::ImageLayout::eUndefined);
-					}
-					break;
-				default:
-					for (const auto resource: binding.resources) {
-						m_descriptor_images.push_back(MakeImageInfo(
-						    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
-					}
-					break;
 			}
 			if (m_descriptor_buffers.size() != buffer_start) {
 				write.pBufferInfo = m_descriptor_buffers.data() + buffer_start;

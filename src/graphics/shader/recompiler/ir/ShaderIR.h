@@ -259,45 +259,13 @@ struct StageOutput {
 	bool operator==(const StageOutput& other) const = default;
 };
 
-enum class DescriptorBindingKind {
-	Buffers,
-	Sampled1D,
-	Sampled1DArray,
-	Sampled2D,
-	Sampled2DArray,
-	Sampled2DMsaa,
-	Sampled2DMsaaArray,
-	Sampled3D,
-	SampledUint1D,
-	SampledUint1DArray,
-	SampledUint2D,
-	SampledUint2DArray,
-	SampledUint2DMsaa,
-	SampledUint2DMsaaArray,
-	SampledUint3D,
-	SampledSint1D,
-	SampledSint1DArray,
-	SampledSint2D,
-	SampledSint2DArray,
-	SampledSint2DMsaa,
-	SampledSint2DMsaaArray,
-	SampledSint3D,
-	Storage1D,
-	Storage1DArray,
-	Storage2D,
-	Storage2DArray,
-	Storage3D,
-	StorageUint1D,
-	StorageUint1DArray,
-	StorageUint2D,
-	StorageUint2DArray,
-	StorageUint3D,
-	StorageAtomic1D,
-	StorageAtomic1DArray,
-	StorageAtomic2D,
-	StorageAtomic2DArray,
-	StorageAtomic3D,
-	Samplers,
+inline constexpr uint32_t FirstImageBinding        = 1u;
+inline constexpr uint32_t FirstStorageImageBinding = 22u;
+inline constexpr uint32_t ImageBindingCount        = 36u;
+
+enum class DescriptorBindingKind : uint32_t {
+	Buffers  = 0u,
+	Samplers = FirstImageBinding + ImageBindingCount,
 	Gds,
 	BdaPagetable,
 	FaultBuffer,
@@ -306,6 +274,9 @@ enum class DescriptorBindingKind {
 	Count,
 };
 
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 37u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u);
+
 constexpr uint32_t NativePushConstantSize = 128;
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
@@ -313,88 +284,87 @@ constexpr uint32_t NativePushConstantSize = 128;
 	       (stage == ShaderType::Pixel ? static_cast<uint32_t>(DescriptorBindingKind::Count) : 0u);
 }
 
-[[nodiscard]] inline std::optional<DescriptorBindingKind>
-DescriptorBindingForImage(const ImageResource& image) {
-	using Dimension = Decoder::ImageDimension;
-	using Kind      = DescriptorBindingKind;
+[[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
+	const auto value = static_cast<uint32_t>(kind);
+	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {
+		return ImageResourceClass::Sampled;
+	}
+	if (value >= FirstStorageImageBinding &&
+	    value < static_cast<uint32_t>(DescriptorBindingKind::Samplers)) {
+		return ImageResourceClass::Storage;
+	}
+	return ImageResourceClass::None;
+}
 
-	switch (image.resource_class) {
-		case ImageResourceClass::Sampled:
-			switch (image.numeric_class) {
-				case Prospero::TextureNumericClass::Float: break;
-				case Prospero::TextureNumericClass::Uint:
-					switch (image.dimension) {
-						case Dimension::Dim1D: return Kind::SampledUint1D;
-						case Dimension::Dim1DArray: return Kind::SampledUint1DArray;
-						case Dimension::Dim2D: return Kind::SampledUint2D;
-						case Dimension::Dim2DArray: return Kind::SampledUint2DArray;
-						case Dimension::Dim2DMsaa: return Kind::SampledUint2DMsaa;
-						case Dimension::Dim2DMsaaArray: return Kind::SampledUint2DMsaaArray;
-						case Dimension::Dim3D: return Kind::SampledUint3D;
-						default: return std::nullopt;
-					}
-				case Prospero::TextureNumericClass::Sint:
-					switch (image.dimension) {
-						case Dimension::Dim1D: return Kind::SampledSint1D;
-						case Dimension::Dim1DArray: return Kind::SampledSint1DArray;
-						case Dimension::Dim2D: return Kind::SampledSint2D;
-						case Dimension::Dim2DArray: return Kind::SampledSint2DArray;
-						case Dimension::Dim2DMsaa: return Kind::SampledSint2DMsaa;
-						case Dimension::Dim2DMsaaArray: return Kind::SampledSint2DMsaaArray;
-						case Dimension::Dim3D: return Kind::SampledSint3D;
-						default: return std::nullopt;
-					}
-				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
+[[nodiscard]] constexpr uint32_t ImageBindingIndex(DescriptorBindingKind kind) {
+	return static_cast<uint32_t>(kind) - FirstImageBinding;
+}
+
+[[nodiscard]] constexpr std::optional<DescriptorBindingKind>
+DescriptorBindingForImage(const ImageResource& image) {
+	constexpr uint32_t SampledFloatBinding = 1u;
+	constexpr uint32_t SampledUintBinding  = 8u;
+	constexpr uint32_t SampledSintBinding  = 15u;
+	constexpr uint32_t StorageFloatBinding = 22u;
+	constexpr uint32_t StorageUintBinding  = 27u;
+	constexpr uint32_t AtomicUintBinding   = 32u;
+
+	uint32_t base    = 0;
+	bool     sampled = false;
+	if (image.resource_class == ImageResourceClass::Sampled) {
+		if (image.atomic) {
+			return std::nullopt;
+		}
+		sampled = true;
+		switch (image.numeric_class) {
+			case Prospero::TextureNumericClass::Float: base = SampledFloatBinding; break;
+			case Prospero::TextureNumericClass::Uint: base = SampledUintBinding; break;
+			case Prospero::TextureNumericClass::Sint: base = SampledSintBinding; break;
+			case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
+			default: return std::nullopt;
+		}
+	} else if (image.resource_class == ImageResourceClass::Storage) {
+		if (image.atomic) {
+			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
+				return std::nullopt;
 			}
-			switch (image.dimension) {
-				case Dimension::Dim1D: return Kind::Sampled1D;
-				case Dimension::Dim1DArray: return Kind::Sampled1DArray;
-				case Dimension::Dim2D: return Kind::Sampled2D;
-				case Dimension::Dim2DArray: return Kind::Sampled2DArray;
-				case Dimension::Dim2DMsaa: return Kind::Sampled2DMsaa;
-				case Dimension::Dim2DMsaaArray: return Kind::Sampled2DMsaaArray;
-				case Dimension::Dim3D: return Kind::Sampled3D;
+			base = AtomicUintBinding;
+		} else {
+			switch (image.numeric_class) {
+				case Prospero::TextureNumericClass::Float: base = StorageFloatBinding; break;
+				case Prospero::TextureNumericClass::Uint: base = StorageUintBinding; break;
+				case Prospero::TextureNumericClass::Sint:
+				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
 				default: return std::nullopt;
 			}
-		case ImageResourceClass::Storage:
-			if (image.atomic) {
-				if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
-					return std::nullopt;
-				}
-				switch (image.dimension) {
-					case Dimension::Dim1D: return Kind::StorageAtomic1D;
-					case Dimension::Dim1DArray: return Kind::StorageAtomic1DArray;
-					case Dimension::Dim2D: return Kind::StorageAtomic2D;
-					case Dimension::Dim2DArray: return Kind::StorageAtomic2DArray;
-					case Dimension::Dim3D: return Kind::StorageAtomic3D;
-					default: return std::nullopt;
-				}
-			}
-			switch (image.numeric_class) {
-				case Prospero::TextureNumericClass::Float:
-					switch (image.dimension) {
-						case Dimension::Dim1D: return Kind::Storage1D;
-						case Dimension::Dim1DArray: return Kind::Storage1DArray;
-						case Dimension::Dim2D: return Kind::Storage2D;
-						case Dimension::Dim2DArray: return Kind::Storage2DArray;
-						case Dimension::Dim3D: return Kind::Storage3D;
-						default: return std::nullopt;
-					}
-				case Prospero::TextureNumericClass::Uint:
-					switch (image.dimension) {
-						case Dimension::Dim1D: return Kind::StorageUint1D;
-						case Dimension::Dim1DArray: return Kind::StorageUint1DArray;
-						case Dimension::Dim2D: return Kind::StorageUint2D;
-						case Dimension::Dim2DArray: return Kind::StorageUint2DArray;
-						case Dimension::Dim3D: return Kind::StorageUint3D;
-						default: return std::nullopt;
-					}
-				case Prospero::TextureNumericClass::Sint:
-				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
-			}
-		case ImageResourceClass::None: return std::nullopt;
+		}
+	} else {
+		return std::nullopt;
 	}
-	return std::nullopt;
+
+	uint32_t dimension = 0;
+	switch (image.dimension) {
+		case Decoder::ImageDimension::Dim1D: break;
+		case Decoder::ImageDimension::Dim1DArray: dimension = 1u; break;
+		case Decoder::ImageDimension::Dim2D: dimension = 2u; break;
+		case Decoder::ImageDimension::Dim2DArray: dimension = 3u; break;
+		case Decoder::ImageDimension::Dim2DMsaa:
+			if (!sampled) {
+				return std::nullopt;
+			}
+			dimension = 4u;
+			break;
+		case Decoder::ImageDimension::Dim2DMsaaArray:
+			if (!sampled) {
+				return std::nullopt;
+			}
+			dimension = 5u;
+			break;
+		case Decoder::ImageDimension::Dim3D: dimension = sampled ? 6u : 4u; break;
+		case Decoder::ImageDimension::Unknown: return std::nullopt;
+		default: return std::nullopt;
+	}
+	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
 struct DescriptorBinding {

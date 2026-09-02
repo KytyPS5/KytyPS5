@@ -767,8 +767,10 @@ void TestDynamicStorageMipTracking() {
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
   AllocateBindings(fixture.program, 0);
+  const auto storage_kind = DescriptorBindingForImage(images[0]);
+  Check(storage_kind.has_value(), "storage image has no descriptor binding");
   const auto *storage_binding =
-      FindBinding(fixture.program.bindings, DescriptorBindingKind::Storage2D);
+      FindBinding(fixture.program.bindings, *storage_kind);
   Check(storage_binding != nullptr &&
             storage_binding->resources == std::vector<uint32_t>({0, 1, 1, 1}),
         "dynamic storage mip descriptors were not expanded consecutively");
@@ -1168,6 +1170,113 @@ void TestShaderInfoAndBindingLayout() {
         "binding layout did not collect live typed user-data values");
 }
 
+void TestImageBindingAbi() {
+  using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
+
+  Check(ImageBindingCount == 36u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Buffers) == 0u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 37u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 38u &&
+            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 39u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 40u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 41u &&
+            static_cast<uint32_t>(DescriptorBindingKind::UserData) == 42u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u,
+        "native descriptor binding anchors changed");
+
+  const std::array sampled_dimensions{
+      Decoder::ImageDimension::Dim1D,
+      Decoder::ImageDimension::Dim1DArray,
+      Decoder::ImageDimension::Dim2D,
+      Decoder::ImageDimension::Dim2DArray,
+      Decoder::ImageDimension::Dim2DMsaa,
+      Decoder::ImageDimension::Dim2DMsaaArray,
+      Decoder::ImageDimension::Dim3D,
+  };
+  const std::array storage_dimensions{
+      Decoder::ImageDimension::Dim1D, Decoder::ImageDimension::Dim1DArray,
+      Decoder::ImageDimension::Dim2D, Decoder::ImageDimension::Dim2DArray,
+      Decoder::ImageDimension::Dim3D,
+  };
+  const std::array sampled_classes{NumericClass::Float, NumericClass::Uint,
+                                   NumericClass::Sint};
+  const std::array storage_classes{NumericClass::Float, NumericClass::Uint};
+  uint32_t index = 0;
+  const auto CheckBinding =
+      [&](ImageResourceClass resource_class, NumericClass numeric_class,
+          Decoder::ImageDimension dimension, bool atomic) {
+        ImageResource image;
+        image.resource_class = resource_class;
+        image.numeric_class = numeric_class;
+        image.dimension = dimension;
+        image.atomic = atomic;
+        const auto kind = DescriptorBindingForImage(image);
+        Check(kind.has_value() &&
+                  static_cast<uint32_t>(*kind) == FirstImageBinding + index &&
+                  ImageBindingIndex(*kind) == index &&
+                  ImageBindingResourceClass(*kind) == resource_class &&
+                  NativeBinding(ShaderType::Compute, *kind) ==
+                      FirstImageBinding + index &&
+                  NativeBinding(ShaderType::Pixel, *kind) ==
+                      static_cast<uint32_t>(DescriptorBindingKind::Count) +
+                          FirstImageBinding + index,
+              "generated image descriptor binding changed ABI");
+        index++;
+      };
+  for (const auto numeric_class : sampled_classes) {
+    for (const auto dimension : sampled_dimensions) {
+      CheckBinding(ImageResourceClass::Sampled, numeric_class, dimension,
+                   false);
+    }
+  }
+  for (const auto numeric_class : storage_classes) {
+    for (const auto dimension : storage_dimensions) {
+      CheckBinding(ImageResourceClass::Storage, numeric_class, dimension,
+                   false);
+    }
+  }
+  for (const auto dimension : storage_dimensions) {
+    CheckBinding(ImageResourceClass::Storage, NumericClass::Uint, dimension,
+                 true);
+  }
+  Check(index == ImageBindingCount, "image descriptor ABI case count changed");
+
+  const auto Invalid = [](ImageResource image) {
+    return !DescriptorBindingForImage(image).has_value();
+  };
+  ImageResource image;
+  Check(Invalid(image), "untyped image received a descriptor binding");
+  image.resource_class = ImageResourceClass::Sampled;
+  image.numeric_class = NumericClass::Float;
+  image.dimension = Decoder::ImageDimension::Unknown;
+  Check(Invalid(image),
+        "unknown sampled dimension received a descriptor binding");
+  image.dimension = Decoder::ImageDimension::Dim2D;
+  image.numeric_class = NumericClass::Unsupported;
+  Check(Invalid(image),
+        "unsupported sampled class received a descriptor binding");
+  image.numeric_class = static_cast<NumericClass>(UINT32_MAX);
+  Check(Invalid(image), "invalid sampled class received a descriptor binding");
+  image.numeric_class = NumericClass::Float;
+  image.dimension = static_cast<Decoder::ImageDimension>(UINT32_MAX);
+  Check(Invalid(image),
+        "invalid sampled dimension received a descriptor binding");
+  image.dimension = Decoder::ImageDimension::Dim2D;
+  image.atomic = true;
+  Check(Invalid(image), "atomic sampled image received a descriptor binding");
+  image.resource_class = ImageResourceClass::Storage;
+  image.atomic = false;
+  image.numeric_class = NumericClass::Sint;
+  Check(Invalid(image), "signed storage image received a descriptor binding");
+  image.numeric_class = NumericClass::Float;
+  image.dimension = Decoder::ImageDimension::Dim2DMsaa;
+  Check(Invalid(image),
+        "multisampled storage image received a descriptor binding");
+  image.dimension = Decoder::ImageDimension::Dim2D;
+  image.atomic = true;
+  Check(Invalid(image), "float atomic image received a descriptor binding");
+}
+
 void TestGraphicsPushConstantLayout() {
   const auto AddUserData = [](Fixture &fixture, uint32_t count) {
     for (uint32_t index = 0; index < count; index++) {
@@ -1312,6 +1421,7 @@ int main() {
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
+    Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);

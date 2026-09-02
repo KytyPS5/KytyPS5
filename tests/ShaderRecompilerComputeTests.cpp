@@ -9534,36 +9534,26 @@ public:
     auto Native = [](Kind kind) {
       return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
     };
-    auto Count = [&](Kind kind) {
-      const auto *binding = Binding(kind);
-      if (binding == nullptr) {
-        return 0u;
+    for (const auto &binding : layout.descriptors) {
+      const auto resource_class =
+          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
+        continue;
       }
-      if (kind == Kind::Gds) {
-        return 1u;
+      const auto &image =
+          compiled.program.info.images.at(binding.resources.front());
+      bool supported =
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+        supported = supported ||
+                    image.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
+                    image.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
-      return static_cast<u32>(binding->resources.size());
-    };
-    Require(
-        test.name, "dispatch",
-        Count(Kind::Sampled2DArray) == 0 && Count(Kind::Sampled3D) == 0 &&
-            Count(Kind::SampledUint2DArray) == 0 &&
-            Count(Kind::SampledUint3D) == 0 &&
-            Count(Kind::SampledSint2DArray) == 0 &&
-            Count(Kind::SampledSint3D) == 0 && Count(Kind::Storage1D) == 0 &&
-            Count(Kind::Storage1DArray) == 0 &&
-            Count(Kind::Storage2DArray) == 0 && Count(Kind::Storage3D) == 0 &&
-            Count(Kind::StorageUint1D) == 0 &&
-            Count(Kind::StorageUint1DArray) == 0 &&
-            Count(Kind::StorageUint2DArray) == 0 &&
-            Count(Kind::StorageUint3D) == 0 &&
-            Count(Kind::StorageAtomic1D) == 0 &&
-            Count(Kind::StorageAtomic1DArray) == 0 &&
-            Count(Kind::StorageAtomic2DArray) == 0 &&
-            Count(Kind::StorageAtomic3D) == 0,
-        "unsupported array/3D image cases must provide matching Vulkan test "
-        "views "
-        "before dispatch");
+      Require(test.name, "dispatch", supported,
+              "unsupported image dimension needs a matching Vulkan test view");
+    }
 
     vk::ShaderModuleCreateInfo module_info{};
     module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
@@ -9652,34 +9642,10 @@ public:
       }
       pool_sizes.push_back({type, count});
     };
-    add_pool_size(vk::DescriptorType::eStorageBuffer,
-                  Count(Kind::Buffers) +
-                      (Binding(Kind::BdaPagetable) != nullptr ? 1u : 0u) +
-                      (Binding(Kind::FaultBuffer) != nullptr ? 1u : 0u) +
-                      Count(Kind::Gds) +
-                      (Binding(Kind::FlattenedSrt) != nullptr ? 1u : 0u) +
-                      (Binding(Kind::UserData) != nullptr ? 1u : 0u));
-    add_pool_size(
-        vk::DescriptorType::eSampledImage,
-        Count(Kind::Sampled1D) + Count(Kind::Sampled1DArray) +
-            Count(Kind::Sampled2D) + Count(Kind::Sampled2DArray) +
-            Count(Kind::Sampled3D) + Count(Kind::SampledUint1D) +
-            Count(Kind::SampledUint1DArray) + Count(Kind::SampledUint2D) +
-            Count(Kind::SampledUint2DArray) + Count(Kind::SampledUint3D) +
-            Count(Kind::SampledSint1D) + Count(Kind::SampledSint1DArray) +
-            Count(Kind::SampledSint2D) + Count(Kind::SampledSint2DArray) +
-            Count(Kind::SampledSint3D));
-    add_pool_size(
-        vk::DescriptorType::eStorageImage,
-        Count(Kind::Storage1D) + Count(Kind::Storage1DArray) +
-            Count(Kind::Storage2D) + Count(Kind::Storage2DArray) +
-            Count(Kind::Storage3D) + Count(Kind::StorageUint1D) +
-            Count(Kind::StorageUint1DArray) + Count(Kind::StorageUint2D) +
-            Count(Kind::StorageUint2DArray) + Count(Kind::StorageUint3D) +
-            Count(Kind::StorageAtomic1D) + Count(Kind::StorageAtomic1DArray) +
-            Count(Kind::StorageAtomic2D) + Count(Kind::StorageAtomic2DArray) +
-            Count(Kind::StorageAtomic3D));
-    add_pool_size(vk::DescriptorType::eSampler, Count(Kind::Samplers));
+    for (const auto &binding : layout.descriptors) {
+      add_pool_size(NativeDescriptorType(binding.kind),
+                    NativeDescriptorCount(binding));
+    }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
     pool_info.maxSets = 1;
@@ -9810,17 +9776,28 @@ public:
       writes.push_back(write);
     }
     const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
-    constexpr std::array sampled_kinds{
-        Kind::Sampled1D,     Kind::Sampled1DArray,     Kind::Sampled2D,
-        Kind::SampledUint1D, Kind::SampledUint1DArray, Kind::SampledUint2D,
-        Kind::SampledSint1D, Kind::SampledSint1DArray, Kind::SampledSint2D,
-    };
-    for (const auto kind : sampled_kinds) {
-      if (const auto *candidate = Binding(kind); candidate != nullptr) {
+    const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
+    for (const auto &binding : layout.descriptors) {
+      const auto resource_class =
+          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
+        continue;
+      }
+      const auto &image =
+          compiled.program.info.images.at(binding.resources.front());
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         Require(test.name, "dispatch", sampled == nullptr,
                 "Vulkan test harness needs separate sampled images for mixed "
                 "descriptor classes");
-        sampled = candidate;
+        sampled = &binding;
+      } else if (image.atomic) {
+        storage_atomic = &binding;
+      } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
+        storage = &binding;
+      } else {
+        storage_uint = &binding;
       }
     }
     if (sampled != nullptr) {
@@ -9841,9 +9818,6 @@ public:
       write.pImageInfo = sampled_infos.data();
       writes.push_back(write);
     }
-    const auto *storage = Binding(Kind::Storage2D);
-    const auto *storage_uint = Binding(Kind::StorageUint2D);
-    const auto *storage_atomic = Binding(Kind::StorageAtomic2D);
     const auto BindStorage =
         [&](const ShaderRecompiler::IR::DescriptorBinding *binding,
             const Image *image, std::vector<vk::DescriptorImageInfo> *infos) {
@@ -11837,24 +11811,18 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   VulkanHarness::Image storage_image_uint;
   VulkanHarness::Buffer gds_buffer;
   vk::Sampler sampler = nullptr;
-  const bool needs_sampled_image =
-      Has(Kind::Sampled1D) || Has(Kind::Sampled1DArray) ||
-      Has(Kind::Sampled2D) || Has(Kind::Sampled2DArray) ||
-      Has(Kind::Sampled3D) || Has(Kind::SampledUint2D) ||
-      Has(Kind::SampledUint1D) || Has(Kind::SampledUint1DArray) ||
-      Has(Kind::SampledUint2DArray) || Has(Kind::SampledUint3D) ||
-      Has(Kind::SampledSint2D) || Has(Kind::SampledSint1D) ||
-      Has(Kind::SampledSint1DArray) || Has(Kind::SampledSint2DArray) ||
-      Has(Kind::SampledSint3D);
-  const bool needs_storage_image =
-      Has(Kind::Storage1D) || Has(Kind::Storage1DArray) ||
-      Has(Kind::Storage2D) || Has(Kind::Storage2DArray) ||
-      Has(Kind::Storage3D) || Has(Kind::StorageUint2D) ||
-      Has(Kind::StorageUint1D) || Has(Kind::StorageUint1DArray) ||
-      Has(Kind::StorageUint2DArray) || Has(Kind::StorageUint3D) ||
-      Has(Kind::StorageAtomic1D) || Has(Kind::StorageAtomic1DArray) ||
-      Has(Kind::StorageAtomic2D) || Has(Kind::StorageAtomic2DArray) ||
-      Has(Kind::StorageAtomic3D);
+  bool needs_sampled_image = false;
+  bool needs_storage_image = false;
+  for (const auto &binding : compiled.program.bindings.descriptors) {
+    const auto resource_class =
+        ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+    if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      needs_sampled_image = true;
+    } else if (resource_class ==
+               ShaderRecompiler::IR::ImageResourceClass::Storage) {
+      needs_storage_image = true;
+    }
+  }
   const bool needs_sampler = Has(Kind::Samplers);
   const bool needs_gds = Has(Kind::Gds);
   if (needs_gds) {
@@ -19760,7 +19728,7 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   test.sampled_image_dwords_per_pixel = 1;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+  test.required_spirv = {"image_10", "OpTypeImage %uint",
                          "OpImageFetch %v4uint"};
   return test;
 }
@@ -19788,8 +19756,8 @@ TestCase ImageLoadR32SintUsesSignedSampledImage() {
   test.sampled_image_dwords_per_pixel = 1;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
   test.has_user_data = true;
-  test.required_spirv = {"sampled_sint_2d", "OpTypeImage %int",
-                         "OpImageFetch %v4int", "OpBitcast %uint"};
+  test.required_spirv = {"image_17", "OpTypeImage %int", "OpImageFetch %v4int",
+                         "OpBitcast %uint"};
   return test;
 }
 
@@ -19914,7 +19882,7 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_1d"};
+  test.required_spirv = {"image_8"};
   return test;
 }
 
@@ -19950,7 +19918,7 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"sampled_1d", "OpImageQuerySizeLod",
+  test.required_spirv = {"image_1", "OpImageQuerySizeLod",
                          "OpImageSampleExplicitLod", "Floor"};
   test.forbidden_spirv = {"OpImageGather"};
   return test;
@@ -19985,7 +19953,7 @@ TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1DArray)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_1d_array"};
+  test.required_spirv = {"image_9"};
   return test;
 }
 
@@ -20022,7 +19990,7 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
                       << 28u;
   test.user_data[4] = 1u | (1u << 16u);
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_1d"};
+  test.required_spirv = {"image_8"};
   return test;
 }
 
@@ -20767,7 +20735,7 @@ TestCase ImageStoreR32SintUsesRawUintView() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d"};
+                         "image_29"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20797,7 +20765,7 @@ TestCase ImageStoreR32UintUsesFormatlessStorageImage() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d"};
+                         "image_29"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20831,7 +20799,7 @@ TestCase ImageStorePackedUintSaturatesChannels() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d", "OpULessThan", "OpSelect"};
+                         "image_29", "OpULessThan", "OpSelect"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20863,7 +20831,7 @@ TestCase ImageStorePackedUintHonorsSparseDmask() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d"};
+                         "image_29"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20924,9 +20892,9 @@ TestCase ImageStoreAndAtomicShareTypedBinding() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpImageWrite", "OpImageTexelPointer", "R32ui",
-                         "storage_atomic_2d"};
+                         "image_34"};
   test.forbidden_spirv = {"StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat", "storage_uint_2d"};
+                          "StorageImageWriteWithoutFormat", "image_29"};
   return test;
 }
 
@@ -20965,8 +20933,8 @@ TestCase ImageStoreAndAtomicUseSeparateBindings() {
                          "OpImageWrite",
                          "OpImageTexelPointer",
                          "R32ui",
-                         "storage_uint_2d",
-                         "storage_atomic_2d"};
+                         "image_29",
+                         "image_34"};
   return test;
 }
 
@@ -20997,10 +20965,10 @@ TestCase ImageAtomicVariants() {
                   O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
                   O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpImageTexelPointer", "R32ui", "storage_atomic_2d"};
+  test.required_spirv = {"OpImageTexelPointer", "R32ui", "image_34"};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
                           "StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat", "storage_uint_2d"};
+                          "StorageImageWriteWithoutFormat", "image_29"};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {
@@ -23756,8 +23724,48 @@ void CheckImageSamplerSpecialization() {
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
 
+void CheckNativeImageDescriptorTypes() {
+  using ShaderRecompiler::IR::DescriptorBindingKind;
+  using ShaderRecompiler::IR::FirstImageBinding;
+  using ShaderRecompiler::IR::FirstStorageImageBinding;
+
+  for (uint32_t value = FirstImageBinding;
+       value < static_cast<uint32_t>(DescriptorBindingKind::Samplers);
+       value++) {
+    const auto expected = value < FirstStorageImageBinding
+                              ? vk::DescriptorType::eSampledImage
+                              : vk::DescriptorType::eStorageImage;
+    Require("NativeImageDescriptorTypes", "image binding",
+            NativeDescriptorType(static_cast<DescriptorBindingKind>(value)) ==
+                expected,
+            "generated image binding has the wrong Vulkan descriptor type");
+  }
+  Require("NativeImageDescriptorTypes", "non-image bindings",
+          NativeDescriptorType(DescriptorBindingKind::Samplers) ==
+                  vk::DescriptorType::eSampler &&
+              NativeDescriptorType(DescriptorBindingKind::Buffers) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::Gds) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::BdaPagetable) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::FaultBuffer) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::FlattenedSrt) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::UserData) ==
+                  vk::DescriptorType::eStorageBuffer,
+          "non-image binding has the wrong Vulkan descriptor type");
+  std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void CheckShaderRecompilerFatalContracts() {
+  ExpectFatal("InvalidDescriptorBindingRejection", [] {
+    (void)NativeDescriptorType(
+        ShaderRecompiler::IR::DescriptorBindingKind::Count);
+  });
+
   ExpectFatal("WritableFlatStoreRejection", [] {
     const auto test = FlatStoreVariants();
     (void)CompileCase(test);
@@ -25827,6 +25835,7 @@ int main(int argc, char **argv) {
   VulkanHarness vulkan;
 #endif
   CheckImageSamplerSpecialization();
+  CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckVulkan13FeatureRequirements();

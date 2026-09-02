@@ -5086,8 +5086,7 @@ void TestNewShaderRecompilerImageViewDimensions() {
         "1D derivative sample did not emit scalar SPIR-V gradients");
   Check(Common::ContainsStr(source, "OpImageQuerySizeLod"),
         "1D resource query did not emit a scalar size query");
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                       "sampled_uint_1d"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_8 "),
         "integer 1D load did not access the uint 1D descriptor binding");
 }
 
@@ -5124,11 +5123,10 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_1d "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_22 "),
         "1D store did not access the 1D storage descriptor binding");
   Check(
-      SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                     "storage_1d_array"),
+      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_23 "),
       "1D-array store did not access the 1D-array storage descriptor binding");
 }
 
@@ -5146,9 +5144,9 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
   auto result = ShaderRecompiler::Recompile(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "sampled_2d "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_3 "),
         "null image did not use the canonical 2D sampled descriptor binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "sampled_1d "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_1 "),
         "null image retained the decoded 1D descriptor binding");
 }
 
@@ -5315,17 +5313,17 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
             result.program.info.images[0].dimension ==
                 ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa,
         "2D-MSAA descriptor specialization lost the multisample dimension");
-  Check(ShaderRecompiler::IR::FindBinding(
-            result.program.bindings,
-            ShaderRecompiler::IR::DescriptorBindingKind::Sampled2DMsaa) !=
-            nullptr,
+  const auto binding_kind = ShaderRecompiler::IR::DescriptorBindingForImage(
+      result.program.info.images[0]);
+  Check(binding_kind.has_value() &&
+            ShaderRecompiler::IR::FindBinding(result.program.bindings,
+                                              *binding_kind) != nullptr,
         "2D-MSAA image did not receive a multisampled descriptor binding");
   Check(SpirvContainsTypeImage(result.spirv, 1, 0, 1, 1),
         "SPIR-V binary does not contain a multisampled 2D image type");
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                       "sampled_2d_msaa"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_5 "),
         "2D-MSAA load did not access its multisampled descriptor");
   Check(SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Sample "),
         "2D-MSAA load did not emit the fragment ID as a SPIR-V Sample operand");
@@ -5424,7 +5422,7 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_3d"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
         "storage image store did not access the 3D storage descriptor binding");
 }
 
@@ -5460,14 +5458,13 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_2d"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_24 "),
         "2D descriptor storage image store did not access the base storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                        "storage_2d_array"),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_25 "),
         "2D descriptor storage image store unexpectedly used the array storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_3d"),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
         "2D descriptor storage image store unexpectedly used the 3D storage "
         "binding");
 }
@@ -10342,12 +10339,25 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   auto result = ShaderRecompiler::Recompile(shader, options);
   const auto *buffers = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, BindingKind::Buffers);
-  const auto *sampled = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::Sampled2D);
-  const auto *storage = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::Storage2D);
-  const auto *atomic_storage = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::StorageAtomic2D);
+  const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
+  const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
+  const ShaderRecompiler::IR::DescriptorBinding *atomic_storage = nullptr;
+  for (const auto &image : result.program.info.images) {
+    const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(image);
+    if (!kind.has_value()) {
+      continue;
+    }
+    const auto *binding =
+        ShaderRecompiler::IR::FindBinding(result.program.bindings, *kind);
+    if (image.resource_class ==
+        ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      sampled = binding;
+    } else if (image.atomic) {
+      atomic_storage = binding;
+    } else {
+      storage = binding;
+    }
+  }
   const auto *samplers = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, BindingKind::Samplers);
   Check(buffers != nullptr && buffers->resources.size() == 2,

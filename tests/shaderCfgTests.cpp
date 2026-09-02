@@ -4731,9 +4731,8 @@ void TestNewShaderRecompilerImageSampleVariants() {
   Check(SpirvContainsOpcode(result.spirv, 88),
         "SPIR-V binary does not contain shared OpImageSampleExplicitLod "
         "emission");
-  Check(SpirvContainsOpcode(result.spirv, 90),
-        "SPIR-V binary does not contain shared OpImageSampleDrefExplicitLod "
-        "emission");
+  Check(!SpirvContainsOpcode(result.spirv, 90) && SpirvContainsOpcode(result.spirv, 169),
+        "SPIR-V binary does not lower the compare sample to an ALU select");
   Check(SpirvContainsOpcode(result.spirv, 80),
         "SPIR-V binary does not contain coordinate/gradient composite "
         "construction");
@@ -4846,8 +4845,9 @@ void TestNewShaderRecompilerImageSampleA16ExceptionComponents() {
           "A16 IMAGE_SAMPLE_C did not preserve compare+A16 metadata");
     Check(Common::ContainsStr(result.ir_dump, "image_flags=0x88"),
           "A16 IMAGE_SAMPLE_C did not preserve compare+A16 IR flags");
-    Check(SpirvInstructionOpcodeCount(result.spirv, 90) == 1,
-          "A16 IMAGE_SAMPLE_C should emit one dref sample");
+    Check(SpirvInstructionOpcodeCount(result.spirv, 90) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv, 88) == 1,
+          "A16 IMAGE_SAMPLE_C should emit one plain sample and compare in ALU");
     Check(SpirvExtInstCount(result.spirv, 62) == 2,
           "PCF reference must remain 32-bit while only xy sampler coords use "
           "A16");
@@ -4968,18 +4968,22 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   }
   {
     const auto result = compile(0x28, 0x1); // image_sample_c
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleImplicitLod) ==
+              1,
+          "pixel IMAGE_SAMPLE_C must sample with implicit lod and compare in ALU");
     Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefImplicitLod) == 1,
-          "pixel IMAGE_SAMPLE_C must use OpImageSampleDrefImplicitLod");
-    Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefExplicitLod) == 0,
-          "pixel IMAGE_SAMPLE_C unexpectedly used explicit dref lod");
+                                      OpImageSampleDrefImplicitLod) == 0 &&
+              SpirvInstructionOpcodeCount(result.spirv,
+                                          OpImageSampleDrefExplicitLod) == 0,
+          "pixel IMAGE_SAMPLE_C unexpectedly used a Dref sample");
   }
   {
     const auto result = compile(0x2f, 0x1); // image_sample_c_lz
-    Check(SpirvInstructionOpcodeCount(result.spirv,
-                                      OpImageSampleDrefExplicitLod) == 1,
-          "pixel IMAGE_SAMPLE_C_LZ must use explicit dref lod");
+    Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleExplicitLod) ==
+                  1 &&
+              SpirvInstructionOpcodeCount(result.spirv,
+                                          OpImageSampleDrefExplicitLod) == 0,
+          "pixel IMAGE_SAMPLE_C_LZ must use explicit lod and compare in ALU");
   }
 }
 
@@ -5233,8 +5237,8 @@ void TestNewShaderRecompilerImageGatherVariants() {
         "SPIR-V binary does not request ImageGatherExtended");
   Check(SpirvContainsOpcode(result.spirv, 96),
         "SPIR-V binary does not contain OpImageGather");
-  Check(SpirvContainsOpcode(result.spirv, 97),
-        "SPIR-V binary does not contain OpImageDrefGather");
+  Check(!SpirvContainsOpcode(result.spirv, 97),
+        "SPIR-V binary still contains OpImageDrefGather");
   Check(SpirvContainsOpcode(result.spirv, 202),
         "SPIR-V binary does not contain packed gather offset extraction");
   Check(SpirvContainsOpcode(result.spirv, 81),

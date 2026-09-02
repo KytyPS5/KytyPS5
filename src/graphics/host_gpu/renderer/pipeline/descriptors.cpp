@@ -806,15 +806,8 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	ShaderSamplerResource descriptor;
 	CopyNativeDescriptor(value, descriptor.fields);
-	const bool depth_compare = std::any_of(program.info.sampled_pairs.begin(),
-	                                       program.info.sampled_pairs.end(), [&](const auto& pair) {
-		                                       return pair.sampler == index &&
-		                                              pair.image < program.info.images.size() &&
-		                                              program.info.images[pair.image].depth_compare;
-	                                       });
-	if (!depth_compare) {
-		descriptor.fields[0] &= ~(0x7u << 12u);
-	}
+	// SAMPLE_C is lowered to a sample plus a compare in the shader; no host sampler compares.
+	descriptor.fields[0] &= ~(0x7u << 12u);
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}

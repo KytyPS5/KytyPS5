@@ -739,6 +739,32 @@ static const JsonValue* KYTY_SYSV_ABI JsonValueIndexUInt(const JsonValue* self, 
 	return (index < impl->size() ? (*impl)[static_cast<size_t>(index)] : JsonStaticNullValue());
 }
 
+static JsonValue* KYTY_SYSV_ABI JsonValueReferValueKey(JsonValue* self, const JsonString* key) {
+	PRINT_NAME();
+
+	if (self == nullptr || self->type != JsonValueTypeObject) {
+		return nullptr;
+	}
+	const auto* impl = JsonObjectImpl(self->object);
+	const auto  it   = impl->find(*JsonStringImpl(key));
+	return (it != impl->end() ? it->second : nullptr);
+}
+
+static void KYTY_SYSV_ABI JsonValueToString(const JsonValue* self, JsonString* dst) {
+	PRINT_NAME();
+
+	auto* impl = JsonStringImpl(dst);
+	if (impl == nullptr) {
+		return;
+	}
+	if (self != nullptr && self->type == JsonValueTypeString) {
+		*impl = *JsonStringImpl(self->string);
+	} else {
+		impl->clear();
+		JsonSerializeValue(self, impl);
+	}
+}
+
 static int32_t KYTY_SYSV_ABI JsonValueSerialize(JsonValue* self, JsonString* dst) {
 	PRINT_NAME();
 
@@ -971,6 +997,8 @@ LIB_DEFINE(InitNet_1_Json2) {
 	LIB_FUNC("urOpESTBZmo", LibJson2::JsonObjectAssign);
 	LIB_FUNC("zTwZdI8AZ5Y", LibJson2::JsonValueGetBoolean);
 	LIB_FUNC("R7FDWtcN6f8", LibJson2::JsonValueSerialize);
+	LIB_FUNC("wLsJlmgEIaI", LibJson2::JsonValueReferValueKey);
+	LIB_FUNC("Ncel8t2Rrpc", LibJson2::JsonValueToString);
 	LIB_FUNC("oH8aBmLU+fc", LibJson2::JsonObjectClear);
 	LIB_FUNC("bAM9Qwofus0", LibJson2::JsonArrayBack);
 	LIB_FUNC("UeuWT+yNdCQ", LibJson2::JsonValueBoolCtor);

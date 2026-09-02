@@ -2209,6 +2209,13 @@ public:
             live_compute_value == 44,
             "compute submission executed a copied PM4 stream");
 
+    // Quiesce everything submitted above before the interrupt queue exists.
+    // Those submissions only called Done(), so their end-of-pipe callbacks can
+    // still be in flight; if one lands after the queue is registered it shows
+    // up in the "no interrupt expected" polls below.
+    gpu.SendCommandSync([&] { context.GetCommandScheduler().Finish(); });
+    context.GetCommandScheduler().DrainPriorityOperations();
+
     LibKernel::EventQueue::KernelEqueue interrupt_queue =
         LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
     uint32_t graphics_interrupt_udata = 0;
@@ -2243,6 +2250,11 @@ public:
         };
     const auto finish_gpu = [&] {
       gpu.SendCommandSync([&] { context.GetCommandScheduler().Finish(); });
+      // Finish() waits for the GPU tick but does not quiesce the priority
+      // operations thread, which is what delivers end-of-pipe interrupts. The
+      // checks below poll the interrupt queue with a zero timeout, so without
+      // this drain an interrupt can still be in flight and land on a later poll.
+      context.GetCommandScheduler().DrainPriorityOperations();
     };
     const auto wait_for_interrupt =
         [&](LibKernel::EventQueue::KernelEvent &event, int &count) {

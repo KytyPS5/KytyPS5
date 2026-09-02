@@ -93,6 +93,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::FindUMsb32:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
 		case ValueOpcode::IAddCarry32:
@@ -139,7 +142,82 @@ public:
 
 	bool Run(Value value) { return Validate(value); }
 
+	const std::string& Reason() const { return m_reason; }
+
 private:
+	bool Reject(std::string reason) {
+		if (m_reason.empty()) {
+			m_reason = std::move(reason);
+		}
+		return false;
+	}
+
+	std::string Describe(Value value, uint32_t depth = 0) const {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return value.IsImmediate() && value.GetType() == Type::U32
+			           ? fmt::format("0x{:08x}", value.U32())
+			           : std::string("opaque");
+		}
+		const auto op   = inst->GetOpcode();
+		auto       text = std::string(ValueOpcodeName(op));
+		if (op == ValueOpcode::GetUserData && inst->NumArgs() == 1 &&
+		    inst->Arg(0).GetType() == Type::ScalarReg) {
+			return text + fmt::format(" s{}", RegIndex(inst->Arg(0).ScalarRegister()));
+		}
+		if (op == ValueOpcode::ReadConst && inst->NumArgs() == 2 &&
+		    inst->Arg(1).Resolve().IsImmediate()) {
+			return text + fmt::format(" slot={}", inst->Arg(1).Resolve().U32());
+		}
+		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+			const auto flags = inst->Flags<MemoryFlags>();
+			text += fmt::format(" pc=0x{:08x}", flags.pc);
+			if (flags.index < m_program.memory_info.size()) {
+				text += fmt::format(" offset=0x{:x}", m_program.memory_info[flags.index].offset);
+			}
+			return text;
+		}
+		if (inst->NumArgs() == 0 || depth >= 3u) {
+			return text;
+		}
+		text += '(';
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			text += index == 0 ? "" : ", ";
+			text += Describe(inst->Arg(index), depth + 1u);
+		}
+		return text + ')';
+	}
+
+	std::string DescribePhi(Value value) const {
+		std::vector<Value>              leaves;
+		std::vector<Value>              pending {value};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty()) {
+			const auto current = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = current.TryInstruction();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+				if (seen.insert(inst).second) {
+					for (size_t index = 0; index < inst->NumArgs(); index++) {
+						pending.push_back(inst->Arg(index));
+					}
+				}
+				continue;
+			}
+			if (std::ranges::none_of(leaves, [&](Value known) {
+				    return EquivalentValue(m_program, known, current);
+			    })) {
+				leaves.push_back(current);
+			}
+		}
+		auto text = fmt::format("Phi merges {} unequal values:", leaves.size());
+		for (size_t index = 0; index < leaves.size() && index < 6u; index++) {
+			text += fmt::format(" [{}] {}", index, Describe(leaves[index]));
+		}
+		return text;
+	}
+
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			if (!Validate(inst.Arg(index), require_uniform)) return false;
@@ -164,17 +242,24 @@ private:
 				case Type::U32:
 				case Type::U64:
 				case Type::F32: return true;
-				default: return false;
+				default: return Reject("operand is not an integer");
 			}
 		}
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
 		if (!m_visiting.insert(inst).second) {
+			if (require_uniform) {
+				Reject(fmt::format("{} is cyclic", ValueOpcodeName(inst->GetOpcode())));
+			}
 			return !require_uniform;
 		}
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			if (!valid && require_uniform) {
+				Reject(fmt::format("{} cannot be evaluated before the draw",
+				                   ValueOpcodeName(inst->GetOpcode())));
+			}
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -232,6 +317,7 @@ private:
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
+				Reject(DescribePhi(value));
 				return finish(false);
 			}
 			return finish(Validate(invariant));
@@ -302,6 +388,7 @@ private:
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
+	std::string                     m_reason;
 };
 
 class PlanBuilder {
@@ -799,6 +886,28 @@ private:
 					return true;
 				}
 				return false;
+			case ValueOpcode::BitCount32:
+				if (Arg(inst, 0, a)) {
+					result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(a)));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FindILsb32:
+				if (Arg(inst, 0, a)) {
+					const auto bits = static_cast<uint32_t>(a);
+					result          = bits == 0u ? UINT32_MAX
+					                             : static_cast<uint32_t>(std::countr_zero(bits));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FindUMsb32:
+				if (Arg(inst, 0, a)) {
+					const auto bits = static_cast<uint32_t>(a);
+					result          = bits == 0u ? UINT32_MAX
+					                             : static_cast<uint32_t>(31 - std::countl_zero(bits));
+					return true;
+				}
+				return false;
 			case ValueOpcode::ShiftLeftLogical32:
 				if (binary()) {
 					result = static_cast<uint32_t>(a) << (b & 31u);
@@ -1063,8 +1172,16 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 
 } // namespace
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          std::string* reason) {
+	RuntimeValidator validator(program, type);
+	if (validator.Run(value)) {
+		return true;
+	}
+	if (reason != nullptr) {
+		*reason = validator.Reason();
+	}
+	return false;
 }
 
 void BuildSrtPlan(Program& program) {

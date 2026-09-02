@@ -3,6 +3,8 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <string>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -41,8 +43,16 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Resolves and specializes the immutable resource plan in one transaction. On failure both
 // destinations are unchanged.
+struct MaterializeReport {
+	std::string reason;
+	uint32_t    dropped_candidates = 0;
+	uint32_t    dropped_shapes     = 0;
+	std::string dropped_summary;
+};
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializeReport* report = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

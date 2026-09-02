@@ -14,6 +14,8 @@ namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+constexpr uint32_t DenseIndirectImageShift      = 5u;
+constexpr uint32_t MaxDenseIndirectImageEntries = 4096u;
 
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
@@ -116,10 +118,11 @@ public:
 		}
 		for (const auto& plan: m_indirect_images) {
 			plan.handle->SetArg(0, plan.key);
-			for (uint32_t dword = 0; dword < 4u; dword++) {
-				plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
+			const uint32_t roots = plan.dense ? 2u : 4u;
+			for (uint32_t dword = 0; dword < roots; dword++) {
+				plan.handle->SetArg(dword + 1u, plan.roots[plan.dense ? dword : dword + 4u]);
 			}
-			for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
+			for (uint32_t dword = roots + 1u; dword < plan.roots.size(); dword++) {
 				plan.handle->SetArg(dword, plan.key);
 			}
 			for (const auto index: plan.memory) {
@@ -158,6 +161,7 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		bool                       dense  = false;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -166,6 +170,63 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		EXIT("%s", message.c_str());
 		std::abort();
+	}
+
+	bool CollapseNullPhi(Value value, Value& loaded, std::vector<Block*>& null_blocks) const {
+		const auto* phi = value.Resolve().TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) {
+			return false;
+		}
+		Value               merged;
+		std::vector<Block*> nulls;
+		for (size_t index = 0; index < phi->NumArgs(); index++) {
+			const auto resolved = ResolveInvariantPhi(m_program, phi->Arg(index));
+			if (resolved.IsEmpty()) {
+				return false;
+			}
+			if (resolved.IsImmediate() && resolved.GetType() == Type::U32 && resolved.U32() == 0u) {
+				nulls.push_back(phi->PhiBlock(index));
+				continue;
+			}
+			if (merged.IsEmpty()) {
+				merged = resolved;
+			} else if (!EquivalentValue(m_program, merged, resolved)) {
+				return false;
+			}
+		}
+		if (nulls.empty() || merged.IsEmpty()) {
+			return false;
+		}
+		std::ranges::sort(nulls);
+		loaded      = merged;
+		null_blocks = std::move(nulls);
+		return true;
+	}
+
+	void CollapseNullDescriptorPaths(DescriptorSource& descriptor, uint32_t width) const {
+		std::array<Value, 8> collapsed {};
+		std::vector<Block*>  null_blocks;
+		bool                 rewritten = false;
+		for (uint32_t i = 0; i < width; i++) {
+			collapsed[i] = descriptor.dwords[i];
+			if (!ResolveInvariantPhi(m_program, descriptor.dwords[i]).IsEmpty()) {
+				continue;
+			}
+			Value               loaded;
+			std::vector<Block*> blocks;
+			if (!CollapseNullPhi(descriptor.dwords[i], loaded, blocks)) {
+				return;
+			}
+			if (rewritten && blocks != null_blocks) {
+				return;
+			}
+			collapsed[i] = loaded;
+			null_blocks  = std::move(blocks);
+			rewritten    = true;
+		}
+		if (rewritten) {
+			std::copy_n(collapsed.begin(), width, descriptor.dwords.begin());
+		}
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -178,6 +239,7 @@ private:
 		for (uint32_t i = 0; i < width; i++) {
 			descriptor.dwords[i] = handle.Arg(i).Resolve();
 		}
+		CollapseNullDescriptorPaths(descriptor, width);
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
@@ -189,13 +251,16 @@ private:
 		}
 	}
 
-	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword) const {
+	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword,
+	                    std::string& reason) const {
 		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
 			bad_dword = i;
 			if (descriptor.dwords[i].Resolve().GetType() != Type::U32) {
+				reason = "value is not 32-bit";
 				return false;
 			}
-			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i])) {
+			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i], RuntimeValueType::Any,
+			                          &reason)) {
 				return false;
 			}
 		}
@@ -251,6 +316,20 @@ private:
 		           : nullptr;
 	}
 
+	const MemoryInfo* AddressReadMemory(const Inst& read, uint32_t& index) const {
+		if (read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() != 4u) {
+			return nullptr;
+		}
+		index = read.Flags<MemoryFlags>().index;
+		if (index >= m_program.memory_info.size()) {
+			return nullptr;
+		}
+		const auto& memory = m_program.memory_info[index];
+		return memory.kind == ResourceKind::ScalarAddress && memory.data_bits == 32u &&
+		               memory.data_dwords == 1u
+		           ? &memory
+		           : nullptr;
+	}
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
@@ -275,8 +354,9 @@ private:
 			return false;
 		}
 		MakeSource(handle, 4u, false, false, descriptor, pc);
-		uint32_t bad_dword = 0;
-		if (!ValidateSource(descriptor, bad_dword)) {
+		uint32_t    bad_dword = 0;
+		std::string reason;
+		if (!ValidateSource(descriptor, bad_dword, reason)) {
 			return false;
 		}
 		source = InternSource(descriptor);
@@ -420,6 +500,154 @@ private:
 		return true;
 	}
 
+	bool MakeRuntimeAddressSource(const Inst& handle, uint32_t pc, uint32_t& source,
+	                              DescriptorSource& descriptor) {
+		if (handle.GetOpcode() != ValueOpcode::GetAddressResource) {
+			return false;
+		}
+		MakeSource(handle, 2u, false, false, descriptor, pc);
+		uint32_t    bad_dword = 0;
+		std::string reason;
+		if (!ValidateSource(descriptor, bad_dword, reason)) {
+			return false;
+		}
+		source = InternSource(descriptor);
+		return true;
+	}
+
+	bool MatchDenseTable(const Inst& handle, Inst*& heap_handle, const Inst*& based,
+	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices) {
+		for (uint32_t dword = 0; dword < handle.NumArgs(); dword++) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			    read->NumArgs() != 4u) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = AddressReadMemory(*read, memory_index);
+			auto*       offset       = read->Arg(1).Resolve().TryInstruction();
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *read) ||
+			    offset == nullptr) {
+				return false;
+			}
+			uint32_t extra = 0;
+			if (based == nullptr) {
+				based = offset;
+			} else if (offset != based) {
+				uint32_t    immediate = 0;
+				const Inst* inner     = nullptr;
+				if (offset->GetOpcode() != ValueOpcode::IAdd32 || offset->NumArgs() != 2u) {
+					return false;
+				}
+				if (ImmediateU32(offset->Arg(1), immediate)) {
+					inner = offset->Arg(0).Resolve().TryInstruction();
+				} else if (ImmediateU32(offset->Arg(0), immediate)) {
+					inner = offset->Arg(1).Resolve().TryInstruction();
+				} else {
+					return false;
+				}
+				if (inner != based) {
+					return false;
+				}
+				extra = immediate;
+			}
+			if (extra + memory->offset != dword * sizeof(uint32_t)) {
+				return false;
+			}
+			auto* address = read->Arg(0).Resolve().TryInstruction();
+			if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (heap_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(heap_handle), Value(address)))) {
+				return false;
+			}
+			heap_handle           = address;
+			reads[dword]          = read;
+			memory_indices[dword] = memory_index;
+		}
+		return based != nullptr && heap_handle != nullptr;
+	}
+
+	bool MatchKeyBound(const Inst& key, uint32_t& bound) const {
+		for (const auto& use: key.Uses()) {
+			uint32_t limit = 0;
+			if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::ULessThan32 ||
+			    use.user->NumArgs() != 2u || use.operand != 0u ||
+			    !ImmediateU32(use.user->Arg(1), limit) || limit == 0u ||
+			    limit > MaxDenseIndirectImageEntries) {
+				continue;
+			}
+			bound = limit;
+			return true;
+		}
+		return false;
+	}
+
+	bool TryMakeDenseIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		Inst*                   heap_handle = nullptr;
+		const Inst*             based       = nullptr;
+		std::array<Inst*, 8>    reads {};
+		std::array<uint32_t, 8> memory_indices {};
+		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices)) {
+			return false;
+		}
+		uint32_t table_offset = 0;
+		Value    scaled_value;
+		if (based->GetOpcode() != ValueOpcode::IAdd32 || based->NumArgs() != 2u) {
+			return false;
+		}
+		if (ImmediateU32(based->Arg(1), table_offset)) {
+			scaled_value = based->Arg(0);
+		} else if (ImmediateU32(based->Arg(0), table_offset)) {
+			scaled_value = based->Arg(1);
+		} else {
+			return false;
+		}
+		const auto* scaled = scaled_value.Resolve().TryInstruction();
+		uint32_t    shift  = 0;
+		if (scaled == nullptr || scaled->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    scaled->NumArgs() != 2u || !ImmediateU32(scaled->Arg(1), shift) ||
+		    shift != DenseIndirectImageShift) {
+			return false;
+		}
+		auto*    key   = scaled->Arg(0).Resolve().TryInstruction();
+		uint32_t bound = 0;
+		if (key == nullptr || !MatchKeyBound(*key, bound)) {
+			return false;
+		}
+		const std::array<const Inst*, 1> image_users {&handle};
+		for (const auto* read: reads) {
+			if (!UsesOnly(*read, image_users)) {
+				return false;
+			}
+		}
+
+		DescriptorSource heap_source;
+		uint32_t         heap_source_index = 0;
+		if (!MakeRuntimeAddressSource(*heap_handle, pc, heap_source_index, heap_source)) {
+			return false;
+		}
+
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(key));
+		image_source.dwords[0]      = heap_source.dwords[0];
+		image_source.dwords[1]      = heap_source.dwords[1];
+		image_source.indirect_image = DescriptorSource::IndirectImage {
+		    .heap_source = heap_source_index, .table_offset = table_offset, .key_bound = bound};
+
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = Value(key);
+		plan.roots  = image_source.dwords;
+		plan.dense  = true;
+		std::copy(memory_indices.begin(), memory_indices.end(), plan.memory.begin());
+		std::copy(reads.begin(), reads.end(), plan.reads.begin());
+		return true;
+	}
+
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
@@ -448,7 +676,9 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				const auto        pc = inst.Flags<MemoryFlags>().pc;
+				if (TryMakeIndirectImage(*handle, pc, plan) ||
+				    TryMakeDenseIndirectImage(*handle, pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
@@ -463,7 +693,8 @@ private:
 		}
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
-		uint32_t bad_dword = 0;
+		uint32_t    bad_dword = 0;
+		std::string reason;
 		if (expected == ValueOpcode::GetImageResource) {
 			for (; bad_dword < descriptor.dword_count; bad_dword++) {
 				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
@@ -474,9 +705,9 @@ private:
 			}
 			bad_dword = 0;
 		}
-		if (!ValidateSource(descriptor, bad_dword)) {
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+		if (!ValidateSource(descriptor, bad_dword, reason)) {
+			Fail(pc, fmt::format("{} dword {} is not a valid runtime value: {}",
+			                     ValueOpcodeName(expected), bad_dword, reason));
 		}
 		source = InternSource(descriptor);
 	}

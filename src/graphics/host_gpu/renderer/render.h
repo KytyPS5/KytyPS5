@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -214,6 +215,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	std::unordered_set<uint64_t> m_unrepresentable_textures;
+	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

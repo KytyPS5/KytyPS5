@@ -1,7 +1,6 @@
 #ifndef GAME_LIST_TREE_WIDGET_H
 #define GAME_LIST_TREE_WIDGET_H
 
-#include <QColor>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPalette>
@@ -44,7 +43,9 @@ protected:
 				painter.fillRect(event->rect(), palette().brush(QPalette::Base));
 			} else {
 				painter.drawPixmap(m_scaled_pos, m_scaled);
-				painter.fillRect(event->rect(), QColor(0, 0, 0, 115));
+				auto overlay = palette().color(QPalette::Base);
+				overlay.setAlpha(185);
+				painter.fillRect(event->rect(), overlay);
 			}
 		}
 

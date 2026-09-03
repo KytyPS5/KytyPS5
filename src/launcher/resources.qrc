@@ -5,4 +5,7 @@
   <file alias="input-mapping.svg">icons/input-mapping.svg</file>
   <file alias="remove-configuration.svg">icons/remove-configuration.svg</file>
  </qresource>
+ <qresource prefix="/styles">
+  <file alias="launcher.qss">styles/launcher.qss</file>
+ </qresource>
 </RCC>

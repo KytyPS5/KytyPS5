@@ -18,6 +18,7 @@
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QSettings>
 #include <QSpinBox>
 #include <QStyle>
@@ -115,7 +116,10 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_printf_file->setEnabled(log == Configuration::LogDirection::File);
 	        });
 
-	layout()->setSizeConstraint(QLayout::SetFixedSize);
+	// Keep the controls at a usable minimum while allowing the settings window
+	// and its expanding fields to use any additional space the user gives them.
+	layout()->setSizeConstraint(QLayout::SetMinimumSize);
+	setSizeGripEnabled(true);
 
 	restoreGeometry(g_last_geometry);
 
@@ -248,7 +252,8 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 
 	m_game_dirs_group->setVisible(true);
 	update_game_directory_buttons();
-	adjustSize();
+	layout()->activate();
+	resize(size().expandedTo(minimumSizeHint()));
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -285,6 +290,11 @@ void ConfigurationEditDialog::AddGameDirectoryItem(const QString& dir) {
 
 void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 	QDialog::moveEvent(event);
+	g_last_geometry = saveGeometry();
+}
+
+void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
+	QDialog::resizeEvent(event);
 	g_last_geometry = saveGeometry();
 }
 

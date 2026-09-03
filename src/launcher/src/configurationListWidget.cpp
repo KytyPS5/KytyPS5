@@ -30,6 +30,8 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPalette>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSet>
@@ -131,7 +133,7 @@ static QString GetPic0Path(const Configuration& info) {
 	return QFileInfo::exists(path) ? QFileInfo(path).absoluteFilePath() : QString();
 }
 
-static void ApplyGameListStyle(Ui::ConfigurationListWidget* ui) {
+static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_list->setAlternatingRowColors(false);
 	ui->cfgs_list->setAllColumnsShowFocus(true);
 	ui->cfgs_list->setIndentation(0);
@@ -142,35 +144,6 @@ static void ApplyGameListStyle(Ui::ConfigurationListWidget* ui) {
 	ui->cfgs_list->header()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 	ui->cfgs_list->header()->setHighlightSections(false);
 	ui->cfgs_list->header()->setStretchLastSection(true);
-
-	ui->cfgs_list->setStyleSheet(QStringLiteral(
-	    "QTreeWidget { background: transparent; border: 1px solid rgba(255,255,255,42); "
-	    "color: #eef4ff; outline: 0; }"
-	    "QTreeWidget::item { background: rgba(8,10,16,92); "
-	    "border-bottom: 1px solid rgba(255,255,255,24); padding: 4px; }"
-	    "QTreeWidget::item:selected { background: rgba(32,118,210,150); color: #ffffff; }"
-	    "QHeaderView::section { background: rgba(22,25,31,235); color: #dce6f6; border: 0; "
-	    "border-right: 1px solid rgba(255,255,255,35); border-bottom: 1px solid "
-	    "rgba(255,255,255,45); "
-	    "padding: 5px 6px; }"
-	    "QScrollBar:vertical { background: rgba(12,14,18,150); width: 14px; margin: 0; }"
-	    "QScrollBar::handle:vertical { background: rgba(220,230,245,120); min-height: 36px; }"
-	    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"));
-
-	ui->search_line_edit->setStyleSheet(QStringLiteral(
-	    "QLineEdit { background: rgba(12,14,18,210); border: 1px solid rgba(255,255,255,42); "
-	    "border-radius: 4px; color: #eef4ff; padding: 5px 8px; selection-background-color: "
-	    "#267bd8; }"
-	    "QLineEdit:focus { border-color: rgba(80,160,255,180); }"));
-	ui->global_settings_button->setStyleSheet(QStringLiteral(
-	    "QToolButton { background: rgba(255,255,255,18); border: 1px solid transparent; "
-	    "border-radius: 5px; padding: 3px; }"
-	    "QToolButton:hover { background: rgba(255,255,255,45); border-color: rgba(255,255,255,70); "
-	    "}"
-	    "QToolButton:disabled { background: transparent; }"));
-	ui->edit_button->setStyleSheet(ui->global_settings_button->styleSheet());
-	ui->delete_button->setStyleSheet(ui->global_settings_button->styleSheet());
-	ui->input_mapping_button->setStyleSheet(ui->global_settings_button->styleSheet());
 }
 
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
@@ -226,14 +199,11 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_compatibility = new CompatibilityDatabase(
 	    QCoreApplication::arguments().contains(QStringLiteral("--local")), this);
 	m_ui->setupUi(this);
-	ApplyGameListStyle(m_ui);
+	ConfigureGameList(m_ui);
 
-	m_ui->global_settings_button->setIcon(QIcon(QStringLiteral(":/icons/global-settings.svg")));
+	UpdateToolbarIcons();
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
-	m_ui->input_mapping_button->setIcon(QIcon(QStringLiteral(":/icons/input-mapping.svg")));
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
-	m_ui->edit_button->setIcon(QIcon(QStringLiteral(":/icons/edit-configuration.svg")));
-	m_ui->delete_button->setIcon(QIcon(QStringLiteral(":/icons/remove-configuration.svg")));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
@@ -285,6 +255,30 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 ConfigurationListWidget::~ConfigurationListWidget() {
 	qDeleteAll(m_custom_infos);
 	delete m_ui;
+}
+
+void ConfigurationListWidget::changeEvent(QEvent* event) {
+	QWidget::changeEvent(event);
+	if (event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::PaletteChange) {
+		UpdateToolbarIcons();
+	}
+}
+
+void ConfigurationListWidget::UpdateToolbarIcons() {
+	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
+	                                                                      : QColor(Qt::black);
+	const auto set_icon = [&color](QToolButton* button, const QString& resource) {
+		auto pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
+		QPainter painter(&pixmap);
+		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+		painter.fillRect(pixmap.rect(), color);
+		button->setIcon(QIcon(pixmap));
+	};
+
+	set_icon(m_ui->global_settings_button, QStringLiteral(":/icons/global-settings.svg"));
+	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
+	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
+	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
 }
 
 void ConfigurationListWidget::WriteSettings() {

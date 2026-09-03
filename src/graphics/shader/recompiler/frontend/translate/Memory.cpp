@@ -523,20 +523,14 @@ bool Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	const auto resource = GetBufferResource(memory);
 	const auto address  = ReadBufferAddress(inst, 1);
 	const auto data_src = MemorySourceAt(inst, 0);
-	IR::Value  data     = ReadU32(data_src);
-	if (memory.data_dwords == 2u) {
-		data = ir.ConstructU64(ReadU32(data_src), ReadU32(OffsetOperand(data_src, 1u)));
-	}
+	const IR::Value data =
+	    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
 	const auto result = ir.Emit(opcode,
 	                            {resource, address.index, address.offset, address.soffset, data,
 	                             ir.GetExec()},
 	                            AddMemoryInfo(memory, inst.pc));
 	if (inst.glc) {
-		WriteOperand(inst.dst,
-		             memory.data_dwords == 1u ? result : ir.CompositeExtract(result, 0u));
-		if (memory.data_dwords == 2u) {
-			WriteOperand(OffsetOperand(inst.dst, 1u), ir.CompositeExtract(result, 1u));
-		}
+		WriteOperand(inst.dst, result);
 	}
 	return true;
 }

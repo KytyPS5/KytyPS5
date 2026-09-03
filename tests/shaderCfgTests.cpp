@@ -8618,10 +8618,41 @@ void TestCapturedBufferAtomicOrX2() {
         "64-bit buffer atomic storage view does not use eight-byte elements");
   Check(CountSourceOccurrences(source, "Aliased") == 2u,
         "both storage-buffer views must declare that they alias");
+  const auto array_length =
+      Common::FindIndex(source, std::string("OpArrayLength"), 0);
+  const auto bounds_branch = Common::FindIndex(
+      source, std::string("OpBranchConditional"), array_length);
+  const auto atomic = Common::FindIndex(source, std::string("OpAtomicOr"), 0);
+  const auto memory_barrier =
+      Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
+  Check(array_length != Common::FIND_INVALID_INDEX &&
+            bounds_branch != Common::FIND_INVALID_INDEX &&
+            atomic != Common::FIND_INVALID_INDEX && bounds_branch < atomic,
+        "64-bit buffer atomic was not guarded by storage-buffer bounds");
   Check(SpirvInstructionOpcodeCount(result.spirv, 241u) == 1u,
         "buffer_atomic_or_x2 must lower to exactly one OpAtomicOr");
-  Check(Common::ContainsStr(source, "OpMemoryBarrier"),
-        "64-bit buffer atomic SPIR-V lacks its device-memory barrier");
+  Check(memory_barrier != Common::FIND_INVALID_INDEX && atomic < memory_barrier,
+        "64-bit buffer atomic lacks a following device-memory barrier");
+
+  const std::array glc_shader = {
+      shader[0] | (1u << 14u), shader[1],
+      EncodeMubuf0(0x1d, 32, false),
+      EncodeMubuf1(0, 0, 0), // preserve returned v0:v1 through a dwordx2 store
+      shader[2],
+  };
+  auto glc_result = RecompileForTest(glc_shader, options);
+  const ShaderRecompiler::IR::Inst *glc_atomic = nullptr;
+  for (const auto *block : glc_result.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() ==
+          ShaderRecompiler::IR::ValueOpcode::BufferAtomicOr64) {
+        glc_atomic = &inst;
+      }
+    }
+  }
+  Check(glc_atomic != nullptr && glc_atomic->UseCount() == 2u,
+        "GLC=1 buffer_atomic_or_x2 did not feed both returned dwords");
+  CheckSpirvBinaryValidates(glc_result.spirv);
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {

@@ -132,10 +132,12 @@ public:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_type_and_size,
 	               uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
 	               uint32_t instance_count = 1, uint32_t render_target_slice_offset = 0,
-	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0);
+	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0,
+	               bool offsets_from_indirect_args = false);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count, uint32_t flags,
 	              uint32_t render_target_slice_offset = 0, uint32_t instance_count = 1,
-	              uint32_t first_vertex = 0, uint32_t first_instance = 0);
+	              uint32_t first_vertex = 0, uint32_t first_instance = 0,
+	              bool offsets_from_indirect_args = false);
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 

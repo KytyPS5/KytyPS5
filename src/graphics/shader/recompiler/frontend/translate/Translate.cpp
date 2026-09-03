@@ -950,7 +950,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.cfg_failure_kind    = options.cfg_failure_kind;
 	result.fallback_reason     = options.fallback_reason;
 	if (options.embedded_fetch != nullptr) {
-		result.info.vertex_offset_sgpr = options.embedded_fetch->vertex_offset_sgpr;
+		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
+		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
 	}
 
 	uint32_t vector_limit = 1u;

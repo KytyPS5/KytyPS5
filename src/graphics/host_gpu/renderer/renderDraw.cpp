@@ -64,6 +64,25 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 	return 0;
 }
 
+uint32_t ResolveInstanceOffset(const ShaderVertexInputInfo& vs_input_info) {
+	if (!vs_input_info.fetch_embedded) {
+		return 0;
+	}
+
+	EXIT_IF(!vs_input_info.stage);
+	const auto& program   = *vs_input_info.stage.program;
+	const auto& resources = vs_input_info.stage.resources;
+	if (program.info.instance_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
+		const auto index =
+		    static_cast<uint32_t>(program.info.instance_offset_sgpr) - program.user_data_base;
+		if (index < resources.user_data.size()) {
+			return resources.user_data[index];
+		}
+	}
+
+	return 0;
+}
+
 static std::atomic<uint32_t> g_draw_state_log_count   = 0;
 static std::atomic<uint32_t> g_draw_input_log_count   = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
@@ -508,6 +527,7 @@ struct DrawCallInfo {
 	uint32_t             flags          = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
+	bool                 offsets_from_indirect_args = false;
 };
 
 static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
@@ -747,6 +767,7 @@ struct DrawEmitInfo {
 	bool     indexed       = false;
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
+	uint32_t first_instance = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1124,10 +1145,10 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kRectList:
 			if (emit.indexed) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      draw.first_instance);
+				                      emit.first_instance);
 			} else {
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
-				               draw.first_instance);
+				               emit.first_instance);
 			}
 			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
@@ -1136,17 +1157,17 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			}
 			// Sarah
 			EXIT_NOT_IMPLEMENTED(!(draw.index_count == 3 && vs_input_info.buffers_num == 0));
-			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, draw.first_instance);
+			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, emit.first_instance);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
 				if (emit.indexed) {
 					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
-					                      draw.first_instance);
+					                      emit.first_instance);
 				} else {
 					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
-					               draw.first_instance);
+					               emit.first_instance);
 				}
 			}
 			break;
@@ -1242,7 +1263,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                uint32_t index_type_and_size, uint32_t index_count,
                                const void* index_addr, uint32_t flags, uint32_t type,
                                uint32_t instance_count, uint32_t render_target_slice_offset,
-                               int32_t vertex_offset_add, uint32_t first_instance) {
+	                           int32_t vertex_offset_add, uint32_t first_instance,
+	                           bool offsets_from_indirect_args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1328,7 +1350,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_NOT_IMPLEMENTED(type != 1);
 	const DrawCallInfo    draw {"DrawIndex",    CommandBufferDebugOp::DrawIndex,
 	                            index_count,    flags,
-	                            instance_count, first_instance};
+	                            instance_count, first_instance,
+	                            offsets_from_indirect_args};
 	std::vector<uint16_t> expanded_indices;
 	if (expand_index8_to_u16) {
 		EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
@@ -1359,11 +1382,16 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
 
 	const auto vertex_offset =
-	    ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) + vertex_offset_add;
+	    draw.offsets_from_indirect_args
+	        ? vertex_offset_add
+	        : ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) + vertex_offset_add;
 
 	DrawEmitInfo emit {};
-	emit.indexed       = true;
-	emit.vertex_offset = vertex_offset;
+	emit.indexed        = true;
+	emit.vertex_offset  = vertex_offset;
+	emit.first_instance = draw.offsets_from_indirect_args
+	                          ? draw.first_instance
+	                          : ResolveInstanceOffset(state.vs_input_info);
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart, true, true, false);
@@ -1374,7 +1402,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count,
                               uint32_t flags, uint32_t render_target_slice_offset,
                               uint32_t instance_count, uint32_t first_vertex,
-                              uint32_t first_instance) {
+	                          uint32_t first_instance, bool offsets_from_indirect_args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1426,7 +1454,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	EXIT_NOT_IMPLEMENTED(flags != 0);
 	const DrawCallInfo draw {"DrawIndexAuto", CommandBufferDebugOp::DrawIndexAuto,
 	                         index_count,     flags,
-	                         instance_count,  first_instance};
+	                         instance_count,  first_instance,
+	                         offsets_from_indirect_args};
 
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, false,
@@ -1460,10 +1489,16 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	                     ucfg.GetPrimType() == Prospero::PrimitiveType::kRectListLegacy, 0,
 	                     nullptr);
 
-	const auto   vertex_offset = ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
-	                             static_cast<int32_t>(first_vertex);
+	const auto vertex_offset =
+	    draw.offsets_from_indirect_args
+	        ? static_cast<int32_t>(first_vertex)
+	        : ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
+	              static_cast<int32_t>(first_vertex);
 	DrawEmitInfo emit {};
-	emit.first_vertex = static_cast<uint32_t>(vertex_offset);
+	emit.first_vertex   = static_cast<uint32_t>(vertex_offset);
+	emit.first_instance = draw.offsets_from_indirect_args
+	                          ? draw.first_instance
+	                          : ResolveInstanceOffset(state.vs_input_info);
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,

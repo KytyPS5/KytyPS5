@@ -19,7 +19,8 @@ struct EmbeddedFetchLoad {
 
 struct EmbeddedFetchPlan {
 	std::vector<EmbeddedFetchLoad> loads;
-	int32_t                        vertex_offset_sgpr = -1;
+	int32_t                        vertex_offset_sgpr   = -1;
+	int32_t                        instance_offset_sgpr = -1;
 };
 
 struct TranslateOptions {

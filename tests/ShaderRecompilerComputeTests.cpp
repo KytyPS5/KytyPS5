@@ -21909,6 +21909,18 @@ void CheckEmbeddedFetchVertexOffset() {
     return ResolveVertexOffset(index_offset, vertex);
   };
 
+  const auto ResolveInstance = [](const CompiledShader &result) {
+    ShaderVertexInputInfo vertex;
+    vertex.fetch_embedded = true;
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.user_data_base = result.program.user_data_base;
+    program.info.instance_offset_sgpr =
+        result.program.info.instance_offset_sgpr;
+    vertex.stage.program = &program;
+    vertex.stage.resources = result.resources;
+    return ResolveInstanceOffset(vertex);
+  };
+
   const auto valid =
       Compile("EmbeddedFetchVertexOffset", MakeFetch({{18, 0}}), 7);
   Require(
@@ -21927,6 +21939,33 @@ void CheckEmbeddedFetchVertexOffset() {
               Resolve(ngg, 5) == 5,
           "PS5 NGG vertex-index offset or register index-offset precedence is "
           "wrong");
+
+  const auto ngg_instance =
+      Compile("EmbeddedFetchNggInstanceOffset",
+              MakeFetch({{18, 8}}, {}, 8, true), 81);
+  Require("EmbeddedFetchNggInstanceOffset", "parse",
+          ngg_instance.program.info.vertex_offset_sgpr == -1 &&
+              ngg_instance.program.info.instance_offset_sgpr == 18 &&
+              ResolveInstance(ngg_instance) == 81,
+          "PS5 NGG instance-index offset was not detected or resolved");
+
+  const auto instance_conflict = Compile(
+      "EmbeddedFetchConflictingInstanceOffset",
+      MakeFetch({{17, 8}, {18, 8}}, {}, 8, true), 81);
+  const auto instance_malformed =
+      Compile("EmbeddedFetchMalformedInstanceOffset",
+              MakeFetch({{18, 7}}, {}, 7, true), 81);
+  const auto instance_outside =
+      Compile("EmbeddedFetchOutsideInstanceOffset",
+              MakeFetch({{19, 8}}, {}, 8, true), 81);
+  for (const auto *result :
+       {&instance_conflict, &instance_malformed, &instance_outside}) {
+    Require("EmbeddedFetchNggInstanceOffset", "fail closed",
+            result->program.info.instance_offset_sgpr == -1 &&
+                ResolveInstance(*result) == 0,
+            "conflicting, malformed, or out-of-window instance add was "
+            "classified");
+  }
 
   const auto pointer = 0x5b7c5100u;
   const auto late = Compile("EmbeddedFetchLateOffset",

@@ -234,8 +234,10 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
                                             uint32_t wave_size) {
 	EmbeddedFetchData data;
 	data.loads.reserve(input_info->resources_num);
-	int32_t offset_candidate = -1;
-	bool    offset_conflict  = false;
+	int32_t vertex_offset_candidate   = -1;
+	int32_t instance_offset_candidate = -1;
+	bool    vertex_offset_conflict    = false;
+	bool    instance_offset_conflict  = false;
 
 	const int shift_regs = 8;
 	const int attrib_reg = input_info->fetch_attrib_reg + shift_regs;
@@ -263,26 +265,34 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 
 	for (const auto& inst: decoded.instructions) {
 		// Fetch shaders accumulate the draw's vertex offset in v0. The PS5 NGG ABI
-		// seeds S_NGG_VERTEX_INDEX in v5 and applies the same offset there before fetching.
+		// seeds S_NGG_VERTEX_INDEX in v5 and S_NGG_INSTANCE_INDEX in v8, then applies the
+		// corresponding direct-draw offsets before fetching.
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
 		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
+		const bool instance_index_accumulator =
+		    IsDecodedVgpr(inst.dst) && (inst.dst.reg == (user_data_base == 8 ? 8u : 3u));
 		uint32_t   sad_zero = 0;
-		const bool vertex_offset_add =
-		    vertex_index_accumulator && IsDecodedSgpr(inst.src0) &&
+		const bool index_offset_add =
+		    (vertex_index_accumulator || instance_index_accumulator) &&
+		    IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && inst.dst.reg == 5 &&
+		     (user_data_base == 8 && (inst.dst.reg == 5 || inst.dst.reg == 8) &&
 		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
 		      inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
-		if (data.loads.empty() && vertex_offset_add) {
+		if (data.loads.empty() && index_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
 			if (reg >= user_data_base && reg - user_data_base < user_data_count) {
-				if (offset_candidate >= 0 && offset_candidate != static_cast<int32_t>(reg)) {
-					offset_conflict = true;
+				auto& candidate = vertex_index_accumulator ? vertex_offset_candidate
+				                                           : instance_offset_candidate;
+				auto& conflict  = vertex_index_accumulator ? vertex_offset_conflict
+				                                           : instance_offset_conflict;
+				if (candidate >= 0 && candidate != static_cast<int32_t>(reg)) {
+					conflict = true;
 				} else {
-					offset_candidate = static_cast<int32_t>(reg);
+					candidate = static_cast<int32_t>(reg);
 				}
 			}
 		}
@@ -441,8 +451,13 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						load.attrib_id    = buffer.attrib_id;
 						load.components   = DecodedDstSize(inst);
 						load.prolog_loads = buffer.prolog_loads;
-						if (data.loads.empty() && !offset_conflict) {
-							data.vertex_offset_sgpr = offset_candidate;
+						if (data.loads.empty()) {
+							if (!vertex_offset_conflict) {
+								data.vertex_offset_sgpr = vertex_offset_candidate;
+							}
+							if (!instance_offset_conflict) {
+								data.instance_offset_sgpr = instance_offset_candidate;
+							}
 						}
 						data.loads.push_back(load);
 					}
@@ -615,7 +630,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {
-		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
+		ir.info.vertex_offset_sgpr   = embedded_fetch.vertex_offset_sgpr;
+		ir.info.instance_offset_sgpr = embedded_fetch.instance_offset_sgpr;
 	}
 
 	TranslateResult result;

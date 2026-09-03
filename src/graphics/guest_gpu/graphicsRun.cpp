@@ -850,7 +850,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, uint32_t flags,
                                  uint32_t type, uint32_t instance_count, const void* object_ids,
                                  uint32_t render_target_slice_offset, int32_t vertex_offset_add,
-                                 uint32_t first_instance) {
+                                 uint32_t first_instance, bool offsets_from_indirect_args) {
 	CheckBuffer();
 
 	if (instance_count == 0) {
@@ -868,9 +868,10 @@ void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, u
 		     "\n",
 		     vertex_offset_add, first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(
-	    m_submit_id, CurrentBuffer(), m_index_type_and_size, index_count, index_addr, flags, type,
-	    instance_count, render_target_slice_offset, vertex_offset_add, first_instance);
+	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size,
+	                                         index_count, index_addr, flags, type, instance_count,
+	                                         render_target_slice_offset, vertex_offset_add,
+	                                         first_instance, offsets_from_indirect_args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count,
@@ -929,7 +930,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		}
 		m_num_instances = args.instance_count;
 		SubmitNonIndexedDraw(args.vertex_count_per_instance, 0, 0, args.start_vertex_location,
-		                     args.start_instance_location);
+		                     args.start_instance_location, true);
 		return;
 	}
 
@@ -971,7 +972,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	m_num_instances = args.instance_count;
 	DrawIndex(index_count, index_addr, 0, 1, args.instance_count, nullptr, 0,
-	          static_cast<int32_t>(args.base_vertex_location), args.start_instance_location);
+	          static_cast<int32_t>(args.base_vertex_location), args.start_instance_location, true);
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -1029,7 +1030,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			}
 			m_num_instances = args->instance_count;
 			SubmitNonIndexedDraw(args->vertex_count_per_instance, 0, 0, args->start_vertex_location,
-			                     args->start_instance_location);
+			                     args->start_instance_location, true);
 			continue;
 		}
 
@@ -1072,7 +1073,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		m_num_instances = args->instance_count;
 		DrawIndex(index_count, index_addr, 0, 1, args->instance_count, nullptr, 0,
-		          static_cast<int32_t>(args->base_vertex_location), args->start_instance_location);
+		          static_cast<int32_t>(args->base_vertex_location), args->start_instance_location,
+		          true);
 	}
 }
 
@@ -1170,12 +1172,13 @@ void CommandProcessor::DrawIndexAuto(uint32_t index_count, uint32_t flags,
 
 void CommandProcessor::SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,
                                             uint32_t render_target_slice_offset,
-                                            uint32_t first_vertex, uint32_t first_instance) {
+                                            uint32_t first_vertex, uint32_t first_instance,
+                                            bool offsets_from_indirect_args) {
 	CheckBuffer();
 
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), vertex_count, flags,
-	                                        render_target_slice_offset, m_num_instances,
-	                                        first_vertex, first_instance);
+	m_renderer.GetRenderExecutor().DrawAuto(
+	    m_submit_id, CurrentBuffer(), vertex_count, flags, render_target_slice_offset,
+	    m_num_instances, first_vertex, first_instance, offsets_from_indirect_args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

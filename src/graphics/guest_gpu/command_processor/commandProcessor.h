@@ -76,7 +76,7 @@ public:
 	void DrawIndex(uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
 	               uint32_t instance_count = 0, const void* object_ids = nullptr,
 	               uint32_t render_target_slice_offset = 0, int32_t vertex_offset_add = 0,
-	               uint32_t first_instance = 0);
+	               uint32_t first_instance = 0, bool offsets_from_indirect_args = false);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count, uint32_t flags);
 	void DrawIndexAuto(uint32_t index_count, uint32_t flags,
 	                   uint32_t render_target_slice_offset = 0);
@@ -151,7 +151,7 @@ private:
 	void SuspendPm4();
 	void SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,
 	                          uint32_t render_target_slice_offset, uint32_t first_vertex,
-	                          uint32_t first_instance);
+	                          uint32_t first_instance, bool offsets_from_indirect_args = false);
 
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }

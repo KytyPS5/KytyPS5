@@ -601,12 +601,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features12.shaderOutputLayer != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features12.bufferDeviceAddress != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.shaderBufferInt64Atomics != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
 	features12.timelineSemaphore = VK_TRUE;
 	features12.shaderOutputLayer = VK_TRUE;
 	features12.bufferDeviceAddress = VK_TRUE;
+	features12.shaderBufferInt64Atomics = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;

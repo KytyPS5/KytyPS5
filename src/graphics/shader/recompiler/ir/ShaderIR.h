@@ -433,6 +433,7 @@ struct SpirvRequirements {
 	bool function_lds                 = false;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
+	bool buffer_int64_atomics         = false;
 };
 
 struct BlockInfo {

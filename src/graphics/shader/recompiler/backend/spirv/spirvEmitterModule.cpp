@@ -29,6 +29,10 @@ uint32_t TypeU64(EmitterState& state) {
 }
 
 uint32_t TypeDeviceAddress(EmitterState& state) {
+	return TypeScalarU64(state);
+}
+
+uint32_t TypeScalarU64(EmitterState& state) {
 	return state.builder.Type(OpTypeInt, {64, 0});
 }
 
@@ -92,6 +96,25 @@ uint32_t TypeStorageBufferPointer(EmitterState& state) {
 
 uint32_t TypeStorageBufferElementPointer(EmitterState& state) {
 	return TypePointer(state, StorageClassStorageBuffer, TypeU32(state));
+}
+
+uint32_t StorageU64RuntimeArrayType(EmitterState& state) {
+	return state.builder.DecoratedType(OpTypeRuntimeArray, {TypeScalarU64(state)},
+	                                   {{OpDecorate, {DecorationArrayStride, sizeof(uint64_t)}}});
+}
+
+uint32_t StorageBufferU64Type(EmitterState& state) {
+	return state.builder.DecoratedType(
+	    OpTypeStruct, {StorageU64RuntimeArrayType(state)},
+	    {{OpMemberDecorate, {0, DecorationOffset, 0}}, {OpDecorate, {DecorationBlock}}});
+}
+
+uint32_t TypeStorageBufferU64Pointer(EmitterState& state) {
+	return TypePointer(state, StorageClassStorageBuffer, StorageBufferU64Type(state));
+}
+
+uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state) {
+	return TypePointer(state, StorageClassStorageBuffer, TypeScalarU64(state));
 }
 
 uint32_t TypeDeviceAddressStoragePointer(EmitterState& state) {
@@ -162,6 +185,13 @@ void DefineDescriptorVariables(EmitterState& state) {
 		const auto pointer_type = TypePointer(state, StorageClassStorageBuffer, array_type);
 		state.storage_buffer_variable =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassStorageBuffer);
+		if (state.requirements.buffer_int64_atomics) {
+			const auto u64_array_type =
+			    state.builder.Type(OpTypeArray, {StorageBufferU64Type(state), count});
+			state.storage_buffer_u64_variable = state.builder.DefineGlobalVariable(
+			    TypePointer(state, StorageClassStorageBuffer, u64_array_type),
+			    StorageClassStorageBuffer);
+		}
 	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::BdaPagetable) != nullptr) {
 		state.bda_pagetable_variable = state.builder.DefineGlobalVariable(
@@ -570,6 +600,14 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	if (state.storage_buffer_variable != 0) {
 		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
 	}
+	if (state.storage_buffer_u64_variable != 0) {
+		Decorate(state.storage_buffer_u64_variable, "buffers_u64",
+		         IR::DescriptorBindingKind::Buffers);
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.storage_buffer_variable, DecorationAliased});
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.storage_buffer_u64_variable, DecorationAliased});
+	}
 	if (state.bda_pagetable_variable != 0) {
 		Decorate(state.bda_pagetable_variable, "bda_pagetable",
 		         IR::DescriptorBindingKind::BdaPagetable);
@@ -626,6 +664,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityInt64);
 		state.builder.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
+	}
+	if (state.requirements.buffer_int64_atomics) {
+		state.builder.RequireCapability(CapabilityInt64);
+		state.builder.RequireCapability(CapabilityInt64Atomics);
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(CapabilityClipDistance);

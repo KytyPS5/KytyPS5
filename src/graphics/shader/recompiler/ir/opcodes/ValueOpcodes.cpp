@@ -119,6 +119,7 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicUMax32:
 		case ValueOpcode::BufferAtomicAnd32:
 		case ValueOpcode::BufferAtomicOr32:
+		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::BufferAtomicXor32:
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
@@ -128,6 +129,7 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 
 uint32_t BufferComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
+		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
 		case ValueOpcode::LoadBufferU32x3:

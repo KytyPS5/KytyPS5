@@ -81,6 +81,27 @@ static void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
+                                                         const IR::MemoryInfo& mem,
+                                                         uint32_t variable,
+                                                         uint32_t pointer_type) {
+	if (variable == 0) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "storage buffer descriptor array was not emitted");
+	}
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	MemoryResourceAccess access {.kind = mem.kind};
+	access.object_pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
+	                           ConstantU32(state, array_index)});
+	access.byte_offset = state.memory_byte_offsets[array_index];
+	access.length      = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	return access;
+}
+
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
 	MemoryResourceAccess access {.kind = mem.kind};
 	switch (mem.kind) {
@@ -113,22 +134,13 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
-			if (state.storage_buffer_variable == 0) {
-				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers,
-				                             mem.resource,
-				                             "storage buffer descriptor array was not emitted");
-			}
-			const auto array_index =
-			    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-			access.object_pointer = state.builder.AllocateId();
-			state.builder.AddFunction({OpAccessChain, TypeStorageBufferPointer(state),
-			                           access.object_pointer, state.storage_buffer_variable,
-			                           ConstantU32(state, array_index)});
+			access = PrepareStorageBufferResourceAccess(
+			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
 			access.index_offset =
-			    EmitBinaryU32(state, OpShiftRightLogical, state.memory_byte_offsets[array_index],
+			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
 			                  ConstantU32(state, 2u));
 			access.add_index_offset = true;
-			break;
+			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
@@ -152,17 +164,25 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
-	const auto pointer = state.builder.AllocateId();
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		const auto pointer = state.builder.AllocateId();
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
 		                           : state.stage == ShaderType::Compute     ? StorageClassWorkgroup
 		                                                                    : StorageClassFunction;
 		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                           pointer, access.object_pointer, index});
-	} else {
-		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-		                           access.object_pointer, ConstantU32(state, 0), index});
+		return pointer;
 	}
+	return EmitStorageBufferElementPointer(state, access, index,
+	                                       TypeStorageBufferElementPointer(state));
+}
+
+uint32_t EmitStorageBufferElementPointer(EmitterState& state,
+                                         const MemoryResourceAccess& access, uint32_t index,
+                                         uint32_t pointer_type) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, pointer_type, pointer, access.object_pointer,
+	                           ConstantU32(state, 0), index});
 	return pointer;
 }
 

@@ -672,6 +672,35 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	return return_value ? result : ConstantU32(ctx.state, 0);
 }
 
+uint32_t EmitBufferAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst,
+                              const IR::MemoryInfo& mem) {
+	auto& state = ctx.state;
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
+		    const auto resource = PrepareStorageBufferResourceAccess(
+		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
+		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
+		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
+		                              ConstantU32(state, 3u));
+		    return EmitValueOrDefaultIfCondition(
+		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
+		        ConstantU64(state, 0), [&]() {
+			        const auto value = Unary(state, OpBitcast, TypeScalarU64(state),
+			                                 ctx.Arg(inst, inst.NumArgs() - 2));
+			        const auto old   = state.builder.AllocateId();
+			        state.builder.AddFunction(
+			            {OpAtomicOr, TypeScalarU64(state), old,
+			             EmitStorageBufferElementPointer(
+			                 state, resource, index, TypeStorageBufferU64ElementPointer(state)),
+			             ConstantU32(state, ScopeDevice),
+			             ConstantU32(state, MemorySemanticsNone), value});
+			        EmitDeviceAtomicMemoryBarrier(state);
+			        return Unary(state, OpBitcast, TypeU64(state), old);
+		        });
+	    });
+}
+
 uint32_t FloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                 bool max_value) {
 	struct OrderedBits {
@@ -1080,12 +1109,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op                = inst.GetOpcode();
 	const auto buffer_components = IR::BufferComponentCount(op);
 	if (buffer_components > 1u) {
-		if (IR::BufferAccessOf(op) == IR::BufferAccess::Read) {
+		const auto access = IR::BufferAccessOf(op);
+		if (access == IR::BufferAccess::Read) {
 			ctx.Define(inst, LoadWideBuffer(ctx, inst, buffer_components));
-		} else {
-			StoreWideBuffer(ctx, inst, buffer_components);
+			return true;
 		}
-		return true;
+		if (access == IR::BufferAccess::Write) {
+			StoreWideBuffer(ctx, inst, buffer_components);
+			return true;
+		}
 	}
 	const auto shared_components = IR::SharedComponentCount(op);
 	if (shared_components > 1u) {
@@ -1179,6 +1211,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto atomic_opcode = AtomicOpcode(op);
 	if (atomic_opcode != 0) {
 		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
+		return true;
+	}
+	if (op == IR::ValueOpcode::BufferAtomicOr64) {
+		ctx.Define(inst, EmitBufferAtomicOr64(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {

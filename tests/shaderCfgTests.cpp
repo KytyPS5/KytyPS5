@@ -8593,6 +8593,37 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
         "buffer atomic memory barrier was emitted before atomic");
 }
 
+void TestCapturedBufferAtomicOrX2() {
+  const uint32_t shader[] = {
+      0xe1680018u, 0x80000000u, // buffer_atomic_or_x2 v[0:1], s[0:3], 0 offset:24
+      EncodeSopp(0x01),
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_ATOMIC_OR_X2"),
+        "captured MUBUF instruction did not decode as buffer_atomic_or_x2");
+  Check(Common::ContainsStr(result.ir_dump, "BufferAtomicOr64"),
+        "buffer_atomic_or_x2 did not lower to a 64-bit buffer atomic");
+  Check(!Common::ContainsStr(result.ir_dump, "SetVectorRegister"),
+        "GLC=0 buffer_atomic_or_x2 unexpectedly wrote an old value to v0:v1");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(Common::ContainsStr(source, "OpCapability Int64Atomics"),
+        "64-bit buffer atomic SPIR-V lacks Int64Atomics capability");
+  Check(Common::ContainsStr(source, "ArrayStride 8"),
+        "64-bit buffer atomic storage view does not use eight-byte elements");
+  Check(CountSourceOccurrences(source, "Aliased") == 2u,
+        "both storage-buffer views must declare that they alias");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 241u) == 1u,
+        "buffer_atomic_or_x2 must lower to exactly one OpAtomicOr");
+  Check(Common::ContainsStr(source, "OpMemoryBarrier"),
+        "64-bit buffer atomic SPIR-V lacks its device-memory barrier");
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -11935,6 +11966,7 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
+  TestCapturedBufferAtomicOrX2();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

@@ -522,12 +522,21 @@ bool Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetBufferResource(memory);
 	const auto address  = ReadBufferAddress(inst, 1);
-	const auto result   = ir.Emit(opcode,
-	                              {resource, address.index, address.offset, address.soffset,
-	                               ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	                              AddMemoryInfo(memory, inst.pc));
+	const auto data_src = MemorySourceAt(inst, 0);
+	IR::Value  data     = ReadU32(data_src);
+	if (memory.data_dwords == 2u) {
+		data = ir.ConstructU64(ReadU32(data_src), ReadU32(OffsetOperand(data_src, 1u)));
+	}
+	const auto result = ir.Emit(opcode,
+	                            {resource, address.index, address.offset, address.soffset, data,
+	                             ir.GetExec()},
+	                            AddMemoryInfo(memory, inst.pc));
 	if (inst.glc) {
-		WriteOperand(inst.dst, result);
+		WriteOperand(inst.dst,
+		             memory.data_dwords == 1u ? result : ir.CompositeExtract(result, 0u));
+		if (memory.data_dwords == 2u) {
+			WriteOperand(OffsetOperand(inst.dst, 1u), ir.CompositeExtract(result, 1u));
+		}
 	}
 	return true;
 }
@@ -935,6 +944,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicAnd32);
 		case Decoder::Opcode::BUFFER_ATOMIC_OR:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicOr32);
+		case Decoder::Opcode::BUFFER_ATOMIC_OR_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicOr64);
 		case Decoder::Opcode::BUFFER_ATOMIC_XOR:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicXor32);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMIN:

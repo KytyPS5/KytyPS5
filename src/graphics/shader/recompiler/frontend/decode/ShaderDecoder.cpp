@@ -600,6 +600,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:
 		case Opcode::BUFFER_ATOMIC_OR:
+		case Opcode::BUFFER_ATOMIC_OR_X2:
 		case Opcode::BUFFER_ATOMIC_XOR:
 		case Opcode::BUFFER_ATOMIC_FMIN:
 		case Opcode::BUFFER_ATOMIC_FMAX:

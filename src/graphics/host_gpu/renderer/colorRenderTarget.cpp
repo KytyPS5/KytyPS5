@@ -27,8 +27,6 @@ static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool h
 	// formats here; unsupported encodings remain tracked without unsafe materialization.
 	info.metadata_clear_supported =
 	    has_dcc && DecodePackedColorClear(format, packed_clear, info.color_clear_value);
-	// The fixed clear codes (0/0/0/0, 0/0/0/1, 1/1/1/0, 1/1/1/1) are defined for every
-	// bit depth; "one" is 1.0 for the unsigned normalized and float encodings listed here.
 	switch (format) {
 		case vk::Format::eR8Unorm:
 		case vk::Format::eR8G8Unorm:

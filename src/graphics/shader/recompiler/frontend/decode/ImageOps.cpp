@@ -202,6 +202,7 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
+    {0x0fu, "image_atomic_swap", Opcode::IMAGE_ATOMIC_SWAP},
     {0x11u, "image_atomic_add", Opcode::IMAGE_ATOMIC_ADD},
     {0x15u, "image_atomic_umin", Opcode::IMAGE_ATOMIC_UMIN},
     {0x17u, "image_atomic_umax", Opcode::IMAGE_ATOMIC_UMAX},

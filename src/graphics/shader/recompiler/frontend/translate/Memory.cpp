@@ -223,7 +223,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 	if (decoded.family == Decoder::Family::MIMG) {
 		const bool store_or_atomic = decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
 		                             decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP ||
-		                             (decoded.opcode >= Decoder::Opcode::IMAGE_ATOMIC_ADD &&
+		                             (decoded.opcode >= Decoder::Opcode::IMAGE_ATOMIC_SWAP &&
 		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_XOR);
 		if (store_or_atomic) {
 			return index == 0u ? decoded.dst : decoded.src0;
@@ -981,6 +981,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
 
+		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicIAdd32);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMIN:

@@ -12206,6 +12206,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_LOAD_MIP:
   case Opcode::IMAGE_STORE:
   case Opcode::IMAGE_STORE_MIP:
+  case Opcode::IMAGE_ATOMIC_SWAP:
   case Opcode::IMAGE_ATOMIC_ADD:
   case Opcode::IMAGE_ATOMIC_UMIN:
   case Opcode::IMAGE_ATOMIC_AND:
@@ -20897,6 +20898,39 @@ TestCase ImageStoreAndAtomicShareTypedBinding() {
   return test;
 }
 
+TestCase ImageAtomicSwapReturnsPreviousTexel() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 0, 5);
+  code.push_back(EncodeMimg0(0x08, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendVMovU32(&code, 0, 3);
+  code.push_back(EncodeMimg0(0x0f, 0x1, 0, true));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  std::vector<u32> expected_image(16, 0);
+  expected_image[1 * 4 + 2] = 3;
+
+  TestCase test;
+  test.name = "ImageAtomicSwapReturnsPreviousTexel";
+  test.code = std::move(code);
+  test.expected = {5};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::IMAGE_ATOMIC_SWAP,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui = std::move(expected_image);
+  test.required_spirv = {"OpAtomicExchange", "OpImageTexelPointer"};
+  return test;
+}
+
 TestCase ImageStoreAndAtomicUseSeparateBindings() {
   using O = ShaderOpcode;
 
@@ -21566,6 +21600,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageStoreAndAtomicShareTypedBinding);
+  AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);

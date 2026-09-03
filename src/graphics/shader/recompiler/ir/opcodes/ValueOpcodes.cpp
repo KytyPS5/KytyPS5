@@ -111,6 +111,7 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::StoreBufferU32x3:
 		case ValueOpcode::StoreBufferU32x4: return BufferAccess::Write;
 		case ValueOpcode::BufferAtomicSwap32:
+		case ValueOpcode::BufferAtomicCmpSwap32:
 		case ValueOpcode::BufferAtomicSwap64:
 		case ValueOpcode::BufferAtomicIAdd32:
 		case ValueOpcode::BufferAtomicISub32:

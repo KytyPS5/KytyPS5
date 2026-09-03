@@ -12226,6 +12226,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::TBUFFER_STORE_FORMAT_XYZ:
   case Opcode::TBUFFER_STORE_FORMAT_XYZW:
   case Opcode::BUFFER_ATOMIC_SWAP:
+  case Opcode::BUFFER_ATOMIC_CMPSWAP:
   case Opcode::BUFFER_ATOMIC_ADD:
   case Opcode::BUFFER_ATOMIC_SUB:
   case Opcode::BUFFER_ATOMIC_SMIN:
@@ -19450,6 +19451,52 @@ TestCase BufferAtomicVariants() {
        O::S_ENDPGM}};
 }
 
+TestCase BufferAtomicCmpSwapExactRaw() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  const auto Store = [&](u32 value, u32 index) {
+    AppendVMovU32(&code, 31, index * sizeof(u32));
+    code.push_back(EncodeMubuf0(0x1cu));
+    code.push_back(EncodeMubuf1(value, 8, 31));
+  };
+  AppendVMovU32(&code, 4, 1);
+  AppendVMovLiteral(&code, 1, 0x22222222u);
+  AppendVMovLiteral(&code, 2, 0x11111111u);
+  code.push_back(0xe0c46000u);
+  code.push_back(0x80080104u);
+  Store(1, 2);
+
+  AppendVMovLiteral(&code, 1, 0x33333333u);
+  AppendVMovLiteral(&code, 2, 0x44444444u);
+  code.push_back(0xe0c46000u);
+  code.push_back(0x80080104u);
+  Store(1, 3);
+  Store(2, 4);
+
+  AppendVMovLiteral(&code, 1, 0x55555555u);
+  AppendVMovLiteral(&code, 2, 0x22222222u);
+  code.push_back(EncodeMubuf0(0x31u, 0, true, false));
+  code.push_back(0x80080104u);
+  Store(1, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferAtomicCmpSwapExactRaw";
+  test.code = std::move(code);
+  test.initial = {0xaaaaaaaau, 0x11111111u, 0, 0, 0, 0};
+  test.expected = {0xaaaaaaaau, 0x55555555u, 0x11111111u,
+                   0x22222222u, 0x44444444u, 0x55555555u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_CMPSWAP,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicCompareExchange"};
+  const auto descriptor = MakeStructuredStorageBufferData(
+      sizeof(u32), static_cast<u32>(test.initial.size()));
+  std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 32);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
   using O = ShaderOpcode;
 
@@ -21654,6 +21701,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(BufferAtomicVariants);
+  AddCase(BufferAtomicCmpSwapExactRaw);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
   AddCase(BufferAtomicFMinExactRawGlcModes);
   AddCase(BufferAtomicFMinSpecialValues);
@@ -25839,6 +25887,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {

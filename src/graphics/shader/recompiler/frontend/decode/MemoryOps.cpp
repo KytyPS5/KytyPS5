@@ -47,6 +47,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
+    {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
     {0x33u, Opcode::BUFFER_ATOMIC_SUB, 1, 32},
     {0x35u, Opcode::BUFFER_ATOMIC_SMIN, 1, 32},

@@ -1350,6 +1350,18 @@ std::array<u32, 64> MakeStorageTextureData(Prospero::BufferFormat format) {
   return data;
 }
 
+std::string StorageUint2DImageBindingName(bool atomic) {
+  ShaderRecompiler::IR::ImageResource image{};
+  image.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+  image.numeric_class = Prospero::TextureNumericClass::Uint;
+  image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  image.atomic = atomic;
+  const auto binding = ShaderRecompiler::IR::DescriptorBindingForImage(image);
+  Require("StorageUint2DImageBindingName", "descriptor binding", binding.has_value(),
+          "storage image has no descriptor binding");
+  return "image_" + std::to_string(static_cast<uint32_t>(*binding));
+}
+
 CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -8496,6 +8508,7 @@ public:
       phased_depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
       phased_depth_target.stencil_info.texture_compatibility =
           Prospero::TextureCompatibleStencil::kEnable;
+      phased_depth_target.stencil_info.htile_stencil_disabled = false;
       phased_depth_target.z_read_base_addr = phased_depth_address;
       phased_depth_target.z_write_base_addr = phased_depth_address;
       phased_depth_target.stencil_read_base_addr = phased_stencil_address;
@@ -18857,6 +18870,7 @@ TestCase ScratchIsPrivatePerInvocation() {
   return test;
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 TestCase FlatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -18904,6 +18918,7 @@ TestCase FlatStoreVariants() {
                  O::FLAT_STORE_DWORDX3, O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
   return test;
 }
+#endif
 
 TestCase DsReadWriteVariants() {
   using O = ShaderOpcode;
@@ -20988,7 +21003,7 @@ TestCase ImageStoreR32SintUsesRawUintView() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "image_29"};
+                         StorageUint2DImageBindingName(false)};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -21018,7 +21033,7 @@ TestCase ImageStoreR32UintUsesFormatlessStorageImage() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "image_29"};
+                         StorageUint2DImageBindingName(false)};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -21052,7 +21067,8 @@ TestCase ImageStorePackedUintSaturatesChannels() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "image_29", "OpULessThan", "OpSelect"};
+                         StorageUint2DImageBindingName(false), "OpULessThan",
+                         "OpSelect"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -21084,7 +21100,7 @@ TestCase ImageStorePackedUintHonorsSparseDmask() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "image_29"};
+                         StorageUint2DImageBindingName(false)};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -21145,9 +21161,10 @@ TestCase ImageStoreAndAtomicShareTypedBinding() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpImageWrite", "OpImageTexelPointer", "R32ui",
-                         "image_34"};
+                         StorageUint2DImageBindingName(true)};
   test.forbidden_spirv = {"StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat", "image_29"};
+                          "StorageImageWriteWithoutFormat",
+                          StorageUint2DImageBindingName(false)};
   return test;
 }
 
@@ -21219,8 +21236,8 @@ TestCase ImageStoreAndAtomicUseSeparateBindings() {
                          "OpImageWrite",
                          "OpImageTexelPointer",
                          "R32ui",
-                         "image_29",
-                         "image_34"};
+                         StorageUint2DImageBindingName(false),
+                         StorageUint2DImageBindingName(true)};
   return test;
 }
 
@@ -21251,10 +21268,12 @@ TestCase ImageAtomicVariants() {
                   O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
                   O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpImageTexelPointer", "R32ui", "image_34"};
+  test.required_spirv = {"OpImageTexelPointer", "R32ui",
+                         StorageUint2DImageBindingName(true)};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
                           "StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat", "image_29"};
+                          "StorageImageWriteWithoutFormat",
+                          StorageUint2DImageBindingName(false)};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {

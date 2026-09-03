@@ -9328,6 +9328,114 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckSampledDepthTextureDiscovery() {
+    constexpr const char *name = "SampledDepthTextureDiscovery";
+    constexpr uintptr_t base = 0x0000000204200000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    constexpr auto format = Prospero::BufferFormat::k32Float;
+    constexpr auto tile = Prospero::TileMode::kDepth;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "sampled-depth direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "sampled-depth fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      auto &cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      const auto encoded_address = base >> 8u;
+      ShaderTextureResource descriptor{};
+      descriptor.fields[0] = static_cast<uint32_t>(encoded_address);
+      descriptor.fields[1] =
+          static_cast<uint32_t>(encoded_address >> 32u) |
+          (static_cast<uint32_t>(format) << 20u) | (((width - 1u) & 3u) << 30u);
+      descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+      descriptor.fields[3] =
+          DstSel(4, 4, 4, 4) | (static_cast<uint32_t>(tile) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      descriptor.fields[5] = 0x00700000u;
+      ShaderRecompiler::IR::DescriptorValue value{};
+      std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+                value.dwords.begin());
+      value.dword_count = 8;
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      resource.depth_compare = true;
+
+      auto binding =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      const auto &image = cache.GetImage(binding.image_id);
+      const bool depth_view = std::ranges::any_of(image.views, [&](const auto &cached) {
+        return cached.view == view && cached.info.format == vk::Format::eD32Sfloat &&
+               cached.info.aspect == vk::ImageAspectFlagBits::eDepth;
+      });
+      Require(name, "uncached comparison image",
+              binding.desc.info.pixel_format == vk::Format::eD32Sfloat &&
+                  binding.desc.view_info.format == vk::Format::eR32Sfloat &&
+                  image.backing.format == vk::Format::eD32Sfloat && view != nullptr &&
+                  depth_view,
+              "comparison texture cache miss did not create a sampled D32 image");
+
+      ShaderRecompiler::IR::DescriptorValue null_value{};
+      null_value.dword_count = 8;
+      auto null_binding =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, null_value);
+      const auto null_view =
+          cache.FindTexture(null_binding.image_id, null_binding.desc);
+      const auto &null_image = cache.GetImage(null_binding.image_id);
+      const bool null_depth_view =
+          std::ranges::any_of(null_image.views, [&](const auto &cached) {
+            return cached.view == null_view &&
+                   cached.info.format == vk::Format::eD32Sfloat &&
+                   cached.info.aspect == vk::ImageAspectFlagBits::eDepth;
+          });
+      Require(name, "null comparison image",
+              null_binding.image_id != binding.image_id && null_image.info.data.Empty() &&
+                  null_image.backing.format == vk::Format::eD32Sfloat &&
+                  null_view != nullptr && null_depth_view,
+              "null comparison texture did not use a sampled D32 image");
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "sampled-depth direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "sampled-depth direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
                              size_t dword_count, bool device_address = false) {
@@ -26097,6 +26205,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
     CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
+    vulkan.CheckSampledDepthTextureDiscovery();
     CheckDepthComparisonBindings();
     RunCase(nullptr, ImageSampleOpcodeAliasUsesNormalCoords());
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
@@ -26213,6 +26322,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
+  vulkan.CheckSampledDepthTextureDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();

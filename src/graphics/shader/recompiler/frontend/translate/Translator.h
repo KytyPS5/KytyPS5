@@ -56,6 +56,7 @@ private:
 	void    WriteMask(const Decoder::Operand& operand, IR::U1 value);
 	void    WriteMask64(const Decoder::Operand& operand, IR::U1 value);
 	void    WriteCompareResult(const Decoder::Operand& operand, IR::U1 value);
+	IR::U1  WaveAny(IR::U1 value);
 
 	IR::MemoryFlags AddMemoryInfo(const IR::MemoryInfo& memory, uint32_t pc);
 	IR::ExportFlags AddExportInfo(const Decoder::Instruction& inst);
@@ -87,6 +88,7 @@ private:
 	bool          BUFFER_LOAD(const Decoder::Instruction& inst);
 	bool          BUFFER_STORE(const Decoder::Instruction& inst);
 	bool          BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	bool          BUFFER_ATOMIC_CMPSWAP(const Decoder::Instruction& inst);
 	bool          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	bool DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
 	bool FLAT_LOAD(const Decoder::Instruction& inst);

@@ -8,7 +8,6 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
-#include <bit>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -28,14 +27,6 @@ void Check(bool condition, const char *message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
-}
-
-bool SameResourceSnapshot(const ResourceSnapshot &lhs,
-                          const ResourceSnapshot &rhs) {
-  return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
-         lhs.samplers == rhs.samplers &&
-         lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data;
 }
 
 template <typename F>
@@ -259,7 +250,6 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
-  auto resource_plan = ExtractResourcePlan(fixture->program);
   EliminateDeadCode(fixture->program.blocks);
   ValidateProgram(fixture->program, true);
 
@@ -308,20 +298,24 @@ void TestInvariantIndirectImageMaterialization() {
                      .userdata = &memory,
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+  const auto same_snapshot = [](const ResourceSnapshot &lhs,
+                                const ResourceSnapshot &rhs) {
+    return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
+           lhs.samplers == rhs.samplers &&
+           lhs.flattened_srt == rhs.flattened_srt &&
+           lhs.user_data == rhs.user_data &&
+           lhs.indirect_images.empty() == rhs.indirect_images.empty();
+  };
+  Check(MaterializeResources(fixture->program, runtime, snapshot) &&
             snapshot.images.size() == 1 &&
             std::equal(image_descriptor.begin(), image_descriptor.end(),
                        snapshot.images[0].dwords.begin()),
         "invariant indirect image table did not materialize");
 
   const auto prior_snapshot = snapshot;
-  const auto prior_specialization = specialization;
   memory.fail_address = 0x1004u;
-  Check(!MaterializeResources(resource_plan, runtime, snapshot,
-                              specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
+  Check(!MaterializeResources(fixture->program, runtime, snapshot) &&
+            same_snapshot(snapshot, prior_snapshot),
         "rejected planning memory read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
 
@@ -336,9 +330,8 @@ void TestInvariantIndirectImageMaterialization() {
   memory.words[(0x2020u - memory.base) / 4u + 3u] =
       image_descriptor[3] ^ (1u << 28u);
   ResourceSnapshot null_snapshot;
-  ResourceSpecialization null_specialization;
-  Check(MaterializeResources(resource_plan, runtime, null_snapshot,
-                             null_specialization) &&
+  Check(MaterializeResources(fixture->program, runtime, null_snapshot) &&
+            null_snapshot.indirect_images.empty() &&
             std::ranges::all_of(null_snapshot.images[0].dwords,
                                 [](uint32_t dword) { return dword == 0u; }),
         "stale typed null image descriptors were not canonicalized");
@@ -352,25 +345,19 @@ void TestInvariantIndirectImageMaterialization() {
   memory.words[(0x2020u - memory.base) / 4u] ^= 1u;
   memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
   ResourceSnapshot dynamic_snapshot;
-  ResourceSpecialization dynamic_specialization;
-  Check(MaterializeResources(resource_plan, runtime, dynamic_snapshot,
-                             dynamic_specialization) &&
-            dynamic_snapshot.images.size() == 2 &&
-            dynamic_specialization.images.size() == 2,
+  Check(MaterializeResources(fixture->program, runtime, dynamic_snapshot) &&
+            dynamic_snapshot.images.size() == 1 &&
+            dynamic_snapshot.indirect_images.size() == 1 &&
+            dynamic_snapshot.indirect_images[0].descriptors.size() == 2,
         "dynamic indirect image table did not materialize");
-  ApplyResourceSpecialization(fixture->program, dynamic_specialization);
+  SpecializeResources(fixture->program, dynamic_snapshot);
   Check(fixture->program.info.images.size() == 2 &&
             fixture->program.info.images[0].indirect_root == 0 &&
-            fixture->program.info.images[0].indirect_search_iterations != 0 &&
+            fixture->program.info.images[0].indirect_mapping_capacity != 0 &&
             fixture->program.info.images[0].indirect_resources.size() == 2 &&
-            dynamic_snapshot.images.size() == 2,
+            dynamic_snapshot.images.size() == 2 &&
+            dynamic_snapshot.indirect_images.empty(),
         "dynamic indirect image table was not specialized transactionally");
-  const auto &mapping = dynamic_specialization.images[0];
-  const auto key_count = dynamic_snapshot.flattened_srt[mapping.indirect_mapping_offset];
-  Check(mapping.indirect_search_iterations == std::bit_width(key_count) &&
-            mapping.indirect_mapping_offset + 1u + key_count * 2u ==
-                dynamic_snapshot.flattened_srt.size(),
-        "indirect image mapping retained worst-case padding");
 
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
@@ -381,25 +368,22 @@ void TestInvariantIndirectImageMaterialization() {
   memory.words[(0x2000u - memory.base) / 4u] += 0x100u;
   memory.words[(0x2020u - memory.base) / 4u] += 0x101u;
   ResourceSnapshot rebound_snapshot;
-  ResourceSpecialization rebound_specialization;
-  Check(MaterializeResources(resource_plan, runtime, rebound_snapshot,
-                             rebound_specialization) &&
-            rebound_specialization == dynamic_specialization,
+  Check(MaterializeResources(fixture->program, runtime, rebound_snapshot) &&
+            ValidateResourceSpecialization(fixture->program, rebound_snapshot),
         "stable indirect key mapping did not accept changed image addresses");
   memory.words[(0x2020u - memory.base) / 4u] =
       memory.words[(0x2000u - memory.base) / 4u];
-  Check(MaterializeResources(resource_plan, runtime, rebound_snapshot,
-                             rebound_specialization) &&
-            rebound_specialization != dynamic_specialization,
-        "collapsed indirect candidates did not select a new specialization");
-  const auto collapsed_specialization = rebound_specialization;
+  Check(MaterializeResources(fixture->program, runtime, rebound_snapshot) &&
+            ValidateResourceSpecialization(fixture->program, rebound_snapshot),
+        "runtime indirect key mapping did not accept collapsed candidates");
+  const auto collapsed_snapshot = rebound_snapshot;
   ResourceSnapshot capacity_snapshot;
-  ResourceSpecialization capacity_specialization;
   for (const uint32_t records : {1u, 3u}) {
     user_data[2] = records;
-    Check(MaterializeResources(resource_plan, runtime, capacity_snapshot,
-                               capacity_specialization),
-          "runtime indirect key mapping rejected a valid material-table size");
+    Check(
+        MaterializeResources(fixture->program, runtime, capacity_snapshot) &&
+            ValidateResourceSpecialization(fixture->program, capacity_snapshot),
+        "runtime indirect key mapping rejected a fitting material-table size");
   }
   user_data[2] = 2u;
   memory.words[(0x2020u - memory.base) / 4u] =
@@ -411,14 +395,13 @@ void TestInvariantIndirectImageMaterialization() {
         image_descriptor[dword];
   }
   memory.words[(0x1000u - memory.base + 68u) / 4u] = 2u;
-  Check(MaterializeResources(resource_plan, runtime, rebound_snapshot,
-                             rebound_specialization) &&
-            rebound_specialization != collapsed_specialization,
-        "larger indirect candidate topology reused the old specialization");
+  Check(
+      !MaterializeResources(fixture->program, runtime, rebound_snapshot) &&
+          same_snapshot(rebound_snapshot, collapsed_snapshot),
+      "larger indirect candidate topology reused or mutated a cached snapshot");
 
   auto memory_backed = MakeIndirectImageFixture(false, 0u, true);
   memory_backed->PlanAndTrack();
-  auto memory_backed_plan = ExtractResourcePlan(memory_backed->program);
   EliminateDeadCode(memory_backed->program.blocks);
   std::array<uint32_t, 11> memory_backed_user_data{0x1000u, 224u << 16u, 2u, 0u,
                                                    0x2000u, 16u << 16u,  4u, 0u,
@@ -430,12 +413,9 @@ void TestInvariantIndirectImageMaterialization() {
                                    .userdata = &memory,
                                    .read_specialization_memory =
                                        ReadLinearTestMemory};
-  const auto memory_backed_prior_snapshot = snapshot;
-  const auto memory_backed_prior_specialization = specialization;
-  Check(!MaterializeResources(memory_backed_plan, memory_backed_runtime,
-                              snapshot, specialization) &&
-            SameResourceSnapshot(snapshot, memory_backed_prior_snapshot) &&
-            specialization == memory_backed_prior_specialization,
+  Check(!MaterializeResources(memory_backed->program, memory_backed_runtime,
+                              snapshot) &&
+            same_snapshot(snapshot, prior_snapshot),
         "rejected indirect table descriptor read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
 
@@ -748,7 +728,6 @@ void TestDynamicStorageMipTracking() {
   const auto mip2 = AddStore(12, true, Value(2u));
   const auto dynamic = AddStore(16, true, fixture.UserData(8));
   fixture.PlanAndTrack();
-  auto resource_plan = ExtractResourcePlan(fixture.program);
 
   const auto &images = fixture.program.info.images;
   Check(images.size() == 2 && images[0].mip_mode == ImageMipMode::None &&
@@ -779,23 +758,15 @@ void TestDynamicStorageMipTracking() {
        << 28u);
   descriptor.dwords[5] = 3u << 4u;
   descriptor.dword_count = 8;
-  std::array<uint32_t, 9> user_data{};
-  std::copy(descriptor.dwords.begin(), descriptor.dwords.end(),
-            user_data.begin());
-  user_data[8] = 2u;
-  SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot,
-                             specialization),
-        "dynamic storage resources did not materialize");
-  ApplyResourceSpecialization(fixture.program, specialization);
+  snapshot.images.assign(images.size(), descriptor);
+  SpecializeResources(fixture.program, snapshot);
   Check(fixture.program.info.images[1].mip_count == 3 &&
-            snapshot.images.size() == fixture.program.info.images.size(),
+            ValidateResourceSpecialization(fixture.program, snapshot),
         "base-1 through last-3 dynamic storage range was not specialized");
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
+  AllocateBindings(fixture.program, 0);
   const auto storage_kind = DescriptorBindingForImage(images[0]);
   Check(storage_kind.has_value(), "storage image has no descriptor binding");
   const auto *storage_binding =
@@ -804,58 +775,32 @@ void TestDynamicStorageMipTracking() {
             storage_binding->resources == std::vector<uint32_t>({0, 1, 1, 1}),
         "dynamic storage mip descriptors were not expanded consecutively");
 
-  Fixture null_fixture;
-  const auto null_handle = null_fixture.Image(
-      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-       Value(0u), Value(0u)});
-  const auto null_address = null_fixture.Emit(
-      ValueOpcode::MakeImageAddress,
-      {Value(0u), Value(0u), null_fixture.UserData(0), Value(0u), Value(0u),
-       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-       Value(0u), Value(0u)});
-  MemoryInfo null_memory;
-  null_memory.kind = ResourceKind::Image;
-  null_memory.image_dimension = Decoder::ImageDimension::Dim2D;
-  null_memory.image_address_components = 3u;
-  null_memory.image_has_mip = true;
-  const auto null_data = null_fixture.Emit(
-      ValueOpcode::CompositeConstructU32x4,
-      {Value(1u), Value(2u), Value(3u), Value(4u)});
-  null_fixture.Emit(ValueOpcode::ImageWrite,
-                    {null_handle, null_address, null_data, Value(true)},
-                    null_fixture.AddMemory(null_memory, 4));
-  null_fixture.PlanAndTrack();
-  auto null_plan = ExtractResourcePlan(null_fixture.program);
+  Program null_program;
+  null_program.resource_tracking_complete = true;
+  ImageResource null_image;
+  null_image.resource_class = ImageResourceClass::Storage;
+  null_image.dimension = Decoder::ImageDimension::Dim2D;
+  null_image.mip_mode = ImageMipMode::DynamicStorage;
+  null_image.written = true;
+  null_program.info.images.push_back(null_image);
   ResourceSnapshot null_snapshot;
-  ResourceSpecialization null_specialization;
-  const std::array<uint32_t, 1> null_user_data{0u};
-  Check(MaterializeResources(null_plan, {.user_data = null_user_data},
-                             null_snapshot, null_specialization),
-        "canonical null dynamic storage image did not materialize");
-  ApplyResourceSpecialization(null_fixture.program, null_specialization);
-  Check(null_fixture.program.info.images[0].mip_count == 1 &&
-            null_snapshot.images.size() == 1,
+  DescriptorValue null_descriptor{};
+  null_descriptor.dword_count = 8;
+  null_snapshot.images.push_back(null_descriptor);
+  SpecializeResources(null_program, null_snapshot);
+  Check(null_program.info.images[0].mip_count == 1 &&
+            ValidateResourceSpecialization(null_program, null_snapshot),
         "canonical null dynamic storage image did not retain one descriptor");
 
-  auto changed_user_data = user_data;
-  changed_user_data[3] =
-      (changed_user_data[3] & ~(0xfu << 16u)) | (2u << 16u);
-  ResourceSnapshot changed_snapshot;
-  ResourceSpecialization changed_specialization;
-  Check(MaterializeResources(resource_plan, {.user_data = changed_user_data},
-                             changed_snapshot, changed_specialization) &&
-            changed_specialization != specialization,
-        "a changed dynamic storage mip count reused the specialization key");
-  changed_user_data[3] =
-      (changed_user_data[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
+  snapshot.images[1].dwords[3] =
+      (snapshot.images[1].dwords[3] & ~(0xfu << 16u)) | (2u << 16u);
+  Check(!ValidateResourceSpecialization(fixture.program, snapshot),
+        "a changed dynamic storage mip count reused the specialization");
+  snapshot.images[1].dwords[3] =
+      (snapshot.images[1].dwords[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
       (4u << 12u) | (3u << 16u);
-  const auto valid_snapshot = changed_snapshot;
-  const auto valid_specialization = changed_specialization;
-  Check(!MaterializeResources(resource_plan, {.user_data = changed_user_data},
-                              changed_snapshot, changed_specialization) &&
-            SameResourceSnapshot(changed_snapshot, valid_snapshot) &&
-            changed_specialization == valid_specialization,
-        "an inverted dynamic storage mip range was accepted or mutated output");
+  Check(!ValidateResourceSpecialization(fixture.program, snapshot),
+        "an inverted dynamic storage mip range was accepted");
 }
 
 void TestSrtFlatteningAndRuntimeMemoization() {
@@ -898,7 +843,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
                      .userdata = &memory};
   std::vector<DescriptorValue> descriptors;
   std::vector<uint32_t> flat;
-  const uint32_t request = fixture.program.info.buffers[0].source;
+  const DescriptorSourceRequest request{fixture.program.info.buffers[0].source};
   Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
                                descriptors, flat, {}),
         "typed runtime source evaluation failed");
@@ -918,7 +863,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
 
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
+  AllocateBindings(fixture.program, 0);
   Check(FindBinding(fixture.program.bindings,
                     DescriptorBindingKind::FlattenedSrt) != nullptr,
         "flattened typed SRT reads did not receive a binding");
@@ -961,7 +906,7 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
-  AllocateBindings(fixture.program);
+  AllocateBindings(fixture.program, 0);
   Check(FindBinding(fixture.program.bindings,
                     DescriptorBindingKind::FlattenedSrt) == nullptr &&
             FindBinding(fixture.program.bindings,
@@ -1078,18 +1023,15 @@ void TestDmaAddressMaterialization() {
                {unbased, Value(0u), Value(0u), Value(9u), Value(true)},
                fixture.AddMemory(flat, 8));
   fixture.PlanAndTrack();
-  auto resource_plan = ExtractResourcePlan(fixture.program);
 
   Check(fixture.program.info.uses_dma,
         "typed address operations did not enable DMA");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot,
-                             specialization),
+  Check(MaterializeResources(fixture.program, runtime, snapshot),
         "DMA shader resources did not materialize");
-  ApplyResourceSpecialization(fixture.program, specialization);
+  SpecializeResources(fixture.program, snapshot);
 }
 
 void TestDynamicFlatAddressesUseDma() {
@@ -1111,16 +1053,13 @@ void TestDynamicFlatAddressesUseDma() {
   fixture.Emit(ValueOpcode::LoadAddressU8, {address, low, high, active},
                fixture.AddMemory(flat, 0xa4));
   fixture.PlanAndTrack();
-  auto resource_plan = ExtractResourcePlan(fixture.program);
 
   Check(fixture.program.info.uses_dma,
         "exec-masked FLAT address did not enable DMA");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot,
-                             specialization),
+  Check(MaterializeResources(fixture.program, runtime, snapshot),
         "exec-masked FLAT shader resources did not materialize");
 
   Fixture mismatch;
@@ -1156,7 +1095,6 @@ void TestBufferSwizzleSpecialization() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 4));
   fixture.PlanAndTrack();
-  auto resource_plan = ExtractResourcePlan(fixture.program);
 
   constexpr auto swizzle = Libs::Graphics::DstSel(4, 5, 0, 1);
   std::array<uint32_t, 4> user_data{
@@ -1168,22 +1106,16 @@ void TestBufferSwizzleSpecialization() {
           (1u << 24u)};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot,
-                             specialization),
+  Check(MaterializeResources(fixture.program, runtime, snapshot),
         "buffer resources did not materialize");
-  ApplyResourceSpecialization(fixture.program, specialization);
+  SpecializeResources(fixture.program, snapshot);
   Check(fixture.program.info.buffers[0].descriptor_swizzle == swizzle &&
-            specialization.buffers[0].descriptor_swizzle == swizzle,
+            ValidateResourceSpecialization(fixture.program, snapshot),
         "buffer destination selectors were not specialized");
 
-  user_data[3] ^= 1u << 9u;
-  ResourceSnapshot changed_snapshot;
-  ResourceSpecialization changed_specialization;
-  Check(MaterializeResources(resource_plan, runtime, changed_snapshot,
-                             changed_specialization) &&
-            changed_specialization != specialization,
-        "buffer swizzle change did not select a new specialization key");
+  snapshot.buffers[0].dwords[3] ^= 1u << 9u;
+  Check(!ValidateResourceSpecialization(fixture.program, snapshot),
+        "buffer swizzle change did not invalidate specialization");
 }
 
 void TestShaderInfoAndBindingLayout() {
@@ -1215,14 +1147,15 @@ void TestShaderInfoAndBindingLayout() {
                 StageInputKind::GlobalInvocationId,
         "typed shader values were not reflected in shader info");
 
-  AllocateBindings(fixture.program);
+  AllocateBindings(fixture.program, 0);
   Check(FindBinding(fixture.program.bindings, DescriptorBindingKind::Buffers) !=
                 nullptr &&
             FindBinding(fixture.program.bindings, DescriptorBindingKind::Gds) !=
                 nullptr &&
             FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::ShaderData) == nullptr &&
-	        fixture.program.bindings.UsesPushData(),
+                        DescriptorBindingKind::UserData) == nullptr &&
+            fixture.program.bindings.push_constant_size ==
+                fixture.program.bindings.ShaderDataDwords() * sizeof(uint32_t),
         "typed resources were not assigned native bindings");
   Check(NativeBinding(ShaderType::Compute, DescriptorBindingKind::Buffers) ==
                 static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
@@ -1247,7 +1180,7 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 39u &&
             static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 40u &&
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 41u &&
-            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 42u &&
+            static_cast<uint32_t>(DescriptorBindingKind::UserData) == 42u &&
             static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u,
         "native descriptor binding anchors changed");
 
@@ -1351,53 +1284,58 @@ void TestGraphicsPushConstantLayout() {
     }
     fixture.program.shader_info_complete = true;
   };
-  uint32_t cursor = 0;
-  Fixture pixel(ShaderType::Pixel);
-  AddUserData(pixel, 4);
-  AllocateBindings(pixel.program, cursor);
-  Check(
-      pixel.program.bindings.UsesPushData() &&
-          pixel.program.bindings.push_data_start_dword == 0 &&
-          FindBinding(pixel.program.bindings,
-                      DescriptorBindingKind::ShaderData) == nullptr,
-      "pixel shader did not start the shared push-data block");
-  pixel.program.bindings.AdvancePushData(cursor);
-
   Fixture vertex(ShaderType::Vertex);
   AddUserData(vertex, 9);
-  AllocateBindings(vertex.program, cursor);
-  Check(vertex.program.bindings.UsesPushData() &&
-            vertex.program.bindings.push_data_start_dword == 4,
-        "vertex shader did not follow pixel data in the shared push-data block");
-  vertex.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 13, "graphics push-data cursor advanced incorrectly");
+  AllocateBindings(vertex.program, 0);
+  Check(vertex.program.bindings.push_constant_offset == 0 &&
+            vertex.program.bindings.push_constant_size == 9 * sizeof(uint32_t),
+        "vertex shader was not placed at the start of the graphics push bank");
+
+  const auto pixel_offset = vertex.program.bindings.push_constant_size;
+  Fixture pixel(ShaderType::Pixel);
+  AddUserData(pixel, 4);
+  AllocateBindings(pixel.program, pixel_offset);
+  Check(
+      pixel.program.bindings.push_constant_offset == pixel_offset &&
+          pixel.program.bindings.push_constant_size == 4 * sizeof(uint32_t) &&
+          FindBinding(pixel.program.bindings,
+                      DescriptorBindingKind::UserData) == nullptr,
+      "pixel shader did not follow the vertex data in the graphics push bank");
 
   Fixture edge(ShaderType::Pixel);
-  AddUserData(edge, NativePushConstantSize / sizeof(uint32_t));
-  AllocateBindings(edge.program);
-  Check(edge.program.bindings.UsesPushData() &&
-            FindBinding(edge.program.bindings,
-                        DescriptorBindingKind::ShaderData) == nullptr,
-        "the full shared push-data block did not fit");
+  AddUserData(edge, 1);
+  AllocateBindings(edge.program, NativePushConstantSize - sizeof(uint32_t));
+  Check(edge.program.bindings.push_constant_size == sizeof(uint32_t),
+        "last aligned push-constant dword did not fit in the graphics bank");
 
   Fixture spill(ShaderType::Pixel);
-  AddUserData(spill, 20);
-  AllocateBindings(spill.program, cursor);
+  AddUserData(spill, 32);
+  AllocateBindings(spill.program, pixel_offset);
   Check(
-      !spill.program.bindings.UsesPushData() &&
-          spill.program.bindings.push_data_start_dword == PushData::NoStart &&
+      spill.program.bindings.push_constant_size == 0 &&
           FindBinding(spill.program.bindings,
-                      DescriptorBindingKind::ShaderData) != nullptr,
-      "a stage that exceeded the remaining shared push data did not spill to storage");
-  const auto spill_layout = spill.program.bindings;
-  spill.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 13, "a spilled stage consumed shared push-data space");
+                      DescriptorBindingKind::UserData) != nullptr,
+      "pixel shader overlapping the vertex push data did not spill to storage");
 
-  Fixture repeated_spill(ShaderType::Pixel);
-  AddUserData(repeated_spill, 20);
-  AllocateBindings(repeated_spill.program, 20);
-  Check(repeated_spill.program.bindings == spill_layout,
-        "storage fallback retained an irrelevant attempted push-data position");
+  Fixture full(ShaderType::Pixel);
+  AddUserData(full, 1);
+  AllocateBindings(full.program, NativePushConstantSize);
+  Check(full.program.bindings.push_constant_size == 0 &&
+            FindBinding(full.program.bindings,
+                        DescriptorBindingKind::UserData) != nullptr,
+        "full graphics push bank did not spill pixel user data to storage");
+
+  Fixture invalid(ShaderType::Pixel);
+  AddUserData(invalid, 1);
+  CheckFatal(
+      [&] {
+        AllocateBindings(invalid.program,
+                         NativePushConstantSize + sizeof(uint32_t));
+      },
+      "push-constant offset",
+      "push-constant placement beyond the graphics bank was accepted");
+  Check(!invalid.program.binding_layout_complete,
+        "push-constant placement beyond the graphics bank was accepted");
 }
 
 void TestResourceLimitIsTransactional() {

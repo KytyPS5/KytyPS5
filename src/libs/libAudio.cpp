@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "libatrac9.h"
 #include "libs/audio.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -728,13 +729,15 @@ struct AudiodecM4aacInfo {
 };
 
 struct AudiodecDecoder {
-	bool     used          = false;
-	uint32_t codec_type    = 0;
-	int32_t  word_size     = AUDIODEC_WORD_SZ_16BIT;
-	uint32_t channels      = 2;
-	uint32_t sample_rate   = 48000;
-	uint32_t frame_bytes   = AUDIODEC_MP3_MAX_FRAME_SIZE;
-	uint32_t frame_samples = AUDIODEC_MP3_MAX_FRAME_SAMPLES;
+	bool     used           = false;
+	uint32_t codec_type     = 0;
+	int32_t  word_size      = AUDIODEC_WORD_SZ_16BIT;
+	uint32_t channels       = 2;
+	uint32_t sample_rate    = 48000;
+	uint32_t frame_bytes    = AUDIODEC_MP3_MAX_FRAME_SIZE;
+	uint32_t frame_samples  = AUDIODEC_MP3_MAX_FRAME_SAMPLES;
+	uint8_t  config_data[4] = {};
+	void*    atrac9_handle  = nullptr;
 };
 
 static Common::Mutex                   g_audiodec_mutex;
@@ -945,11 +948,28 @@ static int32_t KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t 
 
 			switch (codec_type) {
 				case AUDIODEC_TYPE_AT9: {
-					auto* param           = static_cast<const AudiodecParamAt9*>(ctrl->pParam);
-					decoder.word_size     = param->iBwPcm;
-					decoder.channels      = 2;
-					decoder.frame_bytes   = AUDIODEC_AT9_MAX_FRAME_SIZE;
-					decoder.frame_samples = AUDIODEC_AT9_MAX_FRAME_SAMPLES;
+					auto* param       = static_cast<const AudiodecParamAt9*>(ctrl->pParam);
+					decoder.word_size = param->iBwPcm;
+					std::memcpy(decoder.config_data, param->uiConfigData, 4);
+					decoder.atrac9_handle = Atrac9GetHandle();
+					if (decoder.atrac9_handle != nullptr) {
+						if (Atrac9InitDecoder(decoder.atrac9_handle, decoder.config_data) == 0) {
+							Atrac9CodecInfo info {};
+							Atrac9GetCodecInfo(decoder.atrac9_handle, &info);
+							decoder.channels      = info.channels > 0 ? info.channels : 2;
+							decoder.sample_rate   = info.samplingRate > 0 ? info.samplingRate : 48000;
+							decoder.frame_samples = info.frameSamples > 0 ? info.frameSamples : 256;
+							decoder.frame_bytes   = info.superframeSize > 0 ? info.superframeSize : 256;
+						} else {
+							Atrac9ReleaseHandle(decoder.atrac9_handle);
+							decoder.atrac9_handle = nullptr;
+						}
+					}
+					if (decoder.atrac9_handle == nullptr) {
+						decoder.channels      = 2;
+						decoder.frame_bytes   = AUDIODEC_AT9_MAX_FRAME_SIZE;
+						decoder.frame_samples = AUDIODEC_AT9_MAX_FRAME_SAMPLES;
+					}
 					break;
 				}
 				case AUDIODEC_TYPE_MP3: {
@@ -997,6 +1017,11 @@ static int32_t KYTY_SYSV_ABI AudiodecDeleteDecoder(int32_t handle) {
 		return AUDIODEC_ERROR_INVALID_HANDLE;
 	}
 
+	if (decoder.atrac9_handle != nullptr) {
+		Atrac9ReleaseHandle(decoder.atrac9_handle);
+		decoder.atrac9_handle = nullptr;
+	}
+
 	decoder = {};
 
 	return 0;
@@ -1028,9 +1053,24 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 	                                   ? ctrl->pAuInfo->uiAuSize
 	                                   : decoder.frame_bytes;
 
-	std::memset(ctrl->pPcmItem->pPcmAddr, 0, produced_pcm);
-	ctrl->pPcmItem->uiPcmSize = produced_pcm;
-	ctrl->pAuInfo->uiAuSize   = consumed_data;
+	if (decoder.codec_type == AUDIODEC_TYPE_AT9 && decoder.atrac9_handle != nullptr) {
+		int bytes_used = 0;
+		if (decoder.word_size == AUDIODEC_WORD_SZ_FLOAT) {
+			Atrac9DecodeF32(decoder.atrac9_handle,
+			                static_cast<const unsigned char*>(ctrl->pAuInfo->pAuAddr),
+			                static_cast<float*>(ctrl->pPcmItem->pPcmAddr), &bytes_used, 0);
+		} else {
+			Atrac9Decode(decoder.atrac9_handle,
+			             static_cast<const unsigned char*>(ctrl->pAuInfo->pAuAddr),
+			             static_cast<short*>(ctrl->pPcmItem->pPcmAddr), &bytes_used, 0);
+		}
+		ctrl->pAuInfo->uiAuSize   = (bytes_used > 0 ? bytes_used : consumed_data);
+		ctrl->pPcmItem->uiPcmSize = produced_pcm;
+	} else {
+		std::memset(ctrl->pPcmItem->pPcmAddr, 0, produced_pcm);
+		ctrl->pPcmItem->uiPcmSize = produced_pcm;
+		ctrl->pAuInfo->uiAuSize   = consumed_data;
+	}
 	audiodec_fill_info(ctrl, decoder);
 
 	return 0;

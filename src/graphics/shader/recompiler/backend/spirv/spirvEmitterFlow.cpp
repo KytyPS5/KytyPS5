@@ -37,22 +37,29 @@ uint32_t EmitWqmWordU32(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
-	const auto shifted_one = state.builder.AllocateId();
-	const auto merged_one  = state.builder.AllocateId();
-	const auto shifted_two = state.builder.AllocateId();
-	const auto merged_two  = state.builder.AllocateId();
-	const auto quad_bits   = state.builder.AllocateId();
-	const auto result      = state.builder.AllocateId();
-	state.builder.AddFunction({OpShiftRightLogical, TypeU64(state), shifted_one, value,
-	                           ConstantU64(state, 0x0000000100000001ull)});
-	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), merged_one, value, shifted_one});
-	state.builder.AddFunction({OpShiftRightLogical, TypeU64(state), shifted_two, merged_one,
-	                           ConstantU64(state, 0x0000000200000002ull)});
-	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), merged_two, merged_one, shifted_two});
-	state.builder.AddFunction({OpBitwiseAnd, TypeU64(state), quad_bits, merged_two,
+	const auto s1 = state.builder.AllocateId();
+	const auto o1 = state.builder.AllocateId();
+	const auto s2 = state.builder.AllocateId();
+	const auto o2 = state.builder.AllocateId();
+	const auto s3 = state.builder.AllocateId();
+	const auto q  = state.builder.AllocateId();
+	const auto quad_bits = state.builder.AllocateId();
+	const auto result    = state.builder.AllocateId();
+
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU64(state), s1, value, ConstantU64(state, 1ull)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), o1, value, s1});
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU64(state), s2, value, ConstantU64(state, 2ull)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), o2, o1, s2});
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU64(state), s3, value, ConstantU64(state, 3ull)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU64(state), q, o2, s3});
+
+	state.builder.AddFunction({OpBitwiseAnd, TypeU64(state), quad_bits, q,
 	                           ConstantU64(state, 0x1111111111111111ull)});
 	state.builder.AddFunction(
-	    {OpIMul, TypeU64(state), result, quad_bits, ConstantU64(state, 0x0000000f0000000full)});
+	    {OpIMul, TypeU64(state), result, quad_bits, ConstantU64(state, 15ull)});
 	return result;
 }
 
@@ -274,6 +281,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 
 uint32_t MrtOutputMode(const EmitterState& state, const IR::ExportInfo& exp) {
 	if (state.stage != ShaderType::Pixel || exp.kind != IR::ExportTargetKind::Mrt ||
+	    state.input_info.pixel == nullptr ||
 	    exp.index >= std::size(state.input_info.pixel->target_output_mode)) {
 		return 0;
 	}
@@ -317,6 +325,23 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 4), vector, f32[0],
 		                           f32[1], f32[2], f32[3]});
 		return vector;
+	}
+	if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+	    !exp.compr && !uint_output && exp.en == 1u) {
+		const auto format = state.input_info.pixel != nullptr &&
+		                            exp.index < std::size(state.input_info.pixel->target_format)
+		                        ? state.input_info.pixel->target_format[exp.index]
+		                        : 0u;
+		const bool is_unorm8_target =
+		    format == static_cast<uint8_t>(Prospero::ChannelLayout::k8_8_8_8) ||
+		    (exp.index == 0u && format == 0u);
+		if (is_unorm8_target) {
+			const auto packed   = ExportRawComponent(ctx, data, 0);
+			const auto unpacked = state.builder.AllocateId();
+			state.builder.AddFunction({OpExtInst, TypeF32Vector(state, 4), unpacked,
+			                           GlslStd450(state), GlslUnpackUnorm4x8, packed});
+			return unpacked;
+		}
 	}
 	uint32_t raw[4] = {
 	    ConstantU32(state, 0),
@@ -487,7 +512,7 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
+		const bool uint_output = MrtUsesUintOutput(state, exp.index);
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
 		if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
@@ -511,6 +536,34 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 			     pointer, variable, ConstantU32(state, 0)});
 			state.builder.AddFunction({OpStore, pointer, value});
 		} else {
+			if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt && exp.index == 0 &&
+			    !exp.compr && uint_output) {
+				state.mrt0_packed_color = ExportRawComponent(ctx, data, 0);
+			}
+			if (state.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt && exp.index == 5) {
+				if (state.mrt0_packed_color != 0) {
+					const auto unpacked = state.builder.AllocateId();
+					state.builder.AddFunction({OpExtInst, TypeF32Vector(state, 4), unpacked,
+					                           GlslStd450(state), GlslUnpackUnorm4x8, state.mrt0_packed_color});
+					value = unpacked;
+				}
+			}
+			const bool is_shadow_post_pass =
+			    (state.program.shader_hash == 0xc3306bfb7dfc8f96 ||
+			     state.program.shader_hash == 0xc4ad0fc783e81479);
+			if (state.stage == ShaderType::Pixel && is_shadow_post_pass &&
+			    exp.kind == IR::ExportTargetKind::Mrt && exp.index == 0) {
+				const auto r = state.builder.AllocateId();
+				const auto g = state.builder.AllocateId();
+				const auto b = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeExtract, TypeF32(state), r, value, 0});
+				state.builder.AddFunction({OpCompositeExtract, TypeF32(state), g, value, 1});
+				state.builder.AddFunction({OpCompositeExtract, TypeF32(state), b, value, 2});
+				const auto modified = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 4), modified,
+				                           r, g, b, ConstantF32Value(state, 0.0f)});
+				value = modified;
+			}
 			state.builder.AddFunction({OpStore, variable, value});
 		}
 	});

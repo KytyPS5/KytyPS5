@@ -10,7 +10,6 @@ class QByteArray;
 class QGroupBox;
 class QListWidget;
 class QMoveEvent;
-class QResizeEvent;
 class QToolButton;
 class QSettings;
 class QWidget;
@@ -49,7 +48,6 @@ protected:
 	void AddGameDirectoryItem(const QString& dir);
 
 	void moveEvent(QMoveEvent* event) override;
-	void resizeEvent(QResizeEvent* event) override;
 
 	static QByteArray g_last_geometry;
 

@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <fmt/format.h>
 #include <span>
 #include <utility>
@@ -237,18 +238,29 @@ private:
 	}
 
 	const MemoryInfo* ScalarReadMemory(const Inst& read, uint32_t& index) const {
-		if (read.GetOpcode() != ValueOpcode::ReadConstBuffer || read.NumArgs() != 2u) {
-			return nullptr;
+		if (read.GetOpcode() == ValueOpcode::ReadConstBuffer && read.NumArgs() == 2u) {
+			index = read.Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				return nullptr;
+			}
+			const auto& memory = m_program.memory_info[index];
+			return memory.kind == ResourceKind::ScalarBuffer && memory.data_bits == 32u &&
+			               memory.data_dwords == 1u
+			           ? &memory
+			           : nullptr;
 		}
-		index = read.Flags<MemoryFlags>().index;
-		if (index >= m_program.memory_info.size()) {
-			return nullptr;
+		if (read.GetOpcode() == ValueOpcode::LoadAddressU32 && read.NumArgs() == 4u) {
+			index = read.Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				return nullptr;
+			}
+			const auto& memory = m_program.memory_info[index];
+			return memory.kind == ResourceKind::ScalarAddress && memory.data_bits == 32u &&
+			               memory.data_dwords == 1u
+			           ? &memory
+			           : nullptr;
 		}
-		const auto& memory = m_program.memory_info[index];
-		return memory.kind == ResourceKind::ScalarBuffer && memory.data_bits == 32u &&
-		               memory.data_dwords == 1u
-		           ? &memory
-		           : nullptr;
+		return nullptr;
 	}
 
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
@@ -269,12 +281,15 @@ private:
 		return true;
 	}
 
-	bool MakeRuntimeBufferSource(const Inst& handle, uint32_t pc, uint32_t& source,
-	                             DescriptorSource& descriptor) {
-		if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
+	bool MakeRuntimeBufferOrAddressSource(const Inst& handle, uint32_t pc, uint32_t& source,
+	                                      DescriptorSource& descriptor) {
+		if (handle.GetOpcode() == ValueOpcode::GetBufferResource) {
+			MakeSource(handle, 4u, false, false, descriptor, pc);
+		} else if (handle.GetOpcode() == ValueOpcode::GetAddressResource) {
+			MakeSource(handle, 2u, false, false, descriptor, pc);
+		} else {
 			return false;
 		}
-		MakeSource(handle, 4u, false, false, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
 			return false;
@@ -325,6 +340,7 @@ private:
 		std::array<Inst*, 8> heap_reads {};
 		Inst*                heap_handle = nullptr;
 		Value                heap_offset;
+		uint32_t             base_offset = 0;
 		for (uint32_t dword = 0; dword < heap_reads.size(); dword++) {
 			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
 			if (heap_reads[dword] == nullptr) {
@@ -332,8 +348,12 @@ private:
 			}
 			uint32_t    memory_index = 0;
 			const auto* memory       = ScalarReadMemory(*heap_reads[dword], memory_index);
-			if (memory == nullptr || memory->offset != dword * sizeof(uint32_t) ||
-			    !MemoryIndexBelongsTo(memory_index, *heap_reads[dword])) {
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *heap_reads[dword])) {
+				return false;
+			}
+			if (dword == 0u) {
+				base_offset = memory->offset;
+			} else if (memory->offset != base_offset + dword * sizeof(uint32_t)) {
 				return false;
 			}
 			auto* current_handle = heap_reads[dword]->Arg(0).Resolve().TryInstruction();
@@ -359,33 +379,79 @@ private:
 			return false;
 		}
 		auto* material_read = shift->Arg(0).Resolve().TryInstruction();
-		if (material_read == nullptr) {
-			return false;
-		}
 		uint32_t    material_memory_index = 0;
-		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
-		if (material_memory == nullptr || material_memory->offset != 0u ||
-		    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-			return false;
-		}
-		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-		if (material_handle == nullptr) {
-			return false;
+		const auto* material_memory       = material_read != nullptr
+		                                        ? ScalarReadMemory(*material_read, material_memory_index)
+		                                        : nullptr;
+		if (material_memory != nullptr && (material_memory->offset % sizeof(uint32_t)) == 0u &&
+		    MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+			if (material_handle == nullptr) {
+				return false;
+			}
+
+			Value    selector;
+			uint32_t selector_stride = 0;
+			uint32_t selector_offset = 0;
+			if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_stride,
+			                         selector_offset)) {
+				return false;
+			}
+			if (material_memory->offset != 0u) {
+				if (selector_offset != 0u) {
+					return false;
+				}
+				selector_offset = material_memory->offset;
+			}
+
+			const std::array<const Inst*, 1> material_users {shift};
+			std::array<const Inst*, 8>       heap_users {};
+			std::copy(heap_reads.begin(), heap_reads.end(), heap_users.begin());
+			const std::array<const Inst*, 1> image_users {&handle};
+			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, heap_users)) {
+				return false;
+			}
+			for (const auto* read: heap_reads) {
+				if (!UsesOnly(*read, image_users)) {
+					return false;
+				}
+			}
+
+			DescriptorSource material_source;
+			DescriptorSource heap_source;
+			uint32_t         material_source_index = 0;
+			uint32_t         heap_source_index     = 0;
+			if (!MakeRuntimeBufferOrAddressSource(*material_handle, pc, material_source_index,
+			                                     material_source) ||
+			    !MakeRuntimeBufferOrAddressSource(*heap_handle, pc, heap_source_index, heap_source)) {
+				return false;
+			}
+
+			DescriptorSource image_source;
+			image_source.dword_count = 8u;
+			std::copy(material_source.dwords.begin(), material_source.dwords.begin() + 4u,
+			          image_source.dwords.begin());
+			std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+			          image_source.dwords.begin() + 4u);
+			image_source.indirect_image = DescriptorSource::IndirectImage {
+			    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
+
+			plan.handle = &handle;
+			plan.source = InternSource(image_source);
+			plan.key    = Value(material_read);
+			plan.roots  = image_source.dwords;
+			return true;
 		}
 
-		Value    selector;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
-		if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_stride,
-		                         selector_offset)) {
-			return false;
-		}
-
-		const std::array<const Inst*, 1> material_users {shift};
-		std::array<const Inst*, 8>       heap_users {};
+		// Direct 1-level table in buffer/address space
+		std::array<const Inst*, 8> heap_users {};
 		std::copy(heap_reads.begin(), heap_reads.end(), heap_users.begin());
 		const std::array<const Inst*, 1> image_users {&handle};
-		if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, heap_users)) {
+		const auto IsAllowedShiftUser = [&](const Inst* user) {
+			return std::ranges::find(heap_users, user) != heap_users.end() ||
+			       user->GetOpcode() == ValueOpcode::Phi;
+		};
+		if (!std::ranges::all_of(shift->Uses(), [&](const Use& use) { return IsAllowedShiftUser(use.user); })) {
 			return false;
 		}
 		for (const auto* read: heap_reads) {
@@ -394,28 +460,24 @@ private:
 			}
 		}
 
-		DescriptorSource material_source;
 		DescriptorSource heap_source;
-		uint32_t         material_source_index = 0;
-		uint32_t         heap_source_index     = 0;
-		if (!MakeRuntimeBufferSource(*material_handle, pc, material_source_index,
-		                             material_source) ||
-		    !MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
+		uint32_t         heap_source_index = 0;
+		if (!MakeRuntimeBufferOrAddressSource(*heap_handle, pc, heap_source_index, heap_source)) {
 			return false;
 		}
 
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
-		std::copy(material_source.dwords.begin(), material_source.dwords.begin() + 4u,
-		          image_source.dwords.begin());
-		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
+		std::fill(image_source.dwords.begin(), image_source.dwords.end(), Value(0u));
+		std::copy(heap_source.dwords.begin(),
+		          heap_source.dwords.begin() + std::min<size_t>(heap_source.dword_count, 4u),
 		          image_source.dwords.begin() + 4u);
 		image_source.indirect_image = DescriptorSource::IndirectImage {
-		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
+		    UINT32_MAX, heap_source_index, 32u, base_offset, 0u};
 
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
-		plan.key    = Value(material_read);
+		plan.key    = shift->Arg(0).Resolve();
 		plan.roots  = image_source.dwords;
 		return true;
 	}
@@ -464,19 +526,33 @@ private:
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
-		if (expected == ValueOpcode::GetImageResource) {
-			for (; bad_dword < descriptor.dword_count; bad_dword++) {
-				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
-				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer) {
-					Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-					                     ValueOpcodeName(expected), bad_dword));
-				}
-			}
-			bad_dword = 0;
-		}
 		if (!ValidateSource(descriptor, bad_dword)) {
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			const auto val = descriptor.dwords[bad_dword].Resolve();
+			std::string extra;
+			if (const auto* val_inst = val.TryInstruction()) {
+				extra = fmt::format(" (inst opcode={} num_args={})",
+				                    std::string(ValueOpcodeName(val_inst->GetOpcode())), val_inst->NumArgs());
+				for (size_t a = 0; a < val_inst->NumArgs(); ++a) {
+					const auto arg = val_inst->Arg(a).Resolve();
+					if (const auto* ai = arg.TryInstruction()) {
+						extra += fmt::format(" [arg{}={}]", a, std::string(ValueOpcodeName(ai->GetOpcode())));
+					} else {
+						extra += fmt::format(" [arg{} type={}]", a, std::string(TypeName(arg.GetType())));
+					}
+				}
+			} else {
+				extra = fmt::format(" (non-inst type={})", std::string(TypeName(val.GetType())));
+			}
+			const auto* val_inst = val.TryInstruction();
+			if ((expected == ValueOpcode::GetSamplerResource && bad_dword < 3) ||
+			    (expected == ValueOpcode::GetImageResource && val_inst != nullptr &&
+			     val_inst->GetOpcode() == ValueOpcode::LoadAddressU32)) {
+				std::printf("warning: %s dword %u at pc=0x%08x is not a static runtime value, using fallback%s\n",
+				            std::string(ValueOpcodeName(expected)).c_str(), bad_dword, pc, extra.c_str());
+			} else {
+				Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
+				                     ValueOpcodeName(expected), bad_dword));
+			}
 		}
 		source = InternSource(descriptor);
 	}

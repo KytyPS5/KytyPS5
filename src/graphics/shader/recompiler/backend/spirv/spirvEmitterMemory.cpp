@@ -617,7 +617,6 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::BufferAtomicSwap32:
-		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return OpAtomicIAdd;
@@ -634,7 +633,6 @@ uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicAnd32:
 		case IR::ValueOpcode::SharedAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
-		case IR::ValueOpcode::BufferAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return OpAtomicXor;
@@ -674,33 +672,37 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	return return_value ? result : ConstantU32(ctx.state, 0);
 }
 
-uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
-                            const IR::MemoryInfo& mem) {
-	auto& state = ctx.state;
-	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
-		    const auto resource = PrepareStorageBufferResourceAccess(
-		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
-		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
-		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
-		                              ConstantU32(state, 3u));
-		    return EmitValueOrDefaultIfCondition(
-		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
-		        ConstantU64(state, 0), [&]() {
-			        const auto value = Unary(state, OpBitcast, TypeScalarU64(state),
-			                                 ctx.Arg(inst, inst.NumArgs() - 2));
-			        const auto old   = state.builder.AllocateId();
-			        state.builder.AddFunction(
-			            {AtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
-			             EmitStorageBufferElementPointer(
-			                 state, resource, index, TypeStorageBufferU64ElementPointer(state)),
-			             ConstantU32(state, ScopeDevice),
-			             ConstantU32(state, MemorySemanticsNone), value});
-			        EmitDeviceAtomicMemoryBarrier(state);
-			        return Unary(state, OpBitcast, TypeU64(state), old);
+uint32_t EmitAtomicCompareSwap(ValueEmitContext& ctx, const IR::Inst& inst,
+                              const IR::MemoryInfo& mem) {
+	const auto result =
+	    EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		    const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		    return EmitValueOrZeroIfCondition(
+		        ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
+		        [&]() {
+			        const auto value      = ctx.Arg(inst, inst.NumArgs() - 3);
+			        const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+			        const auto old        = ctx.state.builder.AllocateId();
+			        const auto scope =
+			            mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+			        ctx.state.builder.AddFunction(
+			            {OpAtomicCompareExchange, TypeU32(ctx.state), old,
+			             EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			             ConstantU32(ctx.state, scope), ConstantU32(ctx.state, MemorySemanticsNone),
+			             ConstantU32(ctx.state, MemorySemanticsNone), value, comparator});
+			        if (mem.kind == IR::ResourceKind::Lds) {
+				        const auto semantics =
+				            MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+				        ctx.state.builder.AddFunction({OpMemoryBarrier,
+				                                       ConstantU32(ctx.state, ScopeWorkgroup),
+				                                       ConstantU32(ctx.state, semantics)});
+			        } else {
+				        EmitDeviceAtomicMemoryBarrier(ctx.state);
+			        }
+			        return old;
 		        });
 	    });
+	return result;
 }
 
 uint32_t FloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
@@ -1111,15 +1113,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op                = inst.GetOpcode();
 	const auto buffer_components = IR::BufferComponentCount(op);
 	if (buffer_components > 1u) {
-		const auto access = IR::BufferAccessOf(op);
-		if (access == IR::BufferAccess::Read) {
+		if (IR::BufferAccessOf(op) == IR::BufferAccess::Read) {
 			ctx.Define(inst, LoadWideBuffer(ctx, inst, buffer_components));
-			return true;
-		}
-		if (access == IR::BufferAccess::Write) {
+		} else {
 			StoreWideBuffer(ctx, inst, buffer_components);
-			return true;
 		}
+		return true;
 	}
 	const auto shared_components = IR::SharedComponentCount(op);
 	if (shared_components > 1u) {
@@ -1211,12 +1210,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	const auto atomic_opcode = AtomicOpcode(op);
-	if (atomic_opcode != 0 && inst.GetType() == IR::Type::U64) {
-		ctx.Define(inst, EmitBufferAtomic64(ctx, inst, ctx.Memory(inst)));
-		return true;
-	}
 	if (atomic_opcode != 0) {
 		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
+		return true;
+	}
+	if (op == IR::ValueOpcode::BufferAtomicCompareAndSwap32) {
+		ctx.Define(inst, EmitAtomicCompareSwap(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {

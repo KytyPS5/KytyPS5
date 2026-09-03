@@ -10,9 +10,13 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include "spirv-tools/libspirv.hpp"
+
 #include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
+#include <fstream>
+#include <vector>
 
 using namespace Common;
 using namespace Emulator;
@@ -77,6 +81,7 @@ static void PrintUsage() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
+	::printf("  --enhanced-graphics                  Enable enhanced rendering (16x AF, fast clear, accurate Z-range).\n");
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
@@ -164,6 +169,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--playgo-hack") {
 			options.config.playgo_hack_enabled = true;
+			continue;
+		}
+
+		if (arg == "--enhanced-graphics" || arg == "--enhanced-gfx") {
+			options.config.enhanced_graphics = true;
 			continue;
 		}
 
@@ -328,7 +338,38 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// Read-only diagnostic: disassemble a .spv file to stdout and exit. Runs single-threaded before
+// any emulator init, so it avoids the compile-thread concurrency that made in-flight disassembly
+// crash. Used to inspect generated Bink decode shaders (barrier placement vs LDS ops).
+static int DisassembleSpvFile(const char* path) {
+	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	if (!file) {
+		::printf("cannot open %s\n", path);
+		return 1;
+	}
+	const auto size_bytes = static_cast<size_t>(file.tellg());
+	file.seekg(0);
+	std::vector<uint32_t> words(size_bytes / 4);
+	file.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(words.size() * 4));
+
+	spvtools::SpirvTools core(SPV_ENV_VULKAN_1_3);
+	std::string          text;
+	if (!core.Disassemble(words.data(), words.size(), &text,
+	                      static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
+	                          static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
+	                          static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT))) {
+		::printf("disassemble failed for %s\n", path);
+		return 1;
+	}
+	::printf("%s\n", text.c_str());
+	return 0;
+}
+
 int main(int argc, char* argv[]) {
+	if (argc == 3 && std::string(argv[1]) == "--disasm-spv") {
+		return DisassembleSpvFile(argv[2]);
+	}
+
 	VirtualMemory::Init();
 	InitializeThreads();
 

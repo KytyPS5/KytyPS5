@@ -274,6 +274,8 @@ To use the graphical launcher:
 
 ```powershell
 .\_Build\windows\install\launcher.exe
+# or from build directory:
+.\_Build\windows\launcher.exe
 ```
 
 ```bash
@@ -288,22 +290,37 @@ On first launch, add one or more game folders in the global settings. The launch
 folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
 from the game list.
 
-The emulator can also be started directly with a legally obtained game directory or ELF file:
+The emulator can also be started directly from the command line with a game directory (containing `eboot.bin` or `sce_sys/` + `eboot.bin`) or an ELF file:
 
 ```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+# Windows (PowerShell / CMD):
+.\_Build\windows\kyty_emulator.exe --game "D:\Games\PPSA01341-app0" --enhanced-graphics
 ```
 
 ```bash
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
+# Linux:
+./_Build/linux/kyty_emulator --game "/games/PPSA01341-app0" --enhanced-graphics
 ```
+
+```bash
+# macOS:
+./_Build/macos/kyty_emulator --game "/games/PPSA01341-app0" --enhanced-graphics
+```
+
+### Useful Command-Line Arguments
+
+| Flag | Description |
+| --- | --- |
+| `--game "<path>"` | Path to the game folder containing `eboot.bin` or path directly to `eboot.bin`. |
+| `--enhanced-graphics` | Enables modern enhanced graphics renderer (recommended for 3D titles and PS5 shaders). |
+| `--fullscreen` | Runs the emulator window in fullscreen mode. |
+| `--printf-direction <Console\|File\|Silent>` | Controls standard log output (default: `Console`). |
+| `--printf-output-file "<file>"` | Destination file when `--printf-direction File` is used. |
+| `--shader-log-direction <Console\|File\|Silent>` | Controls shader compiler log output. |
+| `--graphics-debug-dump <true\|false>` | Dumps GPU command streams and shaders for debugging (default: `false`). |
 
 On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
-environment variable is required:
-
-```bash
-./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
-```
+environment variable is required.
 
 To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
 
@@ -311,8 +328,7 @@ To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
 SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
 ```
 
-Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
+Run `kyty_emulator --help` to see all available graphics, audio, logging, validation, profiling, and debugging options.
 
 ### AI Use
 

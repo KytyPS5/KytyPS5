@@ -576,7 +576,6 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
-		case IR::ValueOpcode::ImageAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicUMin32: return OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicUMax32: return OpAtomicUMax;
@@ -807,7 +806,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
-		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
+		if (state.flattened_srt_variable == 0 || image.indirect_mapping_capacity == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return true;
@@ -825,7 +824,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		auto       low      = ConstantU32(state, 0u);
 		auto       high     = LoadMapping(mapping);
 		auto       selected = ConstantU32(state, 0u);
-		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
+		for (uint32_t iteration = 0; iteration < std::bit_width(image.indirect_mapping_capacity);
 		     iteration++) {
 			const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
 			const auto mid =

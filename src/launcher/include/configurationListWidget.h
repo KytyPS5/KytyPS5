@@ -11,7 +11,6 @@
 
 class ConfigurationItem;
 class CompatibilityDatabase;
-class QEvent;
 class QTreeWidgetItem;
 class QPoint;
 class MainDialog;
@@ -53,9 +52,6 @@ signals:
 	void Run();
 	void Select();
 
-protected:
-	void changeEvent(QEvent* event) override;
-
 public slots:
 	void WriteSettings();
 	void ReadSettings();
@@ -78,7 +74,6 @@ private:
 	void               ClearCustomSettings(ConfigurationItem* item);
 	void               SelectItem(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
-	void               UpdateToolbarIcons();
 	[[nodiscard]] bool HasValidGameDirectory() const;
 
 	ConfigurationItem*            m_selected_item = nullptr;

@@ -738,6 +738,16 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
+IR::U1 Translator::WaveAny(IR::U1 value) {
+	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {value});
+	const auto low    = ir.CompositeExtract(ballot, 0);
+	if (current_wave_size == 32u) {
+		return ir.INotEqual(low, IR::U32(IR::Value(0u)));
+	}
+	const auto high = ir.CompositeExtract(ballot, 1);
+	return ir.INotEqual(ir.BitwiseOr(low, high), IR::U32(IR::Value(0u)));
+}
+
 void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info) {
 	if (source.terminator.goto_value >= 0) {
 		if (source.terminator.goto_variable == UINT32_MAX) {
@@ -761,15 +771,32 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
+	// RDNA2 scalar branches (S_CBRANCH_VCCZ, S_CBRANCH_EXECZ, etc.) branch the entire wavefront
+	// based on the wave-wide mask, not individual invocations. Using WaveAny ensures all
+	// invocations in the wave/subgroup stay converged across loops and convergent operations.
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
+		case CFG::BranchCondition::VccZero: {
+			if (source.terminator.loop_header || source.terminator.continue_block != UINT32_MAX) {
+				const auto active = ir.LogicalAnd(ir.GetExec(), ir.GetVcc());
+				condition = ir.LogicalNot(WaveAny(active));
+			} else {
+				condition = ir.LogicalNot(ir.GetVcc());
+			}
+			break;
+		}
+		case CFG::BranchCondition::VccNonZero: {
+			if (source.terminator.loop_header || source.terminator.continue_block != UINT32_MAX) {
+				const auto active = ir.LogicalAnd(ir.GetExec(), ir.GetVcc());
+				condition = WaveAny(active);
+			} else {
+				condition = ir.GetVcc();
+			}
+			break;
+		}
 		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
 		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
 		case CFG::BranchCondition::GotoVariable:

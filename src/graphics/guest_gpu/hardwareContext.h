@@ -551,6 +551,8 @@ struct ShaderRegisters {
 
 	uint32_t shader_z_format       = 0;
 	uint8_t  target_output_mode[8] = {};
+	uint8_t  target_channel_type[8] = {};
+	uint8_t  target_format[8]       = {};
 	uint32_t ps_input_ena          = 0;
 	uint32_t ps_input_addr         = 0;
 	uint32_t ps_in_control         = 0;
@@ -626,7 +628,31 @@ public:
 
 	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
 	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; }
-	void SetColorInfo(uint32_t slot, const ColorInfo& info) { m_render_targets[slot].info = info; }
+	void SetColorInfo(uint32_t slot, const ColorInfo& info) {
+		m_render_targets[slot].info = info;
+		if (slot < 8) {
+			m_sh_regs.target_channel_type[slot] = static_cast<uint8_t>(info.channel_type);
+			m_sh_regs.target_format[slot]       = static_cast<uint8_t>(info.format);
+		}
+	}
+	void SyncShaderRenderTargetFormats() {
+		for (uint32_t slot = 0; slot < 8; slot++) {
+			m_sh_regs.target_channel_type[slot] =
+			    static_cast<uint8_t>(m_render_targets[slot].info.channel_type);
+			m_sh_regs.target_format[slot] =
+			    static_cast<uint8_t>(m_render_targets[slot].info.format);
+		}
+	}
+	void SetTargetChannelType(uint32_t slot, uint8_t value) {
+		if (slot < 8) {
+			m_sh_regs.target_channel_type[slot] = value;
+		}
+	}
+	void SetTargetFormat(uint32_t slot, uint8_t value) {
+		if (slot < 8) {
+			m_sh_regs.target_format[slot] = value;
+		}
+	}
 	void SetColorAttrib(uint32_t slot, const ColorAttrib& attrib) {
 		m_render_targets[slot].attrib = attrib;
 	}

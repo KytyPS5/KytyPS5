@@ -1,15 +1,18 @@
 #include "mainDialog.h"
-#include "launcherTheme.h"
 
 #include <QApplication>
 #include <QArgument>
 #include <QObject>
+#include <QStyleFactory>
+
+class QStyle;
 
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
-	LauncherTheme::Initialize(a);
+	MainDialog   w;
 
-	MainDialog w;
+	QStyle* s = QStyleFactory::create("fusion");
+	QApplication::setStyle(s);
 
 	QObject::connect(&a, &QApplication::aboutToQuit, &w, &MainDialog::Quit);
 

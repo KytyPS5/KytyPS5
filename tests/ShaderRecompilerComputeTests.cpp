@@ -8496,6 +8496,14 @@ public:
       phased_depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
       phased_depth_target.stencil_info.texture_compatibility =
           Prospero::TextureCompatibleStencil::kEnable;
+      // Hi-Stencil has to be on for this case: the assertion below requires
+      // metadata.stencil_compressed, which ResolveRenderDepthTarget derives from
+      // has_stencil && has_htile && !htile_stencil_disabled. Production always
+      // reaches that field through DepthStencilInfo::Decode, which writes every
+      // member, so only a directly constructed register like this one depends on
+      // the member default, and depending on it is what made this case silently
+      // change meaning when the default flipped.
+      phased_depth_target.stencil_info.htile_stencil_disabled = false;
       phased_depth_target.z_read_base_addr = phased_depth_address;
       phased_depth_target.z_write_base_addr = phased_depth_address;
       phased_depth_target.stencil_read_base_addr = phased_stencil_address;

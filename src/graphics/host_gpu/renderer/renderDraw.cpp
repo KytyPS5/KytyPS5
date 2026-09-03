@@ -335,7 +335,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	EXIT_IF(colors == nullptr);
 	const auto& ctx = buffer.GetRegisters();
 
-	const auto&  vp = ctx.GetScreenViewport();
+	const auto& vp            = ctx.GetScreenViewport();
+	const auto& viewport_regs = vp.viewports[0];
+	const auto& clip_control   = ctx.GetClipControl();
 	vk::Extent2D framebuffer_extent {};
 	if (color_count > 0 && colors[0].image_id) {
 		framebuffer_extent = colors[0].extent;
@@ -349,20 +351,21 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const auto final_scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent);
 
 	vk::Viewport viewport {};
-	if (ctx.GetClipControl().clip_disable) {
+	if (clip_control.clip_disable) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		viewport.x         = 0.0f;
 		viewport.y         = 0.0f;
 		viewport.width     = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
 		viewport.height    = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
 	} else {
-		viewport.x      = vp.viewports[0].xoffset - vp.viewports[0].xscale;
-		viewport.y      = vp.viewports[0].yoffset - vp.viewports[0].yscale;
-		viewport.width  = vp.viewports[0].xscale * 2.0f;
-		viewport.height = vp.viewports[0].yscale * 2.0f;
+		viewport.x      = viewport_regs.xoffset - viewport_regs.xscale;
+		viewport.y      = viewport_regs.yoffset - viewport_regs.yscale;
+		viewport.width  = viewport_regs.xscale * 2.0f;
+		viewport.height = viewport_regs.yscale * 2.0f;
 	}
-	viewport.minDepth = vp.viewports[0].zoffset;
-	viewport.maxDepth = vp.viewports[0].zscale + vp.viewports[0].zoffset;
+	viewport.minDepth =
+	    viewport_regs.zoffset - (clip_control.dx_clip_space ? 0.0f : viewport_regs.zscale);
+	viewport.maxDepth = viewport_regs.zoffset + viewport_regs.zscale;
 	vk_buffer.setViewport(0, 1, &viewport);
 
 	vk::Rect2D scissor {};

@@ -119,8 +119,7 @@ uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class) {
 namespace {
 
 uint32_t PushConstantArrayType(EmitterState& state) {
-	const auto count =
-	    ConstantU32(state, state.program.bindings.push_constant_size / sizeof(uint32_t));
+	const auto count = ConstantU32(state, IR::PushData::DwordCount);
 	return state.builder.DecoratedType(OpTypeArray, {TypeU32(state), count},
 	                                   {{OpDecorate, {DecorationArrayStride, sizeof(uint32_t)}}});
 }
@@ -128,7 +127,7 @@ uint32_t PushConstantArrayType(EmitterState& state) {
 uint32_t PushConstantBlockType(EmitterState& state) {
 	return state.builder.DecoratedType(
 	    OpTypeStruct, {PushConstantArrayType(state)},
-	    {{OpMemberDecorate, {0, DecorationOffset, state.program.bindings.push_constant_offset}},
+	    {{OpMemberDecorate, {0, DecorationOffset, 0}},
 	     {OpDecorate, {DecorationBlock}}});
 }
 
@@ -173,14 +172,14 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.fault_buffer_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
-	if (state.program.bindings.push_constant_size != 0) {
+	if (state.program.bindings.UsesPushData()) {
 		const auto pointer_type =
 		    TypePointer(state, StorageClassPushConstant, PushConstantBlockType(state));
 		state.push_constant_variable =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassPushConstant);
 	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::UserData) != nullptr) {
-		state.vsharp_storage_variable = state.builder.DefineGlobalVariable(
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::ShaderData) != nullptr) {
+		state.shader_data_storage_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
@@ -604,9 +603,9 @@ void AddVsharpAnnotationsAndNames(EmitterState& state) {
 		state.builder.AddName(PushConstantBlockType(state), "BufferResource");
 		state.builder.AddName(state.push_constant_variable, "vsharp");
 	}
-	if (state.vsharp_storage_variable != 0) {
-		DecorateDescriptor(state, state.vsharp_storage_variable, "user_data",
-		                   IR::DescriptorBindingKind::UserData);
+	if (state.shader_data_storage_variable != 0) {
+		DecorateDescriptor(state, state.shader_data_storage_variable, "shader_data",
+		                   IR::DescriptorBindingKind::ShaderData);
 	}
 }
 

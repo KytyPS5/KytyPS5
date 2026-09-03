@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -11,7 +12,9 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
@@ -20,13 +23,14 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
-
-#include <fmt/format.h>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -84,42 +88,188 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 	static_params.scissor_ltrb[3] = 1;
 }
 
+bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
+
+void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
+                     const std::vector<uint32_t>& spirv) {
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
+	static std::atomic_int id = 0;
+	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
+	                                                             id++, stage_name, shader_hash);
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path, Common::File::Mode::Write);
+	if (file.IsInvalid()) {
+		const auto path_text = Common::PathToString(path);
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+		return;
+	}
+	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
+                        std::span<const uint32_t> code, const std::string& decoded_dump) {
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
+	EXIT_IF(code.empty());
+	static std::atomic_int id = 0;
+	const auto base = Config::GetShaderLogFolder() / "original" /
+	                  fmt::format("{:04d}_new_shader_{}_{:016x}", id++, stage_name, shader_hash);
+	Common::File::CreateDirectories(base.parent_path());
+	for (const auto& [suffix, data, size]: {
+	         std::tuple {".bin", static_cast<const void*>(code.data()), code.size_bytes()},
+	         std::tuple {".rdna2", static_cast<const void*>(decoded_dump.data()),
+	                     decoded_dump.size()},
+	     }) {
+		if (size == 0) {
+			continue;
+		}
+		auto path = base;
+		path += suffix;
+		Common::File file(path, Common::File::Mode::Write);
+		if (file.IsInvalid()) {
+			const auto path_text = Common::PathToString(path);
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+		} else {
+			file.Write(data, size);
+		}
+	}
+}
+
+bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
+                         const std::vector<uint32_t>& spirv) {
+	if (!Config::ShaderValidationEnabled()) {
+		return true;
+	}
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	std::string          messages;
+	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
+	                                     const spv_position_t& position, const char* message) {
+		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
+		                        static_cast<int>(position.column), static_cast<int>(position.index),
+		                        message);
+	});
+	if (tools.Validate(spirv)) {
+		return true;
+	}
+	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
+	std::string          text;
+	disassembler.Disassemble(spirv, &text,
+	                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
+	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
+	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
+	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
+	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
+	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
+	           label, shader_hash, messages.c_str());
+	LOGF("%s\n", text.c_str());
+	return false;
+}
+
 } // namespace
 
 struct PipelineCache::ProgramCache {
-	struct SourceKey {
-		ShaderType stage = ShaderType::Unknown;
-		uint64_t   hash  = 0;
+	struct ProgramKey {
+		ShaderType            stage           = ShaderType::Unknown;
+		uint64_t              hash            = 0;
+		uint32_t              user_data_count = 0;
+		uint32_t              code_size       = 0;
+		std::vector<uint32_t> static_state;
 
-		bool operator==(const SourceKey&) const = default;
+		bool operator==(const ProgramKey&) const = default;
 	};
 
 	struct Permutation {
-		std::vector<uint32_t>                               static_key;
-		std::shared_ptr<const ShaderRecompiler::IR::Program> program;
-		ShaderProgram                                       handle;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::CompiledShaderInfo     program;
+		ShaderProgram                                handle;
 	};
 
-	struct SourceKeyHash {
-		std::size_t operator()(const SourceKey& key) const {
+	struct SourceEntry {
+		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
+		    : resource_plan(std::move(plan)) {
+			permutations.reserve(8);
+		}
+
+		ShaderRecompiler::IR::ResourcePlan resource_plan;
+		std::vector<Permutation>           permutations;
+	};
+
+	struct ProgramKeyHash {
+		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
 			PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.hash));
 			if constexpr (sizeof(std::size_t) < sizeof(uint64_t)) {
 				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(key.hash >> 32u));
 			}
+			PipelineKeyHash::Mix(hash, key.user_data_count);
+			PipelineKeyHash::Mix(hash, key.code_size);
+			PipelineKeyHash::Mix(hash, key.static_state.size());
+			// Bucket same-shape static variants by source. ProgramKey equality performs the one
+			// exact state comparison needed on a stable hit without hashing up to 429 words first.
 			return hash;
 		}
 	};
 
-	static uint64_t MixId(uint64_t hash, uint64_t value) {
-		return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u));
+	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
+
+	template <ShaderType Stage>
+	Permutation CompilePermutation(const ShaderParams&                          params,
+	                               const ShaderRecompiler::CompileOptions&      options,
+	                               ShaderRecompiler::TranslateResult            translated,
+	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
+	                               uint32_t push_data_start_dword) {
+		constexpr const char* stage_name = [] {
+			if constexpr (Stage == ShaderType::Vertex) {
+				return "vs";
+			} else if constexpr (Stage == ShaderType::Pixel) {
+				return "ps";
+			} else {
+				static_assert(Stage == ShaderType::Compute);
+				return "cs";
+			}
+		}();
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                               specialization, push_data_start_dword);
+		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
+			     options.shader_hash);
+		}
+		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+
+		vk::ShaderModuleCreateInfo create_info {};
+		create_info.sType       = vk::StructureType::eShaderModuleCreateInfo;
+		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
+		create_info.pCode       = result.spirv.data();
+		vk::ShaderModule module = nullptr;
+		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
+		                     "create recompiled shader module");
+		EXIT_IF(module == nullptr);
+		if (options.dump_ir) {
+			if (!options.early_dump) {
+				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());
+				LOGF("%s IR:\n%s", options.dump_label, result.ir_dump.c_str());
+			}
+			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
+			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+		}
+		return {
+		    .specialization = std::move(specialization),
+		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .handle         = {.id = ++next_shader_id, .module = module},
+		};
 	}
 
-	static constexpr std::size_t MaxStaticKeyWords =
-	    12 + ShaderVertexInputInfo::RES_MAX * 17;
-
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info) {
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
+	                  uint32_t& push_data_cursor) {
 		constexpr ShaderType stage = [] {
 			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 				return ShaderType::Vertex;
@@ -131,36 +281,106 @@ struct PipelineCache::ProgramCache {
 			}
 		}();
 
-		BuildStageStaticKey(input_info, key_scratch);
-		auto& permutations = programs[{stage, params.hash}];
-		for (const auto& permutation: permutations) {
-			if (permutation.static_key == key_scratch &&
-			    MaterializeProgram(permutation.program, params, input_info)) {
-				return permutation.handle;
+		lookup_key.stage           = stage;
+		lookup_key.hash            = params.hash;
+		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, lookup_key.static_state);
+		auto                                         entry = programs.find(lookup_key);
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		    .user_data                  = params.user_data,
+		    .shader_base                = params.Base(),
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		};
+		if (entry != programs.end()) {
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    entry->second.resource_plan, runtime, resources, specialization));
+			if (const auto permutation = std::ranges::find_if(
+			        entry->second.permutations, [&](const Permutation& candidate) {
+				        const auto& layout = candidate.program.bindings;
+				        return layout.push_data_start_dword ==
+				                   ShaderRecompiler::IR::PushData::StartFor(
+				                       push_data_cursor, layout.ShaderDataDwords()) &&
+				               candidate.specialization == specialization;
+			        });
+			    permutation != entry->second.permutations.end()) {
+				input_info.stage = {.program   = &permutation->program,
+				                    .resources = std::move(resources)};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
 			}
 		}
 
-		const auto module = CompileProgram(device, params, input_info);
-		EXIT_IF(module == nullptr || !input_info.stage);
-		uint64_t id = MixId(MixId(params.hash, static_cast<uint64_t>(stage)), permutations.size());
-		if (id == 0) {
-			id = 1;
+		ShaderStageInputInfo stage_input {};
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage_input.vertex = &input_info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage_input.pixel = &input_info;
+		} else {
+			stage_input.compute = &input_info;
 		}
-		const ShaderProgram handle {.id = id, .module = module};
-		permutations.push_back({key_scratch, input_info.stage.program, handle});
+		constexpr const char* label = [] {
+			if constexpr (stage == ShaderType::Vertex) {
+				return "ShaderRecompiler VS";
+			} else if constexpr (stage == ShaderType::Pixel) {
+				return "ShaderRecompiler PS";
+			} else {
+				return "ShaderRecompiler CS";
+			}
+		}();
+		ShaderRecompiler::CompileOptions options;
+		options.stage       = stage;
+		options.shader_hash = params.hash;
+		options.user_data   = params.user_data;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+		options.early_dump  = options.dump_ir;
+		options.dump_label  = label;
+		options.input_info  = stage_input;
+		if constexpr (stage == ShaderType::Vertex) {
+			options.user_data_base = 8;
+			options.scratch_dwords = input_info.scratch_size_dwords;
+		} else if constexpr (stage == ShaderType::Pixel) {
+			options.scratch_dwords = input_info.scratch_size_dwords;
+		} else {
+			options.scratch_dwords = input_info.scratch_size_dwords;
+			options.wave_size      = input_info.wave_size;
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (entry == programs.end()) {
+			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+			                                                    specialization));
+			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+		}
+		entry->second.permutations.push_back(CompilePermutation<stage>(
+		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		const auto& permutation = entry->second.permutations.back();
+		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
+		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::printf("Num compiled %u shaders\n", ++num_compiled);
-		return handle;
+		return permutation.handle;
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
-		key_scratch.reserve(MaxStaticKeyWords);
+		lookup_key.static_state.reserve(MaxStaticKeyWords);
+	}
+	~ProgramCache() {
+		for (const auto& [key, entry]: programs) {
+			(void)key;
+			for (const auto& permutation: entry.permutations) {
+				device.destroyShaderModule(permutation.handle.module, nullptr);
+			}
+		}
 	}
 
-	std::unordered_map<SourceKey, std::vector<Permutation>, SourceKeyHash> programs;
-	std::vector<uint32_t> key_scratch;
-	vk::Device device;
-	uint32_t   num_compiled = 0;
+	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	ProgramKey                                                  lookup_key;
+	vk::Device                                                  device;
+	uint32_t                                                    num_compiled   = 0;
+	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -181,12 +401,6 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
-	for (const auto& [key, permutations]: m_program_cache->programs) {
-		(void)key;
-		for (const auto& permutation: permutations) {
-			m_graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
-		}
-	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -212,7 +426,7 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -224,7 +438,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -236,7 +450,8 @@ void PipelineCache::InitializeDriverCache() {
 			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
 			          &signature_read);
 			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()), &payload_read);
+			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
+			          &payload_read);
 			file.Close();
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
 			    payload_read != initial_data.size() || cached_signature != signature ||
@@ -248,8 +463,7 @@ void PipelineCache::InitializeDriverCache() {
 			}
 		} else {
 			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)",
-			                 path);
+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
 		}
 	}
 
@@ -308,7 +522,7 @@ void PipelineCache::Save() {
 		return;
 	}
 	payload.resize(size);
-	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
@@ -338,15 +552,20 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
-ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
-                                              const HW::ShaderRegisters&  sh,
-                                              const HW::Context&          context,
-                                              ShaderVertexInputInfo&      input_info) {
-	const auto params = PrepareProgram(regs, sh, input_info);
+PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
+	ShaderParams pixel_params;
+	if (pixel_active) {
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = input_info.clip_space;
+		auto&       clip     = vertex_info.clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
 		clip.offset[0]       = viewport.xoffset;
@@ -358,26 +577,23 @@ ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
 		clip.enabled = true;
 	}
 	Common::LockGuard lock(m_mutex);
-	return m_program_cache->Get(params, input_info);
-}
-
-ShaderProgram PipelineCache::GetPixelProgram(
-    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    const ShaderVertexInputInfo&                        vertex_info,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               input_info) {
-	const auto params = PrepareProgram(regs, sh, vertex_info, target_export_mapping, input_info);
-	Common::LockGuard lock(m_mutex);
-	return m_program_cache->Get(params, input_info);
+	uint32_t          push_data_cursor = 0;
+	GraphicsPrograms  result;
+	if (pixel_active) {
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+	}
+	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	return result;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.needs_lds_barriers = !m_graphics.compute_wave64_supported;
-	const auto params             = PrepareProgram(regs, sh, input_info);
+	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
-	return m_program_cache->Get(params, input_info);
+	uint32_t          push_data_cursor = 0;
+	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
@@ -401,8 +617,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	Common::LockGuard lock(m_mutex);
 	auto&             ctx = command.GetRegisters();
 
-	const HW::BlendColor& bclr                                     = ctx.GetBlendColor();
-	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
 		color_mask[i] =
 		    (colors[i].image_id ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
@@ -506,11 +721,6 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		static_params.blend_enable[i]         = bc.enable;
 		static_params.blend_bypass[i]         = rt.info.blend_bypass;
 	}
-	static_params.blend_color_red   = bclr.red;
-	static_params.blend_color_green = bclr.green;
-	static_params.blend_color_blue  = bclr.blue;
-	static_params.blend_color_alpha = bclr.alpha;
-
 	NormalizeStaticParamsForDynamicState(static_params);
 
 	GraphicsPipelineKey key {};
@@ -518,6 +728,30 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	key.vs_shader_id  = p.vs_shader_id;
 	key.ps_shader_id  = p.ps_shader_id;
 	key.static_params = static_params;
+	EXIT_IF(vs_input_info.buffers_num < 0 ||
+	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
+	        vs_input_info.resources_num < 0 ||
+	        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
+	key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
+	key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
+	uint32_t attributes_num          = 0;
+	for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+		const auto& buffer = vs_input_info.buffers[binding];
+		EXIT_IF(buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX);
+		attributes_num += static_cast<uint32_t>(buffer.attr_num);
+		EXIT_IF(attributes_num > static_cast<uint32_t>(vs_input_info.resources_num));
+		key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
+		                                      .instance = buffer.fetch_index != 0};
+		for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
+			const auto index = buffer.attr_indices[attribute];
+			EXIT_IF(index < 0 || index >= vs_input_info.resources_num);
+			key.vertex_input.attributes[index] = {
+			    .offset  = buffer.attr_offsets[attribute],
+			    .binding = static_cast<uint8_t>(binding),
+			};
+		}
+	}
+	EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return *iter->second;
@@ -528,16 +762,16 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(*ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64
-		     " module=%p\n",
+		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
 		     vs_id, static_cast<void*>(vertex_program.module), ps_id,
 		     static_cast<void*>(pixel_program.module));
 	}
 
 	auto cached = std::make_unique<GraphicsPipeline>(p);
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, vs_input_info, vertex_program.module,
-	                       ps_input_info, pixel_program.module, static_params, m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
+	                       vertex_program.module, ps_input_info, pixel_program.module,
+	                       static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

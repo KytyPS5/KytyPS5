@@ -46,7 +46,7 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = *input.stage.resources;
+	const auto& resources = input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -81,7 +81,7 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
                               uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = *input.stage.resources;
+	const auto& resources = input.stage.resources;
 	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
 	    !resources.images.empty() || !resources.samplers.empty()) {
@@ -224,7 +224,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool     large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
-	const auto& resources = *input_info.stage.resources;
+	const auto& resources = input_info.stage.resources;
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
@@ -249,7 +249,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
 		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
 		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(), program.bindings.push_constant_size);
+		     program.info.samplers.size(),
+		     program.bindings.UsesPushData()
+		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
+		         : 0u);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& buffer = program.info.buffers[i];
 			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);

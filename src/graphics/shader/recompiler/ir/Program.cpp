@@ -54,7 +54,7 @@ bool IsRuntimeRead(ValueOpcode opcode) {
 	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
-bool EquivalentValue(const Program& program, Value left, Value right,
+bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
                      std::vector<std::pair<const Inst*, const Inst*>>& visited) {
 	left  = left.Resolve();
 	right = right.Resolve();
@@ -97,6 +97,20 @@ bool EquivalentValue(const Program& program, Value left, Value right,
 
 } // namespace
 
+ResourcePlan::~ResourcePlan() {
+	for (auto& inst: value_storage) {
+		inst.Invalidate();
+	}
+}
+
+ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
+	if (this != &other) {
+		this->~ResourcePlan();
+		new (this) ResourcePlan(std::move(other));
+	}
+	return *this;
+}
+
 Program::~Program() {
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
@@ -115,12 +129,31 @@ Program& Program::operator=(Program&& other) noexcept {
 	return *this;
 }
 
-bool EquivalentValue(const Program& program, Value left, Value right) {
+CompiledShaderInfo Program::TakeCompiledInfo() && {
+	CompiledShaderInfo result {
+	    .stage           = stage,
+	    .shader_hash     = shader_hash,
+	    .wave_size       = wave_size,
+	    .user_data_base  = user_data_base,
+	    .user_data_count = user_data_count,
+	    .scratch_dwords  = scratch_dwords,
+	    .info            = std::move(info),
+	    .bindings        = std::move(bindings),
+	};
+	for (const auto& output: result.info.outputs) {
+		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
+			result.param_export_mask |= 1u << output.index;
+		}
+	}
+	return result;
+}
+
+bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
 	std::vector<std::pair<const Inst*, const Inst*>> visited;
 	return EquivalentValue(program, left, right, visited);
 }
 
-Value ResolveInvariantPhi(const Program& program, Value value) {
+Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	value            = value.Resolve();
 	const auto* root = value.TryInstruction();
 	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {

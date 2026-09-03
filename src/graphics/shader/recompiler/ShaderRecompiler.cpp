@@ -34,9 +34,9 @@ const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
 }
 
-std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
+std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
-	dump += CFG::GraphToString(cfg);
+	dump += cfg;
 	dump += "\nIR:\n";
 	dump += fmt::format("mode={} scratch_dwords={}\n",
 	                    ir.dispatcher_fallback ? "dispatcher" : "structured", ir.scratch_dwords);
@@ -464,7 +464,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 
 } // namespace
 
-CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& options) {
+TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -618,30 +618,42 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
 
-	const IR::SrtRuntime runtime {
-	    .user_data                  = options.user_data,
-	    .shader_base                = reinterpret_cast<uint64_t>(code.data()),
-	    .read_memory                = options.read_memory,
-	    .userdata                   = options.read_memory_data,
-	    .read_specialization_memory = options.read_specialization_memory,
-	};
-	IR::ResourceSnapshot resources;
-	if (!IR::MaterializeResources(ir, runtime, resources)) {
-		EXIT("shader resource materialization failed: stage=%s hash=0x%016" PRIx64 "\n",
-		     StageName(options.stage), options.shader_hash);
+	TranslateResult result;
+	result.program = std::move(ir);
+	if (options.dump_ir) {
+		result.decoded_dump = std::move(decoded_dump);
+		result.cfg_dump     = CFG::GraphToString(cfg);
 	}
-	IR::SpecializeResources(ir, resources);
+	return result;
+}
+
+CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
+                             const IR::ResourceSpecialization& specialization,
+                             uint32_t push_data_start_dword) {
+	const auto emit_begin = std::chrono::steady_clock::now();
+	auto& ir = translated.program;
+	IR::ApplyResourceSpecialization(ir, specialization);
+
+	const ShaderVertexInputInfo*  vertex  = nullptr;
+	const ShaderPixelInputInfo*   pixel   = nullptr;
+	const ShaderComputeInputInfo* compute = nullptr;
+	switch (options.stage) {
+		case ShaderType::Vertex: vertex = options.input_info.vertex; break;
+		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
+		case ShaderType::Compute: compute = options.input_info.compute; break;
+		default: EXIT("invalid shader stage\n");
+	}
 
 	IR::ShaderInfoOptions info_options;
 	info_options.vertex  = vertex;
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	IR::AllocateBindings(ir, options.push_constant_offset);
+	IR::AllocateBindings(ir, push_data_start_dword);
 	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
-		ir_dump = MakeIrDump(cfg, ir);
+		ir_dump = MakeIrDump(translated.cfg_dump, ir);
 		if (options.early_dump) {
 			LOGF("%s native IR and bindings (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
 		}
@@ -649,17 +661,19 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, resources, options.input_info);
+	auto spirv = Spirv::EmitProgram(ir, options.input_info);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(spirv.size()), phase_ms());
+	     static_cast<uint64_t>(spirv.size()),
+	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                               std::chrono::steady_clock::now() - emit_begin)
+	                               .count()));
 	CompileResult result;
-	result.spirv     = std::move(spirv);
-	result.program   = std::move(ir);
-	result.resources = std::move(resources);
+	result.spirv   = std::move(spirv);
+	result.program = std::move(ir);
 	if (options.dump_ir) {
-		result.decoded_dump = std::move(decoded_dump);
+		result.decoded_dump = std::move(translated.decoded_dump);
 		result.ir_dump      = std::move(ir_dump);
 	}
 	return result;

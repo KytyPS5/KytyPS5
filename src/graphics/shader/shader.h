@@ -4,10 +4,10 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
-#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -36,29 +36,17 @@ struct ShaderRegisters;
 enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute };
 
 namespace ShaderRecompiler::IR {
-struct Program;
-struct ResourceSnapshot;
+struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
 struct ShaderStageRuntime {
-	std::shared_ptr<const ShaderRecompiler::IR::Program>          program;
-	std::shared_ptr<const ShaderRecompiler::IR::ResourceSnapshot> resources;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
+	ShaderRecompiler::IR::ResourceSnapshot          resources;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr && resources != nullptr;
+		return program != nullptr;
 	}
 };
-
-using ShaderSpecializationMemoryReader = bool (*)(void* userdata, uint64_t address,
-                                                  uint32_t* value);
-
-// Resolves an immutable native shader plan against current user data. The prior stage is preserved
-// if any ReadConst, snapshot, or specialization check fails.
-bool ShaderMaterializeStageRuntime(
-    std::shared_ptr<const ShaderRecompiler::IR::Program> program,
-    std::span<const uint32_t> user_data, uint64_t shader_base, ShaderStageRuntime& stage,
-    ShaderSpecializationMemoryReader read_specialization_memory = nullptr,
-    void* read_memory_data = nullptr);
 
 constexpr uint32_t DstSel(uint32_t x, uint32_t y = 0, uint32_t z = 0, uint32_t w = 0) {
 	return x | (y << 3u) | (z << 6u) | (w << 9u);
@@ -87,9 +75,7 @@ struct ShaderVertexInputInfo {
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
-	int                     export_count        = 0;
 	uint32_t                scratch_size_dwords = 0;
-	uint32_t                param_export_mask   = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
 	bool                    fetch_external      = false;
@@ -119,8 +105,6 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
-	uint32_t                                       mrt_output_mask              = 0;
-	uint32_t                                       push_constant_offset         = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;

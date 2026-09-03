@@ -69,24 +69,18 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
-void AllocateBindings(Program& program, uint32_t push_constant_offset) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
 		                                             : "binding layout already allocated");
 	}
-	if (push_constant_offset > NativePushConstantSize ||
-	    push_constant_offset % sizeof(uint32_t) != 0) {
-		EXIT("shader binding layout failed: push-constant offset %u exceeds the Vulkan minimum "
-		     "guarantee or is unaligned",
-		     push_constant_offset);
-	}
-
 	BindingLayout next;
-	next.push_constant_offset = push_constant_offset;
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.push_data_start_dword =
+	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources(program.info.buffers.size());
@@ -139,17 +133,14 @@ void AllocateBindings(Program& program, uint32_t push_constant_offset) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_mapping_capacity != 0u;
+		    return image.indirect_search_iterations != 0u;
 	    });
 	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
-	const auto push_dwords = (NativePushConstantSize - push_constant_offset) / sizeof(uint32_t);
-	if (next.ShaderDataDwords() <= push_dwords) {
-		next.push_constant_size = next.ShaderDataDwords() * sizeof(uint32_t);
-	} else {
-		AddBinding(next, DescriptorBindingKind::UserData);
+	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
+		AddBinding(next, DescriptorBindingKind::ShaderData);
 	}
 
 	program.bindings                = std::move(next);

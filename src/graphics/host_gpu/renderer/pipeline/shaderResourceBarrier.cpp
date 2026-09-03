@@ -69,7 +69,7 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 }
 
 std::vector<ShaderBufferWriteRange>
-CollectShaderBufferWrites(const ShaderRecompiler::IR::Program&          program,
+CollectShaderBufferWrites(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                           const ShaderRecompiler::IR::ResourceSnapshot& resources) {
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
 	std::vector<ShaderBufferWriteRange> writes;
@@ -97,7 +97,7 @@ CollectShaderBufferWrites(const ShaderRecompiler::IR::Program&          program,
 
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
-	return !CollectShaderBufferWrites(*runtime.program, *runtime.resources).empty();
+	return !CollectShaderBufferWrites(*runtime.program, runtime.resources).empty();
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

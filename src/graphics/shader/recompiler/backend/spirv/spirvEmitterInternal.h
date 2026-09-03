@@ -341,14 +341,12 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
-	             ShaderStageInputInfo input_info_)
-	    : program(program_), resources(resources_), input_info(input_info_),
+	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
+	    : program(program_), input_info(input_info_),
 	      requirements(*program_.spirv_requirements) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
-	const IR::ResourceSnapshot&                      resources;
 	ShaderStageInputInfo                             input_info;
 	const IR::SpirvRequirements&                     requirements;
 	ShaderType                                       stage                   = ShaderType::Unknown;
@@ -361,7 +359,7 @@ struct EmitterState {
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         vsharp_storage_variable = 0;
+	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         scratch_variable        = 0;

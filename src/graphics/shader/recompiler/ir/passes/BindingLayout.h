@@ -5,7 +5,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void AllocateBindings(Program& program, uint32_t push_constant_offset);
+void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0);
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 

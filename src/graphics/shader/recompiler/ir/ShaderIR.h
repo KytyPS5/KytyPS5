@@ -8,11 +8,13 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
 #include <bit>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -87,15 +89,6 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
-struct DescriptorValue {
-	std::array<uint32_t, 8> dwords      = {};
-	uint32_t                dword_count = 0;
-
-	bool operator==(const DescriptorValue& other) const {
-		return dword_count == other.dword_count && dwords == other.dwords;
-	}
-};
-
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 
@@ -139,7 +132,7 @@ struct ImageResource {
 	bool                          r128              = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
-	uint32_t                      indirect_mapping_capacity = 0;
+	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -149,6 +142,7 @@ struct SamplerResource {
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
+	bool     depth_compare         = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -270,14 +264,28 @@ enum class DescriptorBindingKind : uint32_t {
 	BdaPagetable,
 	FaultBuffer,
 	FlattenedSrt,
-	UserData,
+	ShaderData,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 37u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u);
 
-constexpr uint32_t NativePushConstantSize = 128;
+struct PushData {
+	static constexpr uint32_t DwordCount = 32;
+	static constexpr uint32_t NoStart    = UINT32_MAX;
+	std::array<uint32_t, DwordCount> dwords {};
+
+	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
+		return size != 0 && start <= DwordCount && size <= DwordCount - start;
+	}
+	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
+		return CanFit(cursor, size) ? cursor : NoStart;
+	}
+};
+
+static_assert(sizeof(PushData) == 128);
+constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
 	return static_cast<uint32_t>(kind) +
@@ -375,8 +383,7 @@ struct DescriptorBinding {
 };
 
 struct BindingLayout {
-	uint32_t                       push_constant_offset = 0;
-	uint32_t                       push_constant_size  = 0;
+	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
@@ -384,6 +391,14 @@ struct BindingLayout {
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] bool UsesPushData() const {
+		return push_data_start_dword != PushData::NoStart;
+	}
+	void AdvancePushData(uint32_t& cursor) const {
+		if (UsesPushData()) {
+			cursor = push_data_start_dword + ShaderDataDwords();
+		}
 	}
 
 	bool operator==(const BindingLayout& other) const = default;
@@ -454,7 +469,47 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
-struct Program {
+// Stable shader metadata consumed by the renderer after native IR has been discarded.
+struct CompiledShaderInfo {
+	ShaderType                    stage               = ShaderType::Unknown;
+	uint64_t                      shader_hash         = 0;
+	uint32_t                      wave_size           = 64;
+	uint32_t                      user_data_base      = 0;
+	uint32_t                      user_data_count     = 64;
+	uint32_t                      scratch_dwords      = 0;
+	uint32_t                      param_export_mask   = 0;
+	ShaderInfo                    info;
+	BindingLayout                 bindings;
+};
+
+// Immutable runtime resource analysis retained by the shader cache. It owns only the native
+// value graph reachable from descriptors/SRT reads, rather than the translated shader CFG.
+struct ResourcePlan {
+	ResourcePlan() = default;
+	~ResourcePlan();
+
+	ResourcePlan(const ResourcePlan&)            = delete;
+	ResourcePlan& operator=(const ResourcePlan&) = delete;
+	ResourcePlan(ResourcePlan&&) noexcept         = default;
+	ResourcePlan& operator=(ResourcePlan&& other) noexcept;
+
+	ShaderType                    stage           = ShaderType::Unknown;
+	uint64_t                      shader_hash     = 0;
+	uint32_t                      user_data_base  = 0;
+	uint32_t                      user_data_count = 64;
+	std::list<Inst>                     value_storage;
+	std::vector<MemoryInfo>             memory_info;
+	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<uint32_t>               materialization_sources;
+	std::vector<SrtRead>                srt_reads;
+	std::vector<uint8_t>                clean_flat_slots;
+	bool                                requires_specialization_memory = false;
+	bool                                srt_plan_complete          = false;
+	bool                                resource_tracking_complete = false;
+	ShaderInfo                          info;
+};
+
+struct Program: ResourcePlan {
 	Program() = default;
 	~Program();
 
@@ -462,31 +517,22 @@ struct Program {
 	Program& operator=(const Program&) = delete;
 	Program(Program&&) noexcept         = default;
 	Program& operator=(Program&& other) noexcept;
+	CompiledShaderInfo TakeCompiledInfo() &&;
 
-	ShaderType                    stage               = ShaderType::Unknown;
-	uint64_t                      shader_hash         = 0;
-	uint32_t                      wave_size           = 64;
-	uint32_t                      user_data_base      = 0;
-	uint32_t                      user_data_count     = 64;
-	uint32_t                      scratch_dwords      = 0;
+	std::vector<std::unique_ptr<Block>> block_storage;
+	BlockList                           blocks;
+	uint32_t                      wave_size      = 64;
+	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
-	std::vector<std::unique_ptr<Block>> block_storage;
-	BlockList                           blocks;
-	std::vector<BlockInfo>              block_info;
+	std::vector<BlockInfo>        block_info;
 	// Decoded MIMG/VMEM metadata carries details such as RDNA2 NSA address registers and
 	// storage-image swizzles. Typed memory instructions carry a dense index into these shader-local
 	// tables until those fields are consumed by emission.
-	std::vector<MemoryInfo>       memory_info;
 	std::vector<ExportInfo>       export_info;
-	std::vector<DescriptorSource> descriptor_sources;
-	std::vector<SrtRead>          srt_reads;
 	std::vector<Value>            dynamic_reads;
-	bool                          srt_plan_complete = false;
-	ShaderInfo                    info;
-	bool                          resource_tracking_complete = false;
-	bool                          shader_info_complete       = false;
+	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
 
@@ -497,8 +543,8 @@ std::string ProgramToString(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
-bool  EquivalentValue(const Program& program, Value left, Value right);
-Value ResolveInvariantPhi(const Program& program, Value value);
+bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
+Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

@@ -52,7 +52,7 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
-	const auto& resources = *vs_input_info.stage.resources;
+	const auto& resources = vs_input_info.stage.resources;
 	if (program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
 		const auto index =
 		    static_cast<uint32_t>(program.info.vertex_offset_sgpr) - program.user_data_base;
@@ -364,6 +364,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		line_width = 1.0f;
 	}
 	vk_buffer.setLineWidth(line_width);
+	const auto&      blend = ctx.GetBlendColor();
+	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
+	vk_buffer.setBlendConstants(blend_constants.data());
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
@@ -495,8 +498,7 @@ struct DrawRenderState {
 	RenderState           rendering;
 	ShaderVertexInputInfo vs_input_info;
 	ShaderPixelInputInfo  ps_input_info;
-	ShaderProgram         vertex_program;
-	ShaderProgram         pixel_program;
+	PipelineCache::GraphicsPrograms programs;
 };
 
 struct DrawCallInfo {
@@ -1008,30 +1010,20 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
-	state.vertex_program = {};
-	state.pixel_program  = {};
-	state.ps_input_info  = {};
+	state.programs      = {};
+	state.ps_input_info = {};
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		target_export_mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
 	}
-	if (log_phases) {
-		LogDrawPhase(draw.name, "GetVertexProgram");
-	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
-	state.vertex_program = pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, ctx,
-	                                                         state.vs_input_info);
-
-	if (!state.ps_active) {
-		return;
-	}
 	if (log_phases) {
-		LogDrawPhase(draw.name, "GetPixelProgram");
+		LogDrawPhase(draw.name, "GetGraphicsPrograms");
 	}
-	state.pixel_program =
-	    pipeline_cache.GetPixelProgram(pixel_shader_info, shader_regs, state.vs_input_info,
-	                                   target_export_mapping, state.ps_input_info);
+	state.programs = pipeline_cache.GetGraphicsPrograms(
+	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, target_export_mapping,
+	    state.ps_active, state.vs_input_info, state.ps_input_info);
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
@@ -1185,7 +1177,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.vertex_program, state.pixel_program);
+	    state.programs.vertex, state.programs.pixel);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1452,7 +1444,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
-	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
+	    state.vs_input_info.stage.program->param_export_mask == 0 &&
+	    state.ps_input_info.input_num != 0) {
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
 			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",

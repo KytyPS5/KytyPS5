@@ -40,17 +40,15 @@ struct NativeDescriptors {
 	std::vector<vk::Sampler>    samplers;
 	BufferView                  gds;
 	BufferView                  flattened_srt;
-	BufferView                  user_data;
+	BufferView                  shader_data;
 };
 
 struct PreparedBindings {
-	const ShaderRecompiler::IR::Program*          program  = nullptr;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
 	NativeDescriptors                             resources;
-	std::vector<BufferId>                         buffer_ids;
-	std::vector<uint32_t>                         flattened_srt;
-	std::vector<uint32_t>                         user_data;
-	bool                                          committed = false;
+	std::vector<std::pair<ShaderBufferResource, BufferId>> buffer_sources;
+	std::vector<uint32_t>                         shader_data;
 };
 
 [[nodiscard]] vk::DescriptorType

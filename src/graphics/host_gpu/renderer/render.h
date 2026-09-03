@@ -190,8 +190,6 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
-	std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>
-	    m_push_constants {};
 
 	friend struct RenderExecutorTestAccess;
 };

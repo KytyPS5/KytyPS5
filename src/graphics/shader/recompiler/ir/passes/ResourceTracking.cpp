@@ -464,6 +464,16 @@ private:
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
+		if (expected == ValueOpcode::GetImageResource) {
+			for (; bad_dword < descriptor.dword_count; bad_dword++) {
+				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
+				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+					Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
+					                     ValueOpcodeName(expected), bad_dword));
+				}
+			}
+			bad_dword = 0;
+		}
 		if (!ValidateSource(descriptor, bad_dword)) {
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));

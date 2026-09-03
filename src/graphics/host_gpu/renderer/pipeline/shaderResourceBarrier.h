@@ -23,7 +23,7 @@ VulkanMemoryBarrier     MakeShaderWriteHazardDependency();
 VulkanMemoryBarrier     MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 std::vector<ShaderBufferWriteRange>
-CollectShaderBufferWrites(const ShaderRecompiler::IR::Program&          program,
+CollectShaderBufferWrites(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                           const ShaderRecompiler::IR::ResourceSnapshot& resources);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);

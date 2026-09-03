@@ -81,13 +81,13 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_mapping_capacity != 0u;
+		     return image.indirect_search_iterations != 0u;
 	     });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
-	if (program.bindings.ShaderDataDwords() != 0 && program.bindings.push_constant_size == 0) {
-		Expect(Kind::UserData);
+	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
+		Expect(Kind::ShaderData);
 	}
 
 	std::array<bool, KindCount> seen {};
@@ -104,21 +104,19 @@ void ValidateNativeProgram(const IR::Program& program) {
 			Fail(program, "native shader plan is missing a required descriptor group");
 		}
 	}
-	const auto has_user_storage = present[static_cast<size_t>(Kind::UserData)];
-	if (program.bindings.push_constant_offset % sizeof(uint32_t) != 0 ||
-	    program.bindings.push_constant_offset + program.bindings.push_constant_size >
-	        IR::NativePushConstantSize ||
+	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
+	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+	if ((program.bindings.UsesPushData() &&
+	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
-	    (!has_user_storage &&
-	     program.bindings.push_constant_size != program.bindings.ShaderDataDwords() * 4u) ||
-	    (has_user_storage && program.bindings.push_constant_size != 0) ||
+	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
 	    std::adjacent_find(program.bindings.user_data_registers.begin(),
 	                       program.bindings.user_data_registers.end()) !=
 	        program.bindings.user_data_registers.end()) {
-		Fail(program, "native user-data layout is inconsistent");
+		Fail(program, "native shader-data layout is inconsistent");
 	}
 
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
@@ -302,7 +300,6 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  const IR::ResourceSnapshot& resources,
                                   ShaderStageInputInfo input_info) {
 	using namespace Emitter;
 
@@ -315,15 +312,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    !program.spirv_requirements.has_value()) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	if (!IR::ValidateResourceSnapshot(program, resources)) {
-		Fail(program, "resource snapshot is inconsistent with the native shader plan");
-	}
-	if (!IR::ValidateResourceSpecialization(program, resources)) {
-		Fail(program, "resource specialization is inconsistent with the native shader plan");
-	}
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
-	EmitterState state(program, resources, input_info);
+	EmitterState state(program, input_info);
 	state.stage     = program.stage;
 	state.wave_size = program.wave_size;
 	state.inputs.reserve(program.info.inputs.size());

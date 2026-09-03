@@ -806,7 +806,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
-		if (state.flattened_srt_variable == 0 || image.indirect_mapping_capacity == 0u ||
+		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return true;
@@ -824,7 +824,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		auto       low      = ConstantU32(state, 0u);
 		auto       high     = LoadMapping(mapping);
 		auto       selected = ConstantU32(state, 0u);
-		for (uint32_t iteration = 0; iteration < std::bit_width(image.indirect_mapping_capacity);
+		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
 		     iteration++) {
 			const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
 			const auto mid =

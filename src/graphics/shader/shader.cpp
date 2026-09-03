@@ -3,7 +3,6 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
-#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/profiler.h"
@@ -12,23 +11,15 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
-#include "kernel/memory.h"
 #include "libs/errno.h"
-#include "spirv-tools/libspirv.h"
-#include "spirv-tools/libspirv.hpp"
-#include "spirv-tools/optimizer.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdio>
-#include <filesystem>
-#include <fmt/format.h>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -48,15 +39,6 @@
 #endif
 
 namespace Libs::Graphics {
-
-namespace {
-
-bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
-}
-
-} // namespace
 
 struct ShaderBinaryInfo {
 	uint8_t  signature[7];
@@ -105,62 +87,6 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
-}
-
-static bool SpirvDisassemble(const uint32_t* src_binary, size_t src_binary_size,
-                             std::string* dst_disassembly) {
-	if (dst_disassembly != nullptr) {
-		spvtools::SpirvTools core(SPV_ENV_VULKAN_1_2);
-
-		std::string disassembly;
-		if (!core.Disassemble(src_binary, src_binary_size, &disassembly,
-		                      static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
-		                          static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
-		                          static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
-		                          static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
-		                          static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR))) {
-			*dst_disassembly = disassembly.c_str();
-
-			LOGF("Disassemble failed\n");
-			return false;
-		}
-
-		*dst_disassembly = disassembly.c_str();
-	}
-	return true;
-}
-
-static bool SpirvValidateBinary(const char* label, uint64_t shader_hash,
-                                const std::vector<uint32_t>& spirv) {
-	if (!Config::ShaderValidationEnabled()) {
-		return true;
-	}
-
-	spvtools::SpirvTools core(SPV_ENV_VULKAN_1_3);
-	std::string          messages;
-	core.SetMessageConsumer([&messages](spv_message_level_t /*level*/, const char* /*source*/,
-	                                    const spv_position_t& position, const char* message) {
-		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
-		                        static_cast<int>(position.column), static_cast<int>(position.index),
-		                        message);
-	});
-
-	if (core.Validate(spirv)) {
-		return true;
-	}
-
-	std::string disassembly;
-	SpirvDisassemble(spirv.data(), spirv.size(), &disassembly);
-	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
-	           label, shader_hash, messages.c_str());
-	LOGF("%s\n", disassembly.c_str());
-	return false;
-}
-
-static void ExitShaderRecompilerFailure(const char* label, uint64_t shader_hash,
-                                        const char* reason) {
-	EXIT("%s failed hash=0x%016" PRIx64 ": %s\n", label, shader_hash,
-	     reason != nullptr ? reason : "");
 }
 
 static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
@@ -695,7 +621,6 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 	info = {};
 
-	info.export_count      = static_cast<int>(sh.GetExportCount());
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
 	EXIT_NOT_IMPLEMENTED(regs.es_regs.data_addr == 0);
@@ -746,18 +671,12 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    const ShaderVertexInputInfo&                        vs_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
 	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
-	ps_info.push_constant_offset =
-	    vs_info.stage.program != nullptr
-	        ? vs_info.stage.program->bindings.push_constant_offset +
-	              vs_info.stage.program->bindings.push_constant_size
-	        : 0;
 
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
 	// flags in the hardware state and extract only the input count here.
@@ -801,7 +720,6 @@ static void ShaderGetStaticInputInfoPS(
 		                                       ? target_export_mapping[i]
 		                                       : Prospero::ColorComponentMapping {};
 	}
-	ps_info.mrt_output_mask = 0;
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
@@ -828,73 +746,12 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
-static void ApplyVertexOutputs(ShaderVertexInputInfo&               info,
-                               const ShaderRecompiler::IR::Program& program) {
-	info.export_count      = 0;
-	info.param_export_mask = 0;
-	for (const auto& output: program.info.outputs) {
-		if (output.kind == ShaderRecompiler::IR::StageOutputKind::Parameter && output.index < 32) {
-			info.param_export_mask |= 1u << output.index;
-			info.export_count = std::max(info.export_count, static_cast<int>(output.index + 1));
-		}
-	}
-}
-
-static void ApplyPixelOutputs(ShaderPixelInputInfo&                info,
-                              const ShaderRecompiler::IR::Program& program) {
-	info.mrt_output_mask = 0;
-	for (const auto& output: program.info.outputs) {
-		if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt && output.index < 8) {
-			info.mrt_output_mask |= 1u << output.index;
-		}
-	}
-}
-
-static bool LogPermutationMismatch(const ShaderRecompiler::IR::Program* program,
-                                   const char* stage) {
-	static std::atomic<uint32_t> log_count {0};
-	if (Config::GraphicsDebugDumpEnabled() &&
-	    log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-		LOGF("ShaderProgramCache native runtime mismatch %s shader=0x%016" PRIx64 "\n",
-		     stage, program != nullptr ? program->shader_hash : 0);
-	}
-	return false;
-}
-
-bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
-                        const ShaderParams& params, ShaderVertexInputInfo& info) {
-	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage,
-	                                   ReadShaderGuestMemory)) {
-		return LogPermutationMismatch(program.get(), "VS");
-	}
-	ApplyVertexOutputs(info, *program);
-	return true;
-}
-
-bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
-                        const ShaderParams& params, ShaderPixelInputInfo& info) {
-	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage,
-	                                   ReadShaderGuestMemory)) {
-		return LogPermutationMismatch(program.get(), "PS");
-	}
-	ApplyPixelOutputs(info, *program);
-	return true;
-}
-
-bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
-                        const ShaderParams& params, ShaderComputeInputInfo& info) {
-	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage,
-	                                   ReadShaderGuestMemory)) {
-		return LogPermutationMismatch(program.get(), "CS");
-	}
-	return true;
-}
-
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
-	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX ||
-	        info.buffers_num < 0 || info.buffers_num > ShaderVertexInputInfo::RES_MAX);
+	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
+	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
@@ -917,6 +774,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(destination.register_start);
 		key.push_back(destination.registers_num);
 		key.push_back(destination.fetch_index);
+		key.push_back(static_cast<uint32_t>(destination.attr_id));
 		key.push_back(resource.Stride());
 		key.push_back(static_cast<uint32_t>(resource.SwizzleEnabled()));
 		key.push_back(resource.DstSelX());
@@ -927,28 +785,11 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(resource.OutOfBounds());
 		key.push_back(static_cast<uint32_t>(resource.AddTid()));
 	}
-
-	key.push_back(info.buffers_num);
-	int attributes_num = 0;
-	for (int i = 0; i < info.buffers_num; i++) {
-		const auto& buffer = info.buffers[i];
-		EXIT_IF(buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX);
-		attributes_num += buffer.attr_num;
-		EXIT_IF(attributes_num > ShaderVertexInputInfo::RES_MAX);
-		key.push_back(buffer.attr_num);
-		key.push_back(buffer.stride);
-		key.push_back(buffer.fetch_index);
-		for (int j = 0; j < buffer.attr_num; j++) {
-			key.push_back(buffer.attr_indices[j]);
-			key.push_back(buffer.attr_offsets[j]);
-		}
-	}
 }
 
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
-	key.push_back(info.push_constant_offset);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.input_num);
 	key.push_back(info.ps_system_input_base);
@@ -1006,11 +847,10 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRe
 
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    const ShaderVertexInputInfo&                        vs_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
-	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, data, ps_info);
+	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, "ShaderRecompiler PS", GetDeclaredShaderHash(regs.ps_regs.data_addr),
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
@@ -1032,11 +872,8 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 	LOGF("ShaderDbgDumpInputInfo()\n");
 
 	LOGF("\t fetch_external = %s\n"
-	     "\t fetch_embedded = %s\n"
-	     "\t param_export_mask = 0x%08" PRIx32 "\n"
-	     "\t export_count   = %d\n",
-	     info.fetch_external ? "true" : "false", info.fetch_embedded ? "true" : "false",
-	     info.param_export_mask, info.export_count);
+	     "\t fetch_embedded = %s\n",
+	     info.fetch_external ? "true" : "false", info.fetch_embedded ? "true" : "false");
 
 	for (int i = 0; i < info.resources_num; i++) {
 		LOGF("\t input %d\n", i);
@@ -1132,205 +969,6 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
-}
-
-static bool ShaderRecompilerTextDumpEnabled() {
-	// Graphics debug dump already writes SPIR-V binaries to _Shaders. Keep the very large
-	// disassembly/IR text behind the shader-log switch so file logging cannot stall boot.
-	return Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
-}
-
-static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
-                                      const std::vector<uint32_t>& bin) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
-		return;
-	}
-
-	static std::atomic_int id = 0;
-
-	const auto base_name = Config::GetShaderLogFolder() /
-	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
-	Common::File::CreateDirectories(base_name.parent_path());
-
-	Common::File spv_file;
-	auto         spv_name = base_name;
-	spv_name += ".spv";
-	spv_file.Create(spv_name);
-	if (spv_file.IsInvalid()) {
-		auto spv_name_text = Common::PathToString(spv_name);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", spv_name_text.c_str());
-	} else {
-		spv_file.Write(bin.data(), bin.size() * 4);
-		spv_file.Close();
-	}
-
-	return;
-
-	std::string text;
-	if (!SpirvDisassemble(bin.data(), bin.size(), &text)) {
-		auto spv_name_text = Common::PathToString(spv_name);
-		LOGF_COLOR(Log::Color::BrightRed, "SpirvDisassemble() failed for %s\n",
-		           spv_name_text.c_str());
-		return;
-	}
-
-	Common::File asm_file;
-	auto         asm_name = base_name;
-	asm_name += ".spvasm";
-	asm_file.Create(asm_name);
-	if (asm_file.IsInvalid()) {
-		auto asm_name_text = Common::PathToString(asm_name);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", asm_name_text.c_str());
-	} else {
-		asm_file.Printf("%s", text.c_str());
-		asm_file.Close();
-	}
-}
-
-static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
-                                         std::span<const uint32_t> code,
-                                         const std::string&        decoded_dump) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
-		return;
-	}
-	EXIT_IF(code.empty());
-
-	static std::atomic_int id = 0;
-
-	const auto base_name = Config::GetShaderLogFolder() / "original" /
-	                       fmt::format("{:04d}_new_shader_{}_{:016x}", id++, type, shader_hash);
-	Common::File::CreateDirectories(base_name.parent_path());
-
-	Common::File bin_file;
-	auto         bin_name = base_name;
-	bin_name += ".bin";
-	bin_file.Create(bin_name);
-	if (bin_file.IsInvalid()) {
-		auto bin_name_text = Common::PathToString(bin_name);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", bin_name_text.c_str());
-	} else {
-		bin_file.Write(code.data(), code.size_bytes());
-		bin_file.Close();
-	}
-	if (decoded_dump.empty()) {
-		return;
-	}
-
-	Common::File text_file;
-	auto         text_name = base_name;
-	text_name += ".rdna2";
-	text_file.Create(text_name);
-	if (text_file.IsInvalid()) {
-		auto text_name_text = Common::PathToString(text_name);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", text_name_text.c_str());
-	} else {
-		text_file.Printf("%s", decoded_dump.c_str());
-		text_file.Close();
-	}
-}
-
-static const char* ShaderStageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return "vs";
-		case ShaderType::Pixel: return "ps";
-		case ShaderType::Compute: return "cs";
-		default: EXIT("invalid shader stage\n");
-	}
-}
-
-static const char* ShaderStageLabel(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return "ShaderRecompiler VS";
-		case ShaderType::Pixel: return "ShaderRecompiler PS";
-		case ShaderType::Compute: return "ShaderRecompiler CS";
-		default: EXIT("invalid shader stage\n");
-	}
-}
-
-static ShaderRecompiler::CompileOptions MakeCompileOptions(const ShaderParams& params,
-                                                           ShaderType stage) {
-	ShaderRecompiler::CompileOptions options;
-	options.stage                      = stage;
-	options.shader_hash                = params.hash;
-	options.user_data                  = params.user_data;
-	options.read_specialization_memory = ReadShaderGuestMemory;
-	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
-	options.early_dump                 = options.dump_ir;
-	options.dump_label                 = ShaderStageLabel(stage);
-	return options;
-}
-
-static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& params,
-                                      ShaderRecompiler::CompileOptions options,
-                                      ShaderStageRuntime& stage) {
-	const auto* stage_name = ShaderStageName(options.stage);
-	const auto* label      = ShaderStageLabel(options.stage);
-	auto result = ShaderRecompiler::Recompile(params.code, options);
-
-	DumpShaderRecompilerOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-	if (!SpirvValidateBinary(label, options.shader_hash, result.spirv)) {
-		DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
-		ExitShaderRecompilerFailure(label, options.shader_hash, "SPIR-V validation failed");
-	}
-	DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
-
-	stage.program =
-	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
-	stage.resources =
-	    std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(std::move(result.resources));
-
-	vk::ShaderModuleCreateInfo create_info {};
-	create_info.sType    = vk::StructureType::eShaderModuleCreateInfo;
-	create_info.codeSize = result.spirv.size() * sizeof(uint32_t);
-	create_info.pCode    = result.spirv.data();
-	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-	                     "create recompiled shader module");
-	EXIT_IF(module == nullptr);
-
-	if (options.dump_ir) {
-		if (!options.early_dump) {
-			LOGF("%s decoded RDNA2:\n%s", label, result.decoded_dump.c_str());
-			LOGF("%s IR:\n%s", label, result.ir_dump.c_str());
-		}
-		LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", label,
-		     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
-	}
-	return module;
-}
-
-vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
-                                ShaderVertexInputInfo& input_info) {
-	KYTY_PROFILER_FUNCTION(profiler::colors::Amber300);
-	auto options                 = MakeCompileOptions(params, ShaderType::Vertex);
-	options.user_data_base       = 8;
-	options.scratch_dwords       = input_info.scratch_size_dwords;
-	options.input_info.vertex    = &input_info;
-	const auto module            = CompileModule(device, params, options, input_info.stage);
-	ApplyVertexOutputs(input_info, *input_info.stage.program);
-	return module;
-}
-
-vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
-                                ShaderPixelInputInfo& input_info) {
-	KYTY_PROFILER_FUNCTION(profiler::colors::Blue300);
-	auto options                   = MakeCompileOptions(params, ShaderType::Pixel);
-	options.scratch_dwords         = input_info.scratch_size_dwords;
-	options.push_constant_offset   = input_info.push_constant_offset;
-	options.input_info.pixel       = &input_info;
-	const auto module              = CompileModule(device, params, options, input_info.stage);
-	ApplyPixelOutputs(input_info, *input_info.stage.program);
-	return module;
-}
-
-vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
-                                ShaderComputeInputInfo& input_info) {
-	KYTY_PROFILER_FUNCTION(profiler::colors::CyanA700);
-	auto options               = MakeCompileOptions(params, ShaderType::Compute);
-	options.scratch_dwords     = input_info.scratch_size_dwords;
-	options.wave_size          = input_info.wave_size;
-	options.input_info.compute = &input_info;
-	return CompileModule(device, params, options, input_info.stage);
 }
 
 bool ShaderAddressValid(uint64_t addr) {

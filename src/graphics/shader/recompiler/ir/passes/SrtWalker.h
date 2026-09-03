@@ -19,32 +19,27 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 };
 
-struct DescriptorSourceRequest {
-	uint32_t source = 0;
-};
-
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
-bool ValidateRuntimeValue(const Program& program, Value value);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value);
 
-bool EvaluateDescriptorSource(const Program& program, uint32_t source, const SrtRuntime& runtime,
-                              DescriptorValue& result);
+bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
+                              const SrtRuntime& runtime, DescriptorValue& result);
 
 // Evaluates one runtime snapshot transactionally. Scalar values and ReadConst results shared by
 // several descriptors are memoized once across the batch.
-bool EvaluateDescriptorSources(const Program&                           program,
-                               std::span<const DescriptorSourceRequest> requests,
+bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results);
 
 // Evaluates descriptor sources and the flattened immediate SRT with one memoized scalar walk.
 // On failure neither destination is changed.
-bool EvaluateRuntimeSources(const Program&                           program,
-                            std::span<const DescriptorSourceRequest> requests,
+bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots);
 
-bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat);
+bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
+             std::vector<uint32_t>& flat);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

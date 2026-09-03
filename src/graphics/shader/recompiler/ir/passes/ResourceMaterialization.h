@@ -5,34 +5,46 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-struct ResourceSnapshot {
-	struct IndirectImage {
-		uint32_t                     resource = 0;
-		uint32_t                     capacity = 0;
-		std::vector<uint32_t>        keys;
-		std::vector<uint32_t>        candidates;
-		std::vector<DescriptorValue> descriptors;
+// Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
+// ResourceSnapshot and therefore do not create shader permutations.
+struct ResourceSpecialization {
+	struct Buffer {
+		uint32_t               packed_stride                   = 0;
+		Prospero::BufferFormat descriptor_format               = Prospero::BufferFormat::kInvalid;
+		uint32_t               descriptor_swizzle              = DstSel(4, 5, 6, 7);
+		bool                   operator==(const Buffer&) const = default;
 	};
 
-	std::vector<DescriptorValue> buffers;
-	std::vector<DescriptorValue> images;
-	std::vector<DescriptorValue> samplers;
-	std::vector<uint32_t>        flattened_srt;
-	std::vector<uint32_t>        user_data;
-	std::vector<IndirectImage>   indirect_images;
+	struct Image {
+		Prospero::TextureNumericClass numeric_class = Prospero::TextureNumericClass::Unsupported;
+		Decoder::ImageDimension       dimension     = Decoder::ImageDimension::Unknown;
+		uint32_t                      mip_count     = 1;
+		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
+		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
+		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
+		uint32_t                      indirect_mapping_offset    = 0;
+		uint32_t                      indirect_search_iterations = 0;
+		bool                          cube                       = false;
+		bool                          operator==(const Image&) const = default;
+	};
+
+	std::vector<Buffer> buffers;
+	std::vector<Image>  images;
+
+	bool operator==(const ResourceSpecialization&) const = default;
 };
 
-bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& snapshot);
-bool ValidateResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot);
+// Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
+// its values and is independent of the translated shader CFG.
+ResourcePlan ExtractResourcePlan(const Program& program);
 
-// Resolves the immutable dense resource topology against one runtime user-data/SRT snapshot.
-// On failure the destination is unchanged.
-bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot);
+// Resolves and specializes the immutable resource plan in one transaction. On failure both
+// destinations are unchanged.
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
-// Applies runtime descriptor shape/format facts to a copied dense topology before layout and
-// emission. Invalid specializations are fatal.
-void SpecializeResources(Program& program, ResourceSnapshot& snapshot);
+// Applies an already-derived specialization to native IR before layout and emission.
+void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

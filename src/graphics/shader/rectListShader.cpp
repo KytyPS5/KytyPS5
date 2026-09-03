@@ -48,7 +48,7 @@ std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
 	std::vector<Parameter> parameters;
 	for (const auto input: active_inputs) {
 		const auto input_location = ShaderPixelParameterMappedLocation(*pixel_info, input);
-		if ((vertex_info.param_export_mask & (1u << input_location)) != 0) {
+		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0) {
 			parameters.push_back({input_location,
 			                      ShaderPixelParameterLocation(*pixel_info, active_inputs, input),
 			                      ShaderPixelParameterIsFlat(*pixel_info, input)});

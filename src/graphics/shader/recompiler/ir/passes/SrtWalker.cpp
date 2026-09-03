@@ -26,7 +26,7 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-std::string Diagnostic(const Program& program, uint32_t pc, const std::string& message) {
+std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::string& message) {
 	return fmt::format("shader SRT: hash=0x{:016x} stage={} pc=0x{:08x} {}", program.shader_hash,
 	                   StageName(program.stage), pc, message);
 }
@@ -51,7 +51,7 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	return true;
 }
 
-bool IsRawRead(const Program& values, const Inst& inst) {
+bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
 		return false;
@@ -134,7 +134,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const Program& program, Value active_mask = {})
+	explicit RuntimeValidator(const ResourcePlan& program, Value active_mask = {})
 	    : m_program(program), m_active_mask(active_mask.Resolve()) {}
 
 	bool Run(Value value) { return Validate(value); }
@@ -262,7 +262,7 @@ private:
 		return finish(true);
 	}
 
-	const Program&                  m_program;
+	const ResourcePlan&             m_program;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 };
@@ -415,7 +415,7 @@ private:
 
 class Evaluator {
 public:
-	Evaluator(const Program& program, const SrtRuntime& runtime,
+	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
@@ -435,9 +435,7 @@ private:
 		return std::bit_cast<float>(static_cast<uint32_t>(bits));
 	}
 
-	static uint64_t Float32Bits(float value) {
-		return std::bit_cast<uint32_t>(value);
-	}
+	static uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
 
 	bool EvaluateWide(Value value, uint64_t& result) {
 		value = value.Resolve();
@@ -455,6 +453,11 @@ private:
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
 			return false;
+		}
+		if (!m_reserved) {
+			m_cache.reserve(m_program.value_storage.size());
+			m_visiting.reserve(m_program.value_storage.size());
+			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
@@ -915,24 +918,24 @@ private:
 		return false;
 	}
 
-	const Program&                            m_program;
+	const ResourcePlan&                       m_program;
 	const SrtRuntime&                         m_runtime;
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
+	bool                                      m_reserved = false;
 };
 
-const DescriptorSource* Source(const Program& program, uint32_t source) {
+const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
 	}
 	return &program.descriptor_sources[source];
 }
 
-bool EvaluateRuntimeSourcesImpl(const Program&                           program,
-                                std::span<const DescriptorSourceRequest> requests,
+bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots) {
@@ -948,9 +951,9 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 	Evaluator                    clean_evaluator(program, clean_runtime);
 	Evaluator                    evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	std::vector<DescriptorValue> evaluated;
-	evaluated.reserve(requests.size());
-	for (const auto& request: requests) {
-		const auto* source = Source(program, request.source);
+	evaluated.reserve(sources.size());
+	for (const auto source_index: sources) {
+		const auto* source = Source(program, source_index);
 		if (source == nullptr) {
 			return false;
 		}
@@ -985,7 +988,7 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 
 } // namespace
 
-bool ValidateRuntimeValue(const Program& program, Value value) {
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program).Run(value);
 }
 
@@ -998,34 +1001,32 @@ void BuildSrtPlan(Program& program) {
 	program.srt_plan_complete = true;
 }
 
-bool EvaluateDescriptorSource(const Program& program, uint32_t source, const SrtRuntime& runtime,
-                              DescriptorValue& result) {
-	const DescriptorSourceRequest request {source};
-	std::vector<DescriptorValue>  results;
-	if (!EvaluateDescriptorSources(program, std::span {&request, 1}, runtime, results)) {
+bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
+                              const SrtRuntime& runtime, DescriptorValue& result) {
+	std::vector<DescriptorValue> results;
+	if (!EvaluateDescriptorSources(program, std::span {&source, 1}, runtime, results)) {
 		return false;
 	}
 	result = results.front();
 	return true;
 }
 
-bool EvaluateDescriptorSources(const Program&                           program,
-                               std::span<const DescriptorSourceRequest> requests,
+bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results) {
 	std::vector<uint32_t> ignored;
-	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, ignored, false, {});
+	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, ignored, false, {});
 }
 
-bool EvaluateRuntimeSources(const Program&                           program,
-                            std::span<const DescriptorSourceRequest> requests,
+bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>&   flat,
                             std::span<const uint8_t> clean_flat_slots) {
-	return EvaluateRuntimeSourcesImpl(program, requests, runtime, results, flat, true,
+	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
 	                                  clean_flat_slots);
 }
 
-bool WalkSrt(const Program& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat) {
+bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
+             std::vector<uint32_t>& flat) {
 	std::vector<DescriptorValue> ignored;
 	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, {});
 }

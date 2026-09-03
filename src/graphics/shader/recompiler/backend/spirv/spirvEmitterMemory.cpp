@@ -614,8 +614,9 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	});
 }
 
-uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
+uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
+		case IR::ValueOpcode::BufferAtomicCmpSwap32: return OpAtomicCompareExchange;
 		case IR::ValueOpcode::BufferAtomicSwap32:
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return OpAtomicExchange;
@@ -642,23 +643,37 @@ uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 	}
 }
 
-uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-                    bool return_value) {
+uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
+                             uint32_t scope) {
+	const auto old = ctx.state.builder.AllocateId();
+	if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32) {
+		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		ctx.state.builder.AddFunction(
+		    {OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer, ConstantU32(ctx.state, scope),
+		     ConstantU32(ctx.state, MemorySemanticsNone),
+		     ConstantU32(ctx.state, MemorySemanticsNone), desired, comparator});
+	} else {
+		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+		ctx.state.builder.AddFunction(
+		    {SpirvAtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old, pointer,
+		     ConstantU32(ctx.state, scope), ConstantU32(ctx.state, MemorySemanticsNone), value});
+	}
+	return old;
+}
+
+uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	const auto result =
 	    EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		    const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
 		    return EmitValueOrZeroIfCondition(
 		        ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
 		        [&]() {
-			        const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-			        const auto old   = ctx.state.builder.AllocateId();
 			        const auto scope =
 			            mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
-			        ctx.state.builder.AddFunction(
-			            {AtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old,
-			             EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-			             ConstantU32(ctx.state, scope), ConstantU32(ctx.state, MemorySemanticsNone),
-			             value});
+			        const auto pointer =
+			            EmitMemoryElementPointer(ctx.state, access.resource, access.index);
+			        const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
 			        if (mem.kind == IR::ResourceKind::Lds) {
 				        const auto semantics =
 				            MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
@@ -671,7 +686,7 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 			        return old;
 		        });
 	    });
-	return return_value ? result : ConstantU32(ctx.state, 0);
+	return result;
 }
 
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -692,7 +707,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 			                                 ctx.Arg(inst, inst.NumArgs() - 2));
 			        const auto old   = state.builder.AllocateId();
 			        state.builder.AddFunction(
-			            {AtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
+			            {SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
 			             EmitStorageBufferElementPointer(
 			                 state, resource, index, TypeStorageBufferU64ElementPointer(state)),
 			             ConstantU32(state, ScopeDevice),
@@ -1210,13 +1225,13 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			StoreWord(ctx, inst, mem);
 		return true;
 	}
-	const auto atomic_opcode = AtomicOpcode(op);
+	const auto atomic_opcode = SpirvAtomicOpcode(op);
 	if (atomic_opcode != 0 && inst.GetType() == IR::Type::U64) {
 		ctx.Define(inst, EmitBufferAtomic64(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
 	if (atomic_opcode != 0) {
-		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
+		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {

@@ -8557,40 +8557,47 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
 }
 
 void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
-  const uint32_t shader[] = {
-      EncodeMubuf0(0x32, 0, true, true),
-      EncodeMubuf1(0, 0, 1), // buffer_atomic_add
-      EncodeSopp(0x01),
+  struct Case {
+    std::array<uint32_t, 3> shader;
+    const char *decoded;
+    const char *ir;
+    const char *spirv;
   };
-
+  const Case cases[] = {
+      {{EncodeMubuf0(0x32, 0, true, true), EncodeMubuf1(0, 0, 1),
+        EncodeSopp(0x01)},
+       "BUFFER_ATOMIC_ADD", "BufferAtomicIAdd32", "OpAtomicIAdd"},
+      {{0xe0c46000u, 0x80080104u, EncodeSopp(0x01)},
+       "BUFFER_ATOMIC_CMPSWAP", "BufferAtomicCmpSwap32",
+       "OpAtomicCompareExchange"},
+  };
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
 
-  auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_ATOMIC_ADD"),
-        "buffer atomic bounds regression did not decode MUBUF atomic");
-  CheckSpirvBinaryValidates(result.spirv);
+  for (const auto &test : cases) {
+    const auto result = RecompileForTest(test.shader, options);
+    Check(Common::ContainsStr(result.decoded_dump, test.decoded),
+          "buffer atomic bounds regression did not decode MUBUF atomic");
+    Check(Common::ContainsStr(result.ir_dump, test.ir),
+          "buffer atomic did not lower to its native IR opcode");
+    CheckSpirvBinaryValidates(result.spirv);
 
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  const auto array_length =
-      Common::FindIndex(source, std::string("OpArrayLength"), 0);
-  const auto bounds_branch = Common::FindIndex(
-      source, std::string("OpBranchConditional"), array_length);
-  const auto atomic = Common::FindIndex(source, std::string("OpAtomicIAdd"), 0);
-  const auto memory_barrier =
-      Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
-  Check(array_length != Common::FIND_INVALID_INDEX,
-        "buffer atomic SPIR-V lacks storage buffer array-length bounds check");
-  Check(bounds_branch != Common::FIND_INVALID_INDEX,
-        "buffer atomic SPIR-V lacks storage buffer bounds branch");
-  Check(atomic != Common::FIND_INVALID_INDEX,
-        "buffer atomic SPIR-V lacks atomic operation");
-  Check(memory_barrier != Common::FIND_INVALID_INDEX,
-        "buffer atomic SPIR-V lacks memory barrier after atomic operation");
-  Check(bounds_branch < atomic,
-        "buffer atomic was emitted before bounds guard");
-  Check(atomic < memory_barrier,
-        "buffer atomic memory barrier was emitted before atomic");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    const auto array_length =
+        Common::FindIndex(source, std::string("OpArrayLength"), 0);
+    const auto bounds_branch = Common::FindIndex(
+        source, std::string("OpBranchConditional"), array_length);
+    const auto atomic = Common::FindIndex(source, std::string(test.spirv), 0);
+    const auto memory_barrier =
+        Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
+    Check(array_length != Common::FIND_INVALID_INDEX &&
+              bounds_branch != Common::FIND_INVALID_INDEX &&
+              atomic != Common::FIND_INVALID_INDEX &&
+              memory_barrier != Common::FIND_INVALID_INDEX,
+          "buffer atomic SPIR-V lacks its bounds guard, operation, or barrier");
+    Check(bounds_branch < atomic && atomic < memory_barrier,
+          "buffer atomic bounds guard, operation, and barrier are misordered");
+  }
 }
 
 void TestCapturedBufferAtomicsX2() {

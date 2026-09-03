@@ -523,12 +523,23 @@ bool Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	const auto resource = GetBufferResource(memory);
 	const auto address  = ReadBufferAddress(inst, 1);
 	const auto data_src = MemorySourceAt(inst, 0);
-	const IR::Value data =
-	    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
-	const auto result = ir.Emit(opcode,
-	                            {resource, address.index, address.offset, address.soffset, data,
-	                             ir.GetExec()},
-	                            AddMemoryInfo(memory, inst.pc));
+	const auto flags    = AddMemoryInfo(memory, inst.pc);
+	IR::Value  result;
+	if (opcode == IR::ValueOpcode::BufferAtomicCmpSwap32) {
+		const auto desired    = ReadU32(data_src);
+		const auto comparator = ReadU32(OffsetOperand(data_src, 1u));
+		result = ir.Emit(opcode,
+		                 {resource, address.index, address.offset, address.soffset, desired,
+		                  comparator, ir.GetExec()},
+		                 flags);
+	} else {
+		const IR::Value value =
+		    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
+		result = ir.Emit(opcode,
+		                 {resource, address.index, address.offset, address.soffset, value,
+		                  ir.GetExec()},
+		                 flags);
+	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
 	}
@@ -922,6 +933,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap32);
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicCmpSwap32);
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP_X2:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap64);
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:

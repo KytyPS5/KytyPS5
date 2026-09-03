@@ -524,10 +524,8 @@ struct DrawCallInfo {
 	const char*          name           = nullptr;
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
 	uint32_t             index_count    = 0;
-	uint32_t             flags          = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
-	bool                 offsets_from_indirect_args = false;
 };
 
 static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
@@ -901,8 +899,8 @@ static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const D
                               uint32_t phase) {
 	EXIT_IF(draw.name == nullptr);
 
-	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count,
-	                    draw.flags, draw.instance_count, draw.first_instance);
+	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count, 0,
+	                    draw.instance_count, draw.first_instance);
 }
 
 static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
@@ -1014,7 +1012,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count == 0 && !with_depth && !state.ps_active) {
 		LogFramebufferSkip(draw.name, state.color_info[0], state.depth_info, buffer,
-		                   draw.index_count, draw.flags);
+		                   draw.index_count, 0);
 		return false;
 	}
 
@@ -1123,7 +1121,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 
 	if (state.ps_active) {
 		LogDrawTargetState(draw.name, state.color_info[0], state.depth_info, buffer,
-		                   state.ps_input_info, draw.index_count, draw.flags);
+		                   state.ps_input_info, draw.index_count, 0);
 	}
 	LogDrawInputState(buffer, state.color_info[0], state.vs_input_info, index_type_and_size,
 	                  draw.index_count, index_addr);
@@ -1260,24 +1258,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 }
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
-                               uint32_t index_type_and_size, uint32_t index_count,
-                               const void* index_addr, uint32_t flags, uint32_t type,
-                               uint32_t instance_count, uint32_t render_target_slice_offset,
-	                           int32_t vertex_offset_add, uint32_t first_instance,
-	                           bool offsets_from_indirect_args) {
+                               const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
+	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex), submit_id,
-	                    index_count, flags, type, instance_count,
-	                    reinterpret_cast<uint64_t>(index_addr));
+	                    args.index_count, 0, 1, args.instance_count,
+	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (index_count == 0 || instance_count == 0) {
+	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}
 
@@ -1303,15 +1298,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		     "\t index_type_and_size = 0x%08" PRIx32 "\n"
 		     "\t index_count         = 0x%08" PRIx32 "\n"
 		     "\t index_addr          = 0x%016" PRIx64 "\n"
-		     "\t flags               = 0x%08" PRIx32 "\n"
-		     "\t type                = 0x%08" PRIx32 "\n"
 		     "\t instance_count      = 0x%08" PRIx32 "\n"
-		     "\t rt_slice_offset     = 0x%08" PRIx32 "\n"
-		     "\t vertex_offset_add   = 0x%08" PRIx32 "\n"
+		     "\t base_vertex         = 0x%08" PRIx32 "\n"
 		     "\t first_instance      = 0x%08" PRIx32 "\n",
-		     index_type_and_size, index_count, reinterpret_cast<uint64_t>(index_addr), flags, type,
-		     instance_count, render_target_slice_offset, static_cast<uint32_t>(vertex_offset_add),
-		     first_instance);
+		     args.index_type_and_size, args.index_count,
+		     reinterpret_cast<uint64_t>(args.index_addr), args.instance_count,
+		     static_cast<uint32_t>(args.base_vertex), args.first_instance);
 	}
 
 	uc_check(ucfg);
@@ -1326,45 +1318,42 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	vk::IndexType index_type           = vk::IndexType::eUint16;
 	uint64_t      index_size           = 0;
 	bool          expand_index8_to_u16 = false;
-	const bool primitive_restart = ResolvePrimitiveRestart(buffer, topology, index_type_and_size);
+	const bool    primitive_restart =
+	    ResolvePrimitiveRestart(buffer, topology, args.index_type_and_size);
 
-	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
+	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
 		case Prospero::IndexType::kIndex16:
 			index_type = vk::IndexType::eUint16;
-			index_size = 2 * static_cast<uint64_t>(index_count);
+			index_size = 2 * static_cast<uint64_t>(args.index_count);
 			break;
 		case Prospero::IndexType::kIndex32:
 			index_type = vk::IndexType::eUint32;
-			index_size = 4 * static_cast<uint64_t>(index_count);
+			index_size = 4 * static_cast<uint64_t>(args.index_count);
 			break;
 		// Some games use it - need vulkan extension
 		case Prospero::IndexType::kIndex8:
 			index_type           = vk::IndexType::eUint16;
-			index_size           = static_cast<uint64_t>(index_count);
+			index_size           = static_cast<uint64_t>(args.index_count);
 			expand_index8_to_u16 = true;
 			break;
-		default: EXIT("unknown index_type_and_size: %u\n", index_type_and_size);
+		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(type != 1);
-	const DrawCallInfo    draw {"DrawIndex",    CommandBufferDebugOp::DrawIndex,
-	                            index_count,    flags,
-	                            instance_count, first_instance,
-	                            offsets_from_indirect_args};
+	const DrawCallInfo    draw {"DrawIndex", CommandBufferDebugOp::DrawIndex, args.index_count,
+	                            args.instance_count, args.first_instance};
 	std::vector<uint16_t> expanded_indices;
 	if (expand_index8_to_u16) {
-		EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
-		const auto* src = static_cast<const uint8_t*>(index_addr);
-		expanded_indices.resize(index_count);
-		for (uint32_t i = 0; i < index_count; i++) {
+		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
+		const auto* src = static_cast<const uint8_t*>(args.index_addr);
+		expanded_indices.resize(args.index_count);
+		for (uint32_t i = 0; i < args.index_count; i++) {
 			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
 	}
 
 	DrawIndexBufferSource index_source {};
 	index_source.enabled = true;
-	index_source.address = reinterpret_cast<uint64_t>(index_addr);
+	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
 	index_source.host_data =
 	    expanded_indices.empty() ? nullptr : static_cast<const void*>(expanded_indices.data());
 	index_source.size =
@@ -1372,26 +1361,28 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.type = index_type;
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, true, state)) {
+	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,
+	                            state)) {
 		ResetBindings();
 		return;
 	}
 
 	RefreshShaders(buffer, draw, true, state);
 
-	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
+	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
+	                     args.index_addr);
 
+	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto vertex_offset =
-	    draw.offsets_from_indirect_args
-	        ? vertex_offset_add
-	        : ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) + vertex_offset_add;
+	    indirect
+	        ? args.base_vertex
+	        : ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) + args.base_vertex;
 
 	DrawEmitInfo emit {};
-	emit.indexed        = true;
-	emit.vertex_offset  = vertex_offset;
-	emit.first_instance = draw.offsets_from_indirect_args
-	                          ? draw.first_instance
-	                          : ResolveInstanceOffset(state.vs_input_info);
+	emit.indexed       = true;
+	emit.vertex_offset = vertex_offset;
+	emit.first_instance =
+	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart, true, true, false);
@@ -1399,22 +1390,21 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count,
-                              uint32_t flags, uint32_t render_target_slice_offset,
-                              uint32_t instance_count, uint32_t first_vertex,
-	                          uint32_t first_instance, bool offsets_from_indirect_args) {
+void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
+	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndexAuto), submit_id,
-	                    index_count, flags, first_vertex, instance_count, first_instance);
+	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
+	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (index_count == 0 || instance_count == 0) {
+	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return;
 	}
 
@@ -1437,28 +1427,22 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 		hw_print(buffer);
 
 		LOGF("GraphicsRenderDrawIndexAuto():Parameters:\n"
-		     "\t index_count         = 0x%08" PRIx32 "\n"
-		     "\t flags               = 0x%08" PRIx32 "\n"
-		     "\t rt_slice_offset     = 0x%08" PRIx32 "\n"
+		     "\t vertex_count        = 0x%08" PRIx32 "\n"
 		     "\t instance_count      = 0x%08" PRIx32 "\n"
 		     "\t first_vertex        = 0x%08" PRIx32 "\n"
 		     "\t first_instance      = 0x%08" PRIx32 "\n",
-		     index_count, flags, render_target_slice_offset, instance_count, first_vertex,
-		     first_instance);
+		     args.vertex_count, args.instance_count, args.first_vertex, args.first_instance);
 	}
 
 	uc_check(ucfg);
 
 	hw_check(buffer);
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
 	const DrawCallInfo draw {"DrawIndexAuto", CommandBufferDebugOp::DrawIndexAuto,
-	                         index_count,     flags,
-	                         instance_count,  first_instance,
-	                         offsets_from_indirect_args};
+	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, false,
+	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();
 		return;
@@ -1489,16 +1473,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	                     ucfg.GetPrimType() == Prospero::PrimitiveType::kRectListLegacy, 0,
 	                     nullptr);
 
+	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto vertex_offset =
-	    draw.offsets_from_indirect_args
-	        ? static_cast<int32_t>(first_vertex)
-	        : ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
-	              static_cast<int32_t>(first_vertex);
+	    indirect ? static_cast<int32_t>(args.first_vertex)
+	             : ResolveVertexOffset(ucfg.GetIndexOffset(), state.vs_input_info) +
+	                   static_cast<int32_t>(args.first_vertex);
 	DrawEmitInfo emit {};
-	emit.first_vertex   = static_cast<uint32_t>(vertex_offset);
-	emit.first_instance = draw.offsets_from_indirect_args
-	                          ? draw.first_instance
-	                          : ResolveInstanceOffset(state.vs_input_info);
+	emit.first_vertex = static_cast<uint32_t>(vertex_offset);
+	emit.first_instance =
+	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,

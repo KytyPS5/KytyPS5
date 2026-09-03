@@ -73,13 +73,9 @@ public:
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
-	               uint32_t instance_count = 0, const void* object_ids = nullptr,
-	               uint32_t render_target_slice_offset = 0, int32_t vertex_offset_add = 0,
-	               uint32_t first_instance = 0, bool offsets_from_indirect_args = false);
-	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count, uint32_t flags);
-	void DrawIndexAuto(uint32_t index_count, uint32_t flags,
-	                   uint32_t render_target_slice_offset = 0);
+	void DrawIndex(DrawIndexArgs args);
+	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
+	void DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
@@ -149,10 +145,6 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
-	void SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,
-	                          uint32_t render_target_slice_offset, uint32_t first_vertex,
-	                          uint32_t first_instance, bool offsets_from_indirect_args = false);
-
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }

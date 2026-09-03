@@ -48,6 +48,31 @@ enum class CommandBufferDebugOp : uint32_t {
 	Unknown,
 };
 
+enum class DrawOffsetSource : uint8_t {
+	DrawState,
+	IndirectArgs,
+};
+
+struct DrawIndexArgs {
+	uint32_t         index_count                = 0;
+	const void*      index_addr                 = nullptr;
+	uint32_t         instance_count             = 0;
+	uint32_t         index_type_and_size        = 0;
+	int32_t          base_vertex                = 0;
+	uint32_t         first_instance             = 0;
+	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	uint32_t         render_target_slice_offset = 0;
+};
+
+struct DrawAutoArgs {
+	uint32_t         vertex_count               = 0;
+	uint32_t         instance_count             = 0;
+	uint32_t         first_vertex               = 0;
+	uint32_t         first_instance             = 0;
+	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	uint32_t         render_target_slice_offset = 0;
+};
+
 struct SubmitInfo {
 	static constexpr uint32_t MaxSemaphores = 3;
 
@@ -129,15 +154,6 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_type_and_size,
-	               uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
-	               uint32_t instance_count = 1, uint32_t render_target_slice_offset = 0,
-	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0,
-	               bool offsets_from_indirect_args = false);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count, uint32_t flags,
-	              uint32_t render_target_slice_offset = 0, uint32_t instance_count = 1,
-	              uint32_t first_vertex = 0, uint32_t first_instance = 0,
-	              bool offsets_from_indirect_args = false);
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
@@ -150,6 +166,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+
 	struct GraphicsBindings {
 		PreparedBindings                vertex;
 		std::optional<PreparedBindings> pixel;
@@ -193,6 +212,7 @@ private:
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
 
+	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
 

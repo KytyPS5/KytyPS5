@@ -102,7 +102,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
 	                                                             id++, stage_name, shader_hash);
 	Common::File::CreateDirectories(path.parent_path());
-	Common::File file(path, Common::File::Mode::Write);
+	Common::File file(path);
 	if (file.IsInvalid()) {
 		const auto path_text = Common::PathToString(path);
 		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
@@ -131,7 +131,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		}
 		auto path = base;
 		path += suffix;
-		Common::File file(path, Common::File::Mode::Write);
+		Common::File file(path);
 		if (file.IsInvalid()) {
 			const auto path_text = Common::PathToString(path);
 			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());

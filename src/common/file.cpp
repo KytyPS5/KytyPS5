@@ -69,7 +69,7 @@ File::File(): m_p(std::make_unique<FilePrivate>()) {
 }
 
 File::~File() {
-	EXIT_IF(m_p->f != nullptr);
+	Close();
 }
 
 File::File(const std::filesystem::path& name): m_p(std::make_unique<FilePrivate>()) {

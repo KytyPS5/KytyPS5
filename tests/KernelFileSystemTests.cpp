@@ -70,7 +70,6 @@ void CheckSaveRename(const std::filesystem::path &root,
   Common::File result(root / "SDATA000.DAT", Common::File::Mode::Read);
   Check(!result.IsInvalid(), "open renamed save file");
   const auto data = result.ReadWholeBuffer();
-  result.Close();
   const std::string expected = std::string(payload) + Suffix;
   Check(data.Size() == expected.size(), "renamed save size");
   Check(std::memcmp(data.GetData(), expected.data(), expected.size()) == 0,

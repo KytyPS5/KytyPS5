@@ -7442,6 +7442,103 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckRenderExecutorDccFixedClearFloat() {
+    constexpr const char *name = "RenderExecutorDccFixedClearFloat";
+    constexpr uintptr_t base = 0x0000000204100000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t dcc_address = base + 0x100000;
+    struct FillCase {
+      uint32_t fill;
+      std::array<uint32_t, 4> clear;
+    };
+    constexpr std::array cases{
+        FillCase{0x40404040u, {0, 0, 0, 0x3f800000u}},
+        FillCase{0x80808080u, {0x3f800000u, 0x3f800000u, 0x3f800000u, 0}},
+    };
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "fixed-clear direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed-clear direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    for (const auto &fill_case : cases) {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.dcc_compression_enable = true,
+              .format = Prospero::ChannelLayout::k16_16_16_16,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 255, .width = 255});
+      registers.SetColorAttrib3(0,
+                                {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                 .dimension = 1,
+                                 .metadata_pipe_aligned = true});
+      registers.SetColorDccAddr(0, {.addr = dcc_address});
+      registers.SetColorClearWord0(0, {.word0 = 0});
+      registers.SetColorClearWord1(0, {.word1 = 0});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+      Require(name, "deferred fixed-code fill",
+              !texture_cache.TryConsumeDccFill(dcc_address, 0x1000,
+                                               fill_case.fill),
+              "a pre-registration DCC fill was not deferred");
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, 1, scheduler.Current(), color, 0);
+      RenderDepthInfo no_depth{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, no_depth);
+      Require(name, "fixed clear on a float target",
+              color.image_id &&
+                  color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  color.desc.info.metadata.range.address == dcc_address &&
+                  color.metadata_fixed_clear_supported &&
+                  rendering.num_color_attachments == 1 &&
+                  rendering.color_attachments[0].is_clear &&
+                  rendering.color_attachments[0].clear_value ==
+                      fill_case.clear &&
+                  !texture_cache.IsMetaCleared(dcc_address, 0),
+              "a DCC fixed clear code was not materialised on an RGBA16F "
+              "target");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "fixed-clear direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "fixed-clear direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -25793,6 +25890,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -25979,6 +26077,7 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColor1DDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
+  vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();

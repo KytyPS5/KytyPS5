@@ -3074,7 +3074,6 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
-	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
 	// 6xx
 	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("cQke9UuBQOk", Memory::KernelMunmap);
@@ -3227,9 +3226,6 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqdNorrB+gI", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("sIlRvQqsN2Y", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("bIHoZCTomsI", LibKernel::PthreadRwlockTrywrlock);
-	LIB_FUNC("XD3mDeybCnk", LibKernel::PthreadRwlockTryrdlock);
-	LIB_FUNC("iPtZRWICjrM", LibKernel::PthreadRwlockTimedrdlock);
-	LIB_FUNC("adh--6nIqTk", LibKernel::PthreadRwlockTimedwrlock);
 	LIB_FUNC("i2ifZ3fS2fo", LibKernel::PthreadRwlockattrDestroy);
 	LIB_FUNC("yOfGg-I1ZII", LibKernel::PthreadRwlockattrInit);
 	LIB_FUNC("qsdmgXjqSgk", LibKernel::PthreadRwlockattrDestroy);
@@ -3325,6 +3321,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
+	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);

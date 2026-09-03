@@ -23,21 +23,34 @@ uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
 }
 
+uint32_t render_target_write_mask(const HW::Context& ctx, uint32_t slot) {
+	uint32_t mask = render_target_mask_slot(ctx.GetRenderTargetMask(), slot);
+	if (mask == 0) {
+		const auto& sh_regs = ctx.GetShaderRegisters();
+		mask = (sh_regs.m_cbShaderMask >> (slot * 4u)) & 0x0fu;
+		if (mask == 0 && slot < 8 && sh_regs.target_output_mode[slot] != 0) {
+			mask = 0x0fu;
+		}
+	}
+	return mask;
+}
+
+bool render_target_slot_active(const HW::Context& ctx, uint32_t slot) {
+	if (slot >= 8 || ctx.GetRenderTarget(slot).base.addr == 0) {
+		return false;
+	}
+	return render_target_write_mask(ctx, slot) != 0;
+}
+
 static bool RenderTargetMaskHasMrt(uint32_t mask) {
 	return (mask & ~0x0fu) != 0;
 }
 
 static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
-	const auto& hw   = buffer.GetRegisters();
-	const auto  mask = hw.GetRenderTargetMask();
-
-	if (!RenderTargetMaskHasMrt(mask)) {
-		return false;
-	}
-
+	const auto& hw = buffer.GetRegisters();
 	uint32_t bound_targets = 0;
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_slot_active(hw, i)) {
 			bound_targets++;
 		}
 	}
@@ -46,10 +59,9 @@ static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 }
 
 uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
-	const auto& hw   = buffer.GetRegisters();
-	const auto  mask = hw.GetRenderTargetMask();
+	const auto& hw = buffer.GetRegisters();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_slot_active(hw, i)) {
 			return i;
 		}
 	}

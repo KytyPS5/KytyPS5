@@ -169,7 +169,7 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		                     !checked_add(linear_used, bytes, linear_used) ||
 		                     !checked_multiply(info.width, info.bytes_per_element, bytes) ||
 		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     linear_used > info.linear_size || slice_bytes > UINT32_MAX);
+		                     (info.linear_offset + linear_used > linear_capacity) || slice_bytes > UINT32_MAX);
 
 		const uint64_t columns =
 		    (static_cast<uint64_t>(tiled_width) + block.block_width - 1u) / block.block_width;
@@ -190,8 +190,7 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 			    (static_cast<uint64_t>(info.depth) + block.block_depth - 1u) / block.block_depth;
 			uint64_t tiled_used = 0;
 			EXIT_NOT_IMPLEMENTED(!checked_multiply(blocks_per_slice, slices, tiled_used) ||
-			                     !checked_multiply(tiled_used, block.block_size, tiled_used) ||
-			                     tiled_used > info.tiled_size);
+			                     !checked_multiply(tiled_used, block.block_size, tiled_used));
 		}
 
 		const uint32_t alignment = std::min(info.bytes_per_element, 4u);
@@ -376,6 +375,16 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
                                         std::span<const GpuTileInfo> infos) {
+	for (const auto& info: infos) {
+		const uint64_t pitch_bytes = static_cast<uint64_t>(info.pitch) * info.bytes_per_element;
+		const uint64_t slice_bytes = info.linear_slice_stride != 0 ? info.linear_slice_stride
+		                                                            : (pitch_bytes * info.height);
+		const uint64_t linear_used =
+		    (info.depth > 1 ? (static_cast<uint64_t>(info.depth - 1u) * slice_bytes) : 0u) +
+		    (info.height > 1 ? (static_cast<uint64_t>(info.height - 1u) * pitch_bytes) : 0u) +
+		    (static_cast<uint64_t>(info.width) * info.bytes_per_element);
+		linear_capacity = std::max(linear_capacity, info.linear_offset + linear_used);
+	}
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -408,6 +417,16 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
                             uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
                             ColorTransform transform) {
 	EXIT_IF(regions.empty());
+	for (const auto& info: infos) {
+		const uint64_t pitch_bytes = static_cast<uint64_t>(info.pitch) * info.bytes_per_element;
+		const uint64_t slice_bytes = info.linear_slice_stride != 0 ? info.linear_slice_stride
+		                                                            : (pitch_bytes * info.height);
+		const uint64_t linear_used =
+		    (info.depth > 1 ? (static_cast<uint64_t>(info.depth - 1u) * slice_bytes) : 0u) +
+		    (info.height > 1 ? (static_cast<uint64_t>(info.height - 1u) * pitch_bytes) : 0u) +
+		    (static_cast<uint64_t>(info.width) * info.bytes_per_element);
+		linear_capacity = std::max(linear_capacity, info.linear_offset + linear_used);
+	}
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);

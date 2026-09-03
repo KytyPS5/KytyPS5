@@ -2187,6 +2187,10 @@ bool StructurizeImpl(Graph& graph) {
 			continue;
 		}
 		if (IsInnermostLoopControlConditional(graph, block)) {
+			const auto* loop = FindInnermostContainingLoop(graph, block.id);
+			if (loop != nullptr) {
+				block.terminator.continue_block = loop->continue_block;
+			}
 			continue;
 		}
 

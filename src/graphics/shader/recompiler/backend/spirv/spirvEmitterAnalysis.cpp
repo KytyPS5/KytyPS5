@@ -157,8 +157,9 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
+	const uint32_t depth = image.depth_compare ? 1 : 0;
 	return state.builder.Type(OpTypeImage,
-	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, 0,
+	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, depth,
 	                           info.arrayed, info.multisampled, sampled, format});
 }
 

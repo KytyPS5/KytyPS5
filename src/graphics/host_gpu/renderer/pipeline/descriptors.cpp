@@ -65,7 +65,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::UserData: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -106,6 +106,12 @@ static void BindNullStorageBuffer(RenderContext& context, BufferView& dst) {
 	dst.buffer = context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle();
 	dst.offset = 0;
 	dst.range  = 16;
+}
+
+static void CopyNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& source,
+                                 std::span<uint32_t>                          destination) {
+	EXIT_IF(source.dword_count != destination.size());
+	std::copy_n(source.dwords.begin(), destination.size(), destination.begin());
 }
 
 static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) {
@@ -652,7 +658,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	ShaderTextureResource descriptor;
+	CopyNativeDescriptor(value, descriptor.fields);
 	const bool storage = resource.written;
 	if (storage) {
 		ValidateStorageImageResource(resource);
@@ -795,11 +802,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
+                                 const ShaderRecompiler::IR::Program& program, uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	if (!program.info.samplers[index].depth_compare) {
+	ShaderSamplerResource descriptor;
+	CopyNativeDescriptor(value, descriptor.fields);
+	const bool depth_compare = std::any_of(program.info.sampled_pairs.begin(),
+	                                       program.info.sampled_pairs.end(), [&](const auto& pair) {
+		                                       return pair.sampler == index &&
+		                                              pair.image < program.info.images.size() &&
+		                                              program.info.images[pair.image].depth_compare;
+	                                       });
+	if (!depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
 	if (program.info.samplers[index].force_point_filtering) {
@@ -856,10 +869,15 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
-	const auto& snapshot = runtime.resources;
+	const auto& snapshot = *runtime.resources;
+	if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot)) {
+		EXIT("invalid native shader runtime snapshot: hash=0x%016" PRIx64 " stage=%u\n",
+		     program.shader_hash, static_cast<unsigned>(program.stage));
+	}
+
 	PreparedBindings prepared;
-	prepared.program  = runtime.program;
-	prepared.snapshot = &runtime.resources;
+	prepared.program  = runtime.program.get();
+	prepared.snapshot = runtime.resources.get();
 	auto& descriptors = prepared.resources;
 	descriptors.buffers.reserve(program.info.buffers.size());
 	descriptors.images.reserve(program.info.images.size());
@@ -872,11 +890,17 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		descriptors.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
-	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.bindings.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	if (ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) !=
+	    nullptr) {
+		prepared.flattened_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
 	}
-	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+
+	prepared.user_data.reserve(program.bindings.ShaderDataDwords());
+	for (const auto reg: program.bindings.user_data_registers) {
+		prepared.user_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	}
+	prepared.user_data.resize(program.bindings.ShaderDataDwords());
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
@@ -891,21 +915,22 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot = *prepared.snapshot;
 	auto&       cache    = m_context.GetBufferCache();
 
-	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
+	prepared.buffer_ids.clear();
+	prepared.buffer_ids.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+		ShaderBufferResource descriptor;
+		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		const auto address = descriptor.Base48();
 		const auto stride  = descriptor.Stride();
 		const auto records = descriptor.NumRecords();
 		EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
 		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
+			prepared.buffer_ids.emplace_back();
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-		prepared.buffer_sources.emplace_back(descriptor, cache.FindBuffer(address, size));
+		prepared.buffer_ids.push_back(cache.FindBuffer(address, size));
 	}
 
 }
@@ -917,33 +942,32 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
+	EXIT_IF(prepared.buffer_ids.size() != program.info.buffers.size());
 
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
-	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
-	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
-	          prepared.shader_data.end(), 0);
+	EXIT_IF(prepared.user_data.size() != layout.ShaderDataDwords());
+	std::fill(prepared.user_data.begin() + layout.memory_offset_dword, prepared.user_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
-		prepared.shader_data[dword] |= offset << shift;
+		prepared.user_data[dword] |= offset << shift;
 	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& [descriptor, buffer_id] = prepared.buffer_sources[i];
+		ShaderBufferResource descriptor;
+		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
 		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
 		                                                program.info.buffers[i], program.stage, i,
-		                                                buffer_offset, buffer_id));
+		                                                buffer_offset, prepared.buffer_ids[i]));
 		pack_memory_offset(i, buffer_offset);
 	}
-	if (ShaderRecompiler::IR::FindBinding(
-	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		resources.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+	if (!prepared.flattened_srt.empty()) {
+		resources.flattened_srt = NativeUpload(m_context, prepared.flattened_srt);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
-	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		resources.shader_data = NativeUpload(m_context, prepared.shader_data);
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UserData) != nullptr) {
+		resources.user_data = NativeUpload(m_context, prepared.user_data);
 	}
 }
 
@@ -1032,13 +1056,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
-	ShaderRecompiler::IR::PushData push_data;
-	bool                           has_push_data = false;
 	constexpr auto GraphicsStages =
 	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	const auto push_constant_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
+	                                      ? vk::ShaderStageFlags {GraphicsStages}
+	                                      : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
-		        prepared->snapshot == nullptr);
+		        prepared->snapshot == nullptr || prepared->committed);
 		write_count += prepared->program->bindings.descriptors.size();
 		for (const auto& binding: prepared->program->bindings.descriptors) {
 			descriptor_count += NativeDescriptorCount(binding);
@@ -1052,6 +1077,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();
+	m_push_constants.fill(0);
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
@@ -1141,13 +1167,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					}
 					case BindingKind::FlattenedSrt:
-					case BindingKind::ShaderData:
+					case BindingKind::UserData:
 					case BindingKind::Gds: {
 						const BufferView* view = &descriptors.gds;
 						if (binding.kind == BindingKind::FlattenedSrt) {
 							view = &descriptors.flattened_srt;
-						} else if (binding.kind == BindingKind::ShaderData) {
-							view = &descriptors.shader_data;
+						} else if (binding.kind == BindingKind::UserData) {
+							view = &descriptors.user_data;
 						}
 						EXIT_IF(view->buffer == nullptr);
 						m_descriptor_buffers.emplace_back(view->buffer, view->offset, view->range);
@@ -1180,22 +1206,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			EXIT_IF(m_image_occurrences[i] != expected);
 		}
 
-		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
-		if (program.bindings.UsesPushData()) {
-			std::ranges::copy(prepared->shader_data,
-			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
-			has_push_data = true;
+		if (program.bindings.push_constant_size != 0) {
+			const auto offset = program.bindings.push_constant_offset;
+			EXIT_IF(offset % sizeof(uint32_t) != 0 ||
+			        program.bindings.push_constant_size !=
+			            prepared->user_data.size() * sizeof(uint32_t) ||
+			        offset + program.bindings.push_constant_size >
+			            ShaderRecompiler::IR::NativePushConstantSize);
+			std::copy(prepared->user_data.begin(), prepared->user_data.end(),
+			          m_push_constants.begin() + offset / sizeof(uint32_t));
 		}
 	}
-
-	if (has_push_data) {
-		const auto stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-		                        ? vk::ShaderStageFlags {GraphicsStages}
-		                        : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
-		vk_buffer.pushConstants(pipeline.pipeline_layout, stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
-	}
+	vk_buffer.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
+	                        ShaderRecompiler::IR::NativePushConstantSize,
+	                        m_push_constants.data());
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
@@ -1214,6 +1238,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	for (auto* prepared: prepared_bindings) {
+		prepared->committed = true;
 	}
 }
 

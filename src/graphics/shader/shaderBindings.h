@@ -60,7 +60,8 @@ struct ShaderBufferResource {
 	}
 
 	[[nodiscard]] uint64_t Base48() const {
-		return (fields[0] | (static_cast<uint64_t>(fields[1]) << 32u)) & 0xFFFFFFFFFFFFu;
+		return (fields[0] | ((static_cast<uint64_t>(fields[1]) & 0x0000FFFFu) << 32u)) &
+		       0xFFFFFFFFFFFFu;
 	}
 	[[nodiscard]] uint8_t                RawFormat() const { return (fields[3] >> 12u) & 0x7Fu; }
 	[[nodiscard]] Prospero::BufferFormat Format() const {

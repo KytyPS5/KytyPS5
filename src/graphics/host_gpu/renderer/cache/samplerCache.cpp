@@ -95,23 +95,29 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	const bool depth_compare = (r.DepthCompareFunc() != 0);
+	vk::BorderColor border = depth_compare ? vk::BorderColor::eFloatTransparentBlack
+	                                       : vk::BorderColor::eIntTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = depth_compare ? vk::BorderColor::eFloatTransparentBlack
+			                       : vk::BorderColor::eIntTransparentBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border = depth_compare ? vk::BorderColor::eFloatOpaqueBlack
+			                       : vk::BorderColor::eIntOpaqueBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border = depth_compare ? vk::BorderColor::eFloatOpaqueWhite
+			                       : vk::BorderColor::eIntOpaqueWhite;
 			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = depth_compare ? vk::BorderColor::eFloatTransparentBlack
+			                       : vk::BorderColor::eIntTransparentBlack;
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
@@ -155,6 +161,11 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	vk::Sampler vk_sampler = nullptr;
 	const auto  result     = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
+
+	if (depth_compare) {
+		LOGF("DepthCompare Sampler created: func=%u border=%d clamp=(%u,%u,%u)\n",
+		     r.DepthCompareFunc(), static_cast<int>(border), r.ClampX(), r.ClampY(), r.ClampZ());
+	}
 
 	m_samplers.emplace(key, vk_sampler);
 	return vk_sampler;

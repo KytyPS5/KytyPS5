@@ -63,17 +63,6 @@ struct VulkanExtensions {
 	std::vector<vk::LayerProperties>     available_layers;
 };
 
-vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
-	vk::PhysicalDeviceVulkan12Features features {};
-	features.sType                    = vk::StructureType::ePhysicalDeviceVulkan12Features;
-	features.samplerMirrorClampToEdge = VK_TRUE;
-	features.timelineSemaphore        = VK_TRUE;
-	features.shaderOutputLayer        = VK_TRUE;
-	features.bufferDeviceAddress      = VK_TRUE;
-	features.shaderBufferInt64Atomics = VK_TRUE;
-	return features;
-}
-
 vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noexcept {
 	vk::PhysicalDeviceVulkan13Features features {};
 	features.sType            = vk::StructureType::ePhysicalDeviceVulkan13Features;
@@ -228,7 +217,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		device_features2.pNext = &features13;
 
 		device.getFeatures2(&device_features2);
-		const auto required_features12 = WindowContext::RequiredVulkan12Features();
 		const auto required_features13 = WindowContext::RequiredVulkan13Features();
 
 		const auto queue_family = VulkanFindQueueFamily(device, surface);
@@ -261,29 +249,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 #endif
 
-		if (required_features12.samplerMirrorClampToEdge == VK_TRUE &&
-		    features12.samplerMirrorClampToEdge != VK_TRUE) {
+		if (features12.samplerMirrorClampToEdge != VK_TRUE) {
 			LOGF("samplerMirrorClampToEdge is not supported\n");
 			skip_device = true;
 		}
-		if (required_features12.timelineSemaphore == VK_TRUE &&
-		    features12.timelineSemaphore != VK_TRUE) {
+		if (features12.timelineSemaphore != VK_TRUE) {
 			LOGF("timelineSemaphore is not supported\n");
-			skip_device = true;
-		}
-		if (required_features12.shaderOutputLayer == VK_TRUE &&
-		    features12.shaderOutputLayer != VK_TRUE) {
-			LOGF("shaderOutputLayer is not supported\n");
-			skip_device = true;
-		}
-		if (required_features12.bufferDeviceAddress == VK_TRUE &&
-		    features12.bufferDeviceAddress != VK_TRUE) {
-			LOGF("bufferDeviceAddress is not supported\n");
-			skip_device = true;
-		}
-		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
-		    features12.shaderBufferInt64Atomics != VK_TRUE) {
-			LOGF("shaderBufferInt64Atomics is not supported\n");
 			skip_device = true;
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
@@ -320,6 +291,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("largePoints is not supported\n");
 			skip_device = true;
 		}
+		if (features12.shaderOutputLayer != VK_TRUE) {
+			LOGF("shaderOutputLayer is not supported\n");
+			skip_device = true;
+		}
+
 		if (device_features2.features.fragmentStoresAndAtomics != VK_TRUE) {
 			LOGF("fragmentStoresAndAtomics is not supported\n");
 			skip_device = true;
@@ -571,8 +547,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	depth_clip_control.depthClipControl = VK_TRUE;
 
-	auto features12  = WindowContext::RequiredVulkan12Features();
-	features12.pNext = &depth_clip_control;
+	vk::PhysicalDeviceVulkan12Features features12 {};
+	features12.sType                    = vk::StructureType::ePhysicalDeviceVulkan12Features;
+	features12.pNext                    = &depth_clip_control;
+	features12.samplerMirrorClampToEdge = VK_TRUE;
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
@@ -608,12 +586,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
 	supported_features2.pNext = &supported_features13;
 	physical_device.getFeatures2(&supported_features2);
-	const auto required_features12 = WindowContext::RequiredVulkan12Features();
 	const auto required_features13 = WindowContext::RequiredVulkan13Features();
-	EXIT_NOT_IMPLEMENTED(required_features12.samplerMirrorClampToEdge == VK_TRUE &&
-	                     supported_features12.samplerMirrorClampToEdge != VK_TRUE);
-	EXIT_NOT_IMPLEMENTED(required_features12.timelineSemaphore == VK_TRUE &&
-	                     supported_features12.timelineSemaphore != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.timelineSemaphore != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features13.dynamicRendering == VK_TRUE &&
 	                     supported_features13.dynamicRendering != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features13.synchronization2 == VK_TRUE &&
@@ -625,15 +599,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.largePoints != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
-	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
-	                     supported_features12.shaderOutputLayer != VK_TRUE);
-	EXIT_NOT_IMPLEMENTED(required_features12.bufferDeviceAddress == VK_TRUE &&
-	                     supported_features12.bufferDeviceAddress != VK_TRUE);
-	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
-	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.shaderOutputLayer != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.bufferDeviceAddress != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
+	features12.timelineSemaphore = VK_TRUE;
+	features12.shaderOutputLayer = VK_TRUE;
+	features12.bufferDeviceAddress = VK_TRUE;
+
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;

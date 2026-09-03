@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -52,7 +53,7 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
-	const auto& resources = vs_input_info.stage.resources;
+	const auto& resources = *vs_input_info.stage.resources;
 	if (program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
 		const auto index =
 		    static_cast<uint32_t>(program.info.vertex_offset_sgpr) - program.user_data_base;
@@ -133,12 +134,6 @@ static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
 	const auto  rt_mask        = ctx.GetRenderTargetMask();
 	const auto  cb_shader_mask = sh_regs.m_cbShaderMask;
 	const auto& bc0            = ctx.GetBlendControl(0);
-
-	bool interesting = rt_mask != 0x0f || (cb_shader_mask & ~0x0fu) != 0 ||
-	                   IsDualSourceBlendFactor(bc0.color_srcblend) ||
-	                   IsDualSourceBlendFactor(bc0.color_destblend) ||
-	                   (bc0.separate_alpha_blend && (IsDualSourceBlendFactor(bc0.alpha_srcblend) ||
-	                                                 IsDualSourceBlendFactor(bc0.alpha_destblend)));
 
 	auto log_id = g_mrt_state_log_count.fetch_add(1);
 	if (log_id >= 32) {
@@ -364,9 +359,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		line_width = 1.0f;
 	}
 	vk_buffer.setLineWidth(line_width);
-	const auto&      blend = ctx.GetBlendColor();
-	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
@@ -408,7 +400,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// Color-control operation selects special color-buffer paths, not the normal component write
 	// mask. Attachment availability therefore follows the target write mask.
 	for (uint32_t i = 0; i < color_count; i++) {
-		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
+		enable[i] = render_target_write_mask(ctx, colors[i].target_slot) != 0
 		                ? VK_TRUE
 		                : VK_FALSE;
 	}
@@ -498,7 +490,8 @@ struct DrawRenderState {
 	RenderState           rendering;
 	ShaderVertexInputInfo vs_input_info;
 	ShaderPixelInputInfo  ps_input_info;
-	PipelineCache::GraphicsPrograms programs;
+	ShaderProgram         vertex_program;
+	ShaderProgram         pixel_program;
 };
 
 struct DrawCallInfo {
@@ -694,7 +687,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear  = depth.stencil_clear_enable || depth.depth_meta_clear_enable;
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -974,8 +967,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 		LogDrawPhase(draw.name, "ResolveRenderColorTarget");
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
-		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
+		if (slot == 0 || render_target_slot_active(ctx, slot)) {
 			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
@@ -1000,30 +992,152 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	return true;
 }
 
+static bool IsVulkanIntegerFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool IsVulkanSignedIntegerFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32B32A32Sint:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint8_t VulkanFormatToChannelLayout(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8Snorm:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Sint:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k8);
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16Snorm:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16Sfloat:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k16);
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8G8Snorm:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8Sint:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k8_8);
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32Sfloat:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k32);
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR16G16Snorm:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16Sfloat:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k16_16);
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Snorm:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA8B8G8R8UnormPack32:
+		case vk::Format::eA8B8G8R8SnormPack32:
+		case vk::Format::eA8B8G8R8UintPack32:
+		case vk::Format::eA8B8G8R8SintPack32:
+		case vk::Format::eA8B8G8R8SrgbPack32:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k8_8_8_8);
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16G16B16A16Snorm:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR16G16B16A16Sfloat:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k16_16_16_16);
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32Sfloat:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k32_32);
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint:
+		case vk::Format::eR32G32B32A32Sfloat:
+			return static_cast<uint8_t>(Prospero::ChannelLayout::k32_32_32_32);
+		default:
+			return 0u;
+	}
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	EXIT_IF(draw.name == nullptr);
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
+	ctx.SyncShaderRenderTargetFormats();
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
+	    target_export_mapping {};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto slot = state.color_info[i].target_slot;
+		if (slot < 8) {
+			target_export_mapping[slot] = state.color_info[i].export_mapping;
+			const auto fmt = state.color_info[i].format;
+			if (IsVulkanIntegerFormat(fmt)) {
+				ctx.SetTargetChannelType(slot, static_cast<uint8_t>(Prospero::ChannelType::kUInt));
+			} else if (IsVulkanSignedIntegerFormat(fmt)) {
+				ctx.SetTargetChannelType(slot, static_cast<uint8_t>(Prospero::ChannelType::kSInt));
+			} else {
+				ctx.SetTargetChannelType(slot, static_cast<uint8_t>(Prospero::ChannelType::kFloat));
+			}
+			const auto layout = VulkanFormatToChannelLayout(fmt);
+			if (layout != 0) {
+				ctx.SetTargetFormat(slot, layout);
+			}
+		}
+	}
+
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
-	state.programs      = {};
-	state.ps_input_info = {};
-	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
-	    target_export_mapping {};
-	for (uint32_t i = 0; i < state.color_count; i++) {
-		target_export_mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
+	state.vertex_program = {};
+	state.pixel_program  = {};
+	state.ps_input_info  = {};
+
+	if (log_phases) {
+		LogDrawPhase(draw.name, "GetVertexProgram");
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
-	if (log_phases) {
-		LogDrawPhase(draw.name, "GetGraphicsPrograms");
+	state.vertex_program = pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, ctx,
+	                                                         state.vs_input_info);
+
+	if (!state.ps_active) {
+		return;
 	}
-	state.programs = pipeline_cache.GetGraphicsPrograms(
-	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, target_export_mapping,
-	    state.ps_active, state.vs_input_info, state.ps_input_info);
+	if (log_phases) {
+		LogDrawPhase(draw.name, "GetPixelProgram");
+	}
+	state.pixel_program =
+	    pipeline_cache.GetPixelProgram(pixel_shader_info, shader_regs, state.vs_input_info,
+	                                   target_export_mapping, state.ps_input_info);
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
@@ -1177,7 +1291,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
+	    state.vertex_program, state.pixel_program);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1444,8 +1558,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
-	    state.vs_input_info.stage.program->param_export_mask == 0 &&
-	    state.ps_input_info.input_num != 0) {
+	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
 			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",

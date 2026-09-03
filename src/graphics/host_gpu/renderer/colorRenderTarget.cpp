@@ -28,27 +28,12 @@ static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool h
 	info.metadata_clear_supported =
 	    has_dcc && DecodePackedColorClear(format, packed_clear, info.color_clear_value);
 	switch (format) {
-		case vk::Format::eR8Unorm:
-		case vk::Format::eR8G8Unorm:
 		case vk::Format::eR8G8B8A8Unorm:
 		case vk::Format::eR8G8B8A8Srgb:
 		case vk::Format::eB8G8R8A8Unorm:
 		case vk::Format::eB8G8R8A8Srgb:
 		case vk::Format::eA2B10G10R10UnormPack32:
 		case vk::Format::eA2R10G10B10UnormPack32:
-		case vk::Format::eR5G6B5UnormPack16:
-		case vk::Format::eA1R5G5B5UnormPack16:
-		case vk::Format::eR4G4B4A4UnormPack16:
-		case vk::Format::eR16Unorm:
-		case vk::Format::eR16G16Unorm:
-		case vk::Format::eR16G16B16A16Unorm:
-		case vk::Format::eR16Sfloat:
-		case vk::Format::eR16G16Sfloat:
-		case vk::Format::eR16G16B16A16Sfloat:
-		case vk::Format::eR32Sfloat:
-		case vk::Format::eR32G32Sfloat:
-		case vk::Format::eR32G32B32A32Sfloat:
-		case vk::Format::eB10G11R11UfloatPack32:
 			info.metadata_fixed_clear_supported = has_dcc;
 			break;
 		default: info.metadata_fixed_clear_supported = false; break;
@@ -70,7 +55,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	const auto  rt_slot = (render_target_slot == UINT32_MAX ? render_target_first_bound_slot(buffer)
 	                                                        : render_target_slot);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	auto        mask    = render_target_write_mask(hw, rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}

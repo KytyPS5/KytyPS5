@@ -409,10 +409,14 @@ int PollMouse(uint64_t now_ms) {
 bool HostInputWaitEvent(SDL_Event* event) {
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
-		if (SDL_WaitEvent(event) == 0) {
+		SDL_ClearError();
+		if (SDL_WaitEventTimeout(event, 10) != 0) {
+			return true;
+		}
+		if (SDL_GetError()[0] != '\0') {
 			EXIT("%s\n", SDL_GetError());
 		}
-		return true;
+		return false;
 	}
 
 	const int timeout_ms = PollMouse(SDL_GetTicks64());

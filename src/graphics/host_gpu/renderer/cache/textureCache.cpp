@@ -830,7 +830,15 @@ struct TextureCache::ColorTransferPlan {
 static uint64_t GetLinearSize(std::span<const GpuTileInfo> tiles) {
 	uint64_t size = 0;
 	for (const auto& tile: tiles) {
-		size = std::max(size, tile.linear_offset + tile.linear_size);
+		const uint64_t pitch_bytes = static_cast<uint64_t>(tile.pitch) * tile.bytes_per_element;
+		const uint64_t slice_bytes = tile.linear_slice_stride != 0 ? tile.linear_slice_stride
+		                                                            : (pitch_bytes * tile.height);
+		const uint64_t linear_used =
+		    (tile.depth > 1 ? (static_cast<uint64_t>(tile.depth - 1u) * slice_bytes) : 0u) +
+		    (tile.height > 1 ? (static_cast<uint64_t>(tile.height - 1u) * pitch_bytes) : 0u) +
+		    (static_cast<uint64_t>(tile.width) * tile.bytes_per_element);
+		const uint64_t tile_size = std::max(tile.linear_size, linear_used);
+		size = std::max(size, tile.linear_offset + tile_size);
 	}
 	return size;
 }
@@ -939,7 +947,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	};
 
-	if (desc.type != BindingType::DepthTarget) {
+	if (!info.IsDepth()) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
@@ -951,9 +959,12 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
-		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
+		const uint64_t tiled_cap = source.Size() > source_offset
+		                               ? std::max(info.data.size, source.Size() - source_offset)
+		                               : info.data.size;
+		TileManager::Result linear {source.Handle(), source_offset, tiled_cap};
 		if (plan.tiled) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			linear = m_tiler.Detile(source.Handle(), source_offset, tiled_cap,
 			                        plan.linear_size, plan.tiles);
 		}
 		if (plan.swap_bgra16) {
@@ -963,7 +974,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		return;
 	}
 
-	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
+	if (info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");

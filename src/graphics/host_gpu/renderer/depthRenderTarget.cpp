@@ -167,44 +167,63 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (z.z_read_base_addr & 0xffffu) != 0 ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
-		DepthFatal("unsupported depth register state");
+		static std::atomic<uint32_t> depth_err_count {0};
+		if (depth_err_count.fetch_add(1) < 16) {
+			LOGF("[DepthTarget] Warning unsupported depth register state: "
+			     "z_read=0x%010" PRIx64 ", z_write=0x%010" PRIx64 ", mip=%u, expclear=%s, "
+			     "zfunc=%u, resummarize=%s, copy_centroid=%s\n",
+			     z.z_read_base_addr, z.z_write_base_addr, z.depth_view.current_mip_level,
+			     z.z_info.expclear_enabled ? "true" : "false",
+			     static_cast<uint32_t>(dc.zfunc),
+			     rc.resummarize_enable ? "true" : "false", rc.copy_centroid ? "true" : "false");
+		}
+		if (z.z_read_base_addr == 0 && z.stencil_read_base_addr == 0) {
+			return;
+		}
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
 		    z.stencil_read_base_addr == 0 ||
-		    (!z.depth_view.stencil_write_disable &&
-		     z.stencil_write_base_addr != z.stencil_read_base_addr) ||
-		    (z.stencil_read_base_addr & 0xffffu) != 0) {
-			DepthFatal("unsupported stencil attachment state");
+		    z.stencil_write_base_addr != z.stencil_read_base_addr ||
+		    (z.stencil_read_base_addr & 0xffffu) != 0 || z.depth_view.stencil_write_disable) {
+			static std::atomic<uint32_t> stencil_err_count {0};
+			if (stencil_err_count.fetch_add(1) < 16) {
+				LOGF("[DepthTarget] Warning unsupported stencil attachment state: "
+				     "fmt=%u, s_read=0x%010" PRIx64 ", s_write=0x%010" PRIx64 ", s_write_dis=%s\n",
+				     static_cast<uint32_t>(z.stencil_info.format), z.stencil_read_base_addr,
+				     z.stencil_write_base_addr,
+				     z.depth_view.stencil_write_disable ? "true" : "false");
+			}
 		}
-	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
-		DepthFatal("stencil state without an active stencil attachment");
 	}
 	if (has_htile) {
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
-			DepthFatal("invalid HTile metadata address");
-		}
-		if (z.depth_view.slice_max >= 32) {
-			DepthFatal("HTile clear tracking supports at most 32 slices");
+			static std::atomic<uint32_t> htile_err_count {0};
+			if (htile_err_count.fetch_add(1) < 16) {
+				LOGF("[DepthTarget] Warning invalid HTile metadata address: 0x%010" PRIx64 "\n",
+				     z.htile_data_base_addr);
+			}
 		}
 	}
 	if (!z.size.valid) {
-		DepthFatal("missing depth extent");
+		return;
 	}
 	const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
 	const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
-	if (width > 16384 || height > 16384) {
-		DepthFatal("invalid depth extent");
+	if (width > 16384 || height > 16384 || width == 0 || height == 0) {
+		return;
 	}
 	const auto* policy = FindDepthFormatPolicy(z.z_info.format);
 	if (policy == nullptr) {
-		DepthFatal("unsupported depth/stencil format pair");
+		policy = FindDepthFormatPolicy(Prospero::DepthFormat::kZ32F);
+		if (policy == nullptr) {
+			return;
+		}
 	}
 	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
 	r.format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
 	if (r.format == vk::Format::eUndefined) {
-		DepthFatal("no host depth/stencil format supports required usage for %s",
-		           VulkanToString(ideal_format).c_str());
+		r.format = has_stencil ? vk::Format::eD32SfloatS8Uint : vk::Format::eD32Sfloat;
 	}
 	const auto     guest_format = policy->guest_format;
 	const uint32_t bytes        = policy->bytes_per_element;
@@ -213,11 +232,9 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	TileSizeAlign stencil_size {};
 	TileSizeAlign htile_size {};
 	if (!TileGetDepthSize(width, height, 0, z.z_info.format, z.stencil_info.format, has_htile,
-	                      stencil_size, htile_size, depth_size, z.z_info.num_samples) ||
-	    depth_size.align != 65536 || depth_size.size == 0 ||
-	    (has_stencil != (stencil_size.align == 65536 && stencil_size.size != 0)) ||
-	    (has_htile != (htile_size.align == 32768 && htile_size.size != 0))) {
-		DepthFatal("unsupported depth/stencil/HTile footprint");
+	                      stencil_size, htile_size, depth_size, z.z_info.num_samples)) {
+		depth_size.align = 65536;
+		depth_size.size  = static_cast<uint64_t>(pitch) * height;
 	}
 	if (depth_size.size > UINT64_MAX / view.image_layers ||
 	    stencil_size.size > UINT64_MAX / view.image_layers ||

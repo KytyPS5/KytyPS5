@@ -39,7 +39,6 @@ enum : uint32_t {
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
 	CapabilityInt64                          = 11,
-	CapabilityInt64Atomics                   = 12,
 	CapabilityImageGatherExtended            = 25,
 	CapabilityClipDistance                   = 32,
 	CapabilityCullDistance                   = 33,
@@ -74,7 +73,6 @@ enum : uint32_t {
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
-	DecorationAliased       = 20,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
@@ -298,6 +296,8 @@ enum : uint32_t {
 	GlslPackHalf2x16    = 58,
 	GlslUnpackUnorm2x16 = 61,
 	GlslUnpackHalf2x16  = 62,
+	GlslUnpackSnorm4x8  = 63,
+	GlslUnpackUnorm4x8  = 64,
 	GlslFindILsb        = 73,
 	GlslFindUMsb        = 75,
 };
@@ -343,18 +343,19 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
-	    : program(program_), input_info(input_info_),
+	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
+	             ShaderStageInputInfo input_info_)
+	    : program(program_), resources(resources_), input_info(input_info_),
 	      requirements(*program_.spirv_requirements) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
+	const IR::ResourceSnapshot&                      resources;
 	ShaderStageInputInfo                             input_info;
 	const IR::SpirvRequirements&                     requirements;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
 	uint32_t                                         storage_buffer_variable = 0;
-	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -362,7 +363,7 @@ struct EmitterState {
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         shader_data_storage_variable = 0;
+	uint32_t                                         vsharp_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         scratch_variable        = 0;
@@ -382,6 +383,7 @@ struct EmitterState {
 	uint32_t                   cull_distance_count                   = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
+	uint32_t                   mrt0_packed_color                     = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
@@ -393,7 +395,6 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeDeviceAddress(EmitterState& state);
-uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -407,8 +408,6 @@ uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t point
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferPointer(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state);
-uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
-uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -624,16 +623,10 @@ struct MemoryResourceAccess {
 	uint32_t         object_pointer   = 0;
 	uint32_t         length           = 0;
 	uint32_t         index_offset     = 0;
-	uint32_t         byte_offset      = 0;
 	bool             add_index_offset = false;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
-
-MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
-                                                         const IR::MemoryInfo& mem,
-                                                         uint32_t variable,
-                                                         uint32_t pointer_type);
 
 uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
                                 uint32_t raw_index);
@@ -643,10 +636,6 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
-
-uint32_t EmitStorageBufferElementPointer(EmitterState& state,
-                                         const MemoryResourceAccess& access, uint32_t index,
-                                         uint32_t pointer_type);
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value);
 
@@ -785,6 +774,9 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
 }
+
+bool MrtUsesUintOutput(const EmitterState& state, uint32_t index);
+bool MrtUsesSintOutput(const EmitterState& state, uint32_t index);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 

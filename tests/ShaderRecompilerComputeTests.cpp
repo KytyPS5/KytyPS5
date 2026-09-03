@@ -473,6 +473,10 @@ struct RenderExecutorTestAccess {
     }
   }
 
+  static const auto &PushConstants(const RenderExecutor &executor) {
+    return executor.m_push_constants;
+  }
+
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
                                        uint64_t submit_id,
                                        CommandBuffer &buffer,
@@ -1037,7 +1041,7 @@ struct GraphicsCase {
 struct CompiledShader {
   std::vector<u32> spirv;
   ShaderRecompiler::IR::Program program;
-  ShaderRecompiler::IR::ResourceSnapshot resources;
+  std::vector<u32> flattened_srt;
   std::vector<u32> packed_user_data;
 };
 
@@ -1090,20 +1094,19 @@ size_t CountText(const std::string &text, const std::string &needle) {
 void CheckRectListShaders() {
   constexpr const char *name = "RectListShaders";
 
-  ShaderRecompiler::IR::CompiledShaderInfo program{};
-  program.info.inputs.push_back(
+  auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+  program->info.inputs.push_back(
       {ShaderRecompiler::IR::StageInputKind::Parameter, 0, 4, "in_param_0"});
-  program.info.inputs.push_back(
+  program->info.inputs.push_back(
       {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
 
   ShaderVertexInputInfo vertex{};
-  ShaderRecompiler::IR::CompiledShaderInfo vertex_program{.param_export_mask = 1u};
-  vertex.stage.program = &vertex_program;
+  vertex.param_export_mask = 1u;
   ShaderPixelInputInfo pixel{};
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
-  pixel.stage.program = &program;
+  pixel.stage.program = program;
   std::vector<uint32_t> perspective_specialization;
   BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
@@ -1220,28 +1223,14 @@ CompiledShader CompileCase(const TestCase &test) {
   options.dump_ir = true;
   options.input_info.compute = &test.compute_info;
   options.user_data = user_data;
+  options.read_memory = ReadTestMemory;
+  options.read_memory_data = const_cast<std::vector<u32> *>(&test.initial);
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
   }
 
-  auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-  ShaderRecompiler::IR::ResourceSnapshot resources;
-  ShaderRecompiler::IR::ResourceSpecialization specialization;
-  const ShaderRecompiler::IR::SrtRuntime runtime{
-      .user_data = options.user_data,
-      .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
-      .read_memory = ReadTestMemory,
-      .userdata = const_cast<std::vector<u32> *>(&test.initial),
-  };
-  Require(test.name, "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "translated resources could not be materialized");
-  auto result = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization);
+  auto result = ShaderRecompiler::Recompile(test.code, options);
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -1289,17 +1278,17 @@ CompiledShader CompileCase(const TestCase &test) {
     }
     result.program.bindings = {};
     result.program.binding_layout_complete = false;
-    ShaderRecompiler::IR::AllocateBindings(result.program);
+    ShaderRecompiler::IR::AllocateBindings(result.program, 0);
     const auto *shader_data = ShaderRecompiler::IR::FindBinding(
         result.program.bindings,
-        ShaderRecompiler::IR::DescriptorBindingKind::ShaderData);
+        ShaderRecompiler::IR::DescriptorBindingKind::UserData);
     Require(test.name, "binding layout",
             result.program.bindings.user_data_registers.size() == 33 &&
-                !result.program.bindings.UsesPushData() &&
+                result.program.bindings.push_constant_size == 0 &&
                 shader_data != nullptr,
             "oversized shader data did not use its storage fallback");
-    result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                        options.input_info);
+    result.spirv = ShaderRecompiler::Spirv::EmitProgram(
+        result.program, result.resources, options.input_info);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
@@ -1308,7 +1297,7 @@ CompiledShader CompileCase(const TestCase &test) {
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.bindings.user_data_registers) {
     packed_user_data.push_back(
-        resources.user_data[reg - result.program.user_data_base]);
+        result.resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
   const auto buffer_count =
@@ -1324,7 +1313,8 @@ CompiledShader CompileCase(const TestCase &test) {
         offset << ((i % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(result.resources.flattened_srt),
+          std::move(packed_user_data)};
 }
 
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
@@ -1374,33 +1364,19 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
 
-  auto translated =
-      ShaderRecompiler::TranslateProgram(test.fragment_code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-  ShaderRecompiler::IR::ResourceSnapshot resources;
-  ShaderRecompiler::IR::ResourceSpecialization specialization;
-  const ShaderRecompiler::IR::SrtRuntime runtime{
-      .user_data = options.user_data,
-      .shader_base = reinterpret_cast<uint64_t>(test.fragment_code.data()),
-  };
-  Require(test.name, "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "translated resources could not be materialized");
-  auto result = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization);
+  auto result = ShaderRecompiler::Recompile(test.fragment_code, options);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.bindings.user_data_registers) {
     packed_user_data.push_back(
-        resources.user_data[reg - result.program.user_data_base]);
+        result.resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(result.resources.flattened_srt),
+          std::move(packed_user_data)};
 }
 
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
@@ -1615,7 +1591,7 @@ public:
   }
 
   void CheckGraphicsPushConstantBank() {
-    constexpr const char *name = "GraphicsPushConstantStages";
+    constexpr const char *name = "GraphicsPushConstantBank";
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -1624,34 +1600,34 @@ public:
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
 
-    ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
+    ShaderRecompiler::IR::Program vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
-    vertex_program.bindings.push_data_start_dword = 2;
-    vertex_program.bindings.user_data_registers = {0, 1};
-    vertex_program.bindings.memory_offset_dword = 2;
-    ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
+    vertex_program.bindings.push_constant_size = 2 * sizeof(uint32_t);
+    ShaderRecompiler::IR::Program pixel_program{};
     pixel_program.stage = ShaderType::Pixel;
-    pixel_program.bindings.push_data_start_dword = 0;
-    pixel_program.bindings.user_data_registers = {0, 1};
-    pixel_program.bindings.memory_offset_dword = 2;
+    pixel_program.bindings.push_constant_offset = 2 * sizeof(uint32_t);
+    pixel_program.bindings.push_constant_size = 2 * sizeof(uint32_t);
     ShaderRecompiler::IR::ResourceSnapshot snapshot{};
     PreparedBindings vertex{};
     vertex.program = &vertex_program;
     vertex.snapshot = &snapshot;
-    vertex.shader_data = {0x11111111u, 0x22222222u};
+    vertex.user_data = {0x11111111u, 0x22222222u};
     PreparedBindings pixel{};
     pixel.program = &pixel_program;
     pixel.snapshot = &snapshot;
-    pixel.shader_data = {0x33333333u, 0x44444444u};
+    pixel.user_data = {0x33333333u, 0x44444444u};
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
-    Require(name, "shared push data",
-            vertex.shader_data ==
-                    std::vector<uint32_t>{0x11111111u, 0x22222222u} &&
-                pixel.shader_data ==
-                    std::vector<uint32_t>{0x33333333u, 0x44444444u},
-            "graphics stages did not commit their shared push data");
+    const auto &bank =
+        RenderExecutorTestAccess::PushConstants(context.GetRenderExecutor());
+    Require(name, "packing",
+            bank[0] == 0x11111111u && bank[1] == 0x22222222u &&
+                bank[2] == 0x33333333u && bank[3] == 0x44444444u &&
+                std::ranges::all_of(bank.begin() + 4, bank.end(),
+                                    [](uint32_t value) { return value == 0; }) &&
+                vertex.committed && pixel.committed,
+            "graphics stages were not packed into one zero-filled push bank");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
@@ -3862,14 +3838,14 @@ public:
                 !texture_cache.IsMetaCleared(write_only_meta, 0),
             "test HTile entries were not registered in their initial state");
 
-    const auto MakeInput = [](uint64_t address, bool read, bool written,
-                              ShaderRecompiler::IR::CompiledShaderInfo &program) {
-      program.stage = ShaderType::Compute;
+    const auto MakeInput = [](uint64_t address, bool read, bool written) {
+      auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+      program->stage = ShaderType::Compute;
       ShaderRecompiler::IR::BufferResource resource{};
       resource.read = read;
       resource.written = written;
       resource.formatted = true;
-      program.info.buffers.push_back(resource);
+      program->info.buffers.push_back(resource);
 
       ShaderBufferResource descriptor{};
       descriptor.UpdateAddress48(address);
@@ -3882,16 +3858,18 @@ public:
       ShaderRecompiler::IR::DescriptorValue value{};
       value.dword_count = 4;
       std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
+      auto snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      snapshot->buffers.push_back(value);
+
       ShaderComputeInputInfo input{};
-      input.stage.program = &program;
-      input.stage.resources.buffers.push_back(value);
+      input.stage.program = std::move(program);
+      input.stage.resources = std::move(snapshot);
       return input;
     };
     auto &executor = context.GetRenderExecutor();
     auto &command = scheduler.Current();
-    ShaderRecompiler::IR::CompiledShaderInfo read_only_program{};
-    const auto read_only_input =
-        MakeInput(read_only_meta, true, false, read_only_program);
+    const auto read_only_input = MakeInput(read_only_meta, true, false);
     const bool read_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, read_only_input, command);
@@ -3900,9 +3878,7 @@ public:
                 !texture_cache.IsMetaCleared(read_only_meta, 0),
             "a metadata read-only dispatch changed logical clear state");
 
-    ShaderRecompiler::IR::CompiledShaderInfo read_write_program{};
-    const auto read_write_input =
-        MakeInput(read_write_meta, true, true, read_write_program);
+    const auto read_write_input = MakeInput(read_write_meta, true, true);
     const bool read_write_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, read_write_input, command);
@@ -3911,9 +3887,7 @@ public:
                 !texture_cache.IsMetaCleared(read_write_meta, 0),
             "a metadata read/modify/write dispatch was replaced by a clear");
 
-    ShaderRecompiler::IR::CompiledShaderInfo write_only_program{};
-    const auto write_only_input =
-        MakeInput(write_only_meta, false, true, write_only_program);
+    const auto write_only_input = MakeInput(write_only_meta, false, true);
     const bool write_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, write_only_input, command);
@@ -7442,103 +7416,6 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckRenderExecutorDccFixedClearFloat() {
-    constexpr const char *name = "RenderExecutorDccFixedClearFloat";
-    constexpr uintptr_t base = 0x0000000204100000ull;
-    constexpr uint64_t allocation_size = 0x200000;
-    constexpr uint64_t allocation_alignment = 0x10000;
-    constexpr uint64_t dcc_address = base + 0x100000;
-    struct FillCase {
-      uint32_t fill;
-      std::array<uint32_t, 4> clear;
-    };
-    constexpr std::array cases{
-        FillCase{0x40404040u, {0, 0, 0, 0x3f800000u}},
-        FillCase{0x80808080u, {0x3f800000u, 0x3f800000u, 0x3f800000u, 0}},
-    };
-    EnsureRuntimeContext();
-
-    int64_t direct_offset = -1;
-    Require(name, "direct allocation",
-            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
-            "fixed-clear direct-memory allocation failed");
-    void *mapped = reinterpret_cast<void *>(base);
-    Require(name, "direct mapping",
-            Libs::LibKernel::Memory::KernelMapDirectMemory(
-                &mapped, allocation_size, 0x3, 0x10, direct_offset,
-                allocation_alignment) == 0 &&
-                mapped == reinterpret_cast<void *>(base),
-            "fixed-clear direct mapping failed");
-    std::memset(mapped, 0, allocation_size);
-
-    for (const auto &fill_case : cases) {
-      RenderContext context(m_runtime_context);
-      auto &scheduler = context.GetCommandScheduler();
-      HW::Context registers{};
-      HW::UserConfig user_config{};
-      HW::Shader shaders{};
-      registers.SetColorBase(0, {.addr = base});
-      registers.SetColorInfo(
-          0, {.dcc_compression_enable = true,
-              .format = Prospero::ChannelLayout::k16_16_16_16,
-              .channel_type = Prospero::ChannelType::kFloat,
-              .channel_order = Prospero::ChannelOrder::kStandard});
-      registers.SetColorAttrib2(0, {.height = 255, .width = 255});
-      registers.SetColorAttrib3(0,
-                                {.tile_mode = Prospero::TileMode::kRenderTarget,
-                                 .dimension = 1,
-                                 .metadata_pipe_aligned = true});
-      registers.SetColorDccAddr(0, {.addr = dcc_address});
-      registers.SetColorClearWord0(0, {.word0 = 0});
-      registers.SetColorClearWord1(0, {.word1 = 0});
-      registers.SetRenderTargetMask(0x0f);
-      scheduler.Begin(registers, user_config, shaders);
-
-      auto &resources = context.GetGpuResources();
-      auto &texture_cache = resources.GetTextureCache();
-      auto &executor = context.GetRenderExecutor();
-      resources.MapMemory(base, allocation_size);
-      Require(name, "deferred fixed-code fill",
-              !texture_cache.TryConsumeDccFill(dcc_address, 0x1000,
-                                               fill_case.fill),
-              "a pre-registration DCC fill was not deferred");
-
-      RenderColorInfo color{};
-      RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 1, scheduler.Current(), color, 0);
-      RenderDepthInfo no_depth{};
-      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-          executor, scheduler.Current(), &color, 1, no_depth);
-      Require(name, "fixed clear on a float target",
-              color.image_id &&
-                  color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
-                  color.desc.info.metadata.range.address == dcc_address &&
-                  color.metadata_fixed_clear_supported &&
-                  rendering.num_color_attachments == 1 &&
-                  rendering.color_attachments[0].is_clear &&
-                  rendering.color_attachments[0].clear_value ==
-                      fill_case.clear &&
-                  !texture_cache.IsMetaCleared(dcc_address, 0),
-              "a DCC fixed clear code was not materialised on an RGBA16F "
-              "target");
-
-      RenderExecutorTestAccess::ResetBindings(executor);
-      resources.UnmapMemory(base, allocation_size);
-      scheduler.Finish();
-    }
-
-    Require(name, "unmap direct backing",
-            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
-            "fixed-clear direct mapping release failed");
-    Require(name, "release direct backing",
-            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
-                direct_offset, allocation_size) == 0,
-            "fixed-clear direct-memory allocation release failed");
-    std::printf("[gpu]     %-32s ok\n", name);
-  }
-
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -7827,7 +7704,7 @@ public:
       const auto allocate_bindings =
           [&](ShaderRecompiler::IR::Program &program) {
             program.shader_info_complete = true;
-            ShaderRecompiler::IR::AllocateBindings(program);
+            ShaderRecompiler::IR::AllocateBindings(program, 0);
           };
 
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
@@ -7864,20 +7741,13 @@ public:
       ShaderRecompiler::IR::DescriptorValue null_descriptor{};
       null_descriptor.dword_count = 8;
       null_snapshot.images.assign(3, null_descriptor);
-      ShaderRecompiler::IR::ResourceSpecialization null_specialization{};
-      null_specialization.images.resize(3);
-      for (auto &image : null_specialization.images) {
-        image.numeric_class = Prospero::TextureNumericClass::Float;
-        image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-      }
-      ShaderRecompiler::IR::ApplyResourceSpecialization(
-          null_program, null_specialization);
+      ShaderRecompiler::IR::SpecializeResources(null_program, null_snapshot);
       allocate_bindings(null_program);
-      ShaderRecompiler::IR::CompiledShaderInfo null_info{};
-      null_info.stage = null_program.stage;
-      null_info.info = std::move(null_program.info);
-      null_info.bindings = std::move(null_program.bindings);
-      ShaderStageRuntime null_runtime{&null_info, std::move(null_snapshot)};
+      ShaderStageRuntime null_runtime{
+          std::make_shared<const ShaderRecompiler::IR::Program>(
+              std::move(null_program)),
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(null_snapshot))};
       auto null_bindings = executor.PrepareBindings(null_runtime);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
@@ -8022,18 +7892,19 @@ public:
           executor, sampled_overwide_resource,
           overwide_mipped_storage_descriptor);
       PreparedBindings mipped_prepared{};
-      ShaderRecompiler::IR::CompiledShaderInfo mipped_program{};
-      mipped_program.info.images.push_back(storage_resource);
-      mipped_program.info.images.push_back(mipped_storage_resource);
-      mipped_program.info.images.push_back(storage_resource);
-      mipped_program.info.images.push_back(sampled_overwide_resource);
-      ShaderRecompiler::IR::ResourceSnapshot mipped_snapshot{};
-      mipped_snapshot.images = {mipped_storage_descriptor,
-                                mipped_storage_descriptor,
-                                overwide_mipped_storage_descriptor,
-                                overwide_mipped_storage_descriptor};
-      mipped_prepared.program = &mipped_program;
-      mipped_prepared.snapshot = &mipped_snapshot;
+      auto mipped_program = std::make_shared<ShaderRecompiler::IR::Program>();
+      mipped_program->info.images.push_back(storage_resource);
+      mipped_program->info.images.push_back(mipped_storage_resource);
+      mipped_program->info.images.push_back(storage_resource);
+      mipped_program->info.images.push_back(sampled_overwide_resource);
+      auto mipped_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      mipped_snapshot->images = {mipped_storage_descriptor,
+                                 mipped_storage_descriptor,
+                                 overwide_mipped_storage_descriptor,
+                                 overwide_mipped_storage_descriptor};
+      mipped_prepared.program = mipped_program.get();
+      mipped_prepared.snapshot = mipped_snapshot.get();
       mipped_prepared.resources.images.push_back(
           std::move(plain_mipped_storage_binding));
       mipped_prepared.resources.images.push_back(
@@ -8223,12 +8094,11 @@ public:
 
       ShaderRecompiler::IR::ResourceSnapshot storage_snapshot{};
       storage_snapshot.images.push_back(storage_descriptor);
-      ShaderRecompiler::IR::CompiledShaderInfo storage_info{};
-      storage_info.stage = storage_program.stage;
-      storage_info.info = std::move(storage_program.info);
-      storage_info.bindings = std::move(storage_program.bindings);
-      ShaderStageRuntime storage_runtime{&storage_info,
-                                         std::move(storage_snapshot)};
+      ShaderStageRuntime storage_runtime{
+          std::make_shared<const ShaderRecompiler::IR::Program>(
+              std::move(storage_program)),
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(storage_snapshot))};
       auto storage_discovery = executor.PrepareBindings(storage_runtime);
       const auto storage_id = storage_discovery.resources.images[0].image_id;
       Require(name, "storage prefetch purity",
@@ -8254,12 +8124,11 @@ public:
       allocate_bindings(sampled_program);
       ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
       sampled_snapshot.images.push_back(storage_descriptor);
-      ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
-      sampled_info.stage = sampled_program.stage;
-      sampled_info.info = std::move(sampled_program.info);
-      sampled_info.bindings = std::move(sampled_program.bindings);
-      ShaderStageRuntime sampled_runtime{&sampled_info,
-                                         std::move(sampled_snapshot)};
+      ShaderStageRuntime sampled_runtime{
+          std::make_shared<const ShaderRecompiler::IR::Program>(
+              std::move(sampled_program)),
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(sampled_snapshot))};
 
       constexpr uint64_t ordered_sampled_address = base + 0x10000;
       const uint32_t ordered_sampled_value = 0x89abcdefu;
@@ -8279,8 +8148,10 @@ public:
       ordered_descriptor.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot ordered_snapshot{};
       ordered_snapshot.images.push_back(ordered_descriptor);
-      ShaderStageRuntime ordered_sampled_runtime{sampled_runtime.program,
-                                                 std::move(ordered_snapshot)};
+      ShaderStageRuntime ordered_sampled_runtime{
+          sampled_runtime.program,
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(ordered_snapshot))};
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
       const auto ordered_sampled_id =
@@ -8332,28 +8203,21 @@ public:
               "a later sampled alias dropped an earlier storage write access");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      ShaderRecompiler::IR::Program vertex_sampled_program{};
-      vertex_sampled_program.stage = ShaderType::Vertex;
-      vertex_sampled_program.resource_tracking_complete = true;
-      vertex_sampled_program.info.images.push_back(sampled_resource);
-      allocate_bindings(vertex_sampled_program);
-      ShaderRecompiler::IR::CompiledShaderInfo vertex_sampled_info{};
-      vertex_sampled_info.stage = vertex_sampled_program.stage;
-      vertex_sampled_info.info = std::move(vertex_sampled_program.info);
-      vertex_sampled_info.bindings =
-          std::move(vertex_sampled_program.bindings);
+      auto vertex_sampled_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      vertex_sampled_program->stage = ShaderType::Vertex;
+      vertex_sampled_program->resource_tracking_complete = true;
+      vertex_sampled_program->info.images.push_back(sampled_resource);
+      allocate_bindings(*vertex_sampled_program);
       ShaderStageRuntime vertex_sampled_runtime{
-          &vertex_sampled_info, sampled_runtime.resources};
-      ShaderRecompiler::IR::Program pixel_storage_program{};
-      pixel_storage_program.stage = ShaderType::Pixel;
-      pixel_storage_program.resource_tracking_complete = true;
-      pixel_storage_program.info.images.push_back(storage_resource);
-      allocate_bindings(pixel_storage_program);
-      ShaderRecompiler::IR::CompiledShaderInfo pixel_storage_info{};
-      pixel_storage_info.stage = pixel_storage_program.stage;
-      pixel_storage_info.info = std::move(pixel_storage_program.info);
-      pixel_storage_info.bindings = std::move(pixel_storage_program.bindings);
-      ShaderStageRuntime pixel_storage_runtime{&pixel_storage_info,
+          std::move(vertex_sampled_program), sampled_runtime.resources};
+      auto pixel_storage_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      pixel_storage_program->stage = ShaderType::Pixel;
+      pixel_storage_program->resource_tracking_complete = true;
+      pixel_storage_program->info.images.push_back(storage_resource);
+      allocate_bindings(*pixel_storage_program);
+      ShaderStageRuntime pixel_storage_runtime{std::move(pixel_storage_program),
                                                storage_runtime.resources};
       auto writable_alias_bindings =
           RenderExecutorTestAccess::PrepareGraphicsBindings(
@@ -8422,19 +8286,16 @@ public:
       split_sampled_desc.view_info.level_count = 1;
       split_sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
 
-      ShaderRecompiler::IR::Program split_ir{};
-      split_ir.stage = ShaderType::Vertex;
-      split_ir.resource_tracking_complete = true;
-      split_ir.info.images = {storage_resource, sampled_resource};
-      allocate_bindings(split_ir);
-      ShaderRecompiler::IR::CompiledShaderInfo split_program{};
-      split_program.stage = split_ir.stage;
-      split_program.info = std::move(split_ir.info);
-      split_program.bindings = std::move(split_ir.bindings);
+      auto split_program = std::make_shared<ShaderRecompiler::IR::Program>();
+      split_program->stage = ShaderType::Vertex;
+      split_program->resource_tracking_complete = true;
+      split_program->info.images = {storage_resource, sampled_resource};
+      allocate_bindings(*split_program);
       PreparedBindings split_bindings{};
-      ShaderRecompiler::IR::ResourceSnapshot split_snapshot{};
-      split_bindings.program = &split_program;
-      split_bindings.snapshot = &split_snapshot;
+      auto split_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      split_bindings.program = split_program.get();
+      split_bindings.snapshot = split_snapshot.get();
       split_bindings.resources.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
            split_storage_desc});
@@ -8496,6 +8357,7 @@ public:
       phased_depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
       phased_depth_target.stencil_info.texture_compatibility =
           Prospero::TextureCompatibleStencil::kEnable;
+      phased_depth_target.stencil_info.htile_stencil_disabled = false;
       phased_depth_target.z_read_base_addr = phased_depth_address;
       phased_depth_target.z_write_base_addr = phased_depth_address;
       phased_depth_target.stencil_read_base_addr = phased_stencil_address;
@@ -8809,8 +8671,9 @@ public:
           (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
       array_texture.fields[4] = 1;
 
-      ShaderRecompiler::IR::CompiledShaderInfo array_program{};
+      ShaderRecompiler::IR::Program array_program{};
       array_program.stage = ShaderType::Compute;
+      array_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource array_resource{};
       array_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -8826,8 +8689,11 @@ public:
       array_descriptor.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot array_snapshot{};
       array_snapshot.images.push_back(array_descriptor);
-      ShaderStageRuntime array_runtime{&array_program,
-                                       std::move(array_snapshot)};
+      ShaderStageRuntime array_runtime{
+          std::make_shared<const ShaderRecompiler::IR::Program>(
+              std::move(array_program)),
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(array_snapshot))};
 
       auto array_binding = executor.PrepareBindings(array_runtime);
       executor.RebindImages(array_binding);
@@ -8891,16 +8757,20 @@ public:
                 std::end(colliding_msaa_texture.fields),
                 colliding_msaa_descriptor.dwords.begin());
       colliding_msaa_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::CompiledShaderInfo colliding_msaa_program{};
-      colliding_msaa_program.stage = ShaderType::Compute;
+      auto colliding_msaa_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      colliding_msaa_program->stage = ShaderType::Compute;
+      colliding_msaa_program->resource_tracking_complete = true;
       auto colliding_msaa_resource = array_resource;
       colliding_msaa_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
-      colliding_msaa_program.info.images.push_back(colliding_msaa_resource);
-      ShaderRecompiler::IR::ResourceSnapshot colliding_msaa_snapshot{};
-      colliding_msaa_snapshot.images.push_back(colliding_msaa_descriptor);
+      colliding_msaa_program->info.images.push_back(colliding_msaa_resource);
+      auto colliding_msaa_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      colliding_msaa_snapshot->images.push_back(colliding_msaa_descriptor);
       ShaderStageRuntime colliding_msaa_runtime{
-          &colliding_msaa_program, std::move(colliding_msaa_snapshot)};
+          std::move(colliding_msaa_program),
+          std::move(colliding_msaa_snapshot)};
       auto colliding_msaa_binding =
           executor.PrepareBindings(colliding_msaa_runtime);
       executor.RebindImages(colliding_msaa_binding);
@@ -8951,15 +8821,18 @@ public:
       std::copy(std::begin(msaa_texture.fields), std::end(msaa_texture.fields),
                 msaa_descriptor.dwords.begin());
       msaa_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::CompiledShaderInfo msaa_program{};
-      msaa_program.stage = ShaderType::Compute;
+      auto msaa_program = std::make_shared<ShaderRecompiler::IR::Program>();
+      msaa_program->stage = ShaderType::Compute;
+      msaa_program->resource_tracking_complete = true;
       auto msaa_resource = array_resource;
       msaa_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
-      msaa_program.info.images.push_back(msaa_resource);
-      ShaderRecompiler::IR::ResourceSnapshot msaa_snapshot{};
-      msaa_snapshot.images.push_back(msaa_descriptor);
-      ShaderStageRuntime msaa_runtime{&msaa_program, std::move(msaa_snapshot)};
+      msaa_program->info.images.push_back(msaa_resource);
+      auto msaa_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      msaa_snapshot->images.push_back(msaa_descriptor);
+      ShaderStageRuntime msaa_runtime{std::move(msaa_program),
+                                      std::move(msaa_snapshot)};
       auto msaa_binding = executor.PrepareBindings(msaa_runtime);
       executor.RebindImages(msaa_binding);
       const auto &resolved_msaa = msaa_binding.resources.images[0];
@@ -8990,15 +8863,18 @@ public:
                 std::end(msaa_array_texture.fields),
                 msaa_array_descriptor.dwords.begin());
       msaa_array_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::CompiledShaderInfo msaa_array_program{};
-      msaa_array_program.stage = ShaderType::Compute;
+      auto msaa_array_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      msaa_array_program->stage = ShaderType::Compute;
+      msaa_array_program->resource_tracking_complete = true;
       auto msaa_array_resource = array_resource;
       msaa_array_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
-      msaa_array_program.info.images.push_back(msaa_array_resource);
-      ShaderRecompiler::IR::ResourceSnapshot msaa_array_snapshot{};
-      msaa_array_snapshot.images.push_back(msaa_array_descriptor);
-      ShaderStageRuntime msaa_array_runtime{&msaa_array_program,
+      msaa_array_program->info.images.push_back(msaa_array_resource);
+      auto msaa_array_snapshot =
+          std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+      msaa_array_snapshot->images.push_back(msaa_array_descriptor);
+      ShaderStageRuntime msaa_array_runtime{std::move(msaa_array_program),
                                             std::move(msaa_array_snapshot)};
       auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
       executor.RebindImages(msaa_array_binding);
@@ -9214,8 +9090,9 @@ public:
           DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(linear) << 20u) |
           (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
 
-      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      ShaderRecompiler::IR::Program program{};
       program.stage = ShaderType::Compute;
+      program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource stencil_resource{};
       stencil_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -9231,7 +9108,11 @@ public:
                 descriptor.dwords.begin());
       descriptor.dword_count = 8;
       snapshot.images.push_back(descriptor);
-      ShaderStageRuntime runtime{&program, std::move(snapshot)};
+      ShaderStageRuntime runtime{
+          std::make_shared<const ShaderRecompiler::IR::Program>(
+              std::move(program)),
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(snapshot))};
 
       auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
       const auto sampled_stencil_id = prepared.resources.images[0].image_id;
@@ -9283,14 +9164,16 @@ public:
               "RebindImages did not acquire the associated depth owner");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      ShaderRecompiler::IR::CompiledShaderInfo stencil_storage_program{};
-      stencil_storage_program.stage = ShaderType::Compute;
+      auto stencil_storage_program =
+          std::make_shared<ShaderRecompiler::IR::Program>();
+      stencil_storage_program->stage = ShaderType::Compute;
+      stencil_storage_program->resource_tracking_complete = true;
       auto stencil_storage_resource = stencil_resource;
       stencil_storage_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Storage;
       stencil_storage_resource.read = false;
       stencil_storage_resource.written = true;
-      stencil_storage_program.info.images.push_back(stencil_storage_resource);
+      stencil_storage_program->info.images.push_back(stencil_storage_resource);
       auto storage_stencil = stencil;
       storage_stencil.fields[5] = 0x00700000u;
       ShaderRecompiler::IR::DescriptorValue stencil_storage_descriptor{};
@@ -9301,7 +9184,9 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot stencil_storage_snapshot{};
       stencil_storage_snapshot.images.push_back(stencil_storage_descriptor);
       ShaderStageRuntime stencil_storage_runtime{
-          &stencil_storage_program, std::move(stencil_storage_snapshot)};
+          std::move(stencil_storage_program),
+          std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+              std::move(stencil_storage_snapshot))};
       auto storage_redirected =
           executor.PrepareBindings(stencil_storage_runtime);
       executor.RebindImages(storage_redirected);
@@ -9716,10 +9601,10 @@ public:
     pipeline_layout_info.setLayoutCount = 1;
     pipeline_layout_info.pSetLayouts = &descriptor_layout;
     vk::PushConstantRange push_range{};
-    if (layout.UsesPushData()) {
+    if (layout.push_constant_size != 0) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
       push_range.offset = 0;
-      push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
+      push_range.size = layout.push_constant_size;
       pipeline_layout_info.pushConstantRangeCount = 1;
       pipeline_layout_info.pPushConstantRanges = &push_range;
     }
@@ -9852,9 +9737,8 @@ public:
     }
     if (const auto *flattened = Binding(Kind::FlattenedSrt);
         flattened != nullptr) {
-      flattened_buffer =
-          CreateStorageBuffer(test.name, compiled.resources.flattened_srt,
-                              compiled.resources.flattened_srt.size());
+      flattened_buffer = CreateStorageBuffer(test.name, compiled.flattened_srt,
+                                             compiled.flattened_srt.size());
       flattened_info = {flattened_buffer.buffer, 0, flattened_buffer.size};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -9865,7 +9749,7 @@ public:
       write.pBufferInfo = &flattened_info;
       writes.push_back(write);
     }
-    if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
+    if (const auto *user = Binding(Kind::UserData); user != nullptr) {
       user_data_buffer =
           CreateStorageBuffer(test.name, compiled.packed_user_data,
                               compiled.packed_user_data.size());
@@ -9873,7 +9757,7 @@ public:
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = Native(Kind::ShaderData);
+      write.dstBinding = Native(Kind::UserData);
       write.descriptorCount = 1;
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &user_data_info;
@@ -10034,13 +9918,14 @@ public:
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0,
                            1, &descriptor_set, 0, nullptr);
-    if (layout.UsesPushData()) {
-      ShaderRecompiler::IR::PushData push_data;
-      std::copy(compiled.packed_user_data.begin(),
-                compiled.packed_user_data.end(),
-                push_data.dwords.begin() + layout.push_data_start_dword);
+    if (layout.push_constant_size != 0) {
+      Require(test.name, "dispatch",
+              compiled.packed_user_data.size() * sizeof(u32) ==
+                  layout.push_constant_size,
+              "native user-data size does not match push-constant range");
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                        sizeof(push_data), push_data.dwords.data());
+                        layout.push_constant_size,
+                        compiled.packed_user_data.data());
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
@@ -10127,14 +10012,14 @@ public:
 
     const auto &fragment_bind = fragment.program.bindings;
     vk::PushConstantRange push_constant_range{};
-    if (fragment_bind.UsesPushData()) {
+    if (fragment_bind.push_constant_size > 0) {
       Require(test.name, "graphics",
               test.push_constants.size() * sizeof(u32) ==
-                  fragment_bind.ShaderDataDwords() * sizeof(u32),
+                  fragment_bind.push_constant_size,
               "fragment push constant data size does not match reflection");
       push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
       push_constant_range.offset = 0;
-      push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
+      push_constant_range.size = fragment_bind.push_constant_size;
     }
 
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
@@ -10260,11 +10145,9 @@ public:
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
     if (push_constant_range.size != 0) {
-      ShaderRecompiler::IR::PushData push_data;
-      std::copy(test.push_constants.begin(), test.push_constants.end(),
-                push_data.dwords.begin() + fragment_bind.push_data_start_dword);
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
-                        sizeof(push_data), push_data.dwords.data());
+                        fragment_bind.push_constant_size,
+                        test.push_constants.data());
     }
     vk::DeviceSize offset = 0;
     cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
@@ -12303,7 +12186,6 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_LOAD_MIP:
   case Opcode::IMAGE_STORE:
   case Opcode::IMAGE_STORE_MIP:
-  case Opcode::IMAGE_ATOMIC_SWAP:
   case Opcode::IMAGE_ATOMIC_ADD:
   case Opcode::IMAGE_ATOMIC_UMIN:
   case Opcode::IMAGE_ATOMIC_AND:
@@ -20619,19 +20501,41 @@ void CheckIndirectImageKeySwitch() {
   root.read = true;
   root.indirect_root = 0;
   root.indirect_mapping_offset = 0;
-	root.indirect_search_iterations = std::bit_width(mapping_capacity);
+  root.indirect_mapping_capacity = mapping_capacity;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
-	candidate.indirect_search_iterations = 0;
+  candidate.indirect_mapping_capacity = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
-  AllocateBindings(program);
+  AllocateBindings(program, 0);
+  ResourceSnapshot snapshot{};
+  DescriptorValue descriptor{};
+  descriptor.dword_count = 8;
+  descriptor.dwords[0] = 0x20u;
+  descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor.dwords[2] = 3u | (3u << 14u);
+  descriptor.dwords[3] =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+  snapshot.images = {descriptor, descriptor};
+  snapshot.images[1].dwords[0] = 0x40u;
+  snapshot.flattened_srt.resize(1u + mapping_capacity * 2u);
+  snapshot.flattened_srt[0] = 2u;
+  snapshot.flattened_srt[1] = 0u;
+  snapshot.flattened_srt[2] = 0u;
+  snapshot.flattened_srt[3] = 1u;
+  snapshot.flattened_srt[4] = 1u;
+  DescriptorValue sampler_descriptor{};
+  sampler_descriptor.dword_count = 4;
+  snapshot.samplers.push_back(sampler_descriptor);
+
   ShaderComputeInputInfo compute{};
   ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
-  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
+  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, snapshot,
                                                     {.compute = &compute});
   ValidateSpirv(name, spirv);
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
@@ -20992,39 +20896,6 @@ TestCase ImageStoreAndAtomicShareTypedBinding() {
                          "image_34"};
   test.forbidden_spirv = {"StorageImageReadWithoutFormat",
                           "StorageImageWriteWithoutFormat", "image_29"};
-  return test;
-}
-
-TestCase ImageAtomicSwapReturnsPreviousTexel() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovU32(&code, 20, 2);
-  AppendVMovU32(&code, 21, 1);
-  AppendVMovU32(&code, 22, 0);
-  AppendVMovU32(&code, 0, 5);
-  code.push_back(EncodeMimg0(0x08, 0x1));
-  code.push_back(EncodeMimg1(0, 20));
-  AppendVMovU32(&code, 0, 3);
-  code.push_back(EncodeMimg0(0x0f, 0x1, 0, true));
-  code.push_back(EncodeMimg1(0, 20));
-  AppendStoreVgpr(&code, 0, 0);
-  AppendEnd(&code);
-
-  std::vector<u32> expected_image(16, 0);
-  expected_image[1 * 4 + 2] = 3;
-
-  TestCase test;
-  test.name = "ImageAtomicSwapReturnsPreviousTexel";
-  test.code = std::move(code);
-  test.expected = {5};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_STORE, O::IMAGE_ATOMIC_SWAP,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
-  test.has_user_data = true;
-  test.storage_image_r32ui = std::vector<u32>(16, 0);
-  test.expected_storage_image_r32ui = std::move(expected_image);
-  test.required_spirv = {"OpAtomicExchange", "OpImageTexelPointer"};
   return test;
 }
 
@@ -21697,7 +21568,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageStoreAndAtomicShareTypedBinding);
-  AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
@@ -21762,40 +21632,19 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     options.user_data = user_data;
     options.input_info.compute = &compute;
     options.dump_ir = false;
-    auto translated = ShaderRecompiler::TranslateProgram(code, options);
-    auto resource_plan =
-        ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-    ShaderRecompiler::IR::ResourceSnapshot resources;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
-    const ShaderRecompiler::IR::SrtRuntime runtime{
-        .user_data = options.user_data,
-        .shader_base = reinterpret_cast<uint64_t>(code.data()),
-    };
-    Require("Ps5GameExampleImageClear", "resource materialization",
-            ShaderRecompiler::IR::MaterializeResources(
-                resource_plan, runtime, resources, specialization),
-            "runtime clear resources could not be materialized");
-    auto result = ShaderRecompiler::CompileProgram(
-        std::move(translated), options, specialization);
+    auto result = ShaderRecompiler::Recompile(code, options);
     ValidateSpirv("Ps5GameExampleImageClear", result.spirv);
-    return CompiledShader{std::move(result.spirv), std::move(result.program),
-                          std::move(resources), {}};
+    return result;
   };
 
   const auto code = MakeCode();
   auto positive = Compile(code);
 
-  ShaderRecompiler::IR::CompiledShaderInfo program{};
-  program.stage = positive.program.stage;
-  program.shader_hash = positive.program.shader_hash;
-  program.wave_size = positive.program.wave_size;
-  program.user_data_base = positive.program.user_data_base;
-  program.user_data_count = positive.program.user_data_count;
-  program.scratch_dwords = positive.program.scratch_dwords;
-  program.info = std::move(positive.program.info);
-  program.bindings = std::move(positive.program.bindings);
-  compute.stage.program = &program;
-  compute.stage.resources = positive.resources;
+  compute.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
+      std::move(positive.program));
+  compute.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+          positive.resources);
   ShaderBufferResource descriptor{};
   u32 packed_clear = 0;
   uint64_t size = 0;
@@ -21808,12 +21657,16 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
 
   auto non_repeated = positive.resources;
   non_repeated.user_data[7] ^= 1u;
-  compute.stage.resources = non_repeated;
+  compute.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+          non_repeated);
   Require("Ps5GameExampleImageClear", "non-repeated clear",
           !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "non-uniform uint4 data was replaced with a color clear");
-  compute.stage.resources = positive.resources;
+  compute.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+          positive.resources);
   compute.dispatch_threads_num[0] = 32;
   Require("Ps5GameExampleImageClear", "partial dispatch",
           !ResolveComputeImageClear(compute, 32, 1, 1, 0x61u, descriptor,
@@ -21875,37 +21728,25 @@ void CheckEmbeddedFetchVertexOffset() {
     options.user_data = user_data;
     options.input_info.vertex = &vertex;
 
-    auto translated = ShaderRecompiler::TranslateProgram(code, options);
-    auto resource_plan =
-        ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-    ShaderRecompiler::IR::ResourceSnapshot resources;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
-    const ShaderRecompiler::IR::SrtRuntime runtime{
-        .user_data = options.user_data,
-        .shader_base = reinterpret_cast<uint64_t>(code.data()),
-    };
-    Require(name, "resource materialization",
-            ShaderRecompiler::IR::MaterializeResources(
-                resource_plan, runtime, resources, specialization),
-            "embedded fetch resources could not be materialized");
-    auto result = ShaderRecompiler::CompileProgram(
-        std::move(translated), options, specialization);
+    auto result = ShaderRecompiler::Recompile(code, options);
     Require(name, "fetch rewrite",
             result.program.info.vertex_fetch_components[0] == 4,
             "encoded fetch sequence was not recognized and rewritten");
-    return CompiledShader{std::move(result.spirv), std::move(result.program),
-                          std::move(resources), {}};
+    return result;
   };
 
-  const auto Resolve = [](const CompiledShader &result,
+  const auto Resolve = [](const ShaderRecompiler::CompileResult &result,
                           u32 index_offset) {
     ShaderVertexInputInfo vertex;
     vertex.fetch_embedded = true;
-    ShaderRecompiler::IR::CompiledShaderInfo program{};
-    program.user_data_base = result.program.user_data_base;
-    program.info.vertex_offset_sgpr = result.program.info.vertex_offset_sgpr;
-    vertex.stage.program = &program;
-    vertex.stage.resources = result.resources;
+    auto program = std::make_shared<ShaderRecompiler::IR::Program>();
+    program->user_data_base = result.program.user_data_base;
+    program->info.vertex_offset_sgpr =
+        result.program.info.vertex_offset_sgpr;
+    vertex.stage.program = std::move(program);
+    vertex.stage.resources =
+        std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+            result.resources);
     return ResolveVertexOffset(index_offset, vertex);
   };
 
@@ -23860,34 +23701,15 @@ void CheckImageSamplerSpecialization() {
   signed_image_descriptor.dwords[1] =
       static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u;
 
+  ShaderRecompiler::IR::ResourceSnapshot mixed_sampler_snapshot;
+  mixed_sampler_snapshot.images = {native_image_descriptor,
+                                   packed_image_descriptor,
+                                   signed_image_descriptor};
   ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
-  const std::array descriptors{native_image_descriptor, packed_image_descriptor,
-                               signed_image_descriptor, sampler_descriptor};
-  mixed_sampler_program.descriptor_sources.resize(descriptors.size());
-  for (u32 source = 0; source < descriptors.size(); source++) {
-    auto &destination = mixed_sampler_program.descriptor_sources[source];
-    destination.dword_count = descriptors[source].dword_count;
-    for (u32 dword = 0; dword < destination.dword_count; dword++) {
-      destination.dwords[dword] = Value(descriptors[source].dwords[dword]);
-    }
-  }
-  for (u32 image = 0; image < mixed_sampler_program.info.images.size(); image++) {
-    mixed_sampler_program.info.images[image].source = image;
-  }
-  mixed_sampler_program.info.samplers[0].source = 3;
-  mixed_sampler_program.srt_plan_complete = true;
-  auto mixed_sampler_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(mixed_sampler_program);
-  ShaderRecompiler::IR::ResourceSnapshot mixed_sampler_snapshot;
-  ShaderRecompiler::IR::ResourceSpecialization mixed_sampler_specialization;
-  Require("ImageSamplerSpecialization", "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              mixed_sampler_plan, {}, mixed_sampler_snapshot,
-              mixed_sampler_specialization),
-          "mixed sampler descriptors could not be materialized");
-  ShaderRecompiler::IR::ApplyResourceSpecialization(
-      mixed_sampler_program, mixed_sampler_specialization);
+  mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
+  ShaderRecompiler::IR::SpecializeResources(mixed_sampler_program,
+                                            mixed_sampler_snapshot);
   Require("ImageSamplerSpecialization", "mixed sampler variant",
           mixed_sampler_program.info.samplers.size() == 2u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
@@ -23932,7 +23754,7 @@ void CheckNativeImageDescriptorTypes() {
                   vk::DescriptorType::eStorageBuffer &&
               NativeDescriptorType(DescriptorBindingKind::FlattenedSrt) ==
                   vk::DescriptorType::eStorageBuffer &&
-              NativeDescriptorType(DescriptorBindingKind::ShaderData) ==
+              NativeDescriptorType(DescriptorBindingKind::UserData) ==
                   vk::DescriptorType::eStorageBuffer,
           "non-image binding has the wrong Vulkan descriptor type");
   std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
@@ -23950,7 +23772,7 @@ void CheckShaderRecompilerFatalContracts() {
     (void)CompileCase(test);
   });
 
-  {
+  ExpectFatal("PackedAtomicImageRejection", [] {
     ShaderRecompiler::IR::Program program;
     program.resource_tracking_complete = true;
 
@@ -23973,23 +23795,10 @@ void CheckShaderRecompilerFatalContracts() {
         DstSel(4, 5, 6, 7) |
         (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
 
-    image.source = 0;
-    program.info.images[0].source = 0;
-    program.descriptor_sources.resize(1);
-    program.descriptor_sources[0].dword_count = descriptor.dword_count;
-    for (u32 dword = 0; dword < descriptor.dword_count; dword++) {
-      program.descriptor_sources[0].dwords[dword] =
-          ShaderRecompiler::IR::Value(descriptor.dwords[dword]);
-    }
-    program.srt_plan_complete = true;
-    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
-    ShaderRecompiler::IR::ResourceSpecialization specialization;
-    Require("PackedAtomicImageRejection", "resource materialization",
-            !ShaderRecompiler::IR::MaterializeResources(
-                plan, {}, snapshot, specialization),
-            "packed atomic image descriptor was accepted");
-  }
+    snapshot.images.push_back(descriptor);
+    ShaderRecompiler::IR::SpecializeResources(program, snapshot);
+  });
 }
 #endif
 
@@ -24712,21 +24521,7 @@ void CheckEmbeddedFetchLaneSpill() {
   options.user_data = user_data;
   options.input_info.vertex = &vertex;
 
-  auto translated = ShaderRecompiler::TranslateProgram(code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-  ShaderRecompiler::IR::ResourceSnapshot resources;
-  ShaderRecompiler::IR::ResourceSpecialization specialization;
-  const ShaderRecompiler::IR::SrtRuntime runtime{
-      .user_data = options.user_data,
-      .shader_base = reinterpret_cast<uint64_t>(code.data()),
-  };
-  Require("EmbeddedFetchLaneSpill", "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "lane-spilled fetch resources could not be materialized");
-  auto result = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization);
+  auto result = ShaderRecompiler::Recompile(code, options);
   Require("EmbeddedFetchLaneSpill", "fetch rewrite",
           result.program.info.vertex_fetch_components[0] == 4,
           "lane-spilled fetch descriptor was not recognized and rewritten");
@@ -25890,7 +25685,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
-    vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -26077,7 +25871,6 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColor1DDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
-  vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();

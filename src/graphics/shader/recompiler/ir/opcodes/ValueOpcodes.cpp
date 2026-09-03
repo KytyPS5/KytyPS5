@@ -111,7 +111,7 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::StoreBufferU32x3:
 		case ValueOpcode::StoreBufferU32x4: return BufferAccess::Write;
 		case ValueOpcode::BufferAtomicSwap32:
-		case ValueOpcode::BufferAtomicSwap64:
+		case ValueOpcode::BufferAtomicCompareAndSwap32:
 		case ValueOpcode::BufferAtomicIAdd32:
 		case ValueOpcode::BufferAtomicISub32:
 		case ValueOpcode::BufferAtomicSMin32:
@@ -120,7 +120,6 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicUMax32:
 		case ValueOpcode::BufferAtomicAnd32:
 		case ValueOpcode::BufferAtomicOr32:
-		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::BufferAtomicXor32:
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
@@ -130,8 +129,6 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 
 uint32_t BufferComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
-		case ValueOpcode::BufferAtomicSwap64:
-		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
 		case ValueOpcode::LoadBufferU32x3:
@@ -208,7 +205,6 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
 		case ValueOpcode::ImageWrite:
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
-		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:

@@ -15,6 +15,7 @@
 #include <QIODevice>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -95,7 +96,7 @@ private:
 
 	/*DetachableProcess*/ QProcess m_process;
 
-	ConfigurationItem* m_running_item = nullptr;
+	QPointer<ConfigurationItem> m_running_item;
 };
 
 QByteArray MainDialogPrivate::g_last_geometry;

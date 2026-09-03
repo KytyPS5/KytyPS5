@@ -617,6 +617,7 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::BufferAtomicSwap32:
+		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return OpAtomicIAdd;
@@ -633,6 +634,7 @@ uint32_t AtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicAnd32:
 		case IR::ValueOpcode::SharedAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
+		case IR::ValueOpcode::BufferAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return OpAtomicXor;
@@ -672,8 +674,8 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	return return_value ? result : ConstantU32(ctx.state, 0);
 }
 
-uint32_t EmitBufferAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst,
-                              const IR::MemoryInfo& mem) {
+uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
+                            const IR::MemoryInfo& mem) {
 	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
@@ -690,7 +692,7 @@ uint32_t EmitBufferAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst,
 			                                 ctx.Arg(inst, inst.NumArgs() - 2));
 			        const auto old   = state.builder.AllocateId();
 			        state.builder.AddFunction(
-			            {OpAtomicOr, TypeScalarU64(state), old,
+			            {AtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
 			             EmitStorageBufferElementPointer(
 			                 state, resource, index, TypeStorageBufferU64ElementPointer(state)),
 			             ConstantU32(state, ScopeDevice),
@@ -1209,12 +1211,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	const auto atomic_opcode = AtomicOpcode(op);
-	if (atomic_opcode != 0) {
-		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
+	if (atomic_opcode != 0 && inst.GetType() == IR::Type::U64) {
+		ctx.Define(inst, EmitBufferAtomic64(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
-	if (op == IR::ValueOpcode::BufferAtomicOr64) {
-		ctx.Define(inst, EmitBufferAtomicOr64(ctx, inst, ctx.Memory(inst)));
+	if (atomic_opcode != 0) {
+		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
 		return true;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {

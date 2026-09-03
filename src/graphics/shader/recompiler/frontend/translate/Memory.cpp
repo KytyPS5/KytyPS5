@@ -922,6 +922,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap32);
+		case Decoder::Opcode::BUFFER_ATOMIC_SWAP_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap64);
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd32);
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:

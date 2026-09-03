@@ -8593,66 +8593,77 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
         "buffer atomic memory barrier was emitted before atomic");
 }
 
-void TestCapturedBufferAtomicOrX2() {
-  const uint32_t shader[] = {
-      0xe1680018u, 0x80000000u, // buffer_atomic_or_x2 v[0:1], s[0:3], 0 offset:24
-      EncodeSopp(0x01),
+void TestCapturedBufferAtomicsX2() {
+  using ShaderRecompiler::IR::ValueOpcode;
+  struct Case {
+    std::array<uint32_t, 2> words;
+    uint32_t data_vgpr;
+    uint32_t spirv_opcode;
+    const char *decoded_name;
+    const char *ir_name;
+    const char *spirv_name;
+    ValueOpcode ir_opcode;
   };
-
+  const Case cases[] = {
+      {{0xe1680018u, 0x80000000u}, 0u, 241u, "BUFFER_ATOMIC_OR_X2",
+       "BufferAtomicOr64", "OpAtomicOr", ValueOpcode::BufferAtomicOr64},
+      {{0xe1402000u, 0x80000913u}, 9u, 229u, "BUFFER_ATOMIC_SWAP_X2",
+       "BufferAtomicSwap64", "OpAtomicExchange", ValueOpcode::BufferAtomicSwap64},
+  };
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
+  for (const auto &test : cases) {
+    const std::array shader = {test.words[0], test.words[1], EncodeSopp(0x01)};
+    auto result = RecompileForTest(shader, options);
+    Check(Common::ContainsStr(result.decoded_dump, test.decoded_name),
+          "captured 64-bit MUBUF atomic decoded incorrectly");
+    Check(Common::ContainsStr(result.ir_dump, test.ir_name),
+          "64-bit MUBUF atomic did not lower to its native IR opcode");
+    Check(!Common::ContainsStr(result.ir_dump, "SetVectorRegister"),
+          "GLC=0 64-bit MUBUF atomic unexpectedly returned the old value");
+    CheckSpirvBinaryValidates(result.spirv);
 
-  auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_ATOMIC_OR_X2"),
-        "captured MUBUF instruction did not decode as buffer_atomic_or_x2");
-  Check(Common::ContainsStr(result.ir_dump, "BufferAtomicOr64"),
-        "buffer_atomic_or_x2 did not lower to a 64-bit buffer atomic");
-  Check(!Common::ContainsStr(result.ir_dump, "SetVectorRegister"),
-        "GLC=0 buffer_atomic_or_x2 unexpectedly wrote an old value to v0:v1");
-  CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(Common::ContainsStr(source, "OpCapability Int64Atomics"),
+          "64-bit buffer atomic SPIR-V lacks Int64Atomics capability");
+    Check(Common::ContainsStr(source, "ArrayStride 8"),
+          "64-bit buffer atomic storage view does not use eight-byte elements");
+    Check(CountSourceOccurrences(source, "Aliased") == 2u,
+          "both storage-buffer views must declare that they alias");
+    const auto array_length =
+        Common::FindIndex(source, std::string("OpArrayLength"), 0);
+    const auto bounds_branch = Common::FindIndex(
+        source, std::string("OpBranchConditional"), array_length);
+    const auto atomic =
+        Common::FindIndex(source, std::string(test.spirv_name), 0);
+    const auto memory_barrier =
+        Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
+    Check(array_length != Common::FIND_INVALID_INDEX &&
+              bounds_branch != Common::FIND_INVALID_INDEX &&
+              atomic != Common::FIND_INVALID_INDEX && bounds_branch < atomic,
+          "64-bit buffer atomic was not guarded by storage-buffer bounds");
+    Check(SpirvInstructionOpcodeCount(result.spirv, test.spirv_opcode) == 1u,
+          "64-bit buffer atomic did not lower to one native SPIR-V atomic");
+    Check(memory_barrier != Common::FIND_INVALID_INDEX && atomic < memory_barrier,
+          "64-bit buffer atomic lacks a following device-memory barrier");
 
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "OpCapability Int64Atomics"),
-        "64-bit buffer atomic SPIR-V lacks Int64Atomics capability");
-  Check(Common::ContainsStr(source, "ArrayStride 8"),
-        "64-bit buffer atomic storage view does not use eight-byte elements");
-  Check(CountSourceOccurrences(source, "Aliased") == 2u,
-        "both storage-buffer views must declare that they alias");
-  const auto array_length =
-      Common::FindIndex(source, std::string("OpArrayLength"), 0);
-  const auto bounds_branch = Common::FindIndex(
-      source, std::string("OpBranchConditional"), array_length);
-  const auto atomic = Common::FindIndex(source, std::string("OpAtomicOr"), 0);
-  const auto memory_barrier =
-      Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
-  Check(array_length != Common::FIND_INVALID_INDEX &&
-            bounds_branch != Common::FIND_INVALID_INDEX &&
-            atomic != Common::FIND_INVALID_INDEX && bounds_branch < atomic,
-        "64-bit buffer atomic was not guarded by storage-buffer bounds");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 241u) == 1u,
-        "buffer_atomic_or_x2 must lower to exactly one OpAtomicOr");
-  Check(memory_barrier != Common::FIND_INVALID_INDEX && atomic < memory_barrier,
-        "64-bit buffer atomic lacks a following device-memory barrier");
-
-  const std::array glc_shader = {
-      shader[0] | (1u << 14u), shader[1],
-      EncodeMubuf0(0x1d, 32, false),
-      EncodeMubuf1(0, 0, 0), // preserve returned v0:v1 through a dwordx2 store
-      shader[2],
-  };
-  auto glc_result = RecompileForTest(glc_shader, options);
-  const ShaderRecompiler::IR::Inst *glc_atomic = nullptr;
-  for (const auto *block : glc_result.program.blocks) {
-    for (const auto &inst : *block) {
-      if (inst.GetOpcode() ==
-          ShaderRecompiler::IR::ValueOpcode::BufferAtomicOr64) {
-        glc_atomic = &inst;
+    const std::array glc_shader = {
+        test.words[0] | (1u << 14u), test.words[1],
+        EncodeMubuf0(0x1d, 32, false),
+        EncodeMubuf1(test.data_vgpr, 0, 0),
+        EncodeSopp(0x01),
+    };
+    auto glc_result = RecompileForTest(glc_shader, options);
+    const ShaderRecompiler::IR::Inst *glc_atomic = nullptr;
+    for (const auto *block : glc_result.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == test.ir_opcode) glc_atomic = &inst;
       }
     }
+    Check(glc_atomic != nullptr && glc_atomic->UseCount() == 2u,
+          "GLC=1 64-bit MUBUF atomic did not return both dwords");
+    CheckSpirvBinaryValidates(glc_result.spirv);
   }
-  Check(glc_atomic != nullptr && glc_atomic->UseCount() == 2u,
-        "GLC=1 buffer_atomic_or_x2 did not feed both returned dwords");
-  CheckSpirvBinaryValidates(glc_result.spirv);
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -11997,7 +12008,7 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
-  TestCapturedBufferAtomicOrX2();
+  TestCapturedBufferAtomicsX2();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

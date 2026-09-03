@@ -592,6 +592,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::TBUFFER_STORE_FORMAT_XYZ:
 		case Opcode::TBUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_ATOMIC_SWAP:
+		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:

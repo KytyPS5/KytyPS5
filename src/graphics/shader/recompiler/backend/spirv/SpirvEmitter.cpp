@@ -189,7 +189,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicOr64) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
+			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
 			}
 			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;

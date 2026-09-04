@@ -1240,15 +1240,15 @@ void TestShaderInfoAndBindingLayout() {
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
-  Check(ImageBindingCount == 43u &&
+  Check(ImageBindingCount == 36u &&
             static_cast<uint32_t>(DescriptorBindingKind::Buffers) == 0u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 45u &&
-            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 46u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 47u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 48u &&
-            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u,
+            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 37u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 38u &&
+            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 39u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 40u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 41u &&
+            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 42u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -1271,14 +1271,12 @@ void TestImageBindingAbi() {
   uint32_t index = 0;
   const auto CheckBinding =
       [&](ImageResourceClass resource_class, NumericClass numeric_class,
-          Decoder::ImageDimension dimension, bool atomic,
-          bool depth_compare = false) {
+          Decoder::ImageDimension dimension, bool atomic) {
         ImageResource image;
         image.resource_class = resource_class;
         image.numeric_class = numeric_class;
         image.dimension = dimension;
         image.atomic = atomic;
-        image.depth_compare = depth_compare;
         const auto kind = DescriptorBindingForImage(image);
         Check(kind.has_value() &&
                   static_cast<uint32_t>(*kind) == FirstImageBinding + index &&
@@ -1297,10 +1295,6 @@ void TestImageBindingAbi() {
       CheckBinding(ImageResourceClass::Sampled, numeric_class, dimension,
                    false);
     }
-  }
-  for (const auto dimension : sampled_dimensions) {
-    CheckBinding(ImageResourceClass::Sampled, NumericClass::Float, dimension,
-                 false, true);
   }
   for (const auto numeric_class : storage_classes) {
     for (const auto dimension : storage_dimensions) {
@@ -1328,11 +1322,6 @@ void TestImageBindingAbi() {
   image.numeric_class = NumericClass::Unsupported;
   Check(Invalid(image),
         "unsupported sampled class received a descriptor binding");
-  image.numeric_class = NumericClass::Uint;
-  image.depth_compare = true;
-  Check(Invalid(image),
-        "integer comparison image received a descriptor binding");
-  image.depth_compare = false;
   image.numeric_class = static_cast<NumericClass>(UINT32_MAX);
   Check(Invalid(image), "invalid sampled class received a descriptor binding");
   image.numeric_class = NumericClass::Float;

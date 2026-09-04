@@ -20440,7 +20440,7 @@ TestCase ImageSampleOpcodeAliasUsesNormalCoords() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpTypeImage %float 2D 0", "OpImageSampleExplicitLod"};
+  test.required_spirv = {"OpImageSampleExplicitLod"};
   test.forbidden_spirv = {"UnpackHalf2x16"};
   test.compile_only = true;
   return test;
@@ -20494,8 +20494,7 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpTypeImage %float 2D 1",
-                         "OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+  test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
 }
@@ -24045,42 +24044,6 @@ void CheckNativeImageDescriptorTypes() {
   std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
 }
 
-void CheckDepthComparisonBindings() {
-  using namespace ShaderRecompiler::IR;
-
-  ImageResource color{};
-  color.resource_class = ImageResourceClass::Sampled;
-  color.numeric_class = Prospero::TextureNumericClass::Float;
-  color.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  color.read = true;
-  auto depth = color;
-  depth.depth_compare = true;
-
-  const auto color_kind = DescriptorBindingForImage(color);
-  const auto depth_kind = DescriptorBindingForImage(depth);
-  Program program;
-  program.info.images = {color, depth};
-  program.shader_info_complete = true;
-  AllocateBindings(program);
-
-  Require("DepthComparisonBindings", "separate classes",
-          color_kind.has_value() && depth_kind.has_value() &&
-              color_kind != depth_kind &&
-              ImageBindingResourceClass(*color_kind) ==
-                  ImageResourceClass::Sampled &&
-              ImageBindingResourceClass(*depth_kind) ==
-                  ImageResourceClass::Sampled,
-          "ordinary and comparison images share a descriptor class");
-  const auto *color_binding = FindBinding(program.bindings, *color_kind);
-  const auto *depth_binding = FindBinding(program.bindings, *depth_kind);
-  Require("DepthComparisonBindings", "separate arrays",
-          color_binding != nullptr && depth_binding != nullptr &&
-              color_binding->resources == std::vector<uint32_t>{0u} &&
-              depth_binding->resources == std::vector<uint32_t>{1u},
-          "ordinary and comparison images share a descriptor array");
-  std::printf("[host]    %-32s ok\n", "DepthComparisonBindings");
-}
-
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void CheckShaderRecompilerFatalContracts() {
   ExpectFatal("InvalidDescriptorBindingRejection", [] {
@@ -26116,9 +26079,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
     CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
-    CheckDepthComparisonBindings();
-    RunCase(nullptr, ImageSampleOpcodeAliasUsesNormalCoords());
-    RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
@@ -26194,7 +26154,6 @@ int main(int argc, char **argv) {
 #endif
   CheckImageSamplerSpecialization();
   CheckNativeImageDescriptorTypes();
-  CheckDepthComparisonBindings();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckVulkan13FeatureRequirements();

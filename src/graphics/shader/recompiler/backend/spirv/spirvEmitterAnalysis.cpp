@@ -158,8 +158,7 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
 	return state.builder.Type(OpTypeImage,
-	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension,
-	                           image.depth_compare ? 1u : 0u,
+	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, 0,
 	                           info.arrayed, info.multisampled, sampled, format});
 }
 

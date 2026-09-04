@@ -51,6 +51,15 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

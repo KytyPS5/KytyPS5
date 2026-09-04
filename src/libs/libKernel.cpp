@@ -1330,6 +1330,15 @@ static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
+	PRINT_NAME();
+
+	*mode    = 2; // PS5 Base
+	*submode = 0; // None
+	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
+	return OK;
+}
+
 static int KYTY_SYSV_ABI KernelFsync(int fd) {
 	PRINT_NAME();
 
@@ -3325,6 +3334,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
+	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
 	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);

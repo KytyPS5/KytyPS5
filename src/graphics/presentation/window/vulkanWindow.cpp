@@ -65,12 +65,13 @@ struct VulkanExtensions {
 
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
-	features.sType                    = vk::StructureType::ePhysicalDeviceVulkan12Features;
-	features.samplerMirrorClampToEdge = VK_TRUE;
-	features.timelineSemaphore        = VK_TRUE;
-	features.shaderOutputLayer        = VK_TRUE;
-	features.bufferDeviceAddress      = VK_TRUE;
-	features.shaderBufferInt64Atomics = VK_TRUE;
+	features.sType                     = vk::StructureType::ePhysicalDeviceVulkan12Features;
+	features.samplerMirrorClampToEdge  = VK_TRUE;
+	features.timelineSemaphore         = VK_TRUE;
+	features.shaderOutputLayer         = VK_TRUE;
+	features.shaderOutputViewportIndex = VK_TRUE;
+	features.bufferDeviceAddress       = VK_TRUE;
+	features.shaderBufferInt64Atomics  = VK_TRUE;
 	return features;
 }
 
@@ -274,6 +275,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderOutputLayer == VK_TRUE &&
 		    features12.shaderOutputLayer != VK_TRUE) {
 			LOGF("shaderOutputLayer is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.shaderOutputViewportIndex == VK_TRUE &&
+		    features12.shaderOutputViewportIndex != VK_TRUE) {
+			LOGF("shaderOutputViewportIndex is not supported\n");
 			skip_device = true;
 		}
 		if (required_features12.bufferDeviceAddress == VK_TRUE &&
@@ -523,8 +529,7 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	graphics.compute_subgroup_size_control_enabled =
 	    features13.subgroupSizeControl == VK_TRUE &&
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
-	    subgroup_size_control.minSubgroupSize <= 64 &&
-	    subgroup_size_control.maxSubgroupSize >= 64;
+	    subgroup_size_control.minSubgroupSize <= 64 && subgroup_size_control.maxSubgroupSize >= 64;
 	graphics.compute_wave64_supported =
 	    graphics.subgroup_size == 64u || graphics.compute_subgroup_size_control_enabled;
 
@@ -627,6 +632,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
 	                     supported_features12.shaderOutputLayer != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputViewportIndex == VK_TRUE &&
+	                     supported_features12.shaderOutputViewportIndex != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.bufferDeviceAddress == VK_TRUE &&
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
@@ -652,7 +659,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.largePoints                          = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
-	device_features.shaderInt64 = VK_TRUE;
+	device_features.shaderInt64                          = VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -672,9 +679,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
-	const bool subgroup_size_control_enabled =
-	    graphics.compute_subgroup_size_control_enabled &&
-	    supported_features13.subgroupSizeControl == VK_TRUE;
+	const bool subgroup_size_control_enabled = graphics.compute_subgroup_size_control_enabled &&
+	                                           supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
 #if defined(__APPLE__)
@@ -785,7 +791,7 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 		    "vkEnumerateInstanceExtensionProperties",
 		    [](uint32_t* count, vk::ExtensionProperties* values) {
 			    return vk::enumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation",
-			                                                    count, values);
+				                                                count, values);
 		    });
 
 		for (const auto& ext: available_extensions) {
@@ -969,9 +975,9 @@ void WindowContext::CreateVulkan() {
 	dbg_create_info.pUserData       = nullptr;
 
 	vk::InstanceCreateInfo inst_info {};
-	inst_info.sType                   = vk::StructureType::eInstanceCreateInfo;
-	inst_info.pNext                   = (r.enable_validation_layers ? &dbg_create_info : nullptr);
-	inst_info.flags                   = {};
+	inst_info.sType = vk::StructureType::eInstanceCreateInfo;
+	inst_info.pNext = (r.enable_validation_layers ? &dbg_create_info : nullptr);
+	inst_info.flags = {};
 #if defined(__APPLE__)
 	// MoltenVK requires VK_KHR_portability_enumeration + flag to surface
 	// portability devices. Without this, enumeratePhysicalDevices hides the

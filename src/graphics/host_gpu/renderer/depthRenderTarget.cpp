@@ -144,6 +144,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 		return;
 	}
 	const bool has_htile = z.z_info.htile_acceleration;
+	const bool unsupported_shading_rate_encoding =
+	    z.shading_rate_encoding > 1 || (z.shading_rate_encoding != 0 && !has_htile);
 	const auto samples   = render_sample_count(z.z_info.num_samples);
 	if (samples == 0) {
 		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
@@ -162,7 +164,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    rc.copy_sample != 0 || z.z_info.expclear_enabled ||
 	    z.stencil_info.expclear_enabled || z.z_info.partially_resident ||
 	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
-	    z.depth_view.current_mip_level != 0 || z.shading_rate_encoding != 0 ||
+	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
 	    z.z_read_base_addr == 0 ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (z.z_read_base_addr & 0xffffu) != 0 ||

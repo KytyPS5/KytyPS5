@@ -117,10 +117,6 @@ static const char* RenderColorTypeName(RenderColorType type) {
 	}
 }
 
-static bool IsDualSourceBlendFactor(uint32_t factor) {
-	return factor >= 0x0fu && factor <= 0x12u;
-}
-
 static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color,
                                const RenderDepthInfo& depth, const CommandBuffer& buffer,
                                uint32_t index_count, uint32_t flags) {
@@ -152,12 +148,6 @@ static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
 	const auto  rt_mask        = ctx.GetRenderTargetMask();
 	const auto  cb_shader_mask = sh_regs.m_cbShaderMask;
 	const auto& bc0            = ctx.GetBlendControl(0);
-
-	bool interesting = rt_mask != 0x0f || (cb_shader_mask & ~0x0fu) != 0 ||
-	                   IsDualSourceBlendFactor(bc0.color_srcblend) ||
-	                   IsDualSourceBlendFactor(bc0.color_destblend) ||
-	                   (bc0.separate_alpha_blend && (IsDualSourceBlendFactor(bc0.alpha_srcblend) ||
-	                                                 IsDualSourceBlendFactor(bc0.alpha_destblend)));
 
 	auto log_id = g_mrt_state_log_count.fetch_add(1);
 	if (log_id >= 32) {

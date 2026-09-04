@@ -153,6 +153,30 @@ static int KYTY_SYSV_ABI PadClose(int handle) {
 	return OK;
 }
 
+// PPSA02385
+static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const void* param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = 0x%016" PRIx64 "\n",
+	     user_id, type, index, reinterpret_cast<uint64_t>(param));
+
+	return OK;
+}
+
+// PPSA02385
+static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* info) {
+	PRINT_NAME();
+
+	LOGF("\t handle = %d\n"
+	     "\t info   = 0x%016" PRIx64 "\n",
+	     handle, reinterpret_cast<uint64_t>(info));
+
+	return OK;
+}
+
 static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
                                                uint64_t arg3, uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
@@ -173,6 +197,7 @@ LIB_DEFINE(InitPad_1) {
 
 	LIB_FUNC("hv1luiJrqQM", Controller::PadInit);
 	LIB_FUNC("xk0AcarP3V4", Controller::PadOpen);
+	LIB_FUNC("WFIiSfXGUq8", PadOpenExtStub);
 	LIB_FUNC("u1GRHp+oWoY", Controller::PadGetHandle);
 	LIB_FUNC("AcslpN1jHR8", PadDeviceClassGetExtendedInformation);
 	LIB_FUNC("IHPqcbc0zCA", PadDeviceClassParseData);
@@ -181,6 +206,7 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("rIZnR6eSpvk", Controller::PadResetOrientation);
 	LIB_FUNC("vDLMoJLde8I", PadSetTiltCorrectionState);
 	LIB_FUNC("gjP9-KQzoUk", Controller::PadGetControllerInformation);
+	LIB_FUNC("hGbf2QTBmqc", PadGetExtControllerInformationStub);
 	LIB_FUNC("2JgFB2n9oUM", Controller::PadSetTriggerEffect);
 	LIB_FUNC("YndgXqQVV7c", Controller::PadReadState);
 	LIB_FUNC("q1cHNfGycLI", Controller::PadRead);

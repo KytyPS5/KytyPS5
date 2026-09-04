@@ -72,9 +72,43 @@
         </widget>
        </item>
        <item>
-        <widget class="QLabel" name="label_Version">
+        <layout class="QHBoxLayout" name="versionLayout">
+         <item>
+          <widget class="QLabel" name="label_Version">
+           <property name="text">
+            <string>TextLabel</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="check_updates_link">
+           <property name="text">
+            <string>&lt;a href=&quot;check&quot;&gt;Check for updates&lt;/a&gt;</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::RichText</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="versionSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="check_updates_on_startup">
          <property name="text">
-          <string>TextLabel</string>
+          <string>Check for updates on startup</string>
          </property>
         </widget>
        </item>

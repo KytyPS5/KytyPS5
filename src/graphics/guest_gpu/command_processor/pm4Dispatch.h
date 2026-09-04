@@ -45,8 +45,6 @@ uint32_t HwCtxSetStencilClear(CommandProcessor&, uint32_t, uint32_t, const uint3
 uint32_t HwCtxSetDepthClear(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetScreenScissor(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetStencilInfo(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwCtxSetDepthShadingRateEncoding(CommandProcessor&, uint32_t, uint32_t,
-                                          const uint32_t*, uint32_t);
 uint32_t HwCtxSetHardwareScreenOffset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                       uint32_t);
 uint32_t HwCtxSetWindowOffset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

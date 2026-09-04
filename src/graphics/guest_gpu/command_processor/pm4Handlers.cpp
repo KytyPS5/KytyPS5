@@ -599,17 +599,6 @@ static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint3
 	ctx.SetDepthRenderTarget(target);
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetDepthShadingRateEncoding) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	EXIT_NOT_IMPLEMENTED(num_values != 1);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_SHADING_RATE_ENCODING);
-
-	HwCtxSetDepthShadingRateEncodingRegister(cp, buffer[0]);
-
-	return num_values;
-}
-
 static HW::EqaaControl ParseEqaaControl(uint32_t value) {
 	HW::EqaaControl r;
 

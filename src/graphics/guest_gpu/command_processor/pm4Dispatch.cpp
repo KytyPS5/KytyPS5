@@ -24,7 +24,6 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::DB_DEPTH_CLEAR]               = HwCtxSetDepthClear;
 	g_hw_ctx_func[Pm4::PA_SC_SCREEN_SCISSOR_TL]      = HwCtxSetScreenScissor;
 	g_hw_ctx_func[Pm4::DB_STENCIL_INFO]              = HwCtxSetStencilInfo;
-	g_hw_ctx_func[Pm4::DB_SHADING_RATE_ENCODING]     = HwCtxSetDepthShadingRateEncoding;
 	g_hw_ctx_func[Pm4::PA_SU_HARDWARE_SCREEN_OFFSET] = HwCtxSetHardwareScreenOffset;
 	g_hw_ctx_func[Pm4::PA_SC_WINDOW_OFFSET]          = HwCtxSetWindowOffset;
 	g_hw_ctx_func[Pm4::PA_SC_WINDOW_SCISSOR_TL]      = HwCtxSetWindowScissor;

@@ -435,8 +435,6 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 
 	if (z.z_info.format != Prospero::DepthFormat::kInvalid ||
 	    z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
-		EXIT_NOT_IMPLEMENTED(z.shading_rate_encoding != 0);
-
 		if (z.depth_view.current_mip_level != 0x00000000) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {

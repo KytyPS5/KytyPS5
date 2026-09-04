@@ -512,20 +512,6 @@ struct NullImageSpec {
 	Prospero::BufferFormat guest_format;
 };
 
-static vk::Format TextureBackingFormat(const ShaderRecompiler::IR::ImageResource& resource,
-                                       Prospero::BufferFormat guest_format,
-                                       vk::Format             view_format) {
-	if (!resource.depth_compare) {
-		return view_format;
-	}
-	const auto* policy = FindGuestDepthFormatPolicy(guest_format);
-	if (!IsSupportedSampledDepthResource(resource) || policy == nullptr) {
-		EXIT("unsupported comparison-sampled texture: format=%u\n",
-		     static_cast<uint32_t>(guest_format));
-	}
-	return policy->depth_attachment_format;
-}
-
 static NullImageSpec NullTextureSpec(const ShaderRecompiler::IR::ImageResource& resource) {
 	switch (resource.numeric_class) {
 		case Prospero::TextureNumericClass::Float:
@@ -543,7 +529,7 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
                                                TextureCache::BindingType                  binding) {
 	const auto              spec = NullTextureSpec(resource);
 	TextureCache::ImageDesc desc {};
-	desc.info.pixel_format    = TextureBackingFormat(resource, spec.guest_format, spec.format);
+	desc.info.pixel_format    = spec.format;
 	desc.info.guest_format    = spec.guest_format;
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
@@ -551,7 +537,7 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.bytes_per_block = 4;
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
-	desc.view_info.format     = spec.format;
+	desc.view_info.format     = desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
@@ -767,7 +753,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
-	desc.info.pixel_format = TextureBackingFormat(resource, format, pixel_format);
+	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
 	desc.info.extent       = {width, height, volume ? depth : 1u};

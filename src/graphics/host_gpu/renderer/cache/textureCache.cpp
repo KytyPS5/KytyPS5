@@ -939,7 +939,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	};
 
-	if (!info.IsDepth()) {
+	if (desc.type != BindingType::DepthTarget) {
 		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
@@ -963,8 +963,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		return;
 	}
 
-	if ((desc.type != BindingType::Texture && desc.type != BindingType::DepthTarget) ||
-	    info.samples != 1 || image.backing.samples != 1 ||
+	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");

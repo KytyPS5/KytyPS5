@@ -481,41 +481,6 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
-template <typename Fn>
-uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
-	const auto scope     = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
-	const auto memory    = kind == IR::ResourceKind::Lds ? MemorySemanticsWorkgroupMemory
-	                                                     : MemorySemanticsUniformMemory;
-	const auto preheader = state.builder.AllocateId();
-	const auto header    = state.builder.AllocateId();
-	const auto cont      = state.builder.AllocateId();
-	const auto merge     = state.builder.AllocateId();
-	const auto initial   = state.builder.AllocateId();
-	const auto observed  = state.builder.AllocateId();
-	const auto exchanged = state.builder.AllocateId();
-	state.builder.AddFunction({OpBranch, preheader});
-	EmitLabel(state, preheader);
-	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
-	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
-	state.builder.AddFunction({OpBranch, header});
-	EmitLabel(state, header);
-	state.builder.AddFunction(
-	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
-	const auto next = desired(observed);
-	state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
-	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
-	                           ConstantU32(state, MemorySemanticsNone), next, observed});
-	const auto success = Binary(state, OpIEqual, TypeBool(state), exchanged, observed);
-	state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
-	state.builder.AddFunction({OpBranchConditional, success, merge, cont});
-	EmitLabel(state, cont);
-	state.builder.AddFunction({OpBranch, header});
-	EmitLabel(state, merge);
-	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
-	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
-	return observed;
-}
-
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
@@ -718,39 +683,6 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 	    });
 }
 
-uint32_t FloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
-                                bool max_value) {
-	struct OrderedBits {
-		uint32_t nan;
-		uint32_t zero;
-		uint32_t key;
-	};
-	const auto classify = [&](uint32_t bits) {
-		const auto value    = Unary(state, OpBitcast, TypeF32(state), bits);
-		const auto cls      = EmitClassifyF32(state, value);
-		const auto negative = Binary(
-		    state, OpINotEqual, TypeBool(state),
-		    Binary(state, OpBitwiseAnd, TypeU32(state), bits, ConstantU32(state, 0x80000000u)),
-		    ConstantU32(state, 0));
-		const auto negative_key = Unary(state, OpNot, TypeU32(state), bits);
-		const auto positive_key =
-		    Binary(state, OpBitwiseXor, TypeU32(state), bits, ConstantU32(state, 0x80000000u));
-		return OrderedBits {cls.nan, cls.zero,
-		                    Select(state, TypeU32(state), negative, negative_key, positive_key)};
-	};
-	const auto source_class = classify(source);
-	const auto old_class    = classify(old);
-	const auto unordered =
-	    Binary(state, OpLogicalOr, TypeBool(state),
-	           Binary(state, OpLogicalOr, TypeBool(state), source_class.nan, old_class.nan),
-	           Binary(state, OpLogicalAnd, TypeBool(state), source_class.zero, old_class.zero));
-	const auto ordered = Unary(state, OpLogicalNot, TypeBool(state), unordered);
-	const auto compare = Binary(state, max_value ? OpUGreaterThan : OpULessThan, TypeBool(state),
-	                            source_class.key, old_class.key);
-	return Select(state, TypeU32(state),
-	              Binary(state, OpLogicalAnd, TypeBool(state), ordered, compare), source, old);
-}
-
 uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      bool max_value) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -761,7 +693,7 @@ uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
 			    const auto source = ctx.Arg(inst, inst.NumArgs() - 2);
 			    return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
-				    return FloatAtomicReplacement(ctx.state, old, source, max_value);
+				    return EmitFloatAtomicReplacement(ctx.state, old, source, max_value);
 			    });
 		    });
 	});

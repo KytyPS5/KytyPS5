@@ -130,6 +130,7 @@ enum : uint32_t {
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
 	MemorySemanticsWorkgroupMemory = 0x00000100u,
+	MemorySemanticsImageMemory     = 0x00000800u,
 };
 
 enum : uint32_t {
@@ -671,6 +672,9 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 
+uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                    bool max_value);
+
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control);
 
 uint32_t EmitSelectValueU32(EmitterState& state, uint32_t cond, uint32_t true_value,
@@ -784,6 +788,47 @@ template <typename Fn>
 uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
+}
+
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	const auto scope = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+	const auto memory = [&] {
+		switch (kind) {
+			case IR::ResourceKind::Lds: return MemorySemanticsWorkgroupMemory;
+			case IR::ResourceKind::Image: return MemorySemanticsImageMemory;
+			default: return MemorySemanticsUniformMemory;
+		}
+	}();
+	const auto preheader = state.builder.AllocateId();
+	const auto header    = state.builder.AllocateId();
+	const auto cont      = state.builder.AllocateId();
+	const auto merge     = state.builder.AllocateId();
+	const auto initial   = state.builder.AllocateId();
+	const auto observed  = state.builder.AllocateId();
+	const auto exchanged = state.builder.AllocateId();
+	state.builder.AddFunction({OpBranch, preheader});
+	EmitLabel(state, preheader);
+	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
+	state.builder.AddFunction({OpBranch, header});
+	EmitLabel(state, header);
+	state.builder.AddFunction(
+	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
+	const auto next = desired(observed);
+	state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
+	                           ConstantU32(state, MemorySemanticsNone), next, observed});
+	const auto success = state.builder.AllocateId();
+	state.builder.AddFunction({OpIEqual, TypeBool(state), success, exchanged, observed});
+	state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
+	state.builder.AddFunction({OpBranchConditional, success, merge, cont});
+	EmitLabel(state, cont);
+	state.builder.AddFunction({OpBranch, header});
+	EmitLabel(state, merge);
+	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
+	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
+	return observed;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

@@ -325,6 +325,39 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
 	    {OpMemoryBarrier, ConstantU32(state, ScopeDevice), ConstantU32(state, semantics)});
 }
 
+uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                    bool max_value) {
+	struct OrderedBits {
+		uint32_t nan;
+		uint32_t zero;
+		uint32_t key;
+	};
+	const auto classify = [&](uint32_t bits) {
+		const auto value = EmitBitcastU32ToF32(state, bits);
+		const auto cls   = EmitClassifyF32(state, value);
+		const auto negative = EmitCompareU32Constant(
+		    state, OpINotEqual, EmitAndConstant(state, bits, 0x80000000u), 0u);
+		const auto negative_key = state.builder.AllocateId();
+		state.builder.AddFunction({OpNot, TypeU32(state), negative_key, bits});
+		const auto positive_key = EmitBinaryU32(
+		    state, OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
+		return OrderedBits {
+		    cls.nan, cls.zero,
+		    EmitSelectValueU32(state, negative, negative_key, positive_key)};
+	};
+	const auto source_class = classify(source);
+	const auto old_class    = classify(old);
+	const auto unordered = EmitLogicalOrBool(
+	    state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
+	    EmitLogicalAndBool(state, source_class.zero, old_class.zero));
+	const auto compare = state.builder.AllocateId();
+	state.builder.AddFunction({max_value ? OpUGreaterThan : OpULessThan, TypeBool(state), compare,
+	                           source_class.key, old_class.key});
+	return EmitSelectValueU32(
+	    state, EmitLogicalAndBool(state, EmitLogicalNotBool(state, unordered), compare), source,
+	    old);
+}
+
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
 	if ((control & 0xc000u) == 0xc000u) {
 		const uint32_t mask         = control & 0x1fu;

@@ -38,9 +38,8 @@ elseif(LINUX)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 endif()
 
-add_dependencies(launcher kyty_emulator)
-
 if(KYTY_CLANG_CL)
+	add_dependencies(launcher kyty_emulator)
 	add_custom_command(TARGET launcher POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_PDB_FILE:kyty_emulator> $<TARGET_FILE_DIR:launcher>/$<TARGET_PDB_FILE_NAME:kyty_emulator>
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE_DIR:kyty_emulator>/${KYTY_EMULATOR_MAP_NAME} $<TARGET_FILE_DIR:launcher>/${KYTY_EMULATOR_MAP_NAME}
@@ -197,3 +196,18 @@ list(APPEND inc_headers
 include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
 
 clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")
+
+if(BUILD_TESTING)
+	add_executable(update_checker_tests
+		"${CMAKE_SOURCE_DIR}/tests/UpdateCheckerTests.cpp"
+		"src/updateChecker.cpp"
+		"include/updateChecker.h"
+	)
+	target_include_directories(update_checker_tests PRIVATE
+		"include"
+		"${PROJECT_BINARY_DIR}"
+	)
+	target_link_libraries(update_checker_tests Qt6::Core Qt6::Network Qt6::Widgets)
+	set_target_properties(update_checker_tests PROPERTIES AUTOMOC ON)
+	add_test(NAME update_checker COMMAND $<TARGET_FILE:update_checker_tests>)
+endif()

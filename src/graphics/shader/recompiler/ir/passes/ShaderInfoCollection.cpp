@@ -311,10 +311,6 @@ void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 						}
 						const auto output = DecodePositionExportComponent(
 						    vertex->pa_cl_vs_out_cntl, export_info.index, component);
-						if (!output.valid) {
-							return Fail(fmt::format("unsupported POS{} auxiliary/stereo export",
-							                        export_info.index));
-						}
 						if (output.viewport) {
 							return Fail("vertex viewport-index export is unsupported");
 						}

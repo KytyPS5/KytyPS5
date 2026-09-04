@@ -9062,6 +9062,18 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 std::vector<uint32_t>({0u}),
         "CCDIST1 did not shift across a disabled CCDIST0 vector");
 
+  const uint32_t unmapped[] = {
+      EncodeExp0(0x0d, 0x4, false), EncodeExp1(0, 0, 8, 0),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  const auto ignored = compile(unmapped, 0u);
+  CheckSpirvBinaryValidates(ignored.spirv);
+  Check(ignored.program.info.outputs.size() == 1u &&
+            ignored.program.info.outputs[0].kind ==
+                ShaderRecompiler::IR::StageOutputKind::Position,
+        "unmapped auxiliary position export was not ignored");
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const auto rejects = [](uint32_t control, uint32_t en,
                           const char *message) {
@@ -9079,9 +9091,6 @@ void TestNewShaderRecompilerAuxPositionExports() {
   };
   rejects(0x00280000u, 0x4u,
           "viewport-index auxiliary position export did not terminate "
-          "compilation");
-  rejects(0u, 0x1u,
-          "unsupported auxiliary/stereo position export did not terminate "
           "compilation");
 #endif
 

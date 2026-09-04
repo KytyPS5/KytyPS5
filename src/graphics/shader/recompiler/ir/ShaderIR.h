@@ -184,7 +184,6 @@ enum class StageOutputKind {
 struct PositionExportComponent {
 	uint32_t clip_distance = UINT32_MAX;
 	uint32_t cull_distance = UINT32_MAX;
-	bool     valid          = false;
 	bool     point_size     = false;
 	bool     layer          = false;
 	bool     viewport       = false;
@@ -213,7 +212,6 @@ inline PositionExportComponent DecodePositionExportComponent(uint32_t control,
 		return result;
 	}
 
-	result.valid = true;
 	if (vector == 0) {
 		result.point_size = component == 0 && (control & (1u << 16u)) != 0;
 		result.layer      = component == 2 && (control & (1u << 18u)) != 0;

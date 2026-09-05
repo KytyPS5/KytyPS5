@@ -71,7 +71,6 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
-	buffer_info.sharingMode = vk::SharingMode::eExclusive;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
@@ -105,7 +104,6 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	graphics.device.getBufferMemoryRequirements(m_buffer->buffer, &m_buffer->memory.requirements);
 	if (static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
 		vk::BufferDeviceAddressInfo address_info {};
-		address_info.sType  = vk::StructureType::eBufferDeviceAddressInfo;
 		address_info.buffer = m_buffer->buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
@@ -174,7 +172,6 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 		     static_cast<const void*>(Handle()), offset, size, m_size);
 	}
 	vk::BufferMemoryBarrier barrier {};
-	barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
 	barrier.srcAccessMask       = source;
 	barrier.dstAccessMask       = destination;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;

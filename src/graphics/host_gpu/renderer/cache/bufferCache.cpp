@@ -408,7 +408,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		command.EndRendering();
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
-		before.sType         = vk::StructureType::eBufferMemoryBarrier;
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 		                       vk::AccessFlagBits::eTransferRead |
 		                       vk::AccessFlagBits::eTransferWrite;
@@ -643,29 +642,27 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	if (src_memory || dst_memory) {
-		const auto src_region =
-		    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
-		const auto dst_region =
-		    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
-		if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
-		    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
-		    !dst_region.gpu_image_bytes) {
-			if (dst_region.image_bytes) {
-				m_texture_cache.InvalidateMemory(dst_vaddr, size);
-			}
-			std::array<uint8_t, 64 * 1024> bytes;
-			for (uint64_t offset = 0; offset < size;) {
-				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
-				if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
-				                                             chunk)) {
-					EXIT("BufferCache: host DMA source has no direct backing\n");
-				}
-				WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
-				offset += chunk;
-			}
-			return;
+	const auto src_region =
+	    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
+	const auto dst_region =
+	    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
+	if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
+	    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
+	    !dst_region.gpu_image_bytes) {
+		if (dst_region.image_bytes) {
+			m_texture_cache.InvalidateMemory(dst_vaddr, size);
 		}
+		std::array<uint8_t, 64 * 1024> bytes;
+		for (uint64_t offset = 0; offset < size;) {
+			const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
+			if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
+			                                             chunk)) {
+				EXIT("BufferCache: host DMA source has no direct backing\n");
+			}
+			WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
+			offset += chunk;
+		}
+		return;
 	}
 
 	auto& command = m_scheduler.Current();

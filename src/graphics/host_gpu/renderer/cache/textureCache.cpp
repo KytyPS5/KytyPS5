@@ -116,10 +116,8 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.tile_mode != requested.tile_mode) {
 		return false;
 	}
-	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format)) {
-		return false;
-	}
-	if (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1}) {
+	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
+	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -1036,18 +1034,14 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (image.info.samples > 1) {
 		return;
 	}
-	bool       data_imported = false;
-	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
+	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		data_imported = true;
 		UploadImage(image, *source, source_offset);
-	}
-	if (data_imported) {
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1694,7 +1688,6 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 
 	DownloadImageData(image, download, offset, range.size, std::move(plan));
 	vk::BufferMemoryBarrier barrier {};
-	barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;

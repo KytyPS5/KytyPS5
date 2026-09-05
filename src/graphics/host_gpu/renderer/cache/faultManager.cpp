@@ -39,7 +39,6 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
 	};
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
-	layout_info.sType        = vk::StructureType::eDescriptorSetLayoutCreateInfo;
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
 	layout_info.bindingCount = std::size(bindings);
 	layout_info.pBindings    = bindings;
@@ -49,7 +48,6 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	    "create fault-buffer descriptor layout");
 
 	vk::ShaderModuleCreateInfo module_info {};
-	module_info.sType    = vk::StructureType::eShaderModuleCreateInfo;
 	module_info.codeSize = std::size(FAULT_BUFFER_PROCESS_SPV) * sizeof(uint32_t);
 	module_info.pCode    = FAULT_BUFFER_PROCESS_SPV;
 	vk::ShaderModule module = nullptr;
@@ -57,7 +55,6 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                     "create fault-buffer shader module");
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.sType          = vk::StructureType::ePipelineLayoutCreateInfo;
 	pipeline_layout_info.setLayoutCount = 1;
 	pipeline_layout_info.pSetLayouts    = &m_fault_process_desc_layout;
 	RequireVulkanSuccess(
@@ -66,12 +63,10 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	    "create fault-buffer pipeline layout");
 
 	vk::PipelineShaderStageCreateInfo stage {};
-	stage.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
 	stage.stage  = vk::ShaderStageFlagBits::eCompute;
 	stage.module = module;
 	stage.pName  = "main";
 	vk::ComputePipelineCreateInfo pipeline_info {};
-	pipeline_info.sType  = vk::StructureType::eComputePipelineCreateInfo;
 	pipeline_info.stage  = stage;
 	pipeline_info.layout = m_fault_process_pipeline_layout;
 	const auto result = m_graphics.device.createComputePipelines(
@@ -99,7 +94,6 @@ void FaultManager::ProcessFaultBuffer() {
 	m_download_buffer.Flush(offset, PageFaultAreaSize);
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
-	pre_barrier.sType         = vk::StructureType::eBufferMemoryBarrier2;
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
@@ -119,7 +113,6 @@ void FaultManager::ProcessFaultBuffer() {
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
-		writes[index].sType           = vk::StructureType::eWriteDescriptorSet;
 		writes[index].dstBinding      = index;
 		writes[index].descriptorCount = 1;
 		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
@@ -129,7 +122,6 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
 	vk::DependencyInfo dependency {};
-	dependency.sType                    = vk::StructureType::eDependencyInfo;
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;

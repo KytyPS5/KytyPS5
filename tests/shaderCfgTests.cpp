@@ -1670,6 +1670,49 @@ void TestNewShaderRecompilerSopkWaitcntMarkers() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestSopkCompareImmediateExtension() {
+  using namespace ShaderRecompiler;
+  for (uint32_t opcode = 0x03; opcode <= 0x0e; opcode++) {
+    for (uint32_t immediate : {0x8000u, 0xffffu}) {
+      const std::array shader = {
+          EncodeSopk(opcode, 2, static_cast<int16_t>(immediate)),
+          EncodeSopp(0x01),
+      };
+      Decoder::Program decoded;
+      Decoder::DecodeProgram(shader, decoded);
+      const auto &operand = decoded.instructions.front().src1;
+      const int32_t expected = opcode < 0x09
+                                   ? (immediate == 0x8000u ? -32768 : -1)
+                                   : static_cast<int32_t>(immediate);
+      Check(operand.value == static_cast<uint32_t>(expected) &&
+                operand.signed_val == expected,
+            "SOPK compare immediate extension does not match its signedness");
+    }
+  }
+
+  // GTA3's LUT GS exports its UV parameter only when packed primitive count > 0.
+  for (uint32_t counts : {0x00000006u, 0x00020006u}) {
+    const std::array shader = {
+        EncodeSMovB32(2, 255), counts,
+        0xb582ffffu,             // s_cmpk_gt_u32 s2, 0xffff
+        EncodeSopp(0x04, 2),     // s_cbranch_scc0 past exp param0
+        0xf800020fu, 0x06060504u, // exp param0 v4, v5, v6, v6
+        EncodeSopp(0x01),
+    };
+    auto translated =
+        TranslateProgram(shader, MakeCompileOptions(ShaderType::Vertex));
+    const auto branch = std::ranges::find_if(
+        translated.program.block_info, [](const auto &block) {
+          return block.terminator.condition == CFG::BranchCondition::SccZero;
+        });
+    Check(branch != translated.program.block_info.end(),
+          "captured LUT parameter export branch was lost");
+    const auto condition = branch->condition.Resolve();
+    Check(condition.IsImmediate() && condition.U1() == (counts == 6u),
+          "captured LUT unsigned compare suppressed a live parameter export");
+  }
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -11896,6 +11939,7 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
+  TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();

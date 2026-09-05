@@ -7762,7 +7762,7 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
       std::ranges::count_if(graph.blocks, [](const auto &block) {
         return block.inst_begin == block.inst_end;
       });
-  Check(original_block_count == 8u && graph.natural_loops.size() == 1u,
+  Check(original_block_count == 7u && graph.natural_loops.size() == 1u,
         "nested early-exit fixture has the wrong native CFG");
   const bool structured = ShaderRecompiler::CFG::Structurize(graph);
   Check(structured, graph.unsupported_reason.c_str());
@@ -7832,44 +7832,11 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
                      ShaderRecompiler::CFG::BranchCondition::GotoVariable;
     route_sets += block.terminator.goto_value >= 0;
   }
-  Check(graph.blocks.size() == 10u && route_selects == 1u && route_sets == 3u,
-        "shared selection arm was not routed through typed goto state");
+  Check(graph.blocks.size() == 5u && route_selects == 0u && route_sets == 0u,
+        "shared return arm introduced synthetic routing state");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "EXEC/SCC shared-arm structurization changed semantic coverage");
-
-  ShaderRecompiler::IR::Program value_ir;
-  ShaderComputeInputInfo compute_info{};
-  ShaderRecompiler::Frontend::TranslateOptions translate_options{};
-  translate_options.stage = ShaderType::Compute;
-  translate_options.wave_size = 64u;
-  translate_options.compute = &compute_info;
-  value_ir = ShaderRecompiler::Frontend::TranslateProgram(decoded, graph,
-                                                          translate_options);
-  uint32_t goto_sets = 0;
-  uint32_t goto_gets = 0;
-  for (const auto *block : value_ir.blocks) {
-    for (const auto &inst : *block) {
-      goto_sets += inst.GetOpcode() ==
-                   ShaderRecompiler::IR::ValueOpcode::SetGotoVariable;
-      goto_gets += inst.GetOpcode() ==
-                   ShaderRecompiler::IR::ValueOpcode::GetGotoVariable;
-    }
-  }
-  Check(goto_sets == 3u && goto_gets == 1u,
-        "shared-arm route was not represented by typed goto pseudo-ops");
-  ShaderRecompiler::IR::RewriteToSsa(value_ir.blocks);
-  ShaderRecompiler::IR::RemoveIdentities(value_ir.blocks);
-  ShaderRecompiler::IR::EliminateDeadCode(value_ir.blocks);
-  for (const auto *block : value_ir.blocks) {
-    for (const auto &inst : *block) {
-      Check(inst.GetOpcode() !=
-                    ShaderRecompiler::IR::ValueOpcode::GetGotoVariable &&
-                inst.GetOpcode() !=
-                    ShaderRecompiler::IR::ValueOpcode::SetGotoVariable,
-            "typed goto pseudo-op survived SSA rewriting");
-    }
-  }
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -7877,13 +7844,65 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   Check(!result.program.dispatcher_fallback &&
             Common::ContainsStr(result.ir_dump, "mode=structured"),
         "EXEC/SCC shared-arm epilogue did not stay structured");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 3u,
+  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 2u,
         "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
   Check(Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
                              "OpGroupNonUniformBallot"),
         "scalar mask SCC did not reduce the complete wave mask");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestSharedReturnPreservesDescriptorDominance() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x02, 32, 14), (125u << 25u) | 0x60u,
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 10), // first early return
+      EncodeSmem0(0x02, 32, 14), (125u << 25u) | 0x50u,
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 6), // second early return after descriptor overwrite
+      EncodeSmem0(0x08, 56, 16), 125u << 25u,
+      EncodeVop1(0x01, 0, 56),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+      EncodeSopp(0x01), // shared return epilogue
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+  const auto *overwrite = graph.FindBlockByPc(0x10u);
+  const auto *body = graph.FindBlockByPc(0x20u);
+  Check(graph.blocks.size() == 5u && overwrite != nullptr && body != nullptr &&
+            graph.Dominates(overwrite->id, body->id) &&
+            std::ranges::count_if(graph.blocks, [](const auto &block) {
+              return block.terminator.kind ==
+                     ShaderRecompiler::CFG::TerminatorKind::Return;
+            }) == 2 &&
+            CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+                original_coverage,
+        "shared return routing lost the live descriptor's dominance");
+
+  std::array<uint32_t, 28> table{};
+  table[0x50u / 4u] = 0x2000u;
+  table[0x50u / 4u + 2u] = 4u;
+  table[0x60u / 4u] = 0x3000u;
+  table[0x60u / 4u + 2u] = 4u;
+  std::array<uint32_t, 32> user_data{};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  user_data[28] = static_cast<uint32_t>(address);
+  user_data[29] = static_cast<uint32_t>(address >> 32u);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data = user_data;
+  auto result = RecompileForTest(shader, options, ReadHostTestMemory);
+  Check(!result.program.dispatcher_fallback &&
+            result.resources.buffers.size() == 1u &&
+            result.resources.buffers[0].dwords[0] == 0x2000u,
+        "return-only descriptor reached the surviving buffer operation");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7942,7 +7961,7 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst() {
+void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // outer forward-skip condition
       EncodeSopp(0x04, 4),    // outer -> shared or nested condition
@@ -7979,15 +7998,8 @@ void TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst() {
       std::ranges::count_if(graph.blocks, [](const auto &block) {
         return block.terminator.goto_value >= 0;
       });
-  const bool has_early_route =
-      std::ranges::any_of(graph.blocks, [](const auto &block) {
-        return block.start_pc < 0x30u &&
-               (block.terminator.condition ==
-                    ShaderRecompiler::CFG::BranchCondition::GotoVariable ||
-                block.terminator.goto_value >= 0);
-      });
-  Check(route_selects == 1u && route_sets == 3u && !has_early_route,
-        "shared exits were routed before the innermost blocking construct");
+  Check(route_selects == 0u && route_sets == 0u,
+        "nested selections introduced routing state for a shared return");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8072,9 +8084,9 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
       EncodeSopc(0x06, 3, 3), // block 3
       EncodeSopp(0x04, 2),    // block 3 -> 5 or 4
       EncodeSMovB32(4, 129),  // block 4
-      0xbf810000u,            // block 4 -> 6
+      0xbf810000u,            // block 4 returns
       EncodeSMovB32(5, 129),  // block 5
-      0xbf810000u,            // block 5 -> 6
+      0xbf810000u,            // block 5 returns
   };
 
   ShaderRecompiler::Decoder::Program decoded;
@@ -8082,7 +8094,7 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   Check(
-      graph.blocks.size() == 7u &&
+      graph.blocks.size() == 6u &&
           graph.blocks[0].successors == std::vector<uint32_t>({1, 2}) &&
           graph.blocks[0].terminator.true_block == 2u &&
           graph.blocks[0].terminator.false_block == 1u &&
@@ -8095,8 +8107,12 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
           graph.blocks[3].successors == std::vector<uint32_t>({4, 5}) &&
           graph.blocks[3].terminator.true_block == 5u &&
           graph.blocks[3].terminator.false_block == 4u &&
-          graph.blocks[4].successors == std::vector<uint32_t>({6}) &&
-          graph.blocks[5].successors == std::vector<uint32_t>({6}),
+          graph.blocks[4].successors.empty() &&
+          graph.blocks[5].successors.empty() &&
+          graph.blocks[4].terminator.kind ==
+              ShaderRecompiler::CFG::TerminatorKind::Return &&
+          graph.blocks[5].terminator.kind ==
+              ShaderRecompiler::CFG::TerminatorKind::Return,
       "overlapping early-exit fixture does not match the observed shader CFG");
   const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
@@ -11916,8 +11932,9 @@ int main() {
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
+  TestSharedReturnPreservesDescriptorDominance();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
-  TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst();
+  TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();

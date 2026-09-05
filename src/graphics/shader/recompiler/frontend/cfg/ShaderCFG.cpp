@@ -1160,9 +1160,16 @@ bool HasLinearPathToTerminal(const Graph& graph, uint32_t start) {
 bool IsEnclosingLinearExit(const Graph& graph, uint32_t header, uint32_t block_id) {
 	// AGC commonly lowers nested early returns through a terminal epilogue shared with an
 	// enclosing conditional. Such a path is an exit boundary, not part of the inner selection.
+	if (!HasLinearPathToTerminal(graph, block_id)) {
+		return false;
+	}
 	const auto* block = graph.FindBlock(block_id);
-	if (block == nullptr || graph.Dominates(header, block_id) ||
-	    !HasLinearPathToTerminal(graph, block_id) || block->predecessors.empty()) {
+	while (block != nullptr && graph.Dominates(header, block->id) &&
+	       block->successors.size() == 1u) {
+		block = graph.FindBlock(block->successors.front());
+	}
+	if (block == nullptr || graph.Dominates(header, block->id) ||
+	    block->predecessors.empty()) {
 		return false;
 	}
 	return std::ranges::all_of(block->predecessors, [&](uint32_t predecessor) {
@@ -1199,13 +1206,33 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 		const auto* global_block = graph.FindBlock(global_merge);
 		const auto  true_target  = block.terminator.true_block;
 		const auto  false_target = block.terminator.false_block;
-		if (global_block != nullptr && global_block->successors.empty()) {
+		if (global_block == nullptr || global_block->successors.empty()) {
 			const bool false_reaches_true =
 			    CanReachBefore(graph, false_target, true_target, global_merge);
 			const bool true_reaches_false =
 			    CanReachBefore(graph, true_target, false_target, global_merge);
 			if (false_reaches_true != true_reaches_false) {
 				return false_reaches_true ? true_target : false_target;
+			}
+			if (global_merge == UINT32_MAX) {
+				// An enclosing selection's shared return needs its own inner merge
+				// gateway; the other arm can return directly without joining live state.
+				if (IsEnclosingLinearExit(graph, block.id, true_target)) {
+					return true_target;
+				}
+				if (IsEnclosingLinearExit(graph, block.id, false_target)) {
+					return false_target;
+				}
+				// A return can leave a selection without reaching its merge. Keep the
+				// continuing arm as the merge instead of joining live state with a return.
+				if (graph.Dominates(block.id, false_target) &&
+				    HasLinearPathToTerminal(graph, true_target)) {
+					return false_target;
+				}
+				if (graph.Dominates(block.id, true_target) &&
+				    HasLinearPathToTerminal(graph, false_target)) {
+					return true_target;
+				}
 			}
 		}
 		return global_merge;
@@ -1755,8 +1782,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 			}
 			const auto first_arm = std::min(shared, other);
 			if (first_arm >= original_block_count || outer_id >= inner_id ||
-			    inner_id >= first_arm ||
-			    graph.FindNearestCommonPostDominator(shared, other) == UINT32_MAX) {
+			    inner_id >= first_arm) {
 				continue;
 			}
 
@@ -1819,8 +1845,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 			const auto first_arm = std::min(continuation, other);
 			if (outer_predecessors.empty() || inner_predecessors.empty() ||
 			    external_predecessor || first_arm >= original_block_count ||
-			    outer_id >= inner_id || inner_id >= first_arm ||
-			    graph.FindNearestCommonPostDominator(continuation, other) == UINT32_MAX) {
+			    outer_id >= inner_id || inner_id >= first_arm) {
 				continue;
 			}
 
@@ -1999,9 +2024,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto& last    = program.instructions[block.inst_end - 1u];
 		const auto  next_pc = InstructionEndPc(last);
 		if (last.opcode == Opcode::S_ENDPGM) {
-			block.terminator.kind       = TerminatorKind::Branch;
-			block.terminator.condition  = BranchCondition::Always;
-			block.terminator.true_block = pc_to_block.at(end_pc);
+			block.terminator.kind = TerminatorKind::Return;
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {

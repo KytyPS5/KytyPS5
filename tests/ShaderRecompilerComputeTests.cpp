@@ -17057,6 +17057,51 @@ TestCase SimpleLoop() {
            O::S_BRANCH, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase SharedReturnKeepsSelectedValues() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 5, 4),
+      EncodeVop2(0x1a, 5, InlineU32(6), 5),
+      EncodeVop2(0x25, 5, Vgpr(0), 5),
+      EncodeSMovB32(8, InlineU32(10)),
+      EncodeSopc(0x06, 4, InlineU32(0)),
+      0,
+      EncodeSMovB32(8, InlineU32(20)),
+      EncodeSopc(0x06, 4, InlineU32(1)),
+      0,
+      EncodeSMovB32(8, InlineU32(30)),
+  };
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 5, 0);
+  AppendEnd(&code);
+  const auto shared_return = static_cast<u32>(code.size());
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 5, 0);
+  AppendEnd(&code);
+  code[5] = EncodeSopp(0x05, shared_return - 6u);
+  code[8] = EncodeSopp(0x05, shared_return - 9u);
+
+  TestCase test;
+  test.name = "SharedReturnKeepsSelectedValues";
+  test.code = code;
+  for (u32 group = 0; group < 3; group++) {
+    test.expected.insert(test.expected.end(), 64, (group + 1u) * 10u);
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpSelectionMerge"};
+  test.forbidden_spirv = {"OpSwitch"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  test.dispatch_x = 3;
+  return test;
+}
+
 TestCase BranchVccnzUsesWaveMask() {
   using O = ShaderOpcode;
 
@@ -21983,6 +22028,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
+  AddCase(SharedReturnKeepsSelectedValues);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
   AddCase(ScalarMemoryLoadVariants);
@@ -26322,6 +26368,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
+    RunCase(&vulkan, SharedReturnKeepsSelectedValues());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {

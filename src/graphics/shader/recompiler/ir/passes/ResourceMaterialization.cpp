@@ -940,17 +940,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	next_snapshot.images.reserve(image_count);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
 	next_specialization.images.reserve(image_count);
-	next_specialization.sampler_depth_compare_funcs.reserve(program.info.samplers.size());
-	// Extract depth_compare_func from sampler descriptors for manual compare emulation
-	for (const auto& sampler_descriptor: next_snapshot.samplers) {
-		if (sampler_descriptor.dword_count >= 1) {
-			// DepthCompareFunc is stored in bits 12-14 of dword 0 (from shaderBindings.h)
-			next_specialization.sampler_depth_compare_funcs.push_back(
-			    (sampler_descriptor.dwords[0] >> 12u) & 0x7u);
-		} else {
-			next_specialization.sampler_depth_compare_funcs.push_back(0);
-		}
-	}
 	for (const auto& image: program.info.images) {
 		next_specialization.images.push_back({
 		    .numeric_class              = image.numeric_class,
@@ -1111,6 +1100,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			if (!IsDepthComparisonSupported(surface_format.vk_format)) {
 				// Format doesn't support native depth-compare, enable manual emulation
 				image.needs_manual_depth_compare = true;
+				image.shader_swizzle             = DescriptorImageSwizzle(descriptor);
 			}
 		}
 		if (storage) {
@@ -1194,6 +1184,17 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				                program.info.images[root_index].first_use_pc));
 			}
 		}
+	}
+	// Manual comparison is part of the shader permutation. Extract the final dense sampler
+	// table after indirect candidates have been appended so every cloned sampler keeps its
+	// own comparison function.
+	next_specialization.sampler_depth_compare_funcs.clear();
+	next_specialization.sampler_depth_compare_funcs.reserve(next_snapshot.samplers.size());
+	for (const auto& sampler_descriptor: next_snapshot.samplers) {
+		next_specialization.sampler_depth_compare_funcs.push_back(
+		    sampler_descriptor.dword_count >= 1
+		        ? static_cast<uint8_t>((sampler_descriptor.dwords[0] >> 12u) & 0x7u)
+		        : 0u);
 	}
 	ShaderInfo sampler_info = program.info;
 	sampler_info.samplers.clear();
@@ -1462,6 +1463,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		sampler_info.samplers.push_back(program.info.samplers[origin]);
 	}
 	sampler_info.sampled_pairs = specialization.sampled_pairs;
+	EXIT_IF(specialization.sampler_depth_compare_funcs.size() != sampler_info.samplers.size());
+	for (uint32_t index = 0; index < sampler_info.samplers.size(); index++) {
+		sampler_info.samplers[index].depth_compare_func =
+		    specialization.sampler_depth_compare_funcs[index];
+	}
 	SamplerPlan sampler_plan;
 	EXIT_IF(!BuildSamplerPlan(sampler_info, images, sampler_plan));
 	auto samplers      = sampler_info.samplers;
@@ -1497,14 +1503,6 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 		}
 	}
-
-	// Copy depth_compare_func from specialization to samplers
-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
-		if (index < specialization.sampler_depth_compare_funcs.size()) {
-			samplers[index].depth_compare_func = specialization.sampler_depth_compare_funcs[index];
-		}
-	}
-	// Split samplers (if any) inherit from their original, which we just set above
 
 	auto memory_info = program.memory_info;
 	std::vector<uint8_t> remapped_memory(memory_info.size());

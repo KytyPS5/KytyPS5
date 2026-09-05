@@ -69,6 +69,17 @@ uint32_t EmitFloatCompareOp(EmitterState& state, uint32_t lhs, uint32_t rhs, uin
 	}
 }
 
+uint8_t SamplerDepthCompareFunc(const EmitterState& state, uint32_t sampler_index) {
+	if (sampler_index < state.program.info.samplers.size()) {
+		const auto func = state.program.info.samplers[sampler_index].depth_compare_func;
+		if (func != 0) return func;
+	}
+	if (sampler_index < state.specialization.sampler_depth_compare_funcs.size()) {
+		return state.specialization.sampler_depth_compare_funcs[sampler_index];
+	}
+	return 0;
+}
+
 bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 	return (mem.image_sample_flags & flag) != 0u;
 }
@@ -759,7 +770,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				}
 				
 				// Get the compare-op from the sampler descriptor
-				const auto& sampler = state.program.info.samplers[mem.sampler];
+				const auto compare_func = SamplerDepthCompareFunc(state, mem.sampler);
 				
 				// For gather with manual compare, we need to compare each component
 				uint32_t compared_components[4];
@@ -767,7 +778,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					const auto comp_value = ctx.state.builder.AllocateId();
 					ctx.state.builder.AddFunction({OpCompositeExtract, TypeF32(ctx.state), comp_value, sample, i});
 					
-					const auto compare_result = EmitFloatCompareOp(ctx.state, comp_value, dref_value, sampler.depth_compare_func);
+					const auto compare_result = EmitFloatCompareOp(ctx.state, dref_value, comp_value, compare_func);
 					
 					const auto float_result = ctx.state.builder.AllocateId();
 					ctx.state.builder.AddFunction({OpSelect, TypeF32(ctx.state), float_result, compare_result, 
@@ -893,9 +904,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				ctx.state.builder.AddFunction(
 				    {OpCompositeExtract, TypeF32(ctx.state), r_component, sample, 0});
 
-				const auto& sampler = state.program.info.samplers[mem.sampler];
-				const auto  compare_result =
-				    EmitFloatCompareOp(ctx.state, r_component, dref_value, sampler.depth_compare_func);
+				const auto compare_func = SamplerDepthCompareFunc(state, mem.sampler);
+				const auto compare_result =
+				    EmitFloatCompareOp(ctx.state, dref_value, r_component, compare_func);
 
 				const auto float_result = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(
@@ -1010,9 +1021,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.state.builder.AddFunction(
 			    {OpCompositeExtract, TypeF32(ctx.state), r_component, result, 0});
 
-			const auto& sampler = state.program.info.samplers[mem.sampler];
-			const auto  compare_result =
-			    EmitFloatCompareOp(ctx.state, r_component, dref_value, sampler.depth_compare_func);
+			const auto compare_func = SamplerDepthCompareFunc(state, mem.sampler);
+			const auto compare_result =
+			    EmitFloatCompareOp(ctx.state, dref_value, r_component, compare_func);
 
 			const auto float_result = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(

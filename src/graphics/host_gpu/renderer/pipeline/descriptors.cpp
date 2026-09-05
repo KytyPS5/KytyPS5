@@ -783,9 +783,13 @@ NormalizeTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
 	const auto storage_view_format = storage && (format == Prospero::BufferFormat::k32SInt || resource.atomic)
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
+	const auto unorm_compare_format = !storage && resource.depth_compare &&
+	                                  !IsDepthComparisonSupported(pixel_format)
+	                                      ? SrgbToUnorm(pixel_format)
+	                                      : pixel_format;
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
-	                                     : pixel_format;
+	                                     : unorm_compare_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
@@ -1142,22 +1146,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
-		if (resource.depth_compare) {
-			EXIT("color depth comparison requires a supported depth image representation "
-			     "and enabled VK_EXT_depth_range_unrestricted: extension=%d eligible=%d "
-			     "source=%u class=%u numeric=%u dimension=%u mip=%u read=%d write=%d atomic=%d "
-			     "addr=0x%016" PRIx64 " format=%u type=%u tile=%u "
-			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-			     m_context.GetGraphics().depth_range_unrestricted_enabled, promote_comparison,
-			     resource.source, static_cast<uint32_t>(resource.resource_class),
-			     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
-			     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
-			     descriptor.Base40(), static_cast<uint32_t>(format), static_cast<uint32_t>(type),
-			     static_cast<uint32_t>(descriptor.TileMode()), descriptor.fields[0], descriptor.fields[1],
-			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-			     descriptor.fields[6], descriptor.fields[7]);
-		}
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		(void)SelectSampledColorView(image->info.pixel_format, view_format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};

@@ -194,6 +194,8 @@ private:
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable, bool log_pipeline_phase,
 	                         bool set_bind_debug, bool set_auto_debug);
+	[[nodiscard]] static vk::Extent2D AttachmentViewExtent(const Image&         image,
+	                                                       const ImageViewInfo& view);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth);
 	[[nodiscard]] bool        ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,

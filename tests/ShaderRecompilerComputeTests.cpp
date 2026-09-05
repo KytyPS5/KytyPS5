@@ -11660,13 +11660,19 @@ private:
     available_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
     available_features13.pNext = &available_features12;
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR available_derivatives{};
+    available_derivatives.pNext = &available_features13;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_features13;
+    available_features2.pNext = &available_derivatives;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features.shaderImageGatherExtended == true &&
+                available_derivatives.computeDerivativeGroupQuads == true,
+            "image gather or compute derivative quads are not supported");
     Require("VulkanHarness", "dispatch",
             available_features12.timelineSemaphore == true,
             "timeline semaphores are not supported");
@@ -11711,14 +11717,19 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
-    device_info.pNext = &device_features13;
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
+    derivatives.pNext = &device_features13;
+    derivatives.computeDerivativeGroupQuads = true;
+    device_info.pNext = &derivatives;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
+    device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME};
     device_info.enabledExtensionCount = std::size(device_extensions);
     device_info.ppEnabledExtensionNames = device_extensions;

@@ -127,10 +127,13 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    z.stencil_info.texture_compatibility == Prospero::TextureCompatibleStencil::kDisable &&
 	    !z.stencil_info.expclear_enabled && !z.stencil_info.partially_resident &&
 	    z.depth_view.slice_start == 0 && z.depth_view.slice_max == 0 &&
-	    z.depth_view.current_mip_level == 0 && !z.depth_view.depth_write_disable &&
-	    !z.depth_view.stencil_write_disable && z.z_read_base_addr == 0 && z.z_write_base_addr == 0 &&
-	    z.stencil_read_base_addr == 0 && z.stencil_write_base_addr == 0 &&
-	    z.htile_data_base_addr == 0 &&
+	    z.depth_view.current_mip_level == 0 &&
+	    // DB_DEPTH_VIEW's write-disable bits describe how an attachment is used, not whether one
+	    // is bound, and they survive an unbind like the rest of the register. Requiring them to be
+	    // clear here turns leftover state into a fatal "unsupported depth register state" on the
+	    // first draw that has no depth attachment at all.
+	    z.z_read_base_addr == 0 && z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
+	    z.stencil_write_base_addr == 0 && z.htile_data_base_addr == 0 &&
 	    // DB_DEPTH_SIZE_XY is independent state and may remain programmed after the attachment
 	    // formats and addresses are unbound. A zero encoding is the valid 1x1 value, so its
 	    // presence alone must not manufacture a depth attachment.

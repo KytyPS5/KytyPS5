@@ -439,7 +439,6 @@ void CreatePipelineInternal(
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 
 	vk::ShaderModuleCreateInfo create_info {};
-	create_info.sType = vk::StructureType::eShaderModuleCreateInfo;
 	vk::Result result {};
 	if (rect_list) {
 		const auto shaders =
@@ -469,32 +468,21 @@ void CreatePipelineInternal(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
 	vk::PipelineShaderStageCreateInfo vert_shader_stage_info {};
-
-	vert_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
-	vert_shader_stage_info.pNext               = nullptr;
-	vert_shader_stage_info.flags               = {};
-	vert_shader_stage_info.stage               = vertex_stage;
-	vert_shader_stage_info.module              = vertex_module;
-	vert_shader_stage_info.pName               = "main";
-	vert_shader_stage_info.pSpecializationInfo = nullptr;
+	vert_shader_stage_info.stage  = vertex_stage;
+	vert_shader_stage_info.module = vertex_module;
+	vert_shader_stage_info.pName  = "main";
 
 	vk::PipelineShaderStageCreateInfo frag_shader_stage_info {};
-	frag_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
-	frag_shader_stage_info.pNext               = nullptr;
-	frag_shader_stage_info.flags               = {};
-	frag_shader_stage_info.stage               = vk::ShaderStageFlagBits::eFragment;
-	frag_shader_stage_info.module              = pixel_module;
-	frag_shader_stage_info.pName               = "main";
-	frag_shader_stage_info.pSpecializationInfo = nullptr;
+	frag_shader_stage_info.stage  = vk::ShaderStageFlagBits::eFragment;
+	frag_shader_stage_info.module = pixel_module;
+	frag_shader_stage_info.pName  = "main";
 
 	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
-	tess_control_shader_stage_info.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
 	tess_control_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationControl;
 	tess_control_shader_stage_info.module = tess_control_shader_module;
 	tess_control_shader_stage_info.pName  = "main";
 
 	vk::PipelineShaderStageCreateInfo tess_eval_shader_stage_info {};
-	tess_eval_shader_stage_info.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
 	tess_eval_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationEvaluation;
 	tess_eval_shader_stage_info.module = tess_eval_shader_module;
 	tess_eval_shader_stage_info.pName  = "main";
@@ -639,35 +627,23 @@ void CreatePipelineInternal(
 	}
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};
-	vertex_input_info.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
-	vertex_input_info.pNext = nullptr;
-	vertex_input_info.flags = {};
 	vertex_input_info.vertexBindingDescriptionCount   = vertex_input.binding_count;
 	vertex_input_info.pVertexBindingDescriptions      = input_desc;
 	vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
-	input_assembly.sType    = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
-	input_assembly.pNext    = nullptr;
-	input_assembly.flags    = {};
 	input_assembly.topology = static_params.topology;
 	input_assembly.primitiveRestartEnable =
 	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
-	depth_clip_control.sType = vk::StructureType::ePipelineViewportDepthClipControlCreateInfoEXT;
-	depth_clip_control.pNext = nullptr;
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
 
 	vk::PipelineViewportStateCreateInfo viewport_state {};
-	viewport_state.sType         = vk::StructureType::ePipelineViewportStateCreateInfo;
 	viewport_state.pNext         = &depth_clip_control;
-	viewport_state.flags         = {};
 	viewport_state.viewportCount = 1;
-	viewport_state.pViewports    = nullptr;
 	viewport_state.scissorCount  = 1;
-	viewport_state.pScissors     = nullptr;
 
 	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
 	if (static_params.cull_back) {
@@ -681,65 +657,28 @@ void CreatePipelineInternal(
 	    (static_params.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
 
 	vk::PipelineRasterizationDepthClipStateCreateInfoEXT clip_ext {};
-	clip_ext.sType           = vk::StructureType::ePipelineRasterizationDepthClipStateCreateInfoEXT;
-	clip_ext.pNext           = nullptr;
-	clip_ext.flags           = {};
 	clip_ext.depthClipEnable = static_params.depth_clip_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineRasterizationStateCreateInfo rasterizer {};
-	rasterizer.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
-#if defined(__APPLE__)
-	rasterizer.pNext = nullptr;
-#else
+#if !defined(__APPLE__)
 	rasterizer.pNext = &clip_ext;
 #endif
-	rasterizer.flags                   = {};
-	rasterizer.depthClampEnable        = VK_FALSE;
-	rasterizer.rasterizerDiscardEnable = VK_FALSE;
-	rasterizer.polygonMode             = vk::PolygonMode::eFill;
-	rasterizer.cullMode                = cull_mode;
-	rasterizer.frontFace               = front_face;
-	rasterizer.depthBiasEnable         = VK_FALSE;
-	rasterizer.depthBiasConstantFactor = 0.0f;
-	rasterizer.depthBiasClamp          = 0.0f;
-	rasterizer.depthBiasSlopeFactor    = 0.0f;
-	rasterizer.lineWidth               = 1.0f;
+	rasterizer.cullMode  = cull_mode;
+	rasterizer.frontFace = front_face;
+	rasterizer.lineWidth = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
-	multisampling.sType                 = vk::StructureType::ePipelineMultisampleStateCreateInfo;
-	multisampling.pNext                 = nullptr;
-	multisampling.flags                 = {};
-	multisampling.sampleShadingEnable   = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
-	multisampling.rasterizationSamples  = vulkan_sample_count(static_params.samples);
-	multisampling.minSampleShading      = 1.0f;
-	multisampling.pSampleMask           = nullptr;
-	multisampling.alphaToCoverageEnable = VK_FALSE;
-	multisampling.alphaToOneEnable      = VK_FALSE;
+	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
+	multisampling.rasterizationSamples = vulkan_sample_count(static_params.samples);
+	multisampling.minSampleShading     = 1.0f;
 
 	vk::PipelineColorBlendAttachmentState color_blend_attachment[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < static_params.color_count; i++) {
-		vk::ColorComponentFlags color_write_mask = {};
 		EXIT_NOT_IMPLEMENTED((static_params.color_mask[i] & ~0x0fu) != 0);
-		if ((static_params.color_mask[i] & 0x1u) != 0) {
-			color_write_mask |=
-			    static_cast<vk::ColorComponentFlags>(vk::ColorComponentFlagBits::eR);
-		}
-		if ((static_params.color_mask[i] & 0x2u) != 0) {
-			color_write_mask |=
-			    static_cast<vk::ColorComponentFlags>(vk::ColorComponentFlagBits::eG);
-		}
-		if ((static_params.color_mask[i] & 0x4u) != 0) {
-			color_write_mask |=
-			    static_cast<vk::ColorComponentFlags>(vk::ColorComponentFlagBits::eB);
-		}
-		if ((static_params.color_mask[i] & 0x8u) != 0) {
-			color_write_mask |=
-			    static_cast<vk::ColorComponentFlags>(vk::ColorComponentFlagBits::eA);
-		}
-
-		color_blend_attachment[i].colorWriteMask = color_write_mask;
+		color_blend_attachment[i].colorWriteMask =
+		    vk::ColorComponentFlags {static_params.color_mask[i]};
 		color_blend_attachment[i].blendEnable =
 		    (static_params.blend_enable[i] && !static_params.blend_bypass[i]) ? VK_TRUE : VK_FALSE;
 		color_blend_attachment[i].srcColorBlendFactor =
@@ -765,22 +704,15 @@ void CreatePipelineInternal(
 	}
 
 	vk::PipelineColorWriteCreateInfoEXT color_write {};
-	color_write.sType              = vk::StructureType::ePipelineColorWriteCreateInfoEXT;
-	color_write.pNext              = nullptr;
 	color_write.attachmentCount    = static_params.color_count;
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	color_blending.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
 	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
 	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if defined(__APPLE__)
-	color_blending.pNext = nullptr;
-#else
+#if !defined(__APPLE__)
 	color_blending.pNext = &color_write;
 #endif
-	color_blending.flags           = {};
-	color_blending.logicOpEnable   = VK_FALSE;
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = static_params.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
@@ -798,9 +730,6 @@ void CreatePipelineInternal(
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
-	pipeline_layout_info.pNext                  = nullptr;
-	pipeline_layout_info.flags                  = {};
 	pipeline_layout_info.setLayoutCount         = 1;
 	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
 	pipeline_layout_info.pushConstantRangeCount = 1;
@@ -824,9 +753,6 @@ void CreatePipelineInternal(
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	depth_stencil_info.sType            = vk::StructureType::ePipelineDepthStencilStateCreateInfo;
-	depth_stencil_info.pNext            = nullptr;
-	depth_stencil_info.flags            = {};
 	depth_stencil_info.depthBoundsTestEnable =
 #if defined(__APPLE__)
 	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
@@ -872,41 +798,32 @@ void CreatePipelineInternal(
 #endif
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};
-	dynamic_state.sType             = vk::StructureType::ePipelineDynamicStateCreateInfo;
-	dynamic_state.pNext             = nullptr;
-	dynamic_state.flags             = {};
 	dynamic_state.dynamicStateCount = dynamic_states_count;
 	dynamic_state.pDynamicStates    = dynamic_states;
 
 	vk::GraphicsPipelineCreateInfo  pipeline_info {};
 	vk::PipelineRenderingCreateInfo rendering_info {};
-	rendering_info.sType                   = vk::StructureType::ePipelineRenderingCreateInfo;
 	rendering_info.colorAttachmentCount    = rendering.color_count;
 	rendering_info.pColorAttachmentFormats = rendering.color_formats.data();
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
-	pipeline_info.sType                    = vk::StructureType::eGraphicsPipelineCreateInfo;
 	pipeline_info.pNext                    = &rendering_info;
-	pipeline_info.flags                    = {};
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
 	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
-	tessellation_state.sType              = vk::StructureType::ePipelineTessellationStateCreateInfo;
 	tessellation_state.patchControlPoints = 3;
 	pipeline_info.pTessellationState      = (rect_list ? &tessellation_state : nullptr);
 	pipeline_info.pViewportState          = &viewport_state;
 	pipeline_info.pRasterizationState     = &rasterizer;
 	pipeline_info.pMultisampleState       = &multisampling;
-	pipeline_info.pDepthStencilState = (static_params.with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState   = &color_blending;
-	pipeline_info.pDynamicState      = &dynamic_state;
-	pipeline_info.layout             = pipeline.pipeline_layout;
-	pipeline_info.renderPass         = nullptr;
-	pipeline_info.subpass            = 0;
-	pipeline_info.basePipelineHandle = nullptr;
-	pipeline_info.basePipelineIndex  = -1;
+	pipeline_info.pDepthStencilState      =
+	    (static_params.with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState        = &color_blending;
+	pipeline_info.pDynamicState           = &dynamic_state;
+	pipeline_info.layout                  = pipeline.pipeline_layout;
+	pipeline_info.basePipelineIndex       = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -945,19 +862,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
-	comp_shader_stage_info.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
-	comp_shader_stage_info.pNext               = nullptr;
-	comp_shader_stage_info.flags               = {};
-	comp_shader_stage_info.stage               = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module              = compute_module;
-	comp_shader_stage_info.pName               = "main";
-	comp_shader_stage_info.pSpecializationInfo = nullptr;
+	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
+	comp_shader_stage_info.module = compute_module;
+	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.sType =
-		    vk::StructureType::ePipelineShaderStageRequiredSubgroupSizeCreateInfo;
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
@@ -970,9 +881,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
-	pipeline_layout_info.pNext                  = nullptr;
-	pipeline_layout_info.flags                  = {};
 	pipeline_layout_info.setLayoutCount         = 1;
 	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
 	pipeline_layout_info.pushConstantRangeCount = 1;
@@ -991,13 +899,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::ComputePipelineCreateInfo info {};
-	info.sType              = vk::StructureType::eComputePipelineCreateInfo;
-	info.pNext              = nullptr;
-	info.flags              = {};
-	info.stage              = comp_shader_stage_info;
-	info.layout             = pipeline.pipeline_layout;
-	info.basePipelineHandle = nullptr;
-	info.basePipelineIndex  = -1;
+	info.stage             = comp_shader_stage_info;
+	info.layout            = pipeline.pipeline_layout;
+	info.basePipelineIndex = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 

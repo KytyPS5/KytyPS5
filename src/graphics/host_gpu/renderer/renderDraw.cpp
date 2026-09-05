@@ -999,16 +999,6 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
 }
 
-static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
-                                                  const DrawCallInfo&          draw,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
-	EXIT_IF(draw.name == nullptr);
-	(void)submit_id;
-
-	LogDrawPhase(draw.name, "PrepareVertexBuffers");
-	return AcquireVertexBuffers(buffer, vs_input_info);
-}
-
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
 	PreparedIndexBuffer prepared;
@@ -1164,7 +1154,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
-		vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
+		LogDrawPhase(draw.name, "PrepareVertexBuffers");
+		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	state.rendering =

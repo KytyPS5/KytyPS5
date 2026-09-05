@@ -633,9 +633,6 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	PipelineStaticParameters static_params {};
-	GraphicsPipeline         p {};
-	p.ps_shader_id = ps_id;
-	p.vs_shader_id = vs_id;
 
 	static_params.color_count = color_count;
 	PipelineRenderingState rendering {};
@@ -723,8 +720,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	}
 	GraphicsPipelineKey key {};
 	key.rendering     = rendering;
-	key.vs_shader_id  = p.vs_shader_id;
-	key.ps_shader_id  = p.ps_shader_id;
+	key.vs_shader_id  = vs_id;
+	key.ps_shader_id  = ps_id;
 	key.static_params = static_params;
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
@@ -767,7 +764,9 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
-	auto cached = std::make_unique<GraphicsPipeline>(p);
+	auto cached         = std::make_unique<GraphicsPipeline>();
+	cached->ps_shader_id = ps_id;
+	cached->vs_shader_id = vs_id;
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program.module, ps_input_info, pixel_program.module,
@@ -792,11 +791,8 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
 
 	Common::LockGuard lock(m_mutex);
 
-	ComputePipeline p {};
-	p.cs_shader_id = compute_program.id;
-
 	ComputePipelineKey key {};
-	key.cs_shader_id = p.cs_shader_id;
+	key.cs_shader_id = compute_program.id;
 
 	if (auto iter = m_compute_pipelines.find(key); iter != m_compute_pipelines.end()) {
 		return *iter->second;
@@ -806,7 +802,8 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached = std::make_unique<ComputePipeline>(p);
+	auto cached         = std::make_unique<ComputePipeline>();
+	cached->cs_shader_id = compute_program.id;
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

@@ -76,10 +76,14 @@ uint32_t NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& bi
 }
 
 vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t element) {
-	const auto view =
-	    texture.mip_views.empty()
-	        ? (element == 0u ? texture.image_view : vk::ImageView {})
-	        : (element < texture.mip_views.size() ? texture.mip_views[element] : vk::ImageView {});
+	vk::ImageView view = nullptr;
+	if (texture.mip_views.empty()) {
+		if (element == 0u) {
+			view = texture.image_view;
+		}
+	} else if (element < texture.mip_views.size()) {
+		view = texture.mip_views[element];
+	}
 	EXIT_IF(!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
 	return {nullptr, view, texture.layout};
 }
@@ -171,11 +175,16 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
+	const char* access = "Read";
+	if (resource.written && resource.read) {
+		access = "ReadWrite";
+	} else if (resource.written) {
+		access = "Write";
+	}
 	SetVulkanObjectNameF(
 	    graphics.device, result.buffer,
 	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
-	    ShaderStageResourceName(stage), slot, address, size,
-	    resource.written ? (resource.read ? "ReadWrite" : "Write") : "Read", resource.formatted);
+	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
 	return result;
 }
 

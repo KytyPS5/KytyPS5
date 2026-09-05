@@ -74,6 +74,15 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
+	using BufferMap = std::map<uint64_t, BufferId>;
+	struct OverlapResult {
+		BufferMap::iterator first;
+		BufferMap::iterator last;
+		uint64_t            begin;
+		uint64_t            end;
+		bool                has_stream_leap;
+	};
+
 	struct DownloadCopy;
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
@@ -84,6 +93,8 @@ private:
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
+	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
+	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
@@ -106,7 +117,7 @@ private:
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	std::map<uint64_t, BufferId>                      m_buffers;
+	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;

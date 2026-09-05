@@ -311,38 +311,81 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	auto& command = m_scheduler.Current();
-	EXIT_IF(command.IsInvalid());
-	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	auto       first = m_buffers.lower_bound(begin);
-	if (first != m_buffers.begin()) {
-		const auto previous = std::prev(first);
-		if (const auto& buffer = m_slot_buffers[previous->second];
-		    buffer.CpuAddress() + buffer.Size() > begin) {
-			first = previous;
+BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
+	static constexpr int      StreamLeapThreshold = 16;
+	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
+
+	auto       begin      = vaddr;
+	auto       end        = vaddr + size;
+	const auto find_first = [&](uint64_t address) {
+		auto first = m_buffers.lower_bound(address);
+		if (first != m_buffers.begin()) {
+			const auto  previous = std::prev(first);
+			const auto& buffer   = m_slot_buffers[previous->second];
+			if (buffer.CpuAddress() + buffer.Size() > address) {
+				first = previous;
+			}
+		}
+		return first;
+	};
+	auto first           = find_first(begin);
+	auto last            = first;
+	int  stream_score    = 0;
+	bool has_stream_leap = false;
+	for (; last != m_buffers.end() && last->first < end; ++last) {
+		const auto& buffer        = m_slot_buffers[last->second];
+		const auto  buffer_begin  = buffer.CpuAddress();
+		const auto  buffer_end    = buffer_begin + buffer.Size();
+		const bool  expands_left  = buffer_begin < begin;
+		const bool  expands_right = buffer_end > end;
+		begin                     = std::min(begin, buffer_begin);
+		end                       = std::max(end, buffer_end);
+		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
+			has_stream_leap = true;
+			if (expands_right) {
+				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
+			}
+			if (expands_left) {
+				const auto minimum = CACHING_PAGESIZE * 2;
+				if (begin > minimum) {
+					begin -= std::min(StreamLeapSize, begin - minimum);
+				}
+				first = find_first(begin);
+				begin = std::min(begin, first->first);
+			}
 		}
 	}
-	auto last = first;
-	for (; last != m_buffers.end() && last->first < end; ++last) {
-		const auto& buffer = m_slot_buffers[last->second];
-		begin              = std::min(begin, buffer.CpuAddress());
-		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
+	return {first, last, begin, end, has_stream_leap};
+}
+
+void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
+	auto& new_buffer = m_slot_buffers[new_id];
+	auto& overlap    = m_slot_buffers[overlap_id];
+	if (accumulate_stream_score) {
+		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	DeleteBuffer(overlap_id);
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(m_scheduler.Current().IsInvalid());
+	const auto end = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	vaddr &= ~(CACHING_PAGESIZE - 1);
+	size               = end - vaddr;
+	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, end - begin);
-	auto&      buffer = m_slot_buffers[id];
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
-	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
-	for (auto overlap = first; overlap != last;) {
-		const auto current = overlap++;
-		const auto old_id  = current->second;
-		const auto& old    = m_slot_buffers[old_id];
-		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
-		DeleteBuffer(old_id);
+	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
+	                     overlap.end - overlap.begin);
+	for (auto it = overlap.first; it != overlap.last;) {
+		const auto old_id = (it++)->second;
+		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
 	return id;

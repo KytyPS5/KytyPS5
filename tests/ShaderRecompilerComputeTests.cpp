@@ -3310,6 +3310,35 @@ public:
                   resolved_right == resolved_left &&
                   resolved_left_offset != resolved_right_offset,
               "saved descriptor IDs did not resolve through the merged owner");
+
+      constexpr uint64_t stream_begin = base + 0x1800000;
+      constexpr uint64_t stream_page = BufferCache::CACHING_PAGESIZE;
+      constexpr uint64_t stream_leap = stream_page * 128;
+      const auto caught =
+          cache.FindBuffer(stream_begin - stream_leap / 2, stream_page);
+      const auto anchor = cache.FindBuffer(stream_begin, stream_page * 2);
+      cache.GetBuffer(anchor).IncreaseStreamScore(16);
+      const auto scored =
+          cache.FindBuffer(stream_begin + stream_page * 2 - 4, 8);
+      Require(name, "stream growth threshold",
+              cache.GetBuffer(scored).CpuAddress() == stream_begin &&
+                  cache.GetBuffer(scored).Size() == stream_page * 3 &&
+                  cache.GetBuffer(scored).StreamScore() == 17,
+              "buffer range grew before the shadPS4 stream threshold");
+      const auto grown =
+          cache.FindBuffer(stream_begin + stream_page * 3 - 4, 8);
+      const auto &grown_buffer = cache.GetBuffer(grown);
+      Require(name, "stream range leap",
+              grown_buffer.CpuAddress() == stream_begin - stream_leap &&
+                  grown_buffer.Size() == stream_leap + stream_page * 4 &&
+                  grown_buffer.StreamScore() == 0 &&
+                  cache.GetBuffer(caught).is_deleted &&
+                  cache.GetBuffer(scored).is_deleted &&
+                  BufferCacheTestAccess::PageOwner(
+                      cache, stream_begin - stream_leap / 2) == grown,
+              "buffer stream leap changed its direction, size, reset, or "
+              "overlap capture");
+
       resources.UnmapMemory(index_begin, index_span);
       resources.UnmapMemory(base + recycled_offset, index_page);
       Require(name, "invalidation retains owners",

@@ -53,6 +53,8 @@ public:
 		return address - m_cpu_address;
 	}
 	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
+	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
+	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Write(uint64_t offset, const void* source, uint64_t size);
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
@@ -68,8 +70,9 @@ public:
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
-	bool   is_deleted = false;
-	size_t lru_id     = 0;
+	bool   is_deleted   = false;
+	int    stream_score = 0;
+	size_t lru_id       = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

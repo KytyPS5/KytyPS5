@@ -3360,7 +3360,9 @@ public:
               resources.HandleFault(PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
-      uint64_t expected_packing_offset = 128;
+      // The widened window collects the two earlier writes and both
+      // fault-adjacent writes.
+      uint64_t expected_packing_offset = 4 * 64;
       uint64_t expected_packing_alignment = 1;
       if (!download.IsCoherent()) {
         Require(name, "fault-ring atom policy",
@@ -3377,20 +3379,86 @@ public:
                   packing_offset == expected_packing_offset,
               "adjacent fault downloads did not reserve an atom-safe stride");
       download.Commit();
+      uint32_t widened_first_backing = 0;
+      uint32_t widened_second_backing = 0;
       uint32_t ring_fault_first_backing = 0;
       uint32_t ring_fault_second_backing = 0;
+      std::memcpy(&widened_first_backing, memory + first_offset,
+                  sizeof(widened_first_backing));
+      std::memcpy(&widened_second_backing, memory + second_offset,
+                  sizeof(widened_second_backing));
       std::memcpy(&ring_fault_first_backing, memory + ring_fault_first_offset,
                   sizeof(ring_fault_first_backing));
       std::memcpy(&ring_fault_second_backing, memory + ring_fault_second_offset,
                   sizeof(ring_fault_second_backing));
       Require(name, "fault-ring wrapped contents",
-              ring_fault_first_backing == ring_fault_first_value &&
+              widened_first_backing == first_value &&
+                  widened_second_backing == second_value &&
+                  ring_fault_first_backing == ring_fault_first_value &&
                   ring_fault_second_backing == ring_fault_second_value &&
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   download.Handle() == fixed_download_handle &&
                   download.Size() == (32ull << 20),
               "wrapped fault batch published incorrect disjoint ranges");
+
+      constexpr uint64_t window_size = 512 * 1024;
+      constexpr uint64_t window_owner_offset = 0x240000;
+      constexpr uint64_t window_owner_size = 0xc0000;
+      constexpr uint64_t window_fault_offset = window_owner_offset + 0x100;
+      constexpr uint64_t window_inside_offset =
+          window_owner_offset + window_size - sizeof(uint32_t);
+      constexpr uint64_t window_outside_offset =
+          window_owner_offset + window_size;
+      constexpr uint32_t window_stale = 0x13579bdfu;
+      constexpr uint32_t window_value = 0x2468ace0u;
+      constexpr std::array window_offsets{
+          window_fault_offset, window_inside_offset, window_outside_offset};
+      static_assert((base + window_owner_offset) % window_size ==
+                    window_size / 2);
+      for (const auto offset : window_offsets) {
+        Libs::LibKernel::Memory::WriteBacking(base + offset, &window_stale,
+                                              sizeof(window_stale));
+      }
+      (void)cache.FindBuffer(base + window_owner_offset, window_owner_size);
+      for (const auto offset : window_offsets) {
+        MarkGpuWrite(base + offset, sizeof(window_value));
+        cache.FillBuffer(base + offset, sizeof(window_value), window_value,
+                         false);
+      }
+      cache.ReadMemory(base + window_fault_offset, sizeof(window_value));
+      uint32_t window_inside_backing = 0;
+      uint32_t window_outside_backing = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base + window_inside_offset,
+                                              &window_inside_backing,
+                                              sizeof(window_inside_backing));
+      Libs::LibKernel::Memory::TryReadBacking(base + window_outside_offset,
+                                              &window_outside_backing,
+                                              sizeof(window_outside_backing));
+      Require(name, "widened-window boundary",
+              window_inside_backing == window_value &&
+                  window_outside_backing == window_stale &&
+                  !cache.HasGpuDirtyBytes(base + window_inside_offset,
+                                          sizeof(window_value)) &&
+                  cache.HasGpuDirtyBytes(base + window_outside_offset,
+                                         sizeof(window_value)) &&
+                  !cache.IsRegionGpuModified(base + window_inside_offset,
+                                             sizeof(window_value)) &&
+                  cache.IsRegionGpuModified(base + window_outside_offset,
+                                            sizeof(window_value)),
+              "readback did not honor the clamped half-open 512 KiB window");
+      cache.ReadMemory(base + window_outside_offset, sizeof(window_value));
+
+      Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
+                                            sizeof(first_stale));
+      Libs::LibKernel::Memory::WriteBacking(base + second_offset, &second_stale,
+                                            sizeof(second_stale));
+      MarkGpuWrite(base + first_offset, sizeof(first_value));
+      MarkGpuWrite(base + second_offset, sizeof(second_value));
+      cache.FillBuffer(base + first_offset, sizeof(first_value), first_value,
+                       false);
+      cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
+                       false);
 
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
@@ -3605,16 +3673,24 @@ public:
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
-      Require(name, "partial-invalidation ownership",
-              !resources.IsMapped(base + 0x8000, 0x4000) &&
-                  cache.IsRegionRegistered(base + 0x8000, 0x8000) &&
-                  cache.IsRegionCpuModified(base + 0x8000, 0x4000) &&
-                  !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
-                                          sizeof(partial_unmap_value)) &&
-                  cache.HasGpuDirtyBytes(
-                      base + partial_unmap_survivor_offset,
-                      sizeof(partial_unmap_survivor_value)),
-              "partial invalidation retired its owner or cleared disjoint GPU bytes");
+      uint32_t partial_unmap_survivor_backing = 0;
+      std::memcpy(&partial_unmap_survivor_backing,
+                  memory + partial_unmap_survivor_offset,
+                  sizeof(partial_unmap_survivor_backing));
+      Require(
+          name, "partial-invalidation ownership",
+          !resources.IsMapped(base + 0x8000, 0x4000) &&
+              cache.IsRegionRegistered(base + 0x8000, 0x8000) &&
+              cache.IsRegionCpuModified(base + 0x8000, 0x4000) &&
+              !cache.IsRegionCpuModified(
+                  base + partial_unmap_survivor_offset,
+                  sizeof(partial_unmap_survivor_value)) &&
+              !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
+                                      sizeof(partial_unmap_value)) &&
+              !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                      sizeof(partial_unmap_survivor_value)) &&
+              partial_unmap_survivor_backing == partial_unmap_survivor_value,
+          "widened partial invalidation mishandled ownership or backing");
       resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,

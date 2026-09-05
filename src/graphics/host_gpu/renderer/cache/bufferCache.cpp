@@ -259,51 +259,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
-	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
-	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+	// Widen nearby CPU reads so they share one GPU drain.
+	constexpr uint64_t WindowSize   = 512 * 1024;
+	const auto         buffer_begin = buffer.CpuAddress();
+	const auto         buffer_end   = buffer_begin + buffer.Size();
+	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
+	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+
 	std::vector<DownloadCopy> copies;
 	m_memory_tracker.ForEachDownloadRange<false>(
-	    vaddr, size,
+	    window_begin, window_end - window_begin,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "memory invalidation");
 	    },
-		[&](uint64_t address, uint64_t bytes) noexcept {
+	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
-			    for (uint64_t copied = 0; copied < range.size;) {
-				    const auto copy_address = range.address + copied;
-				    const auto* owner = m_page_table.Find(copy_address >> PageTable::kPageBits);
-				    if (owner == nullptr || !*owner) {
-					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
-				    }
-				    auto& buffer = m_slot_buffers[*owner];
-				    if (!buffer.IsInBounds(copy_address, 1)) {
-					    EXIT("BufferCache: invalidation readback is outside its buffer owner\n");
-				    }
-				    const auto copy_size = std::min(
-				        range.size - copied, buffer.CpuAddress() + buffer.Size() - copy_address);
-				    copies.push_back(
-				        {&buffer, buffer.Offset(copy_address), copy_address, copy_size});
-				    copied += copy_size;
-			    }
+			    copies.push_back(
+			        {&buffer, buffer.Offset(range.address), range.address, range.size});
 		    }
 	    });
-	if (copies.empty()) {
-		if (!is_write) {
-			return;
-		}
-		// A preceding read fault can consume the last GPU-owned copy after this write invalidation
-		// has already chosen to flush. Complete the CPU ownership handoff even though this callback
-		// no longer has bytes to download.
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		return;
+	if (!copies.empty()) {
+		DownloadBufferMemory(copies);
+		// The enumeration covered whole dirty pages and every exact interval on them.
+		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
-	DownloadBufferMemory(copies);
-	// The enumeration above covered whole dirty pages and every exact interval on them.
-	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}

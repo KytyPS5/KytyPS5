@@ -362,7 +362,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
                                   const ComputeWorkgroupLimits& compute_workgroup_limits,
-                                  const ShaderHostProfile& host_profile) {
+                                  const ShaderHostProfile& host_profile,
+                                  const IR::ResourceSpecialization& specialization) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&

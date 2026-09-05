@@ -270,7 +270,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool is_2d_array =
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
 	    ((!resource.cube && is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth()) ||
-	     is_cube);
+		 is_cube);
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::ImageType::kColor3D &&
 	                   descriptor.BaseArray5() == 0;
@@ -336,14 +336,14 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
-	const auto format        = descriptor.Format();
-	const bool resource_ok   = IsSupportedStorageImageResource(resource);
-	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
-	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
+	const auto format           = descriptor.Format();
+	const bool resource_ok      = IsSupportedStorageImageResource(resource);
+	const bool descriptor_ok    = IsSupportedStorageTextureDescriptor(resource, descriptor);
+	const bool encoding_ok      = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
-	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	const auto numeric_class    = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
 	    raw_sint_storage ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
@@ -461,7 +461,9 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
                                      uint32_t view_levels, uint32_t image_layers) {
 	ImageViewInfo view {};
 	view.format      = format;
-	view.aspect      = vk::ImageAspectFlagBits::eColor;
+	view.aspect      = DepthAspectTransferFormat(format) != vk::Format::eUndefined
+	                       ? vk::ImageAspectFlagBits::eDepth
+	                       : vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
 	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
@@ -1039,10 +1041,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	return {id, nullptr, std::move(desc)};
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
+static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+                                 uint32_t                                        index,
+                                 const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
@@ -1165,8 +1167,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	prepared.buffers.clear();
 	prepared.buffers.reserve(program.info.buffers.size());
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
-	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
-	          prepared.shader_data.end(), 0);
+	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword, prepared.shader_data.end(),
+	          0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -1274,9 +1276,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
-	size_t descriptor_count = 0;
-	size_t write_count      = 0;
+	auto                           vk_buffer        = buffer.Handle();
+	size_t                         descriptor_count = 0;
+	size_t                         write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	constexpr auto                 GraphicsStages =

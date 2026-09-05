@@ -7374,6 +7374,122 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckRenderExecutorColor1DArrayDiscovery() {
+    constexpr const char *name = "RenderExecutorColor1DArrayDiscovery";
+    constexpr uintptr_t base = 0x0000000203a00000ull;
+    constexpr uint32_t width = 512;
+    constexpr uint32_t height = 1;
+    constexpr uint32_t bytes_per_element = 4;
+    constexpr uint32_t first_slice = 2;
+    constexpr uint32_t last_slice = 5;
+    constexpr uint32_t image_layers = last_slice + 1;
+    constexpr uint32_t view_layers = last_slice - first_slice + 1;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    const auto pitch = TileGetRenderTargetPitch(width, bytes_per_element, 0);
+    TileSizeAlign layout{};
+    Require(name, "tile layout",
+            pitch == width &&
+                TileGetRenderTargetSize(width, height, pitch,
+                                        bytes_per_element, layout, 0) &&
+                layout.size == 0x40000 &&
+                layout.align == allocation_alignment,
+            "1D-array render-target layout is unavailable");
+    const auto allocation_size = layout.size * image_layers;
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "1D-array color direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "1D-array color fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+              .channel_type = Prospero::ChannelType::kSrgb,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorView(
+          0, {.base_array_slice_index = first_slice,
+              .last_array_slice_index = last_slice});
+      registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+      registers.SetColorAttrib3(0,
+                                {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                 .dimension = 0,
+                                 .cmask_pipe_aligned = true,
+                                 .dcc_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, 1, scheduler.Current(), color, 0);
+      const auto attachment =
+          texture_cache.FindRenderTarget(color.image_id, color.desc);
+      const auto &image = texture_cache.GetImage(color.image_id);
+      RenderDepthInfo no_depth{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, no_depth);
+      scheduler.Current().BeginRendering(rendering);
+      scheduler.Current().EndRendering();
+      Require(
+          name, "captured 1D-array target",
+          color.image_id && attachment != nullptr &&
+              color.image_view == attachment &&
+              color.base_array_layer == first_slice &&
+              color.desc.info.type == Prospero::ImageType::kColor1D &&
+              color.desc.info.extent == vk::Extent3D{width, height, 1} &&
+              color.desc.info.resources == ImageSubresources{1, image_layers} &&
+              color.desc.info.pitch == pitch &&
+              color.desc.info.data.size == allocation_size &&
+              color.desc.info.mip_layout[0].offset == 0 &&
+              color.desc.info.mip_layout[0].size == allocation_size &&
+              color.desc.view_info.type == vk::ImageViewType::e1DArray &&
+              color.desc.view_info.base_layer == first_slice &&
+              color.desc.view_info.layer_count == view_layers &&
+              image.backing.image_type == vk::ImageType::e1D &&
+              image.backing.layers == image_layers &&
+              rendering.width == width && rendering.height == height &&
+              rendering.num_layers == view_layers &&
+              rendering.num_color_attachments == 1,
+          "SDK dimension=0 slice range did not create a Vulkan 1D-array "
+          "attachment view");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "1D-array color direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "1D-array color direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorVolumeDiscovery() {
     constexpr const char *name = "RenderExecutorColorVolumeDiscovery";
     constexpr uintptr_t base = 0x0000000203e00000ull;
@@ -26105,6 +26221,7 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColor1DDiscovery();
+    vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -26197,6 +26314,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
     CheckIndirectImageKeySwitch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rt1d-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorColor1DDiscovery();
+    vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
@@ -26292,6 +26415,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColor1DDiscovery();
+  vulkan.CheckRenderExecutorColor1DArrayDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();

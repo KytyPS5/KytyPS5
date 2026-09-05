@@ -74,20 +74,6 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::Flush();
 }
 
-void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_params) {
-	static_params.viewport_scale[0]  = 0.5f;
-	static_params.viewport_scale[1]  = 0.5f;
-	static_params.viewport_scale[2]  = 1.0f;
-	static_params.viewport_offset[0] = 0.5f;
-	static_params.viewport_offset[1] = 0.5f;
-	static_params.viewport_offset[2] = 0.0f;
-
-	static_params.scissor_ltrb[0] = 0;
-	static_params.scissor_ltrb[1] = 0;
-	static_params.scissor_ltrb[2] = 1;
-	static_params.scissor_ltrb[3] = 1;
-}
-
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
@@ -690,10 +676,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.with_depth         = with_depth;
-	static_params.depth_test_enable  = depth.depth_test_enable;
-	static_params.depth_write_enable = (depth.depth_write_enable && !depth.depth_clear_enable);
-	static_params.depth_compare_op   = depth.depth_compare_op;
+	static_params.with_depth              = with_depth;
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
@@ -721,8 +704,6 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		static_params.blend_enable[i]         = bc.enable;
 		static_params.blend_bypass[i]         = rt.info.blend_bypass;
 	}
-	NormalizeStaticParamsForDynamicState(static_params);
-
 	GraphicsPipelineKey key {};
 	key.rendering     = rendering;
 	key.vs_shader_id  = p.vs_shader_id;

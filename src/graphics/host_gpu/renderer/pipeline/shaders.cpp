@@ -650,20 +650,6 @@ void CreatePipelineInternal(
 	input_assembly.primitiveRestartEnable =
 	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
 
-	vk::Viewport viewport {};
-	viewport.x        = static_params.viewport_offset[0] - static_params.viewport_scale[0];
-	viewport.y        = static_params.viewport_offset[1] - static_params.viewport_scale[1];
-	viewport.width    = static_params.viewport_scale[0] * 2.0f;
-	viewport.height   = static_params.viewport_scale[1] * 2.0f;
-	viewport.minDepth = static_params.viewport_offset[2];
-	viewport.maxDepth = static_params.viewport_scale[2] + static_params.viewport_offset[2];
-
-	vk::Rect2D scissor {};
-	scissor.offset = {static_params.scissor_ltrb[0], static_params.scissor_ltrb[1]};
-	scissor.extent = {
-	    static_cast<uint32_t>(static_params.scissor_ltrb[2] - static_params.scissor_ltrb[0]),
-	    static_cast<uint32_t>(static_params.scissor_ltrb[3] - static_params.scissor_ltrb[1])};
-
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.sType = vk::StructureType::ePipelineViewportDepthClipControlCreateInfoEXT;
 	depth_clip_control.pNext = nullptr;
@@ -674,9 +660,9 @@ void CreatePipelineInternal(
 	viewport_state.pNext         = &depth_clip_control;
 	viewport_state.flags         = {};
 	viewport_state.viewportCount = 1;
-	viewport_state.pViewports    = &viewport;
+	viewport_state.pViewports    = nullptr;
 	viewport_state.scissorCount  = 1;
-	viewport_state.pScissors     = &scissor;
+	viewport_state.pScissors     = nullptr;
 
 	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
 	if (static_params.cull_back) {
@@ -839,9 +825,6 @@ void CreatePipelineInternal(
 	depth_stencil_info.sType            = vk::StructureType::ePipelineDepthStencilStateCreateInfo;
 	depth_stencil_info.pNext            = nullptr;
 	depth_stencil_info.flags            = {};
-	depth_stencil_info.depthTestEnable  = (static_params.depth_test_enable ? VK_TRUE : VK_FALSE);
-	depth_stencil_info.depthWriteEnable = (static_params.depth_write_enable ? VK_TRUE : VK_FALSE);
-	depth_stencil_info.depthCompareOp   = static_params.depth_compare_op;
 	depth_stencil_info.depthBoundsTestEnable =
 #if defined(__APPLE__)
 	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
@@ -864,6 +847,9 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eViewport,
 	    vk::DynamicState::eScissor,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eDepthTestEnable,
+	    vk::DynamicState::eDepthWriteEnable,
+	    vk::DynamicState::eDepthCompareOp,
 	    vk::DynamicState::eDepthBiasEnable,
 	    vk::DynamicState::eDepthBias,
 	    vk::DynamicState::eStencilCompareMask,
@@ -925,14 +911,11 @@ void CreatePipelineInternal(
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
-		     " depth=%s blend=%s dyn_states=%" PRIu32 " viewport=%f,%f %fx%f"
-		     " scissor=%d,%d %ux%u\n",
+		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
 		     pipeline.vs_shader_id, pipeline.ps_shader_id,
-		     static_cast<uint32_t>(static_params.topology),
-		     static_params.color_mask[0], (static_params.with_depth ? "true" : "false"),
-		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count, viewport.x,
-		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
-		     scissor.extent.width, scissor.extent.height);
+		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
+		     (static_params.with_depth ? "true" : "false"),
+		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count);
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);

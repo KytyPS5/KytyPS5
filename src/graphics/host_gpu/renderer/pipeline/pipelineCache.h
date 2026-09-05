@@ -32,19 +32,13 @@ struct ComputeShaderInfo;
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
-	float                      viewport_scale[3]        = {};
-	float                      viewport_offset[3]       = {};
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
-	int                        scissor_ltrb[4]          = {0};
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       with_depth               = false;
-	bool                       depth_test_enable        = false;
-	bool                       depth_write_enable       = false;
-	vk::CompareOp              depth_compare_op         = vk::CompareOp::eNever;
 	bool                       depth_bounds_test_enable = false;
 	float                      depth_min_bounds         = 0.0f;
 	float                      depth_max_bounds         = 0.0f;
@@ -74,14 +68,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) ==
-              sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) * 2 + sizeof(int[4]) +
-                  sizeof(vk::PrimitiveTopology) + sizeof(bool) + sizeof(uint32_t) +
-                  sizeof(bool) * 4 + sizeof(vk::CompareOp) + sizeof(bool) + sizeof(float) * 2 +
-                  sizeof(bool) + sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
-                  sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
-                  sizeof(uint8_t[RENDER_COLOR_ATTACHMENTS_MAX]) * 6 +
-                  sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) * 3);
+static_assert(sizeof(PipelineStaticParameters) == 166);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};

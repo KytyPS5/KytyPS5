@@ -12,8 +12,11 @@ GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandSchedule
 GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	constexpr uint64_t fault_size = 8;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	// A page fault reports ONE address. Asking whether eight bytes from it are mapped wrongly
+	// declines a fault whose address lies within eight bytes of the end of a mapping, and a declined
+	// fault is fatal. Qualify on the faulting byte, then widen only as far as the mapping allows.
+	const uint64_t fault_size = IsMapped(fault_vaddr, 8) ? 8 : 1;
+	if (!IsMapped(fault_vaddr, 1)) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {

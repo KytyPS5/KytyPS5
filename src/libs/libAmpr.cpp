@@ -126,7 +126,9 @@ static bool ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 		const auto ch = src[pos];
 		out[pos]      = ch;
 		if (ch == '\0') {
-			return pos != 0;
+			// An empty string is valid for APR prefixes. Path consumers still
+			// reject an empty resolved path in ResolveOnePath.
+			return true;
 		}
 	}
 

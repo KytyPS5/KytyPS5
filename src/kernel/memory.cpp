@@ -2693,14 +2693,6 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 		    (flags == 0 && (static_cast<uint64_t>(offset) < current->second.start_addr ||
 		                    static_cast<uint64_t>(offset) >=
 		                        current->second.start_addr + current->second.size))) {
-			if (flags == 1 && static_cast<uint64_t>(offset) < PhysicalMemory::Size()) {
-				query_info->start       = static_cast<int64_t>(PhysicalMemory::Size());
-				query_info->end         = static_cast<int64_t>(PhysicalMemory::Size());
-				query_info->memory_type = 0;
-				LOGF_COLOR(Log::Color::Green, "\t terminal    = true\n\t[Ok]\n");
-				return OK;
-			}
-
 			LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 			return KERNEL_ERROR_EACCES;
 		}

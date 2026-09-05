@@ -6,6 +6,8 @@
 #include "graphics/shader/recompiler/ComputeWorkgroup.h"
 #include "graphics/shader/recompiler/ShaderHostProfile.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <vector>
 

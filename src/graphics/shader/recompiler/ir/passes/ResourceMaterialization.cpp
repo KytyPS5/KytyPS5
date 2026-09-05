@@ -2,6 +2,9 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -958,6 +961,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		// specialized SPIR-V image type consistent with the host atomic view.
 		image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 		                                  : Prospero::SampledTextureNumericClass(format);
+
+		// Check if depth-compare is requested but format doesn't support it on Vulkan
+		if (base.depth_compare && !storage) {
+			const auto surface_format = TextureGetSurfaceFormatInfo(format);
+			if (!IsDepthComparisonSupported(surface_format.vk_format)) {
+				// Format doesn't support native depth-compare, enable manual emulation
+				image.needs_manual_depth_compare = true;
+			}
+		}
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
@@ -969,7 +981,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
-		           (base.depth_compare &&
+		           (base.depth_compare && !image.needs_manual_depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
 			return SpecializationFail(
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
@@ -1662,6 +1674,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 		}
 	}
+
+	// Copy depth_compare_func from specialization to samplers
+	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
+		if (index < specialization.sampler_depth_compare_funcs.size()) {
+			samplers[index].depth_compare_func = specialization.sampler_depth_compare_funcs[index];
+		}
+	}
+	// Split samplers (if any) inherit from their original, which we just set above
 
 	auto memory_info = program.memory_info;
 	const ImageRemap image_remap(specialization);

@@ -640,6 +640,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto  layout         = Layout(mem);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		const bool  manual_compare = state.specialization.images[mem.resource].needs_manual_depth_compare;
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
@@ -674,7 +675,62 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words;
-			if (dref) {
+			
+			// Handle manual depth-compare for gather
+			if (dref && manual_compare) {
+				// Use regular gather for manual compare
+				uint32_t gather_component = 0;
+				if (ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
+					gather_component = ImageGatherComponent(mem.dmask);
+				}
+				words = {OpImageGather, ImageVectorType(state, numeric_class, 4),
+				         sample,        sampled,
+				         coord,         ConstantU32(state, gather_component)};
+				
+				if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					words.push_back(ImageOperandsConstOffsetsMask);
+					words.push_back(HorizontalOffsets(state, dimension));
+				} else if (layout.offset != NoImageComponent) {
+					words.push_back(ImageOperandsOffsetMask);
+					words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
+				}
+				state.builder.AddFunction(words);
+				
+				// Extract dref value for comparison
+				auto dref_value = ZeroF32(state);
+				if (layout.dref != NoImageComponent) {
+					dref_value = AddressF32(ctx, mem, *address, layout.dref);
+				}
+				
+				// Get the compare-op from the sampler descriptor
+				const auto& sampler = state.program.info.samplers[mem.sampler];
+				
+				// For gather with manual compare, we need to compare each component
+				uint32_t compared_components[4];
+				for (uint32_t i = 0; i < 4; i++) {
+					const auto comp_value = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction({OpCompositeExtract, TypeF32(ctx.state), comp_value, sample, i});
+					
+					const auto compare_result = EmitFloatCompareOp(ctx.state, comp_value, dref_value, sampler.depth_compare_func);
+					
+					const auto float_result = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction({OpSelect, TypeF32(ctx.state), float_result, compare_result, 
+					                                 ConstantF32Value(ctx.state, 1.0f), ConstantF32Value(ctx.state, 0.0f)});
+					compared_components[i] = float_result;
+				}
+				
+				const auto final_result = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(ctx.state, 4), final_result,
+				                                 compared_components[0], compared_components[1], 
+				                                 compared_components[2], compared_components[3]});
+				
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, final_result),
+				                              Prospero::TextureNumericClass::Float, false, mem, true));
+				return true;
+			}
+			
+			// Normal gather path
+			if (dref && !manual_compare) {
 				auto dref_value = ZeroF32(state);
 				if (layout.dref != NoImageComponent) {
 					dref_value = AddressF32(ctx, mem, *address, layout.dref);
@@ -723,10 +779,16 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		} else if (dref) {
 			opcode = spv::OpImageSampleDrefImplicitLod;
 		}
+		
 		uint32_t result_type = ImageVectorType(state, numeric_class, 4);
 		uint32_t dref_value  = 0;
 		if (dref) {
-			result_type = TypeF32(state);
+			if (use_manual_compare) {
+				// For manual compare, we still need the dref value for comparison
+				result_type = ImageVectorType(state, numeric_class, 4);
+			} else {
+				result_type = TypeF32(state);
+			}
 			dref_value  = ZeroF32(state);
 			if (layout.dref != NoImageComponent) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
@@ -775,6 +837,25 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto       result = sample;
 			if (!dref) {
 				result = UnpackImageTexel(ctx, mem, sample);
+			} else if (use_manual_compare) {
+				// Manual depth-compare emulation: sample as color, then compare in shader.
+				const auto r_component = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(
+				    {OpCompositeExtract, TypeF32(ctx.state), r_component, sample, 0});
+
+				const auto& sampler = state.program.info.samplers[mem.sampler];
+				const auto  compare_result =
+				    EmitFloatCompareOp(ctx.state, r_component, dref_value, sampler.depth_compare_func);
+
+				const auto float_result = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(
+				    {OpSelect, TypeF32(ctx.state), float_result, compare_result,
+				     ConstantF32Value(ctx.state, 1.0f), ConstantF32Value(ctx.state, 0.0f)});
+
+				// Result is a scalar float, same shape as a native Dref sample.
+				ctx.Define(inst, ResultVector(ctx, float_result,
+				                              Prospero::TextureNumericClass::Float, true, mem));
+				return true;
 			}
 			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 			return;
@@ -872,6 +953,25 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		auto result = phi_words[2];
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
+		} else if (use_manual_compare) {
+			// Manual depth-compare emulation for indirect images.
+			const auto r_component = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(
+			    {OpCompositeExtract, TypeF32(ctx.state), r_component, result, 0});
+
+			const auto& sampler = state.program.info.samplers[mem.sampler];
+			const auto  compare_result =
+			    EmitFloatCompareOp(ctx.state, r_component, dref_value, sampler.depth_compare_func);
+
+			const auto float_result = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(
+			    {OpSelect, TypeF32(ctx.state), float_result, compare_result,
+			     ConstantF32Value(ctx.state, 1.0f), ConstantF32Value(ctx.state, 0.0f)});
+
+			// Result is a scalar float, same shape as a native Dref sample.
+			ctx.Define(inst, ResultVector(ctx, float_result, Prospero::TextureNumericClass::Float,
+			                              true, mem));
+			return true;
 		}
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return;

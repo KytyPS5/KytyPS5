@@ -32,6 +32,10 @@ uint32_t Builder::AllocateId() {
 	return m_next_id++;
 }
 
+void Builder::RequireVersion(uint32_t version) {
+	m_version = std::max(m_version, version);
+}
+
 void Builder::RequireCapability(uint32_t capability) {
 	if (m_required_capabilities.insert(capability).second) {
 		AddCapability({capability});

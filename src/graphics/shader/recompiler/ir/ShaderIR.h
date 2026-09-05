@@ -160,6 +160,8 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
+	PackedAncillary,
+	Layer,
 	BaryCoordSmooth,
 	BaryCoordNoPerspective,
 	WorkgroupId,

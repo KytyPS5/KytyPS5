@@ -28,6 +28,7 @@ public:
 	KYTY_CLASS_DEFAULT_COPY(Builder);
 
 	uint32_t AllocateId();
+	void     RequireVersion(uint32_t version);
 	void     RequireCapability(uint32_t capability);
 	void     RequireExtension(const char* name);
 	uint32_t Import(const char* name);

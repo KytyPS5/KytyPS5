@@ -518,6 +518,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
+		case IR::StageInputKind::Layer: return BuiltInLayer;
 		case IR::StageInputKind::BaryCoordSmooth: return BuiltInBaryCoordKHR;
 		case IR::StageInputKind::BaryCoordNoPerspective: return BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return BuiltInWorkgroupId;
@@ -541,6 +542,9 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 	}
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
+		if (input.kind == IR::StageInputKind::Layer) {
+			state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
+		}
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (input.per_vertex) {
@@ -710,9 +714,9 @@ void DefineModule(EmitterState& state) {
 	if (state.cull_distance_variable != 0) {
 		state.builder.RequireCapability(CapabilityCullDistance);
 	}
-	if (state.layer_variable != 0) {
-		state.builder.RequireCapability(CapabilityShaderViewportIndexLayerEXT);
-		state.builder.RequireExtension("SPV_EXT_shader_viewport_index_layer");
+	if (state.layer_variable != 0 || InputVariableForKind(state, IR::StageInputKind::Layer) != 0) {
+		state.builder.RequireVersion(0x00010500u);
+		state.builder.RequireCapability(CapabilityShaderLayer);
 	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
@@ -805,6 +809,7 @@ void DefineModule(EmitterState& state) {
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
 			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::Layer:
 				ptr_type = TypePointer(state, StorageClassInput, TypeI32(state));
 				break;
 			case IR::StageInputKind::WorkgroupId:

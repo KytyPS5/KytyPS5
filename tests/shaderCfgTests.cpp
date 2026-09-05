@@ -4778,7 +4778,6 @@ void TestImageAddressOperands() {
   }
 }
 
-
 void TestNewShaderRecompilerImageSampleVariants() {
   const uint32_t shader[] = {
       EncodeMimg0(0x24, 0xf),
@@ -5930,6 +5929,166 @@ void TestPsInputCountRegisterDecode() {
         "SPI_PS_IN_CONTROL flags were not preserved");
   Check((ps_in_control & 0x3fu) == 3,
         "SPI_PS_IN_CONTROL NUM_INTERP decoding failed");
+}
+
+void TestPixelAncillaryLayerInput() {
+  using namespace ShaderRecompiler::IR;
+  std::vector<uint32_t> shader = {
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
+      EncodeVop3Word0(0x149, 7), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 3),
+      EncodeExp0(0x00, 0x3), EncodeExp1(6, 7, 0, 0), EncodeSopp(0x01),
+  };
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = shader.size() * sizeof(uint32_t);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+  sh.ps_input_ena = sh.ps_input_addr = 0x3320; // Linear I/J, X/Y, front-face, ancillary.
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  ShaderPixelInputInfo pixel{};
+  (void)PrepareProgram(regs, sh, mappings, pixel);
+  Check(pixel.ps_system_input_base == 2 && pixel.ps_front_face && pixel.ps_ancillary,
+        "pixel ancillary register flags were not retained");
+  const auto ancillary_key = MakeStageStaticKey(pixel);
+  pixel.ps_ancillary = false;
+  Check(ancillary_key != MakeStageStaticKey(pixel),
+        "pixel ancillary input is missing from the shader cache key");
+  pixel.ps_ancillary = true;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  auto result = RecompileForTest(shader, options);
+  Check(ProgramHasInput(result.program, StageInputKind::Layer),
+        "ancillary after X/Y and front-face did not provide the layer input");
+  Check(!ProgramHasInput(result.program, StageInputKind::PackedAncillary),
+        "symbolic ancillary input survived its layer extraction");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 9u, 14u) &&
+            result.spirv[1] == 0x00010500u &&
+            SpirvContainsCapability(result.spirv, 69u) &&
+            !SpirvContainsCapability(result.spirv, 5254u),
+        "fragment layer input lacks its builtin, flat decoration or capability");
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%int %gl_Layer") &&
+            SpirvInstructionOpcodeCount(result.spirv, 202u) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 203u) == 1u,
+        "layer extraction lost its scalar integer load or signedness");
+  Check(!SpirvHasDecorationValue(result.spirv, 11u, 18u),
+        "layer extraction unexpectedly enabled SampleId");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  for (const uint32_t destination : {126u, 106u, 0u}) {
+    std::vector<uint32_t> wqm = {
+        EncodeSop1(0x04, 8, 126), // Save the incoming EXEC predicate.
+        EncodeSop1(0x0a, destination, 126),
+        EncodeSop1(0x04, 126, destination),
+        EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
+        EncodeVop1(0x01, 5, 6 + 256), // Overwrite the packed ancillary register.
+        EncodeSop1(0x04, 126, 8),
+        EncodeExp0(0x00, 0x1), EncodeExp1(5, 0, 0, 0), EncodeSopp(0x01),
+    };
+    auto wqm_result = RecompileForTest(wqm, options);
+    Check(ProgramHasInput(wqm_result.program, StageInputKind::Layer) &&
+              !ProgramHasInput(wqm_result.program, StageInputKind::PackedAncillary),
+          "WQM retained an unreachable old ancillary register value");
+    CheckSpirvBinaryValidates(wqm_result.spirv);
+  }
+
+  const uint32_t unused[] = {EncodeSopp(0x01)};
+  auto unused_result = RecompileForTest(unused, options);
+  Check(!ProgramHasInput(unused_result.program, StageInputKind::Layer) &&
+            unused_result.spirv[1] == 0x00010300u &&
+            !SpirvContainsCapability(unused_result.spirv, 69u),
+        "unused ancillary input changed the module requirements");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  shader[1] = EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4);
+  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+              "unsupported live ancillary field was silently replaced");
+#endif
+}
+
+void TestMaskedValueDemand() {
+  using namespace ShaderRecompiler::IR;
+  enum class Use { Guarded, Conjunction, TrueArm, Unguarded, OtherGuard, Predicate,
+                   ReadLane, ExplicitLod, ExplicitGradient, LevelZero, ImplicitLod,
+                   Mixed, Phi, Loop };
+  for (const auto use : {Use::Guarded, Use::Conjunction, Use::TrueArm, Use::Unguarded,
+                         Use::OtherGuard, Use::Predicate, Use::ReadLane,
+                         Use::ExplicitLod, Use::ExplicitGradient, Use::LevelZero,
+                         Use::ImplicitLod, Use::Mixed, Use::Phi, Use::Loop}) {
+    Program program;
+    for (uint32_t i = 0; i < 4; ++i) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+    }
+    auto &entry = *program.blocks[0];
+    auto &join = *program.blocks[3];
+    entry.AddBranch(program.blocks[1]);
+    entry.AddBranch(program.blocks[2]);
+    program.blocks[1]->AddBranch(&join);
+    program.blocks[2]->AddBranch(&join);
+    if (use == Use::Loop) join.AddBranch(&entry);
+    const auto input = Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
+                                                 {Value(static_cast<ScalarReg>(0))}));
+    const auto predicate = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32,
+                                                      {input, Value(0u)}));
+    const auto other = Value(&entry.AppendNewInst(ValueOpcode::IEqual32,
+                                                  {input, Value(2u)}));
+    auto &masked = entry.AppendNewInst(ValueOpcode::SelectU32,
+                                        {predicate, Value(10u), Value(20u)});
+    Value value(&masked);
+    if (use == Use::Phi || use == Use::Loop) {
+      auto &phi = join.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+      phi.AddPhiOperand(program.blocks[1], value);
+      phi.AddPhiOperand(program.blocks[2], Value(0u));
+      value = Value(&phi);
+    }
+    value = Value(&join.AppendNewInst(ValueOpcode::BitCastF32U32, {value}));
+    value = Value(&join.AppendNewInst(ValueOpcode::FPMul32, {value, Value::F32(2.f)}));
+    value = Value(&join.AppendNewInst(ValueOpcode::BitCastU32F32, {value}));
+    if (use == Use::ReadLane) {
+      value = Value(&join.AppendNewInst(ValueOpcode::ReadLane, {value, Value(0u)}));
+    }
+    if (use == Use::ExplicitLod || use == Use::ExplicitGradient ||
+        use == Use::LevelZero || use == Use::ImplicitLod) {
+      const auto zero = Value(0u);
+      auto &address = join.AppendNewInst(ValueOpcode::MakeImageAddress,
+          {value, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero});
+      auto &image = entry.AppendNewInst(ValueOpcode::GetImageResource,
+          {zero, zero, zero, zero, zero, zero, zero, zero});
+      auto &sampler = entry.AppendNewInst(ValueOpcode::GetSamplerResource,
+          {zero, zero, zero, zero});
+      program.memory_info.emplace_back().image_sample_flags =
+          use == Use::ExplicitLod ? ShaderRecompiler::Decoder::ImageSampleFlagLod :
+          use == Use::ExplicitGradient ? ShaderRecompiler::Decoder::ImageSampleFlagDerivative :
+          use == Use::LevelZero ? ShaderRecompiler::Decoder::ImageSampleFlagLevelZero : 0u;
+      value = Value(&join.AppendNewInst(ValueOpcode::ImageSampleRaw,
+                                         {Value(&image), Value(&sampler), Value(&address)}));
+      value = Value(&join.AppendNewInst(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}));
+    }
+    auto guard = predicate;
+    if (use == Use::Conjunction) {
+      guard = Value(&join.AppendNewInst(ValueOpcode::LogicalAnd, {predicate, other}));
+    } else if (use == Use::OtherGuard) {
+      guard = other;
+    } else if (use == Use::Unguarded) {
+      guard = Value(true);
+    } else if (use == Use::Predicate) {
+      guard = Value(&join.AppendNewInst(ValueOpcode::INotEqual32, {value, Value(0u)}));
+    } else if (use == Use::TrueArm) {
+      value = Value(&join.AppendNewInst(ValueOpcode::SelectU32, {predicate, value, Value(0u)}));
+      guard = Value(true);
+    }
+    value = Value(&join.AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+                                       {value, Value(0u), Value(0u), Value(0u)}));
+    join.AppendNewInst(ValueOpcode::SetAttribute, {value, guard});
+    if (use == Use::Mixed) join.AppendNewInst(ValueOpcode::SetAttribute, {value, Value(true)});
+    EliminateMaskedValues(program);
+    const bool removed = Value(&masked).Resolve() == Value(10u);
+    const bool safe = use == Use::Guarded || use == Use::Conjunction || use == Use::TrueArm ||
+                      use == Use::ExplicitLod || use == Use::ExplicitGradient ||
+                      use == Use::LevelZero || use == Use::Phi;
+    Check(removed == safe, "masked value demand crossed an unguarded or nonlocal use");
+  }
 }
 
 void TestGraphicsCreateInterpolantMapping() {
@@ -9170,12 +9329,13 @@ void TestNewShaderRecompilerAuxPositionExports() {
             SpirvHasDecorationValue(all.spirv, 11u, 9u) &&
             SpirvContainsCapability(all.spirv, 32u) &&
             SpirvContainsCapability(all.spirv, 33u) &&
-            SpirvContainsCapability(all.spirv, 5254u),
+            SpirvContainsCapability(all.spirv, 69u),
         "auxiliary vertex BuiltIns or capabilities are missing");
   const auto all_source = DisassembleSpirvBinary(all.spirv);
-  Check(Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
+  Check(all.spirv[1] == 0x00010500u &&
+            !Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
             SpirvBuiltInStoreUsesAndConstant(all.spirv, 9u, 0x7ffu),
-        "layer export extension or GFX10 layer mask is missing");
+        "layer export module version or GFX10 layer mask is incorrect");
   const auto positions = std::count_if(
       all.program.info.outputs.begin(), all.program.info.outputs.end(),
       [](const auto &output) {
@@ -12004,6 +12164,8 @@ int main() {
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestPsInputCountRegisterDecode();
+  TestPixelAncillaryLayerInput();
+  TestMaskedValueDemand();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();

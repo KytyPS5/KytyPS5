@@ -1137,8 +1137,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::FragCoord, 3));
 			}
 			if (ps->ps_front_face) {
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg),
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
 				                      builtin(IR::StageInputKind::FrontFacing));
+			}
+			if (ps->ps_ancillary) {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg),
+				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),

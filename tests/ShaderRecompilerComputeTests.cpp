@@ -1032,6 +1032,9 @@ struct GraphicsCase {
   std::vector<u32> pixel_interpolator_settings;
   bool pixel_no_perspective = false;
   std::vector<u32> vertices;
+  bool pixel_ancillary = false;
+  bool pixel_front_face = false;
+  u32 layers = 1;
 };
 
 struct CompiledShader {
@@ -1373,6 +1376,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           ? 1u
           : static_cast<u32>(test.pixel_interpolator_settings.size());
   pixel_info.ps_no_perspective = test.pixel_no_perspective;
+  pixel_info.ps_ancillary = test.pixel_ancillary;
+  pixel_info.ps_front_face = test.pixel_front_face;
+  pixel_info.ps_system_input_base = 2;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -1457,12 +1463,13 @@ enum : u32 {
   OpReturn = 253,
 };
 
-std::vector<u32> MakePassthroughVertexSpirv() {
+std::vector<u32> MakePassthroughVertexSpirv(bool layered) {
   using ShaderRecompiler::Spirv::Builder;
 
   Builder b;
   const auto void_type = b.Type(OpTypeVoid);
   const auto uint_type = b.Type(OpTypeInt, {32, 0});
+  const auto int_type = b.Type(OpTypeInt, {32, 1});
   const auto float_type = b.Type(OpTypeFloat, {32});
   const auto vec2_type = b.Type(OpTypeVector, {float_type, 2});
   const auto vec4_type = b.Type(OpTypeVector, {float_type, 4});
@@ -1489,6 +1496,20 @@ std::vector<u32> MakePassthroughVertexSpirv() {
       b.DefineGlobalVariable(ptr_output_vec4, StorageClassOutput);
   const auto per_vertex =
       b.DefineGlobalVariable(ptr_output_per_vertex, StorageClassOutput);
+  u32 instance = 0;
+  u32 layer = 0;
+  std::vector<u32> interfaces = {in_pos, in_color, per_vertex, out_color};
+  if (layered) {
+    instance = b.DefineGlobalVariable(
+        b.Type(OpTypePointer, {StorageClassInput, int_type}), StorageClassInput);
+    layer = b.DefineGlobalVariable(
+        b.Type(OpTypePointer, {StorageClassOutput, int_type}), StorageClassOutput);
+    b.AddAnnotation({OpDecorate, instance, DecorationBuiltIn, 43}); // InstanceIndex
+    b.AddAnnotation({OpDecorate, layer, DecorationBuiltIn, 9}); // Layer
+    b.RequireVersion(0x00010500u);
+    b.RequireCapability(69); // ShaderLayer
+    interfaces.insert(interfaces.end(), {instance, layer});
+  }
   const auto main = b.AllocateId();
   const auto label = b.AllocateId();
   const auto pos2 = b.AllocateId();
@@ -1500,8 +1521,7 @@ std::vector<u32> MakePassthroughVertexSpirv() {
 
   b.RequireCapability(CapabilityShader);
   b.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
-  b.AddEntryPoint(ExecutionModelVertex, main, "main",
-                  {in_pos, in_color, per_vertex, out_color});
+  b.AddEntryPoint(ExecutionModelVertex, main, "main", interfaces);
   b.AddAnnotation({OpDecorate, in_pos, DecorationLocation, 0});
   b.AddAnnotation({OpDecorate, in_color, DecorationLocation, 1});
   b.AddAnnotation({OpDecorate, out_color, DecorationLocation, 0});
@@ -1518,6 +1538,11 @@ std::vector<u32> MakePassthroughVertexSpirv() {
       {OpAccessChain, ptr_output_vec4, position_ptr, per_vertex, const_u32_0});
   b.AddFunction({OpStore, position_ptr, position});
   b.AddFunction({OpStore, out_color, color4});
+  if (layered) {
+    const auto index = b.AllocateId();
+    b.AddFunction({OpLoad, int_type, index, instance});
+    b.AddFunction({OpStore, layer, index});
+  }
   b.AddFunction({OpReturn});
   b.AddFunction({OpFunctionEnd});
   return b.Build();
@@ -10343,13 +10368,15 @@ public:
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
-    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv();
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(test.layers > 1);
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImage2D(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
-                      vk::ImageLayout::eGeneral);
+                      vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+                      test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+                      test.layers);
     const std::vector<u32> default_vertices = {
         0xbf800000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u,
         0x3f800000u, 0x40400000u, 0xbf800000u, 0x3e800000u, 0x3f000000u,
@@ -10507,7 +10534,7 @@ public:
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
     rendering.renderArea.extent = {1, 1};
-    rendering.layerCount = 1;
+    rendering.layerCount = test.layers;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &color;
     cmd.beginRendering(rendering);
@@ -10521,13 +10548,13 @@ public:
     }
     vk::DeviceSize offset = 0;
     cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
-    cmd.draw(3, 1, 0, 0);
+    cmd.draw(3, test.layers, 0, 0);
     cmd.endRendering();
     EndSubmitAndFree(test.name, "graphics", cmd);
     target.layout = vk::ImageLayout::eGeneral;
 
     auto pixel = ReadImage(test.name, &target);
-    pixel.resize(4);
+    pixel.resize(4 * test.layers);
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
@@ -11762,6 +11789,8 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
+    Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
+            "vertex layer output is not supported");
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -11779,6 +11808,7 @@ private:
         vk::StructureType::ePhysicalDeviceVulkan12Features;
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
+    device_features12.shaderOutputLayer = true;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -13820,6 +13850,50 @@ TestCase ScalarWqmB64SelectsSccDomain() {
           {O::S_MOV_B32, O::S_WQM_B64, O::S_CSELECT_B32, O::V_CMP_EQ_U32,
            O::S_MOV_B64, O::S_NOT_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase ScalarWqmB64PreservesPartialMasks() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ScalarWqmB64PreservesPartialMasks";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 16, 126)); // Save full EXEC.
+  AppendVMovU32(&code, 1, 3);
+  AppendVMovU32(&code, 2, 9);
+  u32 offset = 0;
+  for (const u32 destination : {126u, 106u, 8u}) {
+    code.push_back(EncodeVopc(0xc2, Vgpr(0), 1)); // Only lane 3.
+    code.push_back(EncodeSop1(0x04, destination, 106));
+    code.push_back(EncodeSop1(0x0a, destination, destination));
+    code.push_back(EncodeSop1(0x04, 126, destination));
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+    code.push_back(EncodeSop1(0x04, 126, 16));
+    offset += 64;
+  }
+  code.push_back(EncodeSMovB32(8, InlineU32(32))); // Raw bits 5 and 33.
+  code.push_back(EncodeSMovB32(9, InlineU32(2)));
+  code.push_back(EncodeSop1(0x0a, 10, 8));
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+  AppendEnd(&code);
+  test.initial.assign(256, 0xdeadbeef);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < 64; ++lane) {
+    for (u32 region = 0; region < 3; ++region) {
+      if (lane < 4) test.expected[region * 64 + lane] = 9;
+    }
+    if ((lane >= 4 && lane < 8) || (lane >= 32 && lane < 36)) {
+      test.expected[192 + lane] = 9;
+    }
+  }
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_WQM_B64, O::V_MOV_B32,
+                  O::V_CMP_EQ_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase ScalarMaskProvenanceOverlapAndMixedBinary() {
@@ -21701,6 +21775,42 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsAncillaryLayer(bool front_face) {
+  GraphicsCase test;
+  test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
+  test.pixel_ancillary = true;
+  test.pixel_front_face = front_face;
+  test.layers = 8;
+  const auto ancillary = Vgpr(front_face ? 3 : 2);
+  test.fragment_code.push_back(EncodeSop1(0x04, 8, 126));
+  test.fragment_code.push_back(EncodeSop1(0x0a, 126, 126));
+  AppendVop3(&test.fragment_code, 0x148, 4, ancillary, InlineU32(16), InlineU32(11));
+  AppendVop3(&test.fragment_code, 0x149, 5, ancillary, InlineU32(16), InlineU32(3));
+  test.fragment_code.push_back(EncodeSop1(0x04, 126, 8));
+  AppendVMovU32(&test.fragment_code, 6, test.layers);
+  test.fragment_code.push_back(EncodeVopc(0xc1, Vgpr(4), 6)); // Dynamic layer < count.
+  test.fragment_code.push_back(EncodeSop1(0x04, 126, 106));
+  test.fragment_code.push_back(EncodeVop1(0x06, 0, Vgpr(4))); // float(unsigned layer)
+  test.fragment_code.push_back(EncodeVop1(0x05, 1, Vgpr(5))); // float(signed low 3 bits)
+  AppendVMovLiteral(&test.fragment_code, 2, 0);
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_BFE_U32, ShaderOpcode::V_BFE_I32,
+                  ShaderOpcode::V_CVT_F32_U32, ShaderOpcode::V_CVT_F32_I32,
+                  ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::S_WQM_B64, ShaderOpcode::V_CMP_LT_U32,
+                  ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  for (u32 layer = 0; layer < test.layers; ++layer) {
+    const auto signed_bits = layer < 4 ? static_cast<int>(layer) : static_cast<int>(layer) - 8;
+    test.expected_pixel.insert(test.expected_pixel.end(),
+        {std::bit_cast<u32>(static_cast<float>(layer)),
+         std::bit_cast<u32>(static_cast<float>(signed_bits)), 0, 0x3f800000u});
+  }
+  return test;
+}
+
 GraphicsCase GraphicsFlatInterpolatorExport() {
   using O = ShaderOpcode;
 
@@ -22000,6 +22110,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarMaskHighWriteInvalidatesProvenance);
   AddCase(ScalarSelectB64PreservesMaskProvenance);
   AddCase(ScalarWqmB64SelectsSccDomain);
+  AddCase(ScalarWqmB64PreservesPartialMasks);
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
@@ -22257,6 +22368,8 @@ std::vector<TestCase> MakeCases() {
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
+      GraphicsAncillaryLayer(false),
+      GraphicsAncillaryLayer(true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
       GraphicsDirectSgprPushConstantExport(),
@@ -26535,6 +26648,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarNotB64UpdatesScc());
     RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
+    RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
     RunCase(&vulkan, ScalarMaskProvenanceOverlapAndMixedBinary());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     RunCase(&vulkan, Vop1MoveRelDestination());

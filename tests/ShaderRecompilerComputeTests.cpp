@@ -14571,6 +14571,34 @@ TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
   return test;
 }
 
+TestCase VectorCompareWave32KeepsVccHi() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 107, 7); // s_mov_b32 vcc_hi, 7
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0)); // v_cmp_eq_u32 vcc, 0, v0
+  code.push_back(EncodeVop1(0x01, 3, 107)); // v_mov_b32 v3, vcc_hi
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 3, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorCompareWave32KeepsVccHi";
+  test.code = code;
+  test.expected = {7, 7, 7, 7, 0, 0, 0, 0};
+  test.opcodes = {O::S_MOV_B32, O::V_CMP_EQ_U32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorVop3BSubrevCoCiUsesEncodedMasks() {
   using O = ShaderOpcode;
 
@@ -21598,6 +21626,7 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(factory());
   };
 
+  AddCase(VectorCompareWave32KeepsVccHi);
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
   AddCase(Shifts);

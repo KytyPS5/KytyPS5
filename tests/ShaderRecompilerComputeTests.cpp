@@ -13761,6 +13761,25 @@ TestCase VectorVop3MoveAppliesFloatSourceModifiers() {
   return test;
 }
 
+TestCase VectorVop3ClampFlushesNanToZero() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 24, 0x7fc00000u);
+  AppendVop3(&code, 0x103, 1, 24, InlineU32(0), 0, 0, 0, true);
+  AppendStoreVgpr(&code, 1, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorVop3ClampFlushesNanToZero";
+  test.code = code;
+  test.expected = {0x00000000u};
+  test.opcodes = {O::S_MOV_B32, O::V_ADD_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"2139095040"};
+  return test;
+}
+
 TestCase VectorIntegerOps() {
   using O = ShaderOpcode;
 
@@ -21634,6 +21653,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
+  AddCase(VectorVop3ClampFlushesNanToZero);
   AddCase(VectorIntegerOps);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);

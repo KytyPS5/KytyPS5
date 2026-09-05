@@ -32,9 +32,12 @@ public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
-		ImageInfo     info;
-		ImageViewInfo view_info;
-		BindingType   type = BindingType::Texture;
+		ImageInfo           info;
+		ImageViewInfo       view_info;
+		BindingType         type = BindingType::Texture;
+		vk::ClearColorValue metadata_clear_value {};
+		bool                metadata_clear_supported       = false;
+		bool                metadata_fixed_clear_supported = false;
 	};
 
 	struct RegionInfo {
@@ -76,6 +79,9 @@ public:
 	// False may still record PendingDcc state, but the guest dispatch must execute.
 	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	[[nodiscard]] bool
+	ResolveDccMetaClear(uint64_t address, uint32_t base_layer, uint32_t layer_count,
+	                    vk::ClearColorValue& clear_value);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -98,6 +104,9 @@ private:
 		uint32_t clear_mask = 0;
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
+		vk::ClearColorValue color_clear_value {};
+		bool                color_clear_supported       = false;
+		bool                fixed_color_clear_supported = false;
 	};
 
 	struct OverlapResult {
@@ -111,6 +120,11 @@ private:
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
+	[[nodiscard]] bool        ResolveDccMetaClearLocked(uint64_t address, uint32_t base_layer,
+	                                                    uint32_t layer_count,
+	                                                    vk::ClearColorValue& clear_value,
+	                                                    bool consume);
+	void               MaterializeDccMetaClear(ImageId id, Image& image, const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);

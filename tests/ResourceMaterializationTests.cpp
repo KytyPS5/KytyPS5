@@ -199,6 +199,55 @@ void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
         "point sampler variant duplicated the wrong runtime descriptor");
 }
 
+void TestAtomicFloatImageUsesRawUintSpecialization() {
+  using namespace Libs::Graphics;
+  using namespace ShaderRecompiler::IR;
+  for (const auto format : {Prospero::BufferFormat::k32UInt,
+                           Prospero::BufferFormat::k32Float}) {
+    for (const bool atomic : {false, true}) {
+      Program program;
+      program.stage = ShaderType::Compute;
+      program.srt_plan_complete = true;
+      program.resource_tracking_complete = true;
+      AddValueBlock(program);
+
+      // A non-null R32 descriptor must take the format-specialization path.
+      const uint32_t words[] = {
+          0x304bb700u, 0xc0000000u | (static_cast<uint32_t>(format) << 20u),
+          0x0000001fu, 0x91b00204u, 0, 0x00700000u, 0, 0};
+      DescriptorSource source;
+      source.dword_count = 8;
+      for (uint32_t i = 0; i < 8; ++i) {
+        source.dwords[i] = Value(words[i]);
+      }
+      program.descriptor_sources.push_back(source);
+      ImageResource image;
+      image.source = 0;
+      image.resource_class = ImageResourceClass::Storage;
+      image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      image.read = true;
+      image.written = true;
+      image.atomic = atomic;
+      program.info.images.push_back(image);
+
+      auto plan = ExtractResourcePlan(program);
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, {}, snapshot, specialization),
+            "R32 image materialization failed");
+      Check(snapshot.images.size() == 1 &&
+                snapshot.images[0].dwords[1] == words[1],
+            "specialization changed the guest image descriptor");
+      const auto expected = atomic || format == Prospero::BufferFormat::k32UInt
+                                ? Prospero::TextureNumericClass::Uint
+                                : Prospero::TextureNumericClass::Float;
+      Check(specialization.images.size() == 1 &&
+                specialization.images[0].numeric_class == expected,
+            "R32F atomic image must use Uint while ordinary R32F stays Float");
+    }
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -220,6 +269,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationPreservesPriorStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestAtomicFloatImageUsesRawUintSpecialization();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

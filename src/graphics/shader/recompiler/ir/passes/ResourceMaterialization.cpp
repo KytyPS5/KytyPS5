@@ -486,7 +486,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
-		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		// Float image atomics use a CAS loop on raw R32Uint texels. Keep the
+		// specialized SPIR-V image type consistent with the host atomic view.
+		image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
+		                                  : Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {

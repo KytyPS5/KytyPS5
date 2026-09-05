@@ -15571,6 +15571,164 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+TestCase VectorDpp8Vop1RawWave64Permute() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 17, 100);
+  code.push_back(EncodeVop2(0x25, 17, Vgpr(0), 17));
+  code.push_back(0x7e0402e9u);
+  code.push_back(0xc6354711u); // v_mov_b32 v2, v17 dpp8:[7,0,5,2,3,4,1,6] fi:0
+  code.push_back(0x7e0602eau);
+  code.push_back(0xc6354711u); // v_mov_b32 v3, v17 dpp8:[7,0,5,2,3,4,1,6] fi:1
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 64);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8Vop1RawWave64Permute";
+  test.code = code;
+  // Every eight-lane group is independent, including both sides of lane 32
+  // when a guest wave64 runs on hardware with 32-lane subgroups.
+  for (u32 fi = 0; fi < 2; fi++) {
+    for (u32 base = 0; base < 64; base += 8) {
+      for (u32 value : {107u, 100u, 105u, 102u, 103u, 104u, 101u, 106u}) {
+        test.expected.push_back(base + value);
+      }
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDpp8Vop2RawInactiveSourceAndDestination() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVMovU32(&code, 18, 1000);
+  code.push_back(EncodeVop2(0x25, 18, Vgpr(0), 18));
+  AppendVMovLiteral(&code, 2, 0xaaaaaaaau);
+  code.push_back(EncodeSop1(0x04, 4, 126)); // Save EXEC before activating even lanes.
+  code.push_back(EncodeVop2(0x1b, 19, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 19));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(0x4a0424e9u);
+  code.push_back(0xfa568101u); // v_add_nc_u32 v2, v1, v18 dpp8:[1,0,2,3,5,4,6,7] fi:0
+  code.push_back(0x4a0224eau);
+  code.push_back(0xfa568101u); // v_add_nc_u32 v1, v1, v18 dpp8:[1,0,2,3,5,4,6,7] fi:1
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 64);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8Vop2RawInactiveSourceAndDestination";
+  test.code = code;
+  for (u32 base = 0; base < 64; base += 8) {
+    // FI0 supplies zero for inactive sources, so addition still uses the
+    // destination lane's unpermuted v18. Inactive destinations keep v2.
+    test.expected.insert(test.expected.end(),
+                         {base + 1000u, 0xaaaaaaaau, 2u * base + 1104u,
+                          0xaaaaaaaau, base + 1004u, 0xaaaaaaaau,
+                          2u * base + 1112u, 0xaaaaaaaau});
+  }
+  for (u32 base = 0; base < 64; base += 8) {
+    // FI1 reads the old v1 even when that source lane is inactive. Its
+    // destination aliases v1; inactive destinations keep their original value.
+    test.expected.insert(test.expected.end(),
+                         {2u * base + 1101u, base + 101u,
+                          2u * base + 1104u, base + 103u,
+                          2u * base + 1109u, base + 105u,
+                          2u * base + 1112u, base + 107u});
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B64,
+                  O::V_AND_B32, O::V_CMP_EQ_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDpp8VopcRawFetchInactive() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVMovLiteral(&code, 2, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 3, 0xbbbbbbbbu);
+  AppendVMovU32(&code, 6, 1);
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeVop2(0x1b, 19, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 19));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeSop1(0x04, 6, 126)); // Save the sparse EXEC mask.
+  code.push_back(0x7d8802e9u);
+  code.push_back(0x81f58101u); // v_cmp_gt_u32 vcc, v1, v1 dpp8:[1,0,6,2,7,3,0,4] fi:0
+  code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 6));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  code.push_back(EncodeVop2(0x01, 20, InlineU32(0), 6));
+  code.push_back(EncodeSop1(0x04, 126, 6));
+  code.push_back(0x7d8802eau);
+  code.push_back(0x81f58101u); // v_cmp_gt_u32 vcc, v1, v1 dpp8:[1,0,6,2,7,3,0,4] fi:1
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 6));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  code.push_back(EncodeVop2(0x01, 21, InlineU32(0), 6));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 32);
+  AppendStoreVgprAtLaneDwordOffset(&code, 20, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 21, 0, 96);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8VopcRawFetchInactive";
+  test.code = code;
+  for (u32 group = 0; group < 4; group++) {
+    test.expected.insert(test.expected.end(),
+                         {0, 0xaaaaaaaau, 1, 0xaaaaaaaau,
+                          0, 0xaaaaaaaau, 0, 0xaaaaaaaau});
+  }
+  for (u32 group = 0; group < 4; group++) {
+    test.expected.insert(test.expected.end(),
+                         {1, 0xbbbbbbbbu, 1, 0xbbbbbbbbu,
+                          1, 0xbbbbbbbbu, 0, 0xbbbbbbbbu});
+  }
+  // CNDMASK under restored full EXEC observes every VCC bit, including lanes
+  // disabled during CMP. This avoids relying on scalar whole-wave mask reads.
+  for (u32 mask : {0x04040404u, 0x15151515u}) {
+    for (u32 lane = 0; lane < 32; lane++) {
+      test.expected.push_back((mask >> lane) & 1u);
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B64,
+                  O::V_AND_B32, O::V_CMP_EQ_U32, O::V_CMP_GT_U32,
+                  O::V_CNDMASK_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop3LdexpSourceModifier() {
   using O = ShaderOpcode;
 
@@ -21284,6 +21442,144 @@ TestCase ImageAtomicVariants() {
   return test;
 }
 
+TestCase ImageAtomicFloatSpecialValues(bool maximum) {
+  using O = ShaderOpcode;
+
+  // AMD min/max retain the old bits for NaNs and equal signed zeros. Include
+  // subnormals to catch accidental host floating-point flush-to-zero behavior.
+  const std::array<u32, 12> initial = {
+      0x40800000u, 0xc0800000u, 0x7f800000u, 0x7fc00001u,
+      0x3f800000u, 0x80000000u, 0x00000000u, 0x00000001u,
+      0x00000000u, 0xff800000u, 0x40400000u, 0xffc12345u};
+  const std::array<u32, 12> values = {
+      0x40000000u, 0xc0000000u, 0xff800000u, 0x3f800000u,
+      0x7fc00002u, 0x00000000u, 0x80000000u, 0x00000000u,
+      0x80000001u, 0x40000000u, 0x7f800000u, 0x7fc00002u};
+  const std::array<u32, 12> minimum_result = {
+      0x40000000u, 0xc0800000u, 0xff800000u, 0x7fc00001u,
+      0x3f800000u, 0x80000000u, 0x00000000u, 0x00000000u,
+      0x80000001u, 0xff800000u, 0x40400000u, 0xffc12345u};
+  const std::array<u32, 12> maximum_result = {
+      0x40800000u, 0xc0000000u, 0x7f800000u, 0x7fc00001u,
+      0x3f800000u, 0x80000000u, 0x00000000u, 0x00000001u,
+      0x00000000u, 0x40000000u, 0x7f800000u, 0xffc12345u};
+
+  std::vector<u32> code;
+  for (u32 i = 0; i < values.size(); i++) {
+    AppendVMovU32(&code, 20, i & 3u);
+    AppendVMovU32(&code, 21, i >> 2u);
+    AppendVMovLiteral(&code, 1, values[i]);
+    code.push_back(EncodeMimg0(maximum ? 0x1f : 0x1e, 0x1, 0, true));
+    code.push_back(EncodeMimg1(1, 20));
+    AppendStoreVgpr(&code, 1, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = maximum ? "ImageAtomicFmaxSpecialValues" : "ImageAtomicFminSpecialValues";
+  test.code = std::move(code);
+  test.expected.assign(initial.begin(), initial.end());
+  test.opcodes = {O::V_MOV_B32,
+                  maximum ? O::IMAGE_ATOMIC_FMAX : O::IMAGE_ATOMIC_FMIN,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // A non-null float descriptor exercises materialization and specialization,
+  // while the Vulkan atomic view must still use raw R32Uint texels.
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32Float);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  std::copy(initial.begin(), initial.end(), test.storage_image_r32ui.begin());
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  const auto &result = maximum ? maximum_result : minimum_result;
+  std::copy(result.begin(), result.end(), test.expected_storage_image_r32ui.begin());
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer", "R32ui",
+                         StorageUint2DImageBindingName(true)};
+  return test;
+}
+
+TestCase ImageAtomicFminSpecialValues() {
+  return ImageAtomicFloatSpecialValues(false);
+}
+
+TestCase ImageAtomicFmaxSpecialValues() {
+  return ImageAtomicFloatSpecialValues(true);
+}
+
+TestCase ImageAtomicFmaxCapturedGlcVariants() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovU32(&code, 9, 0);
+  AppendVMovLiteral(&code, 5, 0x40000000u);
+  code.push_back(0xf07c0108u);
+  code.push_back(0x00010508u); // PPSA26344 #281: image_atomic_fmax v5, v8, s[4:11]
+  AppendStoreVgpr(&code, 5, 0);
+  AppendVMovLiteral(&code, 5, 0x40800000u);
+  code.push_back(0xf07c2108u); // Same encoding with GLC=1 returns the old texel.
+  code.push_back(0x00010508u);
+  AppendStoreVgpr(&code, 5, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageAtomicFmaxCapturedGlcVariants";
+  test.code = std::move(code);
+  test.expected = {0x40000000u, 0x40000000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_ATOMIC_FMAX,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  const auto descriptor = MakeStorageTextureData(Prospero::BufferFormat::k32Float);
+  std::copy_n(descriptor.begin(), 8, test.user_data.begin() + 4);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[0] = 0x3f800000u;
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = 0x40800000u;
+  test.decoded_counts = {{"IMAGE_ATOMIC_FMAX", 2}};
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer", "R32ui"};
+  return test;
+}
+
+TestCase ImageAtomicFloatContended(bool maximum) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // Float lane ID.
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeMimg0(maximum ? 0x1f : 0x1e, 0x1));
+  code.push_back(EncodeMimg1(1, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = maximum ? "ImageAtomicFmaxContended" : "ImageAtomicFminContended";
+  test.code = std::move(code);
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32,
+                  maximum ? O::IMAGE_ATOMIC_FMAX : O::IMAGE_ATOMIC_FMIN,
+                  O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[0] = maximum ? 0xbf800000u : 0x42c80000u;
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = maximum ? 0x427c0000u : 0u;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer", "R32ui"};
+  return test;
+}
+
+TestCase ImageAtomicFminContended() {
+  return ImageAtomicFloatContended(false);
+}
+
+TestCase ImageAtomicFmaxContended() {
+  return ImageAtomicFloatContended(true);
+}
+
 TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   using O = ShaderOpcode;
 
@@ -21688,6 +21984,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(VectorDpp8Vop1RawWave64Permute);
+  AddCase(VectorDpp8Vop2RawInactiveSourceAndDestination);
+  AddCase(VectorDpp8VopcRawFetchInactive);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
@@ -21872,6 +22171,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
+  AddCase(ImageAtomicFminSpecialValues);
+  AddCase(ImageAtomicFmaxSpecialValues);
+  AddCase(ImageAtomicFmaxCapturedGlcVariants);
+  AddCase(ImageAtomicFminContended);
+  AddCase(ImageAtomicFmaxContended);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
   AddCase(DispatcherIrreducibleControlFlow);
@@ -23607,6 +23911,11 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA02527 R32F 2D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), r32_float,
                          0x280000);
+  auto atomic_r32 = BasicBgraStorageTextureResource();
+  atomic_r32.numeric_class = Prospero::TextureNumericClass::Uint;
+  atomic_r32.read = true;
+  atomic_r32.atomic = true;
+  ValidateStorageTexture(atomic_r32, r32_float, 0x280000);
 
   const auto r8_unorm = Ppsa02527R8UnormStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA02527 R8 UNORM descriptor",

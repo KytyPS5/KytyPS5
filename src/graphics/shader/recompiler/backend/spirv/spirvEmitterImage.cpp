@@ -913,6 +913,24 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           }));
 		return true;
 	}
+	if (op == IR::ValueOpcode::ImageAtomicFMin32 || op == IR::ValueOpcode::ImageAtomicFMax32) {
+		const auto dimension = image.dimension;
+		const auto is_max    = op == IR::ValueOpcode::ImageAtomicFMax32;
+		const auto source    = ctx.Arg(inst, 2);
+		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+		           const auto pointer = state.builder.AllocateId();
+		           const auto pointer_type =
+		               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
+		           state.builder.AddFunction(
+		               {OpImageTexelPointer, pointer_type, pointer,
+		                StorageImageDescriptorPointer(state, mem.resource),
+		                CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0)});
+		           return AtomicUpdate(state, pointer, IR::ResourceKind::Image, [&](uint32_t old) {
+			           return EmitFloatAtomicReplacement(state, old, source, is_max);
+		           });
+		       }));
+		return true;
+	}
 	return false;
 }
 

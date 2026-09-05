@@ -10677,6 +10677,23 @@ public:
       cmd.fillBuffer(m_bda_pagetable_buffer.buffer, 0,
                      m_bda_pagetable_buffer.size, 0);
       cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
+      std::array<vk::BufferMemoryBarrier, 2> barriers{};
+      barriers[0].sType = vk::StructureType::eBufferMemoryBarrier;
+      barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barriers[0].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barriers[0].buffer = m_bda_pagetable_buffer.buffer;
+      barriers[0].offset = 0;
+      barriers[0].size = m_bda_pagetable_buffer.size;
+      barriers[1] = barriers[0];
+      barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead |
+                                  vk::AccessFlagBits::eShaderWrite;
+      barriers[1].buffer = m_fault_buffer.buffer;
+      barriers[1].size = m_fault_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
+                          1, barriers.data(), 0, nullptr);
       for (const auto &[guest_base, backing] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
@@ -10696,20 +10713,7 @@ public:
           address += BufferCache::CACHING_PAGESIZE;
         }
       }
-      std::array<vk::BufferMemoryBarrier, 2> barriers{};
-      barriers[0].sType = vk::StructureType::eBufferMemoryBarrier;
-      barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
       barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
-      barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barriers[0].buffer = m_bda_pagetable_buffer.buffer;
-      barriers[0].offset = 0;
-      barriers[0].size = m_bda_pagetable_buffer.size;
-      barriers[1] = barriers[0];
-      barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead |
-                                  vk::AccessFlagBits::eShaderWrite;
-      barriers[1].buffer = m_fault_buffer.buffer;
-      barriers[1].size = m_fault_buffer.size;
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eComputeShader, {}, 0,
                           nullptr, static_cast<u32>(barriers.size()),

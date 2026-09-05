@@ -193,17 +193,16 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
-	: m_graphics(graphics), m_scheduler(scheduler),
-	  m_fault_manager(graphics, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES),
-	  m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-	  m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-	                         BDA_PAGETABLE_SIZE),
-	  m_memory_tracker(page_manager),
-	  m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-	  m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-	  m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
-	  m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-	  m_texture_cache(texture_cache) {
+    : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+      m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
+      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+                             BDA_PAGETABLE_SIZE),
+      m_memory_tracker(page_manager),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
+      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+      m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),

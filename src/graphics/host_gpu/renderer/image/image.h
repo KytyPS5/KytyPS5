@@ -51,7 +51,6 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
-	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -163,8 +162,8 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext*   m_graphics         = nullptr;
-	CommandScheduler* m_scheduler        = nullptr;
+	GraphicContext&   m_graphics;
+	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

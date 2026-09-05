@@ -62,6 +62,36 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	    view_info.level_count, view_info.base_layer, view_info.layer_count);
 }
 
+[[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
+                                                                uint64_t         slice_stride) {
+	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		auto& copy             = copies[layer];
+		copy.bufferOffset      = slice_stride * layer;
+		copy.bufferRowLength   = info.pitch;
+		copy.bufferImageHeight = info.extent.height;
+		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
+		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+	}
+	return copies;
+}
+
+[[nodiscard]] std::vector<GpuTileInfo> BuildDepthTiles(const ImageInfo& info) {
+	TileBlockLayout block {};
+	EXIT_NOT_IMPLEMENTED(
+	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
+	const auto               full_slice_size = info.data.size / info.resources.layers;
+	std::vector<GpuTileInfo> tiles;
+	tiles.reserve(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		const auto offset = full_slice_size * layer;
+		tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
+		                 full_slice_size, 0, info.extent.width, info.extent.height, 1, info.pitch});
+		tiles.back().surface_z = layer;
+	}
+	return tiles;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -825,18 +855,17 @@ struct TextureCache::TextureTransferPlan {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
-	uint64_t                         linear_size = 0;
 	bool                             swap_bgra16 = false;
 	bool                             valid       = false;
-};
 
-static uint64_t GetLinearSize(std::span<const GpuTileInfo> tiles) {
-	uint64_t size = 0;
-	for (const auto& tile: tiles) {
-		size = std::max(size, tile.linear_offset + tile.linear_size);
+	[[nodiscard]] uint64_t LinearSize() const {
+		uint64_t size = 0;
+		for (const auto& tile: tiles) {
+			size = std::max(size, tile.linear_offset + tile.linear_size);
+		}
+		return size;
 	}
-	return size;
-}
+};
 
 struct TextureCache::DownloadPlan {
 	TextureTransferPlan texture;
@@ -902,7 +931,6 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 		                              info.resources.levels, plan.tiles)) {
 			return plan;
 		}
-		plan.linear_size = GetLinearSize(plan.tiles);
 	}
 	plan.valid = true;
 	return plan;
@@ -954,7 +982,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        plan.linear_size, plan.tiles);
+			                        plan.LinearSize(), plan.tiles);
 		}
 		if (plan.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
@@ -968,31 +996,12 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
-	TileBlockLayout block {};
-	EXIT_NOT_IMPLEMENTED(
-	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
-	const auto                       layers          = info.resources.layers;
-	const auto                       full_slice_size = info.data.size / layers;
-	std::vector<GpuTileInfo>         tiles;
-	std::vector<vk::BufferImageCopy> copies(layers);
-	tiles.reserve(layers);
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		const uint64_t offset  = full_slice_size * layer;
-		auto&          copy    = copies[layer];
-		copy.bufferOffset      = offset;
-		copy.bufferRowLength   = info.pitch;
-		copy.bufferImageHeight = info.extent.height;
-		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
-		if (info.tile_mode != Prospero::TileMode::kLinear) {
-			tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
-			                 full_slice_size, 0, info.extent.width, info.extent.height, 1,
-			                 info.pitch});
-			tiles.back().surface_z = layer;
-		}
-	}
+	const auto          layers          = info.resources.layers;
+	const auto          full_slice_size = info.data.size / layers;
+	auto                copies          = BuildDepthCopies(info, full_slice_size);
 	TileManager::Result linear {source.Handle(), source_offset, source.Size() - source_offset};
-	if (!tiles.empty()) {
+	if (info.IsTiled()) {
+		const auto tiles = BuildDepthTiles(info);
 		linear =
 		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
 	}
@@ -1101,7 +1110,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
-	record.AssociateDepth(depth_id);
+	record.depth_id = depth_id;
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -1470,15 +1479,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
 	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
-	std::vector<vk::BufferImageCopy> copies(layers);
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		auto& copy             = copies[layer];
-		copy.bufferOffset      = full_slice_size * layer;
-		copy.bufferRowLength   = info.pitch;
-		copy.bufferImageHeight = info.extent.height;
-		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
-		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
-	}
+	auto copies = BuildDepthCopies(info, full_slice_size);
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {
 			for (auto& copy: copies) {
@@ -1487,18 +1488,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 			image.Download(copies, destination.Handle(), destination_offset, info.data.size);
 			return;
 		}
-		TileBlockLayout block {};
-		EXIT_NOT_IMPLEMENTED(
-		    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
-		std::vector<GpuTileInfo> tiles;
-		tiles.reserve(layers);
-		for (uint32_t layer = 0; layer < layers; layer++) {
-			const uint64_t offset = full_slice_size * layer;
-			tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
-			                 full_slice_size, 0, info.extent.width, info.extent.height, 1,
-			                 info.pitch});
-			tiles.back().surface_z = layer;
-		}
+		const auto tiles = BuildDepthTiles(info);
 		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, info.data.size,
 		                  info.data.size, tiles);
 		return;
@@ -1526,17 +1516,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	if (!tiled) {
 		return;
 	}
-	TileBlockLayout block {};
-	EXIT_NOT_IMPLEMENTED(
-	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
-	std::vector<GpuTileInfo> tiles;
-	tiles.reserve(layers);
-	for (uint32_t layer = 0; layer < layers; layer++) {
-		const uint64_t offset = full_slice_size * layer;
-		tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
-		                 full_slice_size, 0, info.extent.width, info.extent.height, 1, info.pitch});
-		tiles.back().surface_z = layer;
-	}
+	const auto tiles = BuildDepthTiles(info);
 	m_tiler.Tile(guest_linear.buffer, guest_linear.offset, info.data.size, destination.Handle(),
 	             destination_offset, info.data.size, tiles);
 }
@@ -1573,7 +1553,7 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	}
 
 	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
-	                  destination_size, texture.linear_size, texture.tiles, transform);
+	                  destination_size, texture.LinearSize(), texture.tiles, transform);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1607,8 +1587,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!selected) {
 		return false;
 	}
-	if (const auto owner = m_texture_cache.m_slot_images.try_get(selected);
-	    owner != nullptr && owner->depth_id) {
+	if (const auto owner = m_texture_cache.m_slot_images.try_get(selected); owner != nullptr && owner->depth_id) {
 		selected = owner->depth_id;
 	}
 
@@ -1661,7 +1640,6 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			                              texture.tiles)) {
 				return false;
 			}
-			texture.linear_size = GetLinearSize(texture.tiles);
 		}
 	}
 	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));

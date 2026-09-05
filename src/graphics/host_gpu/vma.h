@@ -6,7 +6,6 @@
 
 namespace Libs::Graphics {
 
-uint64_t VulkanNextMemoryUniqueId();
 void     VulkanTrackAllocation(const VulkanMemory& memory);
 void     VulkanUntrackAllocation(const VulkanMemory& memory);
 

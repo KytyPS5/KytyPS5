@@ -43,9 +43,9 @@ public:
 	KYTY_CLASS_NO_COPY(Buffer);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept;
-	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
+	[[nodiscard]] uint64_t           Size() const noexcept;
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
-	[[nodiscard]] bool               IsCoherent() const noexcept { return m_is_coherent; }
+	[[nodiscard]] bool               IsCoherent() const noexcept;
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -77,7 +77,6 @@ public:
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
-	[[nodiscard]] VulkanBuffer&     NativeBuffer() noexcept { return *m_buffer; }
 
 private:
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
@@ -88,11 +87,9 @@ private:
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
-	uint64_t                      m_size        = 0;
 	vk::DeviceAddress             m_device_address = 0;
 	std::unique_ptr<VulkanBuffer> m_buffer;
 	std::span<uint8_t>            m_mapped;
-	bool                          m_is_coherent = false;
 };
 
 class StreamBuffer final: public Buffer {
@@ -113,7 +110,6 @@ private:
 		uint64_t upper_bound = 0;
 	};
 
-	void                      ReserveWatches(std::vector<Watch>& watches, size_t grow_size);
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);
 	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,

@@ -25536,7 +25536,6 @@ void CheckStorageTextureGpuOwnedRebindState() {
           "fixed guest-owner allocation failed");
   PageManager page_manager;
   MemoryTracker tracker(page_manager);
-  page_manager.OnGpuMap(base, size);
   tracker.ForEachUploadRange(
       base, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
   uint64_t readable = 0;
@@ -25588,7 +25587,6 @@ void CheckStorageTextureGpuOwnedRebindState() {
 
   tracker.UnmarkRegionAsGpuModified(base, size);
   tracker.UntrackMemory(base, size);
-  page_manager.OnGpuUnmap(base, size);
   Require("StorageTextureGpuOwnedRebind", "free",
           Libs::LibKernel::Memory::FreeGuestMemory(base, size),
           "guest-owner free failed");

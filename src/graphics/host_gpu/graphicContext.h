@@ -93,11 +93,8 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
-	void                   CreateBuffer(uint64_t size, VulkanBuffer& buffer);
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
-	void                   MapMemory(VulkanMemory& memory, void*& data);
-	void                   UnmapMemory(VulkanMemory& memory);
 	void                   AppendHardwareRayTracingDeviceExtensions(
 	    const std::vector<vk::ExtensionProperties>& available_extensions,
 	    std::vector<const char*>&                   device_extensions);
@@ -120,12 +117,8 @@ struct VulkanMemory {
 	vk::MemoryRequirements  requirements       = {};
 	vk::MemoryPropertyFlags property           = {};
 	vk::MemoryPropertyFlags preferred_property = {};
-	vk::DeviceMemory        memory             = nullptr;
 	VmaAllocation           allocation         = nullptr;
-	VmaAllocationInfo       allocation_info    = {};
-	vk::DeviceSize          offset             = 0;
 	uint32_t                type               = 0;
-	uint64_t                unique_id          = 0;
 };
 
 struct VulkanImageState {

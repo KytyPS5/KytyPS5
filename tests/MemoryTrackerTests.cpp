@@ -176,13 +176,10 @@ uint8_t *Allocate(PageManager &manager, uint64_t pages) {
       VirtualAlloc(reinterpret_cast<void *>(base), size,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
   Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  manager.OnGpuMap(base, size);
   return memory;
 }
 
-void Release(PageManager &manager, uint8_t *memory, uint64_t size) {
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuUnmap(address, size);
+void Release(uint8_t *memory) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -269,7 +266,7 @@ void TestConcurrentRegionPublication() {
   second.join();
 
   tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  Release(memory);
   Check(cpu_dirty_results.load(std::memory_order_relaxed) == 2,
         "concurrent region publication lost initial CPU ownership");
 }
@@ -303,7 +300,7 @@ void TestCpuDirtyUpload() {
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
   tracker.UntrackMemory(address, page_size * 2);
-  Release(page_manager, memory, page_size * 2);
+  Release(memory);
 }
 
 void TestRangeInvalidation() {
@@ -318,7 +315,6 @@ void TestRangeInvalidation() {
   Check(memory == reinterpret_cast<void *>(base),
         "range invalidation allocation failed");
   const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, size);
 
   tracker.ForEachUploadRange(
       address, size, true, [](uint64_t, uint64_t) noexcept {},
@@ -340,7 +336,7 @@ void TestRangeInvalidation() {
   Check(flushes == 1,
         "clean range invalidation unnecessarily requested a GPU flush");
   tracker.UntrackMemory(address, size);
-  Release(page_manager, memory, size);
+  Release(memory);
 }
 
 void TestGpuReacquisitionAfterInvalidation() {
@@ -387,7 +383,7 @@ void TestGpuReacquisitionAfterInvalidation() {
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  Release(memory);
 }
 
 void TestGpuDirtyBits() {
@@ -411,7 +407,7 @@ void TestGpuDirtyBits() {
         "GPU dirty state did not restore write-only tracking");
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size * 2);
-  Release(page_manager, memory, page_size * 2);
+  Release(memory);
 }
 
 void TestExactDirtyIntervalsSharingTrackerPage() {
@@ -456,7 +452,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
         "draining the final exact interval did not release its tracker page");
 
   tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  Release(memory);
 }
 
 void TestGpuDownloadProtectionMirrors() {
@@ -529,7 +525,7 @@ void TestGpuDownloadProtectionMirrors() {
       "CPU-dirty transition did not release only its write watcher");
 
   tracker.UntrackMemory(address, page_size * 4);
-  Release(page_manager, memory, page_size * 4);
+  Release(memory);
 }
 
 void TestCrossRegionUpload() {
@@ -545,7 +541,6 @@ void TestCrossRegionUpload() {
   Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
-  page_manager.OnGpuMap(address, region_size * 2);
   uint32_t ranges = 0;
   tracker.ForEachUploadRange(
       boundary - page_size, page_size * 2, false,
@@ -557,7 +552,7 @@ void TestCrossRegionUpload() {
         "cross-region upload did not clear and protect both regions");
   tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
   tracker.UntrackMemory(address, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
 }
 
 void TestUploadDoesNotSerializeDisjointRegion() {
@@ -607,7 +602,7 @@ void TestUploadDoesNotSerializeDisjointRegion() {
   tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
   tracker.MarkRegionAsCpuModified(allocation_base, page_size);
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
   Check(completed_while_upload_blocked &&
             query_result.load(std::memory_order_relaxed),
         "upload callback serialized an unrelated tracker region");
@@ -663,7 +658,7 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   tracker.MarkRegionAsCpuModified(allocation_base, page_size);
   tracker.MarkRegionAsCpuModified(second_region, page_size);
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
   Check(completed_while_download_blocked && both_gpu_owned,
         "download callback serialized an unrelated tracker region");
 }
@@ -726,7 +721,7 @@ void TestGpuUnmarkUsesRegionMask() {
         "cross-region GPU unmark did not use one update per 4 MiB region");
 
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
 }
 
 void TestFullRegionGpuUnmarkBatching() {
@@ -767,7 +762,7 @@ void TestFullRegionGpuUnmarkBatching() {
       "full-region GPU unmark did not use one exact 4 MiB protection request");
 
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
 }
 
 [[noreturn]] void RunDeathCase(const char *name) {

@@ -371,8 +371,4 @@ template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, Re
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
 
-void PageManager::OnGpuMap(uint64_t, uint64_t) {}
-
-void PageManager::OnGpuUnmap(uint64_t, uint64_t) {}
-
 } // namespace Libs::Graphics

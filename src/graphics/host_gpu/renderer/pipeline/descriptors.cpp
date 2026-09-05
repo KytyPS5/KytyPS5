@@ -1091,16 +1091,38 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                            vk::AccessFlagBits2::eShaderWrite
 				                      : vk::AccessFlagBits2::eShaderRead,
 				              range, vk_buffer);
-			} else if ((image.binding.force_general || image.binding.is_target) &&
-			           !image.info.IsDepth()) {
+			} else if (image.binding.is_target) {
+				const auto layout = image.binding.attachment_layout;
+				EXIT_IF(layout == vk::ImageLayout::eUndefined);
+				if (image.info.IsDepth()) {
+					const auto host_view =
+					    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+					EXIT_IF(storage || host_view == image.views.end());
+					const auto aspect = host_view->info.aspect;
+					const bool depth_read =
+					    layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+					    layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
+					const bool stencil_read =
+					    layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
+					if ((aspect & vk::ImageAspectFlagBits::eDepth && !depth_read) ||
+					    (aspect & vk::ImageAspectFlagBits::eStencil && !stencil_read)) {
+						EXIT("sampling a writable depth/stencil attachment aspect\n");
+					}
+				}
+				image.Transit(layout,
+				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
+				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                                              : vk::AccessFlags2 {}),
+				              {}, vk_buffer);
+			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access |
-				                  vk::AccessFlagBits2::eColorAttachmentRead |
-				                  vk::AccessFlagBits2::eColorAttachmentWrite,
-				              {}, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,

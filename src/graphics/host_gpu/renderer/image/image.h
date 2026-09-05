@@ -35,11 +35,13 @@ struct ImageUsage {
 };
 
 struct ImageBinding {
-	bool is_bound      = false;
-	bool is_target     = false;
-	bool needs_rebind  = false;
-	bool force_general = false;
-	bool shader_write  = false;
+	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
+	vk::AccessFlags2 attachment_access;
+	bool             is_bound      = false;
+	bool             is_target     = false;
+	bool             needs_rebind  = false;
+	bool             force_general = false;
+	bool             shader_write  = false;
 };
 
 class Image final {

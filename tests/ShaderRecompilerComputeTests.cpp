@@ -8506,9 +8506,7 @@ public:
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
                   (vk::AccessFlagBits2::eShaderRead |
-                   vk::AccessFlagBits2::eShaderWrite |
-                   vk::AccessFlagBits2::eColorAttachmentRead |
-                   vk::AccessFlagBits2::eColorAttachmentWrite),
+                   vk::AccessFlagBits2::eShaderWrite),
               "a later sampled alias dropped an earlier storage write access");
       RenderExecutorTestAccess::ResetBindings(executor);
 
@@ -8559,9 +8557,7 @@ public:
                   vk::ImageLayout::eGeneral &&
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
                   (vk::AccessFlagBits2::eShaderRead |
-                   vk::AccessFlagBits2::eShaderWrite |
-                   vk::AccessFlagBits2::eColorAttachmentRead |
-                   vk::AccessFlagBits2::eColorAttachmentWrite),
+                   vk::AccessFlagBits2::eShaderWrite),
           "sampled/storage aliases did not retain the promoted general "
           "layout and writable access in both generated descriptors");
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -8924,6 +8920,82 @@ public:
           "uint T# did not retain its requested format while the concrete "
           "view followed the D32 backing");
       RenderExecutorTestAccess::ResetBindings(executor);
+
+      auto shared_depth_descriptor = sampled_depth_descriptor;
+      shared_depth_descriptor.fields[0] =
+          static_cast<uint32_t>(phased_depth_address >> 8u);
+      shared_depth_descriptor.fields[1] =
+          static_cast<uint32_t>(phased_depth_address >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u);
+      shared_depth_descriptor.fields[2] = 0;
+      ShaderRecompiler::IR::DescriptorValue shared_depth_value{};
+      std::copy(std::begin(shared_depth_descriptor.fields),
+                std::end(shared_depth_descriptor.fields),
+                shared_depth_value.dwords.begin());
+      shared_depth_value.dword_count = 8;
+      ShaderStageRuntime shared_depth_vertex{&vertex_sampled_info, {}};
+      ShaderStageRuntime shared_depth_pixel{&sampled_info, {}};
+      shared_depth_vertex.resources.images.push_back(shared_depth_value);
+      shared_depth_pixel.resources.images.push_back(shared_depth_value);
+      for (const bool stencil_write : {true, false}) {
+        registers.SetDepthRenderTarget(phased_depth_target);
+        registers.SetRenderControl({});
+        registers.SetDepthControl(read_only_depth_control);
+        HW::StencilControl shared_stencil_control{};
+        shared_stencil_control.stencil_zpass =
+            static_cast<uint8_t>(Prospero::StencilOp::kReplaceTest);
+        registers.SetStencilControl(shared_stencil_control);
+        HW::StencilMask shared_stencil_mask{};
+        shared_stencil_mask.stencil_testval = 0x20;
+        shared_stencil_mask.stencil_mask = 0xff;
+        shared_stencil_mask.stencil_writemask = stencil_write ? 0xf4 : 0;
+        registers.SetStencilMask(shared_stencil_mask);
+        RenderDepthInfo shared_depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, 1, scheduler.Current(), shared_depth);
+        auto shared_bindings =
+            RenderExecutorTestAccess::PrepareGraphicsBindings(
+                executor, shared_depth_vertex, shared_depth_pixel, true);
+        const auto shared_rendering =
+            RenderExecutorTestAccess::AcquireRenderTargets(
+                executor, scheduler.Current(), &no_color, 0, shared_depth);
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), shared_bindings.vertex,
+            *shared_bindings.pixel));
+        const auto expected_layout =
+            stencil_write
+                ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+                : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+        const auto expected_access =
+            vk::AccessFlagBits2::eShaderRead |
+            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+            (stencil_write ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                           : vk::AccessFlags2{});
+        const auto &shared_image = texture_cache.GetImage(shared_depth.image_id);
+        const auto &vertex_image = shared_bindings.vertex.resources.images[0];
+        const auto &pixel_image = shared_bindings.pixel->resources.images[0];
+        Require(name, "sampled depth and stencil attachment layout",
+                shared_depth.image_id == phased_depth.image_id &&
+                    vertex_image.image_id == shared_depth.image_id &&
+                    pixel_image.image_id == shared_depth.image_id &&
+                    MakeImageInfo(vertex_image).imageLayout == expected_layout &&
+                    MakeImageInfo(pixel_image).imageLayout == expected_layout &&
+                    shared_rendering.depth_stencil_attachment.image_layout ==
+                        expected_layout &&
+                    shared_image.backing.state.layout == expected_layout &&
+                    shared_image.backing.state.access_mask == expected_access,
+                "a shader alias replaced the depth/stencil attachment layout "
+                "or dropped an attachment access");
+        scheduler.BeginRendering(shared_rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        Require(name, "attachment binding reset",
+                !shared_image.binding.is_target &&
+                    shared_image.binding.attachment_layout ==
+                        vk::ImageLayout::eUndefined &&
+                    !shared_image.binding.attachment_access,
+                "attachment usage leaked into the next draw");
+      }
 
       auto video_subresource =
           make_target_desc(base + 0x20000, target_mip_size, {1, 1, 1});

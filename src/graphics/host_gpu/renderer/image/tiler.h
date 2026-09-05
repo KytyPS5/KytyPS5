@@ -125,7 +125,7 @@ private:
 	void Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
 	             std::vector<Dispatch>& dispatches);
-	void Record(bool tile, vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);

@@ -668,7 +668,6 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.usage       = ImageUsageFlags(graphics, info);
 
 	vk::ImageCreateInfo create {};
-	create.sType         = vk::StructureType::eImageCreateInfo;
 	create.flags         = backing.flags;
 	create.imageType     = backing.image_type;
 	create.extent        = backing.extent;
@@ -678,7 +677,6 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = backing.state.layout;
 	create.usage         = backing.usage;
-	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vulkan_sample_count(backing.samples);
 
 	vk::ImageFormatProperties properties {};

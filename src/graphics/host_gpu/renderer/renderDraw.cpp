@@ -713,6 +713,7 @@ struct DrawIndexBufferSource {
 	const void*   host_data = nullptr;
 	uint64_t      size      = 0;
 	vk::IndexType type      = vk::IndexType::eUint16;
+	uint32_t      guest_element_size = 0;
 };
 
 struct PreparedIndexBuffer {
@@ -1129,15 +1130,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vs_input_info.mesh;
-		if (emit.indexed || ucfg.GetPrimType() != Prospero::PrimitiveType::kTriStrip ||
-		    primitive_restart_enable || mesh.primitives_per_group == 0) {
+		if (primitive_restart_enable || mesh.primitives_per_group == 0) {
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), emit.indexed, primitive_restart_enable);
 		}
-		if (draw.index_count < 3 || draw.instance_count == 0) {
+		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
+		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups        = (draw.index_count - 3u) / mesh.primitives_per_group + 1u;
+		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
@@ -1148,6 +1149,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	if (mesh_active && emit.indexed) {
+		// Register the original guest indices for shader reads; PrepareGraphicsBindings
+		// synchronizes registered BDA ranges before any draw commands are committed.
+		(void)m_context.GetBufferCache().FindBuffer(
+		    index_source.address, static_cast<uint64_t>(draw.index_count) *
+		                              index_source.guest_element_size);
+	}
 	LogDrawPhase(draw.name, "PrepareBindings");
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
@@ -1195,7 +1203,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
 	if (mesh_active) {
-		const uint32_t draw_data[] {draw.index_count, emit.first_vertex, emit.first_instance};
+		const uint32_t draw_data[] {
+		    draw.index_count,
+		    emit.indexed ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+		    emit.first_instance, index_source.guest_element_size,
+		    static_cast<uint32_t>(index_source.address),
+		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
@@ -1342,6 +1355,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.size =
 	    expanded_indices.empty() ? index_size : expanded_indices.size() * sizeof(uint16_t);
 	index_source.type = index_type;
+	index_source.guest_element_size = static_cast<uint32_t>(index_size / args.index_count);
 
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,

@@ -1079,11 +1079,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
-			                                 u32(mesh.primitives_per_group));
+			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
+			                                           u32(mesh.primitives_per_group));
+			const auto step  = u32(mesh.InputPrimitiveStep());
+			const auto chunk = entry_ir.IMul(primitive_chunk, step);
 			const auto vertices =
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
-			const auto primitives      = subtract_saturate(vertices, u32(2));
+			const auto primitives = entry_ir.Select(
+			    entry_ir.ULessThan(vertices, u32(3)), u32(0),
+			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
+			                                       {subtract_saturate(vertices, u32(3)), step})),
+			                  u32(1)));
 			const auto wave            = entry_ir.ShiftRightLogical(local, u32(6));
 			const auto wave_base       = entry_ir.BitwiseAnd(local, u32(~63u));
 			const auto vertex_count    = minimum(subtract_saturate(vertices, wave_base), u32(64));
@@ -1095,18 +1101,41 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// Triangle-strip adjacency addresses the ES records in LDS. Alternating the
-			// first two indices preserves winding across subgroup boundaries.
-			const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(chunk, local), u32(1));
-			const auto first  = entry_ir.IAdd(local, parity);
-			const auto second = entry_ir.ISub(entry_ir.IAdd(local, u32(1)), parity);
+			// GS adjacency addresses local ES records in LDS. Strip winding alternates
+			// with the global primitive number, including across subgroup boundaries.
+			const auto parity = mesh.InputPrimitiveStep() == 1u
+			                        ? entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1))
+			                        : u32(0);
+			const auto vertex = entry_ir.IMul(local, step);
+			const auto first  = entry_ir.IAdd(vertex, parity);
+			const auto second = entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
 			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
 			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-			                      entry_ir.ShiftLeftLogical(entry_ir.IAdd(local, u32(2)), u32(2)));
+			                      entry_ir.ShiftLeftLogical(entry_ir.IAdd(vertex, u32(2)), u32(2)));
+			const auto input_vertex = entry_ir.IAdd(chunk, local);
+			const auto index_bytes  = draw(3);
+			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+			const auto index_low    = draw(4);
+			const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
+			                                           entry_ir.IMul(input_vertex, index_bytes));
+			const auto index_resource = entry_ir.Emit(
+			    IR::ValueOpcode::GetAddressResource,
+			    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
+			const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
+			result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+			const auto packed_index = entry_ir.Emit(
+			    IR::ValueOpcode::LoadAddressU32,
+			    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
+			     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
+			    IR::MemoryFlags {.index = memory_index});
+			const auto index = IR::U32(entry_ir.Emit(
+			    IR::ValueOpcode::BitFieldUExtract,
+			    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
+			     entry_ir.IMul(index_bytes, u32(8))}));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      entry_ir.IAdd(draw(1), entry_ir.IAdd(chunk, local)));
+			                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 			entry_ir.SetVectorReg(
 			    static_cast<IR::VectorReg>(8),
 			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));

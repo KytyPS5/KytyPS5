@@ -78,6 +78,16 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
+
+	[[nodiscard]] constexpr uint32_t InputPrimitiveStep() const {
+		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriList) ? 3u : 1u;
+	}
+	[[nodiscard]] constexpr uint32_t InputPrimitiveCount(uint32_t vertices) const {
+		return vertices < 3u ? 0u : (vertices - 3u) / InputPrimitiveStep() + 1u;
+	}
+	[[nodiscard]] constexpr uint32_t InputVertexCount(uint32_t primitives) const {
+		return primitives == 0u ? 0u : (primitives - 1u) * InputPrimitiveStep() + 3u;
+	}
 };
 
 struct ShaderVertexInputInfo {

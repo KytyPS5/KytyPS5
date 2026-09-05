@@ -9054,6 +9054,95 @@ void TestFusedShaderHandoffPreservesRegisters() {
   Check(allocations == 1u, "fused shader omitted the back shader allocation");
 }
 
+void TestMeshInputAssembly() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  struct Case {
+    Prospero::PrimitiveType topology;
+    uint32_t capacity, count, group, lane, width, address_low, base_vertex;
+    uint32_t wave_info, first, second, third, byte_offset, vertex_id;
+    bool fetch;
+  };
+  const Case cases[] = {
+      {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
+       0x40000309, 6, 7, 8, 340, 0xabcc, true},
+      {Prospero::PrimitiveType::kTriList, 14, 177, 14, 9, 2, 0x1002, 0,
+       0x40000309, 27, 28, 29, 356, 0, false},
+      {Prospero::PrimitiveType::kTriList, 8, 180, 0, 64, 2, 0x1002, 0,
+       0x41000000, 192, 193, 194, 128, 0, false},
+      {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 1, 0x1000, 5,
+       0x40000206, 3, 4, 5, 4, 0xb0, true},
+      {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 4, 0x1000, 5,
+       0x40000206, 3, 4, 5, 28, 0xabcd0128, true},
+      {Prospero::PrimitiveType::kTriStrip, 5, 8, 1, 1, 0, 0, 11,
+       0x40000305, 1, 2, 3, 0, 15, false},
+      {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
+       0x40000305, 2, 1, 3, 0, 12, false},
+  };
+  for (const auto &test : cases) {
+    ShaderVertexInputInfo input{};
+    auto &mesh = input.mesh;
+    mesh.input_primitive = static_cast<uint32_t>(test.topology);
+    mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
+    mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
+    mesh.threads_num[0] = 256;
+    mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    Decoder::Program decoded;
+    CFG::Graph graph;
+    CFG::BasicBlock block;
+    block.id = 0;
+    block.terminator.kind = CFG::TerminatorKind::Return;
+    graph.blocks.push_back(std::move(block));
+    graph.entry_block = 0;
+    Frontend::TranslateOptions options{};
+    options.stage = ShaderType::Mesh;
+    options.wave_size = 64;
+    options.user_data_count = 0;
+    options.vertex = &input;
+    auto program = Frontend::TranslateProgram(decoded, graph, options);
+    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
+                             test.address_low, 0x12};
+    Inst *load = nullptr;
+    for (auto &inst : *program.blocks.front()) {
+      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+        const uint32_t value = kind == StageInputKind::LocalInvocationIndex
+                                   ? test.lane
+                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
+        inst.ReplaceUsesWith(Value(value));
+      } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
+        Check(load == nullptr, "mesh index fetch emitted duplicate loads");
+        load = &inst;
+      }
+    }
+    ConstantPropagationPass(program.blocks);
+    Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
+              load->Arg(3).Resolve().U1() == test.fetch,
+          "mesh index fetch address or active-lane predicate is wrong");
+    const auto *resource = load->Arg(0).ResolveInstruction();
+    Check(resource != nullptr && resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+              resource->Arg(1).Resolve().U32() == 0x12 &&
+              program.memory_info[load->Flags<MemoryFlags>().index].kind == ResourceKind::Global,
+          "mesh index fetch lost its aligned guest address resource");
+    load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
+    ConstantPropagationPass(program.blocks);
+    std::array<uint32_t, 9> vgprs{};
+    uint32_t sgpr3 = 0;
+    for (const auto &inst : *program.blocks.front()) {
+      if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
+        vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
+      } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
+        sgpr3 = inst.Arg(1).Resolve().U32();
+      }
+    }
+    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
+          "mesh prolog changed triangle assembly, wave counts, vertex ID, or instance ID");
+  }
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -12317,6 +12406,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
+  TestMeshInputAssembly();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();

@@ -878,7 +878,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
 	                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	const auto& group = user_config.GetGeControl();
-	if (user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip ||
+	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
+	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
 	    sh.m_vgtGsOutPrimType != 2u || sh.m_vgtGsMaxVertOut < 3u || group.vertex_group_size < 3u ||
 	    mesh.max_vertices == 0u) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
@@ -887,10 +888,10 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	mesh.max_primitives       = group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
-	                                      static_cast<uint32_t>(group.vertex_group_size) - 2u,
+	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
-	mesh.vertices_per_group = mesh.primitives_per_group + 2u;
+	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
 	mesh.threads_num[0] =
 	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;

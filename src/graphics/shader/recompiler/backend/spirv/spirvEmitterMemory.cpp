@@ -93,11 +93,22 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 
 	const auto soffset_value = inst.Arg(3).Resolve();
-	if (soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
-	    soffset_value.U32() == 0u) {
-		return address;
+	if (!(soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
+	      soffset_value.U32() == 0u)) {
+		address = Binary(state, OpIAdd, TypeU32(state), address, soffset);
 	}
-	return Binary(state, OpIAdd, TypeU32(state), address, soffset);
+
+	// The descriptor is bound at the guest base rounded down to minStorageBufferOffsetAlignment,
+	// and the bytes that were rounded off arrive as the binding's byte offset. Add them here,
+	// before the address is split into an element index and an intra-element byte, so a base that
+	// is not dword aligned stays exact in both halves.
+	if (mem.kind == IR::ResourceKind::Buffer && state.storage_buffer_variable != 0) {
+		const auto array_index =
+		    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+		address = Binary(state, OpIAdd, TypeU32(state), address,
+		                 state.memory_byte_offsets[array_index]);
+	}
+	return address;
 }
 
 uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t add_low,
@@ -661,8 +672,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
-		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		    const auto byte_address = ByteAddress(ctx, inst, mem);
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(

@@ -1318,7 +1318,7 @@ CompiledShader CompileCase(const TestCase &test) {
     if (i < test.storage_buffer_offsets.size()) {
       offset = test.storage_buffer_offsets[i];
     }
-    Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
+    Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
@@ -17137,6 +17137,65 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   return test;
 }
 
+TestCase BufferStoreByteAppliesByteHostOffset() {
+  using O = ShaderOpcode;
+
+  // The binding's byte offset is 13, which is not a multiple of four. It has to reach both halves
+  // of the address: the element index and the byte within that element. Storing one byte at guest
+  // offset 0 must therefore land at byte 13, which is byte 1 of dword 3.
+  //
+  // Folding the offset in as a dword index instead loses the low two bits and puts the byte at
+  // byte 12, so this case distinguishes the two.
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xabu);
+  code.push_back(EncodeMubuf0(0x18u, 0, false, false));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreByteAppliesByteHostOffset";
+  test.code = code;
+  test.initial = {0, 0, 0, 0, 0};
+  test.expected = {0, 0, 0, 0x0000ab00u, 0};
+  test.storage_buffer_range_dwords = 1;
+  test.storage_buffer_offsets = {13};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(4, 1);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferAtomic64AppliesHostOffsetOnce() {
+  using O = ShaderOpcode;
+
+  // A 64-bit buffer atomic reaches its element through EmitBufferAtomic64, which is the one
+  // buffer path that does not go through PrepareMemoryResourceAccess. It must still pick the
+  // binding's byte offset up exactly once.
+  //
+  // The offset here is 8, so one application targets byte 8 (u64 element 1, dwords 2 and 3) and
+  // two applications target byte 16 (u64 element 2, dwords 4 and 5). The bound range covers
+  // three u64 elements, so both land in bounds and the case distinguishes where the write went
+  // rather than whether it happened.
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0xaabbccddu);
+  AppendBufferStoreOpcode(&code, 0x50u, 0, 20);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferAtomic64AppliesHostOffsetOnce";
+  test.code = code;
+  test.initial = {0, 0, 0, 0, 0, 0, 0, 0};
+  test.expected = {0, 0, 0x11223344u, 0xaabbccddu, 0, 0, 0, 0};
+  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_offsets = {8};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_SWAP_X2, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(4, 1);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   using O = ShaderOpcode;
 
@@ -21637,6 +21696,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
+  AddCase(BufferStoreByteAppliesByteHostOffset);
+  AddCase(BufferAtomic64AppliesHostOffsetOnce);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);

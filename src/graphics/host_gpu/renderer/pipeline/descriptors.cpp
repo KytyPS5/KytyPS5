@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -128,6 +129,27 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// Whether every access the shader can make through this buffer reads or writes fewer than 32 bits
+// at a time. Those go through the sub-word path, which derives both the element index and the byte
+// within the element from one byte address, so a binding whose base is not dword aligned stays
+// exact. Anything that loads a whole dword -- a 32-bit component, a packed bitfield, a scalar
+// buffer read, an atomic -- indexes by dword and would silently straddle two of them instead.
+static bool BufferAccessIsSubDword(const ShaderRecompiler::IR::BufferResource& resource) {
+	if (!resource.formatted || resource.scalar || resource.atomic) {
+		return false;
+	}
+	const auto info = ShaderRecompiler::Format::GetFormatInfo(resource.descriptor_format);
+	if (info.type == ShaderRecompiler::Format::ComponentType::Unknown || info.packed_bitfield) {
+		return false;
+	}
+	for (uint32_t component = 0; component < info.component_count; component++) {
+		if (info.component_bits[component] >= 32u) {
+			return false;
+		}
+	}
+	return info.component_count != 0;
+}
+
 static BufferView NativeStorageBuffer(RenderContext&                              context,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -159,8 +181,15 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	const bool dword_aligned_adjustment = adjustment % sizeof(uint32_t) == 0;
+	if ((!dword_aligned_adjustment && !BufferAccessIsSubDword(resource)) || adjustment >= 256 ||
+	    size > max_range - adjustment) {
+		EXIT("storage buffer offset adjustment is unsupported: adjustment=0x%" PRIx64
+		     " size=0x%" PRIx64 " format=0x%" PRIx32 " scalar=%d atomic=%d formatted=%d\n",
+		     static_cast<uint64_t>(adjustment), size,
+		     static_cast<uint32_t>(resource.descriptor_format),
+		     static_cast<int>(resource.scalar), static_cast<int>(resource.atomic),
+		     static_cast<int>(resource.formatted));
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	result.buffer = buffer->Handle();

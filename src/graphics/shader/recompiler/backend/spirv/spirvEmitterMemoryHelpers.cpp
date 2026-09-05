@@ -136,10 +136,16 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			access = PrepareStorageBufferResourceAccess(
 			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
-			access.index_offset =
-			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
-			                  ConstantU32(state, 2u));
-			access.add_index_offset = true;
+			// A Buffer access already folds the binding's byte offset into BufferByteAddress,
+			// where the element index, the sub-word shift and the bounds check all stay exact.
+			// ScalarBuffer/ReadConstBuffer loads a whole dword at address >> 2 and has no byte
+			// address to fold into, so it still needs the offset as a dword index.
+			if (mem.kind == IR::ResourceKind::ScalarBuffer) {
+				access.index_offset =
+				    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
+				                  ConstantU32(state, 2u));
+				access.add_index_offset = true;
+			}
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));

@@ -608,7 +608,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_transfer.subresourceRange.levelCount     = 1;
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+	// Match the acquire wait stage so the layout transition cannot precede acquisition.
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 

@@ -1670,6 +1670,52 @@ void TestHintlessDirectMapUsesCanonicalGuestBase() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFixedMapOverIdenticalRangeIsNoOp() {
+	const char* test = "FixedMapOverIdenticalRangeIsNoOp";
+
+	constexpr uint64_t MapSize = SceKernelPageSize * 2;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            MapSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, MapSize,
+	                                                            SceKernelProtCpuRw, 0, phys_addr,
+	                                                            SceKernelPageSize, "noop_probe"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	*reinterpret_cast<uint64_t*>(base) = 0x4b5954594e4f4f50ull; // "KYTYNOOP"
+
+	void* again = address;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(&again, MapSize, SceKernelProtCpuRw,
+	                                                       SceKernelMapFixed, phys_addr, 0),
+	        "KernelMapDirectMemory(fixed over identical range)");
+	Check(test, reinterpret_cast<uint64_t>(again) == base, "identical fixed map moved the mapping");
+
+	const auto info = Query(test, base);
+	Check(test, info.start == base && info.end == base + MapSize,
+	      "identical fixed map changed the range bounds");
+	Check(test, info.offset == static_cast<uint64_t>(phys_addr),
+	      "identical fixed map changed the physical offset");
+	Check(test, info.protection == SceKernelProtCpuRw,
+	      "identical fixed map changed the protection");
+	Check(test, info.is_direct == 1, "identical fixed map changed the range type");
+	Check(test, std::strcmp(info.name, "noop_probe") == 0,
+	      "identical fixed map replaced the live mapping instead of leaving it alone");
+	Check(test, *reinterpret_cast<const uint64_t*>(base) == 0x4b5954594e4f4f50ull,
+	      "identical fixed map lost the mapped contents");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, MapSize), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, MapSize),
+	        "KernelReleaseDirectMemory");
+}
+
 void TestDirectMemoryContentPersistsAcrossRemap() {
 	const char* test = "DirectMemoryContentPersistsAcrossRemap";
 
@@ -2549,6 +2595,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
+	RunTest(TestFixedMapOverIdenticalRangeIsNoOp);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);

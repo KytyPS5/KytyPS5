@@ -167,11 +167,14 @@ private:
 				default: return false;
 			}
 		}
+		// Integer-only dependency checks do not depend on the active EXEC mask.
+		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
+			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -299,6 +302,7 @@ private:
 	RuntimeValueType                m_type;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
+	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
 class PlanBuilder {

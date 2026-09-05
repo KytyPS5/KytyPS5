@@ -398,6 +398,48 @@ void TestUniformFirstLaneSamplerLod() {
         "uniform sampler LOD clamp evaluated incorrectly");
 }
 
+void TestSharedIntegerRuntimeDependencies() {
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto active =
+      fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  auto inactive = lane;
+  for (uint32_t level = 0; level < 36; level++) {
+    const auto left =
+        fixture.Emit(ValueOpcode::IAdd32, {inactive, Value(1u)});
+    const auto right =
+        fixture.Emit(ValueOpcode::IMul32, {inactive, Value(3u)});
+    inactive = fixture.Emit(ValueOpcode::BitwiseXor32, {left, right});
+  }
+  const auto selected = fixture.Emit(
+      ValueOpcode::SelectU32, {active, Value(42u), inactive});
+  const auto first =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {selected, active});
+  Check(ValidateRuntimeValue(fixture.program, first, RuntimeValueType::Integer),
+        "shared integer dependencies behind an inactive arm were rejected");
+
+  const auto uniform_use = fixture.Emit(ValueOpcode::IAdd32, {first, inactive});
+  Check(!ValidateRuntimeValue(fixture.program, uniform_use,
+                              RuntimeValueType::Integer),
+        "integer-only dependency acceptance was reused as uniform acceptance");
+
+  const auto other_active =
+      fixture.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+  const auto other_first =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {selected, other_active});
+  const auto both = fixture.Emit(ValueOpcode::IAdd32, {first, other_first});
+  Check(!ValidateRuntimeValue(fixture.program, both, RuntimeValueType::Integer),
+        "uniform acceptance was reused across different execution masks");
+
+  const auto floating =
+      fixture.Emit(ValueOpcode::BitCastU32F32, {Value::F32(1.f)});
+  const auto mixed =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {inactive, floating});
+  selected.ResolveInstruction()->SetArg(2, mixed);
+  Check(!ValidateRuntimeValue(fixture.program, first, RuntimeValueType::Integer),
+        "shared integer dependencies hid a floating-point sibling");
+}
+
 void TestConstantBufferBounds() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
@@ -555,6 +597,7 @@ int main() {
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
+    TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();

@@ -28019,6 +28019,144 @@ TestCase ImageAtomicVariants() {
   return test;
 }
 
+TestCase ImageAtomicFloatSpecialValues(bool maximum) {
+  using O = ShaderOpcode;
+
+  // AMD min/max retain the old bits for NaNs and equal signed zeros. Include
+  // subnormals to catch accidental host floating-point flush-to-zero behavior.
+  const std::array<u32, 12> initial = {
+      0x40800000u, 0xc0800000u, 0x7f800000u, 0x7fc00001u,
+      0x3f800000u, 0x80000000u, 0x00000000u, 0x00000001u,
+      0x00000000u, 0xff800000u, 0x40400000u, 0xffc12345u};
+  const std::array<u32, 12> values = {
+      0x40000000u, 0xc0000000u, 0xff800000u, 0x3f800000u,
+      0x7fc00002u, 0x00000000u, 0x80000000u, 0x00000000u,
+      0x80000001u, 0x40000000u, 0x7f800000u, 0x7fc00002u};
+  const std::array<u32, 12> minimum_result = {
+      0x40000000u, 0xc0800000u, 0xff800000u, 0x7fc00001u,
+      0x3f800000u, 0x80000000u, 0x00000000u, 0x00000000u,
+      0x80000001u, 0xff800000u, 0x40400000u, 0xffc12345u};
+  const std::array<u32, 12> maximum_result = {
+      0x40800000u, 0xc0000000u, 0x7f800000u, 0x7fc00001u,
+      0x3f800000u, 0x80000000u, 0x00000000u, 0x00000001u,
+      0x00000000u, 0x40000000u, 0x7f800000u, 0xffc12345u};
+
+  std::vector<u32> code;
+  for (u32 i = 0; i < values.size(); i++) {
+    AppendVMovU32(&code, 20, i & 3u);
+    AppendVMovU32(&code, 21, i >> 2u);
+    AppendVMovLiteral(&code, 1, values[i]);
+    code.push_back(EncodeMimg0(maximum ? 0x1f : 0x1e, 0x1, 0, true));
+    code.push_back(EncodeMimg1(1, 20));
+    AppendStoreVgpr(&code, 1, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = maximum ? "ImageAtomicFmaxSpecialValues" : "ImageAtomicFminSpecialValues";
+  test.code = std::move(code);
+  test.expected.assign(initial.begin(), initial.end());
+  test.opcodes = {O::V_MOV_B32,
+                  maximum ? O::IMAGE_ATOMIC_FMAX : O::IMAGE_ATOMIC_FMIN,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // A non-null float descriptor exercises materialization and specialization,
+  // while the Vulkan atomic view must still use raw R32Uint texels.
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32Float);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  std::copy(initial.begin(), initial.end(), test.storage_image_r32ui.begin());
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  const auto &result = maximum ? maximum_result : minimum_result;
+  std::copy(result.begin(), result.end(), test.expected_storage_image_r32ui.begin());
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer", "R32ui",
+                         StorageUint2DImageBindingName(true)};
+  return test;
+}
+
+TestCase ImageAtomicFminSpecialValues() {
+  return ImageAtomicFloatSpecialValues(false);
+}
+
+TestCase ImageAtomicFmaxSpecialValues() {
+  return ImageAtomicFloatSpecialValues(true);
+}
+
+TestCase ImageAtomicFmaxCapturedGlcVariants() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovU32(&code, 9, 0);
+  AppendVMovLiteral(&code, 5, 0x40000000u);
+  code.push_back(0xf07c0108u);
+  code.push_back(0x00010508u); // PPSA26344 #281: image_atomic_fmax v5, v8, s[4:11]
+  AppendStoreVgpr(&code, 5, 0);
+  AppendVMovLiteral(&code, 5, 0x40800000u);
+  code.push_back(0xf07c2108u); // Same encoding with GLC=1 returns the old texel.
+  code.push_back(0x00010508u);
+  AppendStoreVgpr(&code, 5, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageAtomicFmaxCapturedGlcVariants";
+  test.code = std::move(code);
+  test.expected = {0x40000000u, 0x40000000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_ATOMIC_FMAX,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  const auto descriptor = MakeStorageTextureData(Prospero::BufferFormat::k32Float);
+  std::copy_n(descriptor.begin(), 8, test.user_data.begin() + 4);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[0] = 0x3f800000u;
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = 0x40800000u;
+  test.decoded_counts = {{"IMAGE_ATOMIC_FMAX", 2}};
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer", "R32ui"};
+  return test;
+}
+
+TestCase ImageAtomicFloatContended(bool maximum) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x06, 1, Vgpr(0))); // Float lane ID.
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeMimg0(maximum ? 0x1f : 0x1e, 0x1));
+  code.push_back(EncodeMimg1(1, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = maximum ? "ImageAtomicFmaxContended" : "ImageAtomicFminContended";
+  test.code = std::move(code);
+  test.opcodes = {O::V_CVT_F32_U32, O::V_MOV_B32,
+                  maximum ? O::IMAGE_ATOMIC_FMAX : O::IMAGE_ATOMIC_FMIN,
+                  O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[0] = maximum ? 0xbf800000u : 0x42c80000u;
+  test.expected_storage_image_r32ui = std::vector<u32>(16, 0);
+  test.expected_storage_image_r32ui[0] = maximum ? 0x427c0000u : 0u;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer", "R32ui"};
+  return test;
+}
+
+TestCase ImageAtomicFminContended() {
+  return ImageAtomicFloatContended(false);
+}
+
+TestCase ImageAtomicFmaxContended() {
+  return ImageAtomicFloatContended(true);
+}
+
 TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   using O = ShaderOpcode;
 
@@ -28829,6 +28967,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
+  AddCase(ImageAtomicFminSpecialValues);
+  AddCase(ImageAtomicFmaxSpecialValues);
+  AddCase(ImageAtomicFmaxCapturedGlcVariants);
+  AddCase(ImageAtomicFminContended);
+  AddCase(ImageAtomicFmaxContended);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
   AddCase(DispatcherIrreducibleControlFlow);
@@ -30679,6 +30822,11 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA02527 R32F 2D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), r32_float,
                          0x280000);
+  auto atomic_r32 = BasicBgraStorageTextureResource();
+  atomic_r32.numeric_class = Prospero::TextureNumericClass::Uint;
+  atomic_r32.read = true;
+  atomic_r32.atomic = true;
+  ValidateStorageTexture(atomic_r32, r32_float, 0x280000);
 
   const auto r8_unorm = Ppsa02527R8UnormStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA02527 R8 UNORM descriptor",

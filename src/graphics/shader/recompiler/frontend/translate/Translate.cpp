@@ -183,6 +183,13 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 		value =
 		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
 	}
+	if (operand.dpp8) {
+		const IR::Dpp8MoveFlags flags {
+		    .lane_selectors = operand.dpp8_lane_selectors,
+		    .fetch_inactive = operand.dpp8_fetch_inactive,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::Dpp8MoveU32, {value, ir.GetExec()}, flags));
+	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
 		uint32_t width  = 0;

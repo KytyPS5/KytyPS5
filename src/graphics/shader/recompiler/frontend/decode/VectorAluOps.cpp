@@ -1172,6 +1172,38 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+void DecodeVopcDpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t opcode, uint32_t vsrc1, Instruction& inst, bool fetch_inactive) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
+		return;
+	}
+	const auto* info = Detail::FindOpcode(VOPC_OPS, opcode);
+	if (info == nullptr || !info->supports_dpp) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC DPP8 modifier is not supported for opcode");
+		return;
+	}
+	DecodeVectorGpr(vsrc1, inst.src1);
+	DecodeVectorGpr(src0, inst.src0);
+	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	inst.src_count = 2;
+	ReadLiteralOperands(code, word_index, inst);
+}
+
+void DecodeVopcDpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, uint32_t opcode,
+                    uint32_t vsrc1, Instruction& inst) {
+	DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, false);
+}
+
+void DecodeVopcDpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
+	DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, true);
+}
+
 uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_MUL_LO_U32:
@@ -1554,6 +1586,8 @@ void DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	SetRawWords(inst, code, word_index, 1);
 
 	switch (src0) {
+		case 233u: DecodeVopcDpp8(pc, code, word_index, opcode, vsrc1, inst); return;
+		case 234u: DecodeVopcDpp8Fi(pc, code, word_index, opcode, vsrc1, inst); return;
 		case 249u: DecodeVopcSdwa(pc, code, word_index, opcode, vsrc1, inst); return;
 		case 250u: DecodeVopcDpp(pc, code, word_index, opcode, vsrc1, inst); return;
 		default: break;

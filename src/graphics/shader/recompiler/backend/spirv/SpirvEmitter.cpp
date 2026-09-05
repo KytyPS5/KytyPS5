@@ -263,11 +263,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::Dpp8MoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
 					requirements.subgroup_ballot  = true;
 					requirements.subgroup_shuffle = true;
-					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32 ||
+					    inst.GetOpcode() == IR::ValueOpcode::Dpp8MoveU32) {
 						requirements.subgroup_local_invocation_id = true;
 					}
 					break;

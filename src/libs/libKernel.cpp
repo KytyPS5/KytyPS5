@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -366,6 +367,133 @@ void SetProgName(const std::string& name) {
 
 static KYTY_SYSV_ABI int* get_error_addr() {
 	return Posix::GetErrorAddr();
+}
+
+// FreeBSD's userland mutex primitive, which Sony's libkernel exports as _umtx_op. Every
+// blocking pthread wait and every wake is built on it, so a title whose threads contend on
+// anything at all stops making progress while it is missing.
+//
+// Only the two operations games actually reach are implemented. Anything else returns EINVAL
+// rather than pretending to succeed, so a title that needs more is visible in the log instead
+// of hanging.
+namespace Umtx {
+
+constexpr int OP_WAIT      = 2;
+constexpr int OP_WAKE      = 3;
+constexpr int OP_WAIT_UINT = 11;
+
+// Sized against the observed call rate: a title can reach fifteen thousand calls a
+// second, and every collision costs an unrelated waiter a wakeup it has to discard.
+constexpr size_t BUCKET_COUNT = 256;
+
+// How long a wait sleeps before handing control back to the caller to recheck.
+constexpr auto UNBOUNDED_WAIT_SLICE = std::chrono::milliseconds(20);
+
+struct Bucket {
+	std::mutex              mutex;
+	std::condition_variable cv;
+};
+
+static Bucket g_buckets[BUCKET_COUNT];
+
+// The bucket mutex is held across both the compare and the wait, and a wake takes the same
+// mutex, so a wake that lands between the two cannot be missed.
+static Bucket& BucketFor(const void* obj) {
+	return g_buckets[(reinterpret_cast<uintptr_t>(obj) >> 4u) % BUCKET_COUNT];
+}
+
+struct GuestTimespec {
+	int64_t tv_sec;
+	int64_t tv_nsec;
+};
+
+} // namespace Umtx
+
+static KYTY_SYSV_ABI int umtx_op(void* obj, int op, uint64_t val, void* /*uaddr*/, void* uaddr2) {
+	PRINT_NAME();
+
+	if (obj == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+
+	auto& bucket = Umtx::BucketFor(obj);
+
+	switch (op) {
+		case Umtx::OP_WAIT:
+		case Umtx::OP_WAIT_UINT: {
+			std::unique_lock lock(bucket.mutex);
+
+			const auto read = [&] {
+				return op == Umtx::OP_WAIT_UINT
+				           ? static_cast<uint64_t>(*static_cast<const volatile uint32_t*>(obj))
+				           : static_cast<uint64_t>(*static_cast<const volatile uint64_t*>(obj));
+			};
+
+			// The compare is the whole point: no sleep when the value already moved on.
+			if (read() != val) {
+				return 0;
+			}
+
+			// Waits are bounded even when the guest asks for an unbounded one. A wake raised
+			// before its wait began cannot be recovered afterwards, and the objects seen in
+			// practice keep their compare value at zero on both sides of a wake, so nothing in
+			// the value tells a late waiter that it already missed its turn. Returning early
+			// costs the caller one recheck of its own condition, which every caller of this
+			// primitive already does because spurious wakeups are part of the contract. Not
+			// returning costs a hang.
+			if (uaddr2 == nullptr) {
+				bucket.cv.wait_for(lock, Umtx::UNBOUNDED_WAIT_SLICE);
+				return 0;
+			}
+
+			const auto* t        = static_cast<const Umtx::GuestTimespec*>(uaddr2);
+			const auto  deadline = std::chrono::steady_clock::now() +
+			                      std::chrono::seconds(t->tv_sec) +
+			                      std::chrono::nanoseconds(t->tv_nsec);
+			for (;;) {
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= deadline) {
+					break;
+				}
+				// Never sleep past the deadline. Waiting a whole slice would turn a one
+				// millisecond timeout into a twenty millisecond one.
+				const auto remaining =
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+				bucket.cv.wait_for(lock, std::min<std::chrono::nanoseconds>(
+				                             remaining, Umtx::UNBOUNDED_WAIT_SLICE));
+				if (read() != val) {
+					return 0;
+				}
+			}
+			*Posix::GetErrorAddr() = Posix::POSIX_ETIMEDOUT;
+			return -1;
+		}
+
+		case Umtx::OP_WAKE: {
+			std::lock_guard lock(bucket.mutex);
+			// Always every waiter, never notify_one, even when the guest asks to wake one.
+			// A bucket is shared between addresses, so waking one could wake a waiter on a
+			// neighbouring address and leave the intended thread asleep. Waking a thread that
+			// did not need it is a spurious wakeup and every caller of this primitive rechecks
+			// its own condition; failing to wake the one that did need it is a hang.
+			(void)val;
+			bucket.cv.notify_all();
+			return 0;
+		}
+
+		default: break;
+	}
+
+	// Reports success without doing anything, which is exactly what the unresolved import
+	// stub did before this existed. A title that reaches an operation not implemented here
+	// behaves as it did before rather than meeting a brand new error return. The log names
+	// the missing operation once so the gap stays visible.
+	static std::atomic_bool logged_unsupported {false};
+	if (!logged_unsupported.exchange(true)) {
+		LOGF("\tumtx_op: operation %d is not implemented, reporting success\n", op);
+	}
+	return 0;
 }
 
 static KYTY_SYSV_ABI int getargc() {
@@ -3280,6 +3408,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("Io9+nTKXZtA", Posix::pthread_mutex_timedlock);
 	LIB_FUNC("mkx2fVhNMsg", Posix::pthread_cond_broadcast);
 	LIB_FUNC("Op8TBGY5KHg", Posix::pthread_cond_wait);
+	LIB_FUNC("04AjkP0jO9U", LibKernel::umtx_op);
 	LIB_FUNC("14bOACANTBo", Posix::pthread_once);
 	LIB_FUNC("Z4QosVuAsA0", Posix::pthread_once);
 	LIB_FUNC("Oy6IpwgtYOk", Posix::lseek);

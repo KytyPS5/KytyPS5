@@ -386,12 +386,8 @@ IR::MemoryInfo RebaseRawComponent(IR::MemoryInfo mem, uint32_t component) {
 	return mem;
 }
 
-enum class FormattedSourceKind { Memory, Zero, One };
-
-struct FormattedSource {
-	FormattedSourceKind kind      = FormattedSourceKind::Zero;
-	uint32_t            component = 0;
-};
+using Format::FormattedSource;
+using Format::FormattedSourceKind;
 
 FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                        const Format::BufferFormatInfo& info,
@@ -403,24 +399,17 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 	}
 	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
 	                                output_component);
-	if (selector == 0u) return {};
-	if (selector == 1u) return {FormattedSourceKind::One, 0};
-	if (selector < 4u) {
+	const auto source = Format::ResolveFormattedSource(info, selector);
+	if (source.kind == FormattedSourceKind::Invalid) {
 		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer descriptor has reserved dst_sel");
 	}
-	const auto component = selector - 4u;
-	return component < info.component_count
-	           ? FormattedSource {FormattedSourceKind::Memory, component}
-	           : FormattedSource {};
+	return source;
 }
 
 uint32_t FormattedConstant(ValueEmitContext& ctx, const Format::BufferFormatInfo& info,
                            FormattedSourceKind kind) {
-	if (kind != FormattedSourceKind::One) return ConstantU32(ctx.state, 0);
-	const auto integer =
-	    info.type == Format::ComponentType::Uint || info.type == Format::ComponentType::Sint;
-	return ConstantU32(ctx.state, integer ? 1u : 0x3f800000u);
+	return ConstantU32(ctx.state, Format::FormattedConstantBits(info, kind));
 }
 
 template <typename LoadWordFn, typename LoadSubwordFn>

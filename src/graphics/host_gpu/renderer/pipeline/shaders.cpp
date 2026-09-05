@@ -553,76 +553,7 @@ void CreatePipelineInternal(
 		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
 		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
 
-		auto log_unsupported_vertex_swizzle = [index, attr_size, registers_num](uint32_t swizzle,
-		                                                                        uint32_t expected) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("VertexInput: temporary: accepting unsupported dst swizzle at attr %" PRIu32
-				     " (attr_size=%" PRIu32 ", regs=%" PRIu32 ", swizzle=0x%03" PRIx32
-				     ", expected=0x%03" PRIx32 ")\n",
-				     static_cast<uint32_t>(index), attr_size, registers_num, swizzle, expected);
-				logged = true;
-			}
-		};
-
-		switch (registers_num) {
-			case 1: {
-				auto swizzle = vs_input_info.resources[index].DstSelX();
-				if (swizzle != DstSel(4)) {
-					log_unsupported_vertex_swizzle(swizzle, DstSel(4));
-				}
-				break;
-			}
-			case 2: {
-				auto swizzle  = vs_input_info.resources[index].DstSelXY();
-				auto expected = (attr_size == 1 ? DstSel(4, 0) : DstSel(4, 5));
-				if (swizzle != expected) {
-					log_unsupported_vertex_swizzle(swizzle, expected);
-				}
-				break;
-			}
-			case 3: {
-				auto swizzle  = vs_input_info.resources[index].DstSelXYZ();
-				auto expected = DstSel(4, 5, 6);
-				switch (attr_size) {
-					case 1: expected = DstSel(4, 0, 0); break;
-					case 2: expected = DstSel(4, 5, 0); break;
-					default: break;
-				}
-				if (swizzle != expected) {
-					log_unsupported_vertex_swizzle(swizzle, expected);
-				}
-				break;
-			}
-			case 4: {
-				auto swizzle   = vs_input_info.resources[index].DstSelXYZW();
-				auto expected  = DstSel(4, 5, 6, 7);
-				bool supported = false;
-				switch (attr_size) {
-					case 1:
-						expected  = DstSel(4, 0, 0, 1);
-						supported = (swizzle == expected);
-						break;
-					case 2:
-						expected  = DstSel(4, 5, 0, 1);
-						supported = (swizzle == expected);
-						break;
-					case 3:
-						expected  = DstSel(4, 5, 6, 1);
-						supported = (swizzle == expected || swizzle == DstSel(4, 5, 6, 0));
-						break;
-					default:
-						supported = (swizzle == expected || swizzle == DstSel(4, 5, 6, 1) ||
-						             swizzle == DstSel(4, 5, 6, 0));
-						break;
-				}
-				if (!supported) {
-					log_unsupported_vertex_swizzle(swizzle, expected);
-				}
-				break;
-			}
-			default: EXIT("invalid registers_num");
-		}
+		EXIT_IF(registers_num < 1 || registers_num > 4);
 	}
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};

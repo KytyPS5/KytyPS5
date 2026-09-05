@@ -9203,6 +9203,84 @@ void TestMergedShaderUserDataSnapshot() {
   }
 }
 
+void TestEmbeddedVertexFormatSwizzle() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  struct Case {
+    Prospero::BufferFormat format;
+    uint32_t swizzle, opcode, components, source_width;
+    std::array<uint32_t, 4> expected;
+  };
+  const Case cases[] = {
+      {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 7), 3, 4, 3,
+       {0x3e800000, 0x3f000000, 0x3f400000, 0x3e800000}},
+      {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 1), 3, 4, 3,
+       {0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000}},
+      {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(7, 6, 5, 0), 3, 4, 4,
+       {0x40000000, 0x3f400000, 0x3f000000, 0}},
+      {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(7, 0, 0, 0), 0, 1, 4,
+       {0x40000000, 0, 0, 0}},
+      {Prospero::BufferFormat::k32UInt, DstSel(1, 0, 1, 0), 3, 4, 0,
+       {1, 0, 1, 0}},
+      {Prospero::BufferFormat::k32Float, DstSel(1, 0, 1, 0), 3, 4, 0,
+       {0x3f800000, 0, 0x3f800000, 0}},
+      {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 0x0e, 4, 4,
+       {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000}},
+  };
+  for (const auto &test : cases) {
+    const uint32_t code[] = {EncodeMubuf0(test.opcode), EncodeMubuf1(9, 0, 0),
+                             EncodeExp0(0x20, (1u << test.components) - 1u),
+                             EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(code, decoded);
+    ShaderVertexInputInfo input{};
+    input.resources_num = 1;
+    input.resources[0].fields[3] = (static_cast<uint32_t>(test.format) << 12u) | test.swizzle;
+    input.resources_dst[0].attr_id = 0;
+    input.resources_dst[0].registers_num = static_cast<int>(test.components);
+    Frontend::EmbeddedFetchPlan fetch;
+    fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
+    Frontend::TranslateOptions options{};
+    options.stage = ShaderType::Vertex;
+    options.wave_size = 32;
+    options.user_data_count = 0;
+    options.vertex = &input;
+    options.embedded_fetch = &fetch;
+    auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
+    Check(program.info.vertex_fetch_components[0] == test.source_width,
+          "vertex fetch width follows destination VGPR count instead of selected source channels");
+    const uint32_t source[] = {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000};
+    for (auto *block : program.blocks) {
+      for (auto &inst : *block) {
+        if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
+          Check(inst.Arg(0).U32() == 0 && inst.Arg(1).U32() < 4,
+                "vertex fetch selected an invalid attribute channel");
+          inst.ReplaceUsesWith(Value(source[inst.Arg(1).U32()]));
+        }
+      }
+    }
+    RewriteToSsa(program.blocks);
+    RemoveIdentities(program.blocks);
+    ConstantPropagationPass(program.blocks);
+    uint32_t exports = 0;
+    for (const auto *block : program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() != ValueOpcode::SetAttribute) continue;
+        ++exports;
+        const auto *value = inst.Arg(0).ResolveInstruction();
+        Check(value != nullptr && value->GetOpcode() == ValueOpcode::CompositeConstructU32x4,
+              "vertex fetch export did not retain its four components");
+        for (uint32_t component = 0; component < 4; ++component) {
+          const auto actual = value->Arg(component).Resolve();
+          Check(actual.IsImmediate() && actual.U32() == test.expected[component],
+                "formatted vertex fetch did not apply the source-channel swizzle");
+        }
+      }
+    }
+    Check(exports == 1, "vertex fetch test did not reach its export");
+  }
+}
+
 void TestMeshInputAssembly() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -12558,6 +12636,7 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+  TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();

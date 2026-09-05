@@ -175,22 +175,10 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	return value;
 }
 
-uint32_t VertexInputDefaultComponentU32(EmitterState& state, VertexInputScalarKind kind,
-                                        uint32_t component) {
-	if ((component & 3u) != 3u) {
-		return ConstantU32(state, 0);
-	}
-	return ConstantU32(state, kind == VertexInputScalarKind::Float ? 0x3f800000u : 1u);
-}
-
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(state, input);
+	const auto count = VertexParameterComponentCount(input);
 	const auto kind  = VertexParameterScalarKind(state, input.location);
-	if (component >= count) {
-		return VertexInputDefaultComponentU32(state, kind, component);
-	}
-
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {

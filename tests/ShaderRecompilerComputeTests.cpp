@@ -18433,6 +18433,27 @@ TestCase BufferLoadFormatXyzwResource32_32FloatAppliesXy01() {
   return test;
 }
 
+TestCase BufferLoadFormatXyzwResource323232FloatRepeatsSource() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferLoadOpcode(&code, 0x03, 0, 20);
+  for (u32 i = 0; i < 4; ++i) AppendStoreVgpr(&code, i, i + 4);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferLoadFormatXyzwResource323232FloatRepeatsSource";
+  test.code = std::move(code);
+  test.initial = {0x3e800000u, 0x3f000000u, 0x3f400000u, 0xdeadbeefu, 0, 0, 0, 0};
+  test.expected = {0x3e800000u, 0x3f000000u, 0x3f400000u, 0xdeadbeefu,
+                   0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3e800000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 32, false, BufferFormat(Prospero::BufferFormat::k32_32_32Float));
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1() {
   using O = ShaderOpcode;
 
@@ -22716,6 +22737,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(BufferLoadFormatXyzwResource32_32FloatAppliesXy01);
+  AddCase(BufferLoadFormatXyzwResource323232FloatRepeatsSource);
   AddCase(BufferLoadFormatXyzwResource8_8_8_8UintAppliesWzy1);
   AddCase(BufferLoadFormatXyzwInactiveExecPreservesOverlappingAddress);
   AddCase(BufferFormatStoreVariants);
@@ -23087,6 +23109,8 @@ void CheckEmbeddedFetchVertexOffset() {
     vertex.fetch_buffer_reg = 0;
     vertex.fetch_attrib_reg = 2;
     vertex.resources_num = 1;
+    vertex.resources[0].fields[3] =
+        BufferFormat(Prospero::BufferFormat::k32_32_32_32Float) << 12u | DstSel(4, 5, 6, 7);
     vertex.resources_dst[0].attr_id = 0;
     vertex.resources_dst[0].registers_num = 4;
 
@@ -25966,6 +25990,8 @@ void CheckEmbeddedFetchLaneSpill() {
   vertex.fetch_embedded = true;
   vertex.fetch_buffer_reg = 0;
   vertex.resources_num = 1;
+  vertex.resources[0].fields[3] =
+      BufferFormat(Prospero::BufferFormat::k32_32_32_32Float) << 12u | DstSel(4, 5, 6, 7);
   vertex.resources_dst[0].attr_id = 0;
   vertex.resources_dst[0].registers_num = 4;
 

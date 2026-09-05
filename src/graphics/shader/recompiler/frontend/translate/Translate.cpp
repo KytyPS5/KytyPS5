@@ -1204,12 +1204,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					EXIT("embedded vertex fetch at 0x%08x has no resource for attribute %d",
 					     instruction.pc, embedded->attrib_id);
 				}
-				result.info.vertex_fetch_components[static_cast<size_t>(resource)] =
-				    static_cast<uint8_t>(std::max<uint32_t>(
-				        result.info.vertex_fetch_components[static_cast<size_t>(resource)],
-				        embedded->components));
 				translator.TranslateEmbeddedFetch(instruction, static_cast<uint32_t>(resource),
-				                                  embedded->components);
+				                                  embedded->components,
+				                                  options.vertex->resources[resource]);
 				continue;
 			}
 			translator.TranslateInstruction(instruction);

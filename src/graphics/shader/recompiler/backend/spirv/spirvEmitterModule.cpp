@@ -336,15 +336,8 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 	}
 }
 
-uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input) {
-	uint32_t count = input.component_count;
-	if (state.stage == ShaderType::Vertex && input.location < ShaderVertexInputInfo::RES_MAX &&
-	    input.location < static_cast<uint32_t>(state.input_info.vertex->resources_num) &&
-	    state.input_info.vertex->resources_dst[input.location].registers_num > 0) {
-		count = static_cast<uint32_t>(
-		    state.input_info.vertex->resources_dst[input.location].registers_num);
-	}
-	return std::clamp(count, 1u, 4u);
+uint32_t VertexParameterComponentCount(const InputBinding& input) {
+	return std::clamp(input.component_count, 1u, 4u);
 }
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind) {
@@ -830,7 +823,7 @@ void DefineModule(EmitterState& state) {
 			case IR::StageInputKind::Parameter:
 				if (state.stage == ShaderType::Vertex) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
-					const auto components = VertexParameterComponentCount(state, input);
+					const auto components = VertexParameterComponentCount(input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);
 				} else if (input.per_vertex) {
 					const auto array_type = state.builder.Type(

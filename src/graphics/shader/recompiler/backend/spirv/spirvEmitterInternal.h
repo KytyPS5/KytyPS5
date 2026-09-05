@@ -501,7 +501,7 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
-uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input);
+uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 

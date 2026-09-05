@@ -208,15 +208,16 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::S_CSELECT_B64(const Decoder::Instruction& inst) {
+void Translator::ScalarSelect64(const Decoder::Instruction& inst,
+                                 const Decoder::Operand& false_source) {
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
-	const auto rhs           = ReadU32Pair(inst.src1);
+	const auto rhs           = ReadU32Pair(false_source);
 	const auto selected_mask = IR::U1(
-	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(inst.src1)}));
+	    ir.Emit(IR::ValueOpcode::SelectU1, {condition, ReadMask(inst.src0), ReadMask(false_source)}));
 	const auto selected_mask_valid =
 	    IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
-	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(inst.src1)}));
+	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(false_source)}));
 	if (IsExecOrVcc(inst.dst)) {
 		WriteMask(inst.dst, selected_mask, true);
 		return;

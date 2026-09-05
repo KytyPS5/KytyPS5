@@ -14143,6 +14143,73 @@ TestCase Scalar64BitOps() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarConditionalMoveB64() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ScalarConditionalMoveB64";
+  auto &code = test.code;
+  for (u32 scc : {0u, 1u}) {
+    AppendSMovLiteral(&code, 0, 0x13579bdfu);
+    AppendSMovLiteral(&code, 1, 0x2468ace0u);
+    AppendSMovLiteral(&code, 2, 0xabcdef01u);
+    AppendSMovLiteral(&code, 3, 0xfedcba98u);
+    code.push_back(EncodeSopc(0x06, InlineU32(scc), InlineU32(1)));
+    code.push_back(EncodeSop1(0x06, 0, 2));
+    code.push_back(EncodeSop2(0x0a, 4, InlineU32(1), InlineU32(0)));
+    AppendStoreSgprPair(&code, 0, scc * 3);
+    AppendStoreSgpr(&code, 4, scc * 3 + 2);
+  }
+  AppendEnd(&code);
+  test.expected = {0x13579bdfu, 0x2468ace0u, 0,
+                   0xabcdef01u, 0xfedcba98u, 1};
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CMOV_B64,
+                  O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+TestCase ScalarConditionalMoveB64PreservesMasks() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ScalarConditionalMoveB64PreservesMasks";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 16, 126)); // Save full EXEC.
+  AppendVMovU32(&code, 1, 3);
+  AppendVMovU32(&code, 2, 9);
+  u32 offset = 0;
+  for (u32 destination : {126u, 106u, 8u}) {
+    for (u32 scc : {0u, 1u}) {
+      code.push_back(EncodeVopc(0xc2, Vgpr(0), 1)); // Only lane 3.
+      code.push_back(EncodeSop1(0x04, destination, 106));
+      code.push_back(EncodeSopc(0x06, InlineU32(scc), InlineU32(1)));
+      // EXEC encoding is the captured Pathless instruction, 0xbefe06c1.
+      code.push_back(EncodeSop1(0x06, destination, 193u));
+      code.push_back(EncodeSop2(0x0a, 4, InlineU32(1), InlineU32(0)));
+      code.push_back(EncodeSop1(0x04, 126, destination));
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+      code.push_back(EncodeSop1(0x04, 126, 16));
+      AppendStoreSgprAtLaneDwordOffset(&code, 4, 0, offset + 64);
+      for (u32 lane = 0; lane < 64; ++lane) {
+        test.expected.push_back(scc || lane == 3 ? 9u : 0xdeadbeefu);
+      }
+      test.expected.insert(test.expected.end(), 64, scc);
+      offset += 128;
+    }
+  }
+  AppendEnd(&code);
+  test.initial.assign(test.expected.size(), 0xdeadbeefu);
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::V_CMP_EQ_U32,
+                  O::S_CMP_EQ_U32, O::S_CMOV_B64, O::S_CSELECT_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarAndn2B64SccUsesMaskShadow() {
   using O = ShaderOpcode;
 
@@ -22512,6 +22579,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
+  AddCase(ScalarConditionalMoveB64);
+  AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
   AddCase(ScalarMaskHighWriteInvalidatesProvenance);
   AddCase(ScalarSelectB64PreservesMaskProvenance);
@@ -27041,6 +27110,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarOrn2SaveexecUsesSourceOrNotExec());
     RunCase(&vulkan, ScalarNotB64UpdatesScc());
     RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance());
+    RunCase(&vulkan, ScalarConditionalMoveB64());
+    RunCase(&vulkan, ScalarConditionalMoveB64PreservesMasks());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
     RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
     RunCase(&vulkan, ScalarMaskProvenanceOverlapAndMixedBinary());

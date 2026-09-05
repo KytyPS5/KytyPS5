@@ -1148,7 +1148,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
 			vk::WriteDescriptorSet write {};
-			write.sType          = vk::StructureType::eWriteDescriptorSet;
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
 			write.descriptorType = NativeDescriptorType(binding.kind);
 			write.descriptorCount   = NativeDescriptorCount(binding);

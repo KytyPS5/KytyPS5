@@ -95,9 +95,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	viewport.viewportCount = 1;
 	viewport.scissorCount  = 1;
 	vk::PipelineRasterizationStateCreateInfo rasterization {};
-	rasterization.polygonMode = vk::PolygonMode::eFill;
-	rasterization.cullMode    = vk::CullModeFlagBits::eNone;
-	rasterization.lineWidth   = 1.0f;
+	rasterization.lineWidth = 1.0f;
 	vk::PipelineMultisampleStateCreateInfo multisample {};
 	multisample.rasterizationSamples = samples;
 	vk::PipelineDepthStencilStateCreateInfo depth {};

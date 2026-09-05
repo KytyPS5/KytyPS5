@@ -408,7 +408,6 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
 	vk::DescriptorSetLayoutCreateInfo create {};
-	create.sType        = vk::StructureType::eDescriptorSetLayoutCreateInfo;
 	create.flags        = pipeline.uses_push_descriptors
 	                          ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
 	                          : vk::DescriptorSetLayoutCreateFlags {};

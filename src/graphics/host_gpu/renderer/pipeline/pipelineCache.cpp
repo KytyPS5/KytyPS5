@@ -228,7 +228,6 @@ struct PipelineCache::ProgramCache {
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
 		vk::ShaderModuleCreateInfo create_info {};
-		create_info.sType       = vk::StructureType::eShaderModuleCreateInfo;
 		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
 		create_info.pCode       = result.spirv.data();
 		vk::ShaderModule module = nullptr;
@@ -451,7 +450,6 @@ void PipelineCache::InitializeDriverCache() {
 	}
 
 	vk::PipelineCacheCreateInfo create {};
-	create.sType           = vk::StructureType::ePipelineCacheCreateInfo;
 	create.initialDataSize = initial_data.size();
 	create.pInitialData    = initial_data.empty() ? nullptr : initial_data.data();
 	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);

@@ -34,7 +34,6 @@ CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemap
     : m_graphics(graphics), m_master(master) {
 	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
-	create.sType            = vk::StructureType::eCommandPoolCreateInfo;
 	create.queueFamilyIndex = graphics.queue_family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
@@ -52,7 +51,6 @@ size_t CommandScheduler::CommandPool::Grow() {
 	m_buffers.resize(first + GrowStep);
 
 	vk::CommandBufferAllocateInfo allocate {};
-	allocate.sType              = vk::StructureType::eCommandBufferAllocateInfo;
 	allocate.commandPool        = m_pool;
 	allocate.level              = vk::CommandBufferLevel::ePrimary;
 	allocate.commandBufferCount = static_cast<uint32_t>(GrowStep);
@@ -378,14 +376,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.sType                     = vk::StructureType::eTimelineSemaphoreSubmitInfo;
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
 		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
 		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
 		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
 
 		vk::SubmitInfo submit_info {};
-		submit_info.sType                = vk::StructureType::eSubmitInfo;
 		submit_info.pNext                = &timeline_info;
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();

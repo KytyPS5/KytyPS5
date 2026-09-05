@@ -28,7 +28,6 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 
 VulkanMemoryBarrier MakeShaderWriteDependency() {
 	VulkanMemoryBarrier barrier {};
-	barrier.sType         = vk::StructureType::eMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
@@ -41,7 +40,6 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 
 VulkanMemoryBarrier MakeShaderAccessDependency() {
 	VulkanMemoryBarrier barrier {};
-	barrier.sType         = vk::StructureType::eMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	return barrier;
@@ -49,7 +47,6 @@ VulkanMemoryBarrier MakeShaderAccessDependency() {
 
 VulkanMemoryBarrier MakeShaderWriteHazardDependency() {
 	VulkanMemoryBarrier barrier {};
-	barrier.sType         = vk::StructureType::eMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	return barrier;
@@ -59,7 +56,6 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	EXIT_IF(buffer == nullptr);
 
 	vk::BufferMemoryBarrier barrier {};
-	barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;

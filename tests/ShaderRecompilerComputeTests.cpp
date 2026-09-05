@@ -3324,7 +3324,7 @@ public:
               cache.GetBuffer(scored).CpuAddress() == stream_begin &&
                   cache.GetBuffer(scored).Size() == stream_page * 3 &&
                   cache.GetBuffer(scored).StreamScore() == 17,
-              "buffer range grew before the shadPS4 stream threshold");
+              "buffer range grew before the stream threshold");
       const auto grown =
           cache.FindBuffer(stream_begin + stream_page * 3 - 4, 8);
       const auto &grown_buffer = cache.GetBuffer(grown);

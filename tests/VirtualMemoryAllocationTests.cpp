@@ -561,7 +561,7 @@ void TestFlexibleDmemCompatAndAlignmentFlags() {
 	            SceKernelMapDmemCompat | SceKernelMapAligned64Kb, "dmem_compat"),
 	        "KernelMapNamedFlexibleMemory(DMEM_COMPAT|ALIGNED_64KB)");
 	const auto base = reinterpret_cast<uint64_t>(address);
-	Check(test, (base & (0x10000 - 1u)) == 0, "SDK alignment flag was not honored");
+	Check(test, (base & (0x10000 - 1u)) == 0, "Requested alignment flag was not honored");
 	const auto info = Query(test, base);
 	Check(test, info.is_flexible == 1 && info.is_stack == 0,
 	      "SCE_KERNEL_MAP_DMEM_COMPAT was misclassified as MAP_STACK");

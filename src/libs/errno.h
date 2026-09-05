@@ -154,7 +154,7 @@ constexpr int POSIX_ENOBLK            = 95;
 constexpr int POSIX_EICV              = 96;
 constexpr int POSIX_ENOPLAYGOENT      = 97;
 constexpr int POSIX_EREVOKE           = 98;
-constexpr int POSIX_ESDKVERSION       = 99;
+constexpr int POSIX_EAPIVERSION       = 99;
 constexpr int POSIX_ESTART            = 100;
 constexpr int POSIX_ESTOP             = 101;
 constexpr int POSIX_EINVALID2MB       = 102;
@@ -285,7 +285,7 @@ constexpr int KERNEL_ERROR_ENOBLK          = -2147352481; /* 0x8002005F */
 constexpr int KERNEL_ERROR_EICV            = -2147352480; /* 0x80020060 */
 constexpr int KERNEL_ERROR_ENOPLAYGOENT    = -2147352479; /* 0x80020061 */
 constexpr int KERNEL_ERROR_EREVOKE         = -2147352478; /* 0x80020062 */
-constexpr int KERNEL_ERROR_ESDKVERSION     = -2147352477; /* 0x80020063 */
+constexpr int KERNEL_ERROR_EAPIVERSION     = -2147352477; /* 0x80020063 */
 constexpr int KERNEL_ERROR_ESTART          = -2147352476; /* 0x80020064 */
 constexpr int KERNEL_ERROR_ESTOP           = -2147352475; /* 0x80020065 */
 

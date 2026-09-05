@@ -1341,7 +1341,7 @@ bool IsolateSemanticLoopHeaders(Graph& graph) {
 
 		// SPIR-V requires OpLoopMerge and its branch to remain in the loop header's
 		// physical block. Keep that header as a dedicated control node, exactly like
-		// the separate Loop node in shadPS4's structured AST. Guest instructions live
+		// a separate Loop node in a structured AST. Guest instructions live
 		// in the body so later translation may introduce bounds/EXEC control flow without
 		// displacing OpLoopMerge into a helper-created block.
 		if (!IsolateSemanticLoopHeader(graph, loop->header)) {

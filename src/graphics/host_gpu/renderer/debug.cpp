@@ -843,15 +843,6 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(smc.vport_scissor_enable);
 	EXIT_NOT_IMPLEMENTED(smc.line_stipple_enable);
 
-	if (vp.viewports[0].zmin > 0.000000 || vp.viewports[0].zmax != 1.000000) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t warning: non-default viewport depth clamp zmin = %f, zmax = %f; using "
-			     "viewport scale/offset for Vulkan depth range\n",
-			     vp.viewports[0].zmin, vp.viewports[0].zmax);
-			logged = true;
-		}
-	}
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xscale != 960.000000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xoffset != 960.000000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yscale != -540.000000);
@@ -871,7 +862,7 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_horz_clip - 33.133327f) > 0.001f);
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_vert_clip - 59.629623f) > 0.001f);
 
-	if (vp.guard_band_horz_discard != 0.0f || vp.guard_band_vert_discard != 0.0f) {
+	if (vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
 			LOGF("\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",

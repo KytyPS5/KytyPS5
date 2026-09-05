@@ -350,7 +350,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		viewport.width  = vp.viewports[0].xscale * 2.0f;
 		viewport.height = vp.viewports[0].yscale * 2.0f;
 	}
-	viewport.minDepth = vp.viewports[0].zoffset;
+	viewport.minDepth = vp.viewports[0].zoffset -
+	                    (ctx.GetClipControl().dx_clip_space ? 0.0f : vp.viewports[0].zscale);
 	viewport.maxDepth = vp.viewports[0].zscale + vp.viewports[0].zoffset;
 	vk_buffer.setViewport(0, 1, &viewport);
 

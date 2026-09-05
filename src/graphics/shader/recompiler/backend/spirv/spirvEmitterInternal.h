@@ -59,6 +59,7 @@ enum : uint32_t {
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
 	StorageClassWorkgroup                    = 4,
+	StorageClassPrivate                      = 6,
 	StorageClassFunction                     = 7,
 	StorageClassPushConstant                 = 9,
 	StorageClassImage                        = 11,

@@ -16,8 +16,9 @@ uint32_t MeshElement(EmitterState& state, uint32_t variable, uint32_t storage, u
 	return pointer;
 }
 
-uint32_t MeshLoad(EmitterState& state, uint32_t variable, uint32_t type, uint32_t index) {
-	const auto pointer = MeshElement(state, variable, StorageClassWorkgroup, type, index);
+uint32_t MeshLoad(EmitterState& state, uint32_t variable, uint32_t storage, uint32_t type,
+                  uint32_t index) {
+	const auto pointer = MeshElement(state, variable, storage, type, index);
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, type, value, pointer});
 	return value;
@@ -41,8 +42,11 @@ void DefineMeshOutputs(EmitterState& state) {
 		output.variable_id = MeshArray(
 		    state, StorageClassOutput, type,
 		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
-		output.mesh_data_variable =
-		    MeshArray(state, StorageClassWorkgroup, type, mesh.max_vertices);
+		// Only Layer is read by another invocation, through the primitive's provoking vertex.
+		const bool shared = output.kind == IR::StageOutputKind::Layer;
+		output.mesh_data_variable = MeshArray(
+		    state, shared ? StorageClassWorkgroup : StorageClassPrivate, type,
+		    shared ? mesh.max_vertices : state.lane_count);
 		state.interface_variables.push_back(output.variable_id);
 		state.builder.AddName(output.variable_id, output.debug_name.c_str());
 		if (output.kind == IR::StageOutputKind::Parameter) {
@@ -59,7 +63,7 @@ void DefineMeshOutputs(EmitterState& state) {
 	}
 	state.mesh_allocation = MeshArray(state, StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
-	    MeshArray(state, StorageClassWorkgroup, TypeU32(state), mesh.max_primitives);
+	    MeshArray(state, StorageClassPrivate, TypeU32(state), state.lane_count);
 	state.mesh_primitives =
 	    MeshArray(state, StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
 	state.mesh_cull = MeshArray(state, StorageClassOutput, TypeBool(state), mesh.max_primitives);
@@ -80,13 +84,17 @@ uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32
 		EXIT("mesh export has no output binding: kind=%u index=%u\n", static_cast<uint32_t>(kind),
 		     index);
 	}
-	return MeshElement(state, output->mesh_data_variable, StorageClassWorkgroup,
-	                   MeshOutputType(state, kind), EmitLocalInvocationIndex(state));
+	const bool shared = kind == IR::StageOutputKind::Layer;
+	return MeshElement(state, output->mesh_data_variable,
+	                   shared ? StorageClassWorkgroup : StorageClassPrivate,
+	                   MeshOutputType(state, kind),
+	                   shared ? EmitLocalInvocationIndex(state)
+	                          : ConstantU32(state, state.lane_half));
 }
 
 uint32_t MeshPrimitivePointer(EmitterState& state) {
-	return MeshElement(state, state.mesh_primitive_data, StorageClassWorkgroup, TypeU32(state),
-	                   EmitLocalInvocationIndex(state));
+	return MeshElement(state, state.mesh_primitive_data, StorageClassPrivate, TypeU32(state),
+	                   ConstantU32(state, state.lane_half));
 }
 
 void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -118,10 +126,10 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(
 	    {OpControlBarrier, ConstantU32(state, ScopeWorkgroup), ConstantU32(state, ScopeWorkgroup),
 	     ConstantU32(state, MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
-	const auto vertices =
-	    MeshLoad(state, state.mesh_allocation, TypeU32(state), ConstantU32(state, 0));
-	const auto primitives =
-	    MeshLoad(state, state.mesh_allocation, TypeU32(state), ConstantU32(state, 1));
+	const auto vertices = MeshLoad(state, state.mesh_allocation, StorageClassWorkgroup,
+	                               TypeU32(state), ConstantU32(state, 0));
+	const auto primitives = MeshLoad(state, state.mesh_allocation, StorageClassWorkgroup,
+	                                 TypeU32(state), ConstantU32(state, 1));
 	state.builder.AddFunction({5295u, vertices, primitives}); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		state.lane_half      = half;
@@ -134,7 +142,8 @@ void EmitMeshEntryPoint(EmitterState& state) {
 					continue;
 				}
 				const auto type  = MeshOutputType(state, output.kind);
-				const auto value = MeshLoad(state, output.mesh_data_variable, type, index);
+				const auto value = MeshLoad(state, output.mesh_data_variable, StorageClassPrivate,
+				                            type, ConstantU32(state, half));
 				const auto pointer =
 				    MeshElement(state, output.variable_id, StorageClassOutput, type, index);
 				state.builder.AddFunction({OpStore, pointer, value});
@@ -143,7 +152,8 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		const auto is_primitive = state.builder.AllocateId();
 		state.builder.AddFunction({OpULessThan, TypeBool(state), is_primitive, index, primitives});
 		EmitIfCondition(state, is_primitive, [&] {
-			const auto packed = MeshLoad(state, state.mesh_primitive_data, TypeU32(state), index);
+			const auto packed = MeshLoad(state, state.mesh_primitive_data, StorageClassPrivate,
+			                             TypeU32(state), ConstantU32(state, half));
 			uint32_t   vertex[3] {};
 			for (uint32_t component = 0; component < 3; component++) {
 				vertex[component] = state.builder.AllocateId();
@@ -170,8 +180,9 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind != IR::StageOutputKind::Layer) {
 					continue;
 				}
-				const auto layer = MeshLoad(state, output.mesh_data_variable, TypeU32(state),
-				                            vertex[state.input_info.vertex->mesh.provoking_vertex]);
+				const auto layer = MeshLoad(
+				    state, output.mesh_data_variable, StorageClassWorkgroup, TypeU32(state),
+				    vertex[state.input_info.vertex->mesh.provoking_vertex]);
 				const auto pointer = MeshElement(state, output.variable_id, StorageClassOutput,
 				                                 TypeU32(state), index);
 				state.builder.AddFunction({OpStore, pointer, layer});

@@ -9054,6 +9054,79 @@ void TestFusedShaderHandoffPreservesRegisters() {
   Check(allocations == 1u, "fused shader omitted the back shader allocation");
 }
 
+void TestMeshExportStorage() {
+  const uint32_t front[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSop1(0x20, 0, 6), // merged-stage handoff
+  };
+  const uint32_t back[] = {
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x01, 0, 128),
+      EncodeDs0(0x0d), EncodeDs1(0, 0, 0), // retain guest LDS
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x21, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x22, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x0d, 0x4, false), EncodeExp1(0, 0, 0, 0), // Layer
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 18u);
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 3840;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.back_code = back;
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(front, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto &binary = result.spirv;
+    std::vector<uint32_t> sizes(binary[3]), constants(binary[3]);
+    uint32_t shared_bytes = 0, private_bytes = 0;
+    for (size_t i = 5; i < binary.size(); i += binary[i] >> 16u) {
+      switch (binary[i] & 0xffffu) {
+      case 21u: // OpTypeInt
+      case 22u: // OpTypeFloat
+        sizes[binary[i + 1]] = binary[i + 2] / 8u;
+        break;
+      case 23u: // OpTypeVector
+        sizes[binary[i + 1]] = sizes[binary[i + 2]] * binary[i + 3];
+        break;
+      case 28u: // OpTypeArray
+        sizes[binary[i + 1]] = sizes[binary[i + 2]] * constants[binary[i + 3]];
+        break;
+      case 32u: // OpTypePointer
+        sizes[binary[i + 1]] = sizes[binary[i + 3]];
+        break;
+      case 43u: // OpConstant
+        constants[binary[i + 2]] = binary[i + 3];
+        break;
+      case 59u: // OpVariable
+        if (binary[i + 3] == 4u || binary[i + 3] == 6u) {
+          Check(sizes[binary[i + 1]] != 0, "unmeasured mesh staging type");
+          (binary[i + 3] == 4u ? shared_bytes : private_bytes) += sizes[binary[i + 1]];
+        }
+        break;
+      }
+    }
+    // The Pathless shader 35869c17ce783c88 exceeds the host's 28 KiB budget
+    // when its four vertex exports and primitive exports are shared arrays.
+    Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u && shared_bytes <= 28672u,
+          "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
+    Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
+          "mesh vertex and primitive exports lost their separate logical-lane storage");
+  }
+}
+
 void TestMergedShaderUserDataSnapshot() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -12482,6 +12555,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
+  TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestNewShaderRecompilerSetpcJumpTable();

@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <type_traits>
@@ -65,6 +66,18 @@ inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint3
 	}
 	return {base_layer == last_layer ? TargetViewType::Image2D : TargetViewType::Image2DArray,
 	        base_layer, last_layer - base_layer + 1u, last_layer + 1u};
+}
+
+[[nodiscard]] inline constexpr TargetViewInfo
+ResolveVolumeTargetViewInfo(uint32_t base_layer, uint32_t last_layer, uint32_t mip_depth,
+                            uint32_t draw_layer_offset = 0) {
+	if (mip_depth == 0 || base_layer >= mip_depth) {
+		return {};
+	}
+	// A 3D target view addresses slices of the selected mip. Clamp its inclusive upper bound to
+	// that mip's physical depth while preserving a valid nonzero base slice.
+	const auto clamped_last_layer = std::min(last_layer, mip_depth - 1u);
+	return ResolveTargetViewInfo(base_layer, clamped_last_layer, draw_layer_offset);
 }
 
 #pragma pack(push, 1)

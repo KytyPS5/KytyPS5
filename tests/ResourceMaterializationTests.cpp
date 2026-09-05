@@ -159,6 +159,55 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
+void TestIntegerRuntimeValueFollowsSrtReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = SrtPlan(0x10000);
+  const auto root = plan.descriptor_sources.front().dwords[0];
+  Check(ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
+        "integer SRT read was rejected");
+
+  Block values;
+  auto &comparison = values.AppendNewInst(ValueOpcode::FPOrdLessThanEqual32,
+                                          {Value::F32(1.f), Value::F32(0.f)});
+  auto &selection = values.AppendNewInst(
+      ValueOpcode::SelectU32, {Value(&comparison), Value(1u), Value(0u)});
+  plan.srt_reads[0].value = Value(&selection);
+  Check(ValidateRuntimeValue(plan, root),
+        "ordinary SRT validation rejected a floating-point dependency");
+  Check(!ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
+        "integer SRT validation missed a hidden floating-point dependency");
+
+  auto &first =
+      values.AppendNewInst(ValueOpcode::ReadFirstLane, {root, Value(true)});
+  Check(!ValidateRuntimeValue(plan, Value(&first), RuntimeValueType::Integer),
+        "read-first-lane lost integer-only SRT validation");
+
+  auto &active = values.AppendNewInst(ValueOpcode::ReadFirstLane,
+                                      {Value(&selection), Value(&comparison)});
+  Check(!ValidateRuntimeValue(plan, Value(&active), RuntimeValueType::Integer),
+        "floating-point execution mask was accepted as integer-only");
+
+  auto &lane = values.AppendNewInst(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+       Value(0u)});
+  auto &mask =
+      values.AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(0u)});
+  selection.SetArg(0, Value(&mask));
+  active.SetArg(1, Value(&mask));
+  Check(ValidateRuntimeValue(plan, Value(&active), RuntimeValueType::Integer),
+        "nonuniform integer execution mask was rejected");
+  auto &float_value =
+      values.AppendNewInst(ValueOpcode::BitCastU32F32, {Value::F32(1.f)});
+  selection.SetArg(2, Value(&float_value));
+  Check(!ValidateRuntimeValue(plan, Value(&active), RuntimeValueType::Integer),
+        "floating-point inactive arm was accepted as integer-only");
+
+  plan.srt_reads[0].value = Value(&first);
+  Check(!ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
+        "cyclic SRT read-first-lane dependency was accepted");
+}
+
 void TestUnbasedFlatCacheHitMaterializes() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UnbasedFlatPlan();
@@ -217,6 +266,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationPreservesPriorStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();

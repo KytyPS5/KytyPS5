@@ -620,36 +620,6 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 	return true;
 }
 
-static bool UniformIntegerValue(const ResourcePlan& program, Value root) {
-	if (!ValidateRuntimeValue(program, root)) {
-		return false;
-	}
-	std::vector<Value>              pending {root};
-	std::unordered_set<const Inst*> visited;
-	while (!pending.empty()) {
-		const auto value = pending.back().Resolve();
-		pending.pop_back();
-		// Host floating-point evaluation does not model the shader's rounding/denormal modes.
-		if (TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
-			return false;
-		}
-		const auto* inst = value.TryInstruction();
-		if (inst != nullptr && visited.insert(inst).second) {
-			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
-				const auto& read = program.srt_reads[inst->Arg(1).Resolve().U32()];
-				if (!ValidateRuntimeValue(program, read.value)) {
-					return false;
-				}
-				pending.push_back(read.value);
-			}
-			for (size_t i = 0; i < inst->NumArgs(); i++) {
-				pending.push_back(inst->Arg(i));
-			}
-		}
-	}
-	return true;
-}
-
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 	if (program.blocks.size() != program.block_info.size()) {
 		return {};
@@ -670,7 +640,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
 			case CFG::TerminatorKind::ConditionalBranch:
 				successors = {terminator.true_block, terminator.false_block};
-				if (UniformIntegerValue(program, info.condition)) {
+				if (ValidateRuntimeValue(program, info.condition, RuntimeValueType::Integer)) {
 					block.condition = info.condition;
 				}
 				break;
@@ -820,8 +790,12 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (address == nullptr || address->GetOpcode() != ValueOpcode::MakeImageAddress) return {};
 		for (uint32_t axis = 0; axis < 3; ++axis) {
 			const auto index = FillIndex(address->Arg(axis), axis);
-			if (!index || (*index)[0] != 0 || (*index)[1] != (axis < 2 ? 1u : 0u) ||
-			    (*index)[2] == 0 || (axis == 2 && (*index)[2] != 1)) return {};
+			if (!index || (*index)[0] != 0) return {};
+			if (axis < 2) {
+				if ((*index)[1] != 1 || (*index)[2] == 0) return {};
+			} else if ((*index)[1] != 0 || (*index)[2] != 1) {
+				return {};
+			}
 			result.fill.group_stride[axis] = static_cast<uint32_t>((*index)[2]);
 		}
 		const auto* values = store->Arg(2).ResolveInstruction();
@@ -855,12 +829,14 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
 	                                 ValueOpcode::CompositeConstructU32x3,
 	                                 ValueOpcode::CompositeConstructU32x4};
+	if (result.fill.words > 1 &&
+	    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
+		return {};
 	for (uint32_t i = 0; i < result.fill.words; ++i) {
-		if (result.fill.words > 1 &&
-		    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
-			return {};
 		const auto word = result.fill.words == 1 ? data : vector->Arg(i);
-		if (word.GetType() != Type::U32 || !UniformIntegerValue(program, word)) return {};
+		if (word.GetType() != Type::U32 ||
+		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
+			return {};
 		result.values[i] = word;
 	}
 	return result;

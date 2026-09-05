@@ -1681,9 +1681,10 @@ void TestSopkCompareImmediateExtension() {
       Decoder::Program decoded;
       Decoder::DecodeProgram(shader, decoded);
       const auto &operand = decoded.instructions.front().src1;
-      const int32_t expected = opcode < 0x09
-                                   ? (immediate == 0x8000u ? -32768 : -1)
-                                   : static_cast<int32_t>(immediate);
+      int32_t expected = static_cast<int32_t>(immediate);
+      if (opcode < 0x09) {
+        expected = immediate == 0x8000u ? -32768 : -1;
+      }
       Check(operand.value == static_cast<uint32_t>(expected) &&
                 operand.signed_val == expected,
             "SOPK compare immediate extension does not match its signedness");
@@ -6057,10 +6058,23 @@ void TestMaskedValueDemand() {
           {zero, zero, zero, zero, zero, zero, zero, zero});
       auto &sampler = entry.AppendNewInst(ValueOpcode::GetSamplerResource,
           {zero, zero, zero, zero});
-      program.memory_info.emplace_back().image_sample_flags =
-          use == Use::ExplicitLod ? ShaderRecompiler::Decoder::ImageSampleFlagLod :
-          use == Use::ExplicitGradient ? ShaderRecompiler::Decoder::ImageSampleFlagDerivative :
-          use == Use::LevelZero ? ShaderRecompiler::Decoder::ImageSampleFlagLevelZero : 0u;
+      auto &memory = program.memory_info.emplace_back();
+      switch (use) {
+      case Use::ExplicitLod:
+        memory.image_sample_flags =
+            ShaderRecompiler::Decoder::ImageSampleFlagLod;
+        break;
+      case Use::ExplicitGradient:
+        memory.image_sample_flags =
+            ShaderRecompiler::Decoder::ImageSampleFlagDerivative;
+        break;
+      case Use::LevelZero:
+        memory.image_sample_flags =
+            ShaderRecompiler::Decoder::ImageSampleFlagLevelZero;
+        break;
+      default:
+        break;
+      }
       value = Value(&join.AppendNewInst(ValueOpcode::ImageSampleRaw,
                                          {Value(&image), Value(&sampler), Value(&address)}));
       value = Value(&join.AppendNewInst(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}));

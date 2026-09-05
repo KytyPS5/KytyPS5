@@ -87,10 +87,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 		m_ticks[*found] = m_master.CurrentTick();
 	}
 
-	m_hint = *found + 1;
-	if (m_hint == m_ticks.size()) {
-		m_hint = 0;
-	}
+	m_hint = (*found + 1) % m_ticks.size();
 	return m_buffers[*found];
 }
 

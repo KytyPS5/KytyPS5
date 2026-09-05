@@ -895,8 +895,8 @@ static ScissorRect ScissorRectOffset(ScissorRect r, int x, int y) {
 }
 
 static ScissorRect ScissorRectIntersect(const ScissorRect& a, const ScissorRect& b) {
-	return {a.left > b.left ? a.left : b.left, a.top > b.top ? a.top : b.top,
-	        a.right < b.right ? a.right : b.right, a.bottom < b.bottom ? a.bottom : b.bottom};
+	return {std::max(a.left, b.left), std::max(a.top, b.top),
+	        std::min(a.right, b.right), std::min(a.bottom, b.bottom)};
 }
 
 static ScissorRect ScissorRectClamp(ScissorRect r, uint32_t width, uint32_t height) {

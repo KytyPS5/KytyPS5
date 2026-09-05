@@ -386,7 +386,12 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(const GraphicContext& graphics): device(graphics.device) {
+		const auto& limits                       = graphics.GetPhysicalDeviceProperties().limits;
+		compute_workgroup_limits.max_size        = {limits.maxComputeWorkGroupSize[0],
+		                                            limits.maxComputeWorkGroupSize[1],
+		                                            limits.maxComputeWorkGroupSize[2]};
+		compute_workgroup_limits.max_invocations = limits.maxComputeWorkGroupInvocations;
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -405,7 +410,7 @@ struct PipelineCache::ProgramCache {
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

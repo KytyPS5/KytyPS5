@@ -7544,6 +7544,30 @@ public:
               "render-target upload/readback lost the final Z slice");
       DestroyBuffer(&slice_probe);
 
+      for (const uint32_t base_slice : {0u, 7u}) {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        registers.SetColorView(0, {.base_array_slice_index = base_slice,
+                                   .last_array_slice_index = 32});
+        RenderColorInfo volume_color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, 3, scheduler.Current(), volume_color, 0);
+        const auto volume_rendering =
+            RenderExecutorTestAccess::AcquireRenderTargets(
+                executor, scheduler.Current(), &volume_color, 1, no_depth);
+        Require(name, "3D export bound exceeds depth",
+                volume_color.image_id == color.image_id &&
+                    volume_color.desc.info.extent == vk::Extent3D{32, 32, 32} &&
+                    volume_color.desc.info.data.size == allocation_size &&
+                    volume_color.desc.view_info.type == vk::ImageViewType::e2DArray &&
+                    volume_color.desc.view_info.base_layer == base_slice &&
+                    volume_color.desc.view_info.layer_count == 32 - base_slice &&
+                    volume_rendering.num_layers == 32 - base_slice &&
+                    registers.GetRenderTarget(0).view.last_array_slice_index == 32,
+                "3D export bounds changed the backing or exceeded its attachment depth");
+        scheduler.Current().BeginRendering(volume_rendering);
+        scheduler.Current().EndRendering();
+      }
+
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();

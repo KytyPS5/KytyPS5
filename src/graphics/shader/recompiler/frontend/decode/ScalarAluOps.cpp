@@ -40,6 +40,7 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x04u, Opcode::S_MOV_B64},
     {0x07u, Opcode::S_NOT_B32},
     {0x08u, Opcode::S_NOT_B64},
+    {0x09u, Opcode::S_WQM_B32},
     {0x0au, Opcode::S_WQM_B64},
     {0x0bu, Opcode::S_BREV_B32},
     {0x0fu, Opcode::S_BCNT1_I32_B32},

@@ -8,6 +8,7 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_MOV_B32:
 		case O::S_MOVK_I32: MOV_B32(inst, false); return true;
 		case O::S_MOV_B64: S_MOV_B64(inst); return true;
+		case O::S_WQM_B32: S_WQM_B32(inst); return true;
 		case O::S_WQM_B64: S_WQM_B64(inst); return true;
 		case O::S_GETPC_B64: S_GETPC_B64(inst); return true;
 		case O::S_SETPC_B64: return true;

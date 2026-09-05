@@ -130,7 +130,10 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
-		return BindingType::DepthTarget;
+		return image.info.tile_mode == Prospero::TileMode::kDepth ||
+		               image.info.tile_mode == Prospero::TileMode::kLinear
+		           ? BindingType::DepthTarget
+		           : BindingType::Texture;
 	}
 	if (image.usage.render_target) {
 		return BindingType::RenderTarget;
@@ -815,7 +818,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	return expanded_id;
 }
 
-struct TextureCache::ColorTransferPlan {
+struct TextureCache::TextureTransferPlan {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
@@ -834,14 +837,14 @@ static uint64_t GetLinearSize(std::span<const GpuTileInfo> tiles) {
 }
 
 struct TextureCache::DownloadPlan {
-	ColorTransferPlan color;
-	bool              depth = false;
-	bool              valid = false;
+	TextureTransferPlan texture;
+	bool                depth_target = false;
+	bool                valid        = false;
 };
 
-TextureCache::ColorTransferPlan
-TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
-                                 TransferDirection direction) const {
+TextureCache::TextureTransferPlan
+TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
+                                    TransferDirection direction) const {
 	const auto& info             = image.info;
 	auto        format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
@@ -850,7 +853,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 	const char* owner =
 	    direction == TransferDirection::Upload ? "TextureCache" : "TextureCache readback";
 
-	ColorTransferPlan plan;
+	TextureTransferPlan plan;
 	if (direction == TransferDirection::Upload) {
 		switch (binding) {
 			case BindingType::Texture: break;
@@ -895,6 +898,11 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	plan.regions = TextureBuildImageCopies(plan.layout);
+	if (info.IsDepth()) {
+		for (auto& region: plan.regions) {
+			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
+		}
+	}
 	plan.tiled   = plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear;
 	if (plan.tiled) {
 		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,
@@ -908,12 +916,13 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 }
 
 TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const {
-	const auto&  info = image.info;
-	DownloadPlan plan {.depth = info.IsDepth()};
+	const auto&  info    = image.info;
+	const auto   binding = UploadBinding(image);
+	DownloadPlan plan {.depth_target = binding == BindingType::DepthTarget};
 	if (info.samples != 1 || image.backing.samples != 1) {
 		return plan;
 	}
-	if (plan.depth) {
+	if (plan.depth_target) {
 		plan.valid = IsSupportedDepthPlaneReadback(info) && info.resources.layers != 0 &&
 		             info.data.size % info.resources.layers == 0 &&
 		             Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
@@ -922,8 +931,8 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 	if (info.metadata.compression != VideoOutCompression::Uncompressed) {
 		return plan;
 	}
-	plan.color = BuildColorTransfer(image, UploadBinding(image), TransferDirection::Download);
-	plan.valid = plan.color.valid;
+	plan.texture = BuildTextureTransfer(image, binding, TransferDirection::Download);
+	plan.valid   = plan.texture.valid;
 	return plan;
 }
 
@@ -938,9 +947,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	};
 
 	if (binding != BindingType::DepthTarget) {
-		auto plan = BuildColorTransfer(image, binding, TransferDirection::Upload);
+		auto plan = BuildTextureTransfer(image, binding, TransferDirection::Upload);
 		if (!plan.valid) {
-			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
+			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
 			     "pitch=%u levels=%u layers=%u samples=%u\n",
 			     static_cast<uint32_t>(binding), info.data.address, info.data.size,
@@ -1536,7 +1545,7 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	if (!plan.valid) {
 		EXIT("TextureCache: invalid image download plan\n");
 	}
-	if (plan.depth) {
+	if (plan.depth_target) {
 		if (destination_size != image.info.data.size) {
 			EXIT("TextureCache: partial depth image download is unsupported\n");
 		}
@@ -1544,26 +1553,26 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 		return;
 	}
 
-	auto&      color     = plan.color;
-	const auto transform = color.swap_bgra16 ? TileManager::ColorTransform::SwapBgra16
-	                                         : TileManager::ColorTransform::None;
-	if (!color.tiled) {
+	auto&      texture   = plan.texture;
+	const auto transform = texture.swap_bgra16 ? TileManager::ColorTransform::SwapBgra16
+	                                           : TileManager::ColorTransform::None;
+	if (!texture.tiled) {
 		if (transform == TileManager::ColorTransform::SwapBgra16) {
 			auto linear = m_tiler.GetScratchBuffer(destination_size);
-			image.Download(color.regions, linear.buffer, 0, linear.size);
+			image.Download(texture.regions, linear.buffer, 0, linear.size);
 			m_tiler.SwapBgra16(linear,
 			                   {destination.Handle(), destination_offset, destination_size});
 			return;
 		}
-		for (auto& copy: color.regions) {
+		for (auto& copy: texture.regions) {
 			copy.bufferOffset += destination_offset;
 		}
-		image.Download(color.regions, destination.Handle(), destination_offset, destination_size);
+		image.Download(texture.regions, destination.Handle(), destination_offset, destination_size);
 		return;
 	}
 
-	m_tiler.TileImage(image, color.regions, destination.Handle(), destination_offset,
-	                  destination_size, color.linear_size, color.tiles, transform);
+	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
+	                  destination_size, texture.linear_size, texture.tiles, transform);
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
@@ -1634,24 +1643,24 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!plan.valid) {
 		return false;
 	}
-	if (plan.depth && copy_size != image.info.data.size) {
+	if (plan.depth_target && copy_size != image.info.data.size) {
 		return false;
 	}
-	if (!plan.depth && levels < image.info.resources.levels) {
-		auto& color = plan.color;
-		std::erase_if(color.regions, [levels](const vk::BufferImageCopy& region) {
+	if (!plan.depth_target && levels < image.info.resources.levels) {
+		auto& texture = plan.texture;
+		std::erase_if(texture.regions, [levels](const vk::BufferImageCopy& region) {
 			return region.imageSubresource.mipLevel >= levels;
 		});
-		if (color.regions.empty()) {
+		if (texture.regions.empty()) {
 			return false;
 		}
-		if (color.tiled) {
-			color.tiles.clear();
-			if (!TextureBuildGpuTileInfos(copy_size, color.regions, color.layout, levels,
-			                              color.tiles)) {
+		if (texture.tiled) {
+			texture.tiles.clear();
+			if (!TextureBuildGpuTileInfos(copy_size, texture.regions, texture.layout, levels,
+			                              texture.tiles)) {
 				return false;
 			}
-			color.linear_size = GetLinearSize(color.tiles);
+			texture.linear_size = GetLinearSize(texture.tiles);
 		}
 	}
 	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));

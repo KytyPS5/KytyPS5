@@ -7744,6 +7744,170 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckComparisonDepthTexture() {
+    constexpr const char *name = "ComparisonDepthTexture";
+    constexpr uintptr_t base = 0x0000000204200000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t ordinary_address = base + 0x1000;
+    constexpr std::array<uint16_t, 6> depths{0, 13107, 26214, 39321, 52428, 65535};
+    constexpr std::array<float, 5> references{0.1f, 0.3f, 0.5f, 0.7f, 0.9f};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "comparison texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "comparison texture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    for (uint32_t face = 0; face < depths.size(); face++) {
+      for (const auto address : {base, ordinary_address}) {
+        std::memcpy(reinterpret_cast<void *>(address + face * 0x100),
+                    &depths[face], sizeof(uint16_t));
+      }
+    }
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      auto &cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+      ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+          0x00700000u, 0, 0xb0100204u, 5, 0x00700000u, 0, 0}};
+      ShaderSamplerResource sampler_descriptor{{1u << 12u, 0, 1u << 24u, 0}};
+      TestCase test;
+      test.name = name;
+      test.has_user_data = true;
+      test.image_descriptor_swizzle = descriptor.DstSelXYZW();
+      std::copy_n(descriptor.fields, 8, test.user_data.begin());
+      std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
+      test.user_data[50] = depths.size() * references.size() * sizeof(uint32_t);
+      test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      test.required_spirv = {"OpImageSampleDrefExplicitLod"};
+      std::vector<uint32_t> promoted_expected;
+      for (uint32_t face = 0; face < depths.size(); face++) {
+        for (const auto reference : references) {
+          AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(reference));
+          AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(1.5f));
+          AppendVMovLiteral(&test.code, 22, std::bit_cast<uint32_t>(1.5f));
+          AppendVMovLiteral(&test.code, 23, std::bit_cast<uint32_t>(static_cast<float>(face)));
+          test.code.push_back(EncodeMimg0(0x2f, 1, 0, false, 3));
+          test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+          AppendStoreVgpr(&test.code, 0, static_cast<uint32_t>(test.expected.size()));
+          test.expected.push_back(reference < static_cast<float>(depths[face]) / 65535.f
+                                      ? 0x3f800000u : 0u);
+          promoted_expected.push_back(reference < static_cast<float>(depths[5 - face]) / 65535.f
+                                          ? 0x3f800000u : 0u);
+        }
+      }
+      AppendEnd(&test.code);
+      const auto compiled = CompileCase(test, SubgroupSize());
+      Require(name, "comparison resource", compiled.program.info.images.size() == 1 &&
+                  compiled.program.info.images[0].depth_compare &&
+                  compiled.program.info.images[0].cube,
+              "native cube comparison did not retain its resource semantics");
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images[0], value);
+      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = cache.GetImage(binding.image_id);
+      Require(name, "fresh depth backing", view != nullptr &&
+                  image.info.pixel_format == vk::Format::eD16Unorm &&
+                  image.info.guest_format == Prospero::BufferFormat::k16UNorm &&
+                  image.info.tile_mode == Prospero::TileMode::kStandard256B &&
+                  image.info.data.size == 0x600 && image.info.resources.layers == 6,
+              "comparison texture lost its guest layout or depth representation");
+      auto ordinary_resource = compiled.program.info.images[0];
+      ordinary_resource.depth_compare = false;
+      value.dwords[0] = static_cast<uint32_t>(ordinary_address >> 8u);
+      auto ordinary = RenderExecutorTestAccess::ResolveTexture(executor, ordinary_resource, value);
+      (void)cache.FindTexture(ordinary.image_id, ordinary.desc);
+      auto &color = cache.GetImage(ordinary.image_id);
+      Require(name, "ordinary R16", color.info.pixel_format == vk::Format::eR16Unorm,
+              "ordinary R16 sampling unexpectedly acquired a depth format");
+      scheduler.Finish();
+
+      auto output = CreateStorageBuffer(name, {}, test.expected.size());
+      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor);
+      Image sampled;
+      sampled.view = view;
+      sampled.layout = image.backing.state.layout;
+      Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      Require(name, "six face comparisons",
+              ReadBuffer(name, output, test.expected.size()) == test.expected,
+              "comparison samples lost a depth value or Standard256B face stride");
+
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                    {}, scheduler.Current().Handle());
+      color.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                    {}, scheduler.Current().Handle());
+      for (uint32_t face = 0; face < depths.size(); face++) {
+        const vk::ImageSubresourceRange depth_range{vk::ImageAspectFlagBits::eDepth, 0, 1, face, 1};
+        const vk::ClearDepthStencilValue clear_depth{
+            static_cast<float>(depths[5 - face]) / 65535.f, 0};
+        scheduler.Current().Handle().clearDepthStencilImage(image.backing.image,
+            vk::ImageLayout::eTransferDstOptimal, &clear_depth, 1, &depth_range);
+        const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, face, 1};
+        const vk::ClearColorValue clear_color{std::array<float, 4>{
+            static_cast<float>(depths[5 - face]) / 65535.f, 0.f, 0.f, 0.f}};
+        scheduler.Current().Handle().clearColorImage(color.backing.image,
+            vk::ImageLayout::eTransferDstOptimal, &clear_color, 1, &color_range);
+      }
+      cache.MarkGpuWritten(binding.image_id);
+      cache.MarkGpuWritten(ordinary.image_id);
+      Require(name, "depth readback", TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+              "ordinary tiled depth readback did not use the shared transfer path");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      for (uint32_t face = 0; face < depths.size(); face++) {
+        uint16_t actual = 0;
+        std::memcpy(&actual, reinterpret_cast<const void *>(base + face * 0x100), sizeof(actual));
+        Require(name, "depth guest roundtrip", actual == depths[5 - face],
+                "GPU depth clear was not written to the correct guest face");
+      }
+
+      auto promoted = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images[0], value);
+      sampled.view = cache.FindTexture(promoted.image_id, promoted.desc);
+      auto &promoted_image = cache.GetImage(promoted.image_id);
+      Require(name, "GPU color owner promotion", promoted.image_id != ordinary.image_id &&
+                  promoted_image.info.pixel_format == vk::Format::eD16Unorm &&
+                  promoted_image.IsGpuModified(),
+              "comparison binding did not preserve the GPU-current color owner");
+      sampled.layout = promoted_image.backing.state.layout;
+      scheduler.Finish();
+      Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      Require(name, "promoted comparisons",
+              ReadBuffer(name, output, promoted_expected.size()) == promoted_expected,
+              "color-to-depth ownership conversion changed comparison results");
+      DestroyBuffer(&output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "comparison texture unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "comparison texture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -9943,7 +10107,9 @@ public:
                     image.dimension ==
                         ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
                     image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
+                    image.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -23648,7 +23814,7 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
   Require("SampledDepthDescriptor", "normalized padded pitch",
           descriptor.Width5() + 1u == image.info.extent.width &&
               descriptor.Height5() + 1u == image.info.extent.height &&
-              IsSupportedDepthTargetDescriptor(descriptor, image),
+              IsSupportedSampledDepthDescriptor(descriptor, image),
           "normalized depth image rejected a valid padded descriptor");
 
   const ShaderTextureResource disabled_sampler_tweaks{{
@@ -23682,7 +23848,7 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
   Image msaa_image(context, scheduler, msaa_info);
   msaa_image.usage.depth_target = true;
   Require("SampledDepthDescriptor", "uncompressed 2x MSAA depth",
-          IsSupportedDepthTargetDescriptor(uncompressed_msaa, msaa_image) &&
+          IsSupportedSampledDepthDescriptor(uncompressed_msaa, msaa_image) &&
               IsSupportedDepthTextureEncoding(uncompressed_msaa, msaa_image),
           "valid uncompressed MSAA depth descriptor required an HTILE "
           "compatibility flag");
@@ -23690,7 +23856,7 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
   auto r128_msaa = uncompressed_msaa;
   std::fill(r128_msaa.fields + 4, r128_msaa.fields + 8, 0u);
   Require("SampledDepthDescriptor", "R128 uncompressed 2x MSAA depth",
-          IsSupportedDepthTargetDescriptor(r128_msaa, msaa_image, true) &&
+          IsSupportedSampledDepthDescriptor(r128_msaa, msaa_image, true) &&
               IsSupportedDepthTextureEncoding(r128_msaa, msaa_image, true),
           "valid R128 MSAA depth descriptor required omitted dwords");
 
@@ -23698,7 +23864,7 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
       (descriptor.fields[3] & ~(0xfu << 28u)) |
       (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
   Require("SampledDepthDescriptor", "singleton array descriptor",
-          IsSupportedDepthTargetDescriptor(descriptor, image),
+          IsSupportedSampledDepthDescriptor(descriptor, image),
           "normalized singleton-array depth view was rejected");
   descriptor.fields[3] =
       (descriptor.fields[3] & ~(0xfu << 28u)) |
@@ -23723,7 +23889,7 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
       ResolveTargetTextureView(cube_resource, Prospero::ImageType::kCube, 0,
                                cube_image.info.resources.layers);
   Require("SampledDepthDescriptor", "normalized depth cube",
-          IsSupportedDepthTargetDescriptor(cube_descriptor, cube_image) &&
+          IsSupportedSampledDepthDescriptor(cube_descriptor, cube_image) &&
               IsSupportedDepthTextureEncoding(cube_descriptor, cube_image) &&
               cube_view.type == vk::ImageViewType::e2DArray &&
               cube_view.layer_count == 6,
@@ -23787,14 +23953,14 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
       (non_square_cube.fields[2] & ~(0x3fffu << 14u)) | (511u << 14u);
   image.info.pitch = 1344;
   const bool rejects_pitch =
-      !IsSupportedDepthTargetDescriptor(descriptor, image);
+      !IsSupportedSampledDepthDescriptor(descriptor, image);
   image.info.pitch = 1408;
   Require("SampledDepthDescriptor", "normalized hard guards",
           rejects_pitch &&
-              !IsSupportedDepthTargetDescriptor(partial_cube, cube_image) &&
-              !IsSupportedDepthTargetDescriptor(based_cube, cube_image) &&
+              !IsSupportedSampledDepthDescriptor(partial_cube, cube_image) &&
+              !IsSupportedSampledDepthDescriptor(based_cube, cube_image) &&
               !IsSupportedDepthTextureEncoding(reserved_cube, cube_image) &&
-              !IsSupportedDepthTargetDescriptor(non_square_cube, cube_image),
+              !IsSupportedSampledDepthDescriptor(non_square_cube, cube_image),
           "normalized depth descriptor accepted an incompatible image view");
   std::printf("[host]    %-32s ok\n", "SampledDepthDescriptor");
 }
@@ -26863,6 +27029,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
     CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
+    vulkan.CheckComparisonDepthTexture();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
@@ -26913,6 +27080,7 @@ int main(int argc, char **argv) {
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
+  vulkan.CheckComparisonDepthTexture();
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();

@@ -83,7 +83,7 @@ public:
 
 private:
 	enum class TransferDirection { Upload, Download };
-	struct ColorTransferPlan;
+	struct TextureTransferPlan;
 	struct DownloadPlan;
 
 	struct MetaDataInfo {
@@ -139,9 +139,9 @@ private:
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
-	                                                   TransferDirection direction) const;
-	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
+	[[nodiscard]] TextureTransferPlan
+	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] DownloadPlan BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);

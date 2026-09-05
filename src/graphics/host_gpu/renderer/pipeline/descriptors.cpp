@@ -252,7 +252,7 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 	       descriptor.BaseArray5() == 0;
 }
 
-bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, const Image& image,
+bool IsSupportedSampledDepthDescriptor(const ShaderTextureResource& descriptor, const Image& image,
                                       bool r128) {
 	const auto width        = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height       = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -291,7 +291,9 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	       (supported_2d || supported_array || supported_cube || supported_msaa_2d ||
 	        supported_msaa_array) &&
 	       levels_ok && descriptor.MinLod() == 0 &&
-	       descriptor.TileMode() == Prospero::TileMode::kDepth && descriptor.BCSwizzle() == 0 &&
+	       descriptor.TileMode() == image.info.tile_mode &&
+	       (!multisampled || descriptor.TileMode() == Prospero::TileMode::kDepth) &&
+	       descriptor.BCSwizzle() == 0 &&
 	       (!descriptor.MsaaDepth() || multisampled) && pitch >= width && pitch == image.info.pitch;
 }
 
@@ -332,12 +334,12 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	       image.info.metadata.range.Valid() && image.info.metadata.range.address == metadata_addr;
 }
 
-static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource& resource,
+static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                        const ShaderTextureResource& descriptor, const Image* image,
                                        vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	const bool descriptor_ok =
-	    image != nullptr && IsSupportedDepthTargetDescriptor(descriptor, *image, resource.r128);
+	    image != nullptr && IsSupportedSampledDepthDescriptor(descriptor, *image, resource.r128);
 	const bool encoding_ok =
 	    image != nullptr && IsSupportedDepthTextureEncoding(descriptor, *image, resource.r128);
 	const bool format_ok =
@@ -348,7 +350,7 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
-	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
+	EXIT("unsupported sampled depth image: resource=%d descriptor=%d encoding=%d format=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
@@ -745,7 +747,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto pixel_format        = surface_format.vk_format;
+	const auto* depth_format = resource.depth_compare ? FindGuestDepthFormatPolicy(format) : nullptr;
+	EXIT_NOT_IMPLEMENTED(resource.depth_compare && depth_format == nullptr);
+	const auto pixel_format =
+	    depth_format != nullptr ? depth_format->depth_attachment_format : surface_format.vk_format;
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
@@ -784,7 +789,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateDepthTargetBinding(resource, descriptor, image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, image, pixel_format, size.size);
 		(void)SelectSampledDepthView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	} else if (storage) {

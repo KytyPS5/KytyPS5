@@ -6452,6 +6452,65 @@ public:
               "stale native bytes");
       DestroyBuffer(&alias_readback);
 
+      constexpr uint64_t gpu_authored_storage_offset = 0x338000;
+      auto gpu_authored_storage = MakeLinearDesc(
+          base + gpu_authored_storage_offset, sizeof(uint32_t),
+          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+          Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      gpu_authored_storage.type = BindingType::Storage;
+      gpu_authored_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto gpu_authored_storage_image =
+          texture_cache.FindImage(gpu_authored_storage);
+      auto &gpu_authored_storage_owner =
+          texture_cache.GetImage(gpu_authored_storage_image);
+      gpu_authored_storage_owner.usage.storage = true;
+      texture_cache.MarkGpuWritten(gpu_authored_storage_image);
+      const std::array gpu_authored_storage_images{
+          gpu_authored_storage_image};
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, gpu_authored_storage_images, 121, 0);
+      texture_cache.RunGarbageCollector();
+      Require(name, "GPU-authored storage pressure retention",
+              TextureCacheTestAccess::Contains(
+                  texture_cache, gpu_authored_storage_image) &&
+                  texture_cache.GetImage(gpu_authored_storage_image)
+                      .IsGpuModified(),
+              "pressure GC discarded a storage image whose authoritative "
+              "contents exist only in GPU memory");
+
+      constexpr uint64_t gc_starvation_offset = 0x340000;
+      constexpr size_t gc_protected_count = 20;
+      std::array<ImageId, gc_protected_count + 1> gc_starvation_images{};
+      for (size_t index = 0; index < gc_starvation_images.size(); ++index) {
+        auto desc = MakeLinearDesc(
+            base + gc_starvation_offset + index * 0x100, sizeof(uint32_t),
+            vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+        const auto image = texture_cache.FindImage(desc);
+        gc_starvation_images[index] = image;
+        if (index < gc_protected_count) {
+          auto &owner = texture_cache.GetImage(image);
+          owner.usage.storage = true;
+          texture_cache.MarkGpuWritten(image);
+        }
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(
+          texture_cache, gc_starvation_images, 121, 0);
+      texture_cache.RunGarbageCollector();
+      const bool protected_storage_survived = std::ranges::all_of(
+          std::span{gc_starvation_images}.first(gc_protected_count),
+          [&](ImageId image) {
+            return TextureCacheTestAccess::Contains(texture_cache, image) &&
+                   texture_cache.GetImage(image).IsGpuModified();
+          });
+      Require(
+          name, "GPU-authored storage GC progress",
+          protected_storage_survived &&
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                gc_starvation_images.back()),
+          "protected GPU storage exhausted the pressure-GC candidate budget "
+          "before an evictable image");
+
       constexpr uint64_t submit_readback_offset = 0x336000;
       constexpr uint32_t submit_readback_value = 0x13579bdfu;
       constexpr uint32_t submit_readback_stale = 0x2468ace0u;

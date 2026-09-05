@@ -1899,9 +1899,19 @@ void TextureCache::RunGarbageCollector() {
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
+		const auto gpu_authored_storage = [](const Image& image) {
+			return image.IsGpuModified() && image.usage.storage && !image.usage.render_target &&
+			       !image.usage.video_out;
+		};
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+			const auto owner = m_slot_images.try_get(id);
+			// Storage-only images can contain data that has never been materialized in guest
+			// memory. Do not let protected entries consume the finite collection budget.
+			if (owner != nullptr && owner->registered && gpu_authored_storage(*owner)) {
+				return false;
+			}
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});
@@ -1912,6 +1922,9 @@ void TextureCache::RunGarbageCollector() {
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (gpu_authored_storage(*owner)) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {

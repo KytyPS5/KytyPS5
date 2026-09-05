@@ -76,6 +76,46 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void CheckPosixMetadata() {
+  constexpr char Path[] = "/savedata0/metadata.bin";
+  const int fd = FileSystem::KernelOpen(Path, 0x601, 0777);
+  Check(fd >= 3, "open metadata file");
+
+  const Libs::LibKernel::KernelTimeval times[2] = {{1700000000, 125000},
+                                                   {1700000100, 750000}};
+  Check(FileSystem::KernelFutimes(fd, times) == OK,
+        "set descriptor timestamps");
+
+  Libs::LibKernel::FileSystem::FileStat stat{};
+  Check(FileSystem::KernelFstat(fd, &stat) == OK, "stat metadata descriptor");
+  Check(stat.st_atim.tv_sec == times[0].tv_sec &&
+            stat.st_mtim.tv_sec == times[1].tv_sec,
+        "descriptor timestamps");
+
+  Check(FileSystem::KernelFchmod(fd, 0444) == OK,
+        "set descriptor read-only mode");
+  Check(FileSystem::KernelFchmod(fd, 0666) == OK,
+        "restore descriptor writable mode");
+
+  const Libs::LibKernel::KernelTimeval invalid[2] = {{1700000000, 1000000},
+                                                     {1700000100, 0}};
+  Check(FileSystem::KernelFutimes(fd, invalid) ==
+            Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "reject invalid microseconds");
+  Check(FileSystem::KernelClose(fd) == OK, "close metadata file");
+
+  Check(FileSystem::KernelUtimes(Path, times) == OK, "set path timestamps");
+  Check(FileSystem::KernelStat(Path, &stat) == OK, "stat metadata path");
+  Check(stat.st_atim.tv_sec == times[0].tv_sec &&
+            stat.st_mtim.tv_sec == times[1].tv_sec,
+        "path timestamps");
+  Check(FileSystem::KernelUtimes("/savedata0", times) == OK,
+        "set directory timestamps");
+  Check(FileSystem::KernelUtimes("/savedata0/missing", times) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "report missing metadata path");
+}
+
 } // namespace
 
 int main() {
@@ -92,6 +132,7 @@ int main() {
   FileSystem::Mount(temporary.Path(), "/savedata0");
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
+  CheckPosixMetadata();
   FileSystem::Shutdown();
   subsystems.Destroy();
 

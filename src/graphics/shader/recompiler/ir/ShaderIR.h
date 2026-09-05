@@ -492,8 +492,8 @@ struct CompiledShaderInfo {
 	BindingLayout                 bindings;
 };
 
-struct BufferFillPlan {
-	BufferFill           fill;
+struct UniformFillPlan {
+	UniformFill          fill;
 	std::array<Value, 4> values;
 };
 
@@ -523,7 +523,7 @@ struct ResourcePlan {
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
-	BufferFillPlan                      buffer_fill;
+	UniformFillPlan                     uniform_fill;
 };
 
 struct Program: ResourcePlan {

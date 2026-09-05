@@ -11017,6 +11017,92 @@ void TestTypedDescriptorRealWideMoveTranslation() {
   }
 }
 
+void TestComputeImageFill() {
+  using namespace ShaderRecompiler::IR;
+  // Captured GTA3 stencil clear: one scalar load and one IMAGE_STORE, with
+  // x/y = local + 8 * group and array layer = group.z.
+  const uint32_t shader[] = {
+      0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u,
+      0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du,
+      0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u,
+  };
+  uint32_t value = 0x7bu;
+  const auto address = reinterpret_cast<uint64_t>(&value);
+  const std::array<uint32_t, 12> userdata = {
+      0x20021000u, 0xc0500000u, 0x01d8c347u, 0xd1800204u,
+      0u, 0x00700000u, 0u, 0u,
+      static_cast<uint32_t>(address),
+      static_cast<uint32_t>(address >> 32) | (4u << 16), 1u, 0x14204u,
+  };
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = compute.threads_num[1] = 8;
+  compute.threads_num[2] = 1;
+  compute.workgroup_register = 12;
+  compute.thread_ids_num = 2;
+  compute.group_id[0] = compute.group_id[1] = compute.group_id[2] = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = userdata;
+  enum class Mutation { None, Offset, WrongAxis, VaryingValue, Predicate, ExtraStore, A16 };
+  const auto Run = [&](Mutation mutation, bool clean = true) {
+    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+    auto &program = translated.program;
+    for (auto *block : program.blocks) {
+      const auto found = std::ranges::find(*block, ValueOpcode::ImageWrite, &Inst::GetOpcode);
+      if (found == block->end()) continue;
+      auto &store = *found;
+      auto *coordinates = store.Arg(1).ResolveInstruction();
+      auto *values = store.Arg(2).ResolveInstruction();
+      Check(coordinates && values, "stencil fill fixture lost its image operands");
+      const auto x = coordinates->Arg(0);
+      switch (mutation) {
+      case Mutation::None: break;
+      case Mutation::Offset:
+        coordinates->SetArg(0, Value(&*block->PrependNewInst(found, ValueOpcode::IAdd32,
+                                                           {x, Value(1u)})));
+        break;
+      case Mutation::WrongAxis: coordinates->SetArg(1, x); break;
+      case Mutation::VaryingValue: values->SetArg(0, x); break;
+      case Mutation::Predicate:
+        store.SetArg(3, Value(&*block->PrependNewInst(found, ValueOpcode::ULessThan32,
+                                                    {x, Value(32u)})));
+        break;
+      case Mutation::ExtraStore:
+        block->PrependNewInst(found, ValueOpcode::ImageWrite,
+            {store.Arg(0), store.Arg(1), store.Arg(2), store.Arg(3)}, store.Flags<uint64_t>());
+        break;
+      case Mutation::A16:
+        program.memory_info[store.Flags<MemoryFlags>().index].image_sample_flags |=
+            ShaderRecompiler::Decoder::ImageSampleFlagA16;
+        break;
+      }
+      break;
+    }
+    auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan,
+              {.user_data = userdata, .read_memory = ReadHostTestMemory,
+               .read_specialization_memory = clean ? ReadHostTestMemory : nullptr},
+              snapshot, specialization),
+          "captured stencil clear did not materialize");
+    const auto &fill = snapshot.uniform_fill;
+    const bool expected = mutation == Mutation::None && clean;
+    Check((fill.kind == UniformFillKind::Image) == expected,
+          "image fill proof accepted an unsafe store or missed the captured clear");
+    if (expected) {
+      Check(fill.resource == 0 && fill.words == 1 && fill.value == value &&
+                fill.group_stride == std::array<uint32_t, 3>{8, 8, 1},
+            "image fill lost its scalar value or axis coverage");
+    }
+  };
+  Run(Mutation::None);
+  Run(Mutation::None, false);
+  for (const auto mutation : {Mutation::Offset, Mutation::WrongAxis, Mutation::VaryingValue,
+                              Mutation::Predicate, Mutation::ExtraStore, Mutation::A16})
+    Run(mutation);
+}
+
 void TestTypedDescriptorRealCarryAndScalarLoads() {
   const uint32_t carry_shader[] = {
       EncodeSop1(0x1f, 0, 0),      // s_getpc_b64 s[0:1]
@@ -12238,6 +12324,7 @@ int main() {
   TestRenderTargetReverseExportMapping();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();
+  TestComputeImageFill();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();
   TestSrtWalkerVccBaseTranslation();

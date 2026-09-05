@@ -211,6 +211,13 @@ struct TextureCacheTestAccess {
     return std::unique_lock(cache.m_lock);
   }
 
+  static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
+                         const vk::ImageSubresourceRange &range,
+                         const vk::ClearValue &clear) {
+    auto lock = Lock(cache);
+    cache.ClearImage(command, id, range, clear);
+  }
+
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
@@ -368,6 +375,12 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static bool TryConsumeComputeImageClear(RenderExecutor &executor,
+      const ShaderComputeInputInfo &input, CommandBuffer &command,
+      uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
+    return executor.TryConsumeComputeImageClear(input, command, x, y, z, mode);
+  }
+
   static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
                                          const ShaderComputeInputInfo &input,
                                          const CommandBuffer &buffer) {
@@ -5327,6 +5340,72 @@ public:
               "cleared image could not be read or written after ownership "
               "transfer");
 
+      auto stencil_clear_desc = MakeLinearDesc(
+          base + 0x27e0000, 0x1000, vk::Format::eD32SfloatS8Uint,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {13, 11, 1}, 2, 4, 1);
+      stencil_clear_desc.info.stencil = {base + 0x27e2000, 0x1000};
+      stencil_clear_desc.info.resources.levels = 2;
+      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11};
+      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5};
+      stencil_clear_desc.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      const auto stencil_clear_id = texture_cache.FindImage(stencil_clear_desc);
+      auto &stencil_clear_image = texture_cache.GetImage(stencil_clear_id);
+      stencil_clear_image.Transit(vk::ImageLayout::eTransferDstOptimal,
+          vk::AccessFlagBits2::eTransferWrite, {}, command.Handle());
+      const vk::ClearDepthStencilValue initial_depth_stencil{0.75f, 0x91};
+      const vk::ImageSubresourceRange all_depth_stencil{
+          stencil_clear_desc.view_info.aspect, 0, 2, 0, 2};
+      command.Handle().clearDepthStencilImage(stencil_clear_image.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, &initial_depth_stencil, 1,
+          &all_depth_stencil);
+      texture_cache.MarkGpuWritten(stencil_clear_id);
+      vk::ClearValue stencil_value{};
+      stencil_value.depthStencil = vk::ClearDepthStencilValue{0.f, 0x35};
+      TextureCacheTestAccess::ClearImage(texture_cache, command, stencil_clear_id,
+          {vk::ImageAspectFlagBits::eStencil, 1, 1, 1, 1}, stencil_value);
+
+      // Read every mip/layer of both aspects to prove that the stencil clear is local.
+      auto stencil_readback = CreateHostBuffer(name, 0x4000,
+          vk::BufferUsageFlagBits::eTransferDst, {});
+      std::vector<vk::BufferImageCopy> stencil_copies;
+      for (uint32_t mip = 0; mip < 2; mip++) {
+        for (uint32_t layer = 0; layer < 2; layer++) {
+          for (const auto aspect : {vk::ImageAspectFlagBits::eDepth,
+                                    vk::ImageAspectFlagBits::eStencil}) {
+            vk::BufferImageCopy copy{};
+            copy.bufferOffset = stencil_copies.size() * 0x800;
+            copy.imageSubresource = {aspect, mip, layer, 1};
+            copy.imageExtent = {13u >> mip, 11u >> mip, 1};
+            stencil_copies.push_back(copy);
+          }
+        }
+      }
+      stencil_clear_image.Download(stencil_copies, stencil_readback.buffer, 0,
+                                   stencil_readback.size);
+      HostReadBarrier(stencil_readback.buffer, stencil_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      const auto stencil_words = ReadBuffer(name, stencil_readback, 0x1000);
+      const auto *stencil_bytes = reinterpret_cast<const uint8_t *>(stencil_words.data());
+      for (const auto &copy : stencil_copies) {
+        const auto &sub = copy.imageSubresource;
+        const auto count = copy.imageExtent.width * copy.imageExtent.height;
+        const auto *bytes = stencil_bytes + copy.bufferOffset;
+        const bool depth = sub.aspectMask == vk::ImageAspectFlagBits::eDepth;
+        for (uint32_t pixel = 0; pixel < count; pixel++) {
+          uint32_t actual = bytes[pixel];
+          if (depth) std::memcpy(&actual, bytes + pixel * 4, 4);
+          const uint32_t expected = depth ? std::bit_cast<uint32_t>(0.75f)
+              : sub.mipLevel == 1 && sub.baseArrayLayer == 1 ? 0x35u : 0x91u;
+          Require(name, "stencil clear preserves depth and neighbors", actual == expected,
+                  "selected stencil clear changed depth, another mip, or another layer");
+        }
+      }
+      DestroyBuffer(&stencil_readback);
+
       constexpr uint64_t partial_image_offset = 0xa000;
       constexpr uint64_t partial_buffer_offset = 0xa010;
       constexpr uint64_t partial_clean_offset = 0xa020;
@@ -9725,35 +9804,100 @@ public:
               "RebindImages did not acquire the associated depth owner");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      ShaderRecompiler::IR::CompiledShaderInfo stencil_storage_program{};
-      stencil_storage_program.stage = ShaderType::Compute;
-      auto stencil_storage_resource = stencil_resource;
-      stencil_storage_resource.resource_class =
-          ShaderRecompiler::IR::ImageResourceClass::Storage;
-      stencil_storage_resource.read = false;
-      stencil_storage_resource.written = true;
-      stencil_storage_program.info.images.push_back(stencil_storage_resource);
+      // Execute the captured IMAGE_STORE clear through production fill recognition.
+      const std::array<uint32_t, 12> stencil_shader{
+          0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u,
+          0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du,
+          0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u};
+      uint32_t stencil_byte = 0x35;
+      const auto value_address = reinterpret_cast<uint64_t>(&stencil_byte);
       auto storage_stencil = stencil;
+      storage_stencil.fields[3] = (storage_stencil.fields[3] & 0x0fffffffu) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
       storage_stencil.fields[5] = 0x00700000u;
-      ShaderRecompiler::IR::DescriptorValue stencil_storage_descriptor{};
-      std::copy(std::begin(storage_stencil.fields),
-                std::end(storage_stencil.fields),
-                stencil_storage_descriptor.dwords.begin());
-      stencil_storage_descriptor.dword_count = 8;
-      ShaderRecompiler::IR::ResourceSnapshot stencil_storage_snapshot{};
-      stencil_storage_snapshot.images.push_back(stencil_storage_descriptor);
-      ShaderStageRuntime stencil_storage_runtime{
-          &stencil_storage_program, std::move(stencil_storage_snapshot)};
-      auto storage_redirected =
-          executor.PrepareBindings(stencil_storage_runtime);
-      executor.RebindImages(storage_redirected);
-      Require(
-          name, "storage stencil acquisition",
-          storage_redirected.resources.images[0].image_id == depth_id &&
-              storage_redirected.resources.images[0].image_view != nullptr &&
-              texture_cache.GetImage(depth_id).usage.storage,
-          "storage stencil binding did not acquire the associated depth owner");
-      RenderExecutorTestAccess::ResetBindings(executor);
+      std::array<uint32_t, 12> stencil_userdata{};
+      std::copy_n(storage_stencil.fields, 8, stencil_userdata.begin());
+      stencil_userdata[8] = static_cast<uint32_t>(value_address);
+      stencil_userdata[9] = static_cast<uint32_t>(value_address >> 32) | (4u << 16);
+      stencil_userdata[10] = 1;
+      stencil_userdata[11] = 0x14204u;
+      ShaderComputeInputInfo stencil_compute{};
+      stencil_compute.threads_num[0] = stencil_compute.threads_num[1] = 8;
+      stencil_compute.threads_num[2] = 1;
+      stencil_compute.workgroup_register = 12;
+      stencil_compute.thread_ids_num = 2;
+      std::fill_n(stencil_compute.group_id, 3, true);
+      ShaderRecompiler::CompileOptions stencil_options;
+      stencil_options.stage = ShaderType::Compute;
+      stencil_options.user_data = stencil_userdata;
+      stencil_options.input_info.compute = &stencil_compute;
+      auto stencil_translated = ShaderRecompiler::TranslateProgram(stencil_shader, stencil_options);
+      auto stencil_plan = ShaderRecompiler::IR::ExtractResourcePlan(stencil_translated.program);
+      ShaderRecompiler::IR::ResourceSpecialization stencil_specialization;
+      Require(name, "stencil fill materialization",
+          ShaderRecompiler::IR::MaterializeResources(stencil_plan,
+              {.user_data = stencil_userdata, .userdata = &stencil_byte,
+               .read_specialization_memory = +[](void *data, uint64_t address, uint32_t *word) {
+                 if (address != reinterpret_cast<uint64_t>(data)) return false;
+                 *word = *static_cast<uint32_t *>(data);
+                 return true;
+               }}, stencil_compute.stage.resources, stencil_specialization),
+          "captured stencil shader could not resolve its clear byte");
+      ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
+                                                       stencil_specialization);
+      ShaderRecompiler::IR::CompiledShaderInfo stencil_program{};
+      stencil_program.stage = ShaderType::Compute;
+      stencil_program.info = std::move(stencil_translated.program.info);
+      stencil_compute.stage.program = &stencil_program;
+      vk::ClearValue stencil_initial{};
+      stencil_initial.depthStencil = vk::ClearDepthStencilValue{0.625f, 0x91};
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+          stencil_initial);
+      Require(name, "stencil fill coverage",
+          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+              scheduler.Current(), 0, 1, 1, 0x41u) &&
+          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+              scheduler.Current(), 2, 1, 1, 0x41u),
+          "incomplete or excessive stencil dispatch was consumed");
+      auto &stencil_source = stencil_compute.stage.resources.buffers[0];
+      const auto clean_source = stencil_source;
+      stencil_source.dwords[0] = static_cast<uint32_t>(stencil_address);
+      stencil_source.dwords[1] = static_cast<uint32_t>(stencil_address >> 32) | (4u << 16);
+      Require(name, "stencil fill source alias",
+          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+              scheduler.Current(), 1, 1, 1, 0x41u),
+          "an aliased scalar load was consumed as a uniform image clear");
+      stencil_source = clean_source;
+      Require(name, "stencil IMAGE_STORE clear",
+          RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+              scheduler.Current(), 1, 1, 1, 0x41u),
+          "captured clear attempted an unsupported depth/stencil storage binding");
+      auto stencil_readback = CreateHostBuffer(name, 8,
+          vk::BufferUsageFlagBits::eTransferDst, {});
+      const std::array<vk::BufferImageCopy, 2> stencil_copies{{
+          {0, 0, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, {1, 1, 1}},
+          {4, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {1, 1, 1}}}};
+      texture_cache.GetImage(depth_id).Download(stencil_copies, stencil_readback.buffer, 0, 8);
+      vk::MemoryBarrier2 stencil_host_barrier{};
+      stencil_host_barrier.sType = vk::StructureType::eMemoryBarrier2;
+      stencil_host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+      stencil_host_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      stencil_host_barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      stencil_host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      vk::DependencyInfo stencil_dependency{};
+      stencil_dependency.sType = vk::StructureType::eDependencyInfo;
+      stencil_dependency.memoryBarrierCount = 1;
+      stencil_dependency.pMemoryBarriers = &stencil_host_barrier;
+      scheduler.Current().Handle().pipelineBarrier2(stencil_dependency);
+      scheduler.Finish();
+      const auto stencil_result = ReadBuffer(name, stencil_readback, 2);
+      Require(name, "stencil clear retains depth",
+          stencil_result[0] == std::bit_cast<uint32_t>(0.625f) &&
+              (stencil_result[1] & 0xffu) == 0x35 &&
+              !texture_cache.GetImage(depth_id).usage.storage,
+          "stencil clear altered depth, lost its scalar value, or used a storage view");
+      DestroyBuffer(&stencil_readback);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       RenderExecutorTestAccess::DestroyDescriptorPipelines(

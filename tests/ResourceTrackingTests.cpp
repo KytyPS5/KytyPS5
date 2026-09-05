@@ -35,7 +35,7 @@ bool SameResourceSnapshot(const ResourceSnapshot &lhs,
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
          lhs.samplers == rhs.samplers &&
          lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data && lhs.buffer_fill == rhs.buffer_fill;
+         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
 }
 
 template <typename F>
@@ -543,12 +543,12 @@ void TestComputeBufferFill() {
     const bool expected = !options.conditional && !options.shifted &&
                           !options.extra_store && !options.branch &&
                           (!options.scalar || options.clean);
-    Check((snapshot.buffer_fill.element_size != 0) == expected,
+    Check((snapshot.uniform_fill.words != 0) == expected,
           "fill proof accepted an unsafe store or missed the real GTA3 clear");
     if (expected) {
-      Check(snapshot.buffer_fill.element_size == 4 &&
-                snapshot.buffer_fill.group_stride == 64 &&
-                snapshot.buffer_fill.value ==
+      Check(snapshot.uniform_fill.words == 1 &&
+                snapshot.uniform_fill.group_stride[0] == 64 &&
+                snapshot.uniform_fill.value ==
                     (options.scalar ? 0x40404040u : 0u),
             "fill proof lost address coverage or the actual stored scalar");
     }

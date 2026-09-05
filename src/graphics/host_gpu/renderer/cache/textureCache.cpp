@@ -1408,24 +1408,40 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (!selected) {
 		return false;
 	}
-	auto&               image = m_slot_images[selected];
-	vk::ClearColorValue color_clear {};
-	float               depth_clear   = 0.0f;
-	uint8_t             stencil_clear = 0;
+	auto&          image = m_slot_images[selected];
+	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, color_clear)) {
+		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
 			return false;
 		}
 	} else {
+		uint8_t stencil_clear = 0;
 		if ((aspect == vk::ImageAspectFlagBits::eDepth &&
-		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, depth_clear)) ||
+		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
 		    (aspect == vk::ImageAspectFlagBits::eStencil &&
 		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
 			return false;
 		}
+		clear.depthStencil.stencil = stencil_clear;
 	}
+	ClearImage(command, selected, {aspect, 0, image.info.resources.levels, 0, image.backing.layers},
+	           clear);
+	return true;
+}
+
+void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
+                              const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+	auto& image = m_slot_images[id];
+	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
+	                                          : vk::ImageAspectFlagBits::eColor;
+	EXIT_IF(command.IsInvalid() || image.depth_id || !range.aspectMask ||
+	        range.levelCount == 0 || range.baseMipLevel >= image.info.resources.levels ||
+	        range.levelCount > image.info.resources.levels - range.baseMipLevel ||
+	        range.layerCount == 0 || range.baseArrayLayer >= image.backing.layers ||
+	        range.layerCount > image.backing.layers - range.baseArrayLayer ||
+	        (range.aspectMask & aspects) != range.aspectMask);
 	if (image.IsBufferModified() || image.IsCpuDirty()) {
-		InitializeImage(selected);
+		InitializeImage(id);
 		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
 			EXIT("TextureCache: image clear retained guest ownership\n");
 		}
@@ -1433,18 +1449,14 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	command.EndRendering();
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 	              command.Handle());
-	const vk::ImageSubresourceRange range {aspect, 0, VK_REMAINING_MIP_LEVELS, 0,
-	                                       image.backing.layers};
-	if (aspect == vk::ImageAspectFlagBits::eColor) {
+	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
 		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &color_clear, 1, &range);
+		                                 &clear.color, 1, &range);
 	} else {
-		const vk::ClearDepthStencilValue clear {depth_clear, stencil_clear};
 		command.Handle().clearDepthStencilImage(
-		    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+		    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear.depthStencil, 1, &range);
 	}
 	CommitGpuWrite(image);
-	return true;
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {

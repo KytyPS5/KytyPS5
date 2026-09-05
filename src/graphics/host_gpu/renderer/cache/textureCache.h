@@ -147,6 +147,9 @@ private:
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	// Caller holds m_lock. Clears only the selected aspects and subresources.
+	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
+	                const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);

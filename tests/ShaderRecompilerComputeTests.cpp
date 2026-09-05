@@ -4511,6 +4511,95 @@ public:
             0, nullptr);
       };
 
+      constexpr uint64_t mip_layout_offset = 0x27f0000;
+      std::vector<u32> mip_guest(0x2000 / sizeof(u32));
+      std::iota(mip_guest.begin(), mip_guest.end(), 0x51000000u);
+      ImageId previous{};
+      for (const uint32_t width : {32u, 64u, 32u}) {
+        if (previous) {
+          Require(name, "mip-layout CPU overwrite",
+                  resources.HandleFault(PageFaultAccess::Write,
+                                        base + mip_layout_offset),
+                  "mip-layout guest overwrite did not invalidate the old texture");
+        }
+        std::memcpy(memory + mip_layout_offset, mip_guest.data(),
+                    mip_guest.size() * sizeof(u32));
+        TileSurfaceLayout surface{};
+        Require(name, "mip-tail layout",
+                TileGetTiledTextureLayout(
+                    {.format = Prospero::BufferFormat::kBc3Srgb,
+                     .tile_mode = Prospero::TileMode::kStandard4KB,
+                     .width = width, .height = 64, .levels = 7}, surface) &&
+                    surface.first_tail_level == (width == 32 ? 0u : 1u) &&
+                    surface.total_size == (width == 32 ? 0x1000u : 0x2000u),
+                "BC3 width change did not move mip zero into or out of the tail");
+        ImageDesc desc{};
+        desc.type = BindingType::Texture;
+        desc.info.data = {base + mip_layout_offset, surface.total_size};
+        desc.info.pixel_format = vk::Format::eBc3SrgbBlock;
+        desc.info.guest_format = Prospero::BufferFormat::kBc3Srgb;
+        desc.info.extent = {width, 64, 1};
+        desc.info.resources = {7, 1};
+        desc.info.pitch = 64;
+        desc.info.bytes_per_block = 16;
+        desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        desc.view_info.format = desc.info.pixel_format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.level_count = 7;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        std::vector<vk::BufferImageCopy> copies;
+        std::vector<u32> expected;
+        for (uint32_t level = 0; level < 7; level++) {
+          const auto &layout = surface.mips[level];
+          desc.info.mip_layout[level] = {
+              layout.offset, layout.size, layout.padded_width * 4,
+              layout.padded_height * 4};
+          vk::BufferImageCopy copy{};
+          copy.bufferOffset = expected.size() * sizeof(u32);
+          copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1};
+          copy.imageExtent = {std::max(width >> level, 1u),
+                              std::max(64u >> level, 1u), 1};
+          copies.push_back(copy);
+          for (uint32_t y = 0; y < layout.height; y++) {
+            for (uint32_t x = 0; x < layout.width; x++) {
+              uint32_t offset = 0;
+              Require(name, "mip-tail CPU address",
+                      TileGetBlockOffset(
+                          surface.texture.block, x + layout.tail_x,
+                          y + layout.tail_y, 0, offset),
+                      "BC3 mip-tail block address could not be computed");
+              const auto word = (layout.offset + offset) / sizeof(u32);
+              expected.insert(expected.end(), mip_guest.begin() + word,
+                              mip_guest.begin() + word + 4);
+            }
+          }
+        }
+        const auto id = texture_cache.FindImage(desc);
+        Require(name, "distinct mip-layout backing", id && id != previous,
+                "different guest mip layouts reused the same native image");
+        (void)texture_cache.FindTexture(id, desc);
+        auto readback = CreateHostBuffer(
+            name, expected.size() * sizeof(u32),
+            vk::BufferUsageFlagBits::eTransferDst,
+            std::vector<u32>(expected.size()));
+        texture_cache.GetImage(id).Download(copies, readback.buffer, 0,
+                                            readback.size);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "mip-layout GPU contents",
+                ReadBuffer(name, readback, expected.size()) == expected,
+                "cached native copying contaminated the requested guest mip layout");
+        DestroyBuffer(&readback);
+        if (width == 64) {
+          // Leave only the larger backing so shrinking must reject its layout.
+          TextureCacheTestAccess::DeleteImage(texture_cache, previous);
+        }
+        previous = id;
+      }
+
       // A formatted Buffer read must use the private
       // Exercise the cache-native image-copy path. Use a request larger
       // than the stream shortcut and poison guest backing

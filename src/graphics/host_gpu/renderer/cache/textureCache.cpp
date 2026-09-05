@@ -728,7 +728,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    (requested.IsVolume() || cached.info.IsVolume())) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		if (requested.tile_mode != cached.info.tile_mode) {
+		// Equal pitch does not imply equal mip placement: a changed extent can move
+		// a level into or out of the mip tail. These are separate guest layouts.
+		if (requested.tile_mode != cached.info.tile_mode ||
+		    (requested.resources == cached.info.resources &&
+		     requested.mip_layout != cached.info.mip_layout)) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}

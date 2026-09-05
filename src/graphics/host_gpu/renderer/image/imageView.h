@@ -63,6 +63,19 @@ namespace ImageViewOps {
 	}
 }
 
+[[nodiscard]] inline vk::Format SrgbToUnorm(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eBc1RgbaSrgbBlock: return vk::Format::eBc1RgbaUnormBlock;
+		case vk::Format::eBc2SrgbBlock: return vk::Format::eBc2UnormBlock;
+		case vk::Format::eBc3SrgbBlock: return vk::Format::eBc3UnormBlock;
+		case vk::Format::eBc7SrgbBlock: return vk::Format::eBc7UnormBlock;
+		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
+		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eB8G8R8A8Unorm;
+		case vk::Format::eA8B8G8R8SrgbPack32: return vk::Format::eA8B8G8R8UnormPack32;
+		default: return format;
+	}
+}
+
 [[nodiscard]] inline bool IsSupportedSampledColorView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {

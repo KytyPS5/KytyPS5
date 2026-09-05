@@ -25523,6 +25523,69 @@ void CheckPm4DepthControlHighBits(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4DepthControlHighBits");
 }
 
+void CheckAgcShaderFusion() {
+  struct Case {
+    bool gs;
+    uint32_t front1, front2, back1, back2, fused1, fused2, older2;
+  };
+  // Register results from both exports in the supplied libSceAgc.sprx.
+  constexpr Case cases[]{
+      {true, 0x600c0007, 0x00030010, 0x600c0007, 0x008b0000,
+       0x600c0007, 0x008b0010, 0x008b0010}, // Captured volume ES + GS.
+      {true, 0x20ac0003, 0xf805004a, 0x40ec0007, 0x028b003e,
+       0x40ec0007, 0x1a8f000a, 0xfa8f000a},
+      {false, 0x20ac0003, 0xf805004a, 0x10ec0007, 0x028b003e,
+       0x20ec0007, 0x1a8b000a, 0xfa8b000a},
+  };
+  ShaderUserData user_data{};
+  ShaderSpecialRegs specials{};
+  for (const auto &c : cases) {
+    const auto checksum = c.gs ? Pm4::SPI_SHADER_PGM_CHKSUM_GS : Pm4::SPI_SHADER_PGM_CHKSUM_HS;
+    const auto rsrc1 = c.gs ? Pm4::SPI_SHADER_PGM_RSRC1_GS : Pm4::SPI_SHADER_PGM_RSRC1_HS;
+    const auto rsrc2 = c.gs ? Pm4::SPI_SHADER_PGM_RSRC2_GS : Pm4::SPI_SHADER_PGM_RSRC2_HS;
+    const auto lo = c.gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS;
+    std::array<ShaderRegister, 6> front_regs{{
+        {checksum, 0x1234}, {checksum, 0x5678}, {rsrc1, c.front1},
+        {rsrc2, c.front2}, {lo, 0}, {lo + 1u, 0}}};
+    const std::array<ShaderRegister, 6> back_regs{{
+        {checksum, 0}, {checksum, 0}, {rsrc1, c.back1},
+        {rsrc2, c.back2}, {lo, 0}, {lo + 1u, 0xabcdef00}}};
+    Shader front{};
+    front.user_data = &user_data;
+    front.code = reinterpret_cast<const void *>(0x12580e91c00ull);
+    front.sh_registers = front_regs.data();
+    front.specials = &specials;
+    front.type = static_cast<uint8_t>(c.gs ? Prospero::ShaderBinaryType::kGsFront
+                                         : Prospero::ShaderBinaryType::kHsFront);
+    front.num_sh_registers = front_regs.size();
+    for (const bool older : {false, true}) {
+      for (const bool in_place : {false, true}) {
+        auto registers = back_regs;
+        std::array<ShaderRegister, 6> scratch{};
+        Shader back = front;
+        back.sh_registers = registers.data();
+        back.type = static_cast<uint8_t>(c.gs ? Prospero::ShaderBinaryType::kGsBack
+                                            : Prospero::ShaderBinaryType::kHsBack);
+        Shader fused{};
+        const auto fuse = older ? Gen5::AgcUnknownNApJjpKNBl4 : Gen5::AgcUnknownFuseShaderHalves;
+        const auto result = fuse(&fused, &front, &back, in_place ? nullptr : scratch.data());
+        const auto *regs = fused.sh_registers;
+        Require("AgcShaderFusion", "native fused registers",
+                result == 0 && regs == (in_place ? registers.data() : scratch.data()) &&
+                    regs[0].value == 0x1234 && regs[1].value == 0x5678 &&
+                    regs[2].value == c.fused1 && regs[3].value == (older ? c.older2 : c.fused2) &&
+                    regs[4].value == 0x2580e91c && regs[5].value == 0xabcdef01 &&
+                    fused.type == static_cast<uint8_t>(c.gs ? Prospero::ShaderBinaryType::kGs
+                                                            : Prospero::ShaderBinaryType::kHs) &&
+                    fused.user_data == (older ? &user_data : nullptr) &&
+                    (in_place || std::memcmp(registers.data(), back_regs.data(), sizeof(registers)) == 0),
+                "AGC lost front resources or changed the export's allocation/metadata behavior");
+      }
+    }
+  }
+  std::printf("[host]    %-32s ok\n", "AgcShaderFusion");
+}
+
 struct AgcCommandBufferLayout {
   using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
                                           void *);
@@ -26125,6 +26188,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
     VulkanHarness vulkan;
+    CheckAgcShaderFusion();
     CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
     CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
     CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());
@@ -26323,6 +26387,7 @@ int main(int argc, char **argv) {
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+  CheckAgcShaderFusion();
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());

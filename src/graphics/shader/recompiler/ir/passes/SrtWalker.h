@@ -23,6 +23,8 @@ struct SrtRuntime {
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value);
+bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
+                            const SrtRuntime& runtime, std::span<uint32_t> results);
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);

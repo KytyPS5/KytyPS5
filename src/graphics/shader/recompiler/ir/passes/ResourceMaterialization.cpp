@@ -299,8 +299,19 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		return false;
 	}
 
-	auto& next   = snapshot.resources;
-	auto  cursor = values.begin();
+	auto&                   next  = snapshot.resources;
+	const auto&             fill  = program.buffer_fill;
+	const auto              words = fill.fill.element_size / sizeof(uint32_t);
+	std::array<uint32_t, 4> stored {};
+	if (words != 0 &&
+	    EvaluateUniformValues(program, std::span(fill.values).first(words), runtime,
+	                          std::span(stored).first(words)) &&
+	    std::all_of(stored.begin(), stored.begin() + words,
+	                [&](uint32_t value) { return value == stored[0]; })) {
+		next.buffer_fill       = fill.fill;
+		next.buffer_fill.value = stored[0];
+	}
+	auto cursor = values.begin();
 	next.buffers.assign(cursor, cursor + program.info.buffers.size());
 	cursor += program.info.buffers.size();
 	next.flattened_srt = std::move(flattened_srt);
@@ -609,11 +620,11 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 	return true;
 }
 
-static bool IntegerCondition(const ResourcePlan& program, Value condition) {
-	if (!ValidateRuntimeValue(program, condition)) {
+static bool UniformIntegerValue(const ResourcePlan& program, Value root) {
+	if (!ValidateRuntimeValue(program, root)) {
 		return false;
 	}
-	std::vector<Value>              pending {condition};
+	std::vector<Value>              pending {root};
 	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		const auto value = pending.back().Resolve();
@@ -659,7 +670,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
 			case CFG::TerminatorKind::ConditionalBranch:
 				successors = {terminator.true_block, terminator.false_block};
-				if (IntegerCondition(program, info.condition)) {
+				if (UniformIntegerValue(program, info.condition)) {
 					block.condition = info.condition;
 				}
 				break;
@@ -711,6 +722,118 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		return {};
 	}
 	return blocks;
+}
+
+// Nonnegative affine coefficients for constant, local X and workgroup X. Reject modular
+// arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
+static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (depth > 32 || value.GetType() != Type::U32) {
+		return {};
+	}
+	if (value.IsImmediate()) {
+		return std::array<uint64_t, 3> {value.U32(), 0, 0};
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return {};
+	}
+	const auto op = inst->GetOpcode();
+	if (op == ValueOpcode::GetBuiltin && inst->Arg(1) == Value(0u)) {
+		if (inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId))) {
+			return std::array<uint64_t, 3> {0, 1, 0};
+		}
+		if (inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId))) {
+			return std::array<uint64_t, 3> {0, 0, 1};
+		}
+	}
+	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
+	    op != ValueOpcode::ShiftLeftLogical32) {
+		return {};
+	}
+	auto left  = FillIndex(inst->Arg(0), depth + 1);
+	auto right = FillIndex(inst->Arg(1), depth + 1);
+	if (!left || !right) {
+		return {};
+	}
+	if (op == ValueOpcode::IMul32 && ((*right)[1] != 0 || (*right)[2] != 0)) {
+		std::swap(left, right);
+	}
+	if (op != ValueOpcode::IAdd32 && ((*right)[1] != 0 || (*right)[2] != 0)) {
+		return {};
+	}
+	if (op == ValueOpcode::ShiftLeftLogical32) {
+		if ((*right)[0] >= 32) return {};
+		(*right)[0] = uint64_t {1} << (*right)[0];
+	}
+	for (uint32_t i = 0; i < left->size(); ++i) {
+		(*left)[i] =
+		    op == ValueOpcode::IAdd32 ? (*left)[i] + (*right)[i] : (*left)[i] * (*right)[0];
+		if ((*left)[i] > UINT32_MAX) return {};
+	}
+	return left;
+}
+
+static BufferFillPlan AnalyzeBufferFill(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
+	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	    !program.info.images.empty() || !program.info.samplers.empty()) {
+		return {};
+	}
+	std::unordered_set<uint32_t> visited;
+	uint32_t                     index = 0;
+	const Inst*                  store = nullptr;
+	for (;;) {
+		if (!visited.insert(index).second) return {};
+		for (const auto& inst: *program.blocks[index]) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			if (!inst.MayHaveSideEffects()) continue;
+			if (store != nullptr || BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write)
+				return {};
+			store = &inst;
+		}
+		const auto& term = program.block_info[index].terminator;
+		if (term.kind == CFG::TerminatorKind::Return) break;
+		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
+		if (next == program.block_info.end()) return {};
+		index = static_cast<uint32_t>(next - program.block_info.begin());
+	}
+	if (store == nullptr || visited.size() != program.blocks.size()) return {};
+	const auto           op = store->GetOpcode();
+	constexpr std::array stores {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+	                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+	const auto           store_op = std::ranges::find(stores, op);
+	if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
+	    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
+		return {};
+	const auto& memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
+	if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
+	    memory.data_bits != 32 ||
+	    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
+		return {};
+	const auto address = FillIndex(store->Arg(1));
+	if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.read && (!buffer.scalar || buffer.written)) return {};
+	}
+	BufferFillPlan result;
+	result.fill = {memory.resource, static_cast<uint32_t>((*address)[2]), memory.data_dwords * 4,
+	               0};
+	const auto           data   = store->Arg(4).Resolve();
+	const auto*          vector = data.TryInstruction();
+	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
+	                                 ValueOpcode::CompositeConstructU32x3,
+	                                 ValueOpcode::CompositeConstructU32x4};
+	for (uint32_t i = 0; i < memory.data_dwords; ++i) {
+		if (memory.data_dwords > 1 &&
+		    (vector == nullptr || vector->GetOpcode() != composites[memory.data_dwords - 2]))
+			return {};
+		const auto word = memory.data_dwords == 1 ? data : vector->Arg(i);
+		if (word.GetType() != Type::U32 || !UniformIntegerValue(program, word)) return {};
+		result.values[i] = word;
+	}
+	return result;
 }
 
 ResourcePlan ExtractResourcePlan(const Program& program) {
@@ -771,6 +894,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.control_flow = ResourceControlFlow(program);
 	for (auto& block: plan.control_flow) {
 		block.condition = Clone(block.condition);
+	}
+	plan.buffer_fill = AnalyzeBufferFill(program);
+	for (uint32_t i = 0; i < plan.buffer_fill.fill.element_size / sizeof(uint32_t); ++i) {
+		plan.buffer_fill.values[i] = Clone(plan.buffer_fill.values[i]);
 	}
 	plan.materialization_sources.reserve(plan.info.buffers.size() + plan.info.images.size() +
 	                                     plan.info.samplers.size());

@@ -1034,6 +1034,24 @@ void BuildSrtPlan(Program& program) {
 	program.srt_plan_complete = true;
 }
 
+bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
+                            const SrtRuntime& runtime, std::span<uint32_t> results) {
+	if (values.size() != results.size()) {
+		return false;
+	}
+	auto clean = runtime;
+	clean.read_memory = runtime.read_specialization_memory != nullptr
+	                        ? runtime.read_specialization_memory
+	                        : +[](void*, uint64_t, uint32_t*) { return false; };
+	Evaluator evaluator(program, clean);
+	for (size_t i = 0; i < values.size(); ++i) {
+		if (!evaluator.Evaluate(values[i], results[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result) {
 	std::vector<DescriptorValue> results;

@@ -490,8 +490,13 @@ struct CompiledShaderInfo {
 	BindingLayout                 bindings;
 };
 
-// Immutable runtime resource analysis retained by the shader cache. It owns the descriptor/SRT
-// and uniform condition values, plus resource-use edges, without retaining translated blocks.
+struct BufferFillPlan {
+	BufferFill           fill;
+	std::array<Value, 4> values;
+};
+
+// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
+// uniform condition and fill values without retaining translated blocks.
 struct ResourcePlan {
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -516,6 +521,7 @@ struct ResourcePlan {
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
+	BufferFillPlan                      buffer_fill;
 };
 
 struct Program: ResourcePlan {

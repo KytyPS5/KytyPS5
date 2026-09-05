@@ -25,6 +25,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -82,46 +83,54 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
                               uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
-	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
-	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
-	    !resources.images.empty() || !resources.samplers.empty()) {
+	const auto& fill      = resources.buffer_fill;
+	if (fill.element_size == 0 || fill.element_size > 16 || fill.element_size % 4 != 0 ||
+	    fill.buffer >= resources.buffers.size() ||
+	    resources.buffers.size() != program.info.buffers.size()) {
 		return false;
 	}
-	const auto& resource   = program.info.buffers.front();
-	const auto& raw        = resources.buffers.front();
-	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	const auto&          resource   = program.info.buffers[fill.buffer];
+	const auto&          raw        = resources.buffers[fill.buffer];
+	const auto           descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	constexpr std::array formats {
+	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
+	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
 	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
-	    resource.scalar || resource.max_byte_extent != 16 || descriptor.Stride() != 16 ||
-	    descriptor.Format() != Prospero::BufferFormat::k32_32_32_32UInt ||
-	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    resource.scalar || descriptor.Stride() != fill.element_size ||
+	    descriptor.Format() != formats[fill.element_size / 4 - 1] || descriptor.SwizzleEnabled() ||
+	    descriptor.IndexStride() != 0 || descriptor.AddTid() ||
 	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
-	    program.user_data_base != 0 || resources.user_data.size() != 8) {
+	    descriptor.Base48() == 0) {
 		return false;
 	}
-	for (uint32_t i = 0; i < raw.dword_count; i++) {
-		if (raw.dwords[i] != resources.user_data[i]) {
+	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	const auto     size        = BufferDescriptorSize(descriptor);
+	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
+	    descriptor.Base48() > UINT64_MAX - size ||
+	    (input.dispatch_thread_dimensions &&
+	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
+		return false;
+	}
+	for (uint32_t i = 0; i < resources.buffers.size(); ++i) {
+		if (i == fill.buffer) continue;
+		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		const auto bytes  = BufferDescriptorSize(source);
+		if (source.Base48() > UINT64_MAX - bytes ||
+		    (source.Base48() < descriptor.Base48() + size &&
+		     descriptor.Base48() < source.Base48() + bytes)) {
 			return false;
 		}
 	}
-	const uint32_t clear = resources.user_data[4];
-	if (resources.user_data[5] != clear || resources.user_data[6] != clear ||
-	    resources.user_data[7] != clear) {
-		return false;
-	}
-	const bool full_dispatch =
-	    input.dispatch_thread_dimensions && input.threads_num[0] == 64 &&
-	    input.threads_num[1] == 1 && input.threads_num[2] == 1 && group_x != 0 && group_y == 1 &&
-	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
-	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
-	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
-	    input.thread_ids_num == 1 && input.wave_size == 64 && !input.tg_size_en && mode == 0x61u &&
-	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
-	const auto size = BufferDescriptorSize(descriptor);
-	if (!full_dispatch || size == 0) {
-		return false;
-	}
 	resolved_descriptor = descriptor;
-	resolved_clear      = clear;
+	resolved_clear      = fill.value;
 	resolved_size       = size;
 	return true;
 }

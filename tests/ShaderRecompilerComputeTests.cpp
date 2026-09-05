@@ -22271,7 +22271,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
-    AppendVop3(&code, 0x347u, 4, 8, InlineU32(6), Vgpr(0));
+    AppendVop3(&code, 0x346u, 4, 8, InlineU32(6), Vgpr(0));
     for (u32 i = 0; i < 4; i++) {
       code.push_back(EncodeVop1(0x01u, i, i + 4u));
     }
@@ -22300,6 +22300,8 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   compute.wave_size = 64;
   compute.thread_ids_num = 1;
   compute.workgroup_register = 8;
+  u32 scalar_clear = 0x40404040u;
+  bool clean_scalar = false;
 
   const auto Compile = [&](const std::vector<u32> &code) {
     ShaderRecompiler::CompileOptions options;
@@ -22317,6 +22319,13 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     const ShaderRecompiler::IR::SrtRuntime runtime{
         .user_data = options.user_data,
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
+        .userdata = &scalar_clear,
+        .read_specialization_memory = clean_scalar
+            ? +[](void *data, uint64_t address, uint32_t *word) {
+                if (address != reinterpret_cast<uint64_t>(data)) return false;
+                *word = *static_cast<uint32_t *>(data);
+                return true;
+              } : nullptr,
     };
     Require("Ps5GameExampleImageClear", "resource materialization",
             ShaderRecompiler::IR::MaterializeResources(
@@ -22353,9 +22362,16 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
               packed_clear == 0xff000000u,
           "exact Prospero runtime binding did not resolve to a complete clear");
 
-  auto non_repeated = positive.resources;
-  non_repeated.user_data[7] ^= 1u;
-  compute.stage.resources = non_repeated;
+  auto wrong_index = code;
+  wrong_index[0] = (wrong_index[0] & ~(0x3ffu << 16u)) | (0x347u << 16u);
+  compute.stage.resources = Compile(wrong_index).resources;
+  Require("Ps5GameExampleImageClear", "add-before-shift address",
+          !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
+                                    packed_clear, size),
+          "V_ADD_LSHL was mistaken for V_LSHL_ADD contiguous coverage");
+
+  user_data[7] ^= 1u;
+  compute.stage.resources = Compile(code).resources;
   Require("Ps5GameExampleImageClear", "non-repeated clear",
           !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
@@ -22366,6 +22382,91 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeImageClear(compute, 32, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "partial buffer coverage was classified as a complete clear");
+
+  // Same descriptor/dispatch as GTA3, with the stored value encoded in the
+  // shader.
+  user_data = {0x00200000u, 4u << 16u, 64u, 0x14204u};
+  compute.workgroup_register = 4;
+  compute.dispatch_thread_dimensions = false;
+  std::vector<u32> scalar_code;
+  AppendVop3(&scalar_code, 0x346u, 0, 4, InlineU32(6), Vgpr(0));
+  scalar_code.push_back(EncodeVop1(0x01u, 1, InlineU32(0)));
+  scalar_code.push_back(EncodeMubuf0(0x04u, 0, true, false));
+  scalar_code.push_back(EncodeMubuf1(1, 0, 0));
+  AppendEnd(&scalar_code);
+  auto scalar = Compile(scalar_code);
+  program.info = scalar.program.info;
+  compute.stage.resources = scalar.resources;
+  Require("Ps5GameExampleImageClear", "inline scalar fill",
+          ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                   packed_clear, size) &&
+              descriptor.Base48() == 0x200000u && size == 256u &&
+              packed_clear == 0u,
+          "GTA3's actual scalar store was not recognized from IR");
+  Require("Ps5GameExampleImageClear", "excess dispatch",
+          !ResolveComputeImageClear(compute, 2, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "excess invocation coverage was accepted as a fill");
+  auto alias = scalar.resources.buffers.front();
+  compute.stage.resources.buffers.push_back(alias);
+  program.info.buffers.push_back({.read = true, .scalar = true});
+  Require("Ps5GameExampleImageClear", "aliased scalar input",
+          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a scalar read aliasing the destination was accepted as uniform");
+  program.info = scalar.program.info;
+  compute.stage.resources = scalar.resources;
+  compute.stage.resources.buffers[0].dwords[3] =
+      (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u) | 0x204u;
+  Require("Ps5GameExampleImageClear", "wrong store format",
+          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a format that changes the stored value was accepted as a uint fill");
+  // A body change preserving every descriptor and dispatch field must change
+  // the result.
+  scalar_code[2] = EncodeVop1(0x01u, 1, InlineU32(7));
+  compute.stage.resources = Compile(scalar_code).resources;
+  Require("Ps5GameExampleImageClear", "changed store value",
+          ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                   packed_clear, size) &&
+              packed_clear == 7u,
+          "clear recognition ignored the shader's actual stored value");
+  scalar_code[2] = EncodeVop1(0x01u, 1, Vgpr(0));
+  compute.stage.resources = Compile(scalar_code).resources;
+  Require("Ps5GameExampleImageClear", "varying store value",
+          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a varying store with identical resources was treated as a fill");
+
+  const auto scalar_address = reinterpret_cast<uint64_t>(&scalar_clear);
+  user_data[4] = static_cast<u32>(scalar_address);
+  user_data[5] = static_cast<u32>(scalar_address >> 32u) | (16u << 16u);
+  user_data[6] = 1;
+  user_data[7] = 0x4dfacu;
+  compute.workgroup_register = 8;
+  scalar_code.clear();
+  AppendVop3(&scalar_code, 0x346u, 0, 8, InlineU32(6), Vgpr(0));
+  scalar_code.push_back(EncodeSmem0(0x08u, 106, 2));
+  scalar_code.push_back(EncodeSmem1(0, 125));
+  scalar_code.push_back(EncodeVop1(0x01u, 1, 106));
+  scalar_code.push_back(EncodeMubuf0(0x04u, 0, true, false));
+  scalar_code.push_back(EncodeMubuf1(1, 0, 0));
+  AppendEnd(&scalar_code);
+  clean_scalar = true;
+  auto loaded = Compile(scalar_code);
+  program.info = loaded.program.info;
+  compute.stage.resources = loaded.resources;
+  Require("Ps5GameExampleImageClear", "scalar-loaded fill",
+          ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                   packed_clear, size) &&
+              packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
+          "GTA3's scalar input was confused with its destination");
+  clean_scalar = false;
+  compute.stage.resources = Compile(scalar_code).resources;
+  Require("Ps5GameExampleImageClear", "unavailable clean scalar",
+          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a scalar without a clean reader was replaced by a fill");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 

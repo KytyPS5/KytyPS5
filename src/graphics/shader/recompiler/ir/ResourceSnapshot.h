@@ -16,12 +16,22 @@ struct DescriptorValue {
 	}
 };
 
+struct BufferFill {
+	uint32_t buffer       = 0;
+	uint32_t group_stride = 0;
+	uint32_t element_size = 0;
+	uint32_t value        = 0;
+
+	bool operator==(const BufferFill&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
+	BufferFill                  buffer_fill;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

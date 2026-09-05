@@ -35,7 +35,7 @@ bool SameResourceSnapshot(const ResourceSnapshot &lhs,
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
          lhs.samplers == rhs.samplers &&
          lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data;
+         lhs.user_data == rhs.user_data && lhs.buffer_fill == rhs.buffer_fill;
 }
 
 template <typename F>
@@ -455,6 +455,111 @@ void TestInvariantIndirectImageMaterialization() {
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
         "wrapped scalar immediate entered the invariant image proof");
+}
+
+void TestComputeBufferFill() {
+  struct Options {
+    bool scalar = false;
+    bool conditional = false;
+    bool shifted = false;
+    bool extra_store = false;
+    bool clean = false;
+    bool branch = false;
+  };
+  const auto Run = [](Options options) {
+    Fixture fixture;
+    fixture.program.block_info[0].terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+    if (options.branch) {
+      fixture.program.block_info[0].terminator.kind = Libs::Graphics::
+          ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    }
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    auto index =
+        fixture.Emit(ValueOpcode::IAdd32,
+                     {local, fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                          {group, Value(6u)})});
+    if (options.shifted)
+      index = fixture.Emit(ValueOpcode::IAdd32, {index, Value(1u)});
+    Value value(0u);
+    TestMemory memory;
+    memory.words[0] = 0x40404040u;
+    if (options.scalar) {
+      const auto input =
+          fixture.Buffer({Value(static_cast<uint32_t>(memory.base)),
+                          Value(4u << 16), Value(1u), Value(0x14204u)});
+      MemoryInfo load;
+      load.kind = ResourceKind::ScalarBuffer;
+      value = fixture.Emit(ValueOpcode::ReadConstBuffer, {input, Value(0u)},
+                           fixture.AddMemory(load, 8));
+    }
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.formatted = true;
+    store.idxen = true;
+    const auto flags = fixture.AddMemory(store, 16);
+    const auto predicate =
+        options.conditional
+            ? fixture.Emit(ValueOpcode::ULessThan32, {local, Value(32u)})
+            : Value(true);
+    const auto EmitStore = [&] {
+      fixture.Emit(ValueOpcode::StoreBufferU32,
+                   {buffer, index, Value(0u), Value(0u), value, predicate},
+                   flags);
+    };
+    EmitStore();
+    if (options.extra_store)
+      EmitStore();
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 4> userdata{0x200000u, 4u << 16, 0x4000u, 0x14204u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto Read = +[](void *data, uint64_t address, uint32_t *word) {
+      auto &memory = *static_cast<TestMemory *>(data);
+      if (address != memory.base)
+        return false;
+      ++memory.reads;
+      *word = memory.words[0];
+      return true;
+    };
+    Check(MaterializeResources(
+              plan,
+              {.user_data = userdata,
+               .read_memory = Read,
+               .userdata = &memory,
+               .read_specialization_memory = options.clean ? Read : nullptr},
+              snapshot, specialization),
+          "fill fixture did not materialize");
+    const bool expected = !options.conditional && !options.shifted &&
+                          !options.extra_store && !options.branch &&
+                          (!options.scalar || options.clean);
+    Check((snapshot.buffer_fill.element_size != 0) == expected,
+          "fill proof accepted an unsafe store or missed the real GTA3 clear");
+    if (expected) {
+      Check(snapshot.buffer_fill.element_size == 4 &&
+                snapshot.buffer_fill.group_stride == 64 &&
+                snapshot.buffer_fill.value ==
+                    (options.scalar ? 0x40404040u : 0u),
+            "fill proof lost address coverage or the actual stored scalar");
+    }
+  };
+  Run({});
+  Run({.scalar = true, .clean = true});
+  Run({.scalar = true});
+  Run({.conditional = true, .clean = true});
+  Run({.shifted = true, .clean = true});
+  Run({.extra_store = true, .clean = true});
+  Run({.clean = true, .branch = true});
 }
 
 void TestDenseBufferTracking() {
@@ -1650,6 +1755,7 @@ int main() {
       }
     };
     Run("dense buffers", TestDenseBufferTracking);
+    Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);

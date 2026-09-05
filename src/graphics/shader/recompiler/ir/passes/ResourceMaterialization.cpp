@@ -2,6 +2,9 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -369,6 +372,17 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	next_snapshot.images.reserve(image_count);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
 	next_specialization.images.reserve(image_count);
+	next_specialization.sampler_depth_compare_funcs.reserve(program.info.samplers.size());
+	// Extract depth_compare_func from sampler descriptors for manual compare emulation
+	for (const auto& sampler_descriptor: next_snapshot.samplers) {
+		if (sampler_descriptor.dword_count >= 1) {
+			// DepthCompareFunc is stored in bits 12-14 of dword 0 (from shaderBindings.h)
+			next_specialization.sampler_depth_compare_funcs.push_back(
+			    (sampler_descriptor.dwords[0] >> 12u) & 0x7u);
+		} else {
+			next_specialization.sampler_depth_compare_funcs.push_back(0);
+		}
+	}
 	for (const auto& image: program.info.images) {
 		next_specialization.images.push_back({
 		    .numeric_class              = image.numeric_class,
@@ -380,6 +394,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .indirect_mapping_offset    = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
 		    .cube                       = image.cube,
+		    .needs_manual_depth_compare = false,
 		});
 	}
 	for (const auto& table: snapshot.indirect_images) {
@@ -486,6 +501,17 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		
+		// Check if depth-compare is requested but format doesn't support it on Vulkan
+		if (base.depth_compare && !storage) {
+			const auto surface_format = TextureGetSurfaceFormatInfo(format);
+			if (!IsDepthComparisonSupported(surface_format.vk_format)) {
+				// Format doesn't support native depth-compare, enable manual emulation
+				image.needs_manual_depth_compare = true;
+				image.shader_swizzle             = DescriptorImageSwizzle(descriptor);
+			}
+		}
+		
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
@@ -497,7 +523,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
-		           (base.depth_compare &&
+		           (base.depth_compare && !image.needs_manual_depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
 			return SpecializationFail(
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
@@ -540,19 +566,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				continue;
 			}
 			if (NullImageDescriptor(next_snapshot.images[candidate])) {
-				image.numeric_class     = image_class.numeric_class;
-				image.dimension         = image_class.dimension;
-				image.mip_count         = image_class.mip_count;
-				image.conversion_format = image_class.conversion_format;
-				image.shader_swizzle    = image_class.shader_swizzle;
-				image.cube              = image_class.cube;
+				image.numeric_class              = image_class.numeric_class;
+				image.dimension                  = image_class.dimension;
+				image.mip_count                  = image_class.mip_count;
+				image.conversion_format          = image_class.conversion_format;
+				image.shader_swizzle             = image_class.shader_swizzle;
+				image.cube                       = image_class.cube;
+				image.needs_manual_depth_compare = image_class.needs_manual_depth_compare;
 			}
 			if (image.numeric_class != image_class.numeric_class ||
 			    image.dimension != image_class.dimension ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.cube != image_class.cube) {
+			    image.cube != image_class.cube ||
+			    image.needs_manual_depth_compare != image_class.needs_manual_depth_compare) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
@@ -742,6 +770,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
+
+	// Copy depth_compare_func from specialization to samplers before splitting
+	for (uint32_t index = 0; index < samplers.size(); index++) {
+		if (index < specialization.sampler_depth_compare_funcs.size()) {
+			samplers[index].depth_compare_func = specialization.sampler_depth_compare_funcs[index];
+		}
+	}
+
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
 		const auto target = sampler_plan.point_sampler[index];

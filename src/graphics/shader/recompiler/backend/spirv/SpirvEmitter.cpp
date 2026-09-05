@@ -304,7 +304,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+                                  ShaderStageInputInfo input_info,
+                                  const IR::ResourceSpecialization& specialization) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -318,7 +319,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	}
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
-	EmitterState state(program, input_info);
+	EmitterState state(program, input_info, specialization);
 	state.stage     = program.stage;
 	state.wave_size = program.wave_size;
 	state.inputs.reserve(program.info.inputs.size());

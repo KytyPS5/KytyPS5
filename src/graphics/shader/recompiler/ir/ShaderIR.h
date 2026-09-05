@@ -143,6 +143,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	uint8_t  depth_compare_func    = 0; // vk::CompareOp value from sampler descriptor
 
 	bool operator==(const SamplerResource& other) const = default;
 };

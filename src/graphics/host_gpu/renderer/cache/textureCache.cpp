@@ -897,6 +897,14 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	plan.regions = TextureBuildImageCopies(plan.layout);
+	// If the host image is in a depth format (e.g., eD16Unorm created by the depth_compare path),
+	// TextureBuildImageCopies produces copies with a hardcoded eColor, which is invalid for depth images.
+	// Correct the aspect mask before uploading.
+	if (info.IsDepth()) {
+		for (auto& copy: plan.regions) {
+			copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
+		}
+	}
 	plan.tiled   = plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear;
 	if (plan.tiled) {
 		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,

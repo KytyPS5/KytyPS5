@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <vector>
 
@@ -12,7 +13,8 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 void AnalyzeProgramRequirements(IR::Program& program);
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+                                  ShaderStageInputInfo input_info,
+                                  const IR::ResourceSpecialization& specialization);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

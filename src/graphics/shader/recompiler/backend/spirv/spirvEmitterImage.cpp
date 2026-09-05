@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <bit>
@@ -41,6 +42,42 @@ uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lh
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({opcode, type, result, lhs, rhs});
 	return result;
+}
+
+uint32_t EmitFloatCompareOp(EmitterState& state, uint32_t lhs, uint32_t rhs, uint8_t compare_func) {
+	// Map compare-op (vk::CompareOp) to SPIR-V float comparison operations
+	// compare_func values: 0=Never, 1=Less, 2=Equal, 3=LessOrEqual, 4=Greater, 5=NotEqual, 6=GreaterOrEqual, 7=Always
+	switch (compare_func) {
+		case 0: // Never
+			return ConstantBool(state, false);
+		case 1: // Less
+			return Binary(state, OpFOrdLessThan, TypeBool(state), lhs, rhs);
+		case 2: // Equal
+			return Binary(state, OpFOrdEqual, TypeBool(state), lhs, rhs);
+		case 3: // LessOrEqual
+			return Binary(state, OpFOrdLessThanEqual, TypeBool(state), lhs, rhs);
+		case 4: // Greater
+			return Binary(state, OpFOrdGreaterThan, TypeBool(state), lhs, rhs);
+		case 5: // NotEqual
+			return Binary(state, OpFOrdNotEqual, TypeBool(state), lhs, rhs);
+		case 6: // GreaterOrEqual
+			return Binary(state, OpFOrdGreaterThanEqual, TypeBool(state), lhs, rhs);
+		case 7: // Always
+			return ConstantBool(state, true);
+		default:
+			return ConstantBool(state, false);
+	}
+}
+
+uint8_t SamplerDepthCompareFunc(const EmitterState& state, uint32_t sampler_index) {
+	if (sampler_index < state.program.info.samplers.size()) {
+		const auto func = state.program.info.samplers[sampler_index].depth_compare_func;
+		if (func != 0) return func;
+	}
+	if (sampler_index < state.specialization.sampler_depth_compare_funcs.size()) {
+		return state.specialization.sampler_depth_compare_funcs[sampler_index];
+	}
+	return 0;
 }
 
 bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
@@ -677,6 +714,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto  layout         = Layout(mem, dimension);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		const bool  manual_compare = state.specialization.images[mem.resource].needs_manual_depth_compare;
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
@@ -704,7 +742,62 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words;
-			if (dref) {
+			
+			// Handle manual depth-compare for gather
+			if (dref && manual_compare) {
+				// Use regular gather for manual compare
+				uint32_t gather_component = 0;
+				if (ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
+					gather_component = ImageGatherComponent(mem.dmask);
+				}
+				words = {OpImageGather, ImageVectorType(state, numeric_class, 4),
+				         sample,        sampled,
+				         coord,         ConstantU32(state, gather_component)};
+				
+				if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					words.push_back(ImageOperandsConstOffsetsMask);
+					words.push_back(HorizontalOffsets(state, dimension));
+				} else if (layout.offset != NoImageComponent) {
+					words.push_back(ImageOperandsOffsetMask);
+					words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
+				}
+				state.builder.AddFunction(words);
+				
+				// Extract dref value for comparison
+				auto dref_value = ZeroF32(state);
+				if (layout.dref != NoImageComponent) {
+					dref_value = AddressF32(ctx, mem, *address, layout.dref);
+				}
+				
+				// Get the compare-op from the sampler descriptor
+				const auto compare_func = SamplerDepthCompareFunc(state, mem.sampler);
+				
+				// For gather with manual compare, we need to compare each component
+				uint32_t compared_components[4];
+				for (uint32_t i = 0; i < 4; i++) {
+					const auto comp_value = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction({OpCompositeExtract, TypeF32(ctx.state), comp_value, sample, i});
+					
+					const auto compare_result = EmitFloatCompareOp(ctx.state, dref_value, comp_value, compare_func);
+					
+					const auto float_result = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction({OpSelect, TypeF32(ctx.state), float_result, compare_result, 
+					                                 ConstantF32Value(ctx.state, 1.0f), ConstantF32Value(ctx.state, 0.0f)});
+					compared_components[i] = float_result;
+				}
+				
+				const auto final_result = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(ctx.state, 4), final_result,
+				                                 compared_components[0], compared_components[1], 
+				                                 compared_components[2], compared_components[3]});
+				
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, final_result),
+				                              Prospero::TextureNumericClass::Float, false, mem, true));
+				return true;
+			}
+			
+			// Normal gather path
+			if (dref && !manual_compare) {
 				auto dref_value = ZeroF32(state);
 				if (layout.dref != NoImageComponent) {
 					dref_value = AddressF32(ctx, mem, *address, layout.dref);
@@ -740,16 +833,25 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 		                          state.stage != ShaderType::Pixel;
+		
+		// For manual depth-compare emulation, use regular sample operation
+		const bool use_manual_compare = dref && manual_compare;
 		uint32_t opcode = OpImageSampleImplicitLod;
 		if (explicit_lod) {
-			opcode = dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod;
-		} else if (dref) {
+			opcode = (dref && !use_manual_compare) ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod;
+		} else if (dref && !use_manual_compare) {
 			opcode = OpImageSampleDrefImplicitLod;
 		}
+		
 		uint32_t result_type = ImageVectorType(state, numeric_class, 4);
 		uint32_t dref_value  = 0;
 		if (dref) {
-			result_type = TypeF32(state);
+			if (use_manual_compare) {
+				// For manual compare, we still need the dref value for comparison
+				result_type = ImageVectorType(state, numeric_class, 4);
+			} else {
+				result_type = TypeF32(state);
+			}
 			dref_value  = ZeroF32(state);
 			if (layout.dref != NoImageComponent) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
@@ -778,7 +880,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
-			if (dref) {
+			// Only push dref_value for native depth-compare operations
+			if (dref && !use_manual_compare) {
 				words.push_back(dref_value);
 			}
 			if (operand_mask != 0u) {
@@ -793,6 +896,25 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto       result = sample;
 			if (!dref) {
 				result = UnpackImageTexel(ctx, mem, sample);
+			} else if (use_manual_compare) {
+				// Manual depth-compare emulation: sample as color, then compare in shader.
+				const auto r_component = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(
+				    {OpCompositeExtract, TypeF32(ctx.state), r_component, sample, 0});
+
+				const auto compare_func = SamplerDepthCompareFunc(state, mem.sampler);
+				const auto compare_result =
+				    EmitFloatCompareOp(ctx.state, dref_value, r_component, compare_func);
+
+				const auto float_result = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(
+				    {OpSelect, TypeF32(ctx.state), float_result, compare_result,
+				     ConstantF32Value(ctx.state, 1.0f), ConstantF32Value(ctx.state, 0.0f)});
+
+				// Result is a scalar float, same shape as a native Dref sample.
+				ctx.Define(inst, ResultVector(ctx, float_result,
+				                              Prospero::TextureNumericClass::Float, true, mem));
+				return true;
 			}
 			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 			return true;
@@ -888,6 +1010,25 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		auto result = phi_words[2];
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
+		} else if (use_manual_compare) {
+			// Manual depth-compare emulation for indirect images.
+			const auto r_component = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(
+			    {OpCompositeExtract, TypeF32(ctx.state), r_component, result, 0});
+
+			const auto compare_func = SamplerDepthCompareFunc(state, mem.sampler);
+			const auto compare_result =
+			    EmitFloatCompareOp(ctx.state, dref_value, r_component, compare_func);
+
+			const auto float_result = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(
+			    {OpSelect, TypeF32(ctx.state), float_result, compare_result,
+			     ConstantF32Value(ctx.state, 1.0f), ConstantF32Value(ctx.state, 0.0f)});
+
+			// Result is a scalar float, same shape as a native Dref sample.
+			ctx.Define(inst, ResultVector(ctx, float_result, Prospero::TextureNumericClass::Float,
+			                              true, mem));
+			return true;
 		}
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return true;

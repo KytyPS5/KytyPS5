@@ -285,6 +285,10 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	return DepthAspectTransferFormat(pixel_format) != vk::Format::eUndefined;
 }
 
+[[nodiscard]] inline bool IsDepthComparisonSupported(vk::Format format) noexcept {
+	return DepthAspectTransferFormat(format) != vk::Format::eUndefined;
+}
+
 [[nodiscard]] inline constexpr uint32_t DepthAspectTransferBytes(vk::Format format) noexcept {
 	switch (DepthAspectTransferFormat(format)) {
 		case vk::Format::eD16Unorm: return 2;

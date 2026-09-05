@@ -69,7 +69,8 @@ inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto writes        = depth.AttachmentWriteAspects();
 	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
 	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
-	const bool depth_write   = static_cast<bool>(writes & vk::ImageAspectFlagBits::eDepth);
+	// LoadOp clears are separate from guest depth writes.
+	const bool depth_write   = depth.depth_write_enable;
 	const bool stencil_write = static_cast<bool>(writes & vk::ImageAspectFlagBits::eStencil);
 	if (!has_stencil) {
 		return depth_write ? vk::ImageLayout::eDepthAttachmentOptimal

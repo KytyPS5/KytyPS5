@@ -9285,6 +9285,93 @@ public:
           "view followed the D32 backing");
       RenderExecutorTestAccess::ResetBindings(executor);
 
+      // Attachment acquisition consumes pending HTile clears using DB_DEPTH_CLEAR.
+      (void)texture_cache.FindDepthTarget(depth_only.image_id, depth_only.desc);
+      auto bounds_target = depth_only_target;
+      bounds_target.z_write_base_addr = 0;
+      bounds_target.depth_view.depth_write_disable = true;
+      registers.SetDepthRenderTarget(bounds_target);
+      HW::DepthControl bounds_control{};
+      bounds_control.depth_bounds_enable = true;
+      registers.SetDepthControl(bounds_control);
+      registers.SetRenderControl({});
+      registers.SetDepthClearValue(0.375f);
+      ShaderStageRuntime bounds_vertex{&vertex_sampled_info, {}};
+      ShaderStageRuntime bounds_pixel{&sampled_info, {}};
+      bounds_vertex.resources.images.push_back(sampled_depth_value);
+      bounds_pixel.resources.images.push_back(sampled_depth_value);
+      const auto depth_texels = depth_only.desc.info.extent.width *
+                                depth_only.desc.info.extent.height;
+      const auto depth_bytes = depth_texels * sizeof(uint32_t);
+      auto bounds_readback = CreateHostBuffer(name, depth_bytes * 2,
+          vk::BufferUsageFlagBits::eTransferDst, {});
+      for (uint32_t pass = 0; pass < 2; ++pass) {
+        Require(name, "bounds prior depth contents",
+                texture_cache.ClearImageFromBuffer(scheduler.Current(),
+                    depth_only.depth_buffer_vaddr, depth_only.depth_buffer_size,
+                    std::bit_cast<uint32_t>(0.625f)),
+                "failed to seed depth before the deferred HTile clear");
+        if (pass == 0) {
+          Require(name, "bounds deferred HTile clear",
+                  texture_cache.ClearMeta(depth_only_htile_address),
+                  "depth-only HTile was not registered");
+        }
+        RenderDepthInfo bounds_depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, 1, scheduler.Current(), bounds_depth);
+        auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
+            executor, bounds_vertex, bounds_pixel, true);
+        const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, bounds_depth);
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), bounds_bindings.vertex, *bounds_bindings.pixel));
+        const auto &vertex_depth = bounds_bindings.vertex.resources.images[0];
+        const auto &pixel_depth = bounds_bindings.pixel->resources.images[0];
+        constexpr auto readonly_layout = vk::ImageLayout::eDepthReadOnlyOptimal;
+        Require(name, "deferred clear with sampled read-only depth bounds",
+                bounds_depth.image_id == depth_only.image_id &&
+                    bounds_depth.depth_bounds_test_enable &&
+                    !bounds_depth.depth_write_enable &&
+                    bounds_depth.depth_meta_clear_enable == (pass == 0) &&
+                    bounds_depth.depth_load_clear_enable == (pass == 0) &&
+                    !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
+                    bounds_rendering.depth_stencil_attachment.image_layout == readonly_layout &&
+                    bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
+                    vertex_depth.image_id == depth_only.image_id &&
+                    pixel_depth.image_id == depth_only.image_id &&
+                    MakeImageInfo(vertex_depth).imageLayout == readonly_layout &&
+                    MakeImageInfo(pixel_depth).imageLayout == readonly_layout,
+                "deferred clear changed guest depth writes, sampled layouts, or repeated");
+        scheduler.BeginRendering(bounds_rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const vk::BufferImageCopy copy{pass * depth_bytes, 0, 0,
+            {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, depth_only.desc.info.extent};
+        texture_cache.GetImage(depth_only.image_id).Download(
+            std::span{&copy, 1}, bounds_readback.buffer, 0, bounds_readback.size);
+      }
+      vk::MemoryBarrier2 bounds_host_barrier{};
+      bounds_host_barrier.sType = vk::StructureType::eMemoryBarrier2;
+      bounds_host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+      bounds_host_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      bounds_host_barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      bounds_host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      vk::DependencyInfo bounds_dependency{};
+      bounds_dependency.sType = vk::StructureType::eDependencyInfo;
+      bounds_dependency.memoryBarrierCount = 1;
+      bounds_dependency.pMemoryBarriers = &bounds_host_barrier;
+      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Finish();
+      const auto bounds_result = ReadBuffer(name, bounds_readback, depth_texels * 2);
+      Require(name, "deferred HTile clear occurs once",
+              std::ranges::all_of(std::span{bounds_result}.first(depth_texels),
+                  [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.375f); }) &&
+              std::ranges::all_of(std::span{bounds_result}.subspan(depth_texels),
+                  [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.625f); }),
+              "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
+      DestroyBuffer(&bounds_readback);
+      registers.SetDepthClearValue(0.0f);
+
       auto shared_depth_descriptor = sampled_depth_descriptor;
       shared_depth_descriptor.fields[0] =
           static_cast<uint32_t>(phased_depth_address >> 8u);
@@ -9333,8 +9420,7 @@ public:
         const auto expected_access =
             vk::AccessFlagBits2::eShaderRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-            (stencil_write ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
-                           : vk::AccessFlags2{});
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
         const auto &shared_image = texture_cache.GetImage(shared_depth.image_id);
         const auto &vertex_image = shared_bindings.vertex.resources.images[0];
         const auto &pixel_image = shared_bindings.pixel->resources.images[0];
@@ -25726,17 +25812,23 @@ void CheckDynamicRenderingState() {
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
           "fully read-only depth/stencil used a writable layout");
   attachment.depth_load_clear_enable = true;
+  Require("DynamicRenderingState", "read-only deferred depth clear",
+          depth_attachment_layout(attachment) ==
+              vk::ImageLayout::eDepthStencilReadOnlyOptimal,
+          "a load clear changed the guest depth-write layout");
+  attachment.depth_write_enable = true;
   Require("DynamicRenderingState", "depth-write stencil-read layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
           "depth-only writes did not retain read-only stencil");
   attachment.depth_load_clear_enable = false;
+  attachment.depth_write_enable = false;
   attachment.stencil_clear_enable = true;
   Require("DynamicRenderingState", "depth-read stencil-write layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
           "stencil-only writes did not retain read-only depth");
-  attachment.depth_load_clear_enable = true;
+  attachment.depth_write_enable = true;
   Require("DynamicRenderingState", "writable depth/stencil layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal,
@@ -27293,8 +27385,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
+    CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {

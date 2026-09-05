@@ -626,11 +626,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			     depth.samples);
 		}
 		const auto layout = depth_attachment_layout(depth);
-		const auto writes = depth.AttachmentWriteAspects();
-		auto       access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead};
-		if (writes) {
-			access |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-		}
+		// The attachment store writes even when guest depth/stencil tests do not.
+		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;

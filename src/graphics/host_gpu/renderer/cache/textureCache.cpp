@@ -460,7 +460,7 @@ void TextureCache::PrepareImageCopy(Image& image) {
 
 void TextureCache::RefreshCopySource(ImageId id) {
 	auto& image = m_slot_images[id];
-	RefreshImage(id, ImageDesc {.info = image.info, .view_info = {}, .type = UploadBinding(image)});
+	RefreshImage(id);
 	if (image.IsDefinitelyCpuDirty()) {
 		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
 	}
@@ -648,8 +648,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
-	RefreshImage(cached_id,
-	             ImageDesc {.info = cached.info, .view_info = {}, .type = UploadBinding(cached)});
+	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
 		info.data       = cached.info.data;
@@ -810,8 +809,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
-	InitializeImage(expanded_id,
-	                ImageDesc {.info = info, .view_info = {}, .type = UploadBinding(source)});
+	InitializeImage(expanded_id);
 	CopyImage(expanded_id, source_id);
 	FreeImage(source_id);
 	return expanded_id;
@@ -929,23 +927,23 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 	return plan;
 }
 
-void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& source,
-                               uint64_t source_offset) {
-	const auto& info   = image.info;
-	const auto  upload = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
+void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	const auto& info    = image.info;
+	const auto  binding = UploadBinding(image);
+	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
 		}
 		image.Upload(copies, linear.buffer, linear.offset, linear.size);
 	};
 
-	if (desc.type != BindingType::DepthTarget) {
-		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
+	if (binding != BindingType::DepthTarget) {
+		auto plan = BuildColorTransfer(image, binding, TransferDirection::Upload);
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
 			     "pitch=%u levels=%u layers=%u samples=%u\n",
-			     static_cast<uint32_t>(desc.type), info.data.address, info.data.size,
+			     static_cast<uint32_t>(binding), info.data.address, info.data.size,
 			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
 			     static_cast<uint32_t>(plan.layout.surface.texture.block.family), info.extent.width,
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
@@ -963,7 +961,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 		return;
 	}
 
-	if (desc.type != BindingType::DepthTarget || info.samples != 1 || image.backing.samples != 1 ||
+	if (info.samples != 1 || image.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
@@ -1023,7 +1021,7 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 	upload(copies, linear);
 }
 
-void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
+void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
@@ -1047,7 +1045,7 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
 		data_imported = true;
-		UploadImage(image, desc, *source, source_offset);
+		UploadImage(image, *source, source_offset);
 	}
 	if (data_imported) {
 		image.ClearBufferModified();
@@ -1057,7 +1055,7 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
+void TextureCache::RefreshImage(ImageId id) {
 	TrackImage(id);
 	auto& image = m_slot_images[id];
 	if (image.IsMaybeCpuDirty()) {
@@ -1078,7 +1076,7 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	if (!cpu_dirty) {
 		return;
 	}
-	InitializeImage(id, desc);
+	InitializeImage(id);
 }
 
 void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
@@ -1192,7 +1190,7 @@ void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
-	RefreshImage(id, ImageDesc {.info = image.info, .type = UploadBinding(image)});
+	RefreshImage(id);
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
@@ -1248,7 +1246,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		image.MarkGpuModified();
 	}
 	if (!image.info.data.Empty()) {
-		RefreshImage(id, desc);
+		RefreshImage(id);
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
@@ -1280,7 +1278,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
-	RefreshImage(id, desc);
+	RefreshImage(id);
 	// DCC uses a separate metadata allocation. Register it when the color target is bound,
 	// matching the point where CMask/FMask will be registered. Preserve a PendingDcc entry
 	// because the metadata fill may have run before this bind.
@@ -1313,7 +1311,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
-	RefreshImage(id, desc);
+	RefreshImage(id);
 	if (desc.info.HasMetadata()) {
 		image.info.metadata = desc.info.metadata;
 		auto [metadata, inserted] =
@@ -1418,8 +1416,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		}
 	}
 	if (image.IsBufferModified() || image.IsCpuDirty()) {
-		ImageDesc refresh {.info = image.info, .view_info = {}, .type = UploadBinding(image)};
-		InitializeImage(selected, refresh);
+		InitializeImage(selected);
 		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
 			EXIT("TextureCache: image clear retained guest ownership\n");
 		}

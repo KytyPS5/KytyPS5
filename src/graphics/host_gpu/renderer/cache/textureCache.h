@@ -137,12 +137,12 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id, const ImageDesc& desc);
-	void                        InitializeImage(ImageId id, const ImageDesc& desc);
+	void                        RefreshImage(ImageId id);
+	void                        InitializeImage(ImageId id);
 	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
 	                                                   TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
-	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

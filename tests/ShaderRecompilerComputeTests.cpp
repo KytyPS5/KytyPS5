@@ -4566,11 +4566,22 @@ public:
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
       const std::array<uint32_t, 2> volume_values{0x10203040u, 0x50607080u};
-      std::memcpy(memory + 0x1000, volume_values.data(), sizeof(volume_values));
+      TileSizeAlign volume_size{};
+      TileGetTextureTotalSize(Prospero::BufferFormat::k32UInt, 1, 1, 2, 1,
+                              Prospero::TileMode::kLinear, true, volume_size);
+      const auto volume_pitch = TileGetTexturePitch(
+          Prospero::BufferFormat::k32UInt, 1, Prospero::TileMode::kLinear);
+      const auto volume_slice_words = volume_size.size / 2 / sizeof(uint32_t);
+      std::vector<uint32_t> volume_guest(volume_size.size / sizeof(uint32_t));
+      volume_guest[0] = volume_values[0];
+      volume_guest[volume_slice_words] = volume_values[1];
+      std::memcpy(memory + 0x1000, volume_guest.data(), volume_size.size);
       auto array_desc =
-          MakeLinearDesc(base + 0x1000, sizeof(volume_values),
+          MakeLinearDesc(base + 0x1000, volume_size.size,
                          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
                          Prospero::ImageType::kColor2D, {1, 1, 1}, 2, 4, 1);
+      array_desc.info.pitch = volume_pitch;
+      array_desc.info.mip_layout[0].pitch = volume_pitch;
       const auto array_image = texture_cache.FindImage(array_desc);
       (void)texture_cache.FindTexture(array_image, array_desc);
       texture_cache.MarkGpuWritten(array_image);
@@ -4590,12 +4601,10 @@ public:
               "ownership");
 
       constexpr uint64_t unique_volume_offset = 0x27b0000;
-      std::memcpy(memory + unique_volume_offset, volume_values.data(),
-                  sizeof(volume_values));
-      auto unique_volume_desc = MakeLinearDesc(
-          base + unique_volume_offset, sizeof(volume_values),
-          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
-          Prospero::ImageType::kColor3D, {1, 1, 2}, 1, sizeof(uint32_t), 1);
+      std::memcpy(memory + unique_volume_offset, volume_guest.data(),
+                  volume_size.size);
+      auto unique_volume_desc = volume_desc;
+      unique_volume_desc.info.data.address = base + unique_volume_offset;
       const auto unique_volume_image =
           texture_cache.FindImage(unique_volume_desc);
       (void)texture_cache.FindTexture(unique_volume_image, unique_volume_desc);
@@ -4621,6 +4630,16 @@ public:
               "partial 3D synchronization was accepted, "
               "full-volume synchronization was "
               "rejected, or ownership changed");
+      auto volume_readback = CreateHostBuffer(
+          name, volume_size.size, vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(volume_guest.size(), 0));
+      TransferReadBarrier(full_volume.Handle(), volume_size.size);
+      const vk::BufferCopy volume_copy{0, 0, volume_size.size};
+      command.Handle().copyBuffer(full_volume.Handle(), volume_readback.buffer,
+                                  1, &volume_copy);
+      HostReadBarrier(volume_readback.buffer, volume_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
 
       constexpr uint64_t depth_containment_offset = 0x27c0000;
       constexpr std::array<float, 3> depth_containment_values{0.25f, 0.75f,
@@ -6156,6 +6175,13 @@ public:
 
       const auto mip_prefix_words = ReadBuffer(
           name, mip_prefix_readback, mip_prefix_size / sizeof(uint32_t));
+      const auto volume_words =
+          ReadBuffer(name, volume_readback, volume_guest.size());
+      Require(name, "formatted volume content",
+              volume_words[0] == volume_values[0] &&
+                  volume_words[volume_slice_words] == volume_values[1],
+              "volume synchronization lost a padded depth slice");
+      DestroyBuffer(&volume_readback);
       const auto mip_formatted_words = ReadBuffer(
           name, mip_formatted_readback, mip_guest_size / sizeof(uint32_t));
       const auto mip0_word = mip_sizes[0].offset / sizeof(uint32_t);

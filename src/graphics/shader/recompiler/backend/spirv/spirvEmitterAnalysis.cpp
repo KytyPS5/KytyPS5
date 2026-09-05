@@ -248,8 +248,34 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 		state.builder.AddFunction({OpLoad, image_type, descriptor, pointer});
 		return descriptor;
 	};
+	// Out-of-range image stores are discarded by the hardware; robustImageAccess was seen to fault
+	// instead.
+	const auto components   = ImageDimensionInfoFor(image.dimension).coordinate_components;
+	const auto GuardedWrite = [&](uint32_t descriptor) {
+		state.builder.RequireCapability(CapabilityImageQuery);
+		const auto size = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpImageQuerySize, ImageViewSizeType(state, image.dimension), size, descriptor});
+		const auto inside = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpULessThan, components == 1u ? TypeBool(state) : TypeBoolVector(state, components),
+		     inside, coord, size});
+		uint32_t all_inside = inside;
+		if (components > 1u) {
+			all_inside = state.builder.AllocateId();
+			state.builder.AddFunction({OpAll, TypeBool(state), all_inside, inside});
+		}
+		const auto then_label  = state.builder.AllocateId();
+		const auto merge_label = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+		state.builder.AddFunction({OpBranchConditional, all_inside, then_label, merge_label});
+		EmitLabel(state, then_label);
+		state.builder.AddFunction({OpImageWrite, descriptor, coord, texel});
+		state.builder.AddFunction({OpBranch, merge_label});
+		EmitLabel(state, merge_label);
+	};
 	if (image.mip_mode != IR::ImageMipMode::DynamicStorage) {
-		state.builder.AddFunction({OpImageWrite, LoadAt(array_index), coord, texel});
+		GuardedWrite(LoadAt(array_index));
 		return;
 	}
 	if (image.mip_count == 0u) {
@@ -269,7 +295,7 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 	state.builder.AddFunction(words);
 	for (uint32_t mip = 0; mip < image.mip_count; mip++) {
 		EmitLabel(state, labels[mip]);
-		state.builder.AddFunction({OpImageWrite, LoadAt(array_index + mip), coord, texel});
+		GuardedWrite(LoadAt(array_index + mip));
 		state.builder.AddFunction({OpBranch, merge_label});
 	}
 	EmitLabel(state, merge_label);

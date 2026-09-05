@@ -61,6 +61,14 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
     {0x3bu, Opcode::S_BITREPLICATE_B64_B32},
     {0x3cu, Opcode::S_AND_SAVEEXEC_B32},
+    {0x3du, Opcode::S_OR_SAVEEXEC_B32},
+    {0x3eu, Opcode::S_XOR_SAVEEXEC_B32},
+    {0x3fu, Opcode::S_ANDN2_SAVEEXEC_B32},
+    {0x40u, Opcode::S_ORN2_SAVEEXEC_B32},
+    {0x41u, Opcode::S_NAND_SAVEEXEC_B32},
+    {0x42u, Opcode::S_NOR_SAVEEXEC_B32},
+    {0x43u, Opcode::S_XNOR_SAVEEXEC_B32},
+    {0x45u, Opcode::S_ORN1_SAVEEXEC_B32},
     {0x44u, Opcode::S_ANDN1_SAVEEXEC_B32},
 };
 

@@ -193,7 +193,7 @@ static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uin
 }
 
 LIB_DEFINE(InitPad_1) {
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE_ALL(true);
 
 	LIB_FUNC("hv1luiJrqQM", Controller::PadInit);
 	LIB_FUNC("xk0AcarP3V4", Controller::PadOpen);

@@ -651,7 +651,7 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 }
 
 LIB_DEFINE(InitVideoDec2_1) {
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE_ALL(true);
 
 	LIB_FUNC("RnDibcGCPKw", QueryComputeMemoryInfo);
 	LIB_FUNC("eD+X2SmxUt4", AllocateComputeQueue);

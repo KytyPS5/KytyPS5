@@ -335,40 +335,36 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 }
 
 static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
-                                       const ShaderTextureResource& descriptor, const Image* image,
-                                       vk::Format view_format, uint64_t size) {
-	const bool resource_ok = IsSupportedSampledDepthResource(resource);
-	const bool descriptor_ok =
-	    image != nullptr && IsSupportedSampledDepthDescriptor(descriptor, *image, resource.r128);
-	const bool encoding_ok =
-	    image != nullptr && IsSupportedDepthTextureEncoding(descriptor, *image, resource.r128);
-	const bool format_ok =
-	    image != nullptr && IsSupportedSampledDepthFormat(image->info.pixel_format, view_format);
-	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
+                                        const ShaderTextureResource& descriptor, const Image& image,
+                                        vk::Format view_format, uint64_t size) {
+	const bool resource_ok   = IsSupportedSampledDepthResource(resource);
+	const bool descriptor_ok = IsSupportedSampledDepthDescriptor(descriptor, image, resource.r128);
+	const bool encoding_ok   = IsSupportedDepthTextureEncoding(descriptor, image, resource.r128);
+	const bool view_ok =
+	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
+	if (resource_ok && descriptor_ok && encoding_ok && view_ok) {
 		return;
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
-	EXIT("unsupported sampled depth image: resource=%d descriptor=%d encoding=%d format=%d "
+	EXIT("unsupported sampled depth image: resource=%d descriptor=%d encoding=%d view=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, descriptor_ok, encoding_ok, format_ok,
+	     resource_ok, descriptor_ok, encoding_ok, view_ok,
 	     static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
 	     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
 	     resource.depth_compare, static_cast<uint32_t>(descriptor.Format()),
-	     descriptor.DstSelXYZW(),
-	     image == nullptr ? static_cast<int>(vk::Format::eUndefined)
-	                      : static_cast<int>(image->info.pixel_format),
-	     static_cast<int>(view_format), image == nullptr ? 0u : image->info.resources.layers,
+	     descriptor.DstSelXYZW(), static_cast<int>(image.info.pixel_format),
+	     static_cast<int>(view_format), image.info.resources.layers,
 	     static_cast<uint32_t>(descriptor.Type()), descriptor.BaseArray5(), descriptor.Depth(),
-	     descriptor_pitch, image == nullptr ? 0u : image->info.pitch, descriptor.Base40(), size,
-	     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
-	     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	     descriptor_pitch, image.info.pitch, descriptor.Base40(), size, descriptor.fields[0],
+	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
@@ -747,10 +743,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto* depth_format = resource.depth_compare ? FindGuestDepthFormatPolicy(format) : nullptr;
-	EXIT_NOT_IMPLEMENTED(resource.depth_compare && depth_format == nullptr);
-	const auto pixel_format =
-	    depth_format != nullptr ? depth_format->depth_attachment_format : surface_format.vk_format;
+	auto pixel_format = surface_format.vk_format;
+	if (resource.depth_compare) {
+		const auto* depth_format = FindGuestDepthFormatPolicy(format);
+		EXIT_NOT_IMPLEMENTED(depth_format == nullptr);
+		pixel_format = depth_format->depth_attachment_format;
+	}
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
@@ -789,9 +787,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, image, pixel_format, size.size);
-		(void)SelectSampledDepthView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {

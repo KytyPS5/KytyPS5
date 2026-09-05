@@ -130,10 +130,11 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
-		return image.info.tile_mode == Prospero::TileMode::kDepth ||
-		               image.info.tile_mode == Prospero::TileMode::kLinear
-		           ? BindingType::DepthTarget
-		           : BindingType::Texture;
+		if (image.info.tile_mode == Prospero::TileMode::kDepth ||
+		    image.info.tile_mode == Prospero::TileMode::kLinear) {
+			return BindingType::DepthTarget;
+		}
+		return BindingType::Texture;
 	}
 	if (image.usage.render_target) {
 		return BindingType::RenderTarget;
@@ -823,7 +824,6 @@ struct TextureCache::TextureTransferPlan {
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
 	uint64_t                         linear_size = 0;
-	bool                             tiled       = false;
 	bool                             swap_bgra16 = false;
 	bool                             valid       = false;
 };
@@ -846,52 +846,44 @@ TextureCache::TextureTransferPlan
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
                                     TransferDirection direction) const {
 	const auto& info             = image.info;
+	const bool  upload           = direction == TransferDirection::Upload;
+	const bool  render_target    = binding == BindingType::RenderTarget;
+	const bool  video_out        = binding == BindingType::VideoOut;
 	auto        format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
 	bool        volume           = info.IsVolume();
-	bool        allow_depth_tile = direction == TransferDirection::Upload;
-	const char* owner =
-	    direction == TransferDirection::Upload ? "TextureCache" : "TextureCache readback";
+	bool        allow_depth_tile = upload;
+	const char* owner            = "TextureCache readback";
 
 	TextureTransferPlan plan;
-	if (direction == TransferDirection::Upload) {
-		switch (binding) {
-			case BindingType::Texture: break;
-			case BindingType::Storage: owner = "StorageTextureCache"; break;
-			case BindingType::RenderTarget:
-				if (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
-				    info.samples != 1 || image.backing.samples != 1) {
-					EXIT("TextureCache: invalid color-attachment upload\n");
-				}
-				format           = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
-				allow_depth_tile = true;
-				plan.swap_bgra16 = info.bgra16;
-				owner            = "RenderTarget";
-				break;
-			case BindingType::VideoOut:
-				if (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
-				    info.samples != 1 || image.backing.samples != 1 ||
-				    info.metadata.compression != VideoOutCompression::Uncompressed) {
-					EXIT("TextureCache: invalid color-attachment upload\n");
-				}
-				format           = info.guest_format;
-				layers           = info.resources.layers;
-				volume           = false;
-				allow_depth_tile = false;
-				plan.swap_bgra16 = info.bgra16;
-				owner            = "VideoOut";
-				break;
-			case BindingType::DepthTarget: return plan;
+	plan.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
+	if (render_target) {
+		format = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
+	}
+	if (video_out) {
+		allow_depth_tile = false;
+	} else if (render_target || binding == BindingType::Storage) {
+		allow_depth_tile = true;
+	}
+	if (upload) {
+		if ((render_target || video_out) &&
+		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
+		     info.samples != 1 || image.backing.samples != 1)) {
+			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
-	} else {
-		if (binding == BindingType::DepthTarget) {
-			return plan;
+		owner = "TextureCache";
+		if (render_target) {
+			owner = "RenderTarget";
+		} else if (binding == BindingType::Storage) {
+			owner = "StorageTextureCache";
+		} else if (video_out) {
+			if (info.metadata.compression != VideoOutCompression::Uncompressed) {
+				EXIT("TextureCache: invalid color-attachment upload\n");
+			}
+			layers = info.resources.layers;
+			volume = false;
+			owner  = "VideoOut";
 		}
-		format           = binding == BindingType::RenderTarget
-		                       ? ImageOps::RenderTargetTransferFormat(info.bytes_per_block)
-		                       : info.guest_format;
-		allow_depth_tile = binding == BindingType::Storage || binding == BindingType::RenderTarget;
-		plan.swap_bgra16 = info.bgra16;
 	}
 
 	plan.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
@@ -903,8 +895,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
 		}
 	}
-	plan.tiled   = plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear;
-	if (plan.tiled) {
+	if (plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
 		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,
 		                              info.resources.levels, plan.tiles)) {
 			return plan;
@@ -959,7 +950,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			     info.resources.layers, info.samples);
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
-		if (plan.tiled) {
+		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
 			                        plan.linear_size, plan.tiles);
 		}
@@ -1568,7 +1559,7 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 	auto&      texture   = plan.texture;
 	const auto transform = texture.swap_bgra16 ? TileManager::ColorTransform::SwapBgra16
 	                                           : TileManager::ColorTransform::None;
-	if (!texture.tiled) {
+	if (texture.tiles.empty()) {
 		if (transform == TileManager::ColorTransform::SwapBgra16) {
 			auto linear = m_tiler.GetScratchBuffer(destination_size);
 			image.Download(texture.regions, linear.buffer, 0, linear.size);
@@ -1666,7 +1657,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		if (texture.regions.empty()) {
 			return false;
 		}
-		if (texture.tiled) {
+		if (!texture.tiles.empty()) {
 			texture.tiles.clear();
 			if (!TextureBuildGpuTileInfos(copy_size, texture.regions, texture.layout, levels,
 			                              texture.tiles)) {

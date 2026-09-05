@@ -219,7 +219,7 @@ private:
 	friend struct RenderExecutorTestAccess;
 };
 
-[[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+[[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);

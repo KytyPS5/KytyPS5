@@ -39,9 +39,6 @@ namespace Libs::Graphics {
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("compute buffer descriptor footprint overflow\n");
-	}
 	return stride == 0 ? records : records * stride;
 }
 
@@ -51,9 +48,8 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 		if (i == output_buffer) continue;
 		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
 		const auto bytes  = BufferDescriptorSize(source);
-		if (source.Base48() > UINT64_MAX - bytes ||
-		    (source.Base48() < destination.End() &&
-		     destination.address < source.Base48() + bytes)) return false;
+		if (source.Base48() < destination.End() && destination.address < source.Base48() + bytes)
+			return false;
 	}
 	return true;
 }
@@ -91,30 +87,23 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
-bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
                               uint64_t& resolved_size) {
-	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
-	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || fill.words == 0 ||
-	    fill.words > 4 || fill.resource >= resources.buffers.size() ||
-	    resources.buffers.size() != program.info.buffers.size()) {
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
 		return false;
 	}
-	const auto           element_size = fill.words * sizeof(uint32_t);
-	const auto&          resource   = program.info.buffers[fill.resource];
-	const auto&          raw        = resources.buffers[fill.resource];
-	const auto           descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	const auto element_size = fill.words * sizeof(uint32_t);
+	const auto descriptor =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
 	constexpr std::array formats {
 	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
 	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
-	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
-	    resource.scalar || descriptor.Stride() != element_size ||
-	    descriptor.Format() != formats[fill.words - 1] || descriptor.SwizzleEnabled() ||
-	    descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
+	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
 	    descriptor.Base48() == 0) {
 		return false;
 	}
@@ -128,7 +117,6 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = BufferDescriptorSize(descriptor);
 	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
-	    descriptor.Base48() > UINT64_MAX - size ||
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
@@ -150,23 +138,17 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
-		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.words != 1 || fill.value > 255 ||
-		    resources.images.size() != 1 || program.info.images.size() != 1 || fill.resource != 0 ||
-		    resources.images[0].dword_count != 8 || input.threads_num[2] != 1 ||
-		    fill.group_stride[2] != 1) return false;
+		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||
+		    input.threads_num[2] != 1)
+			return false;
 		const auto  descriptor = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[0]);
 		const auto& resource   = program.info.images[0];
 		if (descriptor.IsNull() || descriptor.Format() != Prospero::BufferFormat::k8UInt ||
-		    descriptor.Type() != Prospero::ImageType::kColor2DArray ||
-		    descriptor.MetaCompress() || descriptor.WriteCompress() ||
-		    descriptor.BaseLevel() > descriptor.LastLevel() ||
+		    descriptor.Type() != Prospero::ImageType::kColor2DArray || descriptor.MetaCompress() ||
+		    descriptor.WriteCompress() || descriptor.BaseLevel() > descriptor.LastLevel() ||
 		    descriptor.BaseLevel() > descriptor.MaxMip() ||
-		    descriptor.BaseArray5() > descriptor.Depth() ||
-		    descriptor.DstSelX() != 4 || (resource.shader_swizzle & 7u) != 4 ||
-		    resource.numeric_class != Prospero::TextureNumericClass::Uint ||
-		    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
-		    resource.read || resource.atomic || !resource.written ||
-		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::None) return false;
+		    descriptor.BaseArray5() > descriptor.Depth() || descriptor.DstSelX() != 4)
+			return false;
 		const std::array extents {
 		    std::max(1u, (descriptor.Width5() + 1u) >> descriptor.BaseLevel()),
 		    std::max(1u, (descriptor.Height5() + 1u) >> descriptor.BaseLevel()),
@@ -202,7 +184,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
-	if (!ResolveComputeImageClear(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
+	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
 	                              size)) {
 		return false;
 	}
@@ -219,10 +201,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			     registered_metadata ? "tracked" : "deferred", input.stage.program->shader_hash,
 			     descriptor.Base48(), size, packed_clear);
 		}
-		if (registered_metadata) {
-			return true;
-		}
-		return false;
+		return registered_metadata;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {

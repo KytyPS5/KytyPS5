@@ -5398,11 +5398,15 @@ public:
         const auto count = copy.imageExtent.width * copy.imageExtent.height;
         const auto *bytes = stencil_bytes + copy.bufferOffset;
         const bool depth = sub.aspectMask == vk::ImageAspectFlagBits::eDepth;
+        uint32_t expected = 0x91u;
+        if (depth) {
+          expected = std::bit_cast<uint32_t>(0.75f);
+        } else if (sub.mipLevel == 1 && sub.baseArrayLayer == 1) {
+          expected = 0x35u;
+        }
         for (uint32_t pixel = 0; pixel < count; pixel++) {
           uint32_t actual = bytes[pixel];
           if (depth) std::memcpy(&actual, bytes + pixel * 4, 4);
-          const uint32_t expected = depth ? std::bit_cast<uint32_t>(0.75f)
-              : sub.mipLevel == 1 && sub.baseArrayLayer == 1 ? 0x35u : 0x91u;
           Require(name, "stencil clear preserves depth and neighbors", actual == expected,
                   "selected stencil clear changed depth, another mip, or another layer");
         }
@@ -22760,29 +22764,18 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     auto result = ShaderRecompiler::CompileProgram(
         std::move(translated), options, specialization);
     ValidateSpirv("Ps5GameExampleImageClear", result.spirv);
-    return CompiledShader{std::move(result.spirv), std::move(result.program),
-                          std::move(resources), {}};
+    return resources;
   };
 
   const auto code = MakeCode();
   auto positive = Compile(code);
 
-  ShaderRecompiler::IR::CompiledShaderInfo program{};
-  program.stage = positive.program.stage;
-  program.shader_hash = positive.program.shader_hash;
-  program.wave_size = positive.program.wave_size;
-  program.user_data_base = positive.program.user_data_base;
-  program.user_data_count = positive.program.user_data_count;
-  program.scratch_dwords = positive.program.scratch_dwords;
-  program.info = std::move(positive.program.info);
-  program.bindings = std::move(positive.program.bindings);
-  compute.stage.program = &program;
-  compute.stage.resources = positive.resources;
+  compute.stage.resources = positive;
   ShaderBufferResource descriptor{};
   u32 packed_clear = 0;
   uint64_t size = 0;
   Require("Ps5GameExampleImageClear", "runtime shape",
-          ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
+          ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
                                    packed_clear, size) &&
               descriptor.Base48() == 0x10000u && size == 64u * 16u &&
               packed_clear == 0xff000000u,
@@ -22790,22 +22783,22 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
 
   auto wrong_index = code;
   wrong_index[0] = (wrong_index[0] & ~(0x3ffu << 16u)) | (0x347u << 16u);
-  compute.stage.resources = Compile(wrong_index).resources;
+  compute.stage.resources = Compile(wrong_index);
   Require("Ps5GameExampleImageClear", "add-before-shift address",
-          !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
+          !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "V_ADD_LSHL was mistaken for V_LSHL_ADD contiguous coverage");
 
   user_data[7] ^= 1u;
-  compute.stage.resources = Compile(code).resources;
+  compute.stage.resources = Compile(code);
   Require("Ps5GameExampleImageClear", "non-repeated clear",
-          !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
+          !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "non-uniform uint4 data was replaced with a color clear");
-  compute.stage.resources = positive.resources;
+  compute.stage.resources = positive;
   compute.dispatch_threads_num[0] = 32;
   Require("Ps5GameExampleImageClear", "partial dispatch",
-          !ResolveComputeImageClear(compute, 32, 1, 1, 0x61u, descriptor,
+          !ResolveComputeBufferFill(compute, 32, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "partial buffer coverage was classified as a complete clear");
 
@@ -22821,46 +22814,43 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   scalar_code.push_back(EncodeMubuf1(1, 0, 0));
   AppendEnd(&scalar_code);
   auto scalar = Compile(scalar_code);
-  program.info = scalar.program.info;
-  compute.stage.resources = scalar.resources;
+  compute.stage.resources = scalar;
   Require("Ps5GameExampleImageClear", "inline scalar fill",
-          ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               descriptor.Base48() == 0x200000u && size == 256u &&
               packed_clear == 0u,
           "GTA3's actual scalar store was not recognized from IR");
   Require("Ps5GameExampleImageClear", "excess dispatch",
-          !ResolveComputeImageClear(compute, 2, 1, 1, 0x41u, descriptor,
+          !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "excess invocation coverage was accepted as a fill");
-  auto alias = scalar.resources.buffers.front();
+  auto alias = scalar.buffers.front();
   compute.stage.resources.buffers.push_back(alias);
-  program.info.buffers.push_back({.read = true, .scalar = true});
   Require("Ps5GameExampleImageClear", "aliased scalar input",
-          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "a scalar read aliasing the destination was accepted as uniform");
-  program.info = scalar.program.info;
-  compute.stage.resources = scalar.resources;
+  compute.stage.resources = scalar;
   compute.stage.resources.buffers[0].dwords[3] =
       (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u) | 0x204u;
   Require("Ps5GameExampleImageClear", "wrong store format",
-          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "a format that changes the stored value was accepted as a uint fill");
   // A body change preserving every descriptor and dispatch field must change
   // the result.
   scalar_code[2] = EncodeVop1(0x01u, 1, InlineU32(7));
-  compute.stage.resources = Compile(scalar_code).resources;
+  compute.stage.resources = Compile(scalar_code);
   Require("Ps5GameExampleImageClear", "changed store value",
-          ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               packed_clear == 7u,
           "clear recognition ignored the shader's actual stored value");
   scalar_code[2] = EncodeVop1(0x01u, 1, Vgpr(0));
-  compute.stage.resources = Compile(scalar_code).resources;
+  compute.stage.resources = Compile(scalar_code);
   Require("Ps5GameExampleImageClear", "varying store value",
-          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "a varying store with identical resources was treated as a fill");
 
@@ -22880,17 +22870,16 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   AppendEnd(&scalar_code);
   clean_scalar = true;
   auto loaded = Compile(scalar_code);
-  program.info = loaded.program.info;
-  compute.stage.resources = loaded.resources;
+  compute.stage.resources = loaded;
   Require("Ps5GameExampleImageClear", "scalar-loaded fill",
-          ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
           "GTA3's scalar input was confused with its destination");
   clean_scalar = false;
-  compute.stage.resources = Compile(scalar_code).resources;
+  compute.stage.resources = Compile(scalar_code);
   Require("Ps5GameExampleImageClear", "unavailable clean scalar",
-          !ResolveComputeImageClear(compute, 1, 1, 1, 0x41u, descriptor,
+          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "a scalar without a clean reader was replaced by a fill");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
@@ -23178,12 +23167,6 @@ void CheckRenderTargetFormatContract() {
     (void)SelectSampledColorView(vk::Format::eR8G8B8A8Unorm,
                                  vk::Format::eR8G8B8A8Unorm,
                                  DstSel(7, 6, 5, 3));
-  } else if (std::strcmp(kind, "sampled-depth-format") == 0) {
-    (void)SelectSampledDepthView(vk::Format::eD24UnormS8Uint,
-                                 vk::Format::eR8Unorm, DstSel(4, 4, 4, 4));
-  } else if (std::strcmp(kind, "sampled-depth-swizzle") == 0) {
-    (void)SelectSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                 vk::Format::eR32Sfloat, DstSel(4, 5, 6, 7));
   } else if (std::strcmp(kind, "storage-incompatible-format") == 0) {
     ValidateStorageColorView(vk::Format::eR8G8B8A8Srgb,
                              vk::Format::eR16G16B16A16Unorm,
@@ -23397,34 +23380,44 @@ void CheckSampledColorViews() {
                                      vk::Format::eR8G8B8A8Unorm,
                                      DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7),
           "compatible integer render-target sampled view was rejected");
+  Require("SampledColorViews", "invalid depth format",
+          !IsSupportedSampledDepthView(vk::Format::eD24UnormS8Uint,
+                                       vk::Format::eR8Unorm,
+                                       DstSel(4, 4, 4, 4)),
+          "incompatible sampled depth format was accepted");
+  Require("SampledColorViews", "invalid depth swizzle",
+          !IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
+                                       vk::Format::eR32Sfloat,
+                                       DstSel(4, 5, 6, 7)),
+          "incompatible sampled depth swizzle was accepted");
   Require("SampledColorViews", "D32 depth target",
-          SelectSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                 vk::Format::eR32Sfloat,
-                                 DstSel(4, 4, 4, 4)) == DstSel(4, 4, 4, 4),
+          IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
+                                      vk::Format::eR32Sfloat,
+                                      DstSel(4, 4, 4, 4)),
           "D32 depth target did not select its depth-aspect view");
   Require("SampledColorViews", "D16 R000 depth target",
-          SelectSampledDepthView(vk::Format::eD16Unorm, vk::Format::eR16Unorm,
-                                 DstSel(4, 0, 0, 0)) == DstSel(4, 0, 0, 0),
+          IsSupportedSampledDepthView(
+              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 0, 0, 0)),
           "D16 depth target did not select its R000 depth-aspect view");
   Require("SampledColorViews", "D16S8 R001 depth target",
-          SelectSampledDepthView(vk::Format::eD16UnormS8Uint,
-                                 vk::Format::eR16Unorm,
-                                 DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
+          IsSupportedSampledDepthView(vk::Format::eD16UnormS8Uint,
+                                      vk::Format::eR16Unorm,
+                                      DstSel(4, 0, 0, 1)),
           "D16S8 depth target did not select its R001 depth-aspect view");
   Require("SampledColorViews", "promoted D24S8 R001 depth target",
-          SelectSampledDepthView(vk::Format::eD24UnormS8Uint,
-                                 vk::Format::eR16Unorm,
-                                 DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
+          IsSupportedSampledDepthView(vk::Format::eD24UnormS8Uint,
+                                      vk::Format::eR16Unorm,
+                                      DstSel(4, 0, 0, 1)),
           "D24S8 host fallback did not preserve the guest R16 depth view");
   Require("SampledColorViews", "promoted D32S8 R001 depth target",
-          SelectSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                 vk::Format::eR16Unorm,
-                                 DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
+          IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
+                                      vk::Format::eR16Unorm,
+                                      DstSel(4, 0, 0, 1)),
           "D32S8 host fallback did not preserve the guest R16 depth view");
   Require("SampledColorViews", "D32S8 R001 depth target",
-          SelectSampledDepthView(vk::Format::eD32SfloatS8Uint,
-                                 vk::Format::eR32Sfloat,
-                                 DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
+          IsSupportedSampledDepthView(vk::Format::eD32SfloatS8Uint,
+                                      vk::Format::eR32Sfloat,
+                                      DstSel(4, 0, 0, 1)),
           "D32S8 depth target did not select its R001 depth-aspect view");
   ShaderRecompiler::IR::ImageResource storage_resource{};
   storage_resource.resource_class =
@@ -23470,10 +23463,9 @@ void CheckSampledColorViews() {
           "GetModuleFileName failed");
   for (const char *kind :
        {"sampled-invalid-selector", "sampled-incompatible-format",
-        "sampled-invalid-high", "sampled-depth-format", "sampled-depth-swizzle",
-        "storage-incompatible-format", "storage-kind", "storage-no-write",
-        "storage-nonuint-atomic", "storage-compare", "storage-dimension",
-        "volume-mip-count", "volume-slice-range"}) {
+        "sampled-invalid-high", "storage-incompatible-format", "storage-kind",
+        "storage-no-write", "storage-nonuint-atomic", "storage-compare",
+        "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
     std::string command =
         std::string("\"") + path + "\" --image-view-death " + kind;
     std::vector<char> mutable_command(command.begin(), command.end());

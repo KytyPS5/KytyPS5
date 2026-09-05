@@ -8,8 +8,10 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -413,6 +415,55 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+struct EvaluatorScratch {
+	std::unordered_map<const Inst*, std::pair<uint32_t, uint64_t>> cache;
+	std::vector<const Inst*>                                       visiting;
+	uint32_t                                                       generation = 0;
+	bool                                                           in_use     = false;
+
+	void Begin() {
+		visiting.clear();
+		if (++generation == 0) {
+			cache.clear();
+			generation = 1;
+		}
+	}
+};
+
+class ScratchLease final {
+public:
+	ScratchLease() {
+		auto& pool = Pool();
+		for (auto& slot: pool) {
+			if (!slot->in_use) {
+				m_slot = slot.get();
+				break;
+			}
+		}
+		if (m_slot == nullptr) {
+			pool.push_back(std::make_unique<EvaluatorScratch>());
+			m_slot = pool.back().get();
+		}
+		m_slot->in_use = true;
+		m_slot->Begin();
+	}
+
+	~ScratchLease() { m_slot->in_use = false; }
+
+	ScratchLease(const ScratchLease&)            = delete;
+	ScratchLease& operator=(const ScratchLease&) = delete;
+
+	[[nodiscard]] EvaluatorScratch& Get() const { return *m_slot; }
+
+private:
+	static std::vector<std::unique_ptr<EvaluatorScratch>>& Pool() {
+		static thread_local std::vector<std::unique_ptr<EvaluatorScratch>> pool;
+		return pool;
+	}
+
+	EvaluatorScratch* m_slot = nullptr;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -454,17 +505,13 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
-		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
-			m_reserved = true;
-		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
+		if (const auto found = m_cache.find(inst);
+		    found != m_cache.end() && found->second.first == m_generation) {
+			result = found->second.second;
 			return true;
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
@@ -476,7 +523,7 @@ private:
 			return false;
 		}
 		m_visiting.pop_back();
-		m_cache.emplace(inst, out);
+		m_cache.insert_or_assign(inst, std::pair {m_generation, out});
 		result = out;
 		return true;
 	}
@@ -918,14 +965,15 @@ private:
 		return false;
 	}
 
-	const ResourcePlan&                       m_program;
-	const SrtRuntime&                         m_runtime;
-	std::span<const uint8_t>                  m_clean_flat_slots;
-	Evaluator*                                m_clean_evaluator = nullptr;
-	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
+	const ResourcePlan&                                             m_program;
+	const SrtRuntime&                                               m_runtime;
+	std::span<const uint8_t>                                        m_clean_flat_slots;
+	Evaluator*                                                      m_clean_evaluator = nullptr;
+	Value                                                           m_active_mask;
+	ScratchLease                                                    m_scratch;
+	std::unordered_map<const Inst*, std::pair<uint32_t, uint64_t>>& m_cache = m_scratch.Get().cache;
+	std::vector<const Inst*>& m_visiting   = m_scratch.Get().visiting;
+	uint32_t                  m_generation = m_scratch.Get().generation;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {

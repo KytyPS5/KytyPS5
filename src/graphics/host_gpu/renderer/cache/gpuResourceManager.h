@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <shared_mutex>
+#include <span>
 
 namespace Libs::Graphics {
 
@@ -31,6 +32,8 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	void               PrepareBdaRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool PrepareBdaPointers(std::span<const uint32_t> words);
 	void               RunGarbageCollector();
 
 private:

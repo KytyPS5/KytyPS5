@@ -1,6 +1,9 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/assert.h"
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -41,6 +44,37 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 		case TextureCache::BindingType::VideoOut: return "VideoOut";
 	}
 	return "Image";
+}
+
+[[nodiscard]] bool IsStorageSampledFormatMismatch(const Image& cached,
+                                                   const ImageInfo& requested,
+                                                   TextureCache::BindingType binding) noexcept {
+	const bool requested_storage = binding == TextureCache::BindingType::Storage;
+	const bool requested_image   = binding == TextureCache::BindingType::Texture;
+	if (!requested_storage && !requested_image) {
+		return false;
+	}
+	if (requested_storage == cached.usage.storage ||
+	    cached.info.data.address != requested.data.address ||
+	    cached.info.data.size != requested.data.size || cached.info.type != requested.type ||
+	    cached.info.extent != requested.extent || cached.info.resources != requested.resources ||
+	    cached.info.samples != requested.samples || cached.info.tile_mode != requested.tile_mode ||
+	    cached.info.bytes_per_block != requested.bytes_per_block || cached.info.IsBlock() ||
+	    cached.info.IsDepth() || cached.info.HasMetadata() || cached.info.HasStencil() ||
+	    cached.info.IsVolume() || requested.IsBlock() || requested.IsDepth() ||
+	    requested.HasMetadata() || requested.HasStencil() || requested.IsVolume()) {
+		return false;
+	}
+	const bool r8_integer_normalized =
+		(cached.info.guest_format == Prospero::BufferFormat::k8UInt &&
+		 requested.guest_format == Prospero::BufferFormat::k8UNorm) ||
+		(cached.info.guest_format == Prospero::BufferFormat::k8UNorm &&
+		 requested.guest_format == Prospero::BufferFormat::k8UInt);
+	if (!r8_integer_normalized) {
+		return false;
+	}
+	return cached.info.guest_format != requested.guest_format ||
+	       cached.info.pixel_format != requested.pixel_format;
 }
 
 void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view,
@@ -702,6 +736,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
+	if (IsStorageSampledFormatMismatch(cached, requested, binding)) {
+		return {merged_id};
+	}
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
@@ -799,6 +836,85 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 	}
 	return {merged_id};
+}
+
+void TextureCache::PrepareStorageSampledOverlap(const ImageDesc& desc) {
+	if (desc.type != BindingType::Texture && desc.type != BindingType::Storage) {
+		return;
+	}
+
+	std::vector<ImageId> candidates;
+	std::vector<ImageId> gpu_candidates;
+	{
+		std::scoped_lock lock {m_lock};
+		for (const auto id: FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image == nullptr ||
+			    !IsStorageSampledFormatMismatch(*image, desc.info, desc.type)) {
+				continue;
+			}
+			candidates.push_back(id);
+			if (image->IsGpuModified()) {
+				gpu_candidates.push_back(id);
+			}
+		}
+	}
+	if (candidates.empty()) {
+		return;
+	}
+	// A storage image may have produced the bytes that a differently-formatted sampled
+	// image is about to consume. Publish those bytes before separating the cache owners.
+	// Use the image path directly: storage writes are not necessarily enrolled in the
+	// optional CPU-read tracker, while TryDownloadImage supports the same linear/tiled
+	// download plan used by normal image retirement.
+	if (!gpu_candidates.empty()) {
+		{
+			std::scoped_lock lock {m_lock};
+			for (const auto id: gpu_candidates) {
+				if (m_slot_images.try_get(id) == nullptr || !TryDownloadImage(id)) {
+					EXIT("TextureCache: cannot publish storage image before format reinterpretation "
+					     "at 0x%016" PRIx64 "\n",
+					     desc.info.data.address);
+				}
+			}
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(tick);
+		std::scoped_lock lock {m_lock};
+		for (const auto id: gpu_candidates) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr) {
+				continue;
+			}
+			const auto range = image->info.data;
+			image->ClearGpuModified();
+			m_download_images.erase(id);
+			m_buffer_cache.InvalidateMemory(range.address, range.size);
+		}
+	}
+
+	std::scoped_lock lock {m_lock};
+	for (const auto id: candidates) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			continue;
+		}
+		if (image->IsGpuModified()) {
+			EXIT("TextureCache: cannot separate storage/sampled image without readback at "
+			     "0x%016" PRIx64
+			     " (buffer=%d cpu_dirty=%d safe=%d storage=%d tiled=%d block=%d "
+			     "metadata=%d stencil=%d volume=%d resources=%u/%u)\n",
+			     image->info.data.address, static_cast<int>(image->IsBufferModified()),
+			     static_cast<int>(image->IsCpuDirty()),
+			     static_cast<int>(SafeToDownload(*image)), static_cast<int>(image->usage.storage),
+			     static_cast<int>(image->info.IsTiled()), static_cast<int>(image->info.IsBlock()),
+			     static_cast<int>(image->info.HasMetadata()), static_cast<int>(image->info.HasStencil()),
+			     static_cast<int>(image->info.IsVolume()), image->info.resources.levels,
+			     image->info.resources.layers);
+		}
+		FreeImage(id);
+	}
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
@@ -1118,6 +1234,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
+	PrepareStorageSampledOverlap(desc);
 
 	ImageId result {};
 	{
@@ -1127,7 +1244,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			if (!IsStorageSampledFormatMismatch(image, desc.info, desc.type) &&
+			    SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
 		}

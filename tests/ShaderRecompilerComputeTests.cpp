@@ -7035,6 +7035,151 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBdaUserDataPrefetch() {
+    constexpr const char *name = "BdaUserDataPrefetch";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x20000;
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x200000, 0, &direct_offset) == 0,
+            "BDA prefetch direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                0x200000) == 0 && mapped == reinterpret_cast<void *>(base),
+            "BDA prefetch fixed mapping failed");
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, allocation_size);
+      constexpr uint64_t source = base + 0x8100;
+      std::array<uint32_t, 16> user_data{};
+      user_data[12] = static_cast<uint32_t>(source);
+      user_data[13] = static_cast<uint32_t>(source >> 32);
+      Require(name, "pointer discovery", resources.PrepareBdaPointers(user_data),
+              "BDA pointer in runtime words was not discovered");
+      auto &buffers = resources.GetBufferCache();
+      Require(name, "mapped source pages",
+              buffers.IsRegionRegistered(base + 0x4000, 0x10000),
+              "BDA source pages were not materialized before dispatch");
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA prefetch direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "BDA prefetch direct-memory release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckStorageSampledFormatSeparation() {
+    constexpr const char *name = "StorageSampledFormatSeparation";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t atlas_size = 0x800000;
+    constexpr uint32_t width = 2048;
+    constexpr uint32_t height = 4096;
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x200000, 0, &direct_offset) == 0,
+            "storage/sample direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                0x200000) == 0 && mapped == reinterpret_cast<void *>(base),
+            "storage/sample fixed mapping failed");
+    std::memset(mapped, 0x7f, atlas_size);
+
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, allocation_size);
+      auto MakeAtlasDesc = [&](BindingType type, vk::Format pixel_format,
+                               Prospero::BufferFormat guest_format,
+                               vk::ImageUsageFlags usage) {
+        ImageDesc desc{};
+        desc.type = type;
+        desc.info.data = {base, atlas_size};
+        desc.info.pixel_format = pixel_format;
+        desc.info.guest_format = guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = {width, height, 1};
+        desc.info.resources = {1, 1};
+        desc.info.pitch = width;
+        desc.info.bytes_per_block = 1;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, atlas_size, width, height};
+        desc.view_info.format = pixel_format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.usage = usage;
+        return desc;
+      };
+
+      auto &texture_cache = resources.GetTextureCache();
+      auto storage = MakeAtlasDesc(BindingType::Storage, vk::Format::eR8Uint,
+                                   Prospero::BufferFormat::k8UInt,
+                                   vk::ImageUsageFlagBits::eStorage);
+      const auto storage_id = texture_cache.FindImage(storage);
+      (void)texture_cache.FindTexture(storage_id, storage);
+      auto sampled = MakeAtlasDesc(BindingType::Texture, vk::Format::eR8Unorm,
+                                   Prospero::BufferFormat::k8UNorm,
+                                   vk::ImageUsageFlagBits::eSampled);
+      const auto sampled_id = texture_cache.FindImage(sampled);
+      Require(name, "numeric-format separation",
+              storage_id && sampled_id && storage_id != sampled_id,
+              "R8 integer storage and normalized sampled atlas shared one cache image");
+
+      uint8_t published = 0;
+      Require(name, "storage contents publication",
+              Libs::LibKernel::Memory::TryReadBacking(base, &published, sizeof(published)) &&
+                  published == 0x7f,
+              "separating the storage owner failed to publish its guest bytes");
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "storage/sample direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "storage/sample direct-memory release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBgra16Readback() {
     constexpr const char *name = "Bgra16Readback";
     constexpr uintptr_t base = 0x0000000204000000ull;
@@ -10844,6 +10989,36 @@ public:
     }
     Require(name, "format coverage", format_cases != 0,
             "no CPU-supported standard formats were tested");
+
+    // GTA V's text atlas is a single-mip R8 Standard64KB surface at this
+    // exact size. Keep this case explicit: the small format matrix above does
+    // not exercise the atlas-sized dispatch, pitch, or 8 MiB storage range.
+    {
+      constexpr auto format = Prospero::BufferFormat::k8UInt;
+      constexpr auto tile = Prospero::TileMode::kStandard64KB;
+      constexpr u32 width = 2048, height = 4096, levels = 1;
+      TileSizeAlign total{};
+      TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
+                         nullptr);
+      const auto layout = TextureCalcUploadLayout(
+          format, width, height, levels, 1, tile, total.size, false, false,
+          name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> infos;
+      const bool built =
+          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
+      const bool matches = built && total.size == 0x800000 &&
+                           layout.pitch == width && infos.size() == 1 &&
+                           infos[0].family == TileBlockFamily::Standard64KB &&
+                           infos[0].bytes_per_element == 1 &&
+                           infos[0].width == width && infos[0].height == height &&
+                           infos[0].pitch == width && infos[0].linear_size ==
+                               total.size &&
+                           infos[0].tiled_size == total.size;
+      Require(name, "R8 text atlas layout", matches,
+              "R8 2048x4096 Standard64KB metadata changed");
+      check_round_trip("R8 2048x4096 text atlas", total.size, infos);
+    }
 
     {
       constexpr auto format = Prospero::BufferFormat::k11_11_10UInt;
@@ -26030,7 +26205,12 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckUnifiedImageViewCache();
+    vulkan.CheckStorageSampledFormatSeparation();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-prefetch-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaUserDataPrefetch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {

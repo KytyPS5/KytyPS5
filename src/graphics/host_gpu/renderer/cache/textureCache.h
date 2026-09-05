@@ -128,6 +128,7 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 	[[nodiscard]] bool               SafeToDownload(const Image& image);
+	void PrepareStorageSampledOverlap(const ImageDesc& desc);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,

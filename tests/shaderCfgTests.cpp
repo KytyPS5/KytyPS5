@@ -9054,6 +9054,82 @@ void TestFusedShaderHandoffPreservesRegisters() {
   Check(allocations == 1u, "fused shader omitted the back shader allocation");
 }
 
+void TestMergedShaderUserDataSnapshot() {
+  using namespace ShaderRecompiler;
+  const uint32_t front[] = {
+      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 1), // consume front s[8:11]
+      EncodeSop1(0x20, 0, 6),                   // merged-stage handoff
+  };
+  const uint32_t back[] = {
+      EncodeSmem0(0x02, 8, 0), 125u << 25u, // s_load_dwordx4 s[8:11], s[0:1]
+      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 1), EncodeSopp(0x01),
+  };
+  const std::array<uint32_t, 4> first_table = {0x12340000, 0, 64, 0x00027000};
+  const std::array<uint32_t, 4> second_table = {0x56780000, 0, 64, 0x00027000};
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(front);
+  regs.gs_regs.data_addr = reinterpret_cast<uint64_t>(back);
+  regs.gs_regs.user_data_addr = reinterpret_cast<uint64_t>(first_table.data());
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 3;
+  regs.gs_regs.rsrc2.es_vgpr_component_count = 3;
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  for (uint32_t i = 0; i < 4; i++) {
+    regs.gs_user_sgpr.value[i] = 0x10001000u + i;
+  }
+  const std::array<uint32_t, 4> front_data = {regs.gs_user_sgpr.value[0],
+      regs.gs_user_sgpr.value[1], regs.gs_user_sgpr.value[2], regs.gs_user_sgpr.value[3]};
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(front);
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  mapped.code_size_bytes = sizeof(back);
+  ShaderMapUserData(regs.gs_regs.data_addr, mapped);
+  HW::Context context;
+  context.SetShaderStages(0x20);
+  context.SetMaxOutputPerSubgroup(252);
+  context.SetGsMaxVertOut(18);
+  context.SetGsOutPrimType(2);
+  HW::UserConfig user_config;
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+  user_config.SetGeControl({14, 14});
+  ShaderVertexInputInfo first_input{};
+  const auto first = PrepareProgram(regs, context, user_config, first_input);
+  regs.gs_regs.user_data_addr = reinterpret_cast<uint64_t>(second_table.data());
+  regs.gs_user_sgpr.value[0]++;
+  ShaderVertexInputInfo second_input{};
+  const auto second = PrepareProgram(regs, context, user_config, second_input);
+  Check(first.user_data.size() == 12 && second.user_data.size() == 12 &&
+            std::equal(front_data.begin(), front_data.end(), first.user_data.begin() + 8) &&
+            second.user_data[8] == front_data[0] + 1,
+        "merged shader parameters did not snapshot ordinary user SGPRs at s8");
+  Check(first.hash == second.hash &&
+            MakeStageStaticKey(first_input) == MakeStageStaticKey(second_input),
+        "a dynamic merged-shader user-data pointer changed shader identity");
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.user_data_base = 0;
+  options.user_data = first.user_data;
+  options.input_info.vertex = &first_input;
+  options.back_code = first.back_code;
+  const auto translated = TranslateProgram(first.code, options);
+  const auto &program = translated.program;
+  Check(program.info.buffers.size() == 2 && program.srt_reads.size() == 4,
+        "merged shader lost front user SGPRs or the back-stage SRT load");
+  for (const auto *params : {&first, &second}) {
+    const IR::SrtRuntime runtime{.user_data = params->user_data,
+                                 .read_memory = ReadHostTestMemory};
+    IR::DescriptorValue front_descriptor, back_descriptor;
+    const auto &table = params == &first ? first_table : second_table;
+    Check(IR::EvaluateDescriptorSource(program, program.info.buffers[0].source,
+                                       runtime, front_descriptor) &&
+              IR::EvaluateDescriptorSource(program, program.info.buffers[1].source,
+                                             runtime, back_descriptor) &&
+              std::equal(params->user_data.begin() + 8, params->user_data.end(),
+                         front_descriptor.dwords.begin()) &&
+              std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
+          "merged shader resource plan did not follow the current s0:s1 pointer and s8 data");
+  }
+}
+
 void TestMeshInputAssembly() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -12406,6 +12482,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
+  TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();

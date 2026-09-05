@@ -139,13 +139,13 @@ constexpr auto MakeShaderDispatchTable() {
 	g_hw_sh_func[Pm4::COMPUTE_TMPRING_SIZE]            = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC3]               = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PACE_ID]                 = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS]  = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShIgnoreRegisters;
+	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShSetRegisters;
 
 	return g_hw_sh_func;
 }

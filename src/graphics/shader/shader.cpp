@@ -117,7 +117,7 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	return {
 	    .code      = code,
-	    .user_data = user_data,
+	    .user_data = std::vector<uint32_t>(user_data.begin(), user_data.end()),
 	    .hash      = declared_hash != 0 ? declared_hash
 	                                    : XXH3_64bits(code.data(), code.size_bytes()),
 	};
@@ -864,6 +864,11 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
 	                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
 	params.back_code         = back_params.code;
+	// Merged shaders receive the GS-back user-data pointer in s0:s1, followed
+	// by the ordinary user SGPRs at s8. Keep both in the runtime register snapshot.
+	params.user_data.insert(params.user_data.begin(), 8u, 0u);
+	params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
+	params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
 	const uint64_t hashes[]  = {params.hash, back_params.hash};
 	params.hash              = XXH3_64bits(hashes, sizeof(hashes));
 	info                     = {};

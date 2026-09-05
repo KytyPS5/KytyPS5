@@ -323,6 +323,7 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
 			if (stage == ShaderType::Mesh) {
+				options.user_data_base = 0;
 				options.wave_size      = input_info.mesh.wave_size;
 				options.scratch_dwords = input_info.mesh.scratch_size_dwords;
 			}

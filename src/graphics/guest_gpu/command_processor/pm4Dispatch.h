@@ -98,7 +98,7 @@ uint32_t HwShSetCsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t
 uint32_t HwShIgnoreUserAccumulator(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                    uint32_t);
 uint32_t HwShSetCsRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
-uint32_t HwShIgnoreRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
+uint32_t HwShSetRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetPrimitiveType(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetIndexType(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetObjectId(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);

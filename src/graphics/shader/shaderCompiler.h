@@ -15,7 +15,7 @@ class UserConfig;
 
 struct ShaderParams {
 	std::span<const uint32_t> code;
-	std::span<const uint32_t> user_data;
+	std::vector<uint32_t>     user_data;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
 

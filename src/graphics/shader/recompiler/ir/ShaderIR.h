@@ -470,6 +470,13 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct ResourceBlock {
+	// Conditional successors are ordered true, false; an empty condition follows every edge.
+	Value                 condition;
+	std::vector<uint32_t> successors;
+	std::vector<uint32_t> sources;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -483,8 +490,8 @@ struct CompiledShaderInfo {
 	BindingLayout                 bindings;
 };
 
-// Immutable runtime resource analysis retained by the shader cache. It owns only the native
-// value graph reachable from descriptors/SRT reads, rather than the translated shader CFG.
+// Immutable runtime resource analysis retained by the shader cache. It owns the descriptor/SRT
+// and uniform condition values, plus resource-use edges, without retaining translated blocks.
 struct ResourcePlan {
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -501,6 +508,7 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<ResourceBlock>          control_flow;
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;

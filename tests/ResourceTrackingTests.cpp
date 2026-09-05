@@ -900,9 +900,10 @@ void TestSrtFlatteningAndRuntimeMemoization() {
                      .userdata = &memory};
   std::vector<DescriptorValue> descriptors;
   std::vector<uint32_t> flat;
+  std::vector<uint8_t> active_sources;
   const uint32_t request = fixture.program.info.buffers[0].source;
   Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
-                               descriptors, flat, {}),
+                               descriptors, flat, {}, active_sources),
         "typed runtime source evaluation failed");
   Check(descriptors.size() == 1 && descriptors[0].dwords[0] == 0xdeadbeefu &&
             flat == std::vector<uint32_t>{0xdeadbeefu} && memory.reads == 1,
@@ -912,10 +913,12 @@ void TestSrtFlatteningAndRuntimeMemoization() {
   memory.fail_after = 0;
   descriptors = {{{1u}, 1u}};
   flat = {2u};
+  active_sources = {3u};
   Check(!EvaluateRuntimeSources(fixture.program, std::span{&request, 1},
-                                runtime, descriptors, flat, {}) &&
+                                runtime, descriptors, flat, {}, active_sources) &&
             descriptors == std::vector<DescriptorValue>{{{1u}, 1u}} &&
-            flat == std::vector<uint32_t>{2u},
+            flat == std::vector<uint32_t>{2u} &&
+            active_sources == std::vector<uint8_t>{3u},
         "runtime evaluation failure was not transactional");
 
   ShaderComputeInputInfo compute{};
@@ -1186,6 +1189,183 @@ void TestBufferSwizzleSpecialization() {
                              changed_specialization) &&
             changed_specialization != specialization,
         "buffer swizzle change did not select a new specialization key");
+}
+
+enum class ConditionalBufferUse { Optional, Shared, Loop, Writable };
+
+ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *optional = fixture.AddBlock();
+  auto *done = fixture.AddBlock();
+  auto *condition_block = entry;
+  uint32_t condition_index = 0;
+  fixture.program.block_info[0].id = 11;
+  fixture.program.block_info[1].id = 27;
+  fixture.program.block_info[2].id = 42;
+  if (use == ConditionalBufferUse::Loop) {
+    condition_block = fixture.AddBlock();
+    condition_index = 3;
+    fixture.program.block_info[3].id = 55;
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 55};
+    entry->AddBranch(condition_block);
+  }
+  condition_block->AddBranch(optional);
+  condition_block->AddBranch(done);
+  optional->AddBranch(use == ConditionalBufferUse::Loop ? condition_block : done);
+  fixture.program.block_info[condition_index].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 27, .false_block = 42};
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::Branch,
+      .true_block = use == ConditionalBufferUse::Loop ? 55u : 42u};
+
+  const auto control = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
+       fixture.UserData(3)}, 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer,
+                           {control, Value(0u)}, fixture.AddMemory(scalar, 4));
+  if (use == ConditionalBufferUse::Loop) {
+    auto &phi = condition_block->AppendNewInst(ValueOpcode::Phi, {},
+                                               static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(entry, flag);
+    phi.AddPhiOperand(optional, Value(1u));
+    flag = Value(&phi);
+  }
+  fixture.program.block_info[condition_index].condition =
+      fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)}, 0, condition_block);
+
+  const auto payload = fixture.Buffer(
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6),
+       fixture.UserData(7)}, 8);
+  MemoryInfo vector;
+  vector.kind = ResourceKind::Buffer;
+  const auto load = [&](Block *block) {
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {payload, Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(vector, 8), block);
+  };
+  load(optional);
+  if (use == ConditionalBufferUse::Shared) {
+    load(done);
+  }
+  if (use == ConditionalBufferUse::Writable) {
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {control, Value(0u), Value(0u), Value(0u), Value(1u),
+                  Value(true)}, fixture.AddMemory(vector, 12));
+  }
+  fixture.PlanAndTrack();
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestConditionalBufferMaterialization() {
+  auto plan = ConditionalBufferPlan(ConditionalBufferUse::Optional);
+  // GTA III leaves packet words in s[12:15] when its scalar control word is zero.
+  std::array<uint32_t, 8> user_data{
+      0x1000, 16u << 16u, 1, 0x4dfac,
+      0xc0107600, 0x8c, 0x97730000, 0x100020};
+  TestMemory memory;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 2 &&
+            snapshot.buffers[1].dword_count == 4 &&
+            snapshot.buffers[1].dwords == std::array<uint32_t, 8>{},
+        "untaken scalar branch materialized stale buffer words");
+  Check(snapshot.user_data == std::vector<uint32_t>(user_data.begin(), user_data.end()),
+        "resource reachability changed native shader user data");
+
+  runtime.user_data = std::span(user_data).first(4);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "untaken branch evaluated its unavailable descriptor");
+  const auto prior = snapshot;
+  memory.words[0] = 1;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior),
+        "taken branch accepted an unavailable descriptor or changed the snapshot");
+
+  runtime.user_data = user_data;
+  const auto CheckActive = [&] {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 2 &&
+              std::equal(user_data.begin() + 4, user_data.end(),
+                         snapshot.buffers[1].dwords.begin()),
+          "potentially executed buffer descriptor was discarded");
+  };
+  CheckActive();
+  memory.words[0] = 0;
+  memory.fail_after = memory.reads;
+  CheckActive();
+  runtime.read_specialization_memory = nullptr;
+  CheckActive();
+}
+
+void TestConservativeBufferReachability() {
+  std::array<uint32_t, 8> user_data{
+      0x1000, 16u << 16u, 1, 0x4dfac,
+      0x2000, 16u << 16u, 1, 0x4dfac};
+  TestMemory memory;
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadTestMemory};
+  for (const auto use : {ConditionalBufferUse::Shared, ConditionalBufferUse::Loop,
+                         ConditionalBufferUse::Writable}) {
+    auto plan = ConditionalBufferPlan(use);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 2 &&
+              std::equal(user_data.begin() + 4, user_data.end(),
+                         snapshot.buffers[1].dwords.begin()),
+          "shared, loop-dependent, or writable-alias resource was pruned");
+  }
+}
+
+void TestConditionalIndirectImageMaterialization() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  auto fixture = MakeIndirectImageFixture(false);
+  auto *body = fixture->block;
+  auto *entry = fixture->AddBlock();
+  auto *done = fixture->AddBlock();
+  entry->AddBranch(body);
+  entry->AddBranch(done);
+  body->AddBranch(done);
+  const auto flag = fixture->Emit(ValueOpcode::GetUserData,
+                                  {Value(static_cast<ScalarReg>(8))}, 0, entry);
+  fixture->program.block_info[1].condition = fixture->Emit(
+      ValueOpcode::INotEqual32, {flag, Value(0u)}, 0, entry);
+  fixture->program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 0, .false_block = 2};
+  fixture->program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 2};
+  std::swap(fixture->program.blocks[0], fixture->program.blocks[1]);
+  std::swap(fixture->program.block_info[0], fixture->program.block_info[1]);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 9> user_data{
+      0x1000, 224u << 16u, 2, 0, 0x2000, 16u << 16u, 4, 0, 0};
+  uint32_t reads = 0;
+  const SrtRuntime runtime{
+      .user_data = user_data, .userdata = &reads,
+      .read_specialization_memory = [](void *data, uint64_t, uint32_t *) {
+        ++*static_cast<uint32_t *>(data);
+        return false;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads == 0 && snapshot.images.size() == 1 &&
+            snapshot.images[0].dwords == std::array<uint32_t, 8>{},
+        "untaken indirect image branch probed its descriptor table");
+  user_data[8] = 1;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && reads != 0,
+        "taken indirect image branch did not require its descriptor table");
 }
 
 void TestShaderInfoAndBindingLayout() {
@@ -1484,6 +1664,9 @@ int main() {
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
+    Run("conditional buffer materialization", TestConditionalBufferMaterialization);
+    Run("conservative buffer reachability", TestConservativeBufferReachability);
+    Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);

@@ -472,10 +472,11 @@ private:
 		}
 		m_visiting.push_back(inst);
 		uint64_t out = 0;
-		if (!EvaluateInst(*inst, out)) {
+		const bool evaluated = EvaluateInst(*inst, out);
+		m_visiting.pop_back();
+		if (!evaluated) {
 			return false;
 		}
-		m_visiting.pop_back();
 		m_cache.emplace(inst, out);
 		result = out;
 		return true;
@@ -938,7 +939,8 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
-                                std::span<const uint8_t> clean_flat_slots) {
+                                std::span<const uint8_t> clean_flat_slots,
+                                std::vector<uint8_t>& active_sources) {
 	if (!program.srt_plan_complete) {
 		return false;
 	}
@@ -948,8 +950,38 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	}
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
-	Evaluator                    clean_evaluator(program, clean_runtime);
-	Evaluator                    evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
+	Evaluator            clean_evaluator(program, clean_runtime);
+	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
+	std::vector<uint8_t> active(program.descriptor_sources.size(), 1u);
+	if (evaluate_flat && !program.control_flow.empty()) {
+		for (const auto& block: program.control_flow) {
+			for (const auto source: block.sources) {
+				active.at(source) = 0u;
+			}
+		}
+		std::vector<uint8_t>  visited(program.control_flow.size());
+		std::vector<uint32_t> pending {0};
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			if (visited.at(index)) {
+				continue;
+			}
+			visited[index]    = 1u;
+			const auto& block = program.control_flow[index];
+			for (const auto source: block.sources) {
+				active[source] = 1u;
+			}
+			uint32_t condition = 0;
+			// A missing clean reader must never fall through to the evaluator's raw-memory path.
+			if (!block.condition.IsEmpty() && runtime.read_specialization_memory != nullptr &&
+			    clean_evaluator.Evaluate(block.condition, condition)) {
+				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+			} else {
+				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			}
+		}
+	}
 	std::vector<DescriptorValue> evaluated;
 	evaluated.reserve(sources.size());
 	for (const auto source_index: sources) {
@@ -959,7 +991,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
-		for (uint32_t index = 0; index < source->dword_count; index++) {
+		for (uint32_t index = 0; active[source_index] && index < source->dword_count; index++) {
 			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
 				return false;
 			}
@@ -980,6 +1012,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 	}
 	results = std::move(evaluated);
+	active_sources = std::move(active);
 	if (evaluate_flat) {
 		flat = std::move(flattened);
 	}
@@ -1014,21 +1047,23 @@ bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
 bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results) {
 	std::vector<uint32_t> ignored;
-	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, ignored, false, {});
+	std::vector<uint8_t>  active;
+	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, ignored, false, {},
+	                                  active);
 }
 
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                            std::vector<uint32_t>&   flat,
-                            std::span<const uint8_t> clean_flat_slots) {
+                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
+                            std::vector<uint8_t>& active_sources) {
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
-	                                  clean_flat_slots);
+	                                  clean_flat_slots, active_sources);
 }
 
-bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
-             std::vector<uint32_t>& flat) {
+bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat) {
 	std::vector<DescriptorValue> ignored;
-	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, {});
+	std::vector<uint8_t>         active;
+	return EvaluateRuntimeSources(program, {}, runtime, ignored, flat, {}, active);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

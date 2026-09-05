@@ -293,8 +293,9 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	}
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
+	std::vector<uint8_t>         active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots)) {
+	                            flattened_srt, program.clean_flat_slots, active_sources)) {
 		return false;
 	}
 
@@ -308,6 +309,10 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		const auto& image  = program.info.images[image_index];
 		const auto* source = Source(program, image.source);
 		if (source != nullptr && source->indirect_image.has_value()) {
+			if (!active_sources[image.source]) {
+				next.images[image_index].dword_count = 8u;
+				continue;
+			}
 			const std::array requests {source->indirect_image->material_source,
 			                           source->indirect_image->heap_source};
 			SrtRuntime       clean_runtime = runtime;
@@ -604,6 +609,110 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 	return true;
 }
 
+static bool IntegerCondition(const ResourcePlan& program, Value condition) {
+	if (!ValidateRuntimeValue(program, condition)) {
+		return false;
+	}
+	std::vector<Value>              pending {condition};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto value = pending.back().Resolve();
+		pending.pop_back();
+		// Host floating-point evaluation does not model the shader's rounding/denormal modes.
+		if (TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
+			return false;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst != nullptr && visited.insert(inst).second) {
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto& read = program.srt_reads[inst->Arg(1).Resolve().U32()];
+				if (!ValidateRuntimeValue(program, read.value)) {
+					return false;
+				}
+				pending.push_back(read.value);
+			}
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				pending.push_back(inst->Arg(i));
+			}
+		}
+	}
+	return true;
+}
+
+static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
+	if (program.blocks.size() != program.block_info.size()) {
+		return {};
+	}
+	std::unordered_map<uint32_t, uint32_t> indices;
+	for (uint32_t i = 0; i < program.block_info.size(); i++) {
+		if (!indices.emplace(program.block_info[i].id, i).second) {
+			return {};
+		}
+	}
+	std::vector<ResourceBlock> blocks(program.blocks.size());
+	for (uint32_t i = 0; i < blocks.size(); i++) {
+		auto&                 block      = blocks[i];
+		const auto&           info       = program.block_info[i];
+		const auto&           terminator = info.terminator;
+		std::vector<uint32_t> successors;
+		switch (terminator.kind) {
+			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
+			case CFG::TerminatorKind::ConditionalBranch:
+				successors = {terminator.true_block, terminator.false_block};
+				if (IntegerCondition(program, info.condition)) {
+					block.condition = info.condition;
+				}
+				break;
+			case CFG::TerminatorKind::IndirectBranch:
+				successors = terminator.indirect_targets;
+				break;
+			case CFG::TerminatorKind::Return: break;
+			default: return {};
+		}
+		for (const auto successor: successors) {
+			const auto found = indices.find(successor);
+			if (found == indices.end()) {
+				return {};
+			}
+			block.successors.push_back(found->second);
+		}
+		for (const auto& inst: *program.blocks[i]) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op);
+			// Any shader write may alias a scalar predicate read, including on a later loop visit.
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image.access == ImageAccess::Write || image.access == ImageAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+				return {};
+			}
+			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
+				continue;
+			}
+			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
+			if (memory.planning_only) {
+				continue;
+			}
+			if (buffer != BufferAccess::None) {
+				block.sources.push_back(program.info.buffers.at(memory.resource).source);
+			} else {
+				block.sources.push_back(program.info.images.at(memory.resource).source);
+				if (image.needs_sampler) {
+					block.sources.push_back(program.info.samplers.at(memory.sampler).source);
+				}
+			}
+		}
+		std::ranges::sort(block.sources);
+		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
+		                    block.sources.end());
+	}
+	if (std::ranges::none_of(
+	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
+		return {};
+	}
+	return blocks;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -658,6 +767,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_reads.reserve(program.srt_reads.size());
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
+	}
+	plan.control_flow = ResourceControlFlow(program);
+	for (auto& block: plan.control_flow) {
+		block.condition = Clone(block.condition);
 	}
 	plan.materialization_sources.reserve(plan.info.buffers.size() + plan.info.images.size() +
 	                                     plan.info.samplers.size());

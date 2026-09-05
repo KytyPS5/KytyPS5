@@ -33,7 +33,7 @@ struct ComputeShaderInfo;
 struct ShaderRegisters;
 } // namespace HW
 
-enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute };
+enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute, Mesh };
 
 namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
@@ -63,6 +63,23 @@ struct ShaderClipSpaceTransform {
 	bool  enabled        = false;
 };
 
+struct ShaderWorkgroupInputInfo {
+	uint32_t threads_num[3]      = {0, 0, 0};
+	uint32_t lds_size_dwords     = 0;
+	uint32_t scratch_size_dwords = 0;
+	uint32_t host_subgroup_size  = 64;
+	uint32_t wave_size           = 64;
+};
+
+struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
+	uint32_t input_primitive      = 0;
+	uint32_t primitives_per_group = 0;
+	uint32_t vertices_per_group   = 0;
+	uint32_t max_vertices         = 0;
+	uint32_t max_primitives       = 0;
+	uint32_t provoking_vertex     = 0;
+};
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -78,19 +95,15 @@ struct ShaderVertexInputInfo {
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
+	ShaderMeshInputInfo      mesh;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };
 
-struct ShaderComputeInputInfo {
-	uint32_t           threads_num[3]             = {0, 0, 0};
+struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
-	uint32_t           lds_size_dwords            = 0;
-	uint32_t           scratch_size_dwords        = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
-	bool               needs_lds_barriers          = false;
-	uint32_t           wave_size                  = 64;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
@@ -129,6 +142,15 @@ union ShaderStageInputInfo {
 	const ShaderPixelInputInfo*   pixel;
 	const ShaderComputeInputInfo* compute = nullptr;
 };
+
+inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType           stage,
+                                                            ShaderStageInputInfo input) {
+	switch (stage) {
+		case ShaderType::Compute: return input.compute;
+		case ShaderType::Mesh: return &input.vertex->mesh;
+		default: return nullptr;
+	}
+}
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,

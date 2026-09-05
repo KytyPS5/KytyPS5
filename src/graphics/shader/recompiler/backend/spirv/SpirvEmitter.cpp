@@ -236,7 +236,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
 				}
-				if (program.stage != ShaderType::Compute && kind == IR::ResourceKind::Lds) {
+				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
+				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
 				}
 				if (shared_access == IR::SharedAccess::Append ||
@@ -259,7 +260,6 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					break;
 				}
 				case IR::ValueOpcode::DppUpdateU32:
-				case IR::ValueOpcode::WqmMask:
 				case IR::ValueOpcode::WriteLane: {
 					MarkBallot();
 					requirements.subgroup_local_invocation_id = true;
@@ -308,7 +308,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
-	    program.stage != ShaderType::Pixel) {
+	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Mesh) {
 		Fail(program, "binary SPIR-V emitter supports compute, vertex, and pixel shaders");
 	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -321,6 +321,11 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	EmitterState state(program, input_info);
 	state.stage     = program.stage;
 	state.wave_size = program.wave_size;
+	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	state.lane_count =
+	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+	        ? 2u
+	        : 1u;
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
@@ -329,6 +334,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	AllocateOutputVariables(state);
 	DefineModule(state);
 	EmitProgram(state, program);
+	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
+	                            state.interface_variables);
 
 	auto binary = state.builder.Build();
 	if (binary.empty()) {

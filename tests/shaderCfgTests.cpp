@@ -21,7 +21,6 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
-#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
@@ -7882,9 +7881,9 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
         "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
-  Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
+  Check(Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
                              "OpGroupNonUniformBallot"),
-        "per-invocation EXEC/SCC branch reconstructed a native subgroup mask");
+        "scalar mask SCC did not reduce the complete wave mask");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8727,6 +8726,43 @@ void TestNewShaderRecompilerSetpcBranch() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestFusedShaderHandoffPreservesRegisters() {
+  using namespace ShaderRecompiler;
+  const uint32_t front[] = {
+      EncodeSMovB32(12, 255), 0x1003u, // three vertices and one primitive
+      EncodeSop1(0x20, 0, 6), // merged-stage handoff through s[6:7]
+      0xffffffffu,            // front shader metadata must not be decoded
+  };
+  const uint32_t back[] = {
+      EncodeSMovB32(124, 12), // s_mov_b32 m0, s12
+      EncodeSopp(0x10, 9),   // s_sendmsg MSG_GS_ALLOC_REQ
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.mesh.threads_num[0] = 192;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.primitives_per_group = 62;
+  input.mesh.vertices_per_group = 64;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.back_code = back;
+  auto translated = TranslateProgram(front, options);
+  uint32_t allocations = 0;
+  for (const auto* block: translated.program.blocks) {
+    for (const auto& inst: *block) {
+      if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+        continue;
+      }
+      const auto value = inst.Arg(0).Resolve();
+      Check(value.IsImmediate() && value.U32() == 0x1003u,
+            "fused back shader lost the front shader's scalar register value");
+      allocations++;
+    }
+  }
+  Check(allocations == 1u, "fused shader omitted the back shader allocation");
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -9237,6 +9273,7 @@ void TestTypedEntryStateIsMinimal() {
     uint32_t set_exec_lo = 0;
     uint32_t set_exec_hi = 0;
     uint32_t ballots = 0;
+    const IR::Inst* ballot = nullptr;
     IR::Value exec;
     IR::Value exec_lo;
     IR::Value exec_hi;
@@ -9245,6 +9282,7 @@ void TestTypedEntryStateIsMinimal() {
         switch (inst.GetOpcode()) {
         case IR::ValueOpcode::Ballot:
           ballots++;
+          ballot = &inst;
           break;
         case IR::ValueOpcode::SetExec:
           set_exec++;
@@ -9274,11 +9312,19 @@ void TestTypedEntryStateIsMinimal() {
         }
       }
     }
+    const auto is_mask_word = [&](IR::Value value, uint32_t word) {
+      const auto* extract = value.ResolveInstruction();
+      return extract != nullptr &&
+             extract->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
+             extract->Arg(0).ResolveInstruction() == ballot &&
+             extract->Arg(1).IsImmediate() && extract->Arg(1).U32() == word;
+    };
     Check(set_exec == 1u && set_exec_lo == 1u && set_exec_hi == 1u &&
-              ballots == 0u && exec.IsImmediate() && exec.U1() &&
-              exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
-              exec_hi.IsImmediate() && exec_hi.U32() == 0u,
-          "typed entry is not the local {1,0} invocation mask");
+              ballots == 1u && exec.IsImmediate() && exec.U1() &&
+              ballot->Arg(0) == exec && is_mask_word(exec_lo, 0u) &&
+              (wave_size == 64u ? is_mask_word(exec_hi, 1u)
+                               : exec_hi.IsImmediate() && exec_hi.U32() == 0u),
+          "typed entry did not materialize the active invocation mask once");
 
     IR::RewriteToSsa(values.blocks);
     IR::RemoveIdentities(values.blocks);
@@ -9609,20 +9655,8 @@ void TestValuePhiValidation() {
 #endif
 }
 
-void TestWqmMaskSignatureAndU64ShiftConstantPropagation() {
+void TestU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  Program malformed;
-  malformed.block_storage.push_back(std::make_unique<Block>());
-  malformed.blocks.push_back(malformed.block_storage.back().get());
-  malformed.block_info.emplace_back();
-  IREmitter malformed_ir(malformed.blocks.front());
-  auto malformed_value = malformed_ir.Emit(ValueOpcode::WqmMask, {Value(true)});
-  malformed_value.TryInstruction()->SetArg(0, Value(uint64_t{1}));
-  ExpectFatal([&] { ValidateProgram(malformed, false); },
-              "invalid WqmMask operand type did not terminate IR validation");
-#endif
 
   Program shifts;
   shifts.block_storage.push_back(std::make_unique<Block>());
@@ -10021,8 +10055,8 @@ void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(!Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
-        "vertex EXEC guard depends on the native subgroup lane");
+  Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "raw EXEC=1 did not select guest lane zero");
   Check(Common::ContainsStr(source, "OpBranchConditional"),
         "vertex export lost its per-invocation EXEC guard");
 }
@@ -10049,8 +10083,8 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   Check(
       !Common::ContainsStr(source, "OpGroupNonUniformBallot"),
       "per-invocation VCC producer still materialized a shared subgroup mask");
-  Check(!Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
-        "per-invocation BFM EXEC prefix still selected native subgroup lanes");
+  Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "BFM EXEC prefix did not select the four requested guest lanes");
   Check(!Common::ContainsStr(source, "%vcc_lo") &&
             !Common::ContainsStr(source, "%vcc_hi"),
         "per-invocation comparison retained VCC register mirrors");
@@ -10067,8 +10101,8 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   Check(Common::ContainsStr(wqm_source, "OpCapability GroupNonUniformBallot") &&
             Common::ContainsStr(wqm_source, "OpGroupNonUniformBallot"),
         "per-invocation scalar WQM omitted its subgroup ballot capability");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 2u,
-        "wave64 WQM did not compact exactly two ballot words");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
+        "wave64 WQM did not expand its scalar word pair together");
 
   auto wave32_options = options;
   wave32_options.wave_size = 32u;
@@ -11352,9 +11386,9 @@ void TestComputeLdsAllocationIdentity() {
         "compute pipeline identity omitted the LDS allocation");
 
   auto split_wave = lds_896;
-  split_wave.needs_lds_barriers = true;
+  split_wave.host_subgroup_size = 32;
   Check(MakeStageStaticKey(lds_896) != MakeStageStaticKey(split_wave),
-        "compute shader identity omitted split-wave LDS synchronization");
+        "compute shader identity omitted the host subgroup size");
 
   auto tg_size_disabled = lds_896;
   auto tg_size_enabled = lds_896;
@@ -11416,135 +11450,6 @@ void TestComputeLdsAllocationIdentity() {
   Check(SpirvUnsignedLessThanBoundCount(append_result.spirv, 1152u) == 1u,
         "typed LDS append omitted the declared allocation bound");
   CheckSpirvBinaryValidates(append_result.spirv);
-}
-
-void TestWave64LdsSynchronization() {
-  const uint32_t shader[] = {
-      EncodeDs0(0x0d), // ds_write_b32 v0, v1
-      EncodeDs1(0, 1, 0),
-      EncodeSopp(0x01),
-  };
-
-  const auto compile = [&](bool needs_lds_barriers, uint32_t wave_size,
-                           uint32_t threads) {
-    ShaderComputeInputInfo input_info{};
-    input_info.lds_size_dwords = 128;
-    input_info.needs_lds_barriers = needs_lds_barriers;
-    input_info.threads_num[0] = threads;
-    input_info.threads_num[1] = 1;
-    input_info.threads_num[2] = 1;
-
-    auto options = MakeCompileOptions(ShaderType::Compute);
-    options.wave_size = wave_size;
-    options.input_info.compute = &input_info;
-    auto result = RecompileForTest(shader, options);
-    CheckSpirvBinaryValidates(result.spirv);
-    return result;
-  };
-
-  const auto native_wave64 = compile(false, 64, 64);
-  Check(!SpirvContainsOpcode(native_wave64.spirv, 224),
-        "native wave64 shader gained a synthetic workgroup barrier");
-
-  const auto split_wave64 = compile(true, 64, 64);
-  Check(SpirvContainsOpcode(split_wave64.spirv, 224),
-        "split wave64 LDS shader omitted workgroup synchronization");
-
-  const auto split_wave32 = compile(true, 32, 64);
-  Check(!SpirvContainsOpcode(split_wave32.spirv, 224),
-        "wave32 shader gained wave64 synchronization");
-
-  const auto larger_workgroup = compile(true, 64, 128);
-  Check(!SpirvContainsOpcode(larger_workgroup.spirv, 224),
-        "multi-wave workgroup gained unsupported synthetic synchronization");
-}
-
-void TestSharedMemoryBarrierSafety() {
-  using namespace ShaderRecompiler::IR;
-
-  const auto make_program = [](size_t block_count) {
-    Program program;
-    program.memory_info.push_back({.kind = ResourceKind::Lds});
-    for (size_t index = 0; index < block_count; index++) {
-      program.block_storage.push_back(std::make_unique<Block>());
-      program.blocks.push_back(program.block_storage.back().get());
-      program.block_info.emplace_back();
-      program.block_info.back().id = static_cast<uint32_t>(index);
-    }
-    return program;
-  };
-  const auto append_write = [](Block& block) {
-    auto& inst = block.AppendNewInst(
-        ValueOpcode::WriteSharedU32,
-        {Value(0u), Value(1u), Value(true)});
-    inst.SetFlags(MemoryFlags{.index = 0});
-  };
-  const auto append_read = [](Block& block) {
-    auto& inst = block.AppendNewInst(ValueOpcode::LoadSharedU32,
-                                     {Value(0u), Value(true)});
-    inst.SetFlags(MemoryFlags{.index = 0});
-  };
-  const auto count_barriers = [](const Block& block) {
-    return std::ranges::count_if(block, [](const Inst& inst) {
-      return inst.GetOpcode() == ValueOpcode::Barrier;
-    });
-  };
-  const auto divergent_condition = [](Program& program, size_t block) {
-    IREmitter ir(program.blocks[block]);
-    const auto local_id = U32(ir.Emit(
-        ValueOpcode::GetBuiltin,
-        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
-         Value(0u)}));
-    return ir.INotEqual(local_id, U32(Value(0u)));
-  };
-
-  ShaderComputeInputInfo compute_info{};
-  compute_info.needs_lds_barriers = true;
-  compute_info.lds_size_dwords = 128;
-  compute_info.threads_num[0] = 64;
-  compute_info.threads_num[1] = 1;
-  compute_info.threads_num[2] = 1;
-
-  auto phases = make_program(1);
-  append_write(*phases.blocks[0]);
-  append_read(*phases.blocks[0]);
-  const auto phase_stats = InsertSharedMemoryBarriers(phases, 64u, compute_info);
-  std::vector<ValueOpcode> phase_opcodes;
-  for (const auto& inst : *phases.blocks[0]) {
-    phase_opcodes.push_back(inst.GetOpcode());
-  }
-  Check(phase_stats.inserted_barriers == 2 && phase_opcodes.size() == 4 &&
-            phase_opcodes[0] == ValueOpcode::WriteSharedU32 &&
-            phase_opcodes[1] == ValueOpcode::Barrier &&
-            phase_opcodes[2] == ValueOpcode::LoadSharedU32 &&
-            phase_opcodes[3] == ValueOpcode::Barrier,
-        "LDS write/read phases were not separated by a barrier");
-
-  auto selection = make_program(3);
-  selection.block_info[0].terminator.kind =
-      ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  selection.block_info[0].terminator.merge_block = 2;
-  selection.block_info[0].condition = divergent_condition(selection, 0);
-  append_write(*selection.blocks[1]);
-  append_read(*selection.blocks[2]);
-  const auto selection_stats =
-      InsertSharedMemoryBarriers(selection, 64u, compute_info);
-  Check(selection_stats.inserted_barriers == 2 &&
-            count_barriers(*selection.blocks[1]) == 0 &&
-            selection.blocks[2]->begin()->GetOpcode() ==
-                ValueOpcode::Barrier,
-        "workgroup barrier was placed inside divergent selection flow");
-
-  auto loop = make_program(1);
-  loop.block_info[0].terminator.kind =
-      ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  loop.block_info[0].condition = divergent_condition(loop, 0);
-  append_write(*loop.blocks[0]);
-  append_read(*loop.blocks[0]);
-  const auto loop_stats = InsertSharedMemoryBarriers(loop, 64u, compute_info);
-  Check(loop_stats.inserted_barriers == 0 &&
-            count_barriers(*loop.blocks[0]) == 0,
-        "workgroup barrier was inserted into divergent loop control");
 }
 
 void TestPixelProgramCacheBindingIdentity() {
@@ -11914,8 +11819,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                    .conditional_branches = 1,
                                    .ballots = 1},
                                   ShaderType::Vertex);
-  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmMask"),
-        "WQM size fixture no longer reaches per-invocation WqmMask IR");
+  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmU64"),
+        "WQM size fixture no longer reaches scalar mask expansion");
 
   const uint32_t dispatcher[] = {
       EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
@@ -12028,6 +11933,7 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestFusedShaderHandoffPreservesRegisters();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
@@ -12036,7 +11942,7 @@ int main() {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
-  TestWqmMaskSignatureAndU64ShiftConstantPropagation();
+  TestU64ShiftConstantPropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
 #endif
@@ -12064,8 +11970,6 @@ int main() {
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
-  TestWave64LdsSynchronization();
-  TestSharedMemoryBarrierSafety();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();

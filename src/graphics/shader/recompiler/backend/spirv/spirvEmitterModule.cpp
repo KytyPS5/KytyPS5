@@ -202,7 +202,7 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.fault_buffer_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
-	if (state.program.bindings.UsesPushData()) {
+	if (state.program.bindings.UsesPushData() || state.stage == ShaderType::Mesh) {
 		const auto pointer_type =
 		    TypePointer(state, StorageClassPushConstant, PushConstantBlockType(state));
 		state.push_constant_variable =
@@ -430,6 +430,22 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
+	if (state.lane_count == 2) {
+		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
+		                             const char* name) {
+			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
+				    return input.kind == kind;
+			    })) {
+				state.inputs.push_back({kind, 0, components, 0, name});
+			}
+		};
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
+		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+			    return input.kind == IR::StageInputKind::GlobalInvocationId;
+		    })) {
+			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		}
+	}
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
@@ -454,6 +470,10 @@ static uint32_t AllocateSharedOutputVariable(EmitterState& state, uint32_t& vari
 }
 
 void AllocateOutputVariables(EmitterState& state) {
+	if (state.stage == ShaderType::Mesh) {
+		DefineMeshOutputs(state);
+		return;
+	}
 	for (auto& binding: state.outputs) {
 		switch (binding.kind) {
 			case IR::StageOutputKind::Position:
@@ -548,6 +568,9 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 }
 
 void AddOutputAnnotationsAndNames(EmitterState& state) {
+	if (state.stage == ShaderType::Mesh) {
+		return;
+	}
 	if (state.per_vertex_variable != 0) {
 		state.builder.AddName(PerVertexType(state), "gl_PerVertex");
 		state.builder.AddName(state.per_vertex_variable, "outPerVertex");
@@ -653,9 +676,21 @@ void DefineModule(EmitterState& state) {
 		state.lds_variable = state.builder.AllocateId();
 	}
 	if (state.requirements.function_scratch) {
-		state.scratch_variable = state.builder.AllocateId();
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			state.scratch_variable[half] = state.builder.AllocateId();
+		}
 	}
 	state.main_func   = state.builder.AllocateId();
+	if (state.stage == ShaderType::Mesh) {
+		state.mesh_guest_func = state.builder.AllocateId();
+		state.builder.RequireCapability(5283u); // MeshShadingEXT
+		state.builder.RequireExtension("SPV_EXT_mesh_shader");
+		state.builder.AddExecutionMode({state.main_func, 5298u}); // OutputTrianglesEXT
+		state.builder.AddExecutionMode(
+		    {state.main_func, 26u, state.input_info.vertex->mesh.max_vertices});
+		state.builder.AddExecutionMode(
+		    {state.main_func, 5270u, state.input_info.vertex->mesh.max_primitives});
+	}
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(CapabilityShader);
@@ -682,11 +717,11 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
-	if (state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id) {
+	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
+	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
 	}
-	if (state.requirements.subgroup_ballot) {
+	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {
@@ -711,19 +746,24 @@ void DefineModule(EmitterState& state) {
 	    {state.program.info.uses_dma ? AddressingModelPhysicalStorageBuffer64
 	                                 : AddressingModelLogical,
 	     MemoryModelGLSL450});
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
-	                            state.interface_variables);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
-	if (state.stage == ShaderType::Compute) {
+	if (const auto* cs = ShaderWorkgroupInput(state.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_z = 1u;
-		const auto* cs      = state.input_info.compute;
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		if (state.lane_count == 2) {
+			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
+			local_y = local_z = 1u;
+			if (state.requirements.compute_derivatives) {
+				local_y = local_x / 2u;
+				local_x = 2u;
+			}
+		}
 		state.builder.AddExecutionMode(
 		    {state.main_func, ExecutionModeLocalSize, local_x, local_y, local_z});
 	}
@@ -746,7 +786,9 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddName(state.lds_variable, "lds_dwords");
 	}
 	if (state.requirements.function_scratch) {
-		state.builder.AddName(state.scratch_variable, "scratch_dwords");
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			state.builder.AddName(state.scratch_variable[half], "scratch_dwords");
+		}
 	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);
@@ -796,6 +838,9 @@ void DefineModule(EmitterState& state) {
 			default: break;
 		}
 		state.builder.DefineGlobalVariable(input.variable_id, ptr_type, StorageClassInput);
+	}
+	if (state.stage == ShaderType::Mesh) {
+		return;
 	}
 	if (state.per_vertex_variable != 0) {
 		state.builder.DefineGlobalVariable(

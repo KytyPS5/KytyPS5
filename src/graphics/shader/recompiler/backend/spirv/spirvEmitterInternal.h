@@ -198,6 +198,7 @@ enum : uint32_t {
 	OpIMul                         = 132,
 	OpFMul                         = 133,
 	OpUDiv                         = 134,
+	OpUMod                         = 137,
 	OpFDiv                         = 136,
 	OpIAddCarry                    = 149,
 	OpUMulExtended                 = 151,
@@ -318,6 +319,7 @@ struct OutputBinding {
 	uint32_t            location    = 0;
 	uint32_t            variable_id = 0;
 	std::string         debug_name;
+	uint32_t            mesh_data_variable = 0;
 };
 
 using ImageDimension = Decoder::ImageDimension;
@@ -345,8 +347,8 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
-	    : program(program_), input_info(input_info_),
-	      requirements(*program_.spirv_requirements) {}
+	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
+	      program(program_), input_info(input_info_), requirements(*program_.spirv_requirements) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
@@ -354,6 +356,8 @@ struct EmitterState {
 	const IR::SpirvRequirements&                     requirements;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
+	uint32_t                                         lane_count              = 1;
+	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
@@ -366,10 +370,15 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
-	uint32_t                                         scratch_variable        = 0;
+	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
+	uint32_t                   mesh_guest_func                       = 0;
+	uint32_t                   mesh_allocation                       = 0;
+	uint32_t                   mesh_primitive_data                   = 0;
+	uint32_t                   mesh_primitives                       = 0;
+	uint32_t                   mesh_cull                             = 0;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	uint32_t                   pixel_valid_mask_variable             = 0;
@@ -427,6 +436,10 @@ struct ValueEmitContext {
 
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
+	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
+	uint32_t              Ballot(IR::Value predicate);
+	uint32_t              FirstLane(uint32_t ballot);
+	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);
 	uint32_t              TypeId(IR::Type type) const;
 	uint32_t              Emit(const IR::Inst& inst, uint32_t opcode, IR::Type type,
@@ -448,6 +461,8 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	const IR::Block*                                                   current_block = nullptr;
 	uint32_t                                                           scratch_u32_variable = 0;
+	ValueEmitContext*                                                  other_half = nullptr;
+	uint32_t                                                           half       = 0;
 };
 
 enum class VertexInputScalarKind { Float, Sint, Uint };
@@ -575,6 +590,11 @@ void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name
 void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
 void DefineModule(EmitterState& state);
+void     DefineMeshOutputs(EmitterState& state);
+void     EmitMeshEntryPoint(EmitterState& state);
+void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
+uint32_t MeshPrimitivePointer(EmitterState& state);
 
 uint32_t EmitTrueBool(EmitterState& state);
 

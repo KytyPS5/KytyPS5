@@ -8,6 +8,8 @@ VALUE_OPCODE(ReferenceU32, Void, U32)
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
 VALUE_OPCODE(GetShaderBase, U64)
+VALUE_OPCODE(MeshDrawParameter, U32, U32)
+VALUE_OPCODE(MeshAllocate, Void, U32)
 VALUE_OPCODE(GetBuiltin, U32, U32, U32)
 VALUE_OPCODE(GetThreadBitScalarRegister, U1, ScalarReg)
 VALUE_OPCODE(SetThreadBitScalarRegister, Void, ScalarReg, U1)
@@ -81,7 +83,6 @@ VALUE_OPCODE(BitFieldSExtract, U32, U32, U32, U32)
 VALUE_OPCODE(DppMoveU32, U32, U32, U1)
 VALUE_OPCODE(DppUpdateU32, U32, U32, U32, U1)
 VALUE_OPCODE(WqmU64, U64, U64)
-VALUE_OPCODE(WqmMask, U1, U1)
 
 // Core value operations used to expand architectural side effects.
 VALUE_OPCODE(SelectU1, U1, U1, U1, U1)

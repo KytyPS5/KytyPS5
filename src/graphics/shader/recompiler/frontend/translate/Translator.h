@@ -29,7 +29,7 @@ private:
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
 	IR::Value              ReadOperand(const Decoder::Operand& operand, IR::Type type);
-	IR::U1                 ThreadBit(IR::U32 low);
+	IR::U1                 ThreadBit(const std::array<IR::U32, 2>& mask);
 	void                   WriteRawU32(const Decoder::Operand& operand, IR::U32 value);
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
@@ -53,8 +53,8 @@ private:
 	IR::U32 ConditionBit(const Decoder::Operand& operand);
 	IR::U1  ReadMask(const Decoder::Operand& operand);
 	IR::U1  ReadMaskValid(const Decoder::Operand& operand);
-	void    WriteMask(const Decoder::Operand& operand, IR::U1 value);
-	void    WriteMask64(const Decoder::Operand& operand, IR::U1 value);
+	std::array<IR::U32, 2> WriteMask(const Decoder::Operand& operand, IR::U1 value,
+	                                 bool write_64 = false);
 	void    WriteCompareResult(const Decoder::Operand& operand, IR::U1 value);
 
 	IR::MemoryFlags AddMemoryInfo(const IR::MemoryInfo& memory, uint32_t pc);
@@ -228,7 +228,7 @@ private:
 	void EmitControlNop();
 	void EmitWaitcnt();
 	void S_BARRIER();
-	void S_SENDMSG();
+	void S_SENDMSG(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();
 	void S_INST_PREFETCH();
 	void S_GETPC_B64(const Decoder::Instruction& inst);

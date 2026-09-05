@@ -45,6 +45,7 @@ uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
 struct DeferredPhiPatch {
 	DeferredPhi     phi;
 	const IR::Inst* instruction = nullptr;
+	uint32_t        half        = 0;
 };
 
 struct StructuredFunctionState {
@@ -53,7 +54,7 @@ struct StructuredFunctionState {
 };
 
 struct DispatcherFunctionState {
-	std::unordered_map<const IR::Inst*, uint32_t> spills;
+	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
 	uint32_t                                      header_label       = 0;
 	uint32_t                                      select_label       = 0;
 	uint32_t                                      after_switch_label = 0;
@@ -73,7 +74,7 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 		for (size_t index = 0; index < phi.NumArgs(); index++) {
 			if (phi.PhiBlock(index) == from) {
 				ctx.state.builder.AddFunction(
-				    {OpStore, dispatcher.spills.at(&phi), ctx.Def(phi.Arg(index))});
+				    {OpStore, dispatcher.spills[ctx.half].at(&phi), ctx.Def(phi.Arg(index))});
 				break;
 			}
 		}
@@ -92,6 +93,27 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction({OpReturn});
+}
+
+uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
+	if (ctx.other_half == nullptr ||
+	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
+		return ctx.Def(info.condition);
+	}
+	const auto ballot = ctx.Ballot(info.condition);
+	const auto low    = ctx.state.builder.AllocateId();
+	const auto high   = ctx.state.builder.AllocateId();
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0});
+	ctx.state.builder.AddFunction({OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1});
+	const auto kind     = info.terminator.condition;
+	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
+	                      kind == CFG::BranchCondition::VccZero ||
+	                      kind == CFG::BranchCondition::SccZero;
+	const auto combined = EmitBinaryU32(ctx.state, zero ? OpBitwiseAnd : OpBitwiseOr, low, high);
+	ctx.state.builder.AddFunction({zero ? OpIEqual : OpINotEqual, TypeBool(ctx.state), result,
+	                               combined, ConstantU32(ctx.state, zero ? ~0u : 0u)});
+	return result;
 }
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
@@ -132,7 +154,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			const auto condition = BranchCondition(ctx, info);
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
@@ -147,6 +169,9 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 	const auto* block = TargetBlock(ctx.program, target);
 	if (block != nullptr) {
 		StoreDispatcherPhiEdge(ctx, dispatcher, from, block);
+		if (ctx.other_half != nullptr) {
+			StoreDispatcherPhiEdge(*ctx.other_half, dispatcher, from, block);
+		}
 	}
 }
 
@@ -162,7 +187,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction({OpSelect, TypeU32(ctx.state), selected,
-			                               ctx.Def(info.condition),
+			                               BranchCondition(ctx, info),
 			                               ConstantU32(ctx.state, term.true_block),
 			                               ConstantU32(ctx.state, term.false_block)});
 			return selected;
@@ -219,7 +244,8 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 			}
 		}
 		structured.deferred_phis.push_back(
-		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst});
+		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst,
+		     ctx.half});
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
@@ -233,11 +259,12 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 			ctx.Fail(inst, "cannot be loaded by the dispatcher");
 		}
 		ctx.state.builder.AddFunction(
-		    {OpLoad, type, ctx.Result(inst), dispatcher.spills.at(&inst)});
+		    {OpLoad, type, ctx.Result(inst), dispatcher.spills[ctx.half].at(&inst)});
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
-	if (const auto found = dispatcher.spills.find(&inst); found != dispatcher.spills.end()) {
+	if (const auto found = dispatcher.spills[ctx.half].find(&inst);
+	    found != dispatcher.spills[ctx.half].end()) {
 		ctx.state.builder.AddFunction(
 		    {OpStore, found->second, ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)))});
 	}
@@ -246,6 +273,9 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.current_block = block;
+	if (ctx.other_half != nullptr) {
+		ctx.other_half->current_block = block;
+	}
 	EmitLabel(ctx.state, ctx.Label(block));
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
@@ -256,12 +286,22 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		} else {
 			emitted_non_phi = true;
 		}
-		emit_instruction(inst);
+		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
+			auto& lane          = half == 0 ? ctx : *ctx.other_half;
+			lane.current_block  = block;
+			ctx.state.lane_half = half;
+			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
+			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
+				emit_instruction(lane, inst);
+			}
+		}
+		ctx.state.lane_half = 0;
 	}
 }
 
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
 	for (const auto& deferred: structured.deferred_phis) {
+		auto& lane = deferred.half == 0 ? ctx : *ctx.other_half;
 		for (size_t index = 0; index < deferred.instruction->NumArgs(); index++) {
 			const auto* predecessor = deferred.instruction->PhiBlock(index);
 			const auto  found       = structured.block_exit_labels.find(predecessor);
@@ -269,7 +309,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
 			ctx.state.builder.PatchDeferredPhi(
-			    deferred.phi, index, ctx.Def(deferred.instruction->Arg(index)), found->second);
+			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), found->second);
 		}
 	}
 }
@@ -279,8 +319,8 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction({OpBranch, ctx.Label(ctx.program.blocks.front())});
 	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
 		const auto* block = ctx.program.blocks[index];
-		EmitBlock(ctx, block, [&](const IR::Inst& inst) {
-			EmitStructuredInstruction(ctx, structured, inst);
+		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
+			EmitStructuredInstruction(lane, structured, inst);
 		});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, ctx.program.block_info[index]);
@@ -292,8 +332,8 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	auto&       state = ctx.state;
 	const auto* entry = ctx.program.blocks.front();
 	state.builder.AddFunction({OpBranch, ctx.Label(entry)});
-	EmitBlock(ctx, entry, [&](const IR::Inst& inst) {
-		EmitDispatcherInstruction(ctx, dispatcher, inst);
+	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
+		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
 	const auto initial_pc =
 	    EmitDispatcherNextPc(ctx, dispatcher, entry, ctx.program.block_info.front());
@@ -326,9 +366,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	                                     ConstantU32(state, UINT32_MAX), dispatcher.select_label};
 
 	for (size_t index = 1; index < ctx.program.blocks.size(); index++) {
-		EmitBlock(ctx, ctx.program.blocks[index], [&](const IR::Inst& inst) {
-			EmitDispatcherInstruction(ctx, dispatcher, inst);
-		});
+		EmitBlock(ctx, ctx.program.blocks[index],
+		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
+			          EmitDispatcherInstruction(lane, dispatcher, inst);
+		          });
 		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, ctx.program.blocks[index],
 		                                           ctx.program.block_info[index]);
 		next_pc_words.push_back(selected);
@@ -408,6 +449,83 @@ uint32_t ValueEmitContext::Arg(const IR::Inst& inst, size_t index) {
 	return Def(inst.Arg(index));
 }
 
+uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t lane_half) {
+	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
+}
+
+uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	const auto ballot_type = TypeU32Vector(state, 4);
+	const auto scope       = ConstantU32(state, ScopeSubgroup);
+	const auto low         = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpGroupNonUniformBallot, ballot_type, low, scope,
+	     other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)});
+	if (other_half == nullptr) {
+		return low;
+	}
+	const auto high      = state.builder.AllocateId();
+	const auto low_word  = state.builder.AllocateId();
+	const auto high_word = state.builder.AllocateId();
+	const auto ballot    = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformBallot, ballot_type, high, scope,
+	                           half == 1 ? Def(predicate) : other_half->Def(predicate)});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low_word, low, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high_word, high, 0});
+	state.builder.AddFunction({OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
+	                           ConstantU32(state, 0), ConstantU32(state, 0)});
+	return ballot;
+}
+
+uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	if (other_half == nullptr) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
+		                           ConstantU32(state, ScopeSubgroup), ballot});
+		return result;
+	}
+	const auto low        = state.builder.AllocateId();
+	const auto high       = state.builder.AllocateId();
+	const auto low_first  = state.builder.AllocateId();
+	const auto high_first = state.builder.AllocateId();
+	const auto low_active = state.builder.AllocateId();
+	const auto result     = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
+	state.builder.AddFunction(
+	    {OpExtInst, TypeU32(state), low_first, GlslStd450(state), GlslFindILsb, low});
+	state.builder.AddFunction(
+	    {OpExtInst, TypeU32(state), high_first, GlslStd450(state), GlslFindILsb, high});
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), low_active, low, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpSelect, TypeU32(state), result, low_active, low_first,
+	                           EmitAddU32(state, high_first, ConstantU32(state, 32))});
+	return result;
+}
+
+uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
+	const auto type  = TypeId(inst.Arg(index).GetType());
+	const auto scope = ConstantU32(state, ScopeSubgroup);
+	const auto low   = state.builder.AllocateId();
+	if (other_half == nullptr) {
+		state.builder.AddFunction(
+		    {OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), lane});
+		return low;
+	}
+	const auto physical_lane = EmitBinaryU32(state, OpBitwiseAnd, lane, ConstantU32(state, 31));
+	const auto high          = state.builder.AllocateId();
+	const auto in_high       = state.builder.AllocateId();
+	const auto value         = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0), physical_lane});
+	state.builder.AddFunction(
+	    {OpGroupNonUniformShuffle, type, high, scope, HalfArg(inst, index, 1), physical_lane});
+	state.builder.AddFunction({OpINotEqual, TypeBool(state), in_high,
+	                           EmitBinaryU32(state, OpBitwiseAnd, lane, ConstantU32(state, 32)),
+	                           ConstantU32(state, 0)});
+	state.builder.AddFunction({OpSelect, type, value, in_high, high, low});
+	return value;
+}
+
 uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 	if (const auto found = definitions.find(&inst); found != definitions.end()) {
 		return found->second;
@@ -478,14 +596,22 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 }
 
 void EmitProgram(EmitterState& state, const IR::Program& program) {
-	ValueEmitContext                       ctx(state, program);
+	ValueEmitContext ctx(state, program);
+	ValueEmitContext high(state, program);
+	if (state.lane_count == 2) {
+		ctx.other_half  = &high;
+		high.other_half = &ctx;
+		high.half       = 1;
+	}
 	std::optional<DispatcherFunctionState> dispatcher;
 	if (state.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
 	for (const auto* block: program.blocks) {
-		ctx.labels.emplace(block, state.builder.AllocateId());
+		const auto label = state.builder.AllocateId();
+		ctx.labels.emplace(block, label);
+		high.labels.emplace(block, label);
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
@@ -498,7 +624,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 					ctx.Fail(inst, "cannot be stored by the dispatcher");
 					break;
 				}
-				dispatch.spills.emplace(&inst, state.builder.AllocateId());
+				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -512,8 +638,8 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 				ctx.Fail(*definition, "cannot be stored by the dispatcher");
 				return;
 			}
-			if (!dispatch.spills.contains(definition)) {
-				dispatch.spills.emplace(definition, state.builder.AllocateId());
+			if (!dispatch.spills[0].contains(definition)) {
+				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -534,7 +660,13 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		dispatch.after_switch_label = state.builder.AllocateId();
 		dispatch.continue_label     = state.builder.AllocateId();
 		dispatch.merge_label        = state.builder.AllocateId();
-		ctx.dispatcher_spills       = &dispatch.spills;
+		ctx.dispatcher_spills       = &dispatch.spills[0];
+		if (state.lane_count == 2) {
+			for (const auto& [inst, id]: dispatch.spills[0]) {
+				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
+			}
+			high.dispatcher_spills = &dispatch.spills[1];
+		}
 	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {
@@ -544,11 +676,15 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
 		    })) {
 			ctx.scratch_u32_variable = state.builder.AllocateId();
+			if (state.lane_count == 2) {
+				high.scratch_u32_variable = state.builder.AllocateId();
+			}
 			break;
 		}
 	}
-	state.builder.AddFunction(
-	    {OpFunction, TypeVoid(state), state.main_func, FunctionControlNone, TypeFunction(state)});
+	state.builder.AddFunction({OpFunction, TypeVoid(state),
+	                           state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
+	                           FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
@@ -556,31 +692,37 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		     state.lds_variable, StorageClassFunction});
 	}
 	if (state.requirements.function_scratch) {
-		state.builder.AddFunction(
-		    {OpVariable,
-		     TypeU32ArrayPointer(state, StorageClassFunction, state.program.scratch_dwords),
-		     state.scratch_variable, StorageClassFunction});
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			state.builder.AddFunction(
+			    {OpVariable,
+			     TypeU32ArrayPointer(state, StorageClassFunction, state.program.scratch_dwords),
+			     state.scratch_variable[half], StorageClassFunction});
+		}
 	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction({OpVariable,
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           state.pixel_valid_mask_variable, StorageClassFunction});
 	}
-	if (state.program.dispatcher_fallback) {
-		for (const auto* block: program.blocks) {
-			for (const auto& inst: *block) {
-				if (const auto found = dispatcher->spills.find(&inst);
-				    found != dispatcher->spills.end()) {
-					state.builder.AddFunction({OpVariable, SpillPointerType(ctx, inst.GetType()),
-					                           found->second, StorageClassFunction});
+	for (uint32_t half = 0; half < state.lane_count; half++) {
+		auto& lane = half == 0 ? ctx : high;
+		if (state.program.dispatcher_fallback) {
+			for (const auto* block: program.blocks) {
+				for (const auto& inst: *block) {
+					if (const auto found = dispatcher->spills[half].find(&inst);
+					    found != dispatcher->spills[half].end()) {
+						state.builder.AddFunction({OpVariable,
+						                           SpillPointerType(lane, inst.GetType()),
+						                           found->second, StorageClassFunction});
+					}
 				}
 			}
 		}
-	}
-	if (ctx.scratch_u32_variable != 0) {
-		state.builder.AddFunction({OpVariable,
-		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
-		                           ctx.scratch_u32_variable, StorageClassFunction});
+		if (lane.scratch_u32_variable != 0) {
+			state.builder.AddFunction({OpVariable,
+			                           TypePointer(state, StorageClassFunction, TypeU32(state)),
+			                           lane.scratch_u32_variable, StorageClassFunction});
+		}
 	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
@@ -600,6 +742,9 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		EmitStructuredFunction(ctx);
 	}
 	state.builder.AddFunction({OpFunctionEnd});
+	if (state.stage == ShaderType::Mesh) {
+		EmitMeshEntryPoint(state);
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

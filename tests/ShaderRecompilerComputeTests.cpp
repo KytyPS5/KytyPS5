@@ -1198,7 +1198,7 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test) {
+CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1218,7 +1218,9 @@ CompiledShader CompileCase(const TestCase &test) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
-  options.input_info.compute = &test.compute_info;
+  auto compute_info = test.compute_info;
+  compute_info.host_subgroup_size = host_subgroup_size;
+  options.input_info.compute = &compute_info;
   options.user_data = user_data;
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
   if (test.has_compute_info) {
@@ -1553,6 +1555,13 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] u32 SubgroupSize() const {
+    vk::PhysicalDeviceSubgroupProperties subgroup{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &subgroup;
+    m_physical_device.getProperties2(&properties);
+    return subgroup.subgroupSize;
+  }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -2278,7 +2287,11 @@ public:
           return packet;
         };
     const auto finish_gpu = [&] {
-      gpu.SendCommandSync([&] { context.GetCommandScheduler().Finish(); });
+      gpu.SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      });
     };
     const auto wait_for_interrupt =
         [&](LibKernel::EventQueue::KernelEvent &event, int &count) {
@@ -12064,7 +12077,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
-  auto compiled = CompileCase(test);
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
     Require(test.name, "resource specialization",
             !compiled.program.info.images.empty() &&
@@ -13207,7 +13220,7 @@ TestCase ScalarNotB64UpdatesScc() {
   return {"ScalarNotB64UpdatesScc",
           code,
           {},
-          {0, 1, 0, 0, 1, 0, 0, 0xfffffffeu, 0xffffffffu},
+          {0, 1, 0, 0, 1, 0, 1, 0xfffffffeu, 0xffffffffu},
           {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_NOT_B64, O::S_CSELECT_B32,
            O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
@@ -13341,8 +13354,8 @@ TestCase ScalarSaveExecOps() {
   return {"ScalarSaveExecOps",
           code,
           {},
-          // EXEC and saved EXEC values are invocation-local Booleans.
-          {1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0},
+          {1, 0, 1, 0, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+           3, 0xffffffffu, 3, 2, 0xffffffffu, 1},
           {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
            O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
            O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
@@ -13369,7 +13382,7 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
   return {"ScalarOrn2SaveexecUsesSourceOrNotExec",
           code,
           {},
-          {1, 0, 1, 0, 1},
+          {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
           {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -13688,7 +13701,7 @@ TestCase ScalarSelectB64PreservesMaskProvenance() {
   return {"ScalarSelectB64PreservesMaskProvenance",
           code,
           {},
-          {1, 0},
+          {1, 1},
           {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B64, O::S_NOT_B64,
            O::S_CSELECT_B32, O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
@@ -13720,7 +13733,7 @@ TestCase ScalarWqmB64SelectsSccDomain() {
   return {"ScalarWqmB64SelectsSccDomain",
           code,
           {},
-          {1, 0},
+          {1, 1},
           {O::S_MOV_B32, O::S_WQM_B64, O::S_CSELECT_B32, O::V_CMP_EQ_U32,
            O::S_MOV_B64, O::S_NOT_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
@@ -13754,7 +13767,7 @@ TestCase ScalarMaskProvenanceOverlapAndMixedBinary() {
   return {"ScalarMaskProvenanceOverlapAndMixedBinary",
           code,
           {},
-          {0, 1},
+          {1, 1},
           {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_NOT_B64, O::S_CSELECT_B32,
            O::S_MOV_B32, O::S_NAND_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
@@ -14510,9 +14523,7 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   test.name = "VectorAddcWritesPerLaneCarryOut";
   test.code = code;
   test.initial = {0x0000ffffu, 0u, 0x0000ffffu, 0u};
-  // VCC is represented as the current invocation's carry bit, not a shared
-  // four-lane ballot word.
-  test.expected = {1u, 0u, 1u, 0u};
+  test.expected = {5u, 5u, 5u, 5u};
   test.opcodes = {O::V_MOV_B32,         O::V_LSHLREV_B32, O::V_CMP_T_U32,
                   O::BUFFER_LOAD_DWORD, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -14680,8 +14691,7 @@ TestCase VectorVop3BCarryOutWritesSgprMask() {
   TestCase test;
   test.name = "VectorVop3BCarryOutWritesSgprMask";
   test.code = code;
-  // Scalar mask destinations keep the current invocation's bit.
-  test.expected = std::vector<u32>(12, 1u);
+  test.expected = std::vector<u32>(12, 15u);
   test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
                   O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -14713,7 +14723,7 @@ TestCase VectorVop3BCarryOutUsesEncodedSdst() {
   TestCase test;
   test.name = "VectorVop3BCarryOutUsesEncodedSdst";
   test.code = code;
-  test.expected = std::vector<u32>(12, 1u);
+  test.expected = std::vector<u32>(12, 15u);
   test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
                   O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -14752,7 +14762,7 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
   TestCase test;
   test.name = "VectorVop3BSubCoU32UsesRdna2Opcode310";
   test.code = code;
-  test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 1, 0, 0, 1};
+  test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 9, 9, 9, 9};
   test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32,       O::V_CNDMASK_B32,
                   O::V_SUB_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -15667,10 +15677,11 @@ TestCase Vop1MoveRelDestination() {
   AppendVMovLiteral(&code, 6, 0xbbbbbbbbu);
   AppendVMovLiteral(&code, 7, 0xccccccccu);
   code.push_back(EncodeSMovB32(124, InlineU32(2)));
+  code.push_back(EncodeSop1(0x04, 8, 126));
   code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
   code.push_back(EncodeSop1(0x04, 126, 106));
   code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
-  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSop1(0x04, 126, 8));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 7, 4);
   AppendEnd(&code);
@@ -17035,7 +17046,7 @@ TestCase SimpleLoop() {
            O::S_BRANCH, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase BranchVccnzUsesInvocationMask() {
+TestCase BranchVccnzUsesWaveMask() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
@@ -17053,9 +17064,9 @@ TestCase BranchVccnzUsesInvocationMask() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BranchVccnzUsesInvocationMask";
+  test.name = "BranchVccnzUsesWaveMask";
   test.code = code;
-  test.expected = {42, 11, 11, 11, 42, 11, 11, 11};
+  test.expected = std::vector<u32>(8, 42);
   test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,   O::V_ADD_NC_U32,
                   O::V_CMP_EQ_U32,       O::S_CBRANCH_VCCNZ, O::S_BRANCH,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -18747,7 +18758,7 @@ TestCase FlatSubdwordLoadsApplyByteOffset() {
   return test;
 }
 
-TestCase BranchVccnzUsesCarryProducedInvocationMask() {
+TestCase BranchVccnzUsesCarryProducedWaveMask() {
   using O = ShaderOpcode;
 
   std::vector<u32> code = {
@@ -18765,9 +18776,9 @@ TestCase BranchVccnzUsesCarryProducedInvocationMask() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BranchVccnzUsesCarryProducedInvocationMask";
+  test.name = "BranchVccnzUsesCarryProducedWaveMask";
   test.code = code;
-  test.expected = {11, 42, 42, 42, 42, 42, 42, 42};
+  test.expected = std::vector<u32>(8, 42);
   test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32,      O::V_ADD_NC_U32,
                   O::V_CMP_F_U32, O::V_ADDC_U32,         O::S_CBRANCH_VCCNZ,
                   O::S_BRANCH,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -18903,11 +18914,13 @@ TestCase ScratchIsPrivatePerInvocation() {
   TestCase test;
   test.name = "ScratchIsPrivatePerInvocation";
   test.code = std::move(code);
-  test.expected = {0, 1, 2, 3};
+  for (u32 lane = 0; lane < 64; lane++) {
+    test.expected.push_back(lane);
+  }
   test.opcodes = {O::S_MOV_B32,          O::V_MOV_B32,
                   O::FLAT_STORE_DWORD,   O::FLAT_LOAD_DWORD,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -19584,6 +19597,185 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Wave64CrossHalfLaneAndLds() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVop3(&code, 0x360, 8, Vgpr(1), InlineU32(47));
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, 0);
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(63), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(40), 2));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeVop1(0x02, 9, Vgpr(1)));
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  AppendStoreSgprAtLaneDwordOffset(&code, 9, 0, 128);
+  AppendStoreSgprAtLaneDwordOffset(&code, 106, 0, 256);
+  AppendStoreSgprAtLaneDwordOffset(&code, 107, 0, 384);
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0));
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 1, 2));
+  code.push_back(EncodeSopp(0x0a, 0));
+  code.push_back(EncodeVop2(0x1d, 3, InlineU32(64), 0));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 3));
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(4, 0, 3));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 512);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Wave64CrossHalfLaneAndLds";
+  test.code = std::move(code);
+  test.initial.resize(640);
+  test.expected.insert(test.expected.end(), 64, 147);
+  test.expected.insert(test.expected.end(), 64, 211);
+  test.expected.insert(test.expected.end(), 64, 140);
+  test.expected.insert(test.expected.end(), 64, 204);
+  test.expected.insert(test.expected.end(), 128, 0);
+  test.expected.insert(test.expected.end(), 128, 256);
+  for (u32 lane = 0; lane < 128; lane++) {
+    test.expected.push_back(100 + (lane ^ 64));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_READLANE_B32,
+                  O::V_READFIRSTLANE_B32, O::V_CMP_EQ_U32, O::S_MOV_B64,
+                  O::V_LSHLREV_B32, O::V_AND_B32, O::V_XOR_B32, O::DS_WRITE_B32,
+                  O::S_BARRIER, O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformBallot", "OpGroupNonUniformShuffle",
+                         "OpControlBarrier"};
+  test.ir_counts = {{"Barrier", 1}};
+  test.compute_info.threads_num[0] = 128;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Wave64RawMasksAndScalarBranch() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 7);
+  AppendSMovLiteral(&code, 8, 33u << 16u);
+  code.push_back(EncodeSop2(0x29, 126, 193u, 8)); // captured ES BFE EXEC,-1,width
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  code.push_back(EncodeSop2(0x1f, 126, InlineU32(1), InlineU32(32)));
+  const auto exec_branch = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSopp(0x0a, 0));
+  code.push_back(EncodeSop1(0x24, 10, 193u)); // s_and_saveexec_b64 s[10:11],-1
+  const auto scc_branch = code.size();
+  code.push_back(0);
+  AppendVMovU32(&code, 1, 9);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 64);
+  const auto restore = code.size();
+  code[exec_branch] = EncodeSopp(0x08, restore - exec_branch - 1);
+  code[scc_branch] = EncodeSopp(0x04, restore - scc_branch - 1);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeVopc(0xc2, Vgpr(0), 0));
+  code.push_back(EncodeSop1(0x04, 12, 106));
+  code.push_back(EncodeSMovB32(13, InlineU32(1)));
+  AppendVop3(&code, 0x101, 2, InlineU32(0), InlineU32(11), 12);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 128);
+  code.push_back(EncodeSMovB32(127, InlineU32(1)));
+  AppendVMovU32(&code, 3, 13);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 192);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 256);
+  code.push_back(EncodeSMovB32(107, InlineU32(2)));
+  code.push_back(EncodeSMovB32(127, 107));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 320);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Wave64RawMasksAndScalarBranch";
+  test.code = std::move(code);
+  test.initial.assign(384, 0xdeadbeef);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < 64; lane++) {
+    if (lane < 33) {
+      test.expected[lane] = 7;
+      test.expected[192 + lane] = 13;
+    }
+    test.expected[128 + lane] = lane < 33 ? 11 : 0;
+  }
+  test.expected[64 + 32] = 9;
+  test.expected[256] = 13;
+  test.expected[320] = 7;
+  test.expected[320 + 33] = 7;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_BFE_U64, O::S_LSHL_B64,
+                  O::S_CBRANCH_EXECZ, O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_SCC0,
+                  O::S_BARRIER, O::S_MOV_B64, O::V_CMP_EQ_U32, O::V_CNDMASK_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Wave64PartialMultidimensionalWorkgroup() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(2), 2));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(2), 3));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(1), 3));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(3), 3));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 3));
+  AppendVMovU32(&code, 5, 1);
+  AppendBufferStoreOpcode(&code, 0x32, 5, 4, false);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "Wave64PartialMultidimensionalWorkgroup";
+  test.code = std::move(code);
+  test.initial.resize(128);
+  test.expected.assign(96, 1);
+  test.expected.resize(128);
+  test.opcodes = {O::V_ADD_NC_U32, O::V_LSHLREV_B32, O::V_MOV_B32,
+                  O::BUFFER_ATOMIC_ADD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 3;
+  test.compute_info.threads_num[2] = 4;
+  test.compute_info.thread_ids_num = 3;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Wave64AppendConsumeHighHalf() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 124, 4);
+  code.push_back(EncodeSop2(0x1f, 126, 193u, InlineU32(32)));
+  code.push_back(EncodeDs0(0x3e, 0, true));
+  code.push_back(EncodeDs1(1, 0, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  code.push_back(EncodeDs0(0x3d, 0, true));
+  code.push_back(EncodeDs1(2, 0, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 64);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "Wave64AppendConsumeHighHalf";
+  test.code = std::move(code);
+  test.initial.assign(128, 0xdeadbeef);
+  test.expected = test.initial;
+  for (u32 lane = 32; lane < 64; lane++) {
+    test.expected[lane] = 10;
+    test.expected[64 + lane] = 42;
+  }
+  test.gds_initial = {10};
+  test.expected_gds = {10};
+  test.opcodes = {O::S_MOV_B32, O::S_LSHL_B64, O::DS_APPEND, O::DS_CONSUME,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
@@ -21780,8 +21972,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
-  AddCase(BranchVccnzUsesInvocationMask);
-  AddCase(BranchVccnzUsesCarryProducedInvocationMask);
+  AddCase(BranchVccnzUsesWaveMask);
+  AddCase(BranchVccnzUsesCarryProducedWaveMask);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
@@ -21874,6 +22066,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
+  AddCase(Wave64CrossHalfLaneAndLds);
+  AddCase(Wave64RawMasksAndScalarBranch);
+  AddCase(Wave64PartialMultidimensionalWorkgroup);
+  AddCase(Wave64AppendConsumeHighHalf);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicCmpSwapExactRaw);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
@@ -26093,6 +26289,30 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());
+    RunCase(&vulkan, Wave64CrossHalfLaneAndLds());
+    RunCase(&vulkan, Wave64RawMasksAndScalarBranch());
+    RunCase(&vulkan, Wave64PartialMultidimensionalWorkgroup());
+    RunCase(&vulkan, Wave64AppendConsumeHighHalf());
+    RunCase(&vulkan, VectorAddcWritesPerLaneCarryOut());
+    RunCase(&vulkan, VectorVop3BCarryOutWritesSgprMask());
+    RunCase(&vulkan, VectorVop3BCarryOutUsesEncodedSdst());
+    RunCase(&vulkan, DispatcherIrreducibleControlFlow());
+    RunCase(&vulkan, ScalarSaveExecOps());
+    RunCase(&vulkan, ScalarOrn2SaveexecUsesSourceOrNotExec());
+    RunCase(&vulkan, ScalarNotB64UpdatesScc());
+    RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance());
+    RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
+    RunCase(&vulkan, ScalarMaskProvenanceOverlapAndMixedBinary());
+    RunCase(&vulkan, ScratchIsPrivatePerInvocation());
+    RunCase(&vulkan, Vop1MoveRelDestination());
+    RunCase(&vulkan, BranchVccnzUsesWaveMask());
+    RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
+    RunCase(&vulkan, ImageSampleAndGather());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;

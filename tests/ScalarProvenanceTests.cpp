@@ -321,7 +321,8 @@ void TestRuntime64BitDescriptorOps() {
 
 void TestUniformFirstLaneSamplerLod() {
   Fixture fixture;
-  const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
+  const auto active = fixture.Emit(
+      ValueOpcode::IEqual32, {fixture.Emit(ValueOpcode::LaneId), Value(0u)});
   const auto stale = fixture.Emit(
       ValueOpcode::GetVectorRegister, {Value(static_cast<VectorReg>(0))});
   const auto write = [&](Value value, Value previous) {

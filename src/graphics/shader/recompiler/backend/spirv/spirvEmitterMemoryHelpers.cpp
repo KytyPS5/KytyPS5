@@ -65,14 +65,15 @@ void EmitMemoryOffsets(EmitterState& state) {
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
-	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
+	const auto* workgroup = ShaderWorkgroupInput(state.stage, state.input_info);
+	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
 static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
-	if (state.stage != ShaderType::Compute) {
+	if (ShaderWorkgroupInput(state.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
 	state.lds_variable = state.builder.DefineGlobalVariable(
@@ -122,10 +123,10 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			access.length = state.gds_length;
 			return access;
 		case IR::ResourceKind::Scratch:
-			if (state.scratch_variable == 0) {
+			if (state.scratch_variable[state.lane_half] == 0) {
 				EXIT("scratch storage was not prepared before SPIR-V function emission\n");
 			}
-			access.object_pointer = state.scratch_variable;
+			access.object_pointer = state.scratch_variable[state.lane_half];
 			access.length         = ConstantU32(state, state.program.scratch_dwords);
 			return access;
 		case IR::ResourceKind::ScalarAddress:
@@ -167,8 +168,9 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
 		const auto pointer = state.builder.AllocateId();
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
-		                           : state.stage == ShaderType::Compute     ? StorageClassWorkgroup
-		                                                                    : StorageClassFunction;
+		                           : ShaderWorkgroupInput(state.stage, state.input_info) != nullptr
+		                               ? StorageClassWorkgroup
+		                               : StorageClassFunction;
 		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                           pointer, access.object_pointer, index});
 		return pointer;

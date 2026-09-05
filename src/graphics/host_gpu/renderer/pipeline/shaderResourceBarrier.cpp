@@ -13,6 +13,9 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eVertex) {
 		result |= vk::PipelineStageFlagBits::eVertexShader;
 	}
+	if (stages & vk::ShaderStageFlagBits::eMeshEXT) {
+		result |= vk::PipelineStageFlagBits::eMeshShaderEXT;
+	}
 	if (stages & vk::ShaderStageFlagBits::eFragment) {
 		result |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
@@ -118,13 +121,11 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
-	vk_buffer.pipelineBarrier(
-	    source_stages,
-	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eVertexInput |
-	        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader |
-	        vk::PipelineStageFlagBits::eTransfer |
-	        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	    vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.pipelineBarrier(source_stages,
+	                          vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eAllGraphics |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 } // namespace Libs::Graphics

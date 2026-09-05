@@ -723,23 +723,22 @@ static void ShaderGetStaticInputInfoPS(
 }
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
-	                                   const HW::ShaderRegisters& /*sh*/,
-	                                   const ShaderMappedData& data,
-	                                   ShaderComputeInputInfo& info) {
+                                       const HW::ShaderRegisters& /*sh*/,
+                                       const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
-	const bool needs_lds_barriers          = info.needs_lds_barriers;
-	info = {};
-	info.dispatch_thread_dimensions = dispatch_thread_dimensions;
-	info.needs_lds_barriers          = needs_lds_barriers;
-	info.threads_num[0]      = regs.cs_regs.num_thread_x;
-	info.threads_num[1]      = regs.cs_regs.num_thread_y;
-	info.threads_num[2]      = regs.cs_regs.num_thread_z;
-	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
-	info.scratch_size_dwords = data.scratch_size_dwords;
-	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size           = regs.cs_regs.wave_size;
+	const auto host_subgroup_size         = info.host_subgroup_size;
+	info                                  = {};
+	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
+	info.host_subgroup_size               = host_subgroup_size;
+	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
+	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
+	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
+	info.lds_size_dwords                  = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
+	info.scratch_size_dwords              = data.scratch_size_dwords;
+	info.group_id[0]                      = regs.cs_regs.tgid_x_en != 0;
+	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
+	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
+	info.wave_size                        = regs.cs_regs.wave_size;
 	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
 	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
 
@@ -766,6 +765,15 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		for (const float value: info.clip_space.half_extent) {
 			key.push_back(std::bit_cast<uint32_t>(value));
 		}
+	}
+
+	key.push_back(info.mesh.threads_num[0]);
+	if (info.mesh.threads_num[0] != 0) {
+		const auto& mesh = info.mesh;
+		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		                       mesh.scratch_size_dwords, mesh.input_primitive,
+		                       mesh.primitives_per_group, mesh.vertices_per_group,
+		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -822,10 +830,10 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.clear();
 	key.push_back(info.workgroup_register);
 	key.push_back(info.wave_size);
+	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.needs_lds_barriers));
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
@@ -834,15 +842,57 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
-ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
-                            ShaderVertexInputInfo& info) {
+ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                            const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+	const auto& sh     = context.GetShaderRegisters();
 	const auto data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
-	if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
-		EXIT("failed to prepare vertex shader program\n");
-	}
-	return GetShaderParams(
-	    regs.es_regs.data_addr, "ShaderRecompiler VS", GetDeclaredShaderHash(regs.es_regs.data_addr),
+	auto        params = GetShaderParams(
+	    regs.es_regs.data_addr, "ShaderRecompiler VS",
+	    GetDeclaredShaderHash(regs.es_regs.data_addr),
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data);
+	if ((context.GetShaderStages() & 0x20u) == 0) {
+		if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
+			EXIT("failed to prepare vertex shader program\n");
+		}
+		return params;
+	}
+	EXIT_IF(regs.gs_regs.data_addr == 0);
+	const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
+	const auto back_params =
+	    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
+	                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
+	params.back_code         = back_params.code;
+	const uint64_t hashes[]  = {params.hash, back_params.hash};
+	params.hash              = XXH3_64bits(hashes, sizeof(hashes));
+	info                     = {};
+	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
+	auto& mesh               = info.mesh;
+	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
+	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
+	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
+	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
+	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
+	mesh.scratch_size_dwords = std::max(data.scratch_size_dwords, back.scratch_size_dwords);
+	EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
+	                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
+	const auto& group = user_config.GetGeControl();
+	if (user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip ||
+	    sh.m_vgtGsOutPrimType != 2u || sh.m_vgtGsMaxVertOut < 3u || group.vertex_group_size < 3u ||
+	    mesh.max_vertices == 0u) {
+		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
+		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
+		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
+	}
+	mesh.max_primitives       = group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
+	                                      static_cast<uint32_t>(group.vertex_group_size) - 2u,
+	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	EXIT_IF(mesh.primitives_per_group == 0u);
+	mesh.vertices_per_group = mesh.primitives_per_group + 2u;
+	mesh.threads_num[0] =
+	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
+	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
+	return params;
 }
 
 ShaderParams PrepareProgram(
@@ -960,11 +1010,9 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
 	     "\t lds_size_dwords    = %u\n"
-	     "\t needs_lds_barriers = %s\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
 	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
-	     info.needs_lds_barriers ? "true" : "false",
 	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",

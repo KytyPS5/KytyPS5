@@ -32,6 +32,9 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
+	if (state.lane_count == 2) {
+		target = Binary(state, OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
+	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
 	                           ConstantU32(state, ScopeSubgroup), source, target});
@@ -731,6 +734,9 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 
 uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append) {
 	auto&      state = ctx.state;
+	if (ctx.half == 1) {
+		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+	}
 	const auto m0    = ctx.Arg(inst, 0);
 	const auto base =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
@@ -743,9 +749,7 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 1);
-	const auto ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                           ConstantU32(state, ScopeSubgroup), exec});
+	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto low  = state.builder.AllocateId();
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
@@ -753,11 +757,12 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto count =
 	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), low),
 	           Unary(state, OpBitCount, TypeU32(state), high));
-	const auto first = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), first,
-	                           ConstantU32(state, ScopeSubgroup), ballot});
+	const auto first       = ctx.FirstLane(ballot);
+	const auto source_lane = state.lane_count == 2 ? Binary(state, OpBitwiseAnd, TypeU32(state),
+	                                                        first, ConstantU32(state, 31))
+	                                               : first;
 	const auto is_first =
-	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), first);
+	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), source_lane);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
 	const auto m0_bounds =
 	    mem.kind == IR::ResourceKind::Gds
@@ -765,7 +770,12 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	        : Binary(state, OpULessThan, TypeBool(state),
 	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
 	const auto condition = AndCondition(
-	    state, is_first, AndCondition(state, exec, AndCondition(state, storage_bounds, m0_bounds)));
+	    state, is_first,
+	    AndCondition(state,
+	                 state.lane_count == 2
+	                     ? Binary(state, OpINotEqual, TypeBool(state), count, ConstantU32(state, 0))
+	                     : exec,
+	                 AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(
@@ -777,7 +787,7 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), result,
-	                           ConstantU32(state, ScopeSubgroup), atomic, first});
+	                           ConstantU32(state, ScopeSubgroup), atomic, source_lane});
 	return result;
 }
 

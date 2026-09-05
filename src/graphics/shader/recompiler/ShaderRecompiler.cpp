@@ -14,7 +14,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
-#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
@@ -48,6 +47,7 @@ const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Compute: return "CS";
 		case ShaderType::Vertex: return "VS";
+		case ShaderType::Mesh: return "MS";
 		case ShaderType::Pixel: return "PS";
 		default: return "unknown";
 	}
@@ -477,6 +477,45 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	return data;
 }
 
+Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
+                                    std::vector<uint32_t>& joined_code) {
+	EXIT_IF(back.empty());
+	Decoder::Program result;
+	uint32_t         front_words = 0;
+	while (front_words < front.size()) {
+		auto& inst = result.instructions.emplace_back();
+		Decoder::DecodeInstruction(front, front_words, inst);
+		front_words += inst.word_count;
+		if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
+			                     inst.src0.reg != 6u);
+			break;
+		}
+		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_ENDPGM);
+	}
+	EXIT_IF(result.instructions.empty() ||
+	        result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64);
+	joined_code.assign(front.begin(), front.begin() + front_words);
+	joined_code.insert(joined_code.end(), back.begin(), back.end());
+	// The merged-stage ABI passes the back shader in s[6:7]. Give that handoff an
+	// ordinary CFG edge, retaining both bodies in one register and LDS lifetime.
+	joined_code[front_words - 1u] = 0xbf820000u; // s_branch to the following instruction
+	result.instructions.back()    = {};
+	Decoder::DecodeInstruction(joined_code, front_words - 1u, result.instructions.back());
+	Decoder::Program back_program;
+	Decoder::DecodeProgram(back, back_program);
+	const auto back_pc = front_words * sizeof(uint32_t);
+	for (auto& inst: back_program.instructions) {
+		// A back-stage PC-relative data reference requires its guest code address.
+		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_GETPC_B64);
+		inst.pc += back_pc;
+		inst.branch_target += back_pc;
+		result.instructions.push_back(std::move(inst));
+	}
+	result.code = joined_code;
+	return result;
+}
+
 } // namespace
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
@@ -484,7 +523,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		EXIT("shader recompiler input is empty\n");
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel) {
+	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh) {
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
@@ -501,7 +540,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(code.size()));
 
 	Decoder::Program decoded;
-	Decoder::DecodeProgram(code, decoded);
+	std::vector<uint32_t> joined_code;
+	if (options.stage == ShaderType::Mesh) {
+		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+	} else {
+		Decoder::DecodeProgram(code, decoded);
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -560,8 +604,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	const ShaderComputeInputInfo* compute = nullptr;
 	switch (options.stage) {
 		case ShaderType::Vertex:
-			vertex = options.input_info.vertex;
-			break;
+		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
 		case ShaderType::Pixel:
 			pixel = options.input_info.pixel;
 			break;
@@ -617,14 +660,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	if (options.stage == ShaderType::Compute) {
-		const auto lds_barriers =
-		    IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *compute);
-		if (lds_barriers.inserted_barriers != 0) {
-			LOGF("%s wave64 LDS synchronization: barriers=%" PRIu32 "\n", GetDumpLabel(options),
-			     lds_barriers.inserted_barriers);
-		}
-	}
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	IR::TrackResources(ir);
@@ -654,7 +689,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const ShaderPixelInputInfo*   pixel   = nullptr;
 	const ShaderComputeInputInfo* compute = nullptr;
 	switch (options.stage) {
-		case ShaderType::Vertex: vertex = options.input_info.vertex; break;
+		case ShaderType::Vertex:
+		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
 		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
 		case ShaderType::Compute: compute = options.input_info.compute; break;
 		default: EXIT("invalid shader stage\n");

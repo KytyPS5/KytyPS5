@@ -204,22 +204,19 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
 
-	template <ShaderType Stage>
 	Permutation CompilePermutation(const ShaderParams&                          params,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		constexpr const char* stage_name = [] {
-			if constexpr (Stage == ShaderType::Vertex) {
-				return "vs";
-			} else if constexpr (Stage == ShaderType::Pixel) {
-				return "ps";
-			} else {
-				static_assert(Stage == ShaderType::Compute);
-				return "cs";
-			}
-		}();
+		const char* stage_name = nullptr;
+		switch (options.stage) {
+			case ShaderType::Vertex: stage_name = "vs"; break;
+			case ShaderType::Mesh: stage_name = "ms"; break;
+			case ShaderType::Pixel: stage_name = "ps"; break;
+			case ShaderType::Compute: stage_name = "cs"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
@@ -256,16 +253,15 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
-		constexpr ShaderType stage = [] {
-			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-				return ShaderType::Vertex;
-			} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-				return ShaderType::Pixel;
-			} else {
-				static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-				return ShaderType::Compute;
-			}
-		}();
+		ShaderType stage;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage = ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			stage = ShaderType::Compute;
+		}
 
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -307,31 +303,32 @@ struct PipelineCache::ProgramCache {
 		} else {
 			stage_input.compute = &input_info;
 		}
-		constexpr const char* label = [] {
-			if constexpr (stage == ShaderType::Vertex) {
-				return "ShaderRecompiler VS";
-			} else if constexpr (stage == ShaderType::Pixel) {
-				return "ShaderRecompiler PS";
-			} else {
-				return "ShaderRecompiler CS";
-			}
-		}();
+		const char* label = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
+			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
+			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
+			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
+		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
-		if constexpr (stage == ShaderType::Vertex) {
+		options.scratch_dwords = input_info.scratch_size_dwords;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
-			options.scratch_dwords = input_info.scratch_size_dwords;
-		} else if constexpr (stage == ShaderType::Pixel) {
-			options.scratch_dwords = input_info.scratch_size_dwords;
-		} else {
-			options.scratch_dwords = input_info.scratch_size_dwords;
-			options.wave_size      = input_info.wave_size;
+			if (stage == ShaderType::Mesh) {
+				options.wave_size      = input_info.mesh.wave_size;
+				options.scratch_dwords = input_info.mesh.scratch_size_dwords;
+			}
+		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
@@ -340,7 +337,7 @@ struct PipelineCache::ProgramCache {
 			                                                    specialization));
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
-		entry->second.permutations.push_back(CompilePermutation<stage>(
+		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
@@ -540,10 +537,29 @@ void PipelineCache::Save() {
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
-    const HW::ShaderRegisters& sh, const HW::Context& context,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
-	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
+	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
+	if (mesh_active) {
+		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		auto& mesh              = vertex_info.mesh;
+		mesh.host_subgroup_size = m_graphics.subgroup_size;
+		const auto& limits      = m_graphics.mesh_shader_properties;
+		const auto  logical_threads =
+		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+		if (host_threads > limits.maxMeshWorkGroupInvocations ||
+		    host_threads > limits.maxMeshWorkGroupSize[0] ||
+		    mesh.max_vertices > limits.maxMeshOutputVertices ||
+		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
+			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+		}
+	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
@@ -563,7 +579,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.enabled = true;
 	}
 	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor = 0;
+	uint32_t          push_data_cursor =
+	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
@@ -575,7 +592,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
-	input_info.needs_lds_barriers = !m_graphics.compute_wave64_supported;
+	input_info.host_subgroup_size = m_graphics.compute_wave64_supported ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
@@ -709,30 +726,32 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	key.vs_shader_id  = p.vs_shader_id;
 	key.ps_shader_id  = p.ps_shader_id;
 	key.static_params = static_params;
-	EXIT_IF(vs_input_info.buffers_num < 0 ||
-	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
-	        vs_input_info.resources_num < 0 ||
-	        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
-	key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
-	key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
-	uint32_t attributes_num          = 0;
-	for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
-		const auto& buffer = vs_input_info.buffers[binding];
-		EXIT_IF(buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX);
-		attributes_num += static_cast<uint32_t>(buffer.attr_num);
-		EXIT_IF(attributes_num > static_cast<uint32_t>(vs_input_info.resources_num));
-		key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
-		                                      .instance = buffer.fetch_index != 0};
-		for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
-			const auto index = buffer.attr_indices[attribute];
-			EXIT_IF(index < 0 || index >= vs_input_info.resources_num);
-			key.vertex_input.attributes[index] = {
-			    .offset  = buffer.attr_offsets[attribute],
-			    .binding = static_cast<uint8_t>(binding),
-			};
+	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+		EXIT_IF(vs_input_info.buffers_num < 0 ||
+		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
+		        vs_input_info.resources_num < 0 ||
+		        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
+		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
+		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
+		uint32_t attributes_num          = 0;
+		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+			const auto& buffer = vs_input_info.buffers[binding];
+			EXIT_IF(buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX);
+			attributes_num += static_cast<uint32_t>(buffer.attr_num);
+			EXIT_IF(attributes_num > static_cast<uint32_t>(vs_input_info.resources_num));
+			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
+			                                      .instance = buffer.fetch_index != 0};
+			for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
+				const auto index = buffer.attr_indices[attribute];
+				EXIT_IF(index < 0 || index >= vs_input_info.resources_num);
+				key.vertex_input.attributes[index] = {
+				    .offset  = buffer.attr_offsets[attribute],
+				    .binding = static_cast<uint8_t>(binding),
+				};
+			}
 		}
+		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
-	EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return *iter->second;

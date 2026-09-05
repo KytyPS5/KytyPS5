@@ -604,10 +604,25 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	}
 
+	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+	vk::PhysicalDeviceMeshShaderFeaturesEXT supported_mesh {};
+	supported_mesh.pNext = &supported_features13;
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
 	supported_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-	supported_features2.pNext = &supported_features13;
+	supported_features2.pNext = mesh_extension ? static_cast<void*>(&supported_mesh)
+	                                           : static_cast<void*>(&supported_features13);
 	physical_device.getFeatures2(&supported_features2);
+	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	if (graphics.mesh_shader_enabled) {
+		vk::PhysicalDeviceProperties2 properties {};
+		properties.pNext = &graphics.mesh_shader_properties;
+		physical_device.getProperties2(&properties);
+		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
+		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
+		     graphics.mesh_shader_properties.maxMeshOutputVertices,
+		     graphics.mesh_shader_properties.maxMeshOutputPrimitives,
+		     graphics.mesh_shader_properties.maxMeshSharedMemorySize);
+	}
 	const auto required_features12 = WindowContext::RequiredVulkan12Features();
 	const auto required_features13 = WindowContext::RequiredVulkan13Features();
 	EXIT_NOT_IMPLEMENTED(required_features12.samplerMirrorClampToEdge == VK_TRUE &&
@@ -692,8 +707,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
+	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
+	mesh_features.pNext                 = &features13;
+	mesh_features.meshShader            = graphics.mesh_shader_enabled;
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
-	create_info.pNext                   = &features13;
+	create_info.pNext =
+	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1075,6 +1094,9 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
 		}
 	}
 

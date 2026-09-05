@@ -105,8 +105,8 @@ bool Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 	};
 	if (is_exec_or_vcc(inst.dst) || is_exec_or_vcc(inst.src0) ||
 	    (inst.src_count > 1u && is_exec_or_vcc(inst.src1))) {
-		WriteMask64(inst.dst, invocation_result);
-		ir.SetScc(invocation_result);
+		const auto mask = WriteMask(inst.dst, invocation_result, true);
+		ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 		return true;
 	}
 
@@ -132,13 +132,8 @@ bool Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
 		ir.SetThreadBitScalarReg(dst, invocation_result);
 		ir.SetScalarMaskTag(dst, mask_valid);
-		const auto raw_nonzero =
-		    ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u)));
-		ir.SetScc(IR::U1(
-		    ir.Emit(IR::ValueOpcode::SelectU1, {mask_valid, invocation_result, raw_nonzero})));
-	} else {
-		ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u))));
 	}
+	ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u))));
 	return true;
 }
 

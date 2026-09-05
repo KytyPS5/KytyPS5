@@ -21,6 +21,7 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
+	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
 };
 

@@ -43,6 +43,7 @@ void AddOutput(ShaderInfo& info, StageOutputKind kind, uint32_t index, uint32_t 
 void ValidateOptions(const Program& program, const ShaderInfoOptions& options) {
 	switch (program.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Mesh:
 			if (options.vertex == nullptr) {
 				return Fail("vertex shader has no input metadata");
 			}
@@ -365,6 +366,7 @@ void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
+		case ShaderType::Mesh: break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
 		default: return Fail("unsupported shader stage for info collection");

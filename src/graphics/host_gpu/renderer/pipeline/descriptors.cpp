@@ -87,6 +87,7 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 static const char* ShaderStageResourceName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "Vertex";
+		case ShaderType::Mesh: return "Mesh";
 		case ShaderType::Pixel: return "Pixel";
 		case ShaderType::Compute: return "Compute";
 		default: return "Unknown";
@@ -96,6 +97,7 @@ static const char* ShaderStageResourceName(ShaderType stage) {
 static vk::ShaderStageFlags NativeShaderStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
+		case ShaderType::Mesh: return vk::ShaderStageFlagBits::eMeshEXT;
 		case ShaderType::Pixel: return vk::ShaderStageFlagBits::eFragment;
 		case ShaderType::Compute: return vk::ShaderStageFlagBits::eCompute;
 		default: EXIT("unknown native shader stage\n");
@@ -1034,8 +1036,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
-	constexpr auto GraphicsStages =
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	constexpr auto                 GraphicsStages = vk::ShaderStageFlagBits::eVertex |
+	                                                vk::ShaderStageFlagBits::eMeshEXT |
+	                                                vk::ShaderStageFlagBits::eFragment;
+	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
+	                                       ? vk::ShaderStageFlagBits::eFragment
+	                                       : vk::ShaderStageFlags {};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
 		        prepared->snapshot == nullptr);
@@ -1044,6 +1050,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			descriptor_count += NativeDescriptorCount(binding);
 		}
 		const auto shader_stage = NativeShaderStage(prepared->program->stage);
+		push_stages |= shader_stage;
 		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
@@ -1190,10 +1197,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
-		const auto stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-		                        ? vk::ShaderStageFlags {GraphicsStages}
-		                        : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
-		vk_buffer.pushConstants(pipeline.pipeline_layout, stages, 0, sizeof(push_data),
+		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}
 

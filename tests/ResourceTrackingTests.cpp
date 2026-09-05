@@ -640,7 +640,8 @@ void TestImagesSamplersAndAliases() {
 
 void TestSampleAdjustSamplerScratch() {
   Fixture fixture(ShaderType::Pixel);
-  const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
+  const auto active = fixture.Emit(
+      ValueOpcode::IEqual32, {fixture.Emit(ValueOpcode::LaneId), Value(0u)});
   const auto lane =
       fixture.Emit(ValueOpcode::SelectU32, {active, Value(1u), Value(0u)});
   const auto low =
@@ -686,7 +687,8 @@ void TestSampleAdjustSamplerScratch() {
   const auto CheckRejected = [](uint32_t flags, uint32_t shift,
                                 const char *message) {
     Fixture rejected(ShaderType::Pixel);
-    const auto condition = rejected.Emit(ValueOpcode::WqmMask, {Value(true)});
+    const auto condition = rejected.Emit(
+        ValueOpcode::IEqual32, {rejected.Emit(ValueOpcode::LaneId), Value(0u)});
     const auto bit = rejected.Emit(ValueOpcode::SelectU32,
                                    {condition, Value(1u), Value(0u)});
     const auto dynamic =

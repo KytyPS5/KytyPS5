@@ -14979,6 +14979,38 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Fp16RoundNearestEvenConversion() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f803000u); // tie: 0x3c01/0x3c02
+  AppendVMovLiteral(&code, 1, 0x33c00000u); // tie: 0x0001/0x0002
+  AppendVMovLiteral(&code, 2, 0x33000000u); // tie: 0x0000/0x0001
+  AppendVMovLiteral(&code, 3, 0xb3c00000u); // negative subnormal tie
+  code.push_back(EncodeVop1(0x0a, 10, Vgpr(0)));
+  code.push_back(EncodeVop1(0x0a, 11, Vgpr(1)));
+  code.push_back(EncodeVop1(0x0a, 12, Vgpr(2)));
+  code.push_back(EncodeVop1(0x0a, 13, Vgpr(3)));
+
+  AppendVMovLiteral(&code, 4, 0x3c013c01u);
+  AppendVMovLiteral(&code, 5, 0x10001000u);
+  AppendVop3p(&code, 0x0f, 14, Vgpr(4), Vgpr(5), 0, 0x3);
+  for (u32 i = 0; i < 5; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Fp16RoundNearestEvenConversion";
+  test.code = std::move(code);
+  test.expected = {0x00003c02u, 0x00000002u, 0x00000000u,
+                   0x00008002u, 0x3c023c02u};
+  test.opcodes = {O::V_MOV_B32, O::V_CVT_F16_F32, O::V_PK_ADD_F16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16"};
+  return test;
+}
+
 TestCase VectorMinMaxF16Ops() {
   using O = ShaderOpcode;
 
@@ -21671,6 +21703,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
+  AddCase(Fp16RoundNearestEvenConversion);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);

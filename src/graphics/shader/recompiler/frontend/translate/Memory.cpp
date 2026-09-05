@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <array>
@@ -330,11 +331,14 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
                                        const Decoder::Operand&     base) {
 	const auto                memory = MemoryInfoFromDecoded(inst);
 	std::array<IR::Value, 13> components {};
-	components[0] = ReadRawU32(PlainOperand(base));
+	components.fill(IR::Value(0u));
+	const auto count =
+	    Decoder::ImageAddressDwordCount(memory.image_sample_flags, memory.image_address_components);
+	EXIT_IF(count > components.size());
 	const auto nsa_components =
 	    std::min(memory.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
-	for (uint32_t index = 1; index < components.size(); index++) {
-		if (index - 1u < nsa_components) {
+	for (uint32_t index = 0; index < count; index++) {
+		if (index != 0u && index - 1u < nsa_components) {
 			components[index] =
 			    ir.GetVectorReg(static_cast<IR::VectorReg>(memory.image_nsa_addr[index - 1u]));
 		} else {

@@ -274,6 +274,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
+		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
@@ -296,6 +297,36 @@ bool IsSingleDmaskBit(uint32_t dmask) {
 }
 
 } // namespace
+
+ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component) {
+	const auto width = [flags](uint32_t index) {
+		if ((flags & ImageSampleFlagA16) == 0u) return 32u;
+		uint32_t cursor = 0;
+		if ((flags & ImageSampleFlagOffset) != 0u) {
+			if (index == cursor++) return 32u;
+		}
+		if ((flags & ImageSampleFlagBias) != 0u) {
+			if (index == cursor++) return 16u;
+		}
+		if ((flags & ImageSampleFlagCompare) != 0u && index == cursor) return 32u;
+		return 16u;
+	};
+	uint32_t offset = 0;
+	for (uint32_t index = 0; index < component; index++) {
+		const auto bits = width(index);
+		if (bits == 32u) offset = (offset + 31u) & ~31u;
+		offset += bits;
+	}
+	const auto bits = width(component);
+	if (bits == 32u) offset = (offset + 31u) & ~31u;
+	return {offset, bits};
+}
+
+uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {
+	if (components == 0u) return 0u;
+	const auto last = ImageAddressComponentLayout(flags, components - 1u);
+	return (last.bit_offset + last.bit_width + 31u) / 32u;
+}
 
 void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {

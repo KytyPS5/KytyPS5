@@ -4720,6 +4720,65 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestImageAddressOperands() {
+  using namespace ShaderRecompiler;
+  struct Case {
+    uint32_t opcode;
+    uint32_t dimension;
+    bool a16;
+    bool nsa;
+    uint32_t logical_components;
+    uint32_t dwords;
+  };
+  constexpr std::array cases{
+      Case{0x27, 1, false, false, 2, 2}, // xy, explicit level zero
+      Case{0x22, 2, false, false, 9, 9}, // 3D gradients and xyz
+      Case{0x20, 1, true, false, 2, 1},  // packed xy
+      Case{0x3d, 1, true, false, 5, 4},  // offset, half bias, full dref, packed xy
+      Case{0x20, 2, true, true, 3, 2},   // packed xy/z in nonconsecutive VGPRs
+      Case{0x0e, 1, false, false, 1, 1}, // resource query mip
+  };
+  for (const auto &test : cases) {
+    std::vector<uint32_t> shader;
+    for (uint32_t reg = 0; reg < 16; reg++) {
+      shader.push_back(EncodeVop1(0x01, reg, 129 + reg));
+    }
+    shader.push_back(EncodeMimg0(test.opcode, 0x1, false, test.dimension) |
+                     (test.nsa ? 1u << 1u : 0u));
+    shader.push_back(EncodeMimg1(48, 0, 4, 0, test.a16));
+    if (test.nsa) shader.push_back(0x0f0b0703u);
+    shader.push_back(EncodeSopp(0x01));
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(shader, decoded);
+    Check(decoded.instructions[16].image_address_components == test.logical_components,
+          "MIMG decoded address count does not match its logical operands");
+    ShaderComputeInputInfo compute = RegressionComputeInputInfo();
+    Frontend::TranslateOptions options{};
+    options.stage = ShaderType::Compute;
+    options.compute = &compute;
+    auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
+    IR::RewriteToSsa(program.blocks);
+    IR::ConstantPropagationPass(program.blocks);
+    uint32_t addresses = 0;
+    for (const auto *block : program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() != IR::ValueOpcode::MakeImageAddress) continue;
+        addresses++;
+        for (uint32_t index = 0; index < inst.NumArgs(); index++) {
+          const auto value = inst.Arg(index).Resolve();
+          const auto reg = test.nsa && index > 0 ? 3u + (index - 1u) * 4u : index;
+          const auto expected = index < test.dwords ? reg + 1u : 0u;
+          Check(value.IsImmediate() && value.GetType() == IR::Type::U32 &&
+                    value.U32() == expected,
+                "MIMG address read an unused VGPR or lost a packed/NSA operand");
+        }
+      }
+    }
+    Check(addresses == 1, "MIMG address regression did not reach translation");
+  }
+}
+
+
 void TestNewShaderRecompilerImageSampleVariants() {
   const uint32_t shader[] = {
       EncodeMimg0(0x24, 0xf),
@@ -11939,6 +11998,7 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
+  TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();

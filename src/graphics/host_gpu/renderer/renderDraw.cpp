@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -721,9 +722,24 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
-static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer) {
-	return (buffer.stride != 0 ? static_cast<uint64_t>(buffer.stride) * buffer.num_records
-	                           : buffer.num_records);
+static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer,
+                                           const ShaderVertexInputInfo& info) {
+	if (buffer.stride != 0 || buffer.num_records == 0) {
+		return static_cast<uint64_t>(buffer.stride) * buffer.num_records;
+	}
+
+	uint64_t size = 0;
+	for (int i = 0; i < buffer.attr_num; i++) {
+		const auto& resource = info.resources[buffer.attr_indices[i]];
+		// RDNA2 OOB_SELECT=2 only checks NumRecords != 0. A constant attribute still
+		// fetches its entire format; NumRecords is not a byte count in this mode.
+		const uint64_t extent = resource.OutOfBounds() == 2
+		                            ? static_cast<uint64_t>(buffer.attr_offsets[i]) +
+		                                  ShaderRecompiler::Format::GetFormatInfo(resource.Format()).byte_size
+		                            : buffer.num_records;
+		size = std::max(size, extent);
+	}
+	return size;
 }
 
 struct VertexBufferRange {
@@ -753,7 +769,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex);
+		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
 		if (size == 0) {
 			continue;
 		}
@@ -802,7 +818,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex);
+		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
 		if (size == 0) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();

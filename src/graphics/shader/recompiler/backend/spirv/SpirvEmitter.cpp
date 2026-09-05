@@ -354,7 +354,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
                                   const ComputeWorkgroupLimits& compute_workgroup_limits,
-                                  const ShaderHostProfile& host_profile) {
+                                  const ShaderHostProfile& host_profile,
+                                  const IR::ResourceSpecialization& specialization) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -380,7 +381,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	if (!f64.error.empty()) {
 		Fail(program, f64.error.c_str());
 	}
-	EmitterState state(program, input_info);
+	EmitterState state(program, input_info, specialization);
 	state.f64_certificate = f64;
 	state.stage     = program.stage;
 	state.wave_size = program.wave_size;

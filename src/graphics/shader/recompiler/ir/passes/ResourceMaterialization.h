@@ -16,9 +16,9 @@ struct ResourceSpecialization {
 	};
 
 	struct Image {
-		Prospero::TextureNumericClass numeric_class = Prospero::TextureNumericClass::Unsupported;
-		Decoder::ImageDimension       dimension     = Decoder::ImageDimension::Unknown;
-		uint32_t                      mip_count     = 1;
+		Prospero::TextureNumericClass numeric_class              = Prospero::TextureNumericClass::Unsupported;
+		Decoder::ImageDimension       dimension                  = Decoder::ImageDimension::Unknown;
+		uint32_t                      mip_count                  = 1;
 		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
@@ -26,6 +26,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		uint32_t                      indirect_sampler           = UINT32_MAX;
 		bool                          cube                       = false;
+		bool                          needs_manual_depth_compare = false;
 		bool                          operator==(const Image&) const = default;
 	};
 
@@ -39,6 +40,7 @@ struct ResourceSpecialization {
 	// ResourceSnapshot; only the slot topology and sampled pairs affect shader permutations.
 	std::vector<uint32_t> sampler_origins;
 	std::vector<SampledResourcePair> sampled_pairs;
+	std::vector<uint8_t> sampler_depth_compare_funcs; // depth_compare_func for each sampler
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };

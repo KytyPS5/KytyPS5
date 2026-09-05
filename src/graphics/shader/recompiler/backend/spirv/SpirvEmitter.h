@@ -15,9 +15,10 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 void AnalyzeProgramRequirements(IR::Program& program);
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                   ShaderStageInputInfo input_info,
-                                   const IR::ResourceSpecialization& specialization);
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const ComputeWorkgroupLimits& compute_workgroup_limits = {},
+                                  const ShaderHostProfile& host_profile = {},
+                                  const IR::ResourceSpecialization& specialization = {});
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

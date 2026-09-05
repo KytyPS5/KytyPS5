@@ -689,7 +689,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, options.compute_workgroup_limits,
-	                               options.host_profile);
+	                               options.host_profile, specialization);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

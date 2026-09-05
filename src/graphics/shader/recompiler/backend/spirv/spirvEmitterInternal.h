@@ -361,14 +361,16 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
+	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_,
+	             const IR::ResourceSpecialization& specialization_)
 	    : program(program_), input_info(input_info_),
-	      requirements(*program_.spirv_requirements) {}
+	      requirements(*program_.spirv_requirements), specialization(specialization_) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
 	const IR::SpirvRequirements&                     requirements;
+	const IR::ResourceSpecialization&                specialization;
 	ComputeWorkgroupLayout                           compute_workgroup;
 	ComputeExecutionPlan                             compute_execution;
 	IR::F64Certificate                               f64_certificate;

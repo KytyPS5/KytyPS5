@@ -317,6 +317,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 
 void TextureCache::UntrackImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	UntrackCpuRead(image);
 	if (!image.IsTracked()) {
 		return;
 	}
@@ -326,6 +327,14 @@ void TextureCache::UntrackImage(ImageId id) {
 	image.track_addr_end = 0;
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
+	}
+}
+
+void TextureCache::UntrackCpuRead(Image& image) {
+	if (image.cpu_read_tracked) {
+		image.cpu_read_tracked = false;
+		m_page_manager.UpdatePageWatchers<false, true>(image.info.data.address,
+		                                               image.info.data.size);
 	}
 }
 
@@ -572,7 +581,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer);
 	}
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		CommitGpuWrite(destination);
 	}
 	destination.ClearBufferModified();
 }
@@ -588,7 +597,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		CommitGpuWrite(destination);
 	}
 }
 
@@ -1253,6 +1262,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
+			image.usage.storage = true;
 			if (!image.info.data.Empty()) {
 				if (!image.registered || image.depth_id) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
@@ -1359,6 +1369,16 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	// Demand readback is bounded to supported, single-subresource linear storage images.
+	const auto& info = image.info;
+	if (!image.cpu_read_tracked && image.registered && image.usage.storage && !info.IsTiled() &&
+	    !info.IsDepth() && !info.IsBlock() && !info.HasMetadata() && !info.HasStencil() &&
+	    !info.IsVolume() && info.resources == ImageSubresources {1, 1} && info.data.Valid() &&
+	    info.data.size <= m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() &&
+	    BuildDownload(image).valid) {
+		m_page_manager.UpdatePageWatchers<true, true>(info.data.address, info.data.size);
+		image.cpu_read_tracked = true;
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1661,6 +1681,49 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+bool TextureCache::HasPendingCpuRead(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, true)) {
+		if (m_slot_images[id].cpu_read_tracked) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TextureCache::ReadMemory(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	// A fault can be in padding or a neighboring allocation sharing the host page.
+	// Resolve every image read owner of that page, not just byte-overlapping images.
+	for (const auto id: FindImagesInRegion(address, size, true)) {
+		auto& image = m_slot_images[id];
+		if (!image.cpu_read_tracked) {
+			continue;
+		}
+		const auto range = image.info.data;
+		for (const auto alias: FindImagesInRegion(range.address, range.size, false)) {
+			if (alias != id && m_slot_images[alias].IsGpuModified()) {
+				EXIT("TextureCache: ambiguous GPU image ownership during CPU readback\n");
+			}
+		}
+		if (!TryDownloadImage(id)) {
+			EXIT("TextureCache: CPU readback cannot resolve a protected image at 0x%016" PRIx64
+			     "\n",
+			     range.address);
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Finish();
+		// GPU completion alone does not publish the deferred WriteBacking operation.
+		m_scheduler.WaitPriorityOperations(tick);
+		image.ClearGpuModified();
+		m_download_images.erase(id);
+		// Invalidate stale buffer mirrors after publishing the exact image range. The buffer
+		// tracker preserves disjoint GPU-owned bytes even when they share a host page.
+		m_buffer_cache.InvalidateMemory(range.address, range.size);
+		UntrackCpuRead(image);
+	}
+}
+
 bool TextureCache::TryDownloadImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -1718,6 +1781,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
+		UntrackCpuRead(image);
 		image.MarkBufferModified();
 	}
 }

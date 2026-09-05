@@ -145,6 +145,7 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	bool                         cpu_read_tracked = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

@@ -232,6 +232,30 @@ void TestCrossRegionRange() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestSharedReadWatchers() {
+  PageManager manager;
+  const auto page = manager.GetPageSize();
+  auto *memory = Allocate(page * 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  manager.UpdatePageWatchers<true>(base, page * 2);
+  manager.UpdatePageWatchers<true, true>(base + 16, page);
+  manager.UpdatePageWatchers<true, true>(base + 64, 16);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            Protection(memory + page) == PAGE_NOACCESS,
+        "unaligned image range did not protect both pages");
+  manager.UpdatePageWatchers<false, true>(base + 16, page);
+  Check(Protection(memory) == PAGE_NOACCESS &&
+            Protection(memory + page) == PAGE_READONLY,
+        "one image released a shared read owner or a write watcher");
+  manager.UpdatePageWatchers<false, true>(base + 64, 16);
+  Check(Protection(memory) == PAGE_READONLY,
+        "last image read owner lost the remaining write watcher");
+  manager.UpdatePageWatchers<false>(base, page * 2);
+  Check(IsWritable(memory) && IsWritable(memory + page),
+        "shared read/write owners leaked protection");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestBatchedWatcherRanges() {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -521,8 +545,9 @@ void TestReadWriteWatcherInteractions() {
     const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
     const auto page = static_cast<size_t>((address - region_base) / page_size);
     mask.Set(page);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    for (uint32_t count = 0; count < 256; ++count) {
+      manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    }
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
@@ -599,6 +624,7 @@ int main(int argc, char **argv) {
   }
   TestWatchAndUnwatch();
   TestSharedWatcherCounts();
+  TestSharedReadWatchers();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();

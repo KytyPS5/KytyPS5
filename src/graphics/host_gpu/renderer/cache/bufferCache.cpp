@@ -418,7 +418,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (!Libs::LibKernel::Memory::TryReadGpuUploadMemory(address, mapped + copy.srcOffset,
+			                                                     copy.size)) {
+				EXIT("BufferCache: unreadable upload source addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n",
+				     address, uint64_t(copy.size));
+			}
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -429,8 +434,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		if (!Libs::LibKernel::Memory::TryReadGpuUploadMemory(
+		        address, temporary->Mapped().data() + copy.srcOffset, copy.size)) {
+			EXIT("BufferCache: unreadable temporary upload source addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     address, uint64_t(copy.size));
+		}
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();

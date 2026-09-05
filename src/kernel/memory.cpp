@@ -44,7 +44,13 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 namespace Libs::LibKernel::Memory {
@@ -963,6 +969,60 @@ bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return false;
 	}
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
+}
+
+bool TryReadGpuUploadMemory(uint64_t vaddr, void* data, uint64_t size) {
+	if (data == nullptr || vaddr == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	// Keep the non-faulting alias path for GPU-protected direct and sparse memory.
+	if (TryReadBacking(vaddr, data, size) || TryReadPrtBacking(vaddr, data, size)) {
+		return true;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		return false;
+	}
+	for (const auto& range: ranges) {
+		auto* destination = static_cast<uint8_t*>(data) + (range.start - vaddr);
+		if (TryReadBacking(range.start, destination, range.size) ||
+		    TryReadPrtBacking(range.start, destination, range.size)) {
+			continue;
+		}
+		// Executable data, runtime allocations and stacks are committed guest memory,
+		// not direct-memory aliases. Never reinterpret reserved/unmapped holes as zeros.
+		if (!IsPrivateCommittedRangeType(range.type)) {
+			return false;
+		}
+		// A plain memcpy here could re-enter the GPU fault handler with cache locks held.
+		// Ask the OS to copy readable pages; NOACCESS/guard/unmapped pages must fail.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		SIZE_T copied = 0;
+		if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(range.start),
+		                       destination, static_cast<SIZE_T>(range.size), &copied) ||
+		    copied != range.size) {
+			return false;
+		}
+#elif defined(__APPLE__)
+		mach_vm_size_t copied = 0;
+		if (mach_vm_read_overwrite(mach_task_self(), range.start, range.size,
+		                           reinterpret_cast<mach_vm_address_t>(destination),
+		                           &copied) != KERN_SUCCESS ||
+		    copied != range.size) {
+			return false;
+		}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		iovec local {destination, static_cast<size_t>(range.size)};
+		iovec remote {reinterpret_cast<void*>(range.start), static_cast<size_t>(range.size)};
+		if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
+		    static_cast<ssize_t>(range.size)) {
+			return false;
+		}
+#else
+		return false;
+#endif
+	}
+	return true;
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {

@@ -15890,6 +15890,26 @@ TestCase VectorFloatArithmeticOps() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorClampF32ReturnsZeroForNan() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7fc00000u);
+  AppendVMovLiteral(&code, 1, 0x3f800000u);
+  AppendVop3(&code, 0x108, 10, Vgpr(0), Vgpr(1), 0, 0, 0, true);
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorClampF32ReturnsZeroForNan";
+  test.code = std::move(code);
+  test.expected = {0x00000000u};
+  test.opcodes = {O::V_MOV_B32, O::V_MUL_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.ir_counts = {{" = FPSaturate32 ", 1}};
+  return test;
+}
+
 TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
   using O = ShaderOpcode;
 
@@ -21698,6 +21718,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FloatInlineConstantF16UsesNumericValue);
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
+  AddCase(VectorClampF32ReturnsZeroForNan);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
   AddCase(VectorFloatConversionOps);

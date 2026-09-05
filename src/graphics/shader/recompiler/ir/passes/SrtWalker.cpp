@@ -471,11 +471,12 @@ private:
 			return false;
 		}
 		m_visiting.push_back(inst);
-		uint64_t out = 0;
-		if (!EvaluateInst(*inst, out)) {
+		uint64_t   out   = 0;
+		const bool valid = EvaluateInst(*inst, out);
+		m_visiting.pop_back();
+		if (!valid) {
 			return false;
 		}
-		m_visiting.pop_back();
 		m_cache.emplace(inst, out);
 		result = out;
 		return true;

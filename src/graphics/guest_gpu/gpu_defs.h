@@ -519,4 +519,11 @@ enum class VertexAttribFormat : uint32_t {
 
 } // namespace Libs::Graphics::Prospero
 
+namespace Libs::Graphics {
+
+void     SetBorderColorTableAddress(uint32_t reg_offset, uint32_t value);
+uint64_t GetBorderColorTableAddress(bool compute);
+
+} // namespace Libs::Graphics
+
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GUEST_GPU_GPU_DEFS_H_ */

@@ -224,7 +224,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		const bool store_or_atomic = decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
 		                             decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP ||
 		                             (decoded.opcode >= Decoder::Opcode::IMAGE_ATOMIC_SWAP &&
-		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_XOR);
+		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_FMAX);
 		if (store_or_atomic) {
 			return index == 0u ? decoded.dst : decoded.src0;
 		}
@@ -1015,6 +1015,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32);
 		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMin32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMAX:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMax32);
 
 		case Decoder::Opcode::FLAT_LOAD_UBYTE:
 		case Decoder::Opcode::FLAT_LOAD_SBYTE:

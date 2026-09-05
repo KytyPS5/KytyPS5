@@ -1198,7 +1198,9 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test) {
+CompiledShader CompileCase(
+    const TestCase &test,
+    const ShaderRecompiler::ComputeWorkgroupLimits &workgroup_limits = {}) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1221,6 +1223,7 @@ CompiledShader CompileCase(const TestCase &test) {
   options.input_info.compute = &test.compute_info;
   options.user_data = user_data;
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
+  options.compute_workgroup_limits = workgroup_limits;
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
   }
@@ -1299,7 +1302,8 @@ CompiledShader CompileCase(const TestCase &test) {
                 shader_data != nullptr,
             "oversized shader data did not use its storage fallback");
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                        options.input_info);
+                                                        options.input_info,
+                                                        workgroup_limits);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
@@ -1553,6 +1557,14 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] ShaderRecompiler::ComputeWorkgroupLimits WorkgroupLimits() const {
+    vk::PhysicalDeviceProperties properties{};
+    m_physical_device.getProperties(&properties);
+    return {{properties.limits.maxComputeWorkGroupSize[0],
+             properties.limits.maxComputeWorkGroupSize[1],
+             properties.limits.maxComputeWorkGroupSize[2]},
+            properties.limits.maxComputeWorkGroupInvocations};
+  }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -12014,7 +12026,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
-  auto compiled = CompileCase(test);
+  auto compiled = CompileCase(test, vulkan->WorkgroupLimits());
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
     Require(test.name, "resource specialization",
             !compiled.program.info.images.empty() &&
@@ -21867,6 +21879,203 @@ TestCase MultipleWorkitemsGlobalId() {
   return test;
 }
 
+TestCase MakeComputeReshapeCase(const char *name,
+                                const std::array<u32, 3> &guest_size,
+                                size_t output_dwords) {
+  TestCase test;
+  test.name = name;
+  // A missing invocation must leave a visible hole instead of matching zero.
+  test.initial.assign(output_dwords, 0xdeadbeefu);
+  test.expected.resize(output_dwords);
+  std::copy(guest_size.begin(), guest_size.end(),
+            test.compute_info.threads_num);
+  test.compute_info.thread_ids_num = 3;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ComputeReshapeLocalIds(const char *name,
+                                const std::array<u32, 3> &guest_size) {
+  using O = ShaderOpcode;
+  const u32 count = guest_size[0] * guest_size[1] * guest_size[2];
+  auto test = MakeComputeReshapeCase(name, guest_size, count * 4u);
+  auto &code = test.code;
+
+  // Guest indexing is x + size_x * (y + size_y * z). Both test shapes
+  // have power-of-two X/Y extents; v0, v1, v2 are the original guest IDs.
+  code.push_back(EncodeVop2(
+      0x1a, 10, InlineU32(std::countr_zero(guest_size[1])), 2));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(1), 10));
+  code.push_back(EncodeVop2(
+      0x1a, 10, InlineU32(std::countr_zero(guest_size[0])), 10));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(0), 10));
+  AppendStoreVgprAtLaneDwordOffset(&code, 0, 10, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 10, count);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 10, count * 2u);
+  // TG_SIZE exposes the guest LocalInvocationIndex through its wave ID.
+  AppendStoreSgprAtLaneDwordOffset(&code, 0, 10, count * 3u);
+  AppendEnd(&code);
+
+  u32 index = 0;
+  for (u32 z = 0; z < guest_size[2]; z++) {
+    for (u32 y = 0; y < guest_size[1]; y++) {
+      for (u32 x = 0; x < guest_size[0]; x++, index++) {
+        test.expected[index] = x;
+        test.expected[count + index] = y;
+        test.expected[count * 2u + index] = z;
+        test.expected[count * 3u + index] =
+            ((index / 32u) << 20u) | (count / 32u) |
+            (index < 32u ? 0x80000000u : 0u);
+      }
+    }
+  }
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.tg_size_en = true;
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase ComputeReshapeZ256PreservesLocalIds() {
+  return ComputeReshapeLocalIds("ComputeReshapeZ256PreservesLocalIds",
+                                {1, 1, 256});
+}
+
+TestCase ComputeReshapeXYZPreservesLocalIds() {
+  return ComputeReshapeLocalIds("ComputeReshapeXYZPreservesLocalIds",
+                                {2, 2, 128});
+}
+
+TestCase ComputeReshapeZ256PreservesWorkgroupAndGlobalIds() {
+  using O = ShaderOpcode;
+  constexpr u32 count = 2u * 3u * 2u * 256u;
+  auto test = MakeComputeReshapeCase(
+      "ComputeReshapeZ256PreservesWorkgroupAndGlobalIds", {1, 1, 256},
+      count * 6u);
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x25, 10, 0, 0)); // global X = group X + local X
+  code.push_back(EncodeVop2(0x25, 11, 1, 1)); // global Y = group Y + local Y
+  code.push_back(EncodeVop1(0x01, 12, 2));
+  code.push_back(EncodeVop2(0x1a, 12, InlineU32(8), 12));
+  code.push_back(EncodeVop2(0x25, 12, Vgpr(2), 12)); // global Z
+  // Index in the complete guest dispatch: X + 2 * (Y + 3 * Z).
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(1), 12));
+  code.push_back(EncodeVop2(0x25, 20, Vgpr(12), 20));
+  code.push_back(EncodeVop2(0x25, 20, Vgpr(11), 20));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(1), 20));
+  code.push_back(EncodeVop2(0x25, 20, Vgpr(10), 20));
+  for (u32 axis = 0; axis < 3; axis++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 10 + axis, 20, axis * count);
+    AppendStoreSgprAtLaneDwordOffset(&code, axis, 20, (3u + axis) * count);
+    test.compute_info.group_id[axis] = true;
+  }
+  AppendEnd(&code);
+  u32 index = 0;
+  for (u32 z = 0; z < 512; z++) {
+    for (u32 y = 0; y < 3; y++) {
+      for (u32 x = 0; x < 2; x++, index++) {
+        test.expected[index] = x;
+        test.expected[count + index] = y;
+        test.expected[count * 2u + index] = z;
+        test.expected[count * 3u + index] = x;
+        test.expected[count * 4u + index] = y;
+        test.expected[count * 5u + index] = z / 256u;
+      }
+    }
+  }
+  test.compute_info.workgroup_register = 0;
+  test.dispatch_x = 2;
+  test.dispatch_y = 3;
+  test.dispatch_z = 2;
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase ComputeReshapeZ256SharesLdsAcrossSubgroups() {
+  using O = ShaderOpcode;
+  auto test = MakeComputeReshapeCase(
+      "ComputeReshapeZ256SharesLdsAcrossSubgroups", {1, 1, 256}, 512);
+  auto &code = test.code;
+  code.push_back(EncodeVop1(0x01, 4, 0));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(8), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(2), 4)); // unique dispatch index
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 4));
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 2));
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 5, 6)); // LDS[local Z] = dispatch index + 1
+  code.push_back(EncodeSopp(0x0a, 0)); // s_barrier: all 256 writers
+
+  AppendVMovU32(&code, 10, 0);
+  AppendVMovU32(&code, 11, 255);
+  // Each invocation gathers one value from every one of the eight subgroups.
+  for (u32 group = 0; group < 8; group++) {
+    AppendVMovU32(&code, 12, group * 32u);
+    code.push_back(EncodeVop2(0x25, 12, Vgpr(2), 12));
+    code.push_back(EncodeVop2(0x1b, 12, Vgpr(11), 12));
+    code.push_back(EncodeVop2(0x1a, 12, InlineU32(2), 12));
+    code.push_back(EncodeDs0(0x36, 0));
+    code.push_back(EncodeDs1(13, 0, 12));
+    code.push_back(EncodeVop2(0x25, 10, Vgpr(13), 10));
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 0);
+  AppendEnd(&code);
+  for (u32 workgroup = 0; workgroup < 2; workgroup++) {
+    for (u32 z = 0; z < 256; z++) {
+      u32 sum = 0;
+      for (u32 peer = z % 32u; peer < 256; peer += 32) {
+        sum += workgroup * 256u + peer + 1u;
+      }
+      test.expected[workgroup * 256u + z] = sum;
+    }
+  }
+  test.compute_info.lds_size_dwords = 256;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 0;
+  test.dispatch_x = 2;
+  test.required_spirv = {"OpControlBarrier", " Workgroup"};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_AND_B32, O::DS_WRITE_B32, O::DS_READ_B32,
+                  O::S_BARRIER, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase ComputeReshapeZ256PreservesLaneOrder() {
+  using O = ShaderOpcode;
+  auto test = MakeComputeReshapeCase(
+      "ComputeReshapeZ256PreservesLaneOrder", {1, 1, 256}, 256u * 3u);
+  auto &code = test.code;
+  AppendVMovU32(&code, 17, 1000);
+  code.push_back(EncodeVop2(0x25, 17, Vgpr(2), 17));
+  code.push_back(EncodeVop2(0x1d, 4, InlineU32(31), 2));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 4));
+  code.push_back(EncodeDs0(0xb3, 0));
+  code.push_back(EncodeDs1(5, 17, 4)); // reverse each 32-lane subgroup
+  code.push_back(EncodeVop1(0x01, 6, 0xe9));
+  code.push_back(0xc6354711u); // v17 dpp8:[7,0,5,2,3,4,1,6] fi:0
+  AppendVMovLiteral(&code, 18, 0xffffffffu);
+  AppendVMovU32(&code, 19, 0);
+  code.push_back(EncodeVop2(0x23, 8, Vgpr(18), 19));
+  code.push_back(EncodeVop2(0x24, 9, Vgpr(18), 8));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 2, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 2, 256);
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 2, 512);
+  AppendEnd(&code);
+
+  constexpr std::array<u32, 8> selectors{7, 0, 5, 2, 3, 4, 1, 6};
+  for (u32 z = 0; z < 256; z++) {
+    test.expected[z] = 1000u + (z / 32u) * 32u + (31u - z % 32u);
+    test.expected[256u + z] = 1000u + (z / 8u) * 8u + selectors[z % 8u];
+    test.expected[512u + z] = z % 32u;
+  }
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_XOR_B32, O::DS_BPERMUTE_B32, O::V_MBCNT_LO_U32_B32,
+                  O::V_MBCNT_HI_U32_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase DispatcherIrreducibleControlFlow() {
   using O = ShaderOpcode;
 
@@ -22178,6 +22387,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicFmaxContended);
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
+  AddCase(ComputeReshapeZ256PreservesLocalIds);
+  AddCase(ComputeReshapeXYZPreservesLocalIds);
+  AddCase(ComputeReshapeZ256PreservesWorkgroupAndGlobalIds);
+  AddCase(ComputeReshapeZ256SharesLdsAcrossSubgroups);
+  AddCase(ComputeReshapeZ256PreservesLaneOrder);
   AddCase(DispatcherIrreducibleControlFlow);
 
   return cases;

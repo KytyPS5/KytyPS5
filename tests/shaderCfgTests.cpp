@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/shader/recompiler/ComputeWorkgroup.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -8515,6 +8516,129 @@ void TestComputeDispatchWaveSize() {
         "dispatch with CS_W32_EN did not select wave32");
 }
 
+uint64_t WorkgroupInvocationCount(const std::array<uint32_t, 3> &size) {
+  uint64_t count = 1;
+  for (const auto dimension : size) {
+    Check(dimension != 0 && count <= UINT32_MAX / dimension,
+          "accepted compute workgroup has zero or overflowing invocation count");
+    count *= dimension;
+  }
+  return count;
+}
+
+void CheckComputeWorkgroupLayout(
+    const ShaderRecompiler::ComputeWorkgroupLayout &layout,
+    const std::array<uint32_t, 3> &guest,
+    const ShaderRecompiler::ComputeWorkgroupLimits &limits) {
+  Check(layout.guest_size == guest,
+        "compute planner changed the guest geometry");
+  for (uint32_t axis = 0; axis < 3; axis++) {
+    Check(layout.host_size[axis] > 0 &&
+              layout.host_size[axis] <= limits.max_size[axis],
+          "compute host shape exceeds a per-axis device limit");
+  }
+  const auto count = WorkgroupInvocationCount(guest);
+  Check(WorkgroupInvocationCount(layout.host_size) == count &&
+            count <= limits.max_invocations,
+        "compute reshape changed the exact invocation count or exceeded its limit");
+  const bool guest_fits = guest[0] <= limits.max_size[0] &&
+                          guest[1] <= limits.max_size[1] &&
+                          guest[2] <= limits.max_size[2];
+  Check(!guest_fits || layout.host_size == guest,
+        "compute planner should preserve an already valid guest shape");
+}
+
+void TestComputeWorkgroupPlanningBoundaries() {
+  using ShaderRecompiler::ComputeWorkgroupLimits;
+  using ShaderRecompiler::PlanComputeWorkgroup;
+  struct ValidCase {
+    std::array<uint32_t, 3> guest;
+    ComputeWorkgroupLimits limits;
+  };
+  const ValidCase valid[] = {
+      {{2, 3, 4}, {{4, 4, 8}, 64}},
+      {{8, 4, 2}, {{8, 4, 2}, 64}},
+      {{1, 1, 256}, {{1024, 1024, 64}, 1024}},
+      {{8, 8, 4}, {{4, 4, 16}, 256}},
+      {{12, 6, 1}, {{8, 3, 3}, 72}},
+      {{9, 8, 7}, {{8, 9, 7}, 504}},
+      {{UINT32_MAX, 1, 1}, {{UINT32_MAX, 1, 1}, UINT32_MAX}},
+      {{1, 1, 256}, {}}, // Offline compilation retains the original shape.
+  };
+  for (const auto &test : valid) {
+    const auto layout = PlanComputeWorkgroup(test.guest, test.limits);
+    Check(layout.has_value(), "compute planner rejected a representable shape");
+    CheckComputeWorkgroupLayout(*layout, test.guest, test.limits);
+  }
+
+  for (uint32_t axis = 0; axis < 3; axis++) {
+    std::array<uint32_t, 3> guest = {1, 1, 1};
+    guest[axis] = 0;
+    Check(!PlanComputeWorkgroup(guest, {}),
+          "compute planner accepted a zero guest dimension");
+    ComputeWorkgroupLimits limits;
+    limits.max_size[axis] = 0;
+    Check(!PlanComputeWorkgroup({1, 1, 1}, limits),
+          "compute planner accepted a zero host dimension limit");
+  }
+  Check(!PlanComputeWorkgroup({1, 1, 1}, {{1, 1, 1}, 0}),
+        "compute planner accepted zero max invocations");
+  Check(!PlanComputeWorkgroup({8, 8, 8}, {{1024, 1024, 64}, 256}),
+        "compute planner ignored total invocation limit");
+  Check(!PlanComputeWorkgroup({UINT32_MAX, 2, 1}, {}),
+        "compute planner accepted overflowing uint32 invocation count");
+  Check(!PlanComputeWorkgroup({UINT32_MAX, UINT32_MAX, UINT32_MAX}, {}),
+        "compute planner accepted a product overflowing uint64");
+  Check(!PlanComputeWorkgroup({1, 1, 17}, {{4, 4, 4}, 64}),
+        "compute planner padded or split an unrepresentable prime workgroup");
+  Check(!PlanComputeWorkgroup({1, 1, 8}, {{3, 3, 1}, 9}),
+        "compute planner padded an unrepresentable composite workgroup");
+}
+
+void TestComputeWorkgroupPlanningMatchesSmallExhaustiveOracle() {
+  using ShaderRecompiler::ComputeWorkgroupLimits;
+  using ShaderRecompiler::PlanComputeWorkgroup;
+  for (uint32_t max_x = 1; max_x <= 4; max_x++) {
+    for (uint32_t max_y = 1; max_y <= 4; max_y++) {
+      for (uint32_t max_z = 1; max_z <= 4; max_z++) {
+        for (const uint32_t budget : {1u, 7u, 16u, 31u, 64u}) {
+          const ComputeWorkgroupLimits limits{{max_x, max_y, max_z}, budget};
+          // Independent oracle: enumerate every legal physical shape, without
+          // factorizing the guest count or reproducing the planner's search.
+          std::array<bool, 126> possible{};
+          for (uint32_t x = 1; x <= max_x; x++) {
+            for (uint32_t y = 1; y <= max_y; y++) {
+              for (uint32_t z = 1; z <= max_z; z++) {
+                if (x * y * z <= budget) {
+                  possible[x * y * z] = true;
+                }
+              }
+            }
+          }
+          for (uint32_t x = 1; x <= 5; x++) {
+            for (uint32_t y = 1; y <= 5; y++) {
+              for (uint32_t z = 1; z <= 5; z++) {
+                const std::array<uint32_t, 3> guest = {x, y, z};
+                const auto layout = PlanComputeWorkgroup(guest, limits);
+                if (layout.has_value() != possible[x * y * z]) {
+                  std::fprintf(stderr,
+                               "compute oracle mismatch: guest=%u,%u,%u "
+                               "limits=%u,%u,%u max_invocations=%u\n",
+                               x, y, z, max_x, max_y, max_z, budget);
+                  Check(false, "compute planner disagrees with exhaustive oracle");
+                }
+                if (layout) {
+                  CheckComputeWorkgroupLayout(*layout, guest, limits);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x0c),
@@ -12022,6 +12146,8 @@ int main() {
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerU64PairTranslation();
   TestComputeDispatchWaveSize();
+  TestComputeWorkgroupPlanningBoundaries();
+  TestComputeWorkgroupPlanningMatchesSmallExhaustiveOracle();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();

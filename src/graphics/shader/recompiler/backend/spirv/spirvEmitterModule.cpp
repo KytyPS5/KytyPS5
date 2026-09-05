@@ -717,15 +717,9 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
 	if (state.stage == ShaderType::Compute) {
-		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_z = 1u;
-		const auto* cs      = state.input_info.compute;
-		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		const auto& local = state.compute_workgroup.host_size;
 		state.builder.AddExecutionMode(
-		    {state.main_func, ExecutionModeLocalSize, local_x, local_y, local_z});
+		    {state.main_func, ExecutionModeLocalSize, local[0], local[1], local[2]});
 	}
 	if (state.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode({state.main_func, ExecutionModeOriginUpperLeft});

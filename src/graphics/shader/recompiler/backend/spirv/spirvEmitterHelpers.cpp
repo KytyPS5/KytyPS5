@@ -171,6 +171,41 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 }
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if (state.compute_workgroup.IsReshaped() && (kind == IR::StageInputKind::LocalInvocationId ||
+	                                             kind == IR::StageInputKind::GlobalInvocationId)) {
+		EXIT_IF(component >= 3u);
+		const auto& guest = state.compute_workgroup.guest_size;
+		uint32_t    local = ConstantU32(state, 0);
+		if (guest[component] != 1u) {
+			// Recover guest coordinates from the unchanged X-major local invocation index.
+			local             = EmitLocalInvocationIndex(state);
+			const auto stride = component == 0u   ? 1u
+			                    : component == 1u ? guest[0]
+			                                      : guest[0] * guest[1];
+			if (stride != 1u) {
+				const auto divided = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpUDiv, TypeU32(state), divided, local, ConstantU32(state, stride)});
+				local = divided;
+			}
+			if (component != 2u) {
+				const auto remainder = state.builder.AllocateId();
+				state.builder.AddFunction({OpUMod, TypeU32(state), remainder, local,
+				                           ConstantU32(state, guest[component])});
+				local = remainder;
+			}
+		}
+		if (kind == IR::StageInputKind::LocalInvocationId) {
+			return local;
+		}
+		const auto group = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, component);
+		const auto offset = state.builder.AllocateId();
+		const auto global = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpIMul, TypeU32(state), offset, group, ConstantU32(state, guest[component])});
+		state.builder.AddFunction({OpIAdd, TypeU32(state), global, offset, local});
+		return global;
+	}
 	const auto variable = InputVariableForKind(state, kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);

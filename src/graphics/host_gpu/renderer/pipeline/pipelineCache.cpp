@@ -332,6 +332,7 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.scratch_dwords = input_info.scratch_size_dwords;
 			options.wave_size      = input_info.wave_size;
+			options.compute_workgroup_limits = compute_workgroup_limits;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
@@ -350,7 +351,12 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(const GraphicContext& graphics): device(graphics.device) {
+		const auto& limits                       = graphics.GetPhysicalDeviceProperties().limits;
+		compute_workgroup_limits.max_size        = {limits.maxComputeWorkGroupSize[0],
+		                                            limits.maxComputeWorkGroupSize[1],
+		                                            limits.maxComputeWorkGroupSize[2]};
+		compute_workgroup_limits.max_invocations = limits.maxComputeWorkGroupInvocations;
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -365,12 +371,13 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	ShaderRecompiler::ComputeWorkgroupLimits                    compute_workgroup_limits;
 	uint32_t                                                    num_compiled   = 0;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ComputeWorkgroup.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -199,6 +200,7 @@ enum : uint32_t {
 	OpFMul                         = 133,
 	OpUDiv                         = 134,
 	OpFDiv                         = 136,
+	OpUMod                         = 137,
 	OpIAddCarry                    = 149,
 	OpUMulExtended                 = 151,
 	OpSMulExtended                 = 152,
@@ -352,6 +354,7 @@ struct EmitterState {
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
 	const IR::SpirvRequirements&                     requirements;
+	ComputeWorkgroupLayout                           compute_workgroup;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
 	uint32_t                                         storage_buffer_variable = 0;

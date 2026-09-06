@@ -47,6 +47,7 @@ struct ImageSubresourceRange {
 struct ImageMipInfo {
 	uint64_t offset                                 = 0;
 	uint64_t size                                   = 0;
+	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
 	auto     operator<=>(const ImageMipInfo&) const = default;

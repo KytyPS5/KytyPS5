@@ -4729,8 +4729,8 @@ public:
         for (uint32_t level = 0; level < 7; level++) {
           const auto &layout = surface.mips[level];
           desc.info.mip_layout[level] = {
-              layout.offset, layout.size, layout.padded_width * 4,
-              layout.padded_height * 4};
+              layout.offset, layout.size, layout.padded_width,
+              layout.padded_height};
           vk::BufferImageCopy copy{};
           copy.bufferOffset = expected.size() * sizeof(u32);
           copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1};
@@ -5172,46 +5172,6 @@ public:
                        vk::AccessFlagBits2::eTransferRead),
               "Image::CopyImage did not retain pinned "
               "source/destination states");
-
-      constexpr uint64_t block_alias_offset = 0x23000;
-      constexpr std::array<uint32_t, 4> block_alias_data{
-          0x01234567u, 0x89abcdefu, 0xfedcba98u, 0x76543210u};
-      std::memcpy(memory + block_alias_offset, block_alias_data.data(),
-                  sizeof(block_alias_data));
-      auto uncompressed_block =
-          MakeLinearDesc(base + block_alias_offset, sizeof(block_alias_data),
-                         vk::Format::eR32G32B32A32Uint,
-                         Prospero::BufferFormat::k32_32_32_32UInt,
-                         Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 16, 1);
-      const auto uncompressed_block_image =
-          texture_cache.FindImage(uncompressed_block);
-      (void)texture_cache.FindTexture(uncompressed_block_image,
-                                      uncompressed_block);
-      texture_cache.MarkGpuWritten(uncompressed_block_image);
-      auto compressed_block = MakeLinearDesc(
-          base + block_alias_offset, sizeof(block_alias_data),
-          vk::Format::eBc3UnormBlock, Prospero::BufferFormat::kBc3UNorm,
-          Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 16, 1);
-      const auto compressed_block_image =
-          texture_cache.FindImage(compressed_block);
-      const bool compressed_block_download =
-          TextureCacheTestAccess::TryDownload(texture_cache,
-                                              compressed_block_image);
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
-      std::array<uint32_t, block_alias_data.size()> block_alias_after{};
-      std::memcpy(block_alias_after.data(), memory + block_alias_offset,
-                  sizeof(block_alias_after));
-      Require(
-          name, "compressed view expansion",
-          compressed_block_image &&
-              compressed_block_image != uncompressed_block_image &&
-              texture_cache.GetImage(compressed_block_image).backing.format ==
-                  vk::Format::eBc3UnormBlock &&
-              compressed_block_download &&
-              block_alias_after == block_alias_data,
-          "size-compatible compressed alias did not preserve its native "
-          "contents");
 
       ImageInfo resolve_source_info{};
       resolve_source_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -8806,6 +8766,70 @@ public:
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
       std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+
+      // The virtual-texture atlas is written as raw BC3 blocks, then sampled as BC3.
+      constexpr uint64_t block_alias_address = base + 0xf0000;
+      constexpr std::array<uint32_t, 4> block_alias_data{
+          0x01234567u, 0x89abcdefu, 0xfedcba98u, 0x76543210u};
+      const auto resolve_block_alias = [&](bool compressed) {
+        const uint32_t side = compressed ? 256 : 64;
+        const auto format = compressed ? Prospero::BufferFormat::kBc3UNorm
+                                       : Prospero::BufferFormat::k32_32_32_32UInt;
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        value.dwords = {static_cast<uint32_t>(block_alias_address >> 8u),
+                        (static_cast<uint32_t>(format) << 20u) | (3u << 30u),
+                        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+                        0x90900facu, 0, 0x00700000u, 0, 0};
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = compressed
+            ? ShaderRecompiler::IR::ImageResourceClass::Sampled
+            : ShaderRecompiler::IR::ImageResourceClass::Storage;
+        resource.numeric_class = compressed ? Prospero::TextureNumericClass::Float
+                                            : Prospero::TextureNumericClass::Uint;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = compressed;
+        resource.written = !compressed;
+        return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      };
+      auto raw_blocks = resolve_block_alias(false);
+      (void)texture_cache.FindTexture(raw_blocks.image_id, raw_blocks.desc);
+      auto &raw_blocks_native = texture_cache.GetImage(raw_blocks.image_id);
+      raw_blocks_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                vk::AccessFlagBits2::eTransferWrite, {},
+                                scheduler.Current().Handle());
+      vk::ClearColorValue block_clear{};
+      std::copy(block_alias_data.begin(), block_alias_data.end(),
+                block_clear.uint32.begin());
+      const vk::ImageSubresourceRange block_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(
+          raw_blocks_native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+          &block_clear, 1, &block_range);
+      texture_cache.MarkGpuWritten(raw_blocks.image_id);
+      auto compressed_blocks = resolve_block_alias(true);
+      (void)texture_cache.FindTexture(compressed_blocks.image_id,
+                                      compressed_blocks.desc);
+      auto raw_blocks_again = resolve_block_alias(false);
+      Require(name, "compressed atlas storage reuse",
+              compressed_blocks.image_id != raw_blocks.image_id &&
+                  raw_blocks_again.image_id == compressed_blocks.image_id &&
+                  texture_cache.FindTexture(raw_blocks_again.image_id,
+                                            raw_blocks_again.desc) != nullptr,
+              "BC3 sampling replaced the GPU atlas on its next raw-block write");
+      Require(name, "compressed atlas download",
+              TextureCacheTestAccess::TryDownload(texture_cache,
+                                                  raw_blocks_again.image_id),
+              "the retained BC3 atlas could not publish its native contents");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      const auto *block_words = reinterpret_cast<const uint32_t *>(block_alias_address);
+      Require(name, "compressed atlas GPU contents",
+              std::equal(block_alias_data.begin(), block_alias_data.end(), block_words) &&
+                  std::equal(block_alias_data.begin(), block_alias_data.end(),
+                             block_words + 0x10000 / sizeof(uint32_t) - 4),
+              "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
+
       const auto allocate_bindings =
           [&](ShaderRecompiler::IR::Program &program) {
             program.shader_info_complete = true;

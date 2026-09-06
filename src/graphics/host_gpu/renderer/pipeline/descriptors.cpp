@@ -563,6 +563,7 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	TilePaddedSize padded[16] {};
 	TileGetTextureSize(info.guest_format, info.extent.width, info.extent.height,
 	                   info.resources.levels, info.tile_mode, nullptr, levels, padded);
+	const auto texel_shift = info.IsBlock() ? 2u : 0u;
 	for (uint32_t level = 0; level < info.resources.levels; level++) {
 		const auto offset =
 		    levels[level].src_size != 0 ? levels[level].src_offset : levels[level].offset;
@@ -576,9 +577,8 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 		info.mip_layout[level] = {
 		    offset,
 		    size,
-		    padded[level].width != 0 ? padded[level].width : std::max(info.pitch >> level, 1u),
-		    padded[level].height != 0 ? padded[level].height
-		                              : std::max(info.extent.height >> level, 1u),
+		    padded[level].width >> texel_shift,
+		    padded[level].height >> texel_shift,
 		};
 	}
 }

@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -758,6 +759,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
+	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
+	    !desc.info.IsDepth()) {
+		TileSizeAlign metadata_size {};
+		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
+		                     desc.info.bytes_per_block, levels, tile, metadata_size,
+		                     std::countr_zero(samples));
+		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
+		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
+		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
+	}
 	if (samples > 1) {
 		desc.info.mip_layout[0] = {0, size.size, pitch, height};
 	} else {

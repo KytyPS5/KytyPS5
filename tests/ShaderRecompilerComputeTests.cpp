@@ -5796,10 +5796,10 @@ public:
           texture_cache.FindImage(metadata_depth_a);
       const auto metadata_depth_b_id =
           texture_cache.FindImage(metadata_depth_b);
+      texture_cache.TrackDccFill(base + metadata_a, 0x80, 0);
       Require(
           name, "pending DCC/HTile separation",
-          !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
-              !texture_cache.IsMeta(base + metadata_a),
+          !texture_cache.IsMeta(base + metadata_a),
           "an unclassified PS5 DCC fill was exposed as registered metadata");
       const auto metadata_depth_a_view =
           texture_cache.FindDepthTarget(metadata_depth_a_id, metadata_depth_a);
@@ -5832,11 +5832,11 @@ public:
               texture_cache.IsMeta(base + metadata_b) &&
               texture_cache.IsMetaCleared(base + metadata_b, 0),
           "image discovery retired aliased metadata or its live depth image");
+      const bool touched_metadata = texture_cache.TouchMeta(base + metadata_a, 0, false);
+      texture_cache.TrackDccFill(base + metadata_a, 0x80, 0);
       Require(
           name, "registered DCC/HTile separation",
-          texture_cache.TouchMeta(base + metadata_a, 0, false) &&
-              !texture_cache.TryConsumeDccFill(base + metadata_a, 0x80, 0) &&
-              !texture_cache.IsMetaCleared(base + metadata_a, 0),
+          touched_metadata && !texture_cache.IsMetaCleared(base + metadata_a, 0),
           "a PS5 DCC fill changed registered HTile state");
       Require(
           name, "metadata first-touch state",
@@ -7649,7 +7649,9 @@ public:
   void CheckRenderExecutorColorVolumeDiscovery() {
     constexpr const char *name = "RenderExecutorColorVolumeDiscovery";
     constexpr uintptr_t base = 0x0000000203e00000ull;
-    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t color_size = 0x200000;
+    constexpr uint64_t metadata_size = 0x20000;
+    constexpr uint64_t allocation_size = color_size + metadata_size;
     constexpr uint64_t allocation_alignment = 0x10000;
     EnsureRuntimeContext();
 
@@ -7689,7 +7691,7 @@ public:
                                  .tile_mode = Prospero::TileMode::kRenderTarget,
                                  .dimension = 2,
                                  .metadata_pipe_aligned = true});
-      constexpr uint64_t dcc_address = base + allocation_size - 0x1000;
+      constexpr uint64_t dcc_address = base + color_size;
       registers.SetColorDccAddr(0, {.addr = dcc_address});
       registers.SetColorClearWord0(0, {.word0 = 0});
       registers.SetColorClearWord1(0, {.word1 = 0});
@@ -7700,9 +7702,9 @@ public:
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
+      texture_cache.TrackDccFill(dcc_address, metadata_size, 0);
       Require(name, "deferred DCC clear",
-              !texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0) &&
-                  !texture_cache.IsMeta(dcc_address),
+              !texture_cache.IsMeta(dcc_address),
               "a pre-registration DCC clear was not deferred");
 
       RenderColorInfo color{};
@@ -7719,11 +7721,10 @@ public:
               color.desc.info.extent == vk::Extent3D{32, 32, 32} &&
               color.desc.info.resources == ImageSubresources{1, 1} &&
               color.desc.info.pitch == 128 &&
-              color.desc.info.data.size == allocation_size &&
+              color.desc.info.data.size == color_size &&
               color.desc.info.mip_layout[0].size == 0x10000 &&
               color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
               color.desc.info.metadata.range.address == dcc_address &&
-              color.metadata_clear_supported &&
               texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
               dcc_clear_value == 0 && !texture_cache.ClearMeta(dcc_address) &&
               color.desc.view_info.type == vk::ImageViewType::e2D &&
@@ -7753,23 +7754,17 @@ public:
               sliced_color.desc.view_info.base_layer == 7 &&
               sliced_rendering.num_color_attachments == 1 &&
               sliced_rendering.num_layers == 1 &&
-              sliced_rendering.color_attachments[0].is_clear &&
-              sliced_rendering.color_attachments[0].clear_value ==
-                  vk::ClearColorValue{}.uint32 &&
               !texture_cache.IsMetaCleared(dcc_address, 7),
           "a nonzero 3D attachment slice was treated as a Vulkan array layer");
-      dcc_clear_value = 0;
-      Require(
-          name, "registered DCC code state",
-          texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0xffffffffu) &&
-              !texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
-              dcc_clear_value == 0xffffffffu &&
-              texture_cache.TryConsumeDccFill(dcc_address, 0x1000, 0) &&
-              texture_cache.IsMetaCleared(dcc_address, 7),
-          "DCC fill codes were not classified as clear or uncompressed");
-
+      Require(name, "3D slice clear and preservation",
+              ReadCachedTexel(name, context, color.image_id, {0, 0, 7}) ==
+                  std::vector<u32>{0} &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
+                      std::vector<u32>{0x5a5a5a5a},
+              "clearing one volume slice changed untouched slice contents");
       auto storage_desc = color.desc;
       storage_desc.type = BindingType::Storage;
+      storage_desc.info.metadata = {};
       storage_desc.info.guest_format = Prospero::BufferFormat::k10_10_10_2UNorm;
       storage_desc.view_info.type = vk::ImageViewType::e3D;
       storage_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
@@ -7789,7 +7784,7 @@ public:
           TextureCacheTestAccess::TryDownload(texture_cache, storage_id),
           "the 3D render target could not be queued for guest-layout readback");
       auto mirror = resources.GetBufferCache().ObtainBuffer(
-          base, allocation_size, false, true);
+          base, color_size, false, true);
       Require(name, "volume mirror", mirror.first != nullptr,
               "the 3D render-target readback has no BufferCache owner");
       auto slice_probe =
@@ -7816,6 +7811,17 @@ public:
               "render-target upload/readback lost the final Z slice");
       DestroyBuffer(&slice_probe);
 
+      dcc_clear_value = 0;
+      texture_cache.TrackDccFill(dcc_address, metadata_size, 0xffffffffu);
+      const bool uncompressed =
+          !texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
+          dcc_clear_value == 0xffffffffu;
+      texture_cache.TrackDccFill(dcc_address, metadata_size, 0);
+      Require(
+          name, "registered DCC code state",
+          uncompressed && texture_cache.IsMetaCleared(dcc_address, 7),
+          "DCC fill codes were not classified as clear or uncompressed");
+
       for (const uint32_t base_slice : {0u, 7u}) {
         RenderExecutorTestAccess::ResetBindings(executor);
         registers.SetColorView(0, {.base_array_slice_index = base_slice,
@@ -7829,7 +7835,7 @@ public:
         Require(name, "3D export bound exceeds depth",
                 volume_color.image_id == color.image_id &&
                     volume_color.desc.info.extent == vk::Extent3D{32, 32, 32} &&
-                    volume_color.desc.info.data.size == allocation_size &&
+                    volume_color.desc.info.data.size == color_size &&
                     volume_color.desc.view_info.type == vk::ImageViewType::e2DArray &&
                     volume_color.desc.view_info.base_layer == base_slice &&
                     volume_color.desc.view_info.layer_count == 32 - base_slice &&
@@ -7855,6 +7861,40 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  std::vector<u32> ReadCachedTexel(const char *name, RenderContext &context,
+                                 ImageId id, vk::Offset3D offset = {}) {
+    auto &scheduler = context.GetCommandScheduler();
+    auto &image = context.GetTextureCache().GetImage(id);
+    auto probe = CreateHostBuffer(name, image.info.bytes_per_block,
+                                 vk::BufferUsageFlagBits::eTransferDst, {});
+    scheduler.Current().EndRendering();
+    image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                  vk::AccessFlagBits2::eTransferRead, {},
+                  scheduler.Current().Handle());
+    vk::BufferImageCopy copy{};
+    copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    copy.imageOffset = offset;
+    copy.imageExtent = vk::Extent3D{1, 1, 1};
+    scheduler.Current().Handle().copyImageToBuffer(
+        image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+        probe.buffer, 1, &copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = probe.buffer;
+    barrier.size = probe.size;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+        nullptr);
+    scheduler.Finish();
+    auto result = ReadBuffer(name, probe, image.info.bytes_per_block / 4);
+    DestroyBuffer(&probe);
+    return result;
+  }
+
   void CheckRenderExecutorDccFixedClearFloat() {
     constexpr const char *name = "RenderExecutorDccFixedClearFloat";
     constexpr uintptr_t base = 0x0000000204100000ull;
@@ -7863,11 +7903,11 @@ public:
     constexpr uint64_t dcc_address = base + 0x100000;
     struct FillCase {
       uint32_t fill;
-      std::array<uint32_t, 4> clear;
+      std::array<uint32_t, 2> texel;
     };
     constexpr std::array cases{
-        FillCase{0x40404040u, {0, 0, 0, 0x3f800000u}},
-        FillCase{0x80808080u, {0x3f800000u, 0x3f800000u, 0x3f800000u, 0}},
+        FillCase{0x40404040u, {0, 0x3c000000u}},
+        FillCase{0x80808080u, {0x3c003c00u, 0x00003c00u}},
     };
     EnsureRuntimeContext();
 
@@ -7913,9 +7953,9 @@ public:
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
+      texture_cache.TrackDccFill(dcc_address, 0x1000, fill_case.fill);
       Require(name, "deferred fixed-code fill",
-              !texture_cache.TryConsumeDccFill(dcc_address, 0x1000,
-                                               fill_case.fill),
+              !texture_cache.IsMeta(dcc_address),
               "a pre-registration DCC fill was not deferred");
 
       RenderColorInfo color{};
@@ -7928,14 +7968,14 @@ public:
               color.image_id &&
                   color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
                   color.desc.info.metadata.range.address == dcc_address &&
-                  color.metadata_fixed_clear_supported &&
                   rendering.num_color_attachments == 1 &&
-                  rendering.color_attachments[0].is_clear &&
-                  rendering.color_attachments[0].clear_value ==
-                      fill_case.clear &&
                   !texture_cache.IsMetaCleared(dcc_address, 0),
               "a DCC fixed clear code was not materialised on an RGBA16F "
               "target");
+      Require(name, "GPU float clear value",
+              ReadCachedTexel(name, context, color.image_id) ==
+                  std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
+              "RGBA16F native image did not receive the fixed clear value");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
@@ -7949,6 +7989,100 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "fixed-clear direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckSampledDccClear() {
+    constexpr const char *name = "SampledDccClear";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t color_size = 0x3fc0000;
+    constexpr uint64_t metadata_size = 0x48000;
+    constexpr uint64_t dcc_address = base + color_size;
+    constexpr uint64_t allocation_size = 0x4020000;
+    constexpr uint64_t alignment = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, alignment, 0, &direct_offset) == 0,
+            "captured scene allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "captured scene mapping failed");
+    for (const auto initial_size : {metadata_size - 0x1000, metadata_size}) {
+      std::memset(mapped, 0x5a, color_size);
+      std::memset(reinterpret_cast<void *>(dcc_address), 0x40, metadata_size);
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      auto &cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+      cache.TrackDccFill(dcc_address, initial_size, 0x40404040u);
+      Require(name, "deferred metadata fill",
+              !cache.IsMeta(dcc_address),
+              "unknown metadata was consumed before descriptor discovery");
+
+      // PPSA19244's first sampled scene descriptor, with relocated allocations.
+      ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+          0xc4700000u, 0x021bc3bfu, 0x91b00facu, 0, 0x00700000u,
+          0x006b0000u | (static_cast<uint32_t>(dcc_address >> 8u) << 24u),
+          static_cast<uint32_t>(dcc_address >> 16u)}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "sampled metadata discovery",
+              binding.desc.info.extent == vk::Extent3D{3840, 2160, 1} &&
+                  binding.desc.info.data.size == color_size &&
+                  binding.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  binding.desc.info.metadata.range.address == dcc_address &&
+                  binding.desc.info.metadata.range.size == metadata_size,
+              "captured sampled descriptor lost its DCC allocation");
+      Require(name, "sampled view", cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+              "captured scene did not produce a sampled view");
+      if (initial_size != metadata_size) {
+        Require(name, "partial metadata coverage",
+                ReadCachedTexel(name, context, binding.image_id) ==
+                    std::vector<u32>{0x5a5a5a5au, 0x5a5a5a5au},
+                "an incomplete metadata fill cleared the whole scene");
+        cache.TrackDccFill(dcc_address, metadata_size, 0x40404040u);
+        (void)cache.FindTexture(binding.image_id, binding.desc);
+      }
+      Require(name, "opaque black before first sample",
+              ReadCachedTexel(name, context, binding.image_id, {3839, 2159, 0}) ==
+                  std::vector<u32>{0, 0x3c000000u} &&
+                  !cache.IsMetaCleared(dcc_address, 0),
+              "sampling read stale color bytes instead of the DCC opaque black clear");
+      cache.TrackDccFill(dcc_address, metadata_size, 0x80808080u);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      Require(name, "later sampled clear",
+              ReadCachedTexel(name, context, binding.image_id) ==
+                  std::vector<u32>{0x3c003c00u, 0x00003c00u},
+              "an existing sampled image retained the previous DCC clear");
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "captured scene mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "captured scene allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -10379,7 +10513,7 @@ public:
                              static_cast<size_t>(image->height) *
                              image->layers * image->dwords_per_pixel;
     auto staging = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
-                                    vk::BufferUsageFlagBits::eTransferDst, {});
+                                   vk::BufferUsageFlagBits::eTransferDst, {});
 
     vk::CommandBuffer cmd = BeginCommands(shader_name, "readback");
     AddImageBarrier(
@@ -27472,6 +27606,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
+    vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -27487,6 +27622,9 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckRenderExecutorDccFixedClearFloat();
+    vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -27664,6 +27802,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColor1DDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
+  vulkan.CheckSampledDccClear();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();

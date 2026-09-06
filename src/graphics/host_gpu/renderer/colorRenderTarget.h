@@ -19,9 +19,6 @@ struct RenderColorInfo {
 	uint32_t                        guest_mip_level   = 0;
 	uint32_t                        guest_array_layer = 0;
 	Prospero::ColorComponentMapping export_mapping;
-	bool                            metadata_clear_supported       = false;
-	bool                            metadata_fixed_clear_supported = false;
-	vk::ClearColorValue             color_clear_value {};
 
 	[[nodiscard]] vk::Extent2D Extent() const {
 		return {std::max(desc.info.extent.width >> guest_mip_level, 1u),

@@ -215,15 +215,14 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	LOGF(
 	    "DrawTargetState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64
 	    " extent=%ux%u prim=%u index_count=%u flags=0x%08" PRIx32 " color_mask=0x%08" PRIx32
-	    " clear=%s clear_rgba=(%.3f,%.3f,%.3f,%.3f) cc_mode=%u cc_op=0x%02x"
+	    " cc_mode=%u cc_op=0x%02x"
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
 	    "scissor=(%d,%d)-(%d,%d)\n",
 	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
 	    color.desc.info.data.address, extent.width, extent.height,
 	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
-	    "false", color.color_clear_value.float32[0], color.color_clear_value.float32[1],
-	    color.color_clear_value.float32[2], color.color_clear_value.float32[3], cc.mode, cc.op,
+	    cc.mode, cc.op,
 	    bc.enable ? "true" : "false", bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
 	    static_cast<int>(ps_resources.images.size()), static_cast<int>(sampled_images),
 	    static_cast<int>(ps_resources.images.size() - sampled_images),
@@ -460,70 +459,6 @@ struct DrawCallInfo {
 	uint32_t             first_instance = 0;
 };
 
-static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo& target,
-                                      const ImageViewInfo& view, vk::ClearColorValue& clear_value) {
-	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
-		return false;
-	}
-
-	// A DCC fast clear may update metadata only and leave the color allocation stale. Vulkan has
-	// no guest DCC state, so materialize the deferred value when the surface is next bound.
-	const auto metadata_address = target.desc.info.metadata.range.address;
-	uint32_t   metadata_value   = 0xffffffffu;
-	if (!cache.IsMetaCleared(metadata_address, view.base_layer, &metadata_value)) {
-		return false;
-	}
-
-	// Translate recognized constant and register-backed DCC states into a host clear value.
-	clear_value = {};
-	switch (static_cast<uint8_t>(metadata_value)) {
-		case 0x00: break;
-		case 0x20:
-			if (!target.metadata_clear_supported) {
-				return false;
-			}
-			clear_value = target.color_clear_value;
-			break;
-		case 0x40:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[3] = 1.0f;
-			break;
-		case 0x80:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			break;
-		case 0xc0:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			clear_value.float32[3] = 1.0f;
-			break;
-		default: return false;
-	}
-
-	for (uint32_t layer = 1; layer < view.layer_count; layer++) {
-		if (!cache.IsMetaCleared(metadata_address, view.base_layer + layer)) {
-			return false;
-		}
-	}
-	// Consume only after every layer in this Vulkan view can be materialized together.
-	for (uint32_t layer = 0; layer < view.layer_count; layer++) {
-		if (!cache.TouchMeta(metadata_address, view.base_layer + layer, false)) {
-			EXIT("failed to consume DCC clear state\n");
-		}
-	}
-	return true;
-}
-
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -581,14 +516,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
-		attachment.clear_value  = target.color_clear_value.uint32;
-		vk::ClearColorValue metadata_clear_value {};
-		const bool          metadata_clear =
-		    ResolveDccAttachmentClear(cache, target, view, metadata_clear_value);
-		if (metadata_clear) {
-			attachment.clear_value = metadata_clear_value.uint32;
-		}
-		attachment.is_clear = metadata_clear;
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);

@@ -72,9 +72,8 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
-	// Returns true when registered DCC absorbed the fill and the caller may skip the dispatch.
-	// False may still record PendingDcc state, but the guest dispatch must execute.
-	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	// Record deferred DCC state while the original guest dispatch writes the metadata.
+	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -88,7 +87,7 @@ private:
 
 	struct MetaDataInfo {
 		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
-		// PendingDcc retains that exact fill until FindRenderTarget classifies the address,
+		// PendingDcc retains that exact fill until an image binding classifies the address,
 		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
 		// Keep all surface metadata in one entry so CMask/FMask can be
 		// registered beside HTile and DCC without introducing parallel tracking paths.
@@ -138,6 +137,7 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransferPlan
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -147,7 +147,7 @@ private:
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
-	// Caller holds m_lock. Clears only the selected aspects and subresources.
+	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
 	                const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);

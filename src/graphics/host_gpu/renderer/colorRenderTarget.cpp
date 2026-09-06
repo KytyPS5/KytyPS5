@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -21,41 +22,22 @@ namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
-static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool has_dcc,
-                                uint32_t packed_clear) {
-	// Register-backed DCC clears use the target's packed clear value. Decode one-word guest
-	// formats here; unsupported encodings remain tracked without unsafe materialization.
-	info.metadata_clear_supported =
-	    has_dcc && DecodePackedColorClear(format, packed_clear, info.color_clear_value);
-	switch (format) {
-		case vk::Format::eR8Unorm:
-		case vk::Format::eR8G8Unorm:
-		case vk::Format::eR8G8B8A8Unorm:
-		case vk::Format::eR8G8B8A8Srgb:
-		case vk::Format::eB8G8R8A8Unorm:
-		case vk::Format::eB8G8R8A8Srgb:
-		case vk::Format::eA2B10G10R10UnormPack32:
-		case vk::Format::eA2R10G10B10UnormPack32:
-		case vk::Format::eR5G6B5UnormPack16:
-		case vk::Format::eA1R5G5B5UnormPack16:
-		case vk::Format::eR4G4B4A4UnormPack16:
-		case vk::Format::eR16Unorm:
-		case vk::Format::eR16G16Unorm:
-		case vk::Format::eR16G16B16A16Unorm:
-		case vk::Format::eR16Sfloat:
-		case vk::Format::eR16G16Sfloat:
-		case vk::Format::eR16G16B16A16Sfloat:
-		case vk::Format::eR32Sfloat:
-		case vk::Format::eR32G32Sfloat:
-		case vk::Format::eR32G32B32A32Sfloat:
-		case vk::Format::eB10G11R11UfloatPack32:
-			info.metadata_fixed_clear_supported = has_dcc;
-			break;
-		default: info.metadata_fixed_clear_supported = false; break;
+static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
+	switch (info.format) {
+		case Prospero::ChannelLayout::k10_10_10_2:
+		case Prospero::ChannelLayout::k10_10_10_2Float:
+		case Prospero::ChannelLayout::k5_5_5_1: return true;
+		case Prospero::ChannelLayout::k2_10_10_10:
+		case Prospero::ChannelLayout::k1_5_5_5: return false;
+		default: break;
 	}
-	if (!info.metadata_clear_supported) {
-		info.color_clear_value = {};
+	const auto components =
+	    Prospero::ResolveRenderTargetFormat(info.format, info.channel_type).components;
+	if (components == 1) {
+		return info.channel_order != Prospero::ChannelOrder::kStandard;
 	}
+	return components == 3 || info.channel_order == Prospero::ChannelOrder::kStandard ||
+	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -329,10 +311,14 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
 	if (has_dcc) {
-		// DCC uses a separate metadata allocation. Carry its address through ImageInfo so
-		// TextureCache can associate metadata fills observed before target registration.
-		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
-		desc.info.metadata.range.address = rt.dcc_addr.addr;
+		TileSizeAlign metadata_size {};
+		(void)TileGetDccSize(width, height, volume ? depth : view.image_layers, bytes_per_element,
+		                     levels, rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
+		desc.info.metadata.kind                     = ImageMetadataKind::Dcc;
+		desc.info.metadata.range                    = {rt.dcc_addr.addr, metadata_size.size};
+		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.dcc_clear_register_valid = true;
+		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
@@ -378,7 +364,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
-	ResolveDccClearInfo(r, target_format.format, has_dcc, rt.clear_word0.word0);
 	BindRenderTarget(r.image_id);
 }
 

@@ -23,8 +23,11 @@ struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind               = ImageMetadataKind::None;
 	uint32_t            control            = 0;
+	uint32_t            dcc_clear_word           = 0;
 	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed = false;
+	bool                dcc_clear_register_valid = false;
+	bool                dcc_alpha_msb            = true;
 };
 
 struct ImageSubresources {

@@ -14,6 +14,7 @@
 #include <functional>
 #include <numeric>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -555,6 +556,235 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 	return true;
 }
 
+// This cache makes every clean read of the same source DWORD observe the same snapshot,
+// including count/address chains shared with ordinary flattened SRT slots.
+struct SnapshotReader {
+	const SrtRuntime& runtime;
+	std::unordered_map<uint64_t, uint32_t> words;
+
+	static bool Clean(void* userdata, uint64_t address, uint32_t* result) {
+		auto& self = *static_cast<SnapshotReader*>(userdata);
+		if (address > AddressMask - 3u || self.runtime.read_specialization_memory == nullptr) {
+			return false;
+		}
+		if (const auto found = self.words.find(address); found != self.words.end()) {
+			*result = found->second;
+			return true;
+		}
+		if (!self.runtime.read_specialization_memory(self.runtime.userdata, address, result)) {
+			return false;
+		}
+		self.words.emplace(address, *result);
+		return true;
+	}
+
+	static bool Ordinary(void* userdata, uint64_t address, uint32_t* result) {
+		auto& self = *static_cast<SnapshotReader*>(userdata);
+		if (self.runtime.read_memory != nullptr) {
+			return self.runtime.read_memory(self.runtime.userdata, address, result);
+		}
+		// Preserve the existing evaluator fallback for callers without an ordinary reader.
+		std::memcpy(result, reinterpret_cast<const void*>(address), sizeof(*result));
+		return true;
+	}
+
+	void Finish(ResourceSnapshot& snapshot) const {
+		std::vector<uint64_t> addresses;
+		addresses.reserve(words.size());
+		for (const auto& [address, word]: words) {
+			(void)word;
+			addresses.push_back(address);
+		}
+		std::ranges::sort(addresses);
+		for (const auto address: addresses) {
+			if (!snapshot.immutable_srt_ranges.empty()) {
+				auto& last = snapshot.immutable_srt_ranges.back();
+				if (address <= last.address + last.size) {
+					last.size = std::max(last.address + last.size, address + 4u) - last.address;
+					continue;
+				}
+			}
+			snapshot.immutable_srt_ranges.push_back({address, 4u});
+		}
+	}
+};
+
+bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runtime,
+                             MaterializedSnapshot& snapshot) {
+	if (program.bounded_srt_reads.empty()) {
+		return true;
+	}
+	if (program.stage != ShaderType::Compute || program.info.uses_dma) {
+		return SpecializationFail("bounded SRT snapshots require compute without DMA accesses");
+	}
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	uint64_t probes = 0;
+	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
+		const auto& read = program.bounded_srt_reads[id];
+		const auto* count_source = Source(program, read.count_source);
+		const auto* address_source = Source(program, read.address_source);
+		if (count_source == nullptr || count_source->dword_count != 1u ||
+		    address_source == nullptr || address_source->dword_count != 2u) {
+			return SpecializationFail("bounded SRT read has invalid count/address source widths");
+		}
+		DescriptorValue count;
+		if (!EvaluateDescriptorSource(program, read.count_source, clean_runtime, count)) {
+			return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its count", id));
+		}
+		const uint32_t size = count.dwords[0];
+		probes += size;
+		if (probes > MaxIndirectImageProbes ||
+		    snapshot.resources.flattened_srt.size() > UINT32_MAX - uint64_t{size}) {
+			return SpecializationFail(fmt::format(
+			    "bounded SRT read {} exceeds the probe/flat limit (count={} stride={} bias={} probes={} limit={})",
+			    id, size, read.offset_scale, read.offset_bias, probes, MaxIndirectImageProbes));
+		}
+		auto& flat = snapshot.resources.flattened_srt;
+		const auto start = static_cast<uint32_t>(flat.size());
+		snapshot.bounded_srt_reads.push_back({size, start});
+		if (size == 0u) {
+			continue; // The proved guard makes the read unreachable; do not dereference its table.
+		}
+		DescriptorValue address_words;
+		if (!EvaluateDescriptorSource(program, read.address_source, clean_runtime, address_words)) {
+			return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its address", id));
+		}
+		const uint64_t base = ((uint64_t{address_words.dwords[1]} << 32u) |
+		                       address_words.dwords[0]) & AddressMask & ~uint64_t{3};
+		const int64_t immediate = static_cast<int64_t>(static_cast<int32_t>(read.memory_offset)) & ~int64_t{3};
+		for (uint32_t index = 0; index < size; index++) {
+			const uint32_t dynamic = index * read.offset_scale + read.offset_bias;
+			const int64_t offset = immediate + static_cast<int64_t>(dynamic & ~uint32_t{3});
+			if ((offset < 0 && base < static_cast<uint64_t>(-offset)) ||
+			    (offset >= 0 && base > AddressMask - static_cast<uint64_t>(offset))) {
+				return SpecializationFail(fmt::format("bounded SRT read {} index {} overflows its 48-bit address", id, index));
+			}
+			const uint64_t address = offset < 0 ? base - static_cast<uint64_t>(-offset)
+			                                    : base + static_cast<uint64_t>(offset);
+			uint32_t word = 0;
+			if (address > AddressMask - 3u || !ReadSpecializationWord(runtime, address, word)) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id, index, address));
+			}
+			flat.push_back(word);
+		}
+	}
+	return true;
+}
+
+bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot& materialized,
+                        ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	std::vector<DescriptorValue> buffers;
+	specialization.bounded_srt_reads = materialized.bounded_srt_reads;
+	if (!program.bounded_srt_reads.empty()) {
+		specialization.buffer_tables.resize(program.info.buffers.size());
+	}
+	for (uint32_t logical = 0; logical < program.info.buffers.size(); logical++) {
+		const auto* source = Source(program, program.info.buffers[logical].source);
+		if (source == nullptr || !source->bounded_buffer.has_value()) {
+			buffers.push_back(snapshot.buffers[logical]);
+			specialization.buffer_origins.push_back(logical);
+			continue;
+		}
+		const auto& bounded = *source->bounded_buffer;
+		if (source->dword_count != 4u || bounded.key_arg != 0u || program.bounded_srt_reads.empty()) {
+			return SpecializationFail("bounded buffer has invalid source metadata");
+		}
+		const auto first_read = bounded.reads[0];
+		if (first_read >= specialization.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded buffer has an invalid read column");
+		}
+		const auto& first = program.bounded_srt_reads[first_read];
+		const auto count = specialization.bounded_srt_reads[first_read].count;
+		for (uint32_t word = 0; word < bounded.reads.size(); word++) {
+			const auto read_id = bounded.reads[word];
+			if (read_id >= specialization.bounded_srt_reads.size() ||
+			    specialization.bounded_srt_reads[read_id].count != count ||
+			    program.bounded_srt_reads[read_id].count_source != first.count_source ||
+			    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+			    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
+			    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
+			    program.bounded_srt_reads[read_id].memory_offset !=
+			        uint64_t{first.memory_offset} + word * sizeof(uint32_t)) {
+				return SpecializationFail("bounded buffer columns do not form a correlated four-word descriptor");
+			}
+		}
+		auto& table = specialization.buffer_tables[logical];
+		table.count = count;
+		if (snapshot.flattened_srt.size() > UINT32_MAX - uint64_t{count}) {
+			return SpecializationFail("bounded buffer mapping exceeds the flat address limit");
+		}
+		table.mapping_flat_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		for (uint32_t index = 0; index < count; index++) {
+			DescriptorValue descriptor;
+			descriptor.dword_count = 4u;
+			for (uint32_t word = 0; word < 4u; word++) {
+				const auto& layout = specialization.bounded_srt_reads[bounded.reads[word]];
+				descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
+			}
+			auto candidate = std::ranges::find_if(table.resources, [&](uint32_t resource) {
+				return buffers[resource] == descriptor;
+			});
+			uint32_t resource = 0;
+			if (candidate == table.resources.end()) {
+				if (buffers.size() >= ShaderInfo::MaxBuffers) {
+					return SpecializationFail(fmt::format(
+					    "bounded buffer {} exceeds the dense buffer limit (count={} stride={} candidates={} buffers={} limit={})",
+					    logical, count, first.offset_scale, table.resources.size() + 1u,
+					    buffers.size() + 1u, ShaderInfo::MaxBuffers));
+				}
+				resource = static_cast<uint32_t>(buffers.size());
+				buffers.push_back(descriptor);
+				specialization.buffer_origins.push_back(logical);
+				table.resources.push_back(resource);
+			} else {
+				resource = *candidate;
+			}
+			snapshot.flattened_srt.push_back(resource);
+		}
+	}
+	if (buffers.size() > ShaderInfo::MaxBuffers) {
+		return SpecializationFail("specialized buffers exceed the dense buffer limit");
+	}
+	snapshot.buffers = std::move(buffers);
+	return true;
+}
+
+bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                 const ResourceSpecialization& specialization) {
+	if (snapshot.immutable_srt_ranges.empty()) {
+		return true;
+	}
+	constexpr uint64_t buffer_limit = uint64_t{1} << 40u;
+	for (uint32_t resource = 0; resource < snapshot.buffers.size(); resource++) {
+		const auto& metadata = program.info.buffers[specialization.buffer_origins[resource]];
+		if ((!metadata.written && !metadata.atomic) || metadata.image_alias != BufferResource::NoImageAlias) {
+			continue; // Renderer also checks actual padded image allocations before any binding mutation.
+		}
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[resource], descriptor)) {
+			return SpecializationFail("bounded SRT buffer writer has invalid descriptor width");
+		}
+		const auto address = descriptor.Base48();
+		const auto size = ScalarBufferSize(descriptor);
+		if (descriptor.Type() != 0u || address == 0u || size == 0u) {
+			continue;
+		}
+		if (address >= buffer_limit || size > buffer_limit - address) {
+			return SpecializationFail("bounded SRT buffer writer exceeds the registered 40-bit address range");
+		}
+		for (const auto& read: snapshot.immutable_srt_ranges) {
+			if (address < read.address + read.size && read.address < address + size) {
+				return SpecializationFail(fmt::format(
+				    "immutable SRT snapshot overlaps writable buffer {} (source=0x{:x}+{} writer=0x{:x}+{})",
+				    resource, read.address, read.size, address, size));
+			}
+		}
+	}
+	return true;
+}
+
 } // namespace
 
 struct SamplerPlan {
@@ -620,11 +850,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		specialization.buffers.push_back({
 		    .packed_stride     = packed_stride,
-		    .descriptor_format = program.info.buffers[i].formatted
+		    .descriptor_format = base_buffer.formatted
 		                             ? descriptor.Format()
 		                             : Prospero::BufferFormat::kInvalid,
 		    .descriptor_swizzle =
-		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
+		        base_buffer.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
 		});
 	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1080,6 +1310,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.bounded_srt_reads           = program.bounded_srt_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 	plan.has_address_writes         = program.has_address_writes;
@@ -1141,6 +1372,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
+	for (const auto& read: plan.bounded_srt_reads) {
+		plan.requires_specialization_memory = true;
+		MarkCleanFlatSlots(plan, Source(plan, read.count_source), plan.clean_flat_slots);
+		MarkCleanFlatSlots(plan, Source(plan, read.address_source), plan.clean_flat_slots);
+	}
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
 		if (source == nullptr || !source->indirect_image.has_value()) {
@@ -1296,12 +1532,21 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
-	EXIT_IF(program.info.buffers.size() != specialization.buffers.size() ||
+	EXIT_IF(specialization.buffer_origins.size() != specialization.buffers.size() ||
 	        program.info.images.size() > specialization.images.size() ||
 	        program.info.samplers.size() > specialization.sampler_origins.size());
 
-	auto buffers = program.info.buffers;
-	for (size_t index = 0; index < buffers.size(); index++) {
+	std::vector<BufferResource> buffers;
+	std::vector<uint32_t> buffer_remap(program.info.buffers.size(), UINT32_MAX);
+	for (size_t index = 0; index < specialization.buffers.size(); index++) {
+		const auto origin = specialization.buffer_origins[index];
+		EXIT_IF(origin >= program.info.buffers.size());
+		buffers.push_back(program.info.buffers[origin]);
+		const auto* source = Source(program, buffers.back().source);
+		if (source == nullptr || !source->bounded_buffer.has_value()) {
+			EXIT_IF(buffer_remap[origin] != UINT32_MAX);
+			buffer_remap[origin] = static_cast<uint32_t>(index);
+		}
 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;

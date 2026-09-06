@@ -54,6 +54,7 @@ bool IsPureUniformOperation(O op) {
 		case O::FPTrunc32: case O::FPFract32: case O::Phi: case O::Identity:
 		case O::GetSrtResource: case O::GetBufferResource: case O::GetAddressResource: case O::GetScratchResource:
 		case O::GetImageResource: case O::GetSamplerResource: case O::MakeImageAddress: case O::ReadConst:
+		case O::ReadBoundedSrtU32:
 		case O::SelectU32:
 			return true;
 		default: return false;
@@ -88,7 +89,7 @@ bool IsSupportedSplitOperation(O op) {
 		case O::LaneId: case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WriteLane:
 		case O::WqmMask: case O::DppMoveU32: case O::DppUpdateU32:
 		case O::Dpp8MoveU32: case O::Dpp8UpdateU32: case O::Permlane16U32:
-		case O::SwizzleU32: case O::BpermuteU32:
+		case O::SwizzleU32: case O::BpermuteU32: case O::DataAppend:
 		case O::ControlNop: case O::Waitcnt: case O::Barrier: return true;
 		default: return false;
 	}
@@ -158,13 +159,32 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 	if (program.dispatcher_fallback) return "wave64 splitting requires structured control flow";
 	if (program.blocks.size() != program.block_info.size())
 		return "wave64 splitting requires complete branch metadata";
-	for (const auto& memory : program.memory_info) {
-		if ((memory.kind == IR::ResourceKind::Lds && partitions_guest_workgroup) || memory.kind == IR::ResourceKind::Gds ||
+	// GDS support is restricted to one logical wave reserving an append range.
+	// A declaration alone cannot enable unrelated GDS loads, atomics or consume.
+	std::unordered_set<uint32_t> append_memory;
+	std::vector<const IR::Inst*> appends;
+	for (const auto* block : program.blocks) for (const auto& inst : *block) {
+		if (inst.GetOpcode() != O::DataAppend) continue;
+		const auto index = inst.Flags<IR::MemoryFlags>().index;
+		if (partitions_guest_workgroup || index >= program.memory_info.size())
+			return "wave64 GDS append requires one complete guest wave and valid metadata";
+		const auto& memory = program.memory_info[index];
+		if (memory.kind != IR::ResourceKind::Gds || memory.offset != 0u ||
+		    memory.data_bits != 32u || memory.data_dwords != 1u)
+			return "wave64 GDS append requires a zero-offset DWORD counter";
+		append_memory.insert(index);
+		appends.push_back(&inst);
+	}
+	for (uint32_t index = 0; index < program.memory_info.size(); ++index) {
+		const auto& memory = program.memory_info[index];
+		if ((memory.kind == IR::ResourceKind::Lds && partitions_guest_workgroup) ||
+		    (memory.kind == IR::ResourceKind::Gds && !append_memory.contains(index)) ||
 		    memory.kind == IR::ResourceKind::Scratch)
 			return "wave64 splitting does not support guest shared or scratch memory";
 	}
 	const auto cyclic = CyclicBlocks(program);
 	std::vector<const IR::Inst*> cyclic_reads;
+	std::vector<const IR::Inst*> cyclic_appends;
 	bool has_cyclic_write = false;
 	std::unordered_set<const IR::Inst*> instructions;
 	std::function<void(IR::Value)> collect = [&](IR::Value value) {
@@ -191,18 +211,20 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				planning_only = index < program.memory_info.size() && program.memory_info[index].planning_only;
 			}
 			if ((op == O::Barrier && partitions_guest_workgroup) ||
-			    op == O::DataAppend || op == O::DataConsume ||
+			    op == O::DataConsume ||
 			    op == O::Sendmsg || op == O::TtraceData || op == O::InstPrefetch || op == O::SetAttribute)
 				return "wave64 splitting does not support guest workgroup or DS operations";
 			if (IR::SharedAccessOf(op) != IR::SharedAccess::None) {
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				const bool gds_append = op == O::DataAppend && append_memory.contains(index);
 				if (partitions_guest_workgroup || index >= program.memory_info.size() ||
-				    program.memory_info[index].kind != IR::ResourceKind::Lds)
+				    (!gds_append && program.memory_info[index].kind != IR::ResourceKind::Lds))
 					return "wave64 LDS access requires one complete guest wave and valid LDS metadata";
 			}
 			if (cyclic.contains(block)) {
 				if (!planning_only && IsGuestRead(op)) cyclic_reads.push_back(&inst);
-				has_cyclic_write |= IsGuestWrite(op) || IsGuestAtomic(op);
+				if (op == O::DataAppend) cyclic_appends.push_back(&inst);
+				has_cyclic_write |= IsGuestWrite(op) || IsGuestAtomic(op) || op == O::DataAppend;
 			}
 			if (IsGuestAtomic(op) && inst.HasUses())
 				return "wave64 splitting does not support live atomic return values";
@@ -213,6 +235,24 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		if (block.terminator.kind == CFG::TerminatorKind::IndirectBranch ||
 		    block.terminator.kind == CFG::TerminatorKind::Unsupported)
 			return "wave64 splitting requires statically known branch targets";
+	}
+
+	// A bounded compaction loop may reserve output slots, but a returned GDS
+	// counter must not drive polling or other cross-wave progress. Follow every
+	// use, including Phi edges and collective operands, to every conditional.
+	if (!cyclic_appends.empty()) {
+		std::unordered_set<const IR::Inst*> dependent(cyclic_appends.begin(), cyclic_appends.end());
+		for (size_t cursor = 0; cursor < cyclic_appends.size(); ++cursor) {
+			for (const auto& use : cyclic_appends[cursor]->Uses()) {
+				if (instructions.contains(use.user) && dependent.insert(use.user).second)
+					cyclic_appends.push_back(use.user);
+			}
+		}
+		for (const auto& block : program.block_info) {
+			if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    dependent.contains(block.condition.TryInstruction()))
+				return "wave64 GDS append counter cannot control a branch";
+		}
 	}
 
 	if (!cyclic_reads.empty()) {
@@ -283,6 +323,10 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			if (!is_uniform) changed |= varying.insert(inst).second;
 		}
 	} while (changed);
+	for (const auto* append : appends) {
+		if (!uniform(append->Arg(0)))
+			return "wave64 GDS append requires wave-uniform M0";
+	}
 	for (const auto& block : program.block_info) {
 		if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch && !uniform(block.condition))
 			return "wave64 splitting cannot prove wave-uniform branch at pc " + std::to_string(block.start_pc);

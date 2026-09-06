@@ -50,7 +50,14 @@ struct DeferredPhiPatch {
 	uint32_t        half        = 0;
 };
 
+struct DeferredContinuePatch {
+	DeferredLoopMerge loop;
+	const IR::Block*  body = nullptr;
+};
+
 struct StructuredFunctionState {
+	std::unordered_set<const IR::Block*>           dedicated_continues;
+	std::vector<DeferredContinuePatch>             deferred_continues;
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
 };
@@ -90,6 +97,67 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 		return nullptr;
 	}
 	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
+}
+
+// Move only a proved simple while-loop's SPIR-V continue target past its
+// guest body. Generated bounds checks in that body can terminate invalid paths
+// with OpUnreachable; those paths must not belong to the continue construct.
+// More general early-continue/nested-selection graphs retain their existing
+// targets: moving them requires restructuring the selection exits as well.
+const IR::Block* DedicatedContinueBody(const IR::Program& program, const IR::Block* header,
+                                       const IR::BlockInfo& header_info) {
+	const auto& loop = header_info.terminator;
+	if (!loop.loop_header) {
+		return nullptr;
+	}
+	const auto* merge = TargetBlock(program, loop.merge_block);
+	const auto* body = TargetBlock(program, loop.continue_block);
+	if (merge == nullptr || body == nullptr || merge == header || body == header || merge == body) {
+		return nullptr;
+	}
+	const auto info_for = [&](const IR::Block* block) -> const IR::BlockInfo* {
+		const auto found = std::ranges::find(program.blocks, block);
+		return found == program.blocks.end() ? nullptr :
+		       &program.block_info[static_cast<size_t>(found - program.blocks.begin())];
+	};
+	const auto* body_info = info_for(body);
+	if (body_info == nullptr || body_info->terminator.loop_header ||
+	    body_info->terminator.kind != CFG::TerminatorKind::Branch ||
+	    TargetBlock(program, body_info->terminator.true_block) != header) {
+		return nullptr;
+	}
+	std::unordered_set<const IR::Block*> visited;
+	const auto* guard = header;
+	for (;;) {
+		if (guard == body || guard == merge || !visited.insert(guard).second) {
+			return nullptr;
+		}
+		const auto* info = info_for(guard);
+		if (info == nullptr || (guard != header && info->terminator.loop_header)) {
+			return nullptr;
+		}
+		const auto& term = info->terminator;
+		if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+			const auto* on_true = TargetBlock(program, term.true_block);
+			const auto* on_false = TargetBlock(program, term.false_block);
+			if (info->condition.IsEmpty() ||
+			    (guard != header && term.merge_block != UINT32_MAX) ||
+			    !((on_true == body && on_false == merge) || (on_true == merge && on_false == body))) {
+				return nullptr;
+			}
+			const auto predecessors = body->ImmPredecessors();
+			return predecessors.size() == 1u && predecessors.front() == guard ? body : nullptr;
+		}
+		if (term.kind != CFG::TerminatorKind::Branch) {
+			return nullptr;
+		}
+		const auto* next = TargetBlock(program, term.true_block);
+		if (next == nullptr || next->ImmPredecessors().size() != 1u ||
+		    next->ImmPredecessors().front() != guard) {
+			return nullptr;
+		}
+		guard = next;
+	}
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
@@ -365,6 +433,17 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		if (structured.dedicated_continues.contains(block) &&
+		    ctx.state.current_label != ctx.Label(block)) {
+			// A generated selection/loop merge cannot also be this loop's
+			// continue target: its construct must remain inside the loop body.
+			// Keep the bridge only when emission actually split the IR block.
+			const auto continue_label = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction({OpBranch, continue_label});
+			EmitLabel(ctx.state, continue_label);
+		}
+		// Header Phis must name the actual back-edge label after the body and
+		// its generated selections, including a dedicated continue bridge when needed.
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, program.block_info[index]);
 	}

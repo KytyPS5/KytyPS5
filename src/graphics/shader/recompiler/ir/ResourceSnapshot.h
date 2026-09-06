@@ -29,6 +29,8 @@ struct UniformFill {
 };
 
 struct ResourceSnapshot {
+	// Exact coherent source bytes frozen for indexed SRT reads; never native allocation ranges.
+	std::vector<ResourceReadRange> immutable_srt_ranges;
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;

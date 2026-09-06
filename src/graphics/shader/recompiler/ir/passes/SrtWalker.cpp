@@ -1061,6 +1061,11 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
+std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
+                                                     const Inst& read) {
+	return BoundedLoopProof(program).Run(read);
+}
+
 void BuildSrtPlan(Program& program) {
 	if (program.resource_tracking_complete) {
 		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");

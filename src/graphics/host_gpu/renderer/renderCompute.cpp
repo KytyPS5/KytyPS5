@@ -286,7 +286,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode,
+                                    uint64_t indirect_args) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -345,13 +346,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y,
-	                               thread_group_z, mode)) {
+	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
+	                                                     thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
+	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+	                                                      thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -413,6 +414,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	if (use_thread_dimensions && indirect_args != 0) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("GraphicsRenderDispatchDirect: indirect dispatch with thread dimensions at"
+			     " 0x%016" PRIx64 " uses host-read counts\n",
+			     indirect_args);
+		}
+		indirect_args = 0;
+	}
 	if (use_thread_dimensions) {
 		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
 			return (threads == 0
@@ -438,7 +448,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	if (indirect_args == 0 && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -479,7 +489,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (indirect_args != 0) {
+		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
+		vk::BufferMemoryBarrier args_barrier {};
+		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
+		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+		                             vk::AccessFlagBits::eTransferWrite |
+		                             vk::AccessFlagBits::eMemoryWrite;
+		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		args_barrier.buffer              = args_buffer->Handle();
+		args_barrier.offset              = args_offset;
+		args_barrier.size                = 3u * sizeof(uint32_t);
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eDrawIndirect,
+		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

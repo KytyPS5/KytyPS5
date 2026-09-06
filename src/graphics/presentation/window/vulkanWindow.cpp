@@ -1110,11 +1110,12 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-		}
-		if (HasExtension(available_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+			if (HasExtension(available_extensions, extension)) {
+				device_extensions.push_back(extension);
+			}
 		}
 	}
 

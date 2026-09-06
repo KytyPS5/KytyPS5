@@ -8375,6 +8375,60 @@ void TestNewShaderRecompilerCfgLoopSharedRegion() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
+  // The first selection needs routing at its externally entered common tail.
+  // A later loop has the same lexical shared-arm shape, but its exit branches
+  // are already structured and must retain their loop-control role.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0: enclosing selection
+      EncodeSopp(0x04, 4),    // 0 -> 3 or 1
+      EncodeSopc(0x06, 1, 1), // 1: inner selection
+      EncodeSopp(0x04, 6),    // 1 -> 5 or 2
+      EncodeSMovB32(2, 129),  // 2: inner body
+      EncodeSopp(0x02, 2),    // 2 -> 4
+      EncodeSMovB32(3, 129),  // 3: outer arm
+      EncodeSopp(0x02, 0),    // 3 -> 4
+      EncodeSMovB32(4, 129),  // 4: shared tail
+      EncodeSopp(0x02, 0),    // 4 -> 5
+      EncodeSopc(0x06, 5, 5), // 5: loop header
+      EncodeSopp(0x04, 4),    // 5 -> 8 or 6
+      EncodeSopc(0x06, 6, 6), // 6: early break
+      EncodeSopp(0x04, 2),    // 6 -> 8 or 7
+      EncodeSopc(0x06, 7, 7), // 7: loop latch
+      EncodeSopp(0x05, 0xfffau), // 7 -> 5 or 8
+      EncodeSMovB32(8, 129),  // 8: terminal
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 9u && graph.natural_loops.size() == 1u,
+        "shared-region/early-break fixture has the wrong native CFG");
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+  Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u,
+        "selection routing introduced a cycle around a structured loop exit");
+  Check(std::ranges::count_if(graph.blocks, [](const auto &block) {
+          return block.terminator.condition ==
+                 ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+        }) == 1u,
+        "shared-region routing rewrote unrelated loop-control branches");
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "shared-region/early-break routing changed semantic coverage");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "shared-region/early-break routing lost structured loop control");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // block 0
@@ -12676,6 +12730,7 @@ int main() {
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
   TestNewShaderRecompilerCfgLoopSharedRegion();
+  TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();

@@ -1718,7 +1718,8 @@ void AppendEnclosingRouteBlocks(Graph& graph, uint32_t original_block_count,
 		for (uint32_t candidate = 0; candidate < original_block_count; candidate++) {
 			const auto* candidate_block = graph.FindBlock(candidate);
 			if (candidate_block == nullptr ||
-			    candidate_block->terminator.kind != TerminatorKind::ConditionalBranch) {
+			    candidate_block->terminator.kind != TerminatorKind::ConditionalBranch ||
+			    IsInnermostLoopControlConditional(graph, *candidate_block)) {
 				continue;
 			}
 			const auto candidate_true  = candidate_block->terminator.true_block;
@@ -1752,11 +1753,15 @@ void AppendEnclosingRouteBlocks(Graph& graph, uint32_t original_block_count,
 
 // Turn H0 -> shared/H1, H1 -> shared/other into nested selections whose empty
 // forwarding blocks set one typed SSA route value. Guest semantic blocks remain unique.
+// Preserve loop-control branches just as SplitOneSelectionMerge does. Moving a loop
+// exit through the route selector can create an inner cycle whose merge is also the
+// enclosing loop merge, so splitting that shared exit can never separate the loops.
 bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t outer_id,
                        uint32_t route_variable, GotoRouteBlocks& route) {
 	auto* outer = graph.FindBlock(outer_id);
 	if (outer == nullptr || outer->inst_begin == outer->inst_end ||
-	    outer->terminator.kind != TerminatorKind::ConditionalBranch) {
+	    outer->terminator.kind != TerminatorKind::ConditionalBranch ||
+	    IsInnermostLoopControlConditional(graph, *outer)) {
 		return false;
 	}
 
@@ -1768,7 +1773,8 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 		const auto* inner = graph.FindBlock(inner_id);
 		if (inner == nullptr || inner->inst_begin == inner->inst_end ||
 		    inner->predecessors != std::vector<uint32_t> {outer_id} ||
-		    inner->terminator.kind != TerminatorKind::ConditionalBranch) {
+		    inner->terminator.kind != TerminatorKind::ConditionalBranch ||
+		    IsInnermostLoopControlConditional(graph, *inner)) {
 			continue;
 		}
 

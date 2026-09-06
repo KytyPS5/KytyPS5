@@ -506,6 +506,11 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
+bool LdsHasCompetingInvocations(const EmitterState& state) {
+	return !state.requirements.function_lds &&
+	       state.compute_workgroup.host_size != std::array<uint32_t, 3>{1u, 1u, 1u};
+}
+
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
@@ -526,7 +531,9 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		                     Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
 		              value);
 	};
-	if (mem.kind == IR::ResourceKind::Scratch) {
+	if (mem.kind == IR::ResourceKind::Scratch ||
+	    (mem.kind == IR::ResourceKind::Lds && !LdsHasCompetingInvocations(ctx.state))) {
+		// Private storage has no other writer that could be lost by this RMW.
 		const auto old = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
 		ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
@@ -554,21 +561,31 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 	});
 }
 
+void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                       uint32_t data) {
+	auto& state = ctx.state;
+	const auto pointer = EmitMemoryElementPointer(state, resource, index);
+	if (resource.kind == IR::ResourceKind::Lds && LdsHasCompetingInvocations(state)) {
+		// Guest LDS serializes competing DWORD writes. Plain Vulkan stores would
+		// race even when all active lanes write the same value. Preserve every
+		// writer without specifying a winner for different values. Existing DS
+		// and guest barriers still order subsequent reads; wide stores remain
+		// independent DWORD writes. Graphics Function-backed LDS and compute
+		// workgroups with exactly one host invocation cannot have competing writers.
+		state.builder.AddFunction({OpAtomicStore, pointer, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, MemorySemanticsNone), data});
+	} else {
+		state.builder.AddFunction({OpStore, pointer, data});
+	}
+}
+
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    ctx.state.builder.AddFunction(
-		        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-		         data});
+		    StoreWordInBounds(ctx, access.resource, access.index, data);
 	    });
-}
-
-void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
-                       uint32_t data) {
-	ctx.state.builder.AddFunction(
-	    {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {

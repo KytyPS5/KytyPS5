@@ -259,6 +259,7 @@ enum : uint32_t {
 	OpControlBarrier               = 224,
 	OpMemoryBarrier                = 225,
 	OpAtomicLoad                   = 227,
+	OpAtomicStore                  = 228,
 	OpAtomicExchange               = 229,
 	OpAtomicCompareExchange        = 230,
 	OpAtomicIAdd                   = 234,

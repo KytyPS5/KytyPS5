@@ -10019,7 +10019,15 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
     if (inst.opcode == 61u && args.size() >= 3 && root(args[2]) == lds)
       accesses.push_back(index);
     if (inst.opcode == 62u && args.size() >= 2 && root(args[0]) == lds)
+      return false; // Concurrent guest DWORD writers must not become plain stores.
+    if (inst.opcode == 228u && args.size() >= 1 && root(args[0]) == lds) {
+      if (args.size() != 4) return false;
+      const auto scope = constants.find(args[1]);
+      const auto semantics = constants.find(args[2]);
+      if (scope == constants.end() || scope->second != 2u ||
+          semantics == constants.end() || semantics->second != 0u) return false;
       accesses.push_back(index);
+    }
     if (inst.opcode == 249u) {
       if (args.size() != 1 || !add_label_edge(index, args[0])) return false;
     } else if (inst.opcode == 250u) {
@@ -10035,7 +10043,7 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
     }
   }
   // Full initialization followed by the sparse body W/R/W/R.
-  const uint32_t expected_ops[] = {62u, 62u, 61u, 62u, 61u};
+  const uint32_t expected_ops[] = {228u, 228u, 61u, 228u, 61u};
   if (accesses.size() != std::size(expected_ops)) return false;
   for (size_t i = 0; i < accesses.size(); ++i)
     if (instructions[accesses[i]].opcode != expected_ops[i]) return false;
@@ -10166,6 +10174,109 @@ void TestSingleWaveLdsSpirvPhaseOrdering() {
   CheckSpirvBinaryValidates(missing_memory_order);
   Check(!SpirvLdsPhasesAreSynchronized(missing_memory_order, 128),
         "LDS ordering checker accepted barriers without WorkgroupMemory ordering");
+}
+
+void TestGraphicsFunctionLdsStoresRemainPrivate() {
+  // The same scalar/wide DS operations use invocation-private Function storage
+  // in graphics. Their four read results remain live through an actual export.
+  for (const auto stage : {ShaderType::Vertex, ShaderType::Pixel}) {
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 0, 128), // address = 0
+        EncodeVop1(0x01, 1, 129), EncodeVop1(0x01, 2, 130),
+        EncodeVop1(0x01, 3, 131), EncodeVop1(0x01, 4, 132),
+        EncodeDs0(0x0d, 0), EncodeDs1(0, 1, 0), // scalar store
+        EncodeDs0(0xde, 16), EncodeDs1(0, 2, 0), // three DWORDs
+        EncodeDs0(0x36, 0), EncodeDs1(6, 0, 0),
+        EncodeDs0(0xfe, 16), EncodeDs1(7, 0, 0),
+        EncodeExp0(stage == ShaderType::Vertex ? 0x0c : 0x00, 0xf),
+        EncodeExp1(6, 7, 8, 9), EncodeSopp(0x01),
+    };
+    const auto compiled = RecompileForTest(shader, MakeCompileOptions(stage));
+    CheckSpirvBinaryValidates(compiled.spirv);
+    Check(compiled.program.spirv_requirements.has_value() &&
+              compiled.program.spirv_requirements->function_lds,
+          "graphics DS fixture did not retain Function LDS");
+
+    std::unordered_set<uint32_t> word_types;
+    std::unordered_map<uint32_t, uint32_t> arrays, function_pointees, bases;
+    std::vector<std::pair<uint32_t, uint32_t>> variables;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words = compiled.spirv[offset] >> 16;
+      const auto op = compiled.spirv[offset] & 0xffffu;
+      const auto* args = compiled.spirv.data() + offset + 1;
+      if (op == 21u && words == 4 && args[1] == 32u && args[2] == 0u)
+        word_types.insert(args[0]);
+      if (op == 28u && words == 4) arrays[args[0]] = args[1];
+      if (op == 32u && words == 4 && args[1] == 7u)
+        function_pointees[args[0]] = args[2];
+      if (op == 59u && words >= 4 && args[2] == 7u)
+        variables.emplace_back(args[1], args[0]);
+      if ((op == 65u || op == 66u || op == 67u) && words >= 4)
+        bases[args[1]] = args[2];
+      if (op == 83u && words == 4) bases[args[1]] = args[2];
+      offset += words;
+    }
+    uint32_t lds = 0;
+    for (const auto& [variable, pointer] : variables) {
+      const auto pointee = function_pointees.find(pointer);
+      if (pointee == function_pointees.end()) continue;
+      const auto array = arrays.find(pointee->second);
+      if (array == arrays.end() || !word_types.contains(array->second)) continue;
+      Check(lds == 0, "graphics LDS fixture has ambiguous private word arrays");
+      lds = variable;
+    }
+    Check(lds != 0, "graphics LDS fixture omitted its private word array");
+    const auto root = [&](uint32_t pointer) {
+      std::unordered_set<uint32_t> seen;
+      while (bases.contains(pointer)) {
+        if (!seen.insert(pointer).second) return 0u;
+        pointer = bases.at(pointer);
+      }
+      return pointer;
+    };
+    uint32_t stores = 0, loads = 0;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words = compiled.spirv[offset] >> 16;
+      const auto op = compiled.spirv[offset] & 0xffffu;
+      const auto* args = compiled.spirv.data() + offset + 1;
+      if (op == 62u && words >= 3 && root(args[0]) == lds) ++stores;
+      if (op == 61u && words >= 4 && root(args[2]) == lds) ++loads;
+      if (op == 228u && words >= 2)
+        Check(root(args[0]) != lds,
+              "graphics Function LDS acquired an invalid atomic store");
+      offset += words;
+    }
+    Check(stores == 4u && loads == 4u,
+          "graphics scalar/wide LDS stores or live reads changed shape");
+  }
+}
+
+void TestSingletonLdsStoresDoNotNeedAtomics() {
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 128), EncodeVop1(0x01, 1, 129),
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 1, 0),
+      EncodeSopp(0x0a), // all invocations rendezvous before reading the word
+      EncodeDs0(0x36, 0), EncodeDs1(2, 0, 0),
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 2, 0), // keep the read live
+      EncodeSopp(0x01),
+  };
+  for (const uint32_t count : {1u, 2u}) {
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = count;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.lds_size_dwords = 2u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    const auto compiled = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    const auto metrics = MeasureSpirv(compiled.spirv);
+    Check(metrics.workgroup_variables == 1u && metrics.function_variables == 0u,
+          "singleton LDS fixture did not retain shared storage");
+    const auto atomic_stores = SpirvInstructionOpcodeCount(compiled.spirv, 228u);
+    Check(atomic_stores == (count == 1u ? 0u : 2u) &&
+              metrics.stores == (count == 1u ? 2u : 0u),
+          "LDS store atomicity did not follow the actual competing invocation count");
+  }
 }
 
 void TestComputeExecutionWaveScratchBudget() {
@@ -14490,6 +14601,8 @@ int main(int argc, char* argv[]) {
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();
+  TestGraphicsFunctionLdsStoresRemainPrivate();
+  TestSingletonLdsStoresDoNotNeedAtomics();
   TestMixedComparisonImagesUseSeparateSpirvVariables();
   TestComputeExecutionWaveScratchBudget();
   TestCooperativeWave64GeometryAndBudget();

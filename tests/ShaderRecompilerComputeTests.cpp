@@ -1678,6 +1678,10 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  void CheckValidation(const char* name) const {
+    Require(name, "GPU-assisted validation", m_validation_errors.load() == 0u,
+            "validation reported an error; see the GPUAV callback log");
+  }
   [[nodiscard]] const ShaderRecompiler::ShaderHostProfile &HostProfile() const {
     return m_shader_host_profile;
   }
@@ -13817,10 +13821,45 @@ private:
     vk::InstanceCreateInfo instance_info{};
     instance_info.sType = vk::StructureType::eInstanceCreateInfo;
     instance_info.pApplicationInfo = &app;
+    const char* gpuav_option = std::getenv("KYTY_TEST_GPU_ASSISTED_VALIDATION");
+    const bool gpuav = gpuav_option != nullptr && std::strcmp(gpuav_option, "1") == 0;
+    const char* validation_layer = "VK_LAYER_KHRONOS_validation";
+    const char* validation_extensions[] = {
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME};
+    const vk::ValidationFeatureEnableEXT gpuav_feature =
+        vk::ValidationFeatureEnableEXT::eGpuAssisted;
+    vk::ValidationFeaturesEXT validation_features{};
+    validation_features.enabledValidationFeatureCount = 1;
+    validation_features.pEnabledValidationFeatures = &gpuav_feature;
+    vk::DebugUtilsMessengerCreateInfoEXT debug_info{};
+    debug_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eError |
+                                 vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                                 vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo;
+    debug_info.messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                             vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+                             vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance;
+    debug_info.pfnUserCallback = ValidationMessage;
+    debug_info.pUserData = this;
+    if (gpuav) {
+      debug_info.pNext = &validation_features;
+      instance_info.pNext = &debug_info;
+      instance_info.enabledLayerCount = 1;
+      instance_info.ppEnabledLayerNames = &validation_layer;
+      instance_info.enabledExtensionCount = 2;
+      instance_info.ppEnabledExtensionNames = validation_extensions;
+    }
     RequireVk("VulkanHarness", "dispatch",
               vk::createInstance(&instance_info, nullptr, &m_instance),
               "vkCreateInstance");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_instance);
+    if (gpuav) {
+      debug_info.pNext = nullptr;
+      RequireVk("VulkanHarness", "GPU-assisted validation",
+                m_instance.createDebugUtilsMessengerEXT(&debug_info, nullptr,
+                                                         &m_validation_messenger),
+                "vkCreateDebugUtilsMessengerEXT");
+      std::puts("[GPUAV] enabled; validation errors fail the regression");
+    }
 
     u32 physical_count = 0;
     RequireVk("VulkanHarness", "dispatch",
@@ -14004,6 +14043,10 @@ private:
       m_device.destroy(nullptr);
     }
     if (m_instance != nullptr) {
+      CheckValidation("VulkanHarness teardown");
+      if (m_validation_messenger != nullptr) {
+        m_instance.destroyDebugUtilsMessengerEXT(m_validation_messenger, nullptr);
+      }
       m_instance.destroy(nullptr);
     }
   }
@@ -14277,6 +14320,21 @@ private:
     m_device.unmapMemory(buffer.memory);
   }
 
+  static VKAPI_ATTR VkBool32 VKAPI_CALL ValidationMessage(
+      vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
+      vk::DebugUtilsMessageTypeFlagsEXT, const vk::DebugUtilsMessengerCallbackDataEXT* data,
+      void* userdata) {
+    auto& harness = *static_cast<VulkanHarness*>(userdata);
+    if (severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError) {
+      harness.m_validation_errors.fetch_add(1u, std::memory_order_relaxed);
+    }
+    std::fprintf(stderr, "[GPUAV] %s\n", data != nullptr && data->pMessage != nullptr
+                                            ? data->pMessage : "empty validation message");
+    return VK_FALSE;
+  }
+
+  std::atomic<uint32_t> m_validation_errors{0};
+  vk::DebugUtilsMessengerEXT m_validation_messenger = nullptr;
   vk::Instance m_instance = nullptr;
   vk::PhysicalDevice m_physical_device = nullptr;
   bool m_depth_range_unrestricted_enabled = false;
@@ -14539,6 +14597,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
   CompareComputeReadback(test, actual);
+  vulkan->CheckValidation(test.name);
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
@@ -23781,6 +23840,103 @@ void AppendMultiWaveGuestBarrier(std::vector<u32>* code) {
   code->push_back(EncodeSopp(0x0a));
 }
 
+// Assembly-level LDS collisions have identical payloads. The final value is
+// independent of which active writer wins; no different-data winner is assumed.
+// GPUAV must additionally report no host Workgroup-memory data race.
+TestCase MakeLdsSameAddressCase(const char* name, u32 local_count,
+                               u32 width, bool sparse, bool looped) {
+  using O = ShaderOpcode;
+  auto test = MakeMultiWaveLdsCase(name, local_count, local_count, 7u);
+  const u32 total = 2u * local_count;
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  // Every LDS DWORD starts with a distinct, group-dependent value. This also
+  // checks that local IDs have not collapsed across native or guest waves.
+  AppendMultiWaveLdsStore(&code, 5u, 7u);
+  AppendMultiWaveGuestBarrier(&code);
+
+  AppendVMovU32(&code, 9u, 4u); // Common byte address; LDS[0] is the preceding guard.
+  code.push_back(EncodeVop1(0x01, 10u, 16u)); // Group ID from s16.
+  code.push_back(EncodeVop2(0x1a, 10u, InlineU32(16u), 10u));
+  AppendVMovLiteral(&code, 13u, 0x71000000u);
+  code.push_back(EncodeVop2(0x25, 10u, Vgpr(13u), 10u));
+  code.push_back(EncodeVop2(0x25, 11u, InlineU32(1u), 10u));
+  code.push_back(EncodeVop2(0x25, 12u, InlineU32(2u), 10u));
+  if (sparse) {
+    // Active logical lanes 1,31,33,63 in each wave, excluding lane zero.
+    // Both 32-lane halves and all guest waves still contain real writers.
+    AppendSMovLiteral(&code, 126u, 0x80000002u);
+    AppendSMovLiteral(&code, 127u, 0x80000002u);
+  }
+  if (looped) code.push_back(EncodeSMovB32(20u, InlineU32(0u)));
+  const size_t loop = code.size();
+  if (width == 3u) {
+    code.push_back(EncodeDs0(0xdeu)); // DS_WRITE_B96 v[10:12], v9.
+    code.push_back(EncodeDs1(0u, 10u, 9u));
+  } else {
+    AppendMultiWaveLdsStore(&code, 10u, 9u);
+  }
+  if (looped) {
+    // Same values in both iterations: inter-wave progress cannot change the
+    // oracle. There is no barrier inside the loop and no memory-fed condition.
+    code.push_back(EncodeSop2(0x00, 20u, 20u, InlineU32(1u)));
+    code.push_back(EncodeSopc(0x0a, 20u, InlineU32(2u)));
+    const size_t repeat = code.size();
+    code.push_back(EncodeSopp(0x05, static_cast<u32>(
+        static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  }
+  code.push_back(EncodeSop1(0x04, 126u, 193u)); // Restore EXEC before barrier/readback.
+  AppendMultiWaveGuestBarrier(&code);
+  AppendVMovU32(&code, 9u, 0u);
+  for (u32 word = 0; word < 5u; ++word) {
+    AppendMultiWaveLdsRead(&code, 13u, 9u, word * 4u);
+    AppendStoreVgprAtLaneDwordOffset(&code, 13u, 4u, 4u + total * word);
+  }
+  AppendMultiWaveLdsRead(&code, 13u, 7u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 13u, 4u, 4u + total * 5u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6u, 4u, 4u + total * 6u);
+  AppendEnd(&code);
+
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 original_base = 0x1000u + (group << 16u);
+    const u32 collision_base = 0x71000000u + (group << 16u);
+    const auto expected_word = [&](u32 word) {
+      return word >= 1u && word <= width ? collision_base + word - 1u
+                                       : original_base + word;
+    };
+    for (u32 local = 0; local < local_count; ++local) {
+      const u32 index = group * local_count + local;
+      for (u32 word = 0; word < 5u; ++word)
+        test.expected[4u + total * word + index] = expected_word(word);
+      test.expected[4u + total * 5u + index] = expected_word(local);
+      test.expected[4u + total * 6u + index] = local;
+    }
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::DS_READ_B32, O::S_BARRIER,
+                  O::S_WAITCNT, O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (width == 3u) test.opcodes.push_back(O::DS_WRITE_B96);
+  if (sparse) test.opcodes.push_back(O::S_MOV_B32);
+  if (looped) {
+    test.opcodes.push_back(O::S_ADD_U32);
+    test.opcodes.push_back(O::S_CMP_LT_U32);
+    test.opcodes.push_back(O::S_CBRANCH_SCC1);
+  }
+  return test;
+}
+
+TestCase LdsSameAddressB32Full128() {
+  return MakeLdsSameAddressCase("LdsSameAddressB32Full128", 128u, 1u, false, false);
+}
+TestCase LdsSameAddressB32Sparse256Loop() {
+  return MakeLdsSameAddressCase("LdsSameAddressB32Sparse256Loop", 256u, 1u, true, true);
+}
+TestCase LdsSameAddressB96Sparse128() {
+  return MakeLdsSameAddressCase("LdsSameAddressB96Sparse128", 128u, 3u, true, false);
+}
+TestCase LdsSameAddressB96Full256Loop() {
+  return MakeLdsSameAddressCase("LdsSameAddressB96Full256Loop", 256u, 3u, false, true);
+}
+
 TestCase MakeWave64MultiWaveLdsExchange(u32 local_count) {
   using O = ShaderOpcode;
   auto test = MakeMultiWaveLdsCase(local_count == 128u
@@ -28043,6 +28199,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(DsWave64SparseSourceAndDestination);
+  AddCase(LdsSameAddressB32Full128);
+  AddCase(LdsSameAddressB32Sparse256Loop);
+  AddCase(LdsSameAddressB96Sparse128);
+  AddCase(LdsSameAddressB96Full256Loop);
   AddCase(Wave64MultiWaveLdsExchange128);
   AddCase(Wave64MultiWaveLdsExchange256);
   AddCase(Wave64MultiWaveLdsAtomicReduction);
@@ -33057,6 +33217,14 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave64-cooperative-ssbo-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64CooperativeBufferProducerConsumer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lds-same-address-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, LdsSameAddressB32Full128());
+    RunCase(&vulkan, LdsSameAddressB32Sparse256Loop());
+    RunCase(&vulkan, LdsSameAddressB96Sparse128());
+    RunCase(&vulkan, LdsSameAddressB96Full256Loop());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-multiwave-lds-only") == 0) {

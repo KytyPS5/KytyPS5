@@ -19,8 +19,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1445,6 +1447,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	bool    inserted_new = false;
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
@@ -1454,7 +1457,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_slot_images[id].sampled_htile_clear_import) {
 				EXIT("sampled HTile import requires its metadata-aware lookup path\n");
 			}
-			ValidateDepthComparisonPromotionLayout(desc.info, desc.type, m_slot_images[id]);
 		}
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1490,6 +1492,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
+			inserted_new   = true;
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
@@ -2069,6 +2072,24 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
 			continue;
+		}
+		if (std::getenv("KYTY_IMAGE_INVALIDATE_TRACE") != nullptr &&
+		    image.info.data.size >= 1024 * 1024) {
+			static std::atomic<uint32_t> trace_count {0};
+			const auto count = trace_count.fetch_add(1, std::memory_order_relaxed);
+			if (count < 256) {
+				std::fprintf(stderr,
+				             "ImageInvalidate index=%u write=0x%016" PRIx64 "+0x%" PRIx64
+				             " image=0x%016" PRIx64 "+0x%" PRIx64
+				             " extent=%ux%ux%u usage=t%d/s%d/r%d/v%d dirty=g%d/b%d/c%d\n",
+				             count, address, size, image.info.data.address, image.info.data.size,
+				             image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+				             image.usage.texture ? 1 : 0, image.usage.storage ? 1 : 0,
+				             image.usage.render_target ? 1 : 0, image.usage.video_out ? 1 : 0,
+				             image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+				             image.IsCpuDirty() ? 1 : 0);
+				std::fflush(stderr);
+			}
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();

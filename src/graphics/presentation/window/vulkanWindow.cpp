@@ -279,6 +279,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("shaderBufferInt64Atomics is not supported\n");
 			skip_device = true;
 		}
+		if (required_features12.shaderSharedInt64Atomics == VK_TRUE &&
+		    features12.shaderSharedInt64Atomics != VK_TRUE) {
+			LOGF("shaderSharedInt64Atomics is not supported\n");
+			skip_device = true;
+		}
 		if (features13.robustImageAccess != VK_TRUE) {
 			LOGF("robustImageAccess is not supported\n");
 			skip_device = true;

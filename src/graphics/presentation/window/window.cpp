@@ -939,11 +939,16 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	const auto  video_out   = VideoOut::VideoOutGetDiagnostics();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps, video_out.cpu_submitted,
+	    video_out.gpu_submitted, video_out.prepared, video_out.ready, video_out.presented,
+	    video_out.last_presented_index, video_out.output_status_calls,
+	    video_out.last_output_resolution, video_out.output_support_calls,
+	    video_out.last_output_mode, video_out.last_output_support);
 
 	struct TitleUpdate {
 		SDL_Window*  window;

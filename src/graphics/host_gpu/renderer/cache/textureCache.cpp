@@ -1557,41 +1557,17 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::scoped_lock     lock {m_texture_cache.m_lock};
-	std::vector<ImageId> matches;
-	for (const auto id: m_texture_cache.FindImagesInRegion(vaddr, size, false)) {
-		auto owner = m_texture_cache.m_slot_images.try_get(id);
-		if (owner == nullptr || owner->info.data.address != vaddr) {
-			continue;
-		}
-		if (owner->depth_id) {
-			owner = m_texture_cache.m_slot_images.try_get(owner->depth_id);
-		}
-		if (owner != nullptr && m_texture_cache.SafeToDownload(*owner)) {
-			matches.push_back(id);
-		}
-	}
-
-	ImageId selected {};
-	if (matches.size() == 1) {
-		selected = matches.front();
-	} else {
-		for (const auto id: matches) {
-			const auto& image = m_texture_cache.m_slot_images[id];
-			if (image.info.data.size == size) {
-				selected = id;
-				break;
-			}
-		}
-	}
+	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
 	if (!selected) {
 		return false;
 	}
-	if (const auto owner = m_texture_cache.m_slot_images.try_get(selected); owner != nullptr && owner->depth_id) {
-		selected = owner->depth_id;
-	}
 
+	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
+	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
+	if (!m_texture_cache.SafeToDownload(image)) {
+		return false;
+	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
 		return false;
 	}

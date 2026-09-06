@@ -176,3 +176,30 @@ Required tests:
   diagnostic for unequal byte widths and multisample representations that cannot be copied.
 - Native Vulkan readback comparing manual and hardware comparison where both are available,
   followed by a Yotei run beyond the frame-93 specialization failure.
+
+## Acyclic buffer atomic returns in one split wave64
+
+Status: production fix and native game validation complete; automated regression deferred.
+
+Observed trigger: an acyclic compute shader with exactly one guest wave64 uses the old value
+returned by a predicated `BufferAtomicIAdd32` as the element index for several output stores.
+The native subgroup-32 backend keeps all 64 guest lanes in one host workgroup and emits the
+buffer atomic once per active lane, but the execution planner rejected every live buffer
+atomic result before SPIR-V emission.
+
+Required tests:
+
+- A planner case with one complete guest wave64 and an acyclic live buffer atomic result,
+  checking that native subgroup-32 splitting retains a single 64-invocation host workgroup.
+- SPIR-V and Vulkan readback cases where active lanes reserve unique output indices through
+  `BufferAtomicIAdd32` and use the returned old values for scalar and vector buffer stores.
+- Predicated and sparse-EXEC cases proving inactive lanes neither update the counter nor
+  write output, including bounds-failure fallback values from the existing atomic emitter.
+- Neighboring cases for the supported integer buffer atomic family, aliased counters,
+  multiple atomics in one straight-line shader, and atomic results consumed by wave
+  collectives without changing their lane ownership.
+- Rejection cases for a live atomic result controlling a divergent branch, cyclic atomic
+  feedback, LDS atomics, cooperative scheduling, and partitioned multiwave workgroups until
+  their separate ordering and publication contracts have executable coverage.
+- Native Windows audit and SPIR-V validation of the captured shader class, followed by a
+  bounded game run beyond the original shader-admission failure.

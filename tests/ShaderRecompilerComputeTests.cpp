@@ -19325,6 +19325,123 @@ TestCase BufferStoreFormatXyzwDropsPartialRecord() {
   return test;
 }
 
+TestCase BufferStoreFormatXyzwPacksUnorm10() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0x3f000000u);
+  AppendVMovLiteral(&code, 2, 0xbf800000u);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  AppendVMovU32(&code, 20, 4);
+  code.push_back(EncodeMubuf0(0x07u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwPacksUnorm10";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u};
+  test.expected = {0x11111111u, 0xc00803ffu};
+  test.storage_buffer_range_dwords = 2;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 8, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXPacksUnorm10Word() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXPacksUnorm10Word";
+  test.code = std::move(code);
+  test.initial = {0xffffffffu};
+  test.expected = {0x000003ffu};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyPacksSnorm16() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f000000u);
+  AppendVMovLiteral(&code, 1, 0xc0000000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x05u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyPacksSnorm16";
+  test.code = std::move(code);
+  test.initial = {0x11111111u};
+  test.expected = {0x80014000u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k16_16SNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXPacksHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXPacksHalf";
+  test.code = std::move(code);
+  test.initial = {0x11223344u};
+  test.expected = {0x11223c00u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k16Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzPacksFloat11() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0x3f000000u);
+  AppendVMovLiteral(&code, 2, 0x40000000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x06u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzPacksFloat11";
+  test.code = std::move(code);
+  test.initial = {0x11111111u};
+  test.expected = {0x801c03c0u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k11_11_10Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZ, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadFormatXChecksOnlyTransferredComponent() {
   using O = ShaderOpcode;
 
@@ -23893,6 +24010,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
+  AddCase(BufferStoreFormatXyzwPacksUnorm10);
+  AddCase(BufferStoreFormatXPacksUnorm10Word);
+  AddCase(BufferStoreFormatXyPacksSnorm16);
+  AddCase(BufferStoreFormatXPacksHalf);
+  AddCase(BufferStoreFormatXyzPacksFloat11);
   AddCase(BufferLoadFormatXChecksOnlyTransferredComponent);
   AddCase(BufferStoreFormatXChecksOnlyTransferredComponent);
   AddCase(BufferLoadFormatXyChecksOnlyTransferredComponents);

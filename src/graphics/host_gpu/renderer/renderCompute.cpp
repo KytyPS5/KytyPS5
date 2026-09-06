@@ -130,6 +130,62 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                      ShaderBufferResource& resolved_descriptor,
+                                      uint32_t& resolved_clear, uint64_t& resolved_size) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = input.stage.resources;
+	const auto& user_data = resources.user_data;
+	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() ||
+	    program.info.uses_dma || input.dispatch_thread_dimensions || mode != 0x41u ||
+	    user_data.size() != 10 || program.user_data_base != 0) {
+		return false;
+	}
+	const auto& resource   = program.info.buffers.front();
+	const auto& raw        = resources.buffers.front();
+	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	if (!resource.written || resource.read || resource.atomic || resource.scalar ||
+	    resource.max_byte_extent != 4 ||
+	    (resource.formatted && descriptor.Format() != Prospero::BufferFormat::k32UInt) ||
+	    (descriptor.Stride() != 4 && descriptor.Stride() != 0) || descriptor.SwizzleEnabled() ||
+	    descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
+	    descriptor.Base48() == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != user_data[i]) {
+			return false;
+		}
+	}
+	const uint32_t clear  = user_data[4];
+	const uint32_t period = user_data[9];
+	const uint32_t slots  = period == 0u ? 4u : std::min(period, 4u);
+	for (uint32_t slot = 1; slot < slots; slot++) {
+		if (user_data[4 + slot] != clear) {
+			return false;
+		}
+	}
+	if (input.threads_num[0] != 64 || input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    group_x == 0 || group_y != 1 || group_z != 1 || !input.group_id[0] || input.group_id[1] ||
+	    input.group_id[2] || input.thread_ids_num != 1 || input.wave_size != 64 ||
+	    input.tg_size_en) {
+		return false;
+	}
+	const uint64_t count = user_data[8];
+	const auto     size  = BufferDescriptorSize(descriptor);
+	if (count == 0 || size == 0 || size > UINT32_MAX || count * sizeof(uint32_t) != size ||
+	    group_x != (count + input.threads_num[0] - 1) / input.threads_num[0]) {
+		return false;
+	}
+	resolved_descriptor = descriptor;
+	resolved_clear      = clear;
+	resolved_size       = size;
+	return true;
+}
+
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                 CommandBuffer& command, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z, uint32_t mode) {
@@ -185,7 +241,9 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
 	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
-	                              size)) {
+	                              size) &&
+	    !ResolveComputePatternFill(input, group_x, group_y, group_z, mode, descriptor,
+	                               packed_clear, size)) {
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {

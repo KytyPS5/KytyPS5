@@ -1351,7 +1351,8 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		}
 		DispatchIndirectArgs args {};
 		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
-		cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
+		cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode,
+		                  args_addr);
 
 		return 3;
 	}

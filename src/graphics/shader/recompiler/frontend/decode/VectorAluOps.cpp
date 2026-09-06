@@ -91,6 +91,10 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::V_NOP},
     {0x01u, Opcode::V_MOV_B32},
     {0x02u, Opcode::V_READFIRSTLANE_B32},
+    {0x04u, Opcode::V_CVT_F64_I32},
+    {0x16u, Opcode::V_CVT_F64_U32},
+    {0x0fu, Opcode::V_CVT_F32_F64},
+    {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
     {0x07u, Opcode::V_CVT_U32_F32},
@@ -149,6 +153,8 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::V_NOP},
     {0x01u, Opcode::V_MOV_B32},
     {0x02u, Opcode::V_READFIRSTLANE_B32},
+    {0x04u, Opcode::V_CVT_F64_I32},
+    {0x16u, Opcode::V_CVT_F64_U32},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
     {0x07u, Opcode::V_CVT_U32_F32},
@@ -266,6 +272,8 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x146u, Opcode::V_CUBETC_F32},
     {0x147u, Opcode::V_CUBEMA_F32},
     {0x14bu, Opcode::V_FMA_F32},
+    {0x14cu, Opcode::V_FMA_F64},
+    {0x165u, Opcode::V_MUL_F64},
     {0x148u, Opcode::V_BFE_U32},
     {0x149u, Opcode::V_BFE_I32},
     {0x14au, Opcode::V_BFI_B32},
@@ -770,6 +778,21 @@ bool TryDecodeVop1Modifier(uint32_t pc, std::span<const uint32_t> code, uint32_t
                            uint32_t src0, uint32_t opcode, uint32_t vdst, Instruction& inst) {
 	for (const auto& decoder: VOP1_MODIFIER_DECODERS) {
 		if (decoder.escape == src0) {
+			// These conversions produce two destination words. The existing VOP1
+			// modifier path only implements a single-word destination update.
+			if (inst.opcode == Opcode::V_CVT_F64_I32 ||
+			    inst.opcode == Opcode::V_CVT_F64_U32) {
+				SetRawWords(inst, code, word_index, 2);
+				SetUnsupported(inst, Family::VOP1, opcode,
+				               "FP64 integer conversion DPP/DPP8/SDWA is not supported");
+				return true;
+			}
+			if (inst.opcode == Opcode::V_CVT_F32_F64 || inst.opcode == Opcode::V_RCP_F64) {
+				SetRawWords(inst, code, word_index, 2);
+				SetUnsupported(inst, Family::VOP1, opcode,
+				               "FP64 arithmetic DPP/DPP8/SDWA is not supported");
+				return true;
+			}
 			decoder.decode(pc, code, word_index, opcode, vdst, inst);
 			return true;
 		}
@@ -1330,6 +1353,7 @@ void DecodeVopcDpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word
 
 uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_MUL_F64:
 		case Opcode::V_MUL_LO_U32:
 		case Opcode::V_MUL_HI_U32:
 		case Opcode::V_MUL_LO_I32:
@@ -1480,6 +1504,8 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAC_F32:
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
+		case Opcode::V_MUL_F64:
+		case Opcode::V_FMA_F64:
 		case Opcode::V_PACK_B32_F16:
 		case Opcode::V_CUBEID_F32:
 		case Opcode::V_CUBESC_F32:
@@ -1551,6 +1577,11 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return clamp != 0u || omod != 0u || neg != 0u;
 	}
 	switch (opcode) {
+		case Opcode::V_MUL_F64:
+			return (abs & ~0x3u) != 0u || (neg & ~0x3u) != 0u ||
+			       op_sel != 0u || clamp != 0u || omod != 0u;
+		case Opcode::V_FMA_F64:
+			return op_sel != 0u || clamp != 0u || omod != 0u;
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
 		case Opcode::V_CNDMASK_B32:
 			return (abs & ~0x3u) != 0u || op_sel != 0u || clamp != 0u || omod != 0u ||

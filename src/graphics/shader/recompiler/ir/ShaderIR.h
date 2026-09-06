@@ -562,6 +562,10 @@ struct Program: ResourcePlan {
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
+	// Set from decoded instructions before MODE writes become control NOPs.
+	bool                          fp_mode_inspected = false;
+	bool                          writes_fp_mode = false;
+	uint32_t                      first_fp_mode_write_pc = UINT32_MAX;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;

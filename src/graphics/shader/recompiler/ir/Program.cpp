@@ -663,6 +663,7 @@ std::string ProgramToString(const Program& program) {
 			case Type::U64: return fmt::format("0x{:016x}", value.U64());
 			case Type::F16: return fmt::format("f16(0x{:04x})", value.F16Bits());
 			case Type::F32: return fmt::format("{}f", value.F32Value());
+			case Type::F64: return fmt::format("f64(0x{:016x})", value.F64Bits());
 			default: return fmt::format("<{}>", TypeName(value.GetType()));
 		}
 	};

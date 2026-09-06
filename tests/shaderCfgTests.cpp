@@ -11,6 +11,8 @@
 #include "graphics/shader/recompiler/ComputeWorkgroup.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ShaderHostProfile.h"
+#include "graphics/shader/recompiler/ir/passes/F64Certificate.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -55,6 +57,8 @@
 #endif
 
 namespace Libs::Graphics {
+bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
+                               const std::vector<uint32_t>& spirv);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -1028,6 +1032,88 @@ void EnsureConfigInitialized() {
     ShaderInit();
     config_initialized = true;
   }
+}
+
+// Standalone validator contract; no Vulkan device, optimizer, or shader execution.
+// New numeric values are from the primary SPV_KHR_fma specification, revision 2:
+// https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_fma.html
+// Keep these test constants independent of headers so OLD pinned tools can build
+// the regression and reject the otherwise valid extension module at runtime.
+std::vector<uint32_t> MakeFmaKhrValidatorModule(bool use_fma,
+                                              bool wrong_operand_type = false,
+                                              bool declare_fma = true) {
+  std::vector<uint32_t> words{
+      0x07230203u, 0x00010600u, 0u, 12u, 0u};
+  const auto emit = [&](uint32_t opcode,
+                        std::initializer_list<uint32_t> operands) {
+    words.push_back((static_cast<uint32_t>(operands.size() + 1u) << 16u) |
+                    opcode);
+    words.insert(words.end(), operands.begin(), operands.end());
+  };
+  emit(17u, {1u});  // OpCapability Shader
+  emit(17u, {10u}); // OpCapability Float64
+  if (use_fma && declare_fma) {
+    emit(17u, {6030u}); // OpCapability FMAKHR (SPV_KHR_fma)
+    emit(10u, {0x5f565053u, 0x5f52484bu, 0x00616d66u});
+    // OpExtension "SPV_KHR_fma"
+  }
+  emit(14u, {0u, 1u});                      // Logical GLSL450
+  emit(15u, {5u, 7u, 0x6e69616du, 0u});    // GLCompute %7 "main"
+  emit(16u, {7u, 17u, 1u, 1u, 1u});        // LocalSize 1 1 1
+  emit(19u, {1u});                         // %1 = OpTypeVoid
+  emit(33u, {2u, 1u});                     // %2 = OpTypeFunction %1
+  emit(22u, {3u, 64u});                    // %3 = OpTypeFloat 64
+  emit(43u, {3u, 4u, 0u, 0x3ff00000u});   // %4 = double(1)
+  emit(43u, {3u, 5u, 0u, 0x40000000u});   // %5 = double(2)
+  emit(43u, {3u, 6u, 0u, 0xbff00000u});   // %6 = double(-1)
+  emit(22u, {10u, 32u});                   // %10 = OpTypeFloat 32
+  emit(43u, {10u, 11u, 0x3f800000u});      // %11 = float(1)
+  emit(54u, {1u, 7u, 0u, 2u});            // %7 = OpFunction
+  emit(248u, {9u});                        // %9 = OpLabel
+  if (use_fma) {
+    emit(4427u, {3u, 8u, 4u, 5u, wrong_operand_type ? 11u : 6u});
+    // %8 = OpFmaKHR %double %one %two %minus_one (six words)
+  } else {
+    emit(129u, {3u, 8u, 4u, 5u});          // %8 = OpFAdd %double %one %two
+  }
+  emit(253u, {});                          // OpReturn
+  emit(56u, {});                           // OpFunctionEnd
+  return words;
+}
+
+void TestFmaKhrPipelineValidator() {
+  // Exercise the production helper's enabled path, not its configuration bypass.
+  Check(Config::ShaderValidationEnabled(),
+        "FMA validator regression requires shader validation enabled");
+  Check(ValidateShaderSpirvForTest("FMA baseline", 0u,
+                                 MakeFmaKhrValidatorModule(false)),
+        "ordinary scalar Float64 baseline failed before the FMA extension test");
+  std::puts("KYTY_FMA_VALIDATOR_BASELINE_PASS");
+  std::fflush(stdout);
+  Check(ValidateShaderSpirvForTest("FMAKHR valid Float64", 0u,
+                                 MakeFmaKhrValidatorModule(true)),
+        "valid scalar Float64 OpFmaKHR module was rejected by pipeline validation");
+  Check(!ValidateShaderSpirvForTest("FMAKHR wrong operand", 0u,
+                                  MakeFmaKhrValidatorModule(true, true)),
+        "OpFmaKHR accepted a Float32 operand in a Float64 operation");
+  Check(!ValidateShaderSpirvForTest("FMAKHR missing declaration", 0u,
+                                  MakeFmaKhrValidatorModule(true, false, false)),
+        "OpFmaKHR accepted missing FMAKHR capability and extension");
+  std::puts("KYTY_FMA_VALIDATOR_PASS");
+  std::fflush(stdout);
+}
+
+int RunFmaKhrPipelineValidator() {
+  Common::InitializeThreads();
+  Common::Subsystems subsystems;
+  subsystems.Initialize<Config::Lifecycle>();
+  Config::ConfigOptions options;
+  options.shader_validation_enabled = true;
+  options.printf_direction = Config::OutputDirection::Console;
+  Config::Load(options);
+  subsystems.Initialize<Log::Lifecycle>();
+  TestFmaKhrPipelineValidator();
+  return 0;
 }
 
 void TestResourceDescriptorClassification() {
@@ -4378,6 +4464,49 @@ void TestNewShaderDecoderArchitecture() {
             packed_fmac.src0.negate && packed_fmac.src0.negate_hi &&
             packed_fmac.src1.negate && packed_fmac.src1.negate_hi,
         "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
+}
+
+// Insert beside TestNewShaderRecompilerRejectsDppOn64BitCompares and call
+// TestNewShaderRecompilerRejectsF64IntegerConversionModifiers from the same runner.
+void TestNewShaderRecompilerRejectsF64IntegerConversionModifiers() {
+  using namespace ShaderRecompiler;
+  // The first supported conversion profile has an unmodified two-word result.
+  // Reject even full-width modifier escapes rather than applying a single-word
+  // DPP destination update to only one half of the binary64 value.
+  struct Modifier {
+    uint32_t escape;
+    uint32_t word;
+  };
+  const Modifier modifiers[] = {
+      {250u, EncodeVop1Dpp(7u)},
+      {250u, EncodeVop1Dpp(7u, 0x101u, 1u, 3u)},
+      {233u, 0xfac68807u}, // DPP8 FI=0, identity selectors.
+      {234u, 0xfac68807u}, // DPP8 FI=1.
+      {249u, EncodeVop1Sdwa(7u)}, // Full-width SDWA remains outside this profile.
+      {249u, EncodeVop1Sdwa(7u, 4u, 2u, 4u)},
+      {249u, EncodeVop1Sdwa(7u, 6u, 0u, 6u, 1u)},
+  };
+  for (const uint32_t opcode : {0x04u, 0x16u}) {
+    for (const auto &modifier : modifiers) {
+      const uint32_t shader[] = {
+          EncodeVop1(opcode, 3u, modifier.escape), modifier.word,
+          EncodeSopp(0x01),
+      };
+      Decoder::Program program;
+      Decoder::DecodeProgram(shader, program);
+      Check(program.instructions.size() == 2u,
+            "FP64 conversion modifier did not consume its second word");
+      const auto &inst = program.instructions.front();
+      Check(inst.opcode == Decoder::Opcode::UNSUPPORTED &&
+                inst.opcode_id == opcode && inst.word_count == 2u &&
+                inst.raw_count == 2u,
+            "FP64 conversion illegally accepted a modifier escape");
+      Check(Common::ContainsStr(
+                inst.unsupported_reason,
+                "FP64 integer conversion DPP/DPP8/SDWA is not supported"),
+            "FP64 conversion modifier rejection was not explicit");
+    }
+  }
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
@@ -8705,6 +8834,342 @@ ShaderRecompiler::IR::Block* AddExecutionPlanBlock(ShaderRecompiler::IR::Program
   return block;
 }
 
+// TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
+// include the certificate header plus ShaderHostProfile.h. Register the five
+// TestF64Certificate* functions below. No compilation, Vulkan or game data.
+struct F64CertificateFixture {
+  using Value = ShaderRecompiler::IR::Value;
+  using Op = ShaderRecompiler::IR::ValueOpcode;
+  ShaderRecompiler::IR::Program program;
+  ShaderRecompiler::IR::Block* block;
+  ShaderFloatingPointState initial{true, 0xc0, false, true};
+  ShaderRecompiler::ShaderHostProfile host{true, true, true, true, true, true};
+
+  F64CertificateFixture() {
+    program.stage = ShaderType::Compute;
+    program.wave_size = 32;
+    program.user_data_count = 2;
+    program.fp_mode_inspected = true;
+    block = AddExecutionPlanBlock(program);
+  }
+  Value Emit(Op opcode, std::initializer_list<Value> args = {}) {
+    return Value(&block->AppendNewInst(opcode, args));
+  }
+  Value UnknownU32(uint32_t reg = 0) {
+    return Emit(Op::GetUserData, {Value(static_cast<ShaderRecompiler::IR::ScalarReg>(reg))});
+  }
+  Value Predicate(uint32_t reg = 0) {
+    return Emit(Op::INotEqual32, {UnknownU32(reg), Value(0u)});
+  }
+  Value Convert(Value input) { return Emit(Op::ConvertF64U32, {input}); }
+  Value Word(Value pair, uint32_t index) {
+    return Emit(Op::CompositeExtractF64, {pair, Value(index)});
+  }
+  Value Pack(Value low, Value high) {
+    return Emit(Op::CompositeConstructF64, {low, high});
+  }
+  Value SelectPair(Value predicate, Value yes, Value no) {
+    const auto low = Emit(Op::SelectU32, {predicate, Word(yes, 0), Word(no, 0)});
+    const auto high = Emit(Op::SelectU32, {predicate, Word(yes, 1), Word(no, 1)});
+    return Pack(low, high);
+  }
+  Value MultiplyByOne(Value input) {
+    return Emit(Op::FPMul64, {input, Value::F64(0x3ff0000000000000ull)});
+  }
+  void Keep64(Value value) {
+    Emit(Op::ReferenceU32, {Word(value, 0)});
+    Emit(Op::ReferenceU32, {Word(value, 1)});
+  }
+  void Keep32(Value value) {
+    Emit(Op::ReferenceU32, {Emit(Op::BitCastU32F32, {value})});
+  }
+  auto Analyze() const {
+    return ShaderRecompiler::IR::AnalyzeF64Program(program, initial, host);
+  }
+};
+
+void TestF64CertificateConstantsAndNativeRequirements() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  {
+    F f;
+    // Exact integer conversion is implemented with integer words, including
+    // INT/U32 boundaries; it must not acquire native FP or mode requirements.
+    f.initial = {};
+    f.host = {};
+    f.program.fp_mode_inspected = false;
+    f.Keep64(f.Convert(f.UnknownU32()));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && !result.needs_native64 && !result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "exact integer-to-F64 conversion unexpectedly requires native FP state");
+  }
+  {
+    F f;
+    const auto normal = f.Emit(O::FPNeg64, {f.Emit(O::FPAbs64,
+        {V::F64(0xc000000000000000ull)})}); // -abs(-2)
+    f.Keep64(f.MultiplyByOne(normal));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "normal constant/sign operations failed the F64 certificate");
+    f.host.fma_float64 = false;
+    Check(!f.Analyze().error.empty(),
+          "correctly rounded F64 multiplication ignored its native FMA requirement");
+  }
+  for (const uint64_t bits : {0x0000000000000001ull, 0x8000000000000001ull}) {
+    F f;
+    f.Keep64(f.MultiplyByOne(V::F64(bits)));
+    Check(!f.Analyze().error.empty(), "F64 certificate accepted a subnormal input");
+  }
+  {
+    F f;
+    f.Keep64(f.Emit(O::FPMul64, {V::F64(0x0010000000000000ull),
+                               V::F64(0x3fe0000000000000ull)}));
+    Check(!f.Analyze().error.empty(),
+          "normal F64 operands hid a subnormal multiplication result");
+  }
+  {
+    F f;
+    f.Keep64(f.Emit(O::FPFma64, {V::F64(0x4048800000000000ull),
+        V::F64(0x3f94e5e0a72f0539ull), V::F64(0xbff0000000000000ull)}));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "finite fused residual did not receive FMA64 requirements");
+    f.host.fma_float64 = false;
+    Check(!f.Analyze().error.empty(), "F64 FMA accepted a host without FMA64");
+  }
+  {
+    F f;
+    f.Keep32(f.Emit(O::ConvertF32F64, {V::F64(0x3ff0000010000000ull)}));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && !result.needs_fma64 &&
+              result.needs_narrow_f32,
+          "normal RTE narrowing did not record its native F32 requirement");
+    f.host.rte_float32 = false;
+    Check(!f.Analyze().error.empty(), "F64 narrowing ignored missing host F32 RTE");
+  }
+  {
+    F f;
+    f.Keep32(f.Emit(O::ConvertF32F64, {V::F64(0x3800000000000000ull)})); // 2^-127
+    Check(!f.Analyze().error.empty(),
+          "normal F64 input hid a subnormal F32 conversion result");
+  }
+}
+
+void TestF64CertificatePairProvenance() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    f.Keep64(f.MultiplyByOne(f.Pack(f.Word(a, 0), f.Word(a, 1))));
+    Check(f.Analyze().error.empty(), "matching F64 extract pair lost its typed producer");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u)); // words {0x10000000, 0x41700000}
+    const auto zero = f.Convert(V(0u));
+    // Each whole parent is zero/normal, but this crossed pair is subnormal.
+    f.Keep64(f.MultiplyByOne(f.Pack(f.Word(a, 0), f.Word(zero, 1))));
+    Check(!f.Analyze().error.empty(), "crossed F64 producers invented a safe complete pair");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    const auto b = f.Convert(V(3u));
+    f.Keep64(f.MultiplyByOne(f.SelectPair(f.Predicate(), a, b)));
+    Check(f.Analyze().error.empty(), "matching EXEC selects of normal F64 values were rejected");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    f.Keep64(f.MultiplyByOne(f.SelectPair(f.Predicate(), a, V::F64(1u))));
+    Check(!f.Analyze().error.empty(), "EXEC false arm discarded a retained subnormal pair");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    const auto low = f.Emit(O::SelectU32, {f.Predicate(0), f.Word(a, 0), V(0u)});
+    const auto high = f.Emit(O::SelectU32, {f.Predicate(1), f.Word(a, 1), V(0u)});
+    f.Keep64(f.MultiplyByOne(f.Pack(low, high)));
+    Check(!f.Analyze().error.empty(), "unrelated EXEC predicates were treated as one pair update");
+  }
+  {
+    F f;
+    const auto lane = f.Emit(O::LaneId);
+    const auto bit = f.Emit(O::BitwiseAnd32, {lane, V(31u)});
+    const auto shifted = f.Emit(O::ShiftRightLogical32, {V(0xffffffffu), bit});
+    const auto selected = f.Emit(O::BitwiseAnd32, {shifted, V(1u)});
+    const auto full_exec = f.Emit(O::INotEqual32, {selected, V(0u)});
+    const auto a = f.Convert(V(0x01000001u));
+    f.Keep64(f.MultiplyByOne(f.SelectPair(full_exec, a, V::F64(1u))));
+    Check(f.Analyze().error.empty(),
+          "full EXEC masked-shift proof failed to exclude the unreachable old pair");
+  }
+  for (const bool proven : {true, false}) {
+    F f;
+    const auto lane = f.Emit(O::LaneId);
+    const auto bit = f.Emit(O::BitwiseAnd32, {lane, V(31u)});
+    const auto shifted = f.Emit(O::ShiftRightLogical32, {V(0xffffffffu), bit});
+    const auto selected = f.Emit(O::BitwiseAnd32, {shifted, V(1u)});
+    const auto predicate = proven ? f.Emit(O::INotEqual32, {selected, V(0u)}) : f.Predicate();
+    // The folded low word and surviving high-word Select form a complete
+    // normal value only when the predicate is proved true. The old high word
+    // instead produces the nonzero subnormal 0x0000000010000000.
+    const auto high = f.Emit(O::SelectU32, {predicate, V(0x41700000u), V(0u)});
+    f.Keep64(f.MultiplyByOne(f.Pack(V(0x10000000u), high)));
+    Check(f.Analyze().error.empty() == proven,
+          "mixed constant/Select pair did not preserve its exact reachable arms");
+  }
+}
+
+void TestF64CertificateModeAndHostBoundaries() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  for (uint32_t boundary = 0; boundary < 6u; ++boundary) {
+    F f;
+    f.Keep64(f.MultiplyByOne(V::F64(0x4000000000000000ull)));
+    Check(f.Analyze().error.empty(), "F64 boundary fixture baseline is not certified");
+    switch (boundary) {
+      case 0: f.initial = {}; break;
+      case 1: f.program.fp_mode_inspected = false; break;
+      case 2:
+        f.program.writes_fp_mode = true;
+        f.program.first_fp_mode_write_pc = 0x40u;
+        break;
+      case 3: f.host.known = false; break;
+      case 4: f.host.float64 = false; break;
+      case 5: f.initial.float_mode = 0xc4u; break; // distinct FP64 rounding mode
+    }
+    Check(!f.Analyze().error.empty(), "F64 certificate ignored a mode/host boundary");
+  }
+}
+
+void TestF64CertificateReciprocalNonzeroProof() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  {
+    F f;
+    const auto odd = f.Emit(O::BitwiseOr32, {f.UnknownU32(), V(1u)});
+    f.Keep64(f.Emit(O::FPRecip64, {f.Convert(odd)}));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "odd U32 conversion did not prove a nonzero integer reciprocal domain");
+    f.host.fma_float64 = false;
+    Check(!f.Analyze().error.empty(),
+          "F64 reciprocal correction ignored its native FMA requirement");
+  }
+  {
+    F f;
+    f.Keep64(f.Emit(O::FPRecip64, {f.Convert(f.UnknownU32())}));
+    Check(!f.Analyze().error.empty(), "possible zero integer entered the bounded reciprocal path");
+  }
+  for (const uint32_t addend : {63u, 64u}) {
+    F f;
+    const auto multiple = f.Emit(O::IMul32, {f.UnknownU32(), V(64u)});
+    const auto denominator = f.Emit(O::IAdd32, {multiple, V(addend)});
+    f.Keep64(f.Emit(O::FPRecip64, {f.Convert(denominator)}));
+    // uint32 wrapping preserves low six ones for +63, while +64 can be zero
+    // (for example input 0x03ffffff). Neither requires bounds on the input.
+    Check(f.Analyze().error.empty() == (addend == 63u),
+          "wrapped multiply/add reciprocal proof lost the actual nonzero boundary");
+  }
+}
+
+
+void TestF64CertificatePhiPredecessorProvenance() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  using namespace ShaderRecompiler;
+  for (const bool crossed : {false, true}) {
+    F f;
+    auto* entry = f.block;
+    auto* left = AddExecutionPlanBlock(f.program);
+    auto* right = AddExecutionPlanBlock(f.program);
+    auto* merge = AddExecutionPlanBlock(f.program);
+    entry->AddBranch(left);
+    entry->AddBranch(right);
+    f.program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    f.program.block_info[0].terminator.true_block = 1;
+    f.program.block_info[0].terminator.false_block = 2;
+    f.program.block_info[0].condition = f.Predicate();
+    // Both definitions dominate all Phi edges. Crossing their halves is
+    // therefore valid SSA, but changes the actual numeric value on each edge.
+    const auto a = f.Convert(V(0x01000001u));
+    const auto zero = f.Convert(V(0u));
+    const auto alo = f.Word(a, 0), ahi = f.Word(a, 1);
+    const auto zlo = f.Word(zero, 0), zhi = f.Word(zero, 1);
+    left->AddBranch(merge);
+    right->AddBranch(merge);
+    for (const uint32_t index : {1u, 2u}) {
+      f.program.block_info[index].terminator.kind = CFG::TerminatorKind::Branch;
+      f.program.block_info[index].terminator.true_block = 3;
+    }
+    f.block = merge;
+    auto& low = merge->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+    auto& high = merge->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+    low.AddPhiOperand(left, alo);
+    low.AddPhiOperand(right, zlo);
+    // Reversed vector order is deliberate: match the predecessor identity,
+    // not its position. The negative changes the edge values, not the order.
+    high.AddPhiOperand(right, crossed ? ahi : zhi);
+    high.AddPhiOperand(left, crossed ? zhi : ahi);
+    f.Keep64(f.MultiplyByOne(f.Pack(V(&low), V(&high))));
+    const auto result = f.Analyze();
+    Check(result.error.empty() != crossed,
+          "F64 paired Phi proof ignored predecessor identity or crossed halves");
+  }
+}
+
+// Insert beside the TestF64Certificate* functions in shaderCfgTests.cpp.
+// Uses existing RecompileForTest/CheckSpirvBinaryValidates helpers; no GPU.
+void TestUnusedNativeF64EmissionHasCompleteRequirements() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {EncodeSopp(0x01)}; // S_ENDPGM
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 32u;
+  compute.threads_num[1] = 1u;
+  compute.threads_num[2] = 1u;
+  compute.wave_size = 32u;
+  compute.initial_fp_state = {true, 0xc0, false, true};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 32u;
+  options.input_info.compute = &compute;
+  options.host_profile = {true, true, true, true, true, true};
+  auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto baseline = DisassembleSpirvBinary(result.spirv);
+  Check(!Common::ContainsStr(baseline, "OpCapability Float64") &&
+            !Common::ContainsStr(baseline, "OpTypeFloat 64"),
+        "unused native F64 fixture baseline already needs Float64");
+
+  // Add a legal SSA instruction after planning/DCE, exactly as other direct
+  // emitter tests do. It has no users; admission and emission must agree on
+  // whether it is retained. Either omission or complete declarations are legal.
+  auto& unused = result.program.blocks.front()->AppendNewInst(
+      IR::ValueOpcode::FPMul64,
+      {IR::Value::F64(0x4000000000000000ull),
+       IR::Value::F64(0x4008000000000000ull)}); // 2 * 3
+  Check(!unused.HasUses(), "unused native F64 fixture gained an accidental reader");
+  Spirv::AnalyzeProgramRequirements(result.program);
+  std::puts("KYTY_UNUSED_F64_EMISSION_READY");
+  std::fflush(stdout);
+  const auto emitted = Spirv::EmitProgram(result.program, options.input_info,
+                                          options.compute_workgroup_limits,
+                                          options.host_profile);
+  // Original certificate skipped this instruction while the backend emitted
+  // its native Float64/FmaKHR operations, yielding an invalid SPIR-V module.
+  CheckSpirvBinaryValidates(emitted);
+  std::puts("KYTY_UNUSED_F64_EMISSION_PASS");
+}
+
 void TestComputeExecutionPlanningBoundaries() {
   using namespace ShaderRecompiler;
   IR::Program program;
@@ -12552,6 +13017,75 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CompilePixelRuntime(vcc_params, vcc_input);
 }
 
+// Initial guest FP state must survive the public register-to-static-info path.
+// No compiler execution or new production field is needed for the baseline RED.
+void TestComputeFpModeStaticIdentity() {
+  static const uint32_t shader[] = {EncodeSopp(0x01)}; // s_endpgm
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.cs_regs.num_thread_x = 32;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 32;
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+
+  constexpr uint8_t baseline_mode = 0xc0u;
+  regs.cs_regs.float_mode = baseline_mode;
+  ShaderComputeInputInfo input_info{};
+  const auto baseline_params = PrepareProgram(regs, sh, input_info);
+  const auto baseline_key = MakeStageStaticKey(input_info);
+  Check(baseline_params.code.data() == shader &&
+            baseline_params.code.size_bytes() == sizeof(shader) &&
+            !baseline_key.empty(),
+        "FP mode fixture did not prepare the registered compute shader");
+  const auto repeated_params = PrepareProgram(regs, sh, input_info);
+  Check(repeated_params.hash == baseline_params.hash &&
+            MakeStageStaticKey(input_info) == baseline_key,
+        "unchanged compute registers produced unstable shader identity");
+  std::puts("KYTY_COMPUTE_FP_MODE_KEY_BASELINE_PASS");
+  std::fflush(stdout);
+
+  // FLOAT_MODE contains four independent two-bit round/denormal fields.
+  // Flip each bit independently, retaining the exact same code and all other
+  // registers, so omitting either precision's state cannot satisfy this test.
+  // IEEE_MODE and DX10_CLAMP are distinct initial FP controls as well.
+  for (uint32_t variant = 0; variant < 10u; ++variant) {
+    regs.cs_regs.float_mode = variant < 8u
+        ? static_cast<uint8_t>(baseline_mode ^ (1u << variant))
+        : baseline_mode;
+    regs.cs_regs.ieee_mode = variant == 8u;
+    regs.cs_regs.dx10_clamp = variant == 9u;
+    const auto changed_params = PrepareProgram(regs, sh, input_info);
+    Check(changed_params.hash == baseline_params.hash &&
+              changed_params.code.data() == baseline_params.code.data() &&
+              changed_params.code.size_bytes() == baseline_params.code.size_bytes() &&
+              changed_params.user_data.data() == baseline_params.user_data.data() &&
+              changed_params.user_data.size() == baseline_params.user_data.size(),
+          "changing initial FP controls changed code or runtime user data");
+    std::printf("KYTY_COMPUTE_FP_MODE_KEY_CHECK mode=0x%02x ieee=%u dx10_clamp=%u\n",
+                static_cast<unsigned>(regs.cs_regs.float_mode),
+                static_cast<unsigned>(regs.cs_regs.ieee_mode),
+                static_cast<unsigned>(regs.cs_regs.dx10_clamp));
+    std::fflush(stdout);
+    Check(MakeStageStaticKey(input_info) != baseline_key,
+          "compute shader static identity omitted initial guest FP controls");
+
+    // Reusing the same static-info object also checks that state from a prior
+    // variant does not leak into a later acquisition of the baseline mode.
+    regs.cs_regs.float_mode = baseline_mode;
+    regs.cs_regs.ieee_mode = false;
+    regs.cs_regs.dx10_clamp = false;
+    PrepareProgram(regs, sh, input_info);
+    Check(MakeStageStaticKey(input_info) == baseline_key,
+          "restoring initial FP controls did not restore shader identity");
+  }
+  std::puts("KYTY_COMPUTE_FP_MODE_KEY_PASS");
+  std::fflush(stdout);
+}
+
 void TestComputeLdsAllocationIdentity() {
   const uint32_t shader[] = {
       EncodeDs0(0x0d, 4288u), // ds_write_b32 v0, v1 offset:4288
@@ -13206,10 +13740,42 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--unused-f64-emission-only") == 0) {
+    Libs::Graphics::TestUnusedNativeF64EmissionHasCompleteRequirements();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f64-certificate-only") == 0) {
+    using namespace Libs::Graphics;
+  TestF64CertificateConstantsAndNativeRequirements();
+  TestF64CertificatePairProvenance();
+  TestF64CertificateModeAndHostBoundaries();
+  TestF64CertificateReciprocalNonzeroProof();
+  TestF64CertificatePhiPredecessorProvenance();
+    std::puts("KYTY_F64_CERTIFICATE_PASS");
+    return 0;
+  }
   using namespace Libs::Graphics;
 
   if (argc > 1 && std::strcmp(argv[1], "--audit-shader") == 0) {
     return RunShaderBatchAudit(argc, argv);
+  }
+
+  if (argc > 1 && std::strcmp(argv[1], "--fma-khr-validator-only") == 0) {
+    if (argc != 2) {
+      std::fprintf(stderr, "usage: shader_cfg_tests --fma-khr-validator-only\n");
+      return 2;
+    }
+    return RunFmaKhrPipelineValidator();
+  }
+
+  if (argc > 1 && std::strcmp(argv[1], "--compute-fp-mode-key-only") == 0) {
+    if (argc != 2) {
+      std::fprintf(stderr, "usage: shader_cfg_tests --compute-fp-mode-key-only\n");
+      return 2;
+    }
+    EnsureConfigInitialized();
+    TestComputeFpModeStaticIdentity();
+    return 0;
   }
 
   EnsureConfigInitialized();
@@ -13238,6 +13804,7 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
+  TestNewShaderRecompilerRejectsF64IntegerConversionModifiers();
   TestPsInputCountRegisterDecode();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
@@ -13283,6 +13850,12 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerU64PairTranslation();
   TestComputeDispatchWaveSize();
   TestComputeWorkgroupPlanningBoundaries();
+  TestF64CertificateConstantsAndNativeRequirements();
+  TestF64CertificatePairProvenance();
+  TestF64CertificateModeAndHostBoundaries();
+  TestF64CertificateReciprocalNonzeroProof();
+  TestF64CertificatePhiPredecessorProvenance();
+  TestUnusedNativeF64EmissionHasCompleteRequirements();
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();
@@ -13336,6 +13909,7 @@ int main(int argc, char* argv[]) {
   TestCustomVintrpMovTranslation();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
+  TestComputeFpModeStaticIdentity();
   TestComputeLdsAllocationIdentity();
   TestWave64LdsSynchronization();
   TestSharedMemoryBarrierSafety();

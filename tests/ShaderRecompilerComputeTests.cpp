@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/shaderCapabilities.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -977,6 +978,13 @@ struct SampledImageFixture {
   std::vector<u32> rgba;
 };
 
+struct ReadbackBitInterval {
+  size_t low_word;
+  std::optional<size_t> high_word;
+  uint64_t minimum;
+  uint64_t maximum;
+};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1033,6 +1041,7 @@ struct TestCase {
   u32 expected_sampler_resources = 0;
   u32 expected_sampled_pairs = 0;
   bool expected_shader_data_storage = false;
+  std::vector<ReadbackBitInterval> readback_intervals;
 };
 
 struct GraphicsCase {
@@ -1215,7 +1224,8 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
 
 CompiledShader CompileCase(
     const TestCase &test,
-    const ShaderRecompiler::ComputeWorkgroupLimits &workgroup_limits = {}) {
+    const ShaderRecompiler::ComputeWorkgroupLimits &workgroup_limits = {},
+    const ShaderRecompiler::ShaderHostProfile &host_profile = {}) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1239,6 +1249,7 @@ CompiledShader CompileCase(
   options.user_data = user_data;
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
   options.compute_workgroup_limits = workgroup_limits;
+  options.host_profile = host_profile;
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
   }
@@ -1354,7 +1365,7 @@ CompiledShader CompileCase(
             "oversized shader data did not use its storage fallback");
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program,
                                                         options.input_info,
-                                                        workgroup_limits);
+                                                        workgroup_limits, host_profile);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
@@ -1647,6 +1658,9 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] const ShaderRecompiler::ShaderHostProfile &HostProfile() const {
+    return m_shader_host_profile;
+  }
   [[nodiscard]] ShaderRecompiler::ComputeWorkgroupLimits WorkgroupLimits() const {
     vk::PhysicalDeviceSubgroupProperties subgroup{};
     subgroup.sType = vk::StructureType::ePhysicalDeviceSubgroupProperties;
@@ -9550,7 +9564,7 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
       AppendStoreVgpr(&test.code, 12, 1);
       AppendEnd(&test.code);
 
-      const auto compiled = CompileCase(test, WorkgroupLimits());
+      const auto compiled = CompileCase(test, WorkgroupLimits(), HostProfile());
       std::vector<const Image*> images(compiled.program.info.images.size());
       for (size_t resource = 0; resource < images.size(); ++resource) {
         const auto& info = compiled.program.info.images[resource];
@@ -13380,6 +13394,7 @@ private:
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
+    m_runtime_context.shader_host_profile = m_shader_host_profile;
     m_runtime_context.depth_range_unrestricted_enabled = m_depth_range_unrestricted_enabled;
     m_runtime_context.subgroup_size = WorkgroupLimits().native_subgroup_size;
     m_physical_device.getProperties(
@@ -13543,6 +13558,7 @@ private:
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
+    device_features.shaderFloat64 = available_features.shaderFloat64;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -13556,12 +13572,29 @@ private:
     });
     if (m_depth_range_unrestricted_enabled)
       device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+    const bool shader_fma_available = std::ranges::any_of(available_extensions, [](const auto& extension) {
+      return std::strcmp(extension.extensionName.data(), VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
+    });
+    vk::PhysicalDeviceShaderFmaFeaturesKHR enabled_fma{};
+    if (shader_fma_available) {
+      vk::PhysicalDeviceShaderFmaFeaturesKHR supported_fma{};
+      vk::PhysicalDeviceFeatures2 query{};
+      query.pNext = &supported_fma;
+      m_physical_device.getFeatures2(&query);
+      enabled_fma.shaderFmaFloat64 = device_features.shaderFloat64 == VK_TRUE
+                                         ? supported_fma.shaderFmaFloat64 : VK_FALSE;
+      enabled_fma.pNext = const_cast<void*>(device_info.pNext);
+      device_info.pNext = &enabled_fma;
+      device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+    m_shader_host_profile = QueryShaderHostProfile(m_physical_device,
+        device_features.shaderFloat64 == VK_TRUE, enabled_fma.shaderFmaFloat64 == VK_TRUE);
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -13865,6 +13898,7 @@ private:
   vk::Instance m_instance = nullptr;
   vk::PhysicalDevice m_physical_device = nullptr;
   bool m_depth_range_unrestricted_enabled = false;
+  ShaderRecompiler::ShaderHostProfile m_shader_host_profile;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
@@ -13895,6 +13929,48 @@ void CompareWords(const TestCase &test, const char *stage,
   Fail(test.name, stage, out.str());
 }
 
+void CompareComputeReadback(const TestCase& test,
+                             const std::vector<u32>& actual) {
+  Require(test.name, "readback size", actual.size() == test.expected.size(),
+          "buffer readback size does not match the expected buffer");
+  std::vector<u32> expected = test.expected;
+  std::vector<bool> ranged(expected.size(), false);
+  for (const auto& interval : test.readback_intervals) {
+    Require(test.name, "readback interval declaration",
+            interval.low_word < expected.size() &&
+                (!interval.high_word ||
+                 (*interval.high_word < expected.size() &&
+                  *interval.high_word != interval.low_word)) &&
+                interval.minimum <= interval.maximum &&
+                (interval.high_word || interval.maximum <= 0xffffffffull),
+            "invalid interval bounds, word width or buffer indices");
+    Require(test.name, "readback interval declaration",
+            !ranged[interval.low_word] &&
+                (!interval.high_word || !ranged[*interval.high_word]),
+            "readback intervals overlap");
+    ranged[interval.low_word] = true;
+    uint64_t observed = actual[interval.low_word];
+    if (interval.high_word) {
+      ranged[*interval.high_word] = true;
+      observed |= static_cast<uint64_t>(actual[*interval.high_word]) << 32;
+    }
+    if (observed < interval.minimum || observed > interval.maximum) {
+      std::ostringstream message;
+      message << "word " << interval.low_word << " actual 0x" << std::hex
+              << observed << " is outside [0x" << interval.minimum << ", 0x"
+              << interval.maximum << "]";
+      Fail(test.name, "readback interval", message.str());
+    }
+    // Every exempted word has just passed its explicit interval check. All
+    // remaining input words, sentinels and exact outputs still compare bitwise.
+    expected[interval.low_word] = actual[interval.low_word];
+    if (interval.high_word) {
+      expected[*interval.high_word] = actual[*interval.high_word];
+    }
+  }
+  CompareWords(test, "readback", expected, actual);
+}
+
 void CompareGraphicsWords(const GraphicsCase &test,
                           const std::vector<u32> &actual) {
   if (actual == test.expected_pixel) {
@@ -13914,7 +13990,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
-  auto compiled = CompileCase(test, vulkan->WorkgroupLimits());
+  auto compiled = CompileCase(test, vulkan->WorkgroupLimits(), vulkan->HostProfile());
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
     Require(test.name, "resource specialization",
             !compiled.program.info.images.empty() &&
@@ -14080,7 +14156,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyImage(&storage_image_uint);
   vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
-  CompareWords(test, "readback", test.expected, actual);
+  CompareComputeReadback(test, actual);
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
@@ -25788,6 +25864,468 @@ TestCase DispatcherIrreducibleControlFlow() {
   return test;
 }
 
+// TEST ONLY: signed/unsigned integer conversion to exact IEEE binary64 bits.
+// No shaderFloat64 feature or production translation is introduced here.
+// AMD RDNA2 VOP1 0x04 / 0x16; LLVM VOP1Instructions.td gfx10 mappings.
+// Every 32-bit integer is exactly representable in binary64. These literal
+// oracles expose an incorrect F32 intermediate and do not prescribe lowering.
+TestCase MakeCvt32ToF64Case(const char* name, bool unsigned_input,
+                           u32 source_vgpr, bool sparse_exec, bool e64 = false) {
+  struct Oracle {
+    u32 input;
+    u32 signed_low, signed_high;
+    u32 unsigned_low, unsigned_high;
+  };
+  constexpr std::array<Oracle, 11> values {{
+      {0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
+      {0x00000001u, 0x00000000u, 0x3ff00000u, 0x00000000u, 0x3ff00000u},
+      {0xffffffffu, 0x00000000u, 0xbff00000u, 0xffe00000u, 0x41efffffu},
+      {0x80000000u, 0x00000000u, 0xc1e00000u, 0x00000000u, 0x41e00000u},
+      {0x7fffffffu, 0xffc00000u, 0x41dfffffu, 0xffc00000u, 0x41dfffffu},
+      {0x01000001u, 0x10000000u, 0x41700000u, 0x10000000u, 0x41700000u},
+      {0x40000001u, 0x00400000u, 0x41d00000u, 0x00400000u, 0x41d00000u},
+      {0xfffffffeu, 0x00000000u, 0xc0000000u, 0xffc00000u, 0x41efffffu},
+      {0x00100001u, 0x00000000u, 0x41300001u, 0x00000000u, 0x41300001u},
+      {0x00200001u, 0x80000000u, 0x41400000u, 0x80000000u, 0x41400000u},
+      {0x80000001u, 0xffc00000u, 0xc1dfffffu, 0x00200000u, 0x41e00000u},
+  }};
+  constexpr u32 lanes = 32;
+  constexpr u32 low_plane = lanes;
+  constexpr u32 high_plane = lanes * 2;
+  constexpr u32 before_plane = lanes * 3;
+  constexpr u32 after_plane = lanes * 4;
+  constexpr u32 total_dwords = lanes * 5 + 2;
+  constexpr u32 low_sentinel = 0xdeadbeefu;
+  constexpr u32 high_sentinel = 0xcafebabeu;
+  constexpr u32 before_sentinel = 0x13579bdfu;
+  constexpr u32 after_sentinel = 0x2468ace0u;
+  constexpr u32 active_mask = 0xa5a5a5a5u;
+  TestCase test{};
+  test.name = name;
+  test.has_compute_info = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_user_data = true;
+  // Both descriptors address the one native test buffer. Input is the first
+  // 32 DWORDs; all writes are in four separate output planes after it.
+  test.user_data[2] = total_dwords * sizeof(u32);
+  test.user_data[3] = DstSel(4, 5, 6, 7);
+  test.user_data[50] = total_dwords * sizeof(u32);
+  test.user_data[51] = DstSel(4, 5, 6, 7);
+  test.initial.assign(total_dwords, 0xfeedfaceu);
+  for (u32 lane = 0; lane < lanes; ++lane) {
+    test.initial[lane] = values[lane % values.size()].input;
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; ++lane) {
+    const auto& value = values[lane % values.size()];
+    const bool active = !sparse_exec || ((active_mask >> lane) & 1u) != 0;
+    test.expected[low_plane + lane] = active
+        ? (unsigned_input ? value.unsigned_low : value.signed_low) : low_sentinel;
+    test.expected[high_plane + lane] = active
+        ? (unsigned_input ? value.unsigned_high : value.signed_high) : high_sentinel;
+    test.expected[before_plane + lane] = before_sentinel;
+    test.expected[after_plane + lane] = after_sentinel;
+  }
+  auto& code = test.code;
+  // Destination v[3:4] deliberately starts at an odd VGPR. Guard both adjacent
+  // registers, and load from a real runtime buffer so constant folding cannot
+  // substitute a literal conversion result for the instruction under test.
+  AppendVMovLiteral(&code, 2, before_sentinel);
+  AppendVMovLiteral(&code, 3, low_sentinel);
+  AppendVMovLiteral(&code, 4, high_sentinel);
+  AppendVMovLiteral(&code, 5, after_sentinel);
+  code.push_back(EncodeVop2(0x1au, 20, InlineU32(2), 0)); // byte offset = local_id*4
+  AppendBufferLoadDword(&code, source_vgpr, 20);
+  code.push_back(0xbf8c0000u); // S_WAITCNT, all counters zero
+  if (sparse_exec) {
+    // Sparse cases use source v7, so loading input cannot alter either inactive
+    // destination sentinel. Alias cases run with all32 lanes active.
+    AppendSMovLiteral(&code, 126, active_mask);
+    code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  }
+  static_assert(EncodeVop1(0x04u, 3, Vgpr(7)) == 0x7e060907u);
+  if (e64) {
+    // The same conversion in its native VOP3 encoding; output modifiers are zero.
+    AppendVop3(&code, unsigned_input ? 0x196u : 0x184u, 3, Vgpr(source_vgpr), 0);
+  } else {
+    code.push_back(EncodeVop1(unsigned_input ? 0x16u : 0x04u, 3, Vgpr(source_vgpr)));
+  }
+  if (sparse_exec) {
+    AppendSMovLiteral(&code, 126, 0xffffffffu);
+    code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  }
+  // Every invocation stores after full EXEC restoration, including inactive
+  // conversion lanes. The input region and final two DWORD sentinels stay live.
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, low_plane);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, high_plane);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, before_plane);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, after_plane);
+  AppendEnd(&code);
+  test.decoded_counts = {{unsigned_input ? "V_CVT_F64_U32" : "V_CVT_F64_I32", 1}};
+  return test;
+}
+
+TestCase CvtF64I32E64AliasesLow() {
+  return MakeCvt32ToF64Case("CvtF64I32E64AliasesLow", false, 3, false, true);
+}
+
+TestCase CvtF64U32E64AliasesHigh() {
+  return MakeCvt32ToF64Case("CvtF64U32E64AliasesHigh", true, 4, false, true);
+}
+
+TestCase CvtF64I32OddPairExact() {
+  return MakeCvt32ToF64Case("CvtF64I32OddPairExact", false, 7, false);
+}
+
+TestCase CvtF64I32AliasesLow() {
+  return MakeCvt32ToF64Case("CvtF64I32AliasesLow", false, 3, false);
+}
+
+TestCase CvtF64I32AliasesHigh() {
+  return MakeCvt32ToF64Case("CvtF64I32AliasesHigh", false, 4, false);
+}
+
+TestCase CvtF64I32SparseExecPreservesPair() {
+  return MakeCvt32ToF64Case("CvtF64I32SparseExecPreservesPair", false, 7, true);
+}
+
+TestCase CvtF64U32OddPairExact() {
+  return MakeCvt32ToF64Case("CvtF64U32OddPairExact", true, 7, false);
+}
+
+TestCase CvtF64U32AliasesLow() {
+  return MakeCvt32ToF64Case("CvtF64U32AliasesLow", true, 3, false);
+}
+
+TestCase CvtF64U32AliasesHigh() {
+  return MakeCvt32ToF64Case("CvtF64U32AliasesHigh", true, 4, false);
+}
+
+TestCase CvtF64U32SparseExecPreservesPair() {
+  return MakeCvt32ToF64Case("CvtF64U32SparseExecPreservesPair", true, 7, true);
+}
+
+// TEST ONLY. Insert before MakeCases, register the three factories below.
+// All expected IEEE words are literals from exact rational arithmetic; see
+// make_oracles.py. No native shaderFloat64 feature is enabled by these fixtures.
+// Runtime/profile integration must establish the guest RTE contract separately.
+TestCase MakeF64ArithmeticBase(const char* name, u32 input_planes,
+                               u32 output_planes) {
+  constexpr u32 lanes = 32;
+  const u32 words = (input_planes + output_planes) * lanes + 2;
+  TestCase test{};
+  test.name = name;
+  test.has_compute_info = true;
+  test.compute_info = {};
+  test.compute_info.initial_fp_state = {true, 0xc0, false, true};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_user_data = true;
+  test.user_data[2] = words * sizeof(u32);
+  test.user_data[3] = DstSel(4, 5, 6, 7);
+  test.user_data[50] = words * sizeof(u32);
+  test.user_data[51] = DstSel(4, 5, 6, 7);
+  test.initial.assign(words, 0xfeedfaceu);
+  test.expected = test.initial;
+  AppendSMovLiteral(&test.code, 126, 0xffffffffu);
+  test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  return test;
+}
+
+void AppendF64PairLiteral(std::vector<u32>* code, u32 low_vgpr,
+                          uint64_t bits) {
+  AppendVMovLiteral(code, low_vgpr, static_cast<u32>(bits));
+  AppendVMovLiteral(code, low_vgpr + 1, static_cast<u32>(bits >> 32));
+}
+
+TestCase MulF64ConvertedIntegersExact() {
+  struct Oracle { u32 a, b, low, high; };
+  constexpr Oracle values[] = {
+      {0x00000000u, 0x7fffffffu, 0x00000000u, 0x00000000u},
+      {0x00000001u, 0xffffffffu, 0x00000000u, 0xbff00000u},
+      {0xffffffffu, 0xffffffffu, 0x00000000u, 0x3ff00000u},
+      {0x01000001u, 0x01000001u, 0x20000010u, 0x42f00000u},
+      {0x7fffffffu, 0x7fffffffu, 0xff800000u, 0x43cfffffu},
+      {0x80000000u, 0x7fffffffu, 0xffc00000u, 0xc3cfffffu},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x43d00000u},
+      {0x40000001u, 0x40000001u, 0x00800000u, 0x43b00000u},
+      {0x00000000u, 0xffffffffu, 0x00000000u, 0x80000000u}, // +0 * -1 = -0
+  };
+  auto test = MakeF64ArithmeticBase("MulF64ConvertedIntegersExact", 2, 4);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    const auto& v = values[lane % std::size(values)];
+    test.initial[lane] = test.expected[lane] = v.a;
+    test.initial[32 + lane] = test.expected[32 + lane] = v.b;
+    test.expected[64 + lane] = v.low;
+    test.expected[96 + lane] = v.high;
+    test.expected[128 + lane] = 0x13579bdfu;
+    test.expected[160 + lane] = 0x2468ace0u;
+  }
+  auto& code = test.code;
+  AppendVMovLiteral(&code, 6, 0x13579bdfu);
+  AppendVMovLiteral(&code, 9, 0x2468ace0u);
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 3, 20);
+  code.push_back(EncodeMubuf0(0x0c, 32 * sizeof(u32)));
+  code.push_back(EncodeMubuf1(11, 0, 20));
+  code.push_back(0xbf8c0000u);
+  code.push_back(EncodeVop1(0x04, 3, Vgpr(3)));
+  code.push_back(EncodeVop1(0x04, 11, Vgpr(11)));
+  AppendVop3(&code, 0x165, 7, Vgpr(3), Vgpr(11));
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 96);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 128);
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 160);
+  AppendEnd(&code);
+  test.decoded_counts = {{"V_CVT_F64_I32", 2}, {"V_MUL_F64", 1}};
+  return test;
+}
+
+TestCase FmaF64IsFusedWithSourceNegation() {
+  // The fixed normal constant below deliberately differs from exact 1/49.
+  // FMA(49, r, -1) = -23*2^-58 exactly: bc97000000000000.
+  // Separate rounded multiply/add gives bca0000000000000 and must fail.
+  auto test = MakeF64ArithmeticBase("FmaF64IsFusedWithSourceNegation", 0, 4);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected[lane] = 0;
+    test.expected[32 + lane] = 0xbc970000u;
+    test.expected[64 + lane] = 0x13579bdfu;
+    test.expected[96 + lane] = 0x2468ace0u;
+  }
+  auto& code = test.code;
+  AppendF64PairLiteral(&code, 3, 0x4048800000000000ull); // 49
+  AppendF64PairLiteral(&code, 5, 0x3f94e5e0a72f0539ull); // r
+  AppendF64PairLiteral(&code, 15, 0x3ff0000000000000ull); // +1
+  AppendVMovLiteral(&code, 8, 0x13579bdfu);
+  AppendVMovLiteral(&code, 11, 0x2468ace0u);
+  // Odd destination v[9:10], with both adjacent registers guarded.
+  AppendVop3(&code, 0x14c, 9, Vgpr(3), Vgpr(5), Vgpr(15),
+             0, 0, false, 0, 4); // NEG source2, not a pre-negated input.
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, 32);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 0, 96);
+  AppendEnd(&code);
+  test.decoded_counts = {{"V_FMA_F64", 1}};
+  return test;
+}
+
+TestCase CvtF32F64NormalRteBoundaries() {
+  struct Oracle { uint64_t bits; u32 expected; };
+  constexpr Oracle values[] = {
+      {0x0000000000000000ull, 0x00000000u},
+      {0x8000000000000000ull, 0x80000000u},
+      {0x3ff0000000000000ull, 0x3f800000u},
+      {0x3ff0000010000000ull, 0x3f800000u}, // half-ULP tie to even lower
+      {0x3ff0000030000000ull, 0x3f800002u}, // half-ULP tie to even upper
+      {0x3ff0000010000001ull, 0x3f800001u}, // immediately above midpoint
+      {0xbff0000010000000ull, 0xbf800000u},
+      {0x4170000010000000ull, 0x4b800000u}, // integer 16777217
+      {0xc170000010000000ull, 0xcb800000u},
+      {0x41efffffffe00000ull, 0x4f800000u}, // integer UINT_MAX
+      {0xbc97000000000000ull, 0xa4b80000u}, // exact fused residual
+  };
+  auto test = MakeF64ArithmeticBase("CvtF32F64NormalRteBoundaries", 0,
+                                     static_cast<u32>(std::size(values)) + 2);
+  auto& code = test.code;
+  AppendVMovLiteral(&code, 6, 0x13579bdfu);
+  AppendVMovLiteral(&code, 8, 0x2468ace0u);
+  for (u32 i = 0; i < std::size(values); ++i) {
+    AppendF64PairLiteral(&code, 3, values[i].bits);
+    code.push_back(EncodeVop1(0x0f, 7, Vgpr(3)));
+    AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, i * 32);
+    for (u32 lane = 0; lane < 32; ++lane) {
+      test.expected[i * 32 + lane] = values[i].expected;
+    }
+  }
+  const u32 end = static_cast<u32>(std::size(values)) * 32;
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, end);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, end + 32);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected[end + lane] = 0x13579bdfu;
+    test.expected[end + 32 + lane] = 0x2468ace0u;
+  }
+  AppendEnd(&code);
+  test.decoded_counts = {{"V_CVT_F32_F64", std::size(values)}};
+  return test;
+}
+
+// TEST ONLY. Requires MakeF64ArithmeticBase/AppendF64PairLiteral from the exact
+// fixture file and ReadbackBitInterval/CompareComputeReadback harness support.
+// AMD RDNA2 V_RCP_F64 permits 2^29 binary64 ULP error. Endpoints below are the
+// innermost representable bounds around exact rational 1/d +/- that error;
+// make_oracles.py derives them without host floating arithmetic.
+// Additional test-only factory. The five original arithmetic oracles stay unchanged.
+TestCase FmaF64FiniteSignedZeroRules() {
+  struct Oracle { uint64_t a, b, c; u32 result_high; };
+  constexpr Oracle values[] = {
+      {0x0000000000000000ull, 0xbff0000000000000ull, 0x8000000000000000ull, 0x80000000u},
+      {0x0000000000000000ull, 0xbff0000000000000ull, 0x0000000000000000ull, 0x00000000u},
+      {0x0000000000000000ull, 0x3ff0000000000000ull, 0x8000000000000000ull, 0x00000000u},
+      {0x3ff0000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull, 0x00000000u},
+      {0x8000000000000000ull, 0x3ff0000000000000ull, 0x8000000000000000ull, 0x80000000u},
+      {0x8000000000000000ull, 0xbff0000000000000ull, 0x8000000000000000ull, 0x00000000u},
+      {0xbff0000000000000ull, 0x3ff0000000000000ull, 0x3ff0000000000000ull, 0x00000000u},
+      {0x8000000000000000ull, 0x3ff0000000000000ull, 0x0000000000000000ull, 0x00000000u},
+  };
+  // RTE: exact cancellation is +0. Addition of two signed zeros is -0 only
+  // when both are -0; the exact product's zero sign is sign(a) XOR sign(b).
+  const u32 result_planes = 2 * static_cast<u32>(std::size(values));
+  auto test = MakeF64ArithmeticBase("FmaF64FiniteSignedZeroRules", 0, result_planes + 2);
+  auto& code = test.code;
+  AppendVMovLiteral(&code, 8, 0x13579bdfu);
+  AppendVMovLiteral(&code, 11, 0x2468ace0u);
+  for (u32 i = 0; i < std::size(values); ++i) {
+    AppendF64PairLiteral(&code, 3, values[i].a);
+    AppendF64PairLiteral(&code, 5, values[i].b);
+    AppendF64PairLiteral(&code, 15, values[i].c);
+    AppendVop3(&code, 0x14c, 9, Vgpr(3), Vgpr(5), Vgpr(15));
+    AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, i * 64);
+    AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, i * 64 + 32);
+    for (u32 lane = 0; lane < 32; ++lane) {
+      test.expected[i * 64 + lane] = 0;
+      test.expected[i * 64 + 32 + lane] = values[i].result_high;
+    }
+  }
+  const u32 guards = result_planes * 32;
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, guards);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 0, guards + 32);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected[guards + lane] = 0x13579bdfu;
+    test.expected[guards + 32 + lane] = 0x2468ace0u;
+  }
+  AppendEnd(&code);
+  test.decoded_counts = {{"V_FMA_F64", std::size(values)}};
+  return test;
+}
+
+TestCase RcpF64OddConvertedIntegersWithinIsaError() {
+  struct Oracle { u32 input; uint64_t minimum, maximum, nearest; };
+  constexpr Oracle values[] = {
+      {0x00000000u, 0x3fefffffc0000000ull, 0x3ff0000020000000ull, 0x3ff0000000000000ull},
+      {0x00000002u, 0x3fd5555535555556ull, 0x3fd5555575555555ull, 0x3fd5555555555555ull},
+      {0x00000006u, 0x3fc2492472492493ull, 0x3fc24924b2492492ull, 0x3fc2492492492492ull},
+      {0x00000030u, 0x3f94e5e0872f053aull, 0x3f94e5e0c72f0539ull, 0x3f94e5e0a72f0539ull},
+      {0x0000003eu, 0x3f904103f0410411ull, 0x3f90410430410410ull, 0x3f90410410410410ull},
+      {0x000000feu, 0x3f70100ff0101011ull, 0x3f70101030101010ull, 0x3f70101010101010ull},
+      {0x7ffffffeu, 0x3dffffffc0400001ull, 0x3e00000020200000ull, 0x3e00000000200000ull},
+      {0xfffffffeu, 0x3defffffc0200001ull, 0x3df0000020100000ull, 0x3df0000000100000ull},
+  };
+  auto test = MakeF64ArithmeticBase("RcpF64OddConvertedIntegersWithinIsaError", 1, 5);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    const auto& v = values[lane % std::size(values)];
+    test.initial[lane] = test.expected[lane] = v.input;
+    test.expected[32 + lane] = static_cast<u32>(v.nearest);
+    test.expected[64 + lane] = static_cast<u32>(v.nearest >> 32);
+    test.expected[96 + lane] = v.input | 1u;
+    test.expected[128 + lane] = 0x13579bdfu;
+    test.expected[160 + lane] = 0x2468ace0u;
+    test.readback_intervals.push_back({32 + lane, 64 + lane, v.minimum, v.maximum});
+  }
+  auto& code = test.code;
+  AppendVMovLiteral(&code, 6, 0x13579bdfu);
+  AppendVMovLiteral(&code, 9, 0x2468ace0u);
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 5, 20);
+  code.push_back(0xbf8c0000u);
+  code.push_back(EncodeVop2(0x1c, 5, InlineU32(1), 5)); // OR1 proves nonzero
+  code.push_back(EncodeVop1(0x16, 3, Vgpr(5)));
+  code.push_back(EncodeVop1(0x2f, 7, Vgpr(3)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 32);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 96);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 128);
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 160);
+  AppendEnd(&code);
+  test.decoded_counts = {{"V_CVT_F64_U32", 1}, {"V_RCP_F64", 1}};
+  return test;
+}
+
+TestCase F64IntegerDerivedReciprocalFmaChain() {
+  // d=(runtime U32 | 1), p=double(d+2)*3, q=FMA(p,RCP(d),-3), f=float(q).
+  // Every actually supplied d is bounded below4096; the shader retains a
+  // generic integer producer/nonzero proof. RCP and final q/f are intervals,
+  // while product, denominator, inputs and sentinels are exact. The separate
+  // isolated FMA fixture establishes fused semantics; this chain alone cannot.
+  struct Oracle {
+    u32 input;
+    uint64_t reciprocal_min, reciprocal_max, product;
+    uint64_t result_min, result_max;
+    u32 float_min, float_max;
+  };
+  constexpr Oracle values[] = {
+      {0x00000000u, 0x3fefffffc0000000ull, 0x3ff0000020000000ull, 0x4022000000000000ull, 0x4017ffffb8000000ull, 0x4018000048000000ull, 0x40bffffeu, 0x40c00002u},
+      {0x00000002u, 0x3fd5555535555556ull, 0x3fd5555575555555ull, 0x402e000000000000ull, 0x3fffffff88000002ull, 0x400000003bffffffull, 0x3ffffffcu, 0x40000002u},
+      {0x00000006u, 0x3fc2492472492493ull, 0x3fc24924b2492492ull, 0x403b000000000000ull, 0x3feb6db6036db6e0ull, 0x3feb6db7b36db6daull, 0x3f5b6db0u, 0x3f5b6dbeu},
+      {0x00000030u, 0x3f94e5e0872f053aull, 0x3f94e5e0c72f0539ull, 0x4063200000000000ull, 0x3fbf58cc32c687eaull, 0x3fbf58d5c2c687c4ull, 0x3dfac662u, 0x3dfac6aeu},
+      {0x0000003eu, 0x3f904103f0410411ull, 0x3f90410430410410ull, 0x4068600000000000ull, 0x3fb861800061863dull, 0x3fb8618c3061860cull, 0x3dc30c00u, 0x3dc30c62u},
+      {0x000000feu, 0x3f70100ff0101011ull, 0x3f70101030101010ull, 0x4088180000000000ull, 0x3f981800001818cdull, 0x3f9818303018180cull, 0x3cc0c000u, 0x3cc0c182u},
+      {0x000003feu, 0x3f500400e0401005ull, 0x3f50040120401004ull, 0x40a8060000000000ull, 0x3f7805a168601b04ull, 0x3f78066198601803ull, 0x3bc02d0bu, 0x3bc0330du},
+      {0x00000ffeu, 0x3f3000fff0010011ull, 0x3f30010030010010ull, 0x40c8018000000000ull, 0x3f58000000018c0dull, 0x3f5803003001800cull, 0x3ac00000u, 0x3ac01802u},
+  };
+  auto test = MakeF64ArithmeticBase("F64IntegerDerivedReciprocalFmaChain", 1, 10);
+  for (u32 lane = 0; lane < 32; ++lane) {
+    const auto& v = values[lane % std::size(values)];
+    test.initial[lane] = test.expected[lane] = v.input;
+    test.expected[32 + lane] = static_cast<u32>(v.reciprocal_min);
+    test.expected[64 + lane] = static_cast<u32>(v.reciprocal_min >> 32);
+    test.expected[96 + lane] = static_cast<u32>(v.product);
+    test.expected[128 + lane] = static_cast<u32>(v.product >> 32);
+    test.expected[160 + lane] = static_cast<u32>(v.result_min);
+    test.expected[192 + lane] = static_cast<u32>(v.result_min >> 32);
+    test.expected[224 + lane] = v.float_min;
+    test.expected[256 + lane] = v.input | 1u;
+    test.expected[288 + lane] = 0x13579bdfu;
+    test.expected[320 + lane] = 0x2468ace0u;
+    test.readback_intervals.push_back(
+        {32 + lane, 64 + lane, v.reciprocal_min, v.reciprocal_max});
+    test.readback_intervals.push_back(
+        {160 + lane, 192 + lane, v.result_min, v.result_max});
+    test.readback_intervals.push_back(
+        {224 + lane, std::nullopt, v.float_min, v.float_max});
+  }
+  auto& code = test.code;
+  AppendVMovLiteral(&code, 14, 0x13579bdfu);
+  AppendVMovLiteral(&code, 18, 0x2468ace0u);
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 2, 20);
+  code.push_back(0xbf8c0000u);
+  code.push_back(EncodeVop2(0x1c, 2, InlineU32(1), 2));
+  code.push_back(EncodeVop1(0x01, 17, Vgpr(2)));
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(2), 2));
+  code.push_back(EncodeVop1(0x16, 3, Vgpr(2)));
+  code.push_back(EncodeVop1(0x16, 5, Vgpr(1)));
+  code.push_back(EncodeVop1(0x16, 15, InlineU32(3)));
+  AppendVop3(&code, 0x165, 9, Vgpr(5), Vgpr(15));
+  code.push_back(EncodeVop1(0x2f, 7, Vgpr(3)));
+  AppendVop3(&code, 0x14c, 11, Vgpr(9), Vgpr(7), Vgpr(15),
+             0, 0, false, 0, 4);
+  code.push_back(EncodeVop1(0x0f, 13, Vgpr(11)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 32);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 96);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, 128);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 0, 160);
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 0, 192);
+  AppendStoreVgprAtLaneDwordOffset(&code, 13, 0, 224);
+  AppendStoreVgprAtLaneDwordOffset(&code, 17, 0, 256);
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 0, 288);
+  AppendStoreVgprAtLaneDwordOffset(&code, 18, 0, 320);
+  AppendEnd(&code);
+  test.decoded_counts = {{"V_CVT_F64_U32", 3}, {"V_MUL_F64", 1},
+                         {"V_RCP_F64", 1}, {"V_FMA_F64", 1},
+                         {"V_CVT_F32_F64", 1}};
+  return test;
+}
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -25917,6 +26455,22 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
   AddCase(VectorFloatConversionOps);
+  AddCase(RcpF64OddConvertedIntegersWithinIsaError);
+  AddCase(F64IntegerDerivedReciprocalFmaChain);
+  AddCase(MulF64ConvertedIntegersExact);
+  AddCase(FmaF64IsFusedWithSourceNegation);
+  AddCase(FmaF64FiniteSignedZeroRules);
+  AddCase(CvtF32F64NormalRteBoundaries);
+  AddCase(CvtF64I32OddPairExact);
+  AddCase(CvtF64I32AliasesLow);
+  AddCase(CvtF64I32AliasesHigh);
+  AddCase(CvtF64I32SparseExecPreservesPair);
+  AddCase(CvtF64U32OddPairExact);
+  AddCase(CvtF64U32AliasesLow);
+  AddCase(CvtF64U32AliasesHigh);
+  AddCase(CvtF64U32SparseExecPreservesPair);
+  AddCase(CvtF64I32E64AliasesLow);
+  AddCase(CvtF64U32E64AliasesHigh);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
   AddCase(VectorSpecialF32FlushesDenormalInputs);
@@ -30781,6 +31335,111 @@ void CheckSampledHtileWriteAdmission() {
 }
 #endif
 
+// Shared compiler admission: the same synthetic programs used for native GPU
+// readback, with independently varied guest metadata and host capabilities.
+void CheckF64AdmissionCase(const char* mode) {
+  using ShaderRecompiler::ShaderHostProfile;
+  ShaderHostProfile profile{true, true, true, true, true, true};
+  auto test = MulF64ConvertedIntegersExact();
+  const std::string_view scenario(mode);
+  if (scenario == "host-unknown") profile.known = false;
+  else if (scenario == "host-float64") profile.float64 = false;
+  else if (scenario == "host-fma") {
+    test = FmaF64IsFusedWithSourceNegation();
+    profile.fma_float64 = false;
+  } else if (scenario == "host-rte64") profile.rte_float64 = false;
+  else if (scenario == "host-rte32") {
+    test = CvtF32F64NormalRteBoundaries();
+    profile.rte_float32 = false;
+  } else if (scenario == "host-signed-zero") {
+    profile.signed_zero_inf_nan_preserve_float64 = false;
+  } else if (scenario == "guest-unknown") {
+    test.compute_info.initial_fp_state.known = false;
+  } else if (scenario == "guest-dp-rounding") {
+    test.compute_info.initial_fp_state.float_mode = 0xc4; // DP round toward +inf
+  } else if (scenario == "guest-sp-rounding") {
+    test = CvtF32F64NormalRteBoundaries();
+    test.compute_info.initial_fp_state.float_mode = 0xc1; // SP round toward +inf
+  } else if (scenario == "guest-mode-write") {
+    // hwreg(MODE,0,8), sourced from s8. The compiler must see this MODE write
+    // even though the existing scalar translation represents SETREG as a nop.
+    std::vector<u32> prefix;
+    AppendSMovLiteral(&prefix, 8, 0xc4u);
+    prefix.push_back(EncodeSopk(0x13, 8, (7u << 11) | 1u));
+    test.code.insert(test.code.begin(), prefix.begin(), prefix.end());
+  } else if (scenario == "narrowing-subnormal") {
+    test = MakeF64ArithmeticBase("F64UnprovenNarrowing", 0, 1);
+    AppendF64PairLiteral(&test.code, 3, 0x3800000000000000ull); // 2^-127
+    test.code.push_back(EncodeVop1(0x0f, 7, Vgpr(3)));
+    AppendStoreVgprAtLaneDwordOffset(&test.code, 7, 0, 0);
+    AppendEnd(&test.code);
+  } else if (scenario == "unknown-pair") {
+    test = MakeF64ArithmeticBase("F64UnprovenRuntimePair", 2, 2);
+    auto& code = test.code;
+    code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 0));
+    AppendBufferLoadDword(&code, 3, 20);
+    code.push_back(EncodeMubuf0(0x0c, 32 * sizeof(u32)));
+    code.push_back(EncodeMubuf1(4, 0, 20));
+    code.push_back(0xbf8c0000u);
+    code.push_back(EncodeVop1(0x2f, 7, Vgpr(3)));
+    AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 64);
+    AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 96);
+    AppendEnd(&code);
+  } else {
+    Fail("F64Admission", "case", "unknown admission scenario");
+  }
+  std::printf("KYTY_F64_ADMISSION_READY %s\n", mode);
+  std::fflush(stdout);
+  (void)CompileCase(test, {}, profile); // No Vulkan device or GPU execution.
+  std::printf("KYTY_F64_ADMISSION_RETURNED %s\n", mode);
+}
+
+void CheckF64AdmissionPositive() {
+  const ShaderRecompiler::ShaderHostProfile supported{true, true, true, true, true, true};
+  for (auto test : {MulF64ConvertedIntegersExact(), FmaF64IsFusedWithSourceNegation(),
+                    CvtF32F64NormalRteBoundaries(),
+                    RcpF64OddConvertedIntegersWithinIsaError(),
+                    F64IntegerDerivedReciprocalFmaChain()}) {
+    (void)CompileCase(test, {}, supported);
+  }
+  auto exact = CvtF64I32OddPairExact();
+  exact.forbidden_spirv = {"OpCapability Float64", "OpTypeFloat 64"};
+  (void)CompileCase(exact); // Unknown host/guest modes remain legal for exact bits.
+  auto ordinary = IntegerAddSubMul();
+  ordinary.forbidden_spirv = {"OpCapability Float64", "OpTypeFloat 64"};
+  (void)CompileCase(ordinary);
+  auto dead = CvtF64U32OddPairExact();
+  // Unused FP64 arithmetic must disappear before capability admission.
+  // Fresh v[100:101] has no readers; it cannot change the buffer oracle.
+  const u32 dead_word = EncodeVop1(0x2f, 100, Vgpr(3));
+  dead.code.insert(dead.code.end() - 1, dead_word);
+  dead.forbidden_spirv = {"OpCapability Float64", "OpTypeFloat 64"};
+  (void)CompileCase(dead);
+  std::puts("[host]    F64AdmissionPositive             ok");
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckF64Admission() {
+  constexpr std::array cases {
+      RendererFailureCase{"host-unknown", "FP64 certificate: host profile is unknown"},
+      RendererFailureCase{"host-float64", "FP64 certificate: host float64 is unavailable"},
+      RendererFailureCase{"host-fma", "FP64 certificate: host fma_float64 is unavailable"},
+      RendererFailureCase{"host-rte64", "FP64 certificate: host rte_float64 is unavailable"},
+      RendererFailureCase{"host-rte32", "FP64 certificate: host rte_float32 is unavailable"},
+      RendererFailureCase{"host-signed-zero", "FP64 certificate: host signed_zero_inf_nan_preserve_float64 is unavailable"},
+      RendererFailureCase{"guest-unknown", "FP64 certificate: initial guest FP state is unknown"},
+      RendererFailureCase{"guest-dp-rounding", "FP64 certificate: guest DP rounding mode is unsupported"},
+      RendererFailureCase{"guest-sp-rounding", "FP64 certificate: guest SP rounding mode is unsupported"},
+      RendererFailureCase{"guest-mode-write", "FP64 certificate: guest MODE writes are unsupported"},
+      RendererFailureCase{"narrowing-subnormal", "FP64 certificate: FP32 narrowing range is unproven"},
+      RendererFailureCase{"unknown-pair", "FP64 certificate: unproven finite normal FP64 dataflow"},
+  };
+  CheckRendererFailureCases("F64Admission", "--f64-admission",
+                           "KYTY_F64_ADMISSION_READY ", "KYTY_F64_ADMISSION_RETURNED ", cases);
+  CheckF64AdmissionPositive();
+}
+#endif
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -30814,6 +31473,44 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--native-htile-subset-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckNativeHtileArraySubset();
+    return 0;
+  }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--f64-admission") == 0) {
+    CheckF64AdmissionCase(argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f64-admission-only") == 0) {
+    CheckF64Admission();
+    return 0;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--f64-admission-positive-only") == 0) {
+    CheckF64AdmissionPositive();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f64-arithmetic-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, MulF64ConvertedIntegersExact());
+    RunCase(&vulkan, FmaF64IsFusedWithSourceNegation());
+    RunCase(&vulkan, FmaF64FiniteSignedZeroRules());
+    RunCase(&vulkan, CvtF32F64NormalRteBoundaries());
+    RunCase(&vulkan, RcpF64OddConvertedIntegersWithinIsaError());
+    RunCase(&vulkan, F64IntegerDerivedReciprocalFmaChain());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f64-conversion-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, CvtF64I32OddPairExact());
+    RunCase(&vulkan, CvtF64I32AliasesLow());
+    RunCase(&vulkan, CvtF64I32AliasesHigh());
+    RunCase(&vulkan, CvtF64I32SparseExecPreservesPair());
+    RunCase(&vulkan, CvtF64U32OddPairExact());
+    RunCase(&vulkan, CvtF64U32AliasesLow());
+    RunCase(&vulkan, CvtF64U32AliasesHigh());
+    RunCase(&vulkan, CvtF64U32SparseExecPreservesPair());
+    RunCase(&vulkan, CvtF64I32E64AliasesLow());
+    RunCase(&vulkan, CvtF64U32E64AliasesHigh());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-htile-clear-only") == 0) {

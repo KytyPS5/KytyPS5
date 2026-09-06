@@ -63,6 +63,20 @@ struct ShaderClipSpaceTransform {
 	bool  enabled        = false;
 };
 
+// Unknown is distinct from a known zero register value, particularly for old
+// offline manifests which did not capture the initial guest FP controls.
+struct ShaderFloatingPointState {
+	bool    known      = false;
+	uint8_t float_mode = 0;
+	bool    ieee_mode  = false;
+	bool    dx10_clamp = false;
+
+	[[nodiscard]] uint32_t StaticKey() const {
+		return known ? 0x10000u | float_mode | (uint32_t(ieee_mode) << 8u) |
+		                   (uint32_t(dx10_clamp) << 9u) : 0u;
+	}
+};
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -70,6 +84,7 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
+	ShaderFloatingPointState initial_fp_state;
 	int                     resources_num       = 0;
 	int                     fetch_shader_reg    = 0;
 	int                     fetch_attrib_reg    = 0;
@@ -83,6 +98,7 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo {
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t           threads_num[3]             = {0, 0, 0};
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           lds_size_dwords            = 0;
@@ -98,6 +114,7 @@ struct ShaderComputeInputInfo {
 };
 
 struct ShaderPixelInputInfo {
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       ps_system_input_base         = 0;

@@ -33,6 +33,7 @@ constexpr Type U32             = Type::U32;
 constexpr Type U64             = Type::U64;
 constexpr Type F16             = Type::F16;
 constexpr Type F32             = Type::F32;
+constexpr Type F64             = Type::F64;
 constexpr Type U32x2           = Type::U32x2;
 constexpr Type U32x3           = Type::U32x3;
 constexpr Type U32x4           = Type::U32x4;

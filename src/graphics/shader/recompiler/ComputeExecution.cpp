@@ -14,6 +14,14 @@ bool IsPureUniformOperation(O op) {
 		case O::BitCastU16F16: case O::BitCastF16U16: case O::BitCastU32F32: case O::BitCastF32U32:
 		case O::ConvertU16U32: case O::ConvertU32U16: case O::ConvertU8U32: case O::ConvertU32U8:
 		case O::ConvertF32F16: case O::ConvertF16F32: case O::ConvertS32F32: case O::ConvertU32F32:
+		case O::ConvertF64S32: case O::ConvertF64U32: case O::ConvertF32F64:
+		case O::CompositeConstructF64:
+		case O::FPAbs64:
+		case O::FPNeg64:
+		case O::FPMul64:
+		case O::FPFma64:
+		case O::FPRecip64:
+		case O::CompositeExtractF64:
 		case O::ConvertF32S32: case O::ConvertF32U32: case O::CompositeConstructU64: case O::CompositeConstructU32x2:
 		case O::CompositeConstructU32x3: case O::CompositeConstructF32x2: case O::CompositeConstructU32x4: case O::CompositeExtractU64:
 		case O::CompositeExtractU32x2: case O::CompositeExtractU32x3: case O::CompositeExtractU32x4: case O::PackHalf2x16:

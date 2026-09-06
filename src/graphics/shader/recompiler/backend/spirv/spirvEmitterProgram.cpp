@@ -367,7 +367,8 @@ uint32_t ValueEmitContext::TypeId(IR::Type type) const {
 		case IR::Type::U16:
 		case IR::Type::U32:
 		case IR::Type::F16: return TypeU32(state);
-		case IR::Type::U64: return TypeU64(state);
+		case IR::Type::U64:
+		case IR::Type::F64: return TypeU64(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
@@ -386,6 +387,7 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 			case IR::Type::U16: return ConstantU32(state, value.U16());
 			case IR::Type::U32: return ConstantU32(state, value.U32());
 			case IR::Type::U64: return ConstantU64(state, value.U64());
+			case IR::Type::F64: return ConstantU64(state, value.F64Bits());
 			case IR::Type::F16: return ConstantU32(state, value.F16Bits());
 			case IR::Type::F32:
 				return ConstantF32(state, std::bit_cast<uint32_t>(value.F32Value()));

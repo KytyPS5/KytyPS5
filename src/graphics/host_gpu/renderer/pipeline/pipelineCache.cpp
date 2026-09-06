@@ -120,12 +120,23 @@ void CaptureDispatchedShader(const ShaderParams& params,
 		    {"user_data_count", options.user_data.size()},
 		    {"scratch_dwords", options.scratch_dwords},
 		    {"metadata_complete", false},
+		    {"host_profile", {{"known", options.host_profile.known},
+		                      {"float64", options.host_profile.float64},
+		                      {"fma_float64", options.host_profile.fma_float64},
+		                      {"rte_float64", options.host_profile.rte_float64},
+		                      {"rte_float32", options.host_profile.rte_float32},
+		                      {"signed_zero_inf_nan_preserve_float64",
+		                       options.host_profile.signed_zero_inf_nan_preserve_float64}}},
 		    {"static_state", std::vector<uint32_t>(static_state.begin(), static_state.end())},
 		};
 		if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr) {
 			const auto& input = *options.input_info.compute;
 			metadata["metadata_complete"] = true;
 			metadata["compute"] = {
+			    {"initial_fp_state", {{"known", input.initial_fp_state.known},
+			                          {"float_mode", input.initial_fp_state.float_mode},
+			                          {"ieee_mode", input.initial_fp_state.ieee_mode},
+			                          {"dx10_clamp", input.initial_fp_state.dx10_clamp}}},
 			    {"threads_num", std::array {input.threads_num[0], input.threads_num[1], input.threads_num[2]}},
 			    {"dispatch_threads_num", std::array {input.dispatch_threads_num[0], input.dispatch_threads_num[1], input.dispatch_threads_num[2]}},
 			    {"lds_size_dwords", input.lds_size_dwords},
@@ -249,6 +260,13 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+// Test access to the exact production validation/configuration path. This does
+// not create a Vulkan device or alter validation policy.
+bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
+                               const std::vector<uint32_t>& spirv) {
+	return ValidateShaderSpirv(label, shader_hash, spirv);
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -287,12 +305,12 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
-			// exact state comparison needed on a stable hit without hashing up to 429 words first.
+			// exact state comparison needed on a stable hit without hashing up to 430 words first.
 			return hash;
 		}
 	};
 
-	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
+	static constexpr std::size_t MaxStaticKeyWords = 14 + ShaderVertexInputInfo::RES_MAX * 13;
 
 	template <ShaderType Stage>
 	Permutation CompilePermutation(const ShaderParams&                          params,
@@ -428,6 +446,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.host_profile = host_profile;
 		if constexpr (stage == ShaderType::Vertex) {
 			options.user_data_base = 8;
 			options.scratch_dwords = input_info.scratch_size_dwords;
@@ -457,6 +476,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	explicit ProgramCache(const GraphicContext& graphics): device(graphics.device) {
+		host_profile = graphics.shader_host_profile;
 		const auto& limits                       = graphics.GetPhysicalDeviceProperties().limits;
 		compute_workgroup_limits.max_size        = {limits.maxComputeWorkGroupSize[0],
 		                                            limits.maxComputeWorkGroupSize[1],
@@ -482,6 +502,7 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	ShaderRecompiler::ComputeWorkgroupLimits                    compute_workgroup_limits;
+	ShaderRecompiler::ShaderHostProfile                          host_profile;
 	uint32_t                                                    num_compiled   = 0;
 	uint64_t                                                    next_shader_id = 0;
 };

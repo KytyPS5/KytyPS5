@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ComputeWorkgroup.h"
+#include "graphics/shader/recompiler/ShaderHostProfile.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <vector>
@@ -13,7 +14,8 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 void AnalyzeProgramRequirements(IR::Program& program);
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
-                                  const ComputeWorkgroupLimits& compute_workgroup_limits = {});
+                                  const ComputeWorkgroupLimits& compute_workgroup_limits = {},
+                                  const ShaderHostProfile& host_profile = {});
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

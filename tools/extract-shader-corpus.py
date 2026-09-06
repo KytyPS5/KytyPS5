@@ -152,6 +152,15 @@ def add_compute_header_profile(metadata):
                 f"compute header needs exactly one SH register {offset:#x}")
     require(metadata["specials"] is not None, "compute header has no dispatch modifier")
     rsrc2 = registers[0x213][0]
+    require(len(registers[0x212]) <= 1, "ambiguous COMPUTE_PGM_RSRC1 FP state")
+    initial_fp_state = {"known": False}
+    if registers[0x212]:
+        rsrc1 = registers[0x212][0]
+        initial_fp_state = {
+            "known": True, "float_mode": (rsrc1 >> 12) & 0xff,
+            "ieee_mode": bool(rsrc1 & (1 << 23)),
+            "dx10_clamp": bool(rsrc1 & (1 << 21)),
+        }
     user_count = (rsrc2 >> 1) & 31
     # Pm4::ComputeWaveSize accepts a runtime modifier that can override this
     # header value. These are declared profiles, not captured dispatch inputs.
@@ -169,6 +178,7 @@ def add_compute_header_profile(metadata):
             "needs_lds_barriers": "assumed true for wave64; audit both host capability variants",
         },
         "compute": {
+            "initial_fp_state": initial_fp_state,
             "threads_num": [registers[offset][0] for offset in (0x207, 0x208, 0x209)],
             "dispatch_threads_num": [0, 0, 0],
             "lds_size_dwords": ((rsrc2 >> 15) & 511) * 128,

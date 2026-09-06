@@ -282,6 +282,12 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CVT_F32_UBYTE1: V_CVT_F32_UBYTE(inst, 1); return true;
 		case O::V_CVT_F32_UBYTE2: V_CVT_F32_UBYTE(inst, 2); return true;
 		case O::V_CVT_F32_UBYTE3: V_CVT_F32_UBYTE(inst, 3); return true;
+		case O::V_CVT_F64_I32: V_CVT_F64_32(inst, true); return true;
+		case O::V_CVT_F64_U32: V_CVT_F64_32(inst, false); return true;
+		case O::V_CVT_F32_F64: return FloatUnary(inst, IR::ValueOpcode::ConvertF32F64);
+		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
+		case O::V_MUL_F64: return FloatBinary(inst, IR::ValueOpcode::FPMul64, false);
+		case O::V_FMA_F64: return FloatTernary(inst, IR::ValueOpcode::FPFma64, false, false);
 		case O::V_CVT_F32_U32: V_CVT_F32_U32(inst); return true;
 		case O::V_CVT_F32_I32: V_CVT_F32_I32(inst); return true;
 		case O::V_CVT_U32_F32: V_CVT_U32_F32(inst); return true;

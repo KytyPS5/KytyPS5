@@ -530,6 +530,9 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	add_test(NAME shader_corpus_extractor
+	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ExtractShaderCorpusTests.py")
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -542,6 +545,21 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_audit_metadata
+	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ShaderAuditMetadataTests.py"
+	                 $<TARGET_FILE:shader_cfg_tests>
+	                 --output-root "${CMAKE_CURRENT_BINARY_DIR}/shader-audit-metadata")
+	set_tests_properties(shader_audit_metadata PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+	add_test(NAME shader_fma_khr_validator COMMAND $<TARGET_FILE:shader_cfg_tests> --fma-khr-validator-only)
+	set_tests_properties(shader_fma_khr_validator PROPERTIES TIMEOUT 30)
+	if(WIN32)
+		add_test(NAME shader_f64_admission
+		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-only)
+		set_tests_properties(shader_f64_admission PROPERTIES TIMEOUT 480 RUN_SERIAL TRUE)
+	else()
+		add_test(NAME shader_f64_admission
+		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-positive-only)
+	endif()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)

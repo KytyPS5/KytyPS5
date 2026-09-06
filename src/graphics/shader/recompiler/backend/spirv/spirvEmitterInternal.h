@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/F64Certificate.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -35,11 +36,13 @@ enum : uint32_t {
 	ExecutionModeDepthReplacing              = 12,
 	ExecutionModeLocalSize                   = 17,
 	ExecutionModeSignedZeroInfNanPreserve    = 4461,
+	ExecutionModeRoundingModeRTE              = 4462,
 	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
 	AddressingModelLogical                   = 0,
 	AddressingModelPhysicalStorageBuffer64   = 5348,
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
+	CapabilityFloat64                        = 10,
 	CapabilityInt64                          = 11,
 	CapabilityInt64Atomics                   = 12,
 	CapabilityImageGatherExtended            = 25,
@@ -53,6 +56,8 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
+	CapabilityRoundingModeRTE                 = 4467,
+	CapabilityFMAKHR                          = 6030,
 	CapabilityShaderViewportIndexLayerEXT    = 5254,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
@@ -72,6 +77,7 @@ enum : uint32_t {
 };
 
 enum : uint32_t {
+	DecorationNoContraction = 42,
 	DecorationBlock         = 2,
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
@@ -192,7 +198,9 @@ enum : uint32_t {
 	OpConvertUToPtr                = 120,
 	OpBitcast                      = 124,
 	OpSNegate                      = 126,
+	OpFConvert                     = 115,
 	OpFNegate                      = 127,
+	OpFmaKHR                       = 4427,
 	OpIAdd                         = 128,
 	OpFAdd                         = 129,
 	OpISub                         = 130,
@@ -357,6 +365,7 @@ struct EmitterState {
 	const IR::SpirvRequirements&                     requirements;
 	ComputeWorkgroupLayout                           compute_workgroup;
 	ComputeExecutionPlan                             compute_execution;
+	IR::F64Certificate                               f64_certificate;
 	uint32_t                                         wave_scratch_variable = 0;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
@@ -405,6 +414,7 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeNativeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);

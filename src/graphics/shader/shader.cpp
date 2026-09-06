@@ -620,6 +620,8 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 	KYTY_PROFILER_FUNCTION();
 
 	info = {};
+	info.initial_fp_state = {true, regs.gs_regs.rsrc1.float_mode, regs.gs_regs.rsrc1.ieee_mode,
+	                         regs.gs_regs.rsrc1.dx10_clamp};
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -676,6 +678,8 @@ static void ShaderGetStaticInputInfoPS(
 	KYTY_PROFILER_FUNCTION();
 
 	ps_info = {};
+	ps_info.initial_fp_state = {true, regs.ps_regs.rsrc1.float_mode, regs.ps_regs.rsrc1.ieee_mode,
+	                         regs.ps_regs.rsrc1.dx10_clamp};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
@@ -729,6 +733,8 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
 	const bool needs_lds_barriers          = info.needs_lds_barriers;
 	info = {};
+	info.initial_fp_state = {true, regs.cs_regs.float_mode, regs.cs_regs.ieee_mode,
+	                         regs.cs_regs.dx10_clamp};
 	info.dispatch_thread_dimensions = dispatch_thread_dimensions;
 	info.needs_lds_barriers          = needs_lds_barriers;
 	info.threads_num[0]      = regs.cs_regs.num_thread_x;
@@ -749,6 +755,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
@@ -790,6 +797,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.input_num);
 	key.push_back(info.ps_system_input_base);
@@ -820,6 +828,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.workgroup_register);
 	key.push_back(info.wave_size);
 	key.push_back(info.thread_ids_num);

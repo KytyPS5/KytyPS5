@@ -204,7 +204,34 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	return value;
 }
 
+IR::F64 Translator::ReadF64(const Decoder::Operand& operand) {
+	if (operand.dpp || operand.dpp8 || operand.sdwa_sel != 6u || operand.sdwa_sext ||
+	    operand.op_sel || operand.op_sel_hi || operand.negate_hi) {
+		EXIT("FP64 source selectors are not implemented");
+	}
+	if (operand.kind != Decoder::OperandKind::Sgpr &&
+	    operand.kind != Decoder::OperandKind::Vgpr) {
+		// FP64 literals have different expansion rules from integer U64 operands.
+		// Keep untested literal/inline forms explicit instead of misreading bits.
+		EXIT("FP64 arithmetic currently requires a scalar or vector register pair");
+	}
+	const auto raw = PlainOperand(operand);
+	const auto low = ReadRawU32(raw);
+	const auto high = ReadRawU32(OffsetOperand(raw, 1));
+	auto value = IR::F64(ir.Emit(IR::ValueOpcode::CompositeConstructF64, {low, high}));
+	if (operand.absolute) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPAbs64, {value}));
+	}
+	if (operand.negate) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPNeg64, {value}));
+	}
+	return value;
+}
+
 IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type) {
+	if (type == IR::Type::F64) {
+		return ReadF64(operand);
+	}
 	if (type == IR::Type::U16) {
 		return ir.Emit(IR::ValueOpcode::ConvertU16U32,
 		               {ApplyBitSourceModifiers(operand, ReadRawU32(operand))});
@@ -420,7 +447,12 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
 	}
-	if (type == IR::Type::U64) {
+	if (type == IR::Type::U64 || type == IR::Type::F64) {
+		if (type == IR::Type::F64 &&
+		    (operand.clamp || operand.omod != 0u || operand.sdwa_sel != 6u ||
+		     operand.explicit_sdwa_dst || operand.dpp || operand.dpp8)) {
+			EXIT("FP64 destination modifiers are not implemented");
+		}
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
 		return;
 	}

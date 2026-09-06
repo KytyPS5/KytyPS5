@@ -50,6 +50,10 @@ uint32_t TypeI32Pair(EmitterState& state) {
 	return state.builder.Type(OpTypeStruct, {element, element});
 }
 
+uint32_t TypeNativeF64(EmitterState& state) {
+	return state.builder.Type(OpTypeFloat, {64});
+}
+
 uint32_t TypeF32(EmitterState& state) {
 	return state.builder.Type(OpTypeFloat, {32});
 }
@@ -665,6 +669,14 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(CapabilityShader);
 	state.builder.RequireCapability(CapabilitySignedZeroInfNanPreserve);
+	if (state.f64_certificate.needs_native64) {
+		state.builder.RequireCapability(CapabilityFloat64);
+		state.builder.RequireCapability(CapabilityRoundingModeRTE);
+	}
+	if (state.f64_certificate.needs_fma64) {
+		state.builder.RequireCapability(CapabilityFMAKHR);
+		state.builder.RequireExtension("SPV_KHR_fma");
+	}
 	if (state.program.info.uses_dma) {
 		state.builder.RequireCapability(CapabilityInt64);
 		state.builder.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
@@ -721,6 +733,13 @@ void DefineModule(EmitterState& state) {
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
+	if (state.f64_certificate.needs_native64) {
+		state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 64u});
+		state.builder.AddExecutionMode({state.main_func, ExecutionModeRoundingModeRTE, 64u});
+	}
+	if (state.f64_certificate.needs_narrow_f32) {
+		state.builder.AddExecutionMode({state.main_func, ExecutionModeRoundingModeRTE, 32u});
+	}
 	if (state.stage == ShaderType::Compute) {
 		const auto& local = state.compute_workgroup.host_size;
 		state.builder.AddExecutionMode(

@@ -168,7 +168,7 @@ int KYTY_SYSV_ABI NetSocketClose(int s) {
 
 int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
                                 uint32_t optlen) {
-	return NET_CALL(Net::Setsockopt(s, level, optname, optval, optlen));
+	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {

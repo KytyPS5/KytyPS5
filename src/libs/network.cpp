@@ -14,6 +14,7 @@
 #endif
 #else
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -1901,17 +1902,21 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		}
 		return 0;
 	}
+#else
+	// Guest TCP options: IPPROTO_TCP=6, TCP_NODELAY=1.
+	if (level != 6 || optname != 1) {
+		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
+	}
+	level   = IPPROTO_TCP;
+	optname = TCP_NODELAY;
+#endif
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
-	                 static_cast<const char*>(optval), static_cast<int>(optlen)) == SOCKET_ERROR) {
+	                 static_cast<const char*>(optval), static_cast<SocketLength>(optlen)) != 0) {
 		return SetHostSocketError();
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int64_t KYTY_SYSV_ABI Send(int s, const void* buf, uint64_t len, int flags) {

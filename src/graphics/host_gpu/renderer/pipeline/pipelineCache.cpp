@@ -455,14 +455,14 @@ void PipelineCache::InitializeDriverCache() {
 	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
-		                 VulkanToString(result));
+		                 vk::to_string(result));
 		initial_data.clear();
 		create.initialDataSize = 0;
 		create.pInitialData    = nullptr;
 		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
 	}
 	if (result != vk::Result::eSuccess) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", VulkanToString(result));
+		PipelineCacheLog("Vulkan pipeline cache: disabled ({})", vk::to_string(result));
 		m_driver_cache = nullptr;
 		return;
 	}
@@ -499,7 +499,7 @@ void PipelineCache::Save() {
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 VulkanToString(result), size);
+		                 vk::to_string(result), size);
 		return;
 	}
 	payload.resize(size);
@@ -590,7 +590,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
-	input_info.host_subgroup_size = m_graphics.compute_wave64_supported ? 64u : 32u;
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;

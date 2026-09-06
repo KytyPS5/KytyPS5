@@ -206,7 +206,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	const auto format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
 	if (format == vk::Format::eUndefined) {
 		DepthFatal("no host depth/stencil format supports required usage for %s",
-		           VulkanToString(ideal_format).c_str());
+		           vk::to_string(ideal_format).c_str());
 	}
 	const auto     guest_format = policy->guest_format;
 	const uint32_t bytes        = policy->bytes_per_element;

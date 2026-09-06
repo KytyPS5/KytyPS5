@@ -19,11 +19,11 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
                        uint32_t arg3, uint64_t arg4) {
 	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
 	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	     what, VulkanToString(result).c_str(), static_cast<int>(result), tick, debug_op,
+	     what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	     debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::printf("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
 	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	            what, VulkanToString(result).c_str(), static_cast<int>(result), tick, debug_op,
+	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
 }

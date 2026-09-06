@@ -25,10 +25,6 @@ namespace Libs::Graphics {
 
 using VulkanMemoryBarrier = vk::MemoryBarrier;
 
-std::string VulkanToString(vk::Result value);
-std::string VulkanToString(vk::Format value);
-std::string VulkanToString(vk::ImageLayout value);
-std::string VulkanToString(vk::QueueFlags value);
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 

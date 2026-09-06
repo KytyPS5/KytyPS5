@@ -133,7 +133,7 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 	    " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
 	    log_id, draw_name, RenderColorTypeName(color), color.desc.info.data.address,
 	    color.desc.info.data.size, color.image_id ? "yes" : "no",
-	    VulkanToString(depth.desc.view_info.format).c_str(), depth.image_id ? "yes" : "no",
+	    vk::to_string(depth.desc.view_info.format).c_str(), depth.image_id ? "yes" : "no",
 	    static_cast<int>(!depth.desc.info.data.Empty()) +
 	        static_cast<int>(depth.desc.info.HasStencil()),
 	    ctx.GetRenderTargetMask(), static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);

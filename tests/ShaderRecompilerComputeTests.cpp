@@ -892,7 +892,7 @@ std::string Hex(u32 value) {
 }
 
 std::string VulkanResultName(vk::Result result) {
-  return VulkanToString(result);
+  return vk::to_string(result);
 }
 
 [[noreturn]] void Fail(const char *shader_name, const char *stage,

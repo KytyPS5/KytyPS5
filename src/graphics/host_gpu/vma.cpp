@@ -71,7 +71,7 @@ bool GraphicContext::CreateAllocator() {
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
-		LOGF("vmaCreateAllocator failed: %s\n", VulkanToString(result).c_str());
+		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
 	return true;

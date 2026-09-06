@@ -31,7 +31,6 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
-	bool                               compute_wave64_supported              = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -80,6 +79,10 @@ struct GraphicContext {
 			*properties = it->second.second;
 		}
 		return it->second.first;
+	}
+
+	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
+		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

@@ -143,7 +143,7 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 		                     "vkGetPhysicalDeviceSurfaceSupportKHR");
 
 		LOGF("\tqueue family: %s [count = %u], [present = %s]\n",
-		     VulkanToString(properties.queueFlags).c_str(), properties.queueCount,
+		     vk::to_string(properties.queueFlags).c_str(), properties.queueCount,
 		     (presentation_supported == VK_TRUE ? "true" : "false"));
 		if (properties.queueCount != 0 && (properties.queueFlags & required) == required &&
 		    presentation_supported == VK_TRUE) {
@@ -525,14 +525,12 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
-	graphics.compute_wave64_supported =
-	    graphics.subgroup_size == 64u || graphics.compute_subgroup_size_control_enabled;
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
-	     graphics.compute_wave64_supported ? "true" : "false");
+	     graphics.SupportsComputeWave64() ? "true" : "false");
 }
 
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
@@ -724,7 +722,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkCreateDevice failed: %s\n", VulkanToString(result).c_str());
+		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
 		return nullptr;
 	}
 
@@ -903,7 +901,7 @@ static void VulkanCheckInstanceVersion() {
 	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion != nullptr) {
 		auto result = vk::enumerateInstanceVersion(&version);
 		if (result != vk::Result::eSuccess) {
-			EXIT("Could not query Vulkan loader version: %s\n", VulkanToString(result).c_str());
+			EXIT("Could not query Vulkan loader version: %s\n", vk::to_string(result).c_str());
 		}
 	}
 

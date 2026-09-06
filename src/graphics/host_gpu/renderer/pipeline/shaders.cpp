@@ -103,7 +103,7 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		size   = 4;
 		if (NarrowInputFormat(format, size, used_components)) {
 			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
-			     VulkanToString(format).c_str(), used_components);
+			     vk::to_string(format).c_str(), used_components);
 		}
 		return;
 	}
@@ -117,7 +117,7 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		size   = 2;
 		if (NarrowInputFormat(format, size, used_components)) {
 			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
-			     VulkanToString(format).c_str(), used_components);
+			     vk::to_string(format).c_str(), used_components);
 		}
 		return;
 	}
@@ -450,7 +450,7 @@ void CreatePipelineInternal(
 		    graphics.device.createShaderModule(&create_info, nullptr, &tess_control_shader_module);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done result=%s module=%p\n",
-			     VulkanToString(result).c_str(), static_cast<void*>(tess_control_shader_module));
+			     vk::to_string(result).c_str(), static_cast<void*>(tess_control_shader_module));
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -460,7 +460,7 @@ void CreatePipelineInternal(
 		    graphics.device.createShaderModule(&create_info, nullptr, &tess_eval_shader_module);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done result=%s module=%p\n",
-			     VulkanToString(result).c_str(), static_cast<void*>(tess_eval_shader_module));
+			     vk::to_string(result).c_str(), static_cast<void*>(tess_eval_shader_module));
 		}
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
@@ -678,7 +678,7 @@ void CreatePipelineInternal(
 	                                              &pipeline.pipeline_layout);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-		     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -771,7 +771,7 @@ void CreatePipelineInternal(
 	                                                 &pipeline.pipeline);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
-		     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline));
+		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -824,7 +824,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                  &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
@@ -841,7 +841,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

@@ -12073,8 +12073,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int RunShaderBatchAudit(int argc, char* argv[]);
+
+int main(int argc, char* argv[]) {
   using namespace Libs::Graphics;
+
+  if (argc > 1 && std::strcmp(argv[1], "--audit-shader") == 0) {
+    return RunShaderBatchAudit(argc, argv);
+  }
 
   EnsureConfigInitialized();
   TestResourceDescriptorClassification();

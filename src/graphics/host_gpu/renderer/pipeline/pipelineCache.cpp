@@ -19,12 +19,15 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fmt/format.h>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -77,6 +80,87 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
+
+void CaptureDispatchedShader(const ShaderParams& params,
+                             const ShaderRecompiler::CompileOptions& options,
+                             std::span<const uint32_t> static_state) {
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
+	try {
+		const char* stage = options.stage == ShaderType::Compute ? "compute"
+		                    : options.stage == ShaderType::Vertex ? "vertex"
+		                    : options.stage == ShaderType::Pixel ? "pixel" : "unknown";
+		const auto content_hash = XXH3_64bits(params.code.data(), params.code.size_bytes());
+		const auto state_hash = XXH3_64bits(static_state.data(), static_state.size_bytes());
+		const auto stem = fmt::format("{}_{:016x}_{:016x}", stage, options.shader_hash, state_hash);
+		const auto directory = Config::GetShaderLogFolder() / "dispatched";
+		if (!Common::File::CreateDirectories(directory) && !Common::File::IsDirectoryExisting(directory)) {
+			LOGF("Shader capture: cannot create directory %s\n", Common::PathToString(directory).c_str());
+			return;
+		}
+		nlohmann::ordered_json metadata {
+		    {"schema_version", 1},
+		    {"kind", "dispatched"},
+		    {"stage", stage},
+		    {"shader_hash", fmt::format("{:016x}", options.shader_hash)},
+		    {"content_hash_xxh3_64", fmt::format("{:016x}", content_hash)},
+		    {"static_state_hash_xxh3_64", fmt::format("{:016x}", state_hash)},
+		    {"code_file", stem + ".bin"},
+		    {"code_size_bytes", params.code.size_bytes()},
+		    {"wave_size", options.wave_size},
+		    {"user_data_base", options.user_data_base},
+		    {"user_data_count", options.user_data.size()},
+		    {"scratch_dwords", options.scratch_dwords},
+		    {"metadata_complete", false},
+		    {"static_state", std::vector<uint32_t>(static_state.begin(), static_state.end())},
+		};
+		if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr) {
+			const auto& input = *options.input_info.compute;
+			metadata["metadata_complete"] = true;
+			metadata["compute"] = {
+			    {"threads_num", std::array {input.threads_num[0], input.threads_num[1], input.threads_num[2]}},
+			    {"dispatch_threads_num", std::array {input.dispatch_threads_num[0], input.dispatch_threads_num[1], input.dispatch_threads_num[2]}},
+			    {"lds_size_dwords", input.lds_size_dwords},
+			    {"scratch_size_dwords", input.scratch_size_dwords},
+			    {"group_id", std::array {input.group_id[0], input.group_id[1], input.group_id[2]}},
+			    {"dispatch_thread_dimensions", input.dispatch_thread_dimensions},
+			    {"needs_lds_barriers", input.needs_lds_barriers},
+			    {"wave_size", input.wave_size},
+			    {"thread_ids_num", input.thread_ids_num},
+			    {"workgroup_register", input.workgroup_register},
+			    {"tg_size_en", input.tg_size_en},
+			};
+			metadata["compute_workgroup_limits"] = {
+			    {"max_size", options.compute_workgroup_limits.max_size},
+			    {"max_invocations", options.compute_workgroup_limits.max_invocations},
+			};
+		}
+		const auto json = metadata.dump(2) + '\n';
+		const auto write = [&](const std::filesystem::path& path, const void* data, size_t size) {
+			if (size > UINT32_MAX) {
+				return false;
+			}
+			Common::File file(path);
+			if (file.IsInvalid()) {
+				return false;
+			}
+			uint32_t written = 0;
+			file.Write(data, static_cast<uint32_t>(size), &written);
+			return written == size && file.Flush();
+		};
+		// Write the JSON last so a new manifest never advertises an unfinished binary. This
+		// capture precedes translation: even a fatal frontend error leaves a replayable record.
+		if (!write(directory / (stem + ".bin"), params.code.data(), params.code.size_bytes()) ||
+		    !write(directory / (stem + ".json"), json.data(), json.size())) {
+			LOGF("Shader capture: cannot write dispatched shader %s\n", stem.c_str());
+		}
+	} catch (const std::exception& error) {
+		LOGF("Shader capture: cannot capture dispatched shader: %s\n", error.what());
+	} catch (...) {
+		LOGF("Shader capture: cannot capture dispatched shader: unknown exception\n");
+	}
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -334,6 +418,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size      = input_info.wave_size;
 			options.compute_workgroup_limits = compute_workgroup_limits;
 		}
+		CaptureDispatchedShader(params, options, lookup_key.static_state);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);

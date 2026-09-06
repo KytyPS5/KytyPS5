@@ -1051,6 +1051,16 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
 
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: {
+			// Stub : sémantique inerte « aucune intersection » — 4 canaux 0xFFFFFFFF
+			// (pointeur d'enfant absent pour un nœud boîte / temps NaN pour un nœud triangle)
+			const auto memory = MemoryInfoFromDecoded(inst);
+			const auto result = ir.Emit(IR::ValueOpcode::ImageBvhIntersectRay);
+			WriteImageComponents(inst.dst, result, memory, 4u);
+			return true;
+		}
+
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);
 		case Decoder::Opcode::DS_MAX_F32:

@@ -8736,6 +8736,236 @@ void TestComputeExecutionConvergenceProof() {
   }
 }
 
+bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
+                                  uint32_t lds_dwords) {
+  struct Instruction {
+    uint32_t opcode;
+    std::vector<uint32_t> args;
+  };
+  std::vector<Instruction> instructions;
+  std::unordered_map<uint32_t, uint32_t> constants, arrays, pointees, pointer_bases;
+  std::unordered_map<uint32_t, size_t> labels;
+  std::vector<std::pair<uint32_t, uint32_t>> workgroup_variables;
+  if (binary.size() < 5 || binary[0] != 0x07230203u) return false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16;
+    if (words == 0 || words > binary.size() - offset) return false;
+    const uint32_t op = binary[offset] & 0xffffu;
+    std::vector<uint32_t> args(binary.begin() + offset + 1,
+                               binary.begin() + offset + words);
+    if (op == 43u && args.size() == 3) constants[args[1]] = args[2];
+    if (op == 28u && args.size() == 3) arrays[args[0]] = args[2];
+    if (op == 32u && args.size() == 3) pointees[args[0]] = args[2];
+    if (op == 59u && args.size() >= 3 && args[2] == 4u)
+      workgroup_variables.emplace_back(args[1], args[0]);
+    if ((op == 65u || op == 66u || op == 67u) && args.size() >= 3)
+      pointer_bases[args[1]] = args[2];
+    if (op == 83u && args.size() == 3) pointer_bases[args[1]] = args[2];
+    if (op == 248u && args.size() == 1) labels[args[0]] = instructions.size();
+    instructions.push_back({op, std::move(args)});
+    offset += words;
+  }
+  // Identify storage from OpVariable -> OpTypePointer -> OpTypeArray -> length.
+  // The fixture reserves 128 guest DWORDs and the software wave has 64 slots;
+  // neither debug names nor the order of variable declarations is significant.
+  uint32_t lds = 0, wave = 0;
+  for (const auto& [variable, type] : workgroup_variables) {
+    const auto pointer = pointees.find(type);
+    if (pointer == pointees.end()) return false;
+    const auto array = arrays.find(pointer->second);
+    if (array == arrays.end()) return false;
+    const auto length = constants.find(array->second);
+    if (length == constants.end()) return false;
+    if (length->second == lds_dwords) {
+      if (lds != 0) return false;
+      lds = variable;
+    } else if (length->second == 64u) {
+      if (wave != 0) return false;
+      wave = variable;
+    }
+  }
+  if (lds == 0 || wave == 0 || lds == wave) return false;
+  const auto root = [&](uint32_t pointer) {
+    std::unordered_set<uint32_t> seen;
+    while (pointer_bases.contains(pointer)) {
+      if (!seen.insert(pointer).second) return 0u;
+      pointer = pointer_bases.at(pointer);
+    }
+    return pointer;
+  };
+  std::vector<size_t> accesses;
+  std::vector<std::vector<size_t>> edges(instructions.size());
+  const auto add_label_edge = [&](size_t from, uint32_t label) {
+    const auto found = labels.find(label);
+    if (found == labels.end()) return false;
+    edges[from].push_back(found->second);
+    return true;
+  };
+  const auto barrier = [&](size_t index) {
+    const auto& inst = instructions[index];
+    if (inst.opcode != 224u || inst.args.size() != 3) return false;
+    const auto execution = constants.find(inst.args[0]);
+    const auto memory = constants.find(inst.args[1]);
+    const auto semantics = constants.find(inst.args[2]);
+    return execution != constants.end() && execution->second == 2u &&
+           memory != constants.end() && memory->second == 2u &&
+           semantics != constants.end() && (semantics->second & 0x108u) == 0x108u;
+  };
+  for (size_t index = 0; index < instructions.size(); ++index) {
+    const auto& inst = instructions[index];
+    const auto& args = inst.args;
+    if (inst.opcode == 61u && args.size() >= 3 && root(args[2]) == lds)
+      accesses.push_back(index);
+    if (inst.opcode == 62u && args.size() >= 2 && root(args[0]) == lds)
+      accesses.push_back(index);
+    if (inst.opcode == 249u) {
+      if (args.size() != 1 || !add_label_edge(index, args[0])) return false;
+    } else if (inst.opcode == 250u) {
+      if (args.size() < 3 || !add_label_edge(index, args[1]) ||
+          !add_label_edge(index, args[2])) return false;
+    } else if (inst.opcode == 251u || inst.opcode == 246u) {
+      // The bounded fixture has neither switches nor loops.
+      return false;
+    } else if (inst.opcode != 253u && inst.opcode != 254u &&
+               inst.opcode != 255u && inst.opcode != 56u &&
+               index + 1 < instructions.size()) {
+      edges[index].push_back(index + 1);
+    }
+  }
+  // Full initialization followed by the sparse body W/R/W/R.
+  const uint32_t expected_ops[] = {62u, 62u, 61u, 62u, 61u};
+  if (accesses.size() != std::size(expected_ops)) return false;
+  for (size_t i = 0; i < accesses.size(); ++i)
+    if (instructions[accesses[i]].opcode != expected_ops[i]) return false;
+
+  const auto reachable = [&](size_t start, size_t target, bool stop_at_barrier) {
+    std::vector<size_t> pending{start};
+    std::unordered_set<size_t> seen;
+    while (!pending.empty()) {
+      const auto index = pending.back();
+      pending.pop_back();
+      if (!seen.insert(index).second) continue;
+      if (index == target) return true;
+      if (stop_at_barrier && barrier(index)) continue;
+      for (const auto next : edges[index]) pending.push_back(next);
+    }
+    return false;
+  };
+  for (size_t i = 1; i + 1 < accesses.size(); ++i) {
+    // A barrier must cut every path between each RAW/WAR/RAW pair. A missing
+    // path is also an error, rather than a vacuous synchronization success.
+    if (!reachable(accesses[i] + 1, accesses[i + 1], false) ||
+        reachable(accesses[i] + 1, accesses[i + 1], true)) return false;
+  }
+  // This straight-line IR has no guest branch: emitted selections are the
+  // per-lane memory guards. Even a selection containing only a barrier is
+  // unsafe. Walk both arms up to each merge, excluding the preceding header.
+  for (size_t index = 0; index < instructions.size(); ++index) {
+    const auto& inst = instructions[index];
+    if (inst.opcode != 247u) continue;
+    if (inst.args.size() != 2 || !labels.contains(inst.args[0]) ||
+        index + 1 >= instructions.size() || instructions[index + 1].opcode != 250u)
+      return false;
+    const size_t merge = labels.at(inst.args[0]);
+    std::vector<size_t> pending = edges[index + 1];
+    std::unordered_set<size_t> region;
+    while (!pending.empty()) {
+      const auto next = pending.back();
+      pending.pop_back();
+      if (next == merge || !region.insert(next).second) continue;
+      for (const auto successor : edges[next]) pending.push_back(successor);
+    }
+    for (const auto member : region) if (barrier(member)) return false;
+  }
+  return true;
+}
+
+void TestSingleWaveLdsSpirvPhaseOrdering() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* block = AddExecutionPlanBlock(program);
+  program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+  const auto emit = [&](O op, std::initializer_list<IR::Value> args = {}) {
+    return IR::Value(&block->AppendNewInst(op, args));
+  };
+  const auto lane = emit(O::LaneId);
+  const auto own = emit(O::ShiftLeftLogical32, {lane, IR::Value(2u)});
+  const auto peer = emit(O::ShiftLeftLogical32,
+      {emit(O::BitwiseXor32, {lane, IR::Value(32u)}), IR::Value(2u)});
+  const auto active = emit(O::ULessThan32, {lane, IR::Value(48u)});
+  const auto write = [&](uint32_t value, IR::Value exec) {
+    auto& inst = block->AppendNewInst(O::WriteSharedU32, {own, IR::Value(value), exec});
+    inst.SetFlags(IR::MemoryFlags{.index = 0});
+  };
+  const auto read = [&] {
+    auto& inst = block->AppendNewInst(O::LoadSharedU32, {peer, active});
+    inst.SetFlags(IR::MemoryFlags{.index = 0});
+    block->AppendNewInst(O::ReferenceU32, {IR::Value(&inst)});
+  };
+  write(1000u, IR::Value(true));
+  const auto ballot = emit(O::Ballot, {active});
+  emit(O::ReferenceU32, {emit(O::CompositeExtractU32x4, {ballot, IR::Value(1u)})});
+  write(2000u, active);
+  read();
+  write(3000u, active);
+  read();
+  IR::ValidateProgram(program, true);
+  IR::BuildSrtPlan(program);
+  IR::TrackResources(program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.wave_size = 64;
+  compute.lds_size_dwords = 128;
+  compute.needs_lds_barriers = false;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  TranslateResult translated;
+  translated.program = std::move(program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  Check(SpirvLdsPhasesAreSynchronized(compiled.spirv, 128),
+        "guest LDS RAW/WAR ordering needs workgroup barriers outside sparse-EXEC guards");
+  // Execution rendezvous alone is insufficient: the checker must also require
+  // LDS availability/visibility, not just the presence of OpControlBarrier.
+  auto missing_memory_order = compiled.spirv;
+  std::unordered_set<uint32_t> unsigned_word_types;
+  for (size_t offset = 5; offset < missing_memory_order.size();) {
+    const auto words = missing_memory_order[offset] >> 16;
+    if ((missing_memory_order[offset] & 0xffffu) == 21u && words == 4 &&
+        missing_memory_order[offset + 2] == 32u &&
+        missing_memory_order[offset + 3] == 0u)
+      unsigned_word_types.insert(missing_memory_order[offset + 1]);
+    offset += words;
+  }
+  uint32_t zero = 0;
+  for (size_t offset = 5; offset < missing_memory_order.size();) {
+    const auto words = missing_memory_order[offset] >> 16;
+    if ((missing_memory_order[offset] & 0xffffu) == 43u && words == 4 &&
+        unsigned_word_types.contains(missing_memory_order[offset + 1]) &&
+        missing_memory_order[offset + 3] == 0)
+      zero = missing_memory_order[offset + 2];
+    offset += words;
+  }
+  Check(zero != 0, "LDS ordering fixture has no zero constant for its negative control");
+  for (size_t offset = 5; offset < missing_memory_order.size();) {
+    const auto words = missing_memory_order[offset] >> 16;
+    if ((missing_memory_order[offset] & 0xffffu) == 224u && words == 4)
+      missing_memory_order[offset + 3] = zero;
+    offset += words;
+  }
+  CheckSpirvBinaryValidates(missing_memory_order);
+  Check(!SpirvLdsPhasesAreSynchronized(missing_memory_order, 128),
+        "LDS ordering checker accepted barriers without WorkgroupMemory ordering");
+}
+
 void TestComputeExecutionWaveScratchBudget() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
@@ -12913,6 +13143,7 @@ int main(int argc, char* argv[]) {
   TestComputeWorkgroupPlanningBoundaries();
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
+  TestSingleWaveLdsSpirvPhaseOrdering();
   TestComputeExecutionWaveScratchBudget();
   TestComputeExecutionSingleWaveLds();
   TestComputeExecutionUnusedMemoryDeclarations();

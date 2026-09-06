@@ -139,6 +139,13 @@ uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32
 	return TypePointer(state, storage_class, array);
 }
 
+uint32_t TypeScalarU64ArrayPointer(EmitterState& state, uint32_t storage_class,
+                                   uint32_t elements) {
+	const auto count = ConstantU32(state, std::max(elements, 1u));
+	const auto array = state.builder.Type(OpTypeArray, {TypeScalarU64(state), count});
+	return TypePointer(state, storage_class, array);
+}
+
 uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class) {
 	return TypePointer(state, storage_class, TypeU32(state));
 }
@@ -701,7 +708,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics) {
+	if (state.requirements.buffer_int64_atomics ||
+	    state.requirements.shared_int64_atomics) {
 		state.builder.RequireCapability(CapabilityInt64);
 		state.builder.RequireCapability(CapabilityInt64Atomics);
 	}

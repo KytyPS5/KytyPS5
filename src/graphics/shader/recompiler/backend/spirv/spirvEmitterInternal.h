@@ -175,6 +175,8 @@ enum : uint32_t {
 	OpArrayLength                  = 68,
 	OpDecorate                     = 71,
 	OpMemberDecorate               = 72,
+	OpVectorExtractDynamic         = 77,
+	OpVectorInsertDynamic          = 78,
 	OpVectorShuffle                = 79,
 	OpCompositeConstruct           = 80,
 	OpCompositeExtract             = 81,
@@ -434,6 +436,8 @@ uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
+uint32_t TypeScalarU64ArrayPointer(EmitterState& state, uint32_t storage_class,
+                                   uint32_t elements);
 uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
@@ -838,7 +842,8 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 }
 
 template <typename Fn>
-uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+uint32_t AtomicUpdateTyped(EmitterState& state, uint32_t pointer, IR::ResourceKind kind,
+                           uint32_t type, Fn&& desired) {
 	const auto scope = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
@@ -856,14 +861,14 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto exchanged = state.builder.AllocateId();
 	state.builder.AddFunction({OpBranch, preheader});
 	EmitLabel(state, preheader);
-	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
+	state.builder.AddFunction({OpAtomicLoad, type, initial, pointer,
 	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
 	state.builder.AddFunction({OpBranch, header});
 	EmitLabel(state, header);
 	state.builder.AddFunction(
-	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
+	    {OpPhi, type, observed, initial, preheader, exchanged, cont});
 	const auto next = desired(observed);
-	state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+	state.builder.AddFunction({OpAtomicCompareExchange, type, exchanged, pointer,
 	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
 	                           ConstantU32(state, MemorySemanticsNone), next, observed});
 	const auto success = state.builder.AllocateId();
@@ -876,6 +881,11 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
 	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
 	return observed;
+}
+
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	return AtomicUpdateTyped(state, pointer, kind, TypeU32(state), std::forward<Fn>(desired));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

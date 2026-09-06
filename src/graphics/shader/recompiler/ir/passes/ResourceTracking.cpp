@@ -88,6 +88,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.writes_dma = false;
 	}
 
 	void Run() {
@@ -1203,6 +1204,7 @@ private:
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			m_info.uses_dma = true;
+			m_info.writes_dma |= address_info.access == AddressAccess::Write;
 			return;
 		}
 

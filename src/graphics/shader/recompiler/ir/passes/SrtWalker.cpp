@@ -985,6 +985,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			auto&      selected = clean ? clean_evaluator : evaluator;
 			if (read.flat_offset >= flattened.size() ||
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
+				const auto message = Diagnostic(
+				    program, 0u,
+				    fmt::format("flattened SRT slot {} evaluation failed (clean={})",
+				                read.flat_offset, clean ? 1u : 0u));
+				std::fprintf(stderr, "%s\n", message.c_str());
 				return false;
 			}
 		}

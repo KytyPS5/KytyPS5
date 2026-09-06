@@ -318,6 +318,55 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = EmitMemoryElementIndex(ctx.state, resource, raw_index)};
 }
 
+bool UsesPackedLds64(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return resource.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics;
+}
+
+uint32_t PackedLds64Pointer(EmitterState& state, uint32_t object_pointer,
+                            uint32_t dword_index) {
+	const auto packed_index = Binary(state, OpShiftRightLogical, TypeU32(state), dword_index,
+	                                 ConstantU32(state, 1u));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpAccessChain, TypePointer(state, StorageClassWorkgroup, TypeScalarU64(state)), pointer,
+	     object_pointer, packed_index});
+	return pointer;
+}
+
+uint32_t PackedLdsWordIndex(EmitterState& state, uint32_t dword_index) {
+	return Binary(state, OpBitwiseAnd, TypeU32(state), dword_index, ConstantU32(state, 1u));
+}
+
+uint32_t ExtractPackedLdsWord(EmitterState& state, uint32_t packed_value,
+                              uint32_t dword_index) {
+	const auto words = Unary(state, OpBitcast, TypeU64(state), packed_value);
+	const auto word  = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpVectorExtractDynamic, TypeU32(state), word, words, PackedLdsWordIndex(state, dword_index)});
+	return word;
+}
+
+uint32_t ReplacePackedLdsWord(EmitterState& state, uint32_t packed_value,
+                              uint32_t dword_index, uint32_t word) {
+	const auto words   = Unary(state, OpBitcast, TypeU64(state), packed_value);
+	const auto updated = state.builder.AllocateId();
+	state.builder.AddFunction({OpVectorInsertDynamic, TypeU64(state), updated, words, word,
+	                           PackedLdsWordIndex(state, dword_index)});
+	return Unary(state, OpBitcast, TypeScalarU64(state), updated);
+}
+
+template <typename Fn>
+uint32_t AtomicUpdatePackedLdsWord(EmitterState& state, uint32_t object_pointer,
+                                   uint32_t dword_index, Fn&& desired) {
+	const auto old_packed = AtomicUpdateTyped(
+	    state, PackedLds64Pointer(state, object_pointer, dword_index), IR::ResourceKind::Lds,
+	    TypeScalarU64(state), [&](uint32_t packed) {
+		    const auto old_word = ExtractPackedLdsWord(state, packed, dword_index);
+		    return ReplacePackedLdsWord(state, packed, dword_index, desired(old_word));
+	    });
+	return ExtractPackedLdsWord(state, old_packed, dword_index);
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
 
@@ -355,6 +404,15 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
+	if (UsesPackedLds64(ctx.state, resource)) {
+		const auto packed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpAtomicLoad, TypeScalarU64(ctx.state), packed,
+		     PackedLds64Pointer(ctx.state, resource.object_pointer, index),
+		     ConstantU32(ctx.state, ScopeWorkgroup),
+		     ConstantU32(ctx.state, MemorySemanticsNone)});
+		return ExtractPackedLdsWord(ctx.state, packed, index);
+	}
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
@@ -514,7 +572,6 @@ bool LdsHasCompetingInvocations(const EmitterState& state) {
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
-	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	const auto shift   = Binary(
 	    ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
 	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address, ConstantU32(ctx.state, 3)),
@@ -531,6 +588,11 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		                     Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
 		              value);
 	};
+	if (UsesPackedLds64(ctx.state, resource)) {
+		AtomicUpdatePackedLdsWord(ctx.state, resource.object_pointer, index, merge);
+		return;
+	}
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (mem.kind == IR::ResourceKind::Scratch ||
 	    (mem.kind == IR::ResourceKind::Lds && !LdsHasCompetingInvocations(ctx.state))) {
 		// Private storage has no other writer that could be lost by this RMW.
@@ -564,6 +626,11 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
 	auto& state = ctx.state;
+	if (UsesPackedLds64(state, resource)) {
+		AtomicUpdatePackedLdsWord(state, resource.object_pointer, index,
+		                         [&](uint32_t) { return data; });
+		return;
+	}
 	const auto pointer = EmitMemoryElementPointer(state, resource, index);
 	if (resource.kind == IR::ResourceKind::Lds && LdsHasCompetingInvocations(state)) {
 		// Guest LDS serializes competing DWORD writes. Plain Vulkan stores would
@@ -628,7 +695,8 @@ uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
-		case IR::ValueOpcode::SharedAtomicIAdd32: return OpAtomicIAdd;
+		case IR::ValueOpcode::SharedAtomicIAdd32:
+		case IR::ValueOpcode::SharedAtomicIAdd64: return OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
 		case IR::ValueOpcode::SharedAtomicISub32: return OpAtomicISub;
 		case IR::ValueOpcode::BufferAtomicSMin32:
@@ -643,7 +711,8 @@ uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::SharedAtomicAnd32: return OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
-		case IR::ValueOpcode::SharedAtomicOr32: return OpAtomicOr;
+		case IR::ValueOpcode::SharedAtomicOr32:
+		case IR::ValueOpcode::SharedAtomicOr64: return OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return OpAtomicXor;
 		default: return 0;
@@ -669,6 +738,38 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	return old;
 }
 
+uint32_t EmitSharedAtomicReplacement(ValueEmitContext& ctx, const IR::Inst& inst,
+                                     uint32_t old) {
+	auto&      state  = ctx.state;
+	const auto source = ctx.Arg(inst, inst.NumArgs() - 2);
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::SharedAtomicSwap32: return source;
+		case IR::ValueOpcode::SharedAtomicIAdd32:
+			return Binary(state, OpIAdd, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicISub32:
+			return Binary(state, OpISub, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicSMin32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpSLessThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicUMin32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpULessThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicSMax32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpSGreaterThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicUMax32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpUGreaterThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicAnd32:
+			return Binary(state, OpBitwiseAnd, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicOr32:
+			return Binary(state, OpBitwiseOr, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicXor32:
+			return Binary(state, OpBitwiseXor, TypeU32(state), old, source);
+		default: ctx.Fail(inst, "unsupported packed LDS atomic operation");
+	}
+}
+
 uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	const auto result =
 	    EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -676,6 +777,11 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 		    return EmitValueOrZeroIfCondition(
 		        ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
 		        [&]() {
+			        if (UsesPackedLds64(ctx.state, access.resource)) {
+				        return AtomicUpdatePackedLdsWord(
+				            ctx.state, access.resource.object_pointer, access.index,
+				            [&](uint32_t old) { return EmitSharedAtomicReplacement(ctx, inst, old); });
+			        }
 			        const auto scope =
 			            mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
 			        const auto pointer =
@@ -724,6 +830,36 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 	    });
 }
 
+void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
+                        const IR::MemoryInfo& mem) {
+	auto& state = ctx.state;
+	if (mem.kind != IR::ResourceKind::Lds || state.stage != ShaderType::Compute ||
+	    !state.requirements.shared_int64_atomics) {
+		ctx.Fail(inst, "64-bit shared atomic has no packed compute LDS storage");
+	}
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		const auto high_index =
+		    Binary(state, OpIAdd, TypeU32(state), access.index, ConstantU32(state, 1u));
+		const auto in_bounds =
+		    AndCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
+		                 EmitMemoryElementInBounds(state, access.resource, high_index));
+		EmitIfCondition(state, in_bounds, [&]() {
+			const auto value = Unary(state, OpBitcast, TypeScalarU64(state),
+			                         ctx.Arg(inst, inst.NumArgs() - 2));
+			const auto old = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
+			     PackedLds64Pointer(state, access.resource.object_pointer, access.index),
+			     ConstantU32(state, ScopeWorkgroup),
+			     ConstantU32(state, MemorySemanticsNone), value});
+			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, semantics)});
+		});
+	});
+}
+
 uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      bool max_value) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -751,9 +887,7 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 			    const auto data = ctx.state.builder.AllocateId();
 			    ctx.state.builder.AddFunction(
 			        {OpLoad, TypeU32(ctx.state), data, ctx.scratch_u32_variable});
-			    AtomicUpdate(
-			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-			        mem.kind, [&](uint32_t old) {
+			    const auto replacement = [&](uint32_t old) {
 				        const auto old_f = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), old);
 				        const auto compare_f =
 				            Unary(ctx.state, OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
@@ -764,7 +898,15 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 				                   max_value ? compare_f : old_f);
 				        return Unary(ctx.state, OpBitcast, TypeU32(ctx.state),
 				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
-			        });
+			    };
+			    if (UsesPackedLds64(ctx.state, access.resource)) {
+				    AtomicUpdatePackedLdsWord(ctx.state, access.resource.object_pointer,
+				                              access.index, replacement);
+			    } else {
+				    AtomicUpdate(
+				        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+				        mem.kind, replacement);
+			    }
 		    });
 	});
 	return 0;
@@ -1255,12 +1397,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto shared_components = IR::SharedComponentCount(op);
 	if (shared_components > 1u) {
-		if (IR::SharedAccessOf(op) == IR::SharedAccess::Read) {
+		const auto access = IR::SharedAccessOf(op);
+		if (access == IR::SharedAccess::Read) {
 			ctx.Define(inst, LoadWideShared(ctx, inst, shared_components));
-		} else {
-			StoreWideShared(ctx, inst, shared_components);
+			return true;
 		}
-		return true;
+		if (access == IR::SharedAccess::Write) {
+			StoreWideShared(ctx, inst, shared_components);
+			return true;
+		}
 	}
 	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::ReadConstBuffer) &&
 	    ctx.Memory(inst).planning_only) {
@@ -1288,13 +1433,21 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto access    = PrepareMemoryResourceAccess(state, mem);
 		const auto element   = EmitMemoryElementIndex(state, access, index);
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
+		auto value = EmitValueOrZeroIfCondition(state, condition, [&]() {
 			           const auto value = state.builder.AllocateId();
 			           state.builder.AddFunction(
 			               {OpLoad, TypeU32(state), value,
 			                EmitMemoryElementPointer(state, access, element)});
 			           return value;
-		           }));
+		           });
+		if (state.compute_execution.IsSplitWave64() &&
+		    !state.compute_execution.IsCooperativeWave64()) {
+			// SMEM produces one value per logical guest wave. The host storage
+			// instruction is per invocation, so publish lane zero to both native32
+			// halves before scalar results can control guest flow.
+			value = EmitWaveReadLane(state, value, ConstantU32(state, 0));
+		}
+		ctx.Define(inst, value);
 		return true;
 	}
 	const auto address_info = IR::AddressOpcodeInfoOf(op);
@@ -1343,6 +1496,11 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	const auto atomic_opcode = SpirvAtomicOpcode(op);
+	if (op == IR::ValueOpcode::SharedAtomicIAdd64 ||
+	    op == IR::ValueOpcode::SharedAtomicOr64) {
+		EmitSharedAtomic64(ctx, inst, ctx.Memory(inst));
+		return true;
+	}
 	if (atomic_opcode != 0 && inst.GetType() == IR::Type::U64) {
 		ctx.Define(inst, EmitBufferAtomic64(ctx, inst, ctx.Memory(inst)));
 		return true;

@@ -274,9 +274,12 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (EmitValueFlow(ctx, inst) || EmitValueAlu(ctx, inst) || EmitValueMemory(ctx, inst) ||
 	    EmitValueImage(ctx, inst)) {
 		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+		const auto buffer_access = IR::BufferAccessOf(inst.GetOpcode());
+		const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+		const auto image_access = IR::ImageOpcodeInfoOf(inst.GetOpcode()).access;
 		if (ctx.state.compute_execution.IsSplitWave64() &&
 		    !ctx.state.compute_execution.IsCooperativeWave64() &&
-		    (shared_access == IR::SharedAccess::Read || shared_access == IR::SharedAccess::Write)) {
+		    shared_access != IR::SharedAccess::None) {
 			// The planner admits LDS only when one complete guest wave remains
 			// one host workgroup and every branch is wave-uniform. Finish each
 			// DS instruction across both native halves, including reads before
@@ -287,6 +290,25 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
 			                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
 			                           MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
+		}
+		bool planning_only = false;
+		if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32 ||
+		    inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) {
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			planning_only = index < ctx.program.memory_info.size() &&
+			                ctx.program.memory_info[index].planning_only;
+		}
+		const bool external_memory = buffer_access != IR::BufferAccess::None ||
+		                             address_access != IR::AddressAccess::None ||
+		                             image_access != IR::ImageAccess::None ||
+		                             inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer;
+		if (ctx.state.compute_execution.SynchronizesSplitWaveMemory() &&
+		    external_memory && !planning_only) {
+			auto& state = ctx.state;
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
+			                           MemorySemanticsAcquireRelease | MemorySemanticsUniformMemory |
+			                           MemorySemanticsImageMemory)});
 		}
 		return;
 	}

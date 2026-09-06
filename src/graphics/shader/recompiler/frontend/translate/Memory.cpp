@@ -563,8 +563,11 @@ bool Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
 	const auto address = ReadU32(MemorySourceAt(inst, 1));
-	const auto result  = ir.Emit(opcode, {address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	                             AddMemoryInfo(memory, inst.pc));
+	const auto data    = MemorySourceAt(inst, 0);
+	const auto value   = memory.data_dwords == 2u ? IR::Value(ReadU64(data))
+	                                               : IR::Value(ReadU32(data));
+	const auto result  =
+	    ir.Emit(opcode, {address, value, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
 	}
@@ -998,6 +1001,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr32, false);
 		case Decoder::Opcode::DS_OR_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr32, true);
+		case Decoder::Opcode::DS_ADD_U64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd64, false);
+		case Decoder::Opcode::DS_OR_B64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr64, false);
 		case Decoder::Opcode::DS_XOR_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, false);
 		case Decoder::Opcode::DS_XOR_RTN_B32:

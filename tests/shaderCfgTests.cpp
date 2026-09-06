@@ -31,6 +31,9 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
+#include "libs/errno.h"
+#include "libs/libs.h"
+#include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
 
@@ -59,6 +62,10 @@
 namespace Libs::Graphics {
 bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
                                const std::vector<uint32_t>& spirv);
+std::vector<uint32_t> OptimizeShaderSpirvForTest(
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization);
+bool ShouldOptimizeShaderSpirvForTest(
+    bool dispatcher_fallback, Config::ShaderOptimizationType optimization);
 bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view git_hash, std::string_view git_revision,
     std::string_view worktree_fingerprint);
@@ -69,6 +76,54 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+void TestShaderOptimizationSelection() {
+  constexpr const char *source = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+        %one = OpConstant %u32 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %dead = OpIAdd %u32 %one %one
+               OpReturn
+               OpFunctionEnd
+  )";
+  spvtools::SpirvTools assembler(SPV_ENV_VULKAN_1_3);
+  std::vector<uint32_t> spirv;
+  Check(assembler.Assemble(source, &spirv),
+        "shader optimization fixture did not assemble");
+
+  const auto unchanged = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::None);
+  const auto performance = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::Performance);
+  const auto size = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::Size);
+  Check(unchanged == spirv,
+        "None shader optimization changed the generated module");
+  Check(performance.size() < spirv.size(),
+        "Performance shader optimization did not remove dead work");
+  Check(size.size() <= performance.size(),
+        "Size shader optimization produced more words than Performance");
+  Check(assembler.Validate(performance),
+        "Performance optimized module failed SPIR-V validation");
+  Check(assembler.Validate(size),
+        "Size optimized module failed SPIR-V validation");
+  Check(ShouldOptimizeShaderSpirvForTest(
+            false, Config::ShaderOptimizationType::Performance),
+        "structured Performance shader was not admitted for optimization");
+  Check(!ShouldOptimizeShaderSpirvForTest(
+            true, Config::ShaderOptimizationType::Performance),
+        "dispatcher fallback was admitted to the driver-pathological optimization path");
+  Check(!ShouldOptimizeShaderSpirvForTest(
+            false, Config::ShaderOptimizationType::None),
+        "None optimization mode admitted a module");
 }
 
 void TestDriverPipelineCacheBuildIdentity() {
@@ -91,6 +146,48 @@ void TestDriverPipelineCacheBuildIdentity() {
             !IsDriverCacheBuildIdentityUsableForTest(
                 "0123456-dirty", revision, "1234"),
         "driver cache accepted an incomplete build identity");
+}
+
+void TestVideoOutVrrStatusLibraryContract() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitAll(&symbols);
+
+  const auto resolve = [&](const char *nid) {
+    Loader::SymbolResolve request{};
+    request.name = nid;
+    request.library = "VideoOutVrrStatus";
+    request.library_version = 1;
+    request.module = "VideoOut";
+    request.module_version_major = 1;
+    request.module_version_minor = 1;
+    request.type = Loader::SymbolType::Func;
+    return symbols.Find(request);
+  };
+
+  const auto *initialize = resolve("kP2L8t3j-aM");
+  Check(initialize != nullptr,
+        "VideoOutVrrStatus initialization import did not resolve");
+  using Initialize = int(KYTY_SYSV_ABI *)();
+  Check(reinterpret_cast<Initialize>(initialize->vaddr)() == OK,
+        "VideoOutVrrStatus initialization failed");
+
+  const auto *query = resolve("gWT7X8H0bYs");
+  Check(query != nullptr, "VideoOutVrrStatus query import did not resolve");
+  using Query = int(KYTY_SYSV_ABI *)(int, void *);
+  struct GuardedStatus {
+    uint64_t pre;
+    std::array<uint8_t, 0x80> status;
+    uint64_t post;
+  } output{0x1122334455667788ull, {}, 0x8877665544332211ull};
+  output.status.fill(0xa5);
+  Check(reinterpret_cast<Query>(query->vaddr)(1, output.status.data()) == OK,
+        "VideoOutVrrStatus query failed");
+  Check(std::all_of(output.status.begin(), output.status.end(),
+                    [](uint8_t value) { return value == 0; }),
+        "fixed-rate host did not report a deterministic unsupported VRR status");
+  Check(output.pre == 0x1122334455667788ull &&
+            output.post == 0x8877665544332211ull,
+        "VideoOutVrrStatus query wrote outside its 0x80-byte output");
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -8954,8 +9051,8 @@ void TestCooperativeWave64GeometryAndBudget() {
     f.Emit(0,O::ReferenceU32,{read});
     f.KeepWave(0);
     f.RequireWholeGroup("multi-wave LDS requires one full host workgroup and isolated wave64 collectives");
-    // Collective scratch doubles as the scheduler's PC publication storage.
-    // Guest LDS stays a separate full allocation; neither allocation may wrap.
+    // Collective scratch and guest LDS use separate full workgroup arrays;
+    // neither allocation may wrap.
     const uint64_t bytes=(uint64_t{count}+f.compute.lds_size_dwords)*sizeof(uint32_t);
     f.limits.max_shared_memory_bytes=static_cast<uint32_t>(bytes);
     f.RequireWholeGroup("cooperative LDS and collective scratch must fit at the exact byte limit");
@@ -8964,7 +9061,7 @@ void TestCooperativeWave64GeometryAndBudget() {
     f.limits.max_shared_memory_bytes=UINT32_MAX;
     f.compute.lds_size_dwords=UINT32_MAX;
     Check(!f.Plan().error.empty(),"cooperative LDS byte multiplication wrapped past the shared-memory guard");
-    f.compute.lds_size_dwords=count+3u;
+    f.compute.lds_size_dwords=count;
     f.limits.max_invocations=count-1u;
     Check(!f.Plan().error.empty(),"cooperative mode partitioned a guest workgroup that did not fit the device");
   }
@@ -9011,27 +9108,40 @@ void TestCooperativeWave64BarrierOrderAndControl() {
     f.Emit(phase,O::Barrier); f.Branch(phase,finish); f.KeepWave(finish);
     f.RequireWholeGroup("a bounded per-wave loop between ordered barriers must remain schedulable");
   }
-  // These are limits of the first static barrier-order proof, not a claim
-  // that AMD forbids every early-terminated wave or every barrier in a loop.
-  for (const bool cyclic : {false,true}) {
+  // RDNA2 defines a barrier as satisfied once all surviving waves reach it.
+  // A wave may therefore terminate before the first barrier in the chain.
+  {
     F f;
     const auto body=f.AddBlock(),finish=f.AddBlock();
     f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
         f.Emit(0,O::IEqual32,{f.local,V(0u)})});
-    if (cyclic) {
-      f.Branch(0,body);
-      f.Emit(body,O::Barrier);
-      f.Conditional(body,body,finish,f.FirstWave(body));
-      f.program.block_info[body].terminator.loop_header=true;
-      f.program.block_info[body].terminator.continue_block=f.program.block_info[body].id;
-      f.program.block_info[body].terminator.merge_block=f.program.block_info[finish].id;
-    } else {
-      f.Conditional(0,body,finish,f.FirstWave(0));
-      f.Emit(body,O::Barrier); f.Branch(body,finish);
-    }
+    f.Conditional(0,body,finish,f.FirstWave(0));
+    f.Emit(body,O::Barrier); f.Branch(body,finish);
     f.KeepWave(finish);
-    Check(!f.Plan().error.empty(),
-          "cooperative admission silently broadened its ordered acyclic barrier contract");
+    f.RequireWholeGroup("early-terminated waves must satisfy the remaining guest barrier");
+  }
+  // Cyclic barriers remain outside the proved scheduler contract.
+  {
+    F f;
+    const auto body=f.AddBlock(),finish=f.AddBlock();
+    f.Branch(0,body);
+    f.Emit(body,O::Barrier);
+    f.Conditional(body,body,finish,f.FirstWave(body));
+    f.program.block_info[body].terminator.loop_header=true;
+    f.program.block_info[body].terminator.continue_block=f.program.block_info[body].id;
+    f.program.block_info[body].terminator.merge_block=f.program.block_info[finish].id;
+    f.KeepWave(finish);
+    Check(!f.Plan().error.empty(),"cooperative admission accepted a cyclic guest barrier");
+  }
+  {
+    F f;
+    const auto left=f.AddBlock(),right=f.AddBlock(),finish=f.AddBlock();
+    f.Conditional(0,left,right,f.FirstWave(0));
+    f.Emit(left,O::Barrier); f.Branch(left,finish);
+    f.Emit(right,O::Barrier); f.Branch(right,finish);
+    f.KeepWave(finish);
+    f.RequireWholeGroup(
+        "incomparable acyclic barrier sites must form one dynamic rendezvous");
   }
 }
 
@@ -9081,6 +9191,50 @@ void TestCooperativeWave64OperationBoundaries() {
     else
       Check(!f.Plan().error.empty(),
             "cooperative LDS support bypassed GDS, scratch, live-atomic or within-wave convergence boundaries");
+  }
+}
+
+void TestCooperativeWave64ScalarReadBranchUniformity() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+
+  for (const bool scalar : {true, false}) {
+    F f({256, 1, 1});
+    f.program.memory_info.push_back({.kind = scalar ? IR::ResourceKind::ScalarBuffer
+                                                    : IR::ResourceKind::Buffer});
+    const auto resource = f.Emit(0, O::GetBufferResource,
+                                 {V(0u), V(0u), V(256u), V(0u)});
+    const auto value = scalar
+                           ? f.Shared(0, O::ReadConstBuffer,
+                                      {resource, V(0u)}, 1u)
+                           : f.Shared(0, O::LoadBufferU32,
+                                      {resource, V(0u), V(0u), V(0u), V(true)}, 1u);
+    // Force cooperative scheduling independently of the branch. Scalar memory
+    // loads execute once and broadcast within their guest wave. Ordinary
+    // vector loads remain per-lane and retain the rejection boundary.
+    f.Emit(0, O::Barrier);
+    const auto taken = f.AddBlock();
+    const auto other = f.AddBlock();
+    const auto finish = f.AddBlock();
+    const auto condition = f.Emit(0, O::ULessThanEqual32, {value, V(1u)});
+    f.Conditional(0, taken, other, condition);
+    f.KeepWave(taken);
+    f.Branch(taken, finish);
+    f.Branch(other, finish);
+    f.KeepWave(finish);
+
+    const auto plan = f.Plan();
+    if (!scalar) {
+      Check(!plan.error.empty() &&
+                Common::ContainsStr(plan.error, "wave-uniform branch"),
+            "per-lane vector-buffer load controlled a cooperative branch");
+    } else {
+      Check(plan.error.empty() && plan.IsCooperativeWave64() &&
+                plan.wave_partition_factor == 1u,
+            "wave-uniform scalar-buffer read was rejected as a cooperative branch condition");
+    }
   }
 }
 
@@ -9275,9 +9429,12 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
       f.Emit(after,O::ReferenceU32,{uniform_read});
       f.KeepWave(after);
     }
+	if (scenario == Scenario::Partitioned) f.limits.max_invocations = 128u;
     const bool accepted = scenario == Scenario::BufferCycle ||
         scenario == Scenario::SeparateWriterCycle || scenario == Scenario::AcyclicInputImage ||
-        scenario == Scenario::ImmutableSnapshot || scenario == Scenario::PlanningOnlyAddressTemplate;
+        scenario == Scenario::ImmutableSnapshot || scenario == Scenario::PlanningOnlyAddressTemplate ||
+        scenario == Scenario::CyclicScalarBufferRead || scenario == Scenario::ImageWriteAfter ||
+        scenario == Scenario::CyclicImageRead || scenario == Scenario::CyclicImageSample;
     const auto plan = f.Plan();
     if (plan.error.empty() != accepted)
       std::fprintf(stderr,"cooperative SSBO visibility scenario=%u: %s\n",
@@ -9293,6 +9450,66 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
             "cooperative buffer visibility bypassed image, DMA, atomic, partition or convergence guards");
     }
   }
+}
+
+void TestCooperativeWave64AutomaticBufferCyclePromotion() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+
+  F f({16, 16, 1});
+  f.compute.lds_size_dwords = 0;
+  f.program.memory_info.clear();
+  const auto loop = f.AddBlock();
+  const auto finish = f.AddBlock();
+  const auto buffer = f.Emit(0, O::GetBufferResource,
+                             {V(0u), V(0u), V(4096u), V(0u)});
+  const auto memory = [&](uint32_t block, O opcode,
+                          std::initializer_list<V> args) {
+    const auto value = f.Emit(block, opcode, args);
+    const auto index = static_cast<uint32_t>(f.program.memory_info.size());
+    IR::MemoryInfo info{};
+    info.kind = IR::ResourceKind::Buffer;
+    info.glc = true;
+    f.program.memory_info.push_back(info);
+    value.TryInstruction()->SetFlags(IR::MemoryFlags{.index = index});
+    return value;
+  };
+
+  f.Branch(0, loop);
+  auto& counter = f.program.blocks[loop]->AppendNewInst(
+      O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+  counter.AddPhiOperand(f.program.blocks[0], V(0u));
+  const auto read = memory(loop, O::LoadBufferU32,
+                           {buffer, V(0u), V(0u), V(0u), V(true)});
+  const auto uniform_read = f.Emit(loop, O::ReadLane, {read, V(0u)});
+  const auto next = f.Emit(loop, O::IAdd32, {V(&counter), V(1u)});
+  counter.AddPhiOperand(f.program.blocks[loop], next);
+  memory(loop, O::StoreBufferU32,
+         {buffer, V(4u), V(0u), V(0u), next, V(true)});
+  const auto bounded = f.Emit(loop, O::ULessThan32, {next, V(4u)});
+  const auto pending = f.Emit(loop, O::IEqual32, {uniform_read, V(0u)});
+  const auto condition = f.Emit(loop, O::LogicalAnd, {bounded, pending});
+  f.Conditional(loop, loop, finish, condition);
+  f.program.block_info[loop].terminator.loop_header = true;
+  f.program.block_info[loop].terminator.continue_block =
+      f.program.block_info[loop].id;
+  f.program.block_info[loop].terminator.merge_block =
+      f.program.block_info[finish].id;
+  f.Emit(finish, O::ReferenceU32, {uniform_read});
+  f.KeepWave(finish);
+
+  const auto plan = f.Plan();
+  Check(plan.error.empty() && plan.IsCooperativeWave64() &&
+            plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
+            plan.layout.guest_size == std::array<uint32_t, 3>{16, 16, 1} &&
+            WorkgroupInvocationCount(plan.layout.host_size) == 256u,
+        "ordinary buffer feedback must promote a partitioned wave64 workgroup to the proved cooperative scheduler");
+
+  f.limits.max_invocations = 128u;
+  Check(!f.Plan().error.empty(),
+        "automatic cooperative promotion ignored the host workgroup invocation limit");
 }
 
 struct F64CertificateFixture {
@@ -9878,10 +10095,13 @@ void TestComputeExecutionConvergenceProof() {
   ComputeWorkgroupLimits limits{{1024,1024,64},1024};
   limits.native_subgroup_size = 32;
   enum class Scenario { Uniform, Divergent, MutableRead, LoopRead, LoopSnapshot, LoopAtomic,
-                        LiveAtomic, Lds, Barrier, Dispatcher, UnknownSideEffect, UniformPhi, VaryingPhi, DppRowMask, DppInactiveBoundary };
+                        LiveAtomic, Lds, Barrier, Dispatcher, DispatcherDivergent,
+                        UnknownSideEffect, UniformPhi, VaryingPhi, DppRowMask,
+                        DppInactiveBoundary };
   for (const auto scenario : {Scenario::Uniform, Scenario::Divergent, Scenario::MutableRead,
          Scenario::LoopRead, Scenario::LoopSnapshot, Scenario::LoopAtomic, Scenario::LiveAtomic,
-         Scenario::Lds, Scenario::Barrier, Scenario::Dispatcher, Scenario::UnknownSideEffect,
+         Scenario::Lds, Scenario::Barrier, Scenario::Dispatcher, Scenario::DispatcherDivergent,
+         Scenario::UnknownSideEffect,
          Scenario::UniformPhi, Scenario::VaryingPhi, Scenario::DppRowMask, Scenario::DppInactiveBoundary}) {
     IR::Program program;
     program.stage = ShaderType::Compute;
@@ -9906,7 +10126,8 @@ void TestComputeExecutionConvergenceProof() {
     auto& low = body->AppendNewInst(O::CompositeExtractU32x4, {IR::Value(&ballot),IR::Value(0u)});
     auto& uniform_cond = body->AppendNewInst(O::INotEqual32, {IR::Value(&low),IR::Value(0u)});
     program.block_info[1].condition = IR::Value(&uniform_cond);
-    if (scenario == Scenario::Divergent) program.block_info[1].condition = IR::Value(&pred);
+    if (scenario == Scenario::Divergent || scenario == Scenario::DispatcherDivergent)
+      program.block_info[1].condition = IR::Value(&pred);
     if (scenario == Scenario::MutableRead || scenario == Scenario::LoopRead) {
       auto* target = scenario == Scenario::MutableRead ? entry : body;
       auto& load = target->AppendNewInst(O::ReadConstBuffer, {IR::Value(&source),IR::Value(0u)});
@@ -9935,7 +10156,8 @@ void TestComputeExecutionConvergenceProof() {
     }
     if (scenario == Scenario::Barrier) body->AppendNewInst(O::Barrier);
     if (scenario == Scenario::UnknownSideEffect) body->AppendNewInst(O::Sendmsg);
-    program.dispatcher_fallback = scenario == Scenario::Dispatcher;
+    program.dispatcher_fallback = scenario == Scenario::Dispatcher ||
+                                  scenario == Scenario::DispatcherDivergent;
     if (scenario == Scenario::UniformPhi || scenario == Scenario::VaryingPhi) {
       auto it = body->PrependNewInst(body->begin(), O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
       it->AddPhiOperand(entry, scenario == Scenario::VaryingPhi ? IR::Value(&lane) : IR::Value(0u));
@@ -9962,11 +10184,14 @@ void TestComputeExecutionConvergenceProof() {
       flags.bound_control = true;
       move.SetFlags(flags);
     }
-    // A discarded loop read cannot feed a branch or another wave; the separate
-    // feedback cases below retain rejection of polling and cyclic writes.
-    const bool accepted = scenario == Scenario::Uniform || scenario == Scenario::LoopSnapshot ||
+    // Scalar-buffer reads are broadcast once per guest wave before they can
+    // control flow. A discarded loop read cannot feed another wave; the
+    // separate feedback cases below retain rejection of polling and cyclic writes.
+    const bool accepted = scenario == Scenario::Uniform || scenario == Scenario::MutableRead ||
+                          scenario == Scenario::LoopSnapshot ||
                           scenario == Scenario::LoopAtomic || scenario == Scenario::UniformPhi ||
-                          scenario == Scenario::LoopRead || scenario == Scenario::Lds;
+                          scenario == Scenario::LoopRead || scenario == Scenario::Lds ||
+                          scenario == Scenario::Dispatcher;
     const auto plan = PlanComputeExecution(program,input,limits);
     Check(plan.error.empty() == accepted, "split-wave convergence proof accepted/rejected the wrong invariant");
     if (scenario == Scenario::Lds)
@@ -10655,7 +10880,9 @@ void TestComputeExecutionLoopReadFeedback() {
   enum class Scenario {
     ImageOutput, BufferOutput, AddressOutput, PollDirect, PollBallot,
     PollReadLane, PollReadFirst, PollPhi, PostLoopBranch,
-    CyclicImageWrite, CyclicBufferWrite, CyclicAtomic, OtherCycleWrite
+    CyclicImageWrite, CyclicDisjointImageWrite, CyclicAddressImageWrite,
+    CyclicBufferWrite,
+    CyclicAtomic, OtherCycleWrite
   };
   const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
   for (const uint32_t invocations : {64u,128u}) {
@@ -10663,7 +10890,9 @@ void TestComputeExecutionLoopReadFeedback() {
       Scenario::ImageOutput, Scenario::BufferOutput, Scenario::AddressOutput,
       Scenario::PollDirect, Scenario::PollBallot, Scenario::PollReadLane,
       Scenario::PollReadFirst, Scenario::PollPhi, Scenario::PostLoopBranch,
-      Scenario::CyclicImageWrite, Scenario::CyclicBufferWrite,
+      Scenario::CyclicImageWrite, Scenario::CyclicDisjointImageWrite,
+      Scenario::CyclicAddressImageWrite,
+      Scenario::CyclicBufferWrite,
       Scenario::CyclicAtomic, Scenario::OtherCycleWrite}) {
     IR::Program program;
     program.stage = ShaderType::Compute;
@@ -10687,10 +10916,12 @@ void TestComputeExecutionLoopReadFeedback() {
         {IR::Value(0u),IR::Value(0u),IR::Value(4096u),IR::Value(0u)});
     auto& address = entry->AppendNewInst(O::GetAddressResource,
         {IR::Value(0u),IR::Value(0u)});
-    const auto tag_memory = [&](IR::Inst& inst, IR::ResourceKind kind) {
+    const auto tag_memory = [&](IR::Inst& inst, IR::ResourceKind kind,
+                                uint32_t resource = 0u) {
       const auto index = static_cast<uint32_t>(program.memory_info.size());
       IR::MemoryInfo memory{};
       memory.kind = kind;
+      memory.resource = resource;
       program.memory_info.push_back(memory);
       inst.SetFlags(IR::MemoryFlags{.index=index,.pc=0});
     };
@@ -10712,10 +10943,13 @@ void TestComputeExecutionLoopReadFeedback() {
           {IR::Value(&buffer),IR::Value(counter)});
       tag_memory(read,IR::ResourceKind::ScalarBuffer);
       pixel = IR::Value(&read);
-    } else if (scenario == Scenario::AddressOutput) {
+    } else if (scenario == Scenario::AddressOutput ||
+               scenario == Scenario::CyclicAddressImageWrite) {
       auto& read = body->AppendNewInst(O::LoadAddressU32,
           {IR::Value(&address),IR::Value(counter),IR::Value(0u),IR::Value(true)});
-      tag_memory(read,IR::ResourceKind::Global);
+      tag_memory(read,scenario == Scenario::CyclicAddressImageWrite
+                          ? IR::ResourceKind::ScalarAddress
+                          : IR::ResourceKind::Global);
       pixel = IR::Value(&read);
     } else {
       auto& read = body->AppendNewInst(O::ImageRead,
@@ -10769,12 +11003,15 @@ void TestComputeExecutionLoopReadFeedback() {
         {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),
          IR::Value(&wave_result),IR::Value(true)});
     tag_memory(output,IR::ResourceKind::Buffer);
-    if (scenario == Scenario::CyclicImageWrite) {
+    if (scenario == Scenario::CyclicImageWrite ||
+        scenario == Scenario::CyclicDisjointImageWrite ||
+        scenario == Scenario::CyclicAddressImageWrite) {
       auto& data = body->AppendNewInst(O::CompositeConstructU32x4,
           {pixel,IR::Value(0u),IR::Value(0u),IR::Value(0u)});
       auto& write = body->AppendNewInst(O::ImageWrite,
           {IR::Value(&image),IR::Value(&coords),IR::Value(&data),IR::Value(true)});
-      tag_memory(write,IR::ResourceKind::Image);
+      tag_memory(write,IR::ResourceKind::Image,
+                 scenario == Scenario::CyclicDisjointImageWrite ? 1u : 0u);
     }
     if (scenario == Scenario::CyclicBufferWrite) {
       auto& write = body->AppendNewInst(O::StoreBufferU32,
@@ -10830,11 +11067,20 @@ void TestComputeExecutionLoopReadFeedback() {
     const auto plan = PlanComputeExecution(program,input,limits);
     // A single full guest wave remains one host workgroup. Its memory-driven
     // uniform branches do not introduce progress dependence between partitions.
-    // Direct varying branches and cyclic communication stay unsupported at both sizes.
+    // Direct varying branches stay unsupported. Cyclic memory operations in one
+    // complete guest wave require the split-half rendezvous; 128 invocations
+    // partition the guest workgroup and therefore remain unsupported.
+    const bool cyclic_writer =
+        scenario == Scenario::CyclicImageWrite ||
+        scenario == Scenario::CyclicDisjointImageWrite ||
+        scenario == Scenario::CyclicAddressImageWrite ||
+        scenario == Scenario::CyclicBufferWrite ||
+        scenario == Scenario::CyclicAtomic ||
+        scenario == Scenario::OtherCycleWrite;
     const bool single_wave_feedback = invocations == 64 &&
         (scenario == Scenario::PollBallot || scenario == Scenario::PollReadLane ||
          scenario == Scenario::PollReadFirst || scenario == Scenario::PollPhi ||
-         scenario == Scenario::PostLoopBranch);
+         scenario == Scenario::PostLoopBranch || cyclic_writer);
     const bool accepted = scenario == Scenario::ImageOutput ||
                           scenario == Scenario::BufferOutput || scenario == Scenario::AddressOutput ||
                           single_wave_feedback;
@@ -10844,6 +11090,8 @@ void TestComputeExecutionLoopReadFeedback() {
     if (accepted) {
       Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == invocations / 64,
             "supported loop reads must preserve complete-wave dispatch geometry");
+      Check(plan.SynchronizesSplitWaveMemory() == cyclic_writer,
+            "split-wave external-memory rendezvous did not match the cyclic writer proof");
     } else {
       Check(!plan.error.empty() && !plan.IsSplitWave64(),
             "split-wave proof accepted mutable loop feedback or cyclic memory communication");
@@ -14491,9 +14739,38 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 3 && std::strcmp(argv[1], "--spirv-optimize-file") == 0) {
+    auto *input = std::fopen(argv[2], "rb");
+    if (input == nullptr) return 2;
+    std::fseek(input, 0, SEEK_END);
+    const auto bytes = std::ftell(input);
+    std::rewind(input);
+    if (bytes <= 0 || (bytes % 4) != 0) {
+      std::fclose(input);
+      return 2;
+    }
+    std::vector<uint32_t> spirv(static_cast<size_t>(bytes) / 4u);
+    const auto read = std::fread(spirv.data(), 1, static_cast<size_t>(bytes), input);
+    std::fclose(input);
+    if (read != static_cast<size_t>(bytes)) return 2;
+    const auto optimized = Libs::Graphics::OptimizeShaderSpirvForTest(
+        spirv, Config::ShaderOptimizationType::Performance);
+    std::printf("original_words=%zu optimized_words=%zu\n", spirv.size(), optimized.size());
+    return optimized.empty() ? 1 : 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--spirv-optimization-only") == 0) {
+    Libs::Graphics::TestShaderOptimizationSelection();
+    std::puts("KYTY_SPIRV_OPTIMIZATION_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-identity-only") == 0) {
     Libs::Graphics::TestDriverPipelineCacheBuildIdentity();
     std::puts("KYTY_PIPELINE_CACHE_IDENTITY_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--videoout-vrr-status-only") == 0) {
+    Libs::Graphics::TestVideoOutVrrStatusLibraryContract();
+    std::puts("KYTY_VIDEOOUT_VRR_STATUS_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-guest-workgroups-only") == 0) {
@@ -14511,11 +14788,20 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_COOPERATIVE_BUFFER_CYCLES_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-autopromotion-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64AutomaticBufferCyclePromotion();
+    std::puts("KYTY_COOPERATIVE_AUTOPROMOTION_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-wave64-admission-only") == 0) {
     Libs::Graphics::TestCooperativeWave64GeometryAndBudget();
     Libs::Graphics::TestCooperativeWave64BarrierOrderAndControl();
     Libs::Graphics::TestCooperativeWave64OperationBoundaries();
     Libs::Graphics::TestCooperativeWave64LegacyBarrierInsertionScope();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-scalar-read-branch-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64ScalarReadBranchUniformity();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gds-append-admission-only") == 0) {
@@ -14651,8 +14937,10 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64GeometryAndBudget();
   TestCooperativeWave64BarrierOrderAndControl();
   TestCooperativeWave64OperationBoundaries();
+  TestCooperativeWave64ScalarReadBranchUniformity();
   TestCooperativeWave64LegacyBarrierInsertionScope();
   TestCooperativeWave64BufferCycleVisibility();
+  TestCooperativeWave64AutomaticBufferCyclePromotion();
   TestComputeExecutionSingleWaveLds();
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();

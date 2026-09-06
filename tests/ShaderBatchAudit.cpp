@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -270,7 +271,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       options.shader_hash = manifest.contains("shader_hash") ? HexValue(manifest.at("shader_hash"))
                             : XXH3_64bits(code.data(), size);
       options.scratch_dwords = manifest.at("scratch_dwords");
-      options.dump_ir = false;
+      const bool dump_ir = std::getenv("KYTY_SHADER_AUDIT_DUMP_IR") != nullptr;
+      options.dump_ir = dump_ir;
       options.input_info.compute = &info;
       Json profiles = Json::array();
       const bool initial_barriers = info.needs_lds_barriers;
@@ -280,6 +282,12 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
         phase = "translate_resources";
         Progress(header_profile ? (info.needs_lds_barriers ? "translate_profile_barriers_on" : "translate_profile_barriers_off") : phase);
         auto translated = ShaderRecompiler::TranslateProgram(code, options);
+        if (dump_ir) {
+          std::printf("KYTY_SHADER_AUDIT_IR_BEGIN barriers=%u\n%sKYTY_SHADER_AUDIT_IR_END\n",
+                      info.needs_lds_barriers ? 1u : 0u,
+                      ShaderRecompiler::IR::ProgramToString(translated.program).c_str());
+          std::fflush(stdout);
+        }
         const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
         Json profile{{"needs_lds_barriers", info.needs_lds_barriers},
                      {"blocks", translated.program.blocks.size()},
@@ -324,7 +332,18 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
         phase = "cfg";
         Progress(phase);
         auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+        const bool dump_cfg = std::getenv("KYTY_SHADER_AUDIT_DUMP_CFG") != nullptr;
+        if (dump_cfg) {
+          std::printf("KYTY_SHADER_AUDIT_CFG_BEFORE_BEGIN\n%sKYTY_SHADER_AUDIT_CFG_BEFORE_END\n",
+                      ShaderRecompiler::CFG::GraphToString(graph).c_str());
+          std::fflush(stdout);
+        }
         const bool structured = !graph.unsupported && ShaderRecompiler::CFG::Structurize(graph);
+        if (dump_cfg) {
+          std::printf("KYTY_SHADER_AUDIT_CFG_AFTER_BEGIN\n%sKYTY_SHADER_AUDIT_CFG_AFTER_END\n",
+                      ShaderRecompiler::CFG::GraphToString(graph).c_str());
+          std::fflush(stdout);
+        }
         result["checked_through"] = "cfg";
         result["blocks"] = graph.blocks.size();
         result["dispatcher_fallback_required"] = !structured;

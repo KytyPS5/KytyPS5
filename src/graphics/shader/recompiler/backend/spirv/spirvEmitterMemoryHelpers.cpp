@@ -88,10 +88,18 @@ static void EnsureLdsStorage(EmitterState& state) {
 	if (state.stage != ShaderType::Compute) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
-	    StorageClassWorkgroup);
-	state.builder.AddName(state.lds_variable, "lds_dwords");
+	if (state.requirements.shared_int64_atomics) {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeScalarU64ArrayPointer(state, StorageClassWorkgroup,
+		                              (LdsDwordCount(state) + 1u) / 2u),
+		    StorageClassWorkgroup);
+		state.builder.AddName(state.lds_variable, "lds_qwords");
+	} else {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
+		    StorageClassWorkgroup);
+		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
 }
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,

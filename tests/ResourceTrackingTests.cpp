@@ -2160,8 +2160,8 @@ void TestDmaAddressMaterialization() {
   fixture.PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture.program);
 
-  Check(fixture.program.info.uses_dma,
-        "typed address operations did not enable DMA");
+  Check(fixture.program.info.uses_dma && fixture.program.info.writes_dma,
+        "typed address store did not enable writable DMA");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -2193,8 +2193,8 @@ void TestDynamicFlatAddressesUseDma() {
   fixture.PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture.program);
 
-  Check(fixture.program.info.uses_dma,
-        "exec-masked FLAT address did not enable DMA");
+  Check(fixture.program.info.uses_dma && !fixture.program.info.writes_dma,
+        "exec-masked FLAT load did not retain read-only DMA metadata");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -2220,8 +2220,8 @@ void TestDynamicFlatAddressesUseDma() {
                 {mismatch_address, mismatch_low, mismatch_high, other_active},
                 mismatch.AddMemory(flat, 0xa4));
   mismatch.PlanAndTrack();
-  Check(mismatch.program.info.uses_dma,
-        "dynamic FLAT address did not enable DMA");
+  Check(mismatch.program.info.uses_dma && !mismatch.program.info.writes_dma,
+        "dynamic FLAT load did not retain read-only DMA metadata");
 }
 
 void TestBufferSwizzleSpecialization() {
@@ -3670,6 +3670,20 @@ void TestWorkgroupSrtMaterializationAndSpecialization() {
             reader.reads == std::vector<uint64_t>{0x1000u,0x1004u,0x1008u} && reader.ordinary_reads == 0u &&
             snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000u,12u}},
         "axis cardinality, source alignment, cross-column memoization or footprints changed");
+  plan.info.uses_dma = true;
+  reader.reads.clear();
+  Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x11u,0x22u,0x33u,0x11u,0x22u,0x11u} &&
+            snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000u,12u}},
+        "read-only DMA access rejected an otherwise coherent bounded SRT snapshot");
+  const auto read_only_snapshot = snapshot;
+  const auto read_only_specialization = specialization;
+  plan.info.writes_dma = true;
+  Check(!MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization),
+        "dynamic DMA write was admitted alongside an immutable bounded SRT snapshot");
+  CheckBoundedTransaction(snapshot,read_only_snapshot,specialization,read_only_specialization);
+  plan.info.writes_dma = false;
+  plan.info.uses_dma = false;
   const auto saved_snapshot = snapshot;
   const auto saved_specialization = specialization;
   reader.fail_address = 0x1008u;

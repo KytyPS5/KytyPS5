@@ -524,8 +524,8 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	if (program.bounded_srt_reads.empty()) {
 		return true;
 	}
-	if (program.stage != ShaderType::Compute || program.info.uses_dma) {
-		return SpecializationFail("bounded SRT snapshots require compute without DMA accesses");
+	if (program.stage != ShaderType::Compute || program.info.writes_dma) {
+		return SpecializationFail("bounded SRT snapshots require compute without DMA writes");
 	}
 	SrtRuntime clean_runtime = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
@@ -717,7 +717,7 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& input_runtime,
                                 MaterializedSnapshot& snapshot) {
 	if (!program.resource_tracking_complete) {
-		return false;
+		return SpecializationFail("resource plan is incomplete");
 	}
 
 	SnapshotReader reader {input_runtime};
@@ -729,13 +729,13 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	}
 	if ((program.requires_specialization_memory || !program.bounded_srt_reads.empty()) &&
 	    input_runtime.read_specialization_memory == nullptr) {
-		return false;
+		return SpecializationFail("coherent specialization memory reader is unavailable");
 	}
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots)) {
-		return false;
+		return SpecializationFail("runtime descriptor/SRT evaluation failed");
 	}
 
 	auto& next   = snapshot.resources;
@@ -803,7 +803,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			if (!MaterializeInlineImage(*source->inline_descriptor, inline_sampler,
 			                            tables[0], tables.size() > 1u ? &tables[1] : nullptr,
 			                            image.first_use_pc, runtime, table)) {
-				return false;
+				return SpecializationFail("inline sampled table materialization failed");
 			}
 			next.images[image_index] = table.descriptors[0];
 			if (table.descriptors.size() > 1u) {
@@ -818,14 +818,14 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			clean_runtime.read_memory      = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
-				return false;
+				return SpecializationFail("indirect image table source evaluation failed");
 			}
 			const auto&   material = tables[0];
 			const auto&   heap     = tables[1];
 			IndirectImage table;
 			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, image.r128,
 			                              runtime, table)) {
-				return false;
+				return SpecializationFail("indirect image table materialization failed");
 			}
 			next.images[image_index] = table.descriptors[table.candidates[0]];
 			if (table.descriptors.size() > 1u) {
@@ -861,8 +861,13 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			    "inline sampler at pc 0x{:08x} requires a matching inline image", pair.first_use_pc));
 		}
 	}
-	if (cursor != values.end() || !MaterializeBoundedReads(program, runtime, snapshot)) {
-		return false;
+	if (cursor != values.end()) {
+		return SpecializationFail(fmt::format(
+		    "runtime descriptor source count does not match resources (unused={})",
+		    std::distance(cursor, values.end())));
+	}
+	if (!MaterializeBoundedReads(program, runtime, snapshot)) {
+		return SpecializationFail("bounded SRT materialization failed");
 	}
 	if (!program.bounded_srt_reads.empty()) {
 		reader.Finish(next);

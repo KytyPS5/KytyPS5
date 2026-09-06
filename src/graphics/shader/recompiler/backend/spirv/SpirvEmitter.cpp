@@ -207,6 +207,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 void AnalyzeProgramRequirements(IR::Program& program) {
 	program.spirv_requirements.reset();
 	IR::SpirvRequirements requirements {};
+	bool has_lds_append_consume = false;
 	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -273,8 +274,16 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				if (program.stage != ShaderType::Compute && kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
 				}
+				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicIAdd64 ||
+				    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+					if (program.stage != ShaderType::Compute || kind != IR::ResourceKind::Lds) {
+						Fail(program, "64-bit shared atomics require compute LDS storage");
+					}
+					requirements.shared_int64_atomics = true;
+				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
+					has_lds_append_consume |= kind == IR::ResourceKind::Lds;
 					MarkBallot();
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
@@ -336,6 +345,9 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				default: break;
 			}
 		}
+	}
+	if (requirements.shared_int64_atomics && has_lds_append_consume) {
+		Fail(program, "64-bit shared atomics cannot share LDS with append/consume operations");
 	}
 	program.spirv_requirements.emplace(requirements);
 }

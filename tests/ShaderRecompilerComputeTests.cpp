@@ -1010,6 +1010,7 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  std::vector<std::pair<std::string, size_t>> spirv_counts;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1198,7 +1199,8 @@ void CheckRectListShaders() {
 }
 
 void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  if (test.required_spirv.empty() && test.forbidden_spirv.empty() &&
+      test.spirv_counts.empty()) {
     return;
   }
 
@@ -1218,6 +1220,14 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
     if (text.find(forbidden) != std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
            std::string("found forbidden text: ") + forbidden);
+    }
+  }
+  for (const auto &[needle, expected] : test.spirv_counts) {
+    const auto actual = CountText(text, needle);
+    if (actual != expected) {
+      Fail(test.name, "SPIR-V disassembly",
+           needle + " count: expected " + std::to_string(expected) +
+               ", got " + std::to_string(actual));
     }
   }
 }
@@ -1642,8 +1652,9 @@ constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"range-overflow", "immutable SRT snapshot has an invalid range"},
     ImmutableSrtScenario{"range-48bit", "immutable SRT snapshot has an invalid range"},
     ImmutableSrtScenario{"range-zero", "immutable SRT snapshot has an invalid range"},
-    ImmutableSrtScenario{"dma-access", "immutable SRT snapshot requires compute without DMA accesses"},
-    ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute without DMA accesses"},
+    ImmutableSrtScenario{"dma-read", "", true},
+    ImmutableSrtScenario{"dma-write", "immutable SRT snapshot requires compute without DMA writes"},
+    ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute without DMA writes"},
     ImmutableSrtScenario{"buffer-disjoint", "", true},
     ImmutableSrtScenario{"image-padding-disjoint", "", true},
 };
@@ -8492,15 +8503,17 @@ OpFunctionEnd
 [[noreturn]] void RunComparisonPromotionLayoutDeathCase(const char* mode) {
   using namespace ShaderRecompiler::IR;
   constexpr const char* name = "ComparisonPromotionLayout";
-  if (std::strcmp(mode, "extent") != 0) {
+  const bool offset_overlap = std::strcmp(mode, "offset-overlap") == 0;
+  if (std::strcmp(mode, "extent") != 0 && !offset_overlap) {
     std::fprintf(stderr, "unknown comparison promotion layout mode: %s\n", mode);
     std::_Exit(2);
   }
   constexpr uintptr_t base = 0x0000000203e00000ull;
-  constexpr uint64_t allocation_size = 0x10000;
-  constexpr uint32_t source_width = 128;
-  constexpr uint32_t requested_width = 64;
-  constexpr uint32_t height = 64;
+  constexpr uint64_t allocation_size = 0x200000;
+  constexpr uint64_t overlap_offset = 0x10000;
+  const uint32_t source_width = offset_overlap ? 256 : 128;
+  const uint32_t requested_width = offset_overlap ? 256 : 64;
+  const uint32_t height = offset_overlap ? 256 : 64;
   EnsureRuntimeContext();
   Require(name, "promotion capability",
           m_runtime_context.depth_range_unrestricted_enabled,
@@ -8509,13 +8522,13 @@ OpFunctionEnd
   Require(name, "direct allocation",
           Libs::LibKernel::Memory::KernelAllocateDirectMemory(
               0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-              allocation_size, allocation_size, 0, &direct_offset) == 0,
+              allocation_size, overlap_offset, 0, &direct_offset) == 0,
           "comparison promotion layout allocation failed");
   void* mapped = reinterpret_cast<void*>(base);
   Require(name, "direct mapping",
           Libs::LibKernel::Memory::KernelMapDirectMemory(
               &mapped, allocation_size, 0x3, 0x10, direct_offset,
-              allocation_size) == 0 && mapped == reinterpret_cast<void*>(base),
+              overlap_offset) == 0 && mapped == reinterpret_cast<void*>(base),
           "comparison promotion layout mapping failed");
   std::memset(mapped, 0, allocation_size);
   RenderContext context(m_runtime_context);
@@ -8529,10 +8542,10 @@ OpFunctionEnd
   auto& executor = context.GetRenderExecutor();
   resources.MapMemory(base, allocation_size);
 
-  const auto make_descriptor = [&](uint32_t width) {
+  const auto make_descriptor = [&](uintptr_t address, uint32_t width) {
     ShaderTextureResource descriptor{};
-    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
-    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+    descriptor.fields[0] = static_cast<uint32_t>(address >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(address >> 40u) |
         (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
         (((width - 1u) & 3u) << 30u);
     descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
@@ -8552,7 +8565,8 @@ OpFunctionEnd
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   resource.written = true;
   const auto source = RenderExecutorTestAccess::ResolveTexture(
-      executor, resource, make_descriptor(source_width));
+      executor, resource,
+      make_descriptor(base, offset_overlap ? requested_width : source_width));
   Require(name, "source upload",
           cache.FindTexture(source.image_id, source.desc) != nullptr,
           "layout fixture could not acquire the native source image");
@@ -8564,7 +8578,7 @@ OpFunctionEnd
               cached.backing.mip_levels == 1 && cached.backing.layers == 1 &&
               cached.backing.samples == 1 &&
               cached.info.data.address == base &&
-              cached.info.data.size == allocation_size,
+              (!offset_overlap || cached.info.data.size > overlap_offset),
           "layout fixture did not establish the expected R32 allocation");
   cache.MarkGpuWritten(source.image_id);
   scheduler.Finish();
@@ -8575,13 +8589,20 @@ OpFunctionEnd
   resource.depth_compare = true;
   std::printf("KYTY_COMPARISON_LAYOUT_READY %s\n", mode);
   std::fflush(stdout);
-  // Both descriptors are individually legal and address the same 64-KiB
-  // depth-tiled allocation. Their visible widths differ. The old cache path
-  // creates a 64-wide D32 replacement, then records a 128-wide buffer-to-image
-  // copy using the cached source extent. The intended guard must run before
-  // that copy and report its specific admission failure.
-  (void)RenderExecutorTestAccess::ResolveTexture(
-      executor, resource, make_descriptor(requested_width));
+  // The extent case addresses one allocation and must reject an invalid
+  // color-to-depth copy. The offset case models overlapping transient heap
+  // allocations: the color image is not a promotion candidate and the depth
+  // request must receive its own exact-range image.
+  const auto requested_address = offset_overlap ? base + overlap_offset : base;
+  const auto resolved = RenderExecutorTestAccess::ResolveTexture(
+      executor, resource, make_descriptor(requested_address, requested_width));
+  if (offset_overlap) {
+    Require(name, "offset overlap result",
+            resolved.image_id != source.image_id &&
+                resolved.desc.info.data.address == requested_address &&
+                cache.GetImage(resolved.image_id).info.data.address == requested_address,
+            "overlapping different-base image reused the color promotion source");
+  }
   std::printf("KYTY_COMPARISON_LAYOUT_RETURNED %s\n", mode);
   std::fflush(nullptr);
   // Do not submit the invalid copy or let teardown submit it implicitly.
@@ -9621,7 +9642,8 @@ void CheckSampledHtileArrayClearDiscovery() {
       program.stage = graphics ? ShaderType::Vertex : ShaderType::Compute;
       program.resource_tracking_complete = true;
       program.shader_info_complete = true;
-      program.info.uses_dma = selected == "dma-access";
+      program.info.uses_dma = selected == "dma-read" || selected == "dma-write";
+      program.info.writes_dma = selected == "dma-write";
       program.info.bounded_srt_reads.push_back({1u,0u});
       ShaderStageRuntime runtime{};
       runtime.resources.flattened_srt = {0x13579bdfu};
@@ -14070,6 +14092,7 @@ private:
           if (barycentric.fragmentShaderBarycentric != true ||
               features.features.shaderInt64 != true ||
               features12.shaderBufferInt64Atomics != true ||
+              features12.shaderSharedInt64Atomics != true ||
               features12.bufferDeviceAddress != true) {
             continue;
           }
@@ -14120,6 +14143,9 @@ private:
             available_features12.shaderBufferInt64Atomics == true,
             "shaderBufferInt64Atomics is not supported");
     Require("VulkanHarness", "dispatch",
+            available_features12.shaderSharedInt64Atomics == true,
+            "shaderSharedInt64Atomics is not supported");
+    Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
 
@@ -14140,6 +14166,7 @@ private:
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
     device_features12.shaderBufferInt64Atomics = true;
+    device_features12.shaderSharedInt64Atomics = true;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -14943,6 +14970,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_LE_F16:
   case Opcode::V_CMPX_GT_F16:
   case Opcode::V_CMPX_GE_F16:
+  case Opcode::V_CMPX_NLE_F16:
   case Opcode::V_CMPX_NEQ_F16:
   case Opcode::V_CMPX_NLT_F16:
     return CoverageClass::NeedsFloatCase;
@@ -15028,6 +15056,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_AND_RTN_B32:
   case Opcode::DS_OR_B32:
   case Opcode::DS_OR_RTN_B32:
+  case Opcode::DS_ADD_U64:
+  case Opcode::DS_OR_B64:
   case Opcode::DS_XOR_B32:
   case Opcode::DS_XOR_RTN_B32:
   case Opcode::DS_WRXCHG_RTN_B32:
@@ -20715,6 +20745,36 @@ TestCase VectorVopcCmpxNgtF16CapturedSdwaExecMask() {
   return test;
 }
 
+TestCase VectorVopcCmpxNleF16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 5, 0x3c003c00u); // WORD_1 = 1.0h; !(1.0h <= 0.0h).
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovU32(&code, 30, 0);
+  code.insert(code.end(), {0x7df900f9u, 0x86050005u});
+  AppendBufferStoreDword(&code, 3, 30);
+
+  code.push_back(EncodeSMovB32(126, InlineU32(1))); // Restore lane-zero EXEC.
+  AppendVMovLiteral(&code, 5, 0x00003c00u);         // WORD_1 = 0.0h; false.
+  AppendVMovU32(&code, 3, 9);
+  AppendVMovU32(&code, 30, 4);
+  code.insert(code.end(), {0x7df900f9u, 0x86050005u});
+  AppendBufferStoreDword(&code, 3, 30);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCmpxNleF16CapturedSdwaExecMask",
+                code,
+                {0x11111111u, 0x22222222u},
+                {7, 0x22222222u},
+                {O::V_MOV_B32, O::S_MOV_B32, O::V_CMPX_NLE_F16,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {
+      {"V_CMPX_NLE_F16 exec_lo, v5.sdwa(sel=5,sext=0), 0", 2}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpFUnordGreaterThan"};
+  return test;
+}
+
 TestCase VectorCompareInvertedMaskSelect() {
   using O = ShaderOpcode;
 
@@ -24039,6 +24099,306 @@ TestCase DsAtomicReturnVariants() {
        O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase DsOrB64CapturedUpdatesBothWordsAndPreservesNeighbors() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovLiteral(&code, 10, 0x11111111u);
+  AppendVMovLiteral(&code, 11, 0x22222222u);
+  AppendVMovLiteral(&code, 12, 0x00ff00ffu);
+  AppendVMovLiteral(&code, 13, 0x0f0f0f0fu);
+  code.push_back(EncodeDs0(0xdf));
+  code.push_back(EncodeDs1(0, 10, 8)); // LDS[0..15] = v[10:13].
+
+  AppendVMovU32(&code, 7, 8);
+  AppendVMovLiteral(&code, 3, 0xff0000f0u);
+  AppendVMovLiteral(&code, 4, 0xf00000f0u);
+  code.insert(code.end(), {0xd9280000u, 0x00000307u}); // Captured ds_or_b64 v7, v[3:4].
+
+  code.push_back(EncodeDs0(0xff));
+  code.push_back(EncodeDs1(20, 0, 8));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 20 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test{"DsOrB64CapturedUpdatesBothWordsAndPreservesNeighbors",
+                code,
+                std::vector<u32>(4, 0),
+                {0x11111111u, 0x22222222u, 0xffff00ffu, 0xff0f0fffu},
+                {O::V_MOV_B32, O::DS_WRITE_B128, O::DS_OR_B64,
+                 O::DS_READ_B128, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_OR_B64", 1}};
+  test.required_spirv = {"OpAtomicOr"};
+  return test;
+}
+
+TestCase DsAddU64CapturedCarriesAcrossDwordsAndPreservesNeighbors() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovLiteral(&code, 10, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 11, 0xccccccccu);
+  AppendVMovLiteral(&code, 12, 0xffffffffu);
+  AppendVMovLiteral(&code, 13, 0x11111111u);
+  code.push_back(EncodeDs0(0xdf));
+  code.push_back(EncodeDs1(0, 10, 8)); // LDS[0..15] = v[10:13].
+  AppendVMovLiteral(&code, 14, 0xbbbbbbbbu);
+  code.push_back(EncodeDs0(0x0d, 16));
+  code.push_back(EncodeDs1(0, 14, 8)); // Guard after the target qword.
+
+  AppendVMovU32(&code, 7, 8);
+  AppendVMovU32(&code, 3, 2);
+  AppendVMovU32(&code, 4, 3);
+  code.insert(code.end(), {0xd9000000u, 0x00000307u}); // Captured ds_add_u64 v7, v[3:4].
+
+  code.push_back(EncodeDs0(0xff));
+  code.push_back(EncodeDs1(20, 0, 8));
+  code.push_back(EncodeDs0(0x36, 16));
+  code.push_back(EncodeDs1(24, 0, 8));
+  for (u32 i = 0; i < 5; i++) AppendStoreVgpr(&code, 20 + i, i);
+  AppendEnd(&code);
+
+  TestCase test{"DsAddU64CapturedCarriesAcrossDwordsAndPreservesNeighbors",
+                code,
+                std::vector<u32>(5, 0),
+                {0xaaaaaaaau, 0xccccccccu, 0x00000001u, 0x11111115u, 0xbbbbbbbbu},
+                {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_WRITE_B128, O::DS_ADD_U64,
+                 O::DS_READ_B32, O::DS_READ_B128, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_ADD_U64", 1}};
+  test.required_spirv = {"OpAtomicIAdd", "OpTypeInt 64"};
+  return test;
+}
+
+// One guest wave64 occupies two native subgroup32 halves. Each half contributes
+// a different DWORD to a 64-bit LDS atomic in a bounded loop, then reads the
+// combined value without a guest barrier. Split-wave lowering must complete
+// every DS phase across both halves just as one native guest wave64 would.
+TestCase Wave64SingleWaveCyclicDsOrB64ImplicitCompletion() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64u;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 9, 0);
+  code.push_back(EncodeVop2(0x23, 9, 193u, 9)); // MBCNT_LO(-1,0)
+  code.push_back(EncodeVop2(0x24, 9, 193u, 9)); // MBCNT_HI(-1,lo)
+
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovLiteral(&code, 10, 0xaaaaaaaau);
+  AppendVMovLiteral(&code, 11, 0xbbbbbbbbu);
+  AppendVMovLiteral(&code, 12, 0x11111110u);
+  AppendVMovLiteral(&code, 13, 0x22222220u);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 9));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // Only logical lane zero initializes LDS.
+  code.push_back(EncodeDs0(0xdf));
+  code.push_back(EncodeDs1(0, 10, 8));
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeSopp(0x0a));
+
+  code.push_back(EncodeSMovB32(8, InlineU32(0)));
+  const size_t loop = code.size();
+  AppendVMovU32(&code, 7, 8);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 9));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // Lane zero resets the pair each pass.
+  code.push_back(EncodeDs0(0x4d));
+  code.push_back(EncodeDs1(0, 12, 7));
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendVMovU32(&code, 3, 1);
+  AppendVMovU32(&code, 4, 2);
+  AppendVMovU32(&code, 5, 0);
+  code.push_back(EncodeVopc(0xc1, InlineU32(31), 9)); // Upper native half.
+  code.push_back(EncodeVop2(0x01, 3, Vgpr(3), 5));   // lower:1, upper:0
+  code.push_back(EncodeVop2(0x01, 4, Vgpr(5), 4));   // lower:0, upper:2
+  code.insert(code.end(), {0xd9280000u, 0x00000307u});
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeDs0(0xff));
+  code.push_back(EncodeDs1(20, 0, 8));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 8, InlineU32(2)));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  for (u32 word = 0; word < 4; ++word) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 20 + word, 9, word * lanes);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Wave64SingleWaveCyclicDsOrB64ImplicitCompletion";
+  test.initial.assign(4u * lanes, 0xdeadbeefu);
+  test.expected.resize(4u * lanes);
+  constexpr std::array<u32, 4> words{0xaaaaaaaau, 0xbbbbbbbbu,
+                                     0x11111111u, 0x22222222u};
+  for (u32 word = 0; word < words.size(); ++word) {
+    std::fill_n(test.expected.begin() + word * lanes, lanes, words[word]);
+  }
+  test.code = std::move(code);
+  test.opcodes = {O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32,
+                  O::V_CMP_EQ_U32, O::V_CMP_LT_U32, O::V_CNDMASK_B32,
+                  O::S_MOV_B64, O::DS_WRITE_B128, O::DS_WRITE_B64, O::S_BARRIER,
+                  O::DS_OR_B64, O::DS_READ_B128, O::S_MOV_B32, O::S_ADD_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_OR_B64", 1}};
+  test.required_spirv = {"OpAtomicOr", "OpTypeInt 64", "OpLoopMerge"};
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.lds_size_dwords = 4u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.thread_ids_num = 1u;
+  test.has_compute_info = true;
+  test.dispatch_x = 1u;
+  return test;
+}
+
+// One guest wave64 becomes two native subgroup32 halves. A store issued only
+// by logical lane zero must complete before either half executes the following
+// load from the same guest buffer, including on the loop backedge. This is the
+// external-memory counterpart of the LDS phase test above.
+TestCase Wave64SingleWaveCyclicBufferFeedback() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64u;
+  constexpr u32 words = lanes + 4u;
+
+  TestCase test;
+  test.name = "Wave64SingleWaveCyclicBufferFeedback";
+  test.initial.assign(words, 0xdeadbeefu);
+  test.expected = test.initial;
+  std::fill_n(test.expected.begin(), lanes + 1u, 0x12345678u);
+  test.has_user_data = true;
+  test.user_data[2] = words * sizeof(u32);
+  test.user_data[48] = test.user_data[0];
+  test.user_data[49] = test.user_data[1];
+  test.user_data[50] = test.user_data[2];
+  test.user_data[51] = test.user_data[3];
+  test.has_compute_info = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.thread_ids_num = 1u;
+  test.dispatch_x = 1u;
+  test.required_spirv = {"OpLoopMerge", "OpControlBarrier"};
+
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // Full EXEC.
+  AppendVMovU32(&code, 9, 0u);
+  code.push_back(EncodeVop2(0x23, 9, 193u, 9)); // MBCNT_LO(-1,0).
+  code.push_back(EncodeVop2(0x24, 9, 193u, 9)); // MBCNT_HI(-1,lo).
+  AppendVMovU32(&code, 0, 0u);
+  AppendVMovLiteral(&code, 10, 0x12345678u);
+  code.push_back(EncodeSMovB32(8, InlineU32(0)));
+  const size_t loop = code.size();
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 9));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // EXEC=VCC, lane zero only.
+  AppendBufferStoreDword(&code, 10, 0);
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // Restore all 64 lanes.
+  code.push_back(EncodeMubuf0(0x0cu));
+  code.push_back(EncodeMubuf1(20, 12, 0)); // Read through the same s[48:51] resource.
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 20, 9, 1u);
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 8, InlineU32(2)));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  AppendEnd(&code);
+
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_ADD_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32,
+                  O::V_CMP_EQ_U32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::BUFFER_LOAD_DWORD, O::S_WAITCNT, O::S_ENDPGM};
+  return test;
+}
+
+// Reducible guest CFG with an external edge into one arm of a selection:
+// entry -> header/A, header -> body/merge, A -> body. The structured path
+// cannot represent it without cloning, so the dispatcher must keep one wave64
+// in lockstep across two native subgroup32 halves.
+TestCase Wave64DispatcherExternalSelectionEntry() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64u;
+  TestCase test;
+  test.name = "Wave64DispatcherExternalSelectionEntry";
+  test.initial.assign(lanes * 2u, 0xdeadbeefu);
+  test.expected.assign(lanes * 2u, 63u);
+  std::fill_n(test.expected.begin(), lanes, 2u);
+  test.has_compute_info = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.thread_ids_num = 1u;
+  test.required_spirv = {"OpSwitch", "OpControlBarrier"};
+
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // Full EXEC.
+  AppendVMovU32(&code, 0, 0u);
+  code.push_back(EncodeVop2(0x23, 0, 193u, 0)); // Logical lane id, low half.
+  code.push_back(EncodeVop2(0x24, 0, 193u, 0)); // Logical lane id, high half.
+  for (u32 s = 4; s <= 7; ++s) code.push_back(EncodeSMovB32(s, InlineU32(0)));
+  code.push_back(EncodeSMovB32(9, InlineU32(0)));
+  const size_t loop_header = code.size();
+  code.push_back(EncodeSopc(0x0a, 9, InlineU32(1))); // One-iteration outer loop.
+  const size_t loop_exit = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSopc(0x06, 4, 5));       // Runtime-equal fixture values.
+  const size_t outer_to_header = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSMovB32(8, InlineU32(2))); // External arm.
+  const size_t external_to_body = code.size();
+  code.push_back(0);
+  const size_t selection_header = code.size();
+  code.push_back(EncodeSopc(0x06, 6, 7));      // Selection header.
+  const size_t false_to_merge = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSMovB32(8, InlineU32(1))); // Header-owned arm.
+  const size_t arm_to_body = code.size();
+  code.push_back(0);
+  const size_t shared_body = code.size();
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1))); // Shared body.
+  AppendVop3(&code, 0x360, 16, Vgpr(0), InlineU32(63));
+  const size_t body_to_merge = code.size();
+  code.push_back(0);
+  const size_t merge = code.size();
+  code.push_back(EncodeSop2(0x00, 9, 9, InlineU32(1)));
+  const size_t backedge = code.size();
+  code.push_back(0);
+  const size_t exit = code.size();
+  const auto patch_branch = [&](size_t at, u32 opcode, size_t target) {
+    code[at] = EncodeSopp(opcode, static_cast<u32>(
+        static_cast<int32_t>(target) - static_cast<int32_t>(at) - 1));
+  };
+  patch_branch(loop_exit, 0x04, exit);
+  patch_branch(outer_to_header, 0x05, selection_header);
+  patch_branch(external_to_body, 0x02, shared_body);
+  patch_branch(false_to_merge, 0x04, merge);
+  patch_branch(arm_to_body, 0x02, shared_body);
+  patch_branch(body_to_merge, 0x02, merge);
+  patch_branch(backedge, 0x02, loop_header);
+  code.push_back(EncodeVop1(0x01, 10, 8));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, 0u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 16, 0, lanes);
+  AppendEnd(&code);
+
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC0, O::S_CBRANCH_SCC1, O::S_BRANCH,
+                  O::S_ADD_U32, O::V_MOV_B32, O::V_MBCNT_LO_U32_B32,
+                  O::V_MBCNT_HI_U32_B32, O::V_READLANE_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 1}};
+  return test;
+}
+
 TestCase DsMiscVariants() {
   using O = ShaderOpcode;
 
@@ -24553,6 +24913,239 @@ TestCase Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit() {
                   O::S_CBRANCH_EXECZ, O::V_READLANE_B32, O::V_ADD_NC_U32,
                   O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// RDNA2 S_BARRIER waits only for surviving waves. Two waves terminate before
+// the first guest barrier; the remaining pair must still rendezvous and observe
+// each other's LDS publication. Participation output makes every early exit
+// observable without depending on which live wave reaches the barrier first.
+TestCase Wave64MultiWaveLdsPeersTerminateBeforeBarrier() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256;
+  constexpr u32 total = 2u * local_count;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64MultiWaveLdsPeersTerminateBeforeBarrier", local_count, 2, 3);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, 4u);
+
+  // Waves 2 and 3 terminate before S_BARRIER; waves 0 and 1 continue.
+  AppendVMovU32(&code, 9, 128);
+  code.push_back(EncodeVopc(0xc1, Vgpr(6), 9));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  const size_t peers_exit = code.size();
+  code.push_back(0); // EXECZ targets the final S_ENDPGM.
+
+  // One leader per surviving wave publishes its first lane to LDS[wave].
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(63), 6));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 8));
+  AppendMultiWaveLdsStore(&code, 5, 9);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendMultiWaveGuestBarrier(&code);
+
+  // Surviving wave 0 reads wave 1 and surviving wave 1 reads wave 0.
+  code.push_back(EncodeVop2(0x25, 9, InlineU32(1), 8));
+  code.push_back(EncodeVop2(0x1b, 9, InlineU32(1), 9));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 9));
+  AppendMultiWaveLdsRead(&code, 10, 9);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 4u + total);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 4, 4u + 2u * total);
+  const size_t finish = code.size();
+  AppendEnd(&code);
+  code[peers_exit] = EncodeSopp(0x08, static_cast<u32>(
+      static_cast<int32_t>(finish) - static_cast<int32_t>(peers_exit) - 1));
+
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 base = 0x1000u + (group << 16u);
+    for (u32 lane = 0; lane < local_count; ++lane) {
+      const u32 index = group * local_count + lane;
+      test.expected[4u + index] = base + lane;
+      if (lane >= 128u) continue;
+      const u32 wave = lane / 64u;
+      test.expected[4u + total + index] = base + ((wave ^ 1u) * 64u);
+      test.expected[4u + 2u * total + index] = wave;
+    }
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::DS_READ_B32, O::S_BARRIER, O::S_WAITCNT,
+                  O::V_CMP_LT_U32, O::V_CMP_EQ_U32, O::S_MOV_B64,
+                  O::S_CBRANCH_EXECZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpControlBarrier"};
+  test.spirv_counts = {{"OpUMod", 2}};
+  return test;
+}
+
+// Different waves may execute different static S_BARRIER instructions for the
+// same dynamic rendezvous. All four waves publish to LDS first; waves 0/1 take
+// one barrier site while waves 2/3 take another, then every lane reads the next
+// wave's leader. The oracle checks both barrier arms and cross-wave visibility.
+TestCase Wave64MultiWaveLdsDivergentBarrierSites() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256;
+  constexpr u32 total = 2u * local_count;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64MultiWaveLdsDivergentBarrierSites", local_count, 4, 3);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, 4u);
+
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(63), 6));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 8));
+  AppendMultiWaveLdsStore(&code, 5, 9);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSopp(0x0c, 0));
+
+  // Split whole guest waves between two distinct static barrier sites.
+  AppendVMovU32(&code, 9, 128);
+  code.push_back(EncodeVopc(0xc1, Vgpr(6), 9));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  const size_t to_right = code.size();
+  code.push_back(0); // EXECZ -> right barrier site.
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSopp(0x0a));
+  const size_t to_join = code.size();
+  code.push_back(0); // Left barrier -> common continuation.
+  const size_t right = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSopp(0x0a));
+  const size_t join = code.size();
+  code[to_right] = EncodeSopp(0x08, static_cast<u32>(
+      static_cast<int32_t>(right) - static_cast<int32_t>(to_right) - 1));
+  code[to_join] = EncodeSopp(0x02, static_cast<u32>(
+      static_cast<int32_t>(join) - static_cast<int32_t>(to_join) - 1));
+
+  code.push_back(EncodeVop2(0x25, 9, InlineU32(1), 8));
+  code.push_back(EncodeVop2(0x1b, 9, InlineU32(3), 9));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 9));
+  AppendMultiWaveLdsRead(&code, 10, 9);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 4u + total);
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 4, 4u + 2u * total);
+  AppendEnd(&code);
+
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 base = 0x1000u + (group << 16u);
+    for (u32 lane = 0; lane < local_count; ++lane) {
+      const u32 index = group * local_count + lane;
+      const u32 wave = lane / 64u;
+      test.expected[4u + index] = base + lane;
+      test.expected[4u + total + index] = base + ((wave + 1u) & 3u) * 64u;
+      test.expected[4u + 2u * total + index] = wave;
+    }
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::DS_READ_B32, O::S_BARRIER, O::S_WAITCNT,
+                  O::V_CMP_LT_U32, O::V_CMP_EQ_U32, O::S_MOV_B64,
+                  O::S_CBRANCH_EXECZ, O::S_BRANCH,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"s_barrier", 2}};
+  test.ir_counts = {{"Barrier", 2}};
+  test.required_spirv = {"OpControlBarrier"};
+  return test;
+}
+
+// A storage-image atomic returns the texel value that preceded its update.
+// Keep that per-lane result live through an LDS publication and guest barrier;
+// cooperative wave64 execution must retain it instead of rejecting or
+// substituting the atomic operand. One leader in each guest wave uses a
+// distinct texel, so both image contents and every lane's LDS read are exact.
+TestCase Wave64CooperativeImageAtomicReturnToLds() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256u;
+  constexpr std::array<u32, 4> initial_texels{100u, 200u, 300u, 400u};
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64CooperativeImageAtomicReturnToLds", local_count, 4u, 1u);
+  test.dispatch_x = 1u;
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.storage_image_r32ui.assign(16u, 0u);
+  std::copy(initial_texels.begin(), initial_texels.end(),
+            test.storage_image_r32ui.begin());
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  for (u32 wave = 0; wave < initial_texels.size(); ++wave) {
+    test.expected_storage_image_r32ui[wave] += wave + 1u;
+  }
+  for (u32 lane = 0; lane < local_count; ++lane) {
+    test.expected[4u + lane] = initial_texels[lane / 64u];
+  }
+
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(63), 6));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // One leader per guest wave.
+  code.push_back(EncodeVop1(0x01, 20, Vgpr(8)));
+  AppendVMovU32(&code, 21, 0u);
+  AppendVMovU32(&code, 22, 0u);
+  code.push_back(EncodeVop2(0x25, 0, InlineU32(1), 8));
+  code.push_back(EncodeMimg0(0x11, 0x1, 0, true)); // GLC: return old texel.
+  code.push_back(EncodeMimg1(0, 20));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 8));
+  AppendMultiWaveLdsStore(&code, 0, 9);
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // Restore all lanes.
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 8));
+  AppendMultiWaveGuestBarrier(&code);
+  AppendMultiWaveLdsRead(&code, 10, 9);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 4u);
+  AppendEnd(&code);
+
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::V_AND_B32,
+                  O::V_CMP_EQ_U32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::V_LSHRREV_B32, O::IMAGE_ATOMIC_ADD, O::DS_WRITE_B32,
+                  O::S_WAITCNT, O::S_BARRIER, O::DS_READ_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicIAdd", "OpControlBarrier",
+                         "OpImageTexelPointer", "R32ui"};
+  test.decoded_counts = {{"IMAGE_ATOMIC_ADD", 1}};
+  test.ir_counts = {{"ImageAtomicIAdd32", 1}};
+  return test;
+}
+
+// Scalar-buffer memory executes once per guest wave on RDNA2. In cooperative
+// wave64 lowering every physical invocation must join the host rendezvous, but
+// only the selected guest wave may perform the descriptor access. Verify both
+// the loaded value and scalar control derived from it across four guest waves.
+TestCase Wave64CooperativeScalarBufferLoadBranch() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256u;
+  constexpr u32 total = 2u * local_count;
+  constexpr u32 scalar_value = 0x13579bdfu;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64CooperativeScalarBufferLoadBranch", local_count, 1u, 2u);
+  test.initial[0] = scalar_value;
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < total; ++lane) {
+    test.expected[4u + lane] = scalar_value;
+    test.expected[4u + total + lane] = 7u;
+  }
+
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendMultiWaveLdsStore(&code, 5u, 7u);
+  AppendMultiWaveGuestBarrier(&code);
+  AppendSmemLoadOpcode(&code, 0x08, 20u, 0u);
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendSMovLiteral(&code, 21u, scalar_value);
+  code.push_back(EncodeSopc(0x06, 20u, 21u));
+  code.push_back(EncodeSopp(0x05, 2u));
+  code.push_back(EncodeSMovB32(22u, InlineU32(0u)));
+  code.push_back(EncodeSopp(0x02, 1u));
+  code.push_back(EncodeSMovB32(22u, InlineU32(7u)));
+  AppendStoreSgprAtLaneDwordOffset(&code, 20u, 4u, 4u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 22u, 4u, 4u + total);
+  AppendEnd(&code);
+
+  test.opcodes = {O::S_MOV_B64, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::DS_WRITE_B32, O::S_BARRIER, O::S_WAITCNT,
+                  O::S_BUFFER_LOAD_DWORD, O::S_MOV_B32, O::S_CMP_EQ_U32,
+                  O::S_CBRANCH_SCC1, O::S_BRANCH, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_BUFFER_LOAD_DWORD", 1u}};
+  test.ir_counts = {{"ReadConstBuffer", 1u}};
+  test.required_spirv = {"OpControlBarrier"};
   return test;
 }
 
@@ -28527,6 +29120,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
   AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxNleF16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
@@ -28638,6 +29232,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsWideGdsPartialBounds);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
+  AddCase(DsOrB64CapturedUpdatesBothWordsAndPreservesNeighbors);
+  AddCase(DsAddU64CapturedCarriesAcrossDwordsAndPreservesNeighbors);
+  AddCase(Wave64SingleWaveCyclicDsOrB64ImplicitCompletion);
+  AddCase(Wave64SingleWaveCyclicBufferFeedback);
+  AddCase(Wave64DispatcherExternalSelectionEntry);
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
@@ -28652,6 +29251,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64MultiWaveLdsExchange256);
   AddCase(Wave64MultiWaveLdsAtomicReduction);
   AddCase(Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit);
+  AddCase(Wave64MultiWaveLdsPeersTerminateBeforeBarrier);
+  AddCase(Wave64MultiWaveLdsDivergentBarrierSites);
+  AddCase(Wave64CooperativeImageAtomicReturnToLds);
+  AddCase(Wave64CooperativeScalarBufferLoadBranch);
   AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
   AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
@@ -33089,7 +33692,8 @@ void CheckComparisonPromotionLayoutAdmission() {
           GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0,
           "GetModuleFileName failed");
   std::string failures;
-  for (const char* mode : {"extent"}) {
+  struct Mode { const char* name; bool must_fail; };
+  for (const auto mode : {Mode{"extent", true}, Mode{"offset-overlap", false}}) {
     char directory[MAX_PATH]{};
     char filename[MAX_PATH]{};
     Require(name, "temporary log",
@@ -33115,7 +33719,7 @@ void CheckComparisonPromotionLayoutAdmission() {
                                          &limits, sizeof(limits)) != 0,
             "child cleanup job could not be created");
     std::string command = std::string("\"") + executable +
-        "\" --comparison-layout-death " + mode;
+        "\" --comparison-layout-death " + mode.name;
     std::vector<char> mutable_command(command.begin(), command.end());
     mutable_command.push_back('\0');
     STARTUPINFOA startup{sizeof(startup)};
@@ -33169,7 +33773,7 @@ void CheckComparisonPromotionLayoutAdmission() {
       // Fail immediately: the other modes must not launch while termination
       // is unconfirmed. This is a cleanup failure, never RED or GREEN.
       Require(name, "confirmed child termination", false,
-              std::string(mode) + " cleanup did not confirm child termination");
+              std::string(mode.name) + " cleanup did not confirm child termination");
     }
     LARGE_INTEGER zero{};
     LARGE_INTEGER length{};
@@ -33188,21 +33792,24 @@ void CheckComparisonPromotionLayoutAdmission() {
       }
     }
     CloseHandle(log); // Deletes the temporary file after the child has exited.
-    std::printf("[layout] %s exit=%lu completed=%d timeout=%d\n%s", mode,
+    std::printf("[layout] %s exit=%lu completed=%d timeout=%d\n%s", mode.name,
                 static_cast<unsigned long>(exit_code),
                 wait == WAIT_OBJECT_0 && exited, wait == WAIT_TIMEOUT,
                 output.c_str());
-    const bool intended = output.find(
-        std::string("KYTY_COMPARISON_LAYOUT_READY ") + mode) != std::string::npos &&
-        output.find("depth comparison promotion requires matching color backing layout") !=
-            std::string::npos;
+    const bool ready = output.find(
+        std::string("KYTY_COMPARISON_LAYOUT_READY ") + mode.name) != std::string::npos;
+    const bool rejected = output.find(
+        "depth comparison promotion requires matching color backing layout") != std::string::npos;
+    const bool returned = output.find(
+        std::string("KYTY_COMPARISON_LAYOUT_RETURNED ") + mode.name) != std::string::npos;
+    const bool intended = ready && (mode.must_fail ? rejected : returned && !rejected);
     if (!created || !assigned || !resumed || wait != WAIT_OBJECT_0 ||
-        !exited || exit_code != 321 || !intended) {
-      failures += std::string(mode) + " exit=" + std::to_string(exit_code) + "; ";
+        !exited || exit_code != (mode.must_fail ? 321u : 0u) || !intended) {
+      failures += std::string(mode.name) + " exit=" + std::to_string(exit_code) + "; ";
     }
   }
   Require(name, "actual ResolveTexture layout guard", failures.empty(), failures);
-  std::printf("[host]    %-32s ok (1 case)\n", name);
+  std::printf("[host]    %-32s ok (2 cases)\n", name);
 }
 #endif
 
@@ -33769,6 +34376,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Wave64MultiWaveLdsExchange256());
     RunCase(&vulkan, Wave64MultiWaveLdsAtomicReduction());
     RunCase(&vulkan, Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit());
+    RunCase(&vulkan, Wave64MultiWaveLdsPeersTerminateBeforeBarrier());
+    RunCase(&vulkan, Wave64MultiWaveLdsDivergentBarrierSites());
+    RunCase(&vulkan, Wave64CooperativeImageAtomicReturnToLds());
+    RunCase(&vulkan, Wave64CooperativeScalarBufferLoadBranch());
     RunCase(&vulkan, Wave64MultiWaveLdsDifferentIterationsBeforeBarrier());
     return 0;
   }

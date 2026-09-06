@@ -189,51 +189,6 @@ static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageRes
 	       resource.read && !resource.written && !resource.atomic && !resource.depth_compare;
 }
 
-TargetTextureViewInfo ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
-                                               Prospero::ImageType type, uint32_t base_layer,
-                                               uint32_t image_layers) {
-	switch (type) {
-		case Prospero::ImageType::kColor2D:
-			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
-			               base_layer == 0 && image_layers == 1
-			           ? TargetTextureViewInfo {vk::ImageViewType::e2D, 0, 1}
-			           : TargetTextureViewInfo {};
-		case Prospero::ImageType::kCube:
-			if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
-			    base_layer >= image_layers || (image_layers - base_layer) % 6u != 0) {
-				return {};
-			}
-			return {vk::ImageViewType::e2DArray, base_layer, image_layers - base_layer};
-		case Prospero::ImageType::kColor2DArray:
-			if (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
-			    base_layer == 0 && image_layers == 1) {
-				return {vk::ImageViewType::e2D, 0, 1};
-			}
-			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
-			               base_layer < image_layers
-			           ? TargetTextureViewInfo {vk::ImageViewType::e2DArray, base_layer,
-			                                    image_layers - base_layer}
-			           : TargetTextureViewInfo {};
-		case Prospero::ImageType::kColor2DMsaa:
-			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
-			               base_layer == 0 && image_layers == 1
-			           ? TargetTextureViewInfo {vk::ImageViewType::e2D, 0, 1}
-			           : TargetTextureViewInfo {};
-		case Prospero::ImageType::kColor2DMsaaArray:
-			if (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
-			    base_layer == 0 && image_layers == 1) {
-				return {vk::ImageViewType::e2D, 0, 1};
-			}
-			return resource.dimension ==
-			                   ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray &&
-			               base_layer < image_layers
-			           ? TargetTextureViewInfo {vk::ImageViewType::e2DArray, base_layer,
-			                                    image_layers - base_layer}
-			           : TargetTextureViewInfo {};
-		default: return {};
-	}
-}
-
 bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
                                     const ShaderTextureResource& descriptor, const Image& image) {
 	return image.usage.video_out && image.info.resources.layers == 1 &&
@@ -241,51 +196,6 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
 	       descriptor.Type() == Prospero::ImageType::kColor2D && descriptor.Depth() == 0 &&
 	       descriptor.BaseArray5() == 0;
-}
-
-bool IsSupportedSampledDepthDescriptor(const ShaderTextureResource& descriptor, const Image& image,
-                                      bool r128) {
-	const auto width        = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height       = static_cast<uint32_t>(descriptor.Height5()) + 1u;
-	const auto type         = descriptor.Type();
-	const bool multisampled = IsMultisampledTexture(type);
-	const auto samples      = multisampled ? 1u << descriptor.LastLevel() : 1u;
-	const auto pitch =
-	    multisampled ? TileGetDepthPitch(width, image.info.bytes_per_block, descriptor.LastLevel())
-	                 : TileGetTexturePitch(descriptor.Format(), width, descriptor.TileMode());
-	const bool supported_2d    = type == Prospero::ImageType::kColor2D &&
-	                             image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
-	                             descriptor.BaseArray5() == 0;
-	const bool supported_array = type == Prospero::ImageType::kColor2DArray &&
-	                             descriptor.BaseArray5() <= descriptor.Depth() &&
-	                             descriptor.Depth() < image.info.resources.layers;
-	const bool supported_cube =
-	    type == Prospero::ImageType::kCube && width == height && image.info.resources.layers >= 6 &&
-	    image.info.resources.layers % 6u == 0 &&
-	    static_cast<uint32_t>(descriptor.Depth()) + 1u == image.info.resources.layers &&
-	    descriptor.BaseArray5() == 0;
-	const bool supported_msaa_2d    = type == Prospero::ImageType::kColor2DMsaa &&
-	                                  image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
-	                                  descriptor.BaseArray5() == 0;
-	const bool supported_msaa_array = type == Prospero::ImageType::kColor2DMsaaArray &&
-	                                  descriptor.BaseArray5() <= descriptor.Depth() &&
-	                                  descriptor.Depth() < image.info.resources.layers;
-	const bool levels_ok =
-	    multisampled ? descriptor.BaseLevel() == 0 && descriptor.LastLevel() >= 1 &&
-	                       descriptor.LastLevel() <= 3 &&
-	                       (r128 || descriptor.MaxMip() == descriptor.LastLevel()) &&
-	                       image.info.resources.levels == 1 && image.info.samples == samples
-	                 : descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
-	                       (r128 || descriptor.MaxMip() == 0) && image.info.samples == 1;
-	return image.info.IsDepth() && width == image.info.extent.width &&
-	       height == image.info.extent.height &&
-	       (supported_2d || supported_array || supported_cube || supported_msaa_2d ||
-	        supported_msaa_array) &&
-	       levels_ok && descriptor.MinLod() == 0 &&
-	       descriptor.TileMode() == image.info.tile_mode &&
-	       (!multisampled || descriptor.TileMode() == Prospero::TileMode::kDepth) &&
-	       descriptor.BCSwizzle() == 0 &&
-	       (!descriptor.MsaaDepth() || multisampled) && pitch >= width && pitch == image.info.pitch;
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, const Image& image,
@@ -309,7 +219,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	}
 	const bool full = common && descriptor.fields[4] == field4_expected &&
 	                  descriptor.fields[5] == field5_expected;
-	if (!full || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0)) {
+	if (!full || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0) ||
+	    (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()))) {
 		return false;
 	}
 	if (descriptor.fields[6] == 0) {
@@ -328,24 +239,23 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
-	const bool resource_ok   = IsSupportedSampledDepthResource(resource);
-	const bool descriptor_ok = IsSupportedSampledDepthDescriptor(descriptor, image, resource.r128);
-	const bool encoding_ok   = IsSupportedDepthTextureEncoding(descriptor, image, resource.r128);
+	const bool resource_ok = IsSupportedSampledDepthResource(resource);
+	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, image, resource.r128);
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
-	if (resource_ok && descriptor_ok && encoding_ok && view_ok) {
+	if (resource_ok && encoding_ok && view_ok) {
 		return;
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
-	EXIT("unsupported sampled depth image: resource=%d descriptor=%d encoding=%d view=%d "
+	EXIT("unsupported sampled depth image: resource=%d encoding=%d view=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, descriptor_ok, encoding_ok, view_ok,
+	     resource_ok, encoding_ok, view_ok,
 	     static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
 	     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,

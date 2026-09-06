@@ -103,11 +103,7 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 	if (resource.numeric_class != Prospero::TextureNumericClass::Float && resource.depth_compare) {
 		return false;
 	}
-	return (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
+	return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic;
 }
 

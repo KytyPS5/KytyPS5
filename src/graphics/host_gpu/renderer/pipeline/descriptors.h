@@ -66,18 +66,6 @@ template <typename T>
 	return result;
 }
 
-struct TargetTextureViewInfo {
-	vk::ImageViewType type        = static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM);
-	uint32_t          base_layer  = 0;
-	uint32_t          layer_count = 0;
-};
-
-[[nodiscard]] TargetTextureViewInfo
-ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
-                         Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers);
-
-[[nodiscard]] bool IsSupportedSampledDepthDescriptor(const ShaderTextureResource& descriptor,
-                                                     const Image& image, bool r128 = false);
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    const Image& image, bool r128 = false);
 [[nodiscard]] bool

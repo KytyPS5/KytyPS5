@@ -8323,8 +8323,8 @@ public:
   void CheckComparisonDepthTexture() {
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
-    constexpr uint64_t allocation_size = 0x10000;
-    constexpr uint64_t ordinary_address = base + 0x1000;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t ordinary_address = base + 0x10000;
     constexpr std::array<uint16_t, 6> depths{0, 13107, 26214, 39321, 52428, 65535};
     constexpr std::array<float, 5> references{0.1f, 0.3f, 0.5f, 0.7f, 0.9f};
     EnsureRuntimeContext();
@@ -8340,15 +8340,22 @@ public:
                 &mapped, allocation_size, 0x3, 0x10, direct_offset,
                 allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
             "comparison texture mapping failed");
-    std::memset(mapped, 0, allocation_size);
-    for (uint32_t face = 0; face < depths.size(); face++) {
-      for (const auto address : {base, ordinary_address}) {
-        std::memcpy(reinterpret_cast<void *>(address + face * 0x100),
-                    &depths[face], sizeof(uint16_t));
+    // Sea of Stars' 1D comparison texture and the existing six-face cube.
+    const auto check_layout = [&](bool cube) {
+      const uint32_t layers = cube ? depths.size() : 1;
+      const auto depth_at = [&](uint32_t layer, bool reversed) {
+        const auto index = cube ? layer : 2u;
+        return depths[reversed ? depths.size() - 1u - index : index];
+      };
+      std::memset(mapped, 0, allocation_size);
+      for (uint32_t face = 0; face < layers; face++) {
+        const auto depth = depth_at(face, false);
+        for (const auto address : {base, ordinary_address}) {
+          std::memcpy(reinterpret_cast<void *>(address + face * 0x100),
+                      &depth, sizeof(depth));
+        }
       }
-    }
 
-    {
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
@@ -8360,7 +8367,8 @@ public:
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
       ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
-          0x00700000u, 0, 0xb0100204u, 5, 0x00700000u, 0, 0}};
+          0x00700000u, 0, cube ? 0xb0100204u : 0x81800924u,
+          layers - 1u, 0x00700000u, 0, 0}};
       ShaderSamplerResource sampler_descriptor{{1u << 12u, 0, 1u << 24u, 0}};
       TestCase test;
       test.name = name;
@@ -8368,32 +8376,41 @@ public:
       test.image_descriptor_swizzle = descriptor.DstSelXYZW();
       std::copy_n(descriptor.fields, 8, test.user_data.begin());
       std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
-      test.user_data[50] = depths.size() * references.size() * sizeof(uint32_t);
+      test.user_data[50] = layers * references.size() * sizeof(uint32_t);
       test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
                       ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
       test.required_spirv = {"OpImageSampleDrefExplicitLod"};
       std::vector<uint32_t> promoted_expected;
-      for (uint32_t face = 0; face < depths.size(); face++) {
+      for (uint32_t face = 0; face < layers; face++) {
         for (const auto reference : references) {
           AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(reference));
-          AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(1.5f));
-          AppendVMovLiteral(&test.code, 22, std::bit_cast<uint32_t>(1.5f));
-          AppendVMovLiteral(&test.code, 23, std::bit_cast<uint32_t>(static_cast<float>(face)));
-          test.code.push_back(EncodeMimg0(0x2f, 1, 0, false, 3));
+          AppendVMovLiteral(&test.code, 21,
+                            std::bit_cast<uint32_t>(cube ? 1.5f : 0.5f));
+          if (cube) {
+            AppendVMovLiteral(&test.code, 22, std::bit_cast<uint32_t>(1.5f));
+            AppendVMovLiteral(&test.code, 23,
+                              std::bit_cast<uint32_t>(static_cast<float>(face)));
+          }
+          test.code.push_back(EncodeMimg0(0x2f, 1, 0, false, cube ? 3 : 0));
           test.code.push_back(EncodeMimg1(0, 20, 0, 2));
           AppendStoreVgpr(&test.code, 0, static_cast<uint32_t>(test.expected.size()));
-          test.expected.push_back(reference < static_cast<float>(depths[face]) / 65535.f
-                                      ? 0x3f800000u : 0u);
-          promoted_expected.push_back(reference < static_cast<float>(depths[5 - face]) / 65535.f
-                                          ? 0x3f800000u : 0u);
+          test.expected.push_back(
+              reference < static_cast<float>(depth_at(face, false)) / 65535.f
+                  ? 0x3f800000u : 0u);
+          promoted_expected.push_back(
+              reference < static_cast<float>(depth_at(face, true)) / 65535.f
+                  ? 0x3f800000u : 0u);
         }
       }
       AppendEnd(&test.code);
       const auto compiled = CompileCase(test, SubgroupSize());
       Require(name, "comparison resource", compiled.program.info.images.size() == 1 &&
                   compiled.program.info.images[0].depth_compare &&
-                  compiled.program.info.images[0].cube,
-              "native cube comparison did not retain its resource semantics");
+                  compiled.program.info.images[0].cube == cube &&
+                  compiled.program.info.images[0].dimension ==
+                      (cube ? ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+                            : ShaderRecompiler::Decoder::ImageDimension::Dim1D),
+              "native comparison did not retain its resource semantics");
       ShaderRecompiler::IR::DescriptorValue value{};
       value.dword_count = 8;
       std::copy_n(descriptor.fields, 8, value.dwords.begin());
@@ -8404,8 +8421,11 @@ public:
       Require(name, "fresh depth backing", view != nullptr &&
                   image.info.pixel_format == vk::Format::eD16Unorm &&
                   image.info.guest_format == Prospero::BufferFormat::k16UNorm &&
-                  image.info.tile_mode == Prospero::TileMode::kStandard256B &&
-                  image.info.data.size == 0x600 && image.info.resources.layers == 6,
+                  image.info.tile_mode == descriptor.TileMode() &&
+                  image.info.type == (cube ? Prospero::ImageType::kColor2D
+                                          : Prospero::ImageType::kColor1D) &&
+                  image.info.data.size == (cube ? 0x600u : 0x10000u) &&
+                  image.info.resources.layers == layers,
               "comparison texture lost its guest layout or depth representation");
       auto ordinary_resource = compiled.program.info.images[0];
       ordinary_resource.depth_compare = false;
@@ -8423,23 +8443,23 @@ public:
       sampled.view = view;
       sampled.layout = image.backing.state.layout;
       Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr, sampler);
-      Require(name, "six face comparisons",
+      Require(name, "native comparisons",
               ReadBuffer(name, output, test.expected.size()) == test.expected,
-              "comparison samples lost a depth value or Standard256B face stride");
+              "comparison samples lost a depth value or guest layer stride");
 
       image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
                     {}, scheduler.Current().Handle());
       color.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
                     {}, scheduler.Current().Handle());
-      for (uint32_t face = 0; face < depths.size(); face++) {
+      for (uint32_t face = 0; face < layers; face++) {
         const vk::ImageSubresourceRange depth_range{vk::ImageAspectFlagBits::eDepth, 0, 1, face, 1};
         const vk::ClearDepthStencilValue clear_depth{
-            static_cast<float>(depths[5 - face]) / 65535.f, 0};
+            static_cast<float>(depth_at(face, true)) / 65535.f, 0};
         scheduler.Current().Handle().clearDepthStencilImage(image.backing.image,
             vk::ImageLayout::eTransferDstOptimal, &clear_depth, 1, &depth_range);
         const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, face, 1};
         const vk::ClearColorValue clear_color{std::array<float, 4>{
-            static_cast<float>(depths[5 - face]) / 65535.f, 0.f, 0.f, 0.f}};
+            static_cast<float>(depth_at(face, true)) / 65535.f, 0.f, 0.f, 0.f}};
         scheduler.Current().Handle().clearColorImage(color.backing.image,
             vk::ImageLayout::eTransferDstOptimal, &clear_color, 1, &color_range);
       }
@@ -8449,10 +8469,10 @@ public:
               "ordinary tiled depth readback did not use the shared transfer path");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
-      for (uint32_t face = 0; face < depths.size(); face++) {
+      for (uint32_t face = 0; face < layers; face++) {
         uint16_t actual = 0;
         std::memcpy(&actual, reinterpret_cast<const void *>(base + face * 0x100), sizeof(actual));
-        Require(name, "depth guest roundtrip", actual == depths[5 - face],
+        Require(name, "depth guest roundtrip", actual == depth_at(face, true),
                 "GPU depth clear was not written to the correct guest face");
       }
 
@@ -8474,7 +8494,9 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
-    }
+    };
+    check_layout(false);
+    check_layout(true);
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "comparison texture unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
@@ -24210,47 +24232,6 @@ void CheckSampledColorViews() {
                                  vk::Format::eR8G8B8A8Unorm,
                                  DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7),
           "RGBA did not select the identity view");
-  ShaderRecompiler::IR::ImageResource cube_resource{};
-  cube_resource.resource_class =
-      ShaderRecompiler::IR::ImageResourceClass::Sampled;
-  cube_resource.numeric_class = Prospero::TextureNumericClass::Float;
-  cube_resource.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  cube_resource.read = true;
-  const auto cube_view =
-      ResolveTargetTextureView(cube_resource, Prospero::ImageType::kCube, 0, 6);
-  Require("SampledColorViews", "PPSA17337 cubemap render target",
-          cube_view.type == vk::ImageViewType::e2DArray &&
-              cube_view.base_layer == 0 && cube_view.layer_count == 6,
-          "captured six-face cubemap did not resolve to a 2D-array view");
-  const auto cube_array_view = ResolveTargetTextureView(
-      cube_resource, Prospero::ImageType::kCube, 6, 18);
-  Require("SampledColorViews", "cubemap array subview",
-          cube_array_view.type == vk::ImageViewType::e2DArray &&
-              cube_array_view.base_layer == 6 &&
-              cube_array_view.layer_count == 12,
-          "nonzero-base multi-cube view did not preserve whole face groups");
-  auto non_array_cube_resource = cube_resource;
-  non_array_cube_resource.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  Require("SampledColorViews", "cubemap hard guards",
-          ResolveTargetTextureView(non_array_cube_resource,
-                                   Prospero::ImageType::kCube, 0, 6)
-                      .type ==
-                  static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM) &&
-              ResolveTargetTextureView(cube_resource,
-                                       Prospero::ImageType::kCube, 0, 7)
-                      .type ==
-                  static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM) &&
-              ResolveTargetTextureView(cube_resource,
-                                       Prospero::ImageType::kCube, 1, 6)
-                      .type ==
-                  static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM) &&
-              ResolveTargetTextureView(cube_resource,
-                                       Prospero::ImageType::kCube, 6, 6)
-                      .type ==
-                  static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM),
-          "non-array or partial cubemap views were accepted");
   uint32_t valid_swizzles = 0;
   for (uint32_t swizzle = 0; swizzle <= 0xfffu; swizzle++) {
     bool expected = true;
@@ -24508,19 +24489,6 @@ void CheckSampledDepthResource() {
   Require("SampledDepthResource", "singleton array accepted",
           IsSupportedSampledDepthResource(resource),
           "array depth resource was rejected");
-  const auto singleton_array_view = ResolveTargetTextureView(
-      resource, Prospero::ImageType::kColor2DArray, 0, 1);
-  Require("SampledDepthResource", "singleton array view",
-          singleton_array_view.type == vk::ImageViewType::e2DArray &&
-              singleton_array_view.base_layer == 0 &&
-              singleton_array_view.layer_count == 1,
-          "singleton depth array did not preserve the shader array view type");
-  Require(
-      "SampledDepthResource", "array type mismatch rejected",
-      ResolveTargetTextureView(resource, Prospero::ImageType::kColor2D, 0, 1)
-              .type ==
-          static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM),
-      "array shader resource accepted a non-array descriptor view");
   resource = basic;
   resource.numeric_class = Prospero::TextureNumericClass::Uint;
   Require("SampledDepthResource", "integer read",
@@ -24897,7 +24865,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-void CheckSampledDepthDescriptor(RenderContext &renderer) {
+void CheckDepthTextureEncoding(RenderContext &renderer) {
   auto &context = renderer.GetGraphics();
   CommandScheduler scheduler(renderer, context);
   const auto make_info = [](uint32_t width, uint32_t height, uint32_t pitch,
@@ -24918,19 +24886,10 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
     return info;
   };
 
-  ShaderTextureResource descriptor{{0x00eb0900u, 0xc1600000u, 0x00bcc14fu,
-                                    0x91800924u, 0x00000000u, 0x00700000u,
-                                    0x00000000u, 0x00000000u}};
   Image image(context, scheduler,
               make_info(1344, 756, 1408, 1, vk::Format::eD32SfloatS8Uint,
                         Prospero::ImageType::kColor2D));
   image.usage.depth_target = true;
-  Require("SampledDepthDescriptor", "normalized padded pitch",
-          descriptor.Width5() + 1u == image.info.extent.width &&
-              descriptor.Height5() + 1u == image.info.extent.height &&
-              IsSupportedSampledDepthDescriptor(descriptor, image),
-          "normalized depth image rejected a valid padded descriptor");
-
   const ShaderTextureResource disabled_sampler_tweaks{{
       0x05135600u,
       0xc1600000u,
@@ -24941,7 +24900,7 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
       0x00000000u,
       0x00000000u,
   }};
-  Require("SampledDepthDescriptor", "disabled sampler tweaks",
+  Require("DepthTextureEncoding", "disabled sampler tweaks",
           disabled_sampler_tweaks.PerfMod5() == 0 &&
               IsSupportedDepthTextureEncoding(disabled_sampler_tweaks, image),
           "valid sampler modulation factor zero was rejected");
@@ -24961,53 +24920,16 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
   msaa_info.mip_layout[0] = {0, 0x010e0000, 1920, 1152};
   Image msaa_image(context, scheduler, msaa_info);
   msaa_image.usage.depth_target = true;
-  Require("SampledDepthDescriptor", "uncompressed 2x MSAA depth",
-          IsSupportedSampledDepthDescriptor(uncompressed_msaa, msaa_image) &&
-              IsSupportedDepthTextureEncoding(uncompressed_msaa, msaa_image),
+  Require("DepthTextureEncoding", "uncompressed 2x MSAA depth",
+          IsSupportedDepthTextureEncoding(uncompressed_msaa, msaa_image),
           "valid uncompressed MSAA depth descriptor required an HTILE "
           "compatibility flag");
 
   auto r128_msaa = uncompressed_msaa;
   std::fill(r128_msaa.fields + 4, r128_msaa.fields + 8, 0u);
-  Require("SampledDepthDescriptor", "R128 uncompressed 2x MSAA depth",
-          IsSupportedSampledDepthDescriptor(r128_msaa, msaa_image, true) &&
-              IsSupportedDepthTextureEncoding(r128_msaa, msaa_image, true),
+  Require("DepthTextureEncoding", "R128 uncompressed 2x MSAA depth",
+          IsSupportedDepthTextureEncoding(r128_msaa, msaa_image, true),
           "valid R128 MSAA depth descriptor required omitted dwords");
-
-  descriptor.fields[3] =
-      (descriptor.fields[3] & ~(0xfu << 28u)) |
-      (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
-  Require("SampledDepthDescriptor", "singleton array descriptor",
-          IsSupportedSampledDepthDescriptor(descriptor, image),
-          "normalized singleton-array depth view was rejected");
-  descriptor.fields[3] =
-      (descriptor.fields[3] & ~(0xfu << 28u)) |
-      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
-
-  ShaderTextureResource cube_descriptor{{0x01267d00u, 0xc0700000u, 0x00ffc0ffu,
-                                         0xb1800924u, 0x00000005u, 0x00700000u,
-                                         0x00000000u, 0x00000000u}};
-  Image cube_image(context, scheduler,
-                   make_info(1024, 1024, 1024, 6, vk::Format::eD32Sfloat,
-                             Prospero::ImageType::kColor2D));
-  cube_image.usage.depth_target = true;
-  ShaderRecompiler::IR::ImageResource cube_resource{};
-  cube_resource.resource_class =
-      ShaderRecompiler::IR::ImageResourceClass::Sampled;
-  cube_resource.numeric_class = Prospero::TextureNumericClass::Float;
-  cube_resource.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  cube_resource.read = true;
-  cube_resource.depth_compare = true;
-  const auto cube_view =
-      ResolveTargetTextureView(cube_resource, Prospero::ImageType::kCube, 0,
-                               cube_image.info.resources.layers);
-  Require("SampledDepthDescriptor", "normalized depth cube",
-          IsSupportedSampledDepthDescriptor(cube_descriptor, cube_image) &&
-              IsSupportedDepthTextureEncoding(cube_descriptor, cube_image) &&
-              cube_view.type == vk::ImageViewType::e2DArray &&
-              cube_view.layer_count == 6,
-          "normalized depth cube did not preserve its six-face view");
 
   constexpr uint64_t captured_htile_address = 0x106d48000ull;
   const ShaderTextureResource compressed_descriptor{{
@@ -25028,6 +24950,8 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
   mismatched_metadata_low.fields[6] ^= 1u << 24u;
   auto dcc_only_control = compressed_descriptor;
   dcc_only_control.fields[6] |= 1u << 22u;
+  auto non_msaa_iterate_256 = compressed_descriptor;
+  non_msaa_iterate_256.fields[6] |= 1u << 10u;
   const bool accepts_compressed =
       IsSupportedDepthTextureEncoding(compressed_descriptor, image);
   image.info.metadata.kind = ImageMetadataKind::Dcc;
@@ -25046,37 +24970,18 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
       !IsSupportedDepthTextureEncoding(compressed_descriptor, image);
   image.info.metadata.range.size = 0x1000;
   Require(
-      "SampledDepthDescriptor", "compressed HTILE descriptor",
+      "DepthTextureEncoding", "compressed HTILE descriptor",
       accepts_compressed &&
           !IsSupportedDepthTextureEncoding(mismatched_metadata, image) &&
           !IsSupportedDepthTextureEncoding(mismatched_metadata_low, image) &&
-          !IsSupportedDepthTextureEncoding(dcc_only_control, image),
+          !IsSupportedDepthTextureEncoding(dcc_only_control, image) &&
+          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256, image),
       "compressed sampled depth did not require its exact tracked HTILE");
-  Require("SampledDepthDescriptor", "tracked HTILE state",
+  Require("DepthTextureEncoding", "tracked HTILE state",
           rejects_dcc && rejects_none && rejects_empty && rejects_overflow,
           "compressed sampled depth accepted invalid tracked metadata");
 
-  auto partial_cube = cube_descriptor;
-  partial_cube.fields[4] = 4;
-  auto based_cube = cube_descriptor;
-  based_cube.fields[4] |= 1u << 16u;
-  auto reserved_cube = cube_descriptor;
-  reserved_cube.fields[4] |= 1u << 13u;
-  auto non_square_cube = cube_descriptor;
-  non_square_cube.fields[2] =
-      (non_square_cube.fields[2] & ~(0x3fffu << 14u)) | (511u << 14u);
-  image.info.pitch = 1344;
-  const bool rejects_pitch =
-      !IsSupportedSampledDepthDescriptor(descriptor, image);
-  image.info.pitch = 1408;
-  Require("SampledDepthDescriptor", "normalized hard guards",
-          rejects_pitch &&
-              !IsSupportedSampledDepthDescriptor(partial_cube, cube_image) &&
-              !IsSupportedSampledDepthDescriptor(based_cube, cube_image) &&
-              !IsSupportedDepthTextureEncoding(reserved_cube, cube_image) &&
-              !IsSupportedSampledDepthDescriptor(non_square_cube, cube_image),
-          "normalized depth descriptor accepted an incompatible image view");
-  std::printf("[host]    %-32s ok\n", "SampledDepthDescriptor");
+  std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
 }
 
 ShaderRecompiler::IR::ImageResource BasicStorageTextureResource() {
@@ -28146,6 +28051,13 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
+    VulkanHarness vulkan;
+    CheckSampledDepthResource();
+    CheckDepthTextureEncoding(vulkan.RuntimeRenderer());
+    vulkan.CheckComparisonDepthTexture();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
@@ -28172,13 +28084,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
     VulkanHarness vulkan;
     CheckImageTransitionState(vulkan.RuntimeRenderer());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
-    VulkanHarness vulkan;
-    CheckSampledDepthResource();
-    CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
-    vulkan.CheckComparisonDepthTexture();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
@@ -28228,7 +28133,7 @@ int main(int argc, char **argv) {
   CheckSampledVideoOutView(vulkan.RuntimeRenderer());
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
-  CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
+  CheckDepthTextureEncoding(vulkan.RuntimeRenderer());
   vulkan.CheckComparisonDepthTexture();
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();

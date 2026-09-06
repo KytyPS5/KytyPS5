@@ -375,113 +375,6 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
-static Prospero::BufferFormat
-VertexAttribFormatToBufferFormat(Prospero::VertexAttribFormat format) {
-	struct FormatMap {
-		Prospero::VertexAttribFormat vertex;
-		Prospero::BufferFormat       buffer;
-	};
-
-	static constexpr FormatMap format_map[] = {
-	    {Prospero::VertexAttribFormat::kInvalid, Prospero::BufferFormat::kInvalid},
-	    {Prospero::VertexAttribFormat::k8UNorm, Prospero::BufferFormat::k8UNorm},
-	    {Prospero::VertexAttribFormat::k8SNorm, Prospero::BufferFormat::k8SNorm},
-	    {Prospero::VertexAttribFormat::k8UScaled, Prospero::BufferFormat::k8UScaled},
-	    {Prospero::VertexAttribFormat::k8SScaled, Prospero::BufferFormat::k8SScaled},
-	    {Prospero::VertexAttribFormat::k8UInt, Prospero::BufferFormat::k8UInt},
-	    {Prospero::VertexAttribFormat::k8SInt, Prospero::BufferFormat::k8SInt},
-	    {Prospero::VertexAttribFormat::k16UNorm, Prospero::BufferFormat::k16UNorm},
-	    {Prospero::VertexAttribFormat::k16SNorm, Prospero::BufferFormat::k16SNorm},
-	    {Prospero::VertexAttribFormat::k16UScaled, Prospero::BufferFormat::k16UScaled},
-	    {Prospero::VertexAttribFormat::k16SScaled, Prospero::BufferFormat::k16SScaled},
-	    {Prospero::VertexAttribFormat::k16UInt, Prospero::BufferFormat::k16UInt},
-	    {Prospero::VertexAttribFormat::k16SInt, Prospero::BufferFormat::k16SInt},
-	    {Prospero::VertexAttribFormat::k16Float, Prospero::BufferFormat::k16Float},
-	    {Prospero::VertexAttribFormat::k8_8UNorm, Prospero::BufferFormat::k8_8UNorm},
-	    {Prospero::VertexAttribFormat::k8_8SNorm, Prospero::BufferFormat::k8_8SNorm},
-	    {Prospero::VertexAttribFormat::k8_8UScaled, Prospero::BufferFormat::k8_8UScaled},
-	    {Prospero::VertexAttribFormat::k8_8SScaled, Prospero::BufferFormat::k8_8SScaled},
-	    {Prospero::VertexAttribFormat::k8_8UInt, Prospero::BufferFormat::k8_8UInt},
-	    {Prospero::VertexAttribFormat::k8_8SInt, Prospero::BufferFormat::k8_8SInt},
-	    {Prospero::VertexAttribFormat::k32UInt, Prospero::BufferFormat::k32UInt},
-	    {Prospero::VertexAttribFormat::k32SInt, Prospero::BufferFormat::k32SInt},
-	    {Prospero::VertexAttribFormat::k32Float, Prospero::BufferFormat::k32Float},
-	    {Prospero::VertexAttribFormat::k16_16UNorm, Prospero::BufferFormat::k16_16UNorm},
-	    {Prospero::VertexAttribFormat::k16_16SNorm, Prospero::BufferFormat::k16_16SNorm},
-	    {Prospero::VertexAttribFormat::k16_16UScaled, Prospero::BufferFormat::k16_16UScaled},
-	    {Prospero::VertexAttribFormat::k16_16SScaled, Prospero::BufferFormat::k16_16SScaled},
-	    {Prospero::VertexAttribFormat::k16_16UInt, Prospero::BufferFormat::k16_16UInt},
-	    {Prospero::VertexAttribFormat::k16_16SInt, Prospero::BufferFormat::k16_16SInt},
-	    {Prospero::VertexAttribFormat::k16_16Float, Prospero::BufferFormat::k16_16Float},
-	    {Prospero::VertexAttribFormat::k11_11_10UNorm, Prospero::BufferFormat::k11_11_10UNorm},
-	    {Prospero::VertexAttribFormat::k11_11_10SNorm, Prospero::BufferFormat::k11_11_10SNorm},
-	    {Prospero::VertexAttribFormat::k11_11_10UScaled, Prospero::BufferFormat::k11_11_10UScaled},
-	    {Prospero::VertexAttribFormat::k11_11_10SScaled, Prospero::BufferFormat::k11_11_10SScaled},
-	    {Prospero::VertexAttribFormat::k11_11_10UInt, Prospero::BufferFormat::k11_11_10UInt},
-	    {Prospero::VertexAttribFormat::k11_11_10SInt, Prospero::BufferFormat::k11_11_10SInt},
-	    {Prospero::VertexAttribFormat::k11_11_10Float, Prospero::BufferFormat::k11_11_10Float},
-	    {Prospero::VertexAttribFormat::k10_11_11UNorm, Prospero::BufferFormat::k10_11_11UNorm},
-	    {Prospero::VertexAttribFormat::k10_11_11SNorm, Prospero::BufferFormat::k10_11_11SNorm},
-	    {Prospero::VertexAttribFormat::k10_11_11UScaled, Prospero::BufferFormat::k10_11_11UScaled},
-	    {Prospero::VertexAttribFormat::k10_11_11SScaled, Prospero::BufferFormat::k10_11_11SScaled},
-	    {Prospero::VertexAttribFormat::k10_11_11UInt, Prospero::BufferFormat::k10_11_11UInt},
-	    {Prospero::VertexAttribFormat::k10_11_11SInt, Prospero::BufferFormat::k10_11_11SInt},
-	    {Prospero::VertexAttribFormat::k10_11_11Float, Prospero::BufferFormat::k10_11_11Float},
-	    {Prospero::VertexAttribFormat::k2_10_10_10UNorm, Prospero::BufferFormat::k2_10_10_10UNorm},
-	    {Prospero::VertexAttribFormat::k2_10_10_10SNorm, Prospero::BufferFormat::k2_10_10_10SNorm},
-	    {Prospero::VertexAttribFormat::k2_10_10_10UScaled,
-	     Prospero::BufferFormat::k2_10_10_10UScaled},
-	    {Prospero::VertexAttribFormat::k2_10_10_10SScaled,
-	     Prospero::BufferFormat::k2_10_10_10SScaled},
-	    {Prospero::VertexAttribFormat::k2_10_10_10UInt, Prospero::BufferFormat::k2_10_10_10UInt},
-	    {Prospero::VertexAttribFormat::k2_10_10_10SInt, Prospero::BufferFormat::k2_10_10_10SInt},
-	    {Prospero::VertexAttribFormat::k10_10_10_2UNorm, Prospero::BufferFormat::k10_10_10_2UNorm},
-	    {Prospero::VertexAttribFormat::k10_10_10_2SNorm, Prospero::BufferFormat::k10_10_10_2SNorm},
-	    {Prospero::VertexAttribFormat::k10_10_10_2UScaled,
-	     Prospero::BufferFormat::k10_10_10_2UScaled},
-	    {Prospero::VertexAttribFormat::k10_10_10_2SScaled,
-	     Prospero::BufferFormat::k10_10_10_2SScaled},
-	    {Prospero::VertexAttribFormat::k10_10_10_2UInt, Prospero::BufferFormat::k10_10_10_2UInt},
-	    {Prospero::VertexAttribFormat::k10_10_10_2SInt, Prospero::BufferFormat::k10_10_10_2SInt},
-	    {Prospero::VertexAttribFormat::k8_8_8_8UNorm, Prospero::BufferFormat::k8_8_8_8UNorm},
-	    {Prospero::VertexAttribFormat::k8_8_8_8SNorm, Prospero::BufferFormat::k8_8_8_8SNorm},
-	    {Prospero::VertexAttribFormat::k8_8_8_8UScaled, Prospero::BufferFormat::k8_8_8_8UScaled},
-	    {Prospero::VertexAttribFormat::k8_8_8_8SScaled, Prospero::BufferFormat::k8_8_8_8SScaled},
-	    {Prospero::VertexAttribFormat::k8_8_8_8UInt, Prospero::BufferFormat::k8_8_8_8UInt},
-	    {Prospero::VertexAttribFormat::k8_8_8_8SInt, Prospero::BufferFormat::k8_8_8_8SInt},
-	    {Prospero::VertexAttribFormat::k32_32UInt, Prospero::BufferFormat::k32_32UInt},
-	    {Prospero::VertexAttribFormat::k32_32SInt, Prospero::BufferFormat::k32_32SInt},
-	    {Prospero::VertexAttribFormat::k32_32Float, Prospero::BufferFormat::k32_32Float},
-	    {Prospero::VertexAttribFormat::k16_16_16_16UNorm,
-	     Prospero::BufferFormat::k16_16_16_16UNorm},
-	    {Prospero::VertexAttribFormat::k16_16_16_16SNorm,
-	     Prospero::BufferFormat::k16_16_16_16SNorm},
-	    {Prospero::VertexAttribFormat::k16_16_16_16UScaled,
-	     Prospero::BufferFormat::k16_16_16_16UScaled},
-	    {Prospero::VertexAttribFormat::k16_16_16_16SScaled,
-	     Prospero::BufferFormat::k16_16_16_16SScaled},
-	    {Prospero::VertexAttribFormat::k16_16_16_16UInt, Prospero::BufferFormat::k16_16_16_16UInt},
-	    {Prospero::VertexAttribFormat::k16_16_16_16SInt, Prospero::BufferFormat::k16_16_16_16SInt},
-	    {Prospero::VertexAttribFormat::k16_16_16_16Float,
-	     Prospero::BufferFormat::k16_16_16_16Float},
-	    {Prospero::VertexAttribFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32UInt},
-	    {Prospero::VertexAttribFormat::k32_32_32SInt, Prospero::BufferFormat::k32_32_32SInt},
-	    {Prospero::VertexAttribFormat::k32_32_32Float, Prospero::BufferFormat::k32_32_32Float},
-	    {Prospero::VertexAttribFormat::k32_32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt},
-	    {Prospero::VertexAttribFormat::k32_32_32_32SInt, Prospero::BufferFormat::k32_32_32_32SInt},
-	    {Prospero::VertexAttribFormat::k32_32_32_32Float,
-	     Prospero::BufferFormat::k32_32_32_32Float},
-	};
-
-	for (const auto& entry: format_map) {
-		if (format == entry.vertex) {
-			return entry.buffer;
-		}
-	}
-
-	return static_cast<Prospero::BufferFormat>(static_cast<uint32_t>(format));
-}
-
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        const ShaderSemantic*  input_semantics,
                                        uint32_t num_input_semantics, const uint32_t* attrib,
@@ -536,18 +429,23 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
-			auto                         buffer_format = VertexAttribFormatToBufferFormat(format);
-			static std::atomic<uint64_t> log_count     = 0;
-			auto                         log_id        = log_count.fetch_add(1);
+			const auto                   format_raw    = static_cast<uint32_t>(format);
+			const auto                   buffer_format = format_raw >> 2u;
+			const auto                   channels      = (format_raw & 3u) + 1u;
+			static std::atomic<uint64_t> log_count      = 0;
+			auto                         log_id         = log_count.fetch_add(1);
 			if (log_id < 64) {
-				LOGF("\t temporary: PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
+				LOGF("\t PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
 				     "format %u, offset %u, buffer index %zu\n",
 				     static_cast<uint32_t>(in.semantic), static_cast<uint32_t>(format),
 				     static_cast<uint32_t>(buffer_format), offset, index);
 			}
-			const auto buffer_format_raw = static_cast<uint32_t>(buffer_format);
+			// AGC vertex formats encode the buffer format above the two channel-count bits.
+			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
 			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
-			              ((buffer_format_raw & 0x7fu) << 12u) | DstSel(4, 5, 6, 7);
+			              (buffer_format << 12u) |
+			              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
+			                     channels > 3u ? 7u : 1u);
 		}
 		if (offset != 0) {
 			r.UpdateAddress48(r.Base48() + offset);

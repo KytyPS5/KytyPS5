@@ -9221,6 +9221,7 @@ void TestEmbeddedVertexFormatSwizzle() {
     Prospero::BufferFormat format;
     uint32_t swizzle, opcode, components, source_width;
     std::array<uint32_t, 4> expected;
+    Prospero::VertexAttribFormat attribute_format = Prospero::VertexAttribFormat::kInvalid;
   };
   const Case cases[] = {
       {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 7), 3, 4, 3,
@@ -9237,18 +9238,50 @@ void TestEmbeddedVertexFormatSwizzle() {
        {0x3f800000, 0, 0x3f800000, 0}},
       {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 0x0e, 4, 4,
        {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000}},
+      {Prospero::BufferFormat::k32UInt, DstSel(7, 6, 5, 4), 3, 4, 1,
+       {0x3e800000, 0, 0, 1}, Prospero::VertexAttribFormat::k32UInt},
+      {Prospero::BufferFormat::k32_32Float, DstSel(7, 6, 5, 4), 3, 4, 2,
+       {0x3e800000, 0x3f000000, 0, 0x3f800000}, Prospero::VertexAttribFormat::k32_32Float},
+      {Prospero::BufferFormat::k32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 3,
+       {0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000},
+       Prospero::VertexAttribFormat::k32_32_32Float},
+      {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 4,
+       {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000},
+       Prospero::VertexAttribFormat::k32_32_32_32Float},
   };
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_offset = offsets.data();
+  user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
   for (const auto &test : cases) {
     const uint32_t code[] = {EncodeMubuf0(test.opcode), EncodeMubuf1(9, 0, 0),
                              EncodeExp0(0x20, (1u << test.components) - 1u),
                              EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
     Decoder::Program decoded;
     Decoder::DecodeProgram(code, decoded);
+    const uint32_t attribute = static_cast<uint32_t>(test.attribute_format) << 5u;
+    const uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
+                               (static_cast<uint32_t>(test.format) << 12u) | test.swizzle};
+    HW::VertexShaderInfo regs{};
+    regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+    regs.gs_regs.rsrc2.user_sgpr = 4;
+    const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffer),
+                               reinterpret_cast<uint64_t>(&attribute)};
+    std::memcpy(regs.gs_user_sgpr.value, tables, sizeof(tables));
+    ShaderSemantic semantic{};
+    semantic.hardware_mapping = 9;
+    semantic.size_in_elements = test.components;
+    ShaderMappedData mapped{};
+    mapped.user_data = &user_data;
+    mapped.input_semantics = &semantic;
+    mapped.num_input_semantics = 1;
+    mapped.code_size_bytes = sizeof(code);
+    ShaderMapUserData(regs.es_regs.data_addr, mapped);
     ShaderVertexInputInfo input{};
-    input.resources_num = 1;
-    input.resources[0].fields[3] = (static_cast<uint32_t>(test.format) << 12u) | test.swizzle;
-    input.resources_dst[0].attr_id = 0;
-    input.resources_dst[0].registers_num = static_cast<int>(test.components);
+    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
     Frontend::EmbeddedFetchPlan fetch;
     fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
     Frontend::TranslateOptions options{};

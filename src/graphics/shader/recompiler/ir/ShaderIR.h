@@ -105,6 +105,8 @@ struct BufferResource {
 	bool                   written            = false;
 	bool                   atomic             = false;
 	bool                   formatted          = false;
+	// Positive proof: every access uses the descriptor format, without typed overrides.
+	bool                   descriptor_formatted_only = false;
 	bool                   scalar             = false;
 
 	bool operator==(const BufferResource& other) const = default;

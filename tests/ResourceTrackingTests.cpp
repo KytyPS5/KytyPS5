@@ -1338,6 +1338,90 @@ void TestDenseBufferTracking() {
              "resource tracking allowed a second mutation pass");
 }
 
+// Descriptor format is authoritative only when every surviving access uses it.
+void TestDescriptorFormattedBufferProvenance() {
+  using O = ValueOpcode;
+  using Format = Libs::Graphics::Prospero::BufferFormat;
+  enum class Neighbor { RawDword, Typed32, Scalar, Atomic, DescriptorFormatted };
+  for (const auto neighbor : {Neighbor::RawDword, Neighbor::Typed32, Neighbor::Scalar,
+                              Neighbor::Atomic, Neighbor::DescriptorFormatted}) {
+    for (const bool reverse : {false, true}) {
+      Fixture fixture;
+      const auto handle = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                           fixture.UserData(2), fixture.UserData(3)}, 4);
+      const auto scalar_offset = fixture.UserData(4);
+      const auto descriptor_store = [&] {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::Buffer;
+        memory.formatted = true;
+        fixture.Emit(O::StoreBufferU32,
+            {handle, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+            fixture.AddMemory(memory, 4));
+      };
+      const auto other_access = [&] {
+        MemoryInfo memory;
+        memory.kind = neighbor == Neighbor::Scalar ? ResourceKind::ScalarBuffer
+                                                   : ResourceKind::Buffer;
+        memory.formatted = neighbor == Neighbor::Typed32 ||
+                           neighbor == Neighbor::DescriptorFormatted;
+        memory.typed = neighbor == Neighbor::Typed32;
+        if (memory.typed) {
+          // Explicit TBUFFER32 format is independent of descriptor R8_UINT.
+          const auto format = static_cast<uint32_t>(Format::k32UInt);
+          memory.data_format = format & 0xfu;
+          memory.number_format = format >> 4u;
+        }
+        const auto flags = fixture.AddMemory(memory, 8);
+        Value read;
+        if (neighbor == Neighbor::Scalar)
+          read = fixture.Emit(O::ReadConstBuffer, {handle, scalar_offset}, flags);
+        else if (neighbor == Neighbor::Atomic)
+          read = fixture.Emit(O::BufferAtomicOr32,
+              {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, flags);
+        else
+          read = fixture.Emit(O::LoadBufferU32,
+              {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+        fixture.Emit(O::ReferenceU32, {read});
+      };
+      if (reverse) { other_access(); descriptor_store(); }
+      else { descriptor_store(); other_access(); }
+      fixture.PlanAndTrack();
+      EliminateDeadCode(fixture.program.blocks);
+      ValidateProgram(fixture.program, true);
+      const bool expected = neighbor == Neighbor::DescriptorFormatted;
+      Check(fixture.program.info.buffers.size() == 1u &&
+                fixture.program.descriptor_sources.size() == 1u,
+            "format provenance split accesses sharing one descriptor source");
+      const auto& resource = fixture.program.info.buffers[0];
+      Check(resource.read && resource.written && resource.formatted &&
+                resource.scalar == (neighbor == Neighbor::Scalar) &&
+                resource.atomic == (neighbor == Neighbor::Atomic),
+            "format provenance fixture lost a live neighboring access");
+      Check(resource.descriptor_formatted_only == expected,
+            "descriptor format provenance must include every access in either order");
+      auto plan = ExtractResourcePlan(fixture.program);
+      Check(plan.info.buffers[0].descriptor_formatted_only == expected,
+            "resource-plan extraction lost descriptor format provenance");
+      std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u,
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Format::k8UInt) << 12u) | (1u << 24u), 0u};
+      TestMemory memory;
+      SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
+                         .userdata = &memory};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "format provenance fixture failed ordinary descriptor materialization");
+      ApplyResourceSpecialization(fixture.program, specialization);
+      ValidateProgram(fixture.program, true);
+      Check(fixture.program.info.buffers.size() == 1u &&
+                fixture.program.info.buffers[0].descriptor_formatted_only == expected &&
+                fixture.program.info.buffers[0].descriptor_format == Format::k8UInt,
+            "specialization lost provenance or confused TBUFFER and descriptor formats");
+    }
+  }
+}
+
 void TestScalarAndVectorBufferAlias() {
   Fixture fixture;
   const auto d0 = fixture.UserData(0);
@@ -3098,6 +3182,11 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--descriptor-format-provenance-only") == 0) {
+      TestDescriptorFormattedBufferProvenance();
+      std::cout << "KYTY_DESCRIPTOR_FORMAT_PROVENANCE_PASS\n";
+      return 0;
+    }
     if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {
       CheckSrtRawFallbackCase(argv[2]);
       return 0;
@@ -3115,6 +3204,7 @@ int main(int argc, char** argv) {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("descriptor format provenance", TestDescriptorFormattedBufferProvenance);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

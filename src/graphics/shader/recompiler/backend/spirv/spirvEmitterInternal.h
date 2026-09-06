@@ -83,6 +83,7 @@ enum : uint32_t {
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
 	DecorationAliased       = 20,
+	DecorationCoherent      = 23,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
@@ -657,6 +658,9 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// Shared address/index decision; use effective per-instruction MemoryInfo.
+bool BufferUsesDwordOffset(const EmitterState& state, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
 

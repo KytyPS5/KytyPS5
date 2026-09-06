@@ -603,10 +603,19 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	};
 	if (state.storage_buffer_variable != 0) {
 		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
+		if (state.compute_execution.IsCooperativeWave64()) {
+			// GLSL450 coherent access plus the scheduler's UniformMemory barrier
+			// publishes ordinary stores to other waves of the same host workgroup.
+			state.builder.AddAnnotation(
+			    {OpDecorate, state.storage_buffer_variable, DecorationCoherent});
+		}
 	}
 	if (state.storage_buffer_u64_variable != 0) {
 		Decorate(state.storage_buffer_u64_variable, "buffers_u64",
 		         IR::DescriptorBindingKind::Buffers);
+		if (state.compute_execution.IsCooperativeWave64())
+			state.builder.AddAnnotation(
+			    {OpDecorate, state.storage_buffer_u64_variable, DecorationCoherent});
 		state.builder.AddAnnotation(
 		    {OpDecorate, state.storage_buffer_variable, DecorationAliased});
 		state.builder.AddAnnotation(

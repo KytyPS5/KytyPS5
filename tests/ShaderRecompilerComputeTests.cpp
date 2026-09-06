@@ -1392,7 +1392,7 @@ CompiledShader CompileCase(
               "fixture buffer address is not a small backing offset");
       offset = static_cast<u32>(descriptor.Base48());
     }
-    Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
+    Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
@@ -9217,6 +9217,147 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
 
   // Place inside VulkanHarness. Reaches actual renderer admission before any
   // binding mutation, without dispatching potentially conflicting resources.
+  void CheckStorageBufferByteOffsetBinding(bool unsupported_halfword = false,
+                                         const char* mixed_mode = nullptr) {
+    const bool boundary = unsupported_halfword || mixed_mode != nullptr;
+    const char* boundary_mode = unsupported_halfword ? "unaligned-halfword" : mixed_mode;
+    const bool partial_tail = mixed_mode != nullptr &&
+        std::strcmp(mixed_mode, "partial-dword-tail") == 0;
+    const bool mixed_access = mixed_mode != nullptr && !partial_tail;
+    using namespace ShaderRecompiler::IR;
+    constexpr const char* name = "StorageBufferByteOffsetBinding";
+    constexpr uintptr_t base = 0x0000000205c00000ull;
+    constexpr uint64_t allocation_size = 0x10000u;
+    constexpr uint64_t allocation_alignment = 0x10000u;
+    const std::array<uint32_t, 3> offsets{unsupported_halfword ? 15u : 13u, 12u, 8u};
+    // New byte-offset admission ends on a complete native DWORD. Preserve the
+    // original size4/range17 case separately: its last guest byte is not
+    // representable by the current runtime uint-array length contract.
+    const std::array<uint32_t, 3> sizes{boundary ? 4u : 3u, 4u, 24u};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "byte-offset fixture direct allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 && mapped == reinterpret_cast<void*>(base),
+            "byte-offset fixture direct mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto& scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      auto& resources = context.GetGpuResources();
+      resources.MapMemory(base, allocation_size);
+      auto& executor = context.GetRenderExecutor();
+      // Make the backing origin explicit; NativeStorageBuffer must preserve the
+      // actual subrange in this common backing after satisfying host alignment.
+      const auto [backing, backing_offset] =
+          context.GetBufferCache().ObtainBuffer(base, allocation_size, false, false);
+      Require(name, "backing", backing != nullptr, "byte-offset backing is absent");
+      const auto backing_handle = backing->Handle();
+      const auto alignment = context.GetGraphics().StorageMinAlignment();
+      Require(name, "host alignment", alignment != 0u,
+              "host storage alignment is zero");
+
+      Program program{};
+      program.stage = ShaderType::Compute;
+      program.resource_tracking_complete = true;
+      program.shader_info_complete = true;
+      ShaderStageRuntime runtime{};
+      for (uint32_t index = 0; index < offsets.size(); ++index) {
+        BufferResource info{};
+        info.written = true;
+        info.formatted = index == 0u;
+        // Synthetic input facts for this renderer-entry boundary. The separate
+        // ResourceTracking regression derives the same fact from actual mixed IR.
+        info.descriptor_formatted_only = index == 0u && !mixed_access;
+        info.atomic = index == 2u;
+        info.max_byte_extent = index == 0u ? (mixed_access ? 4u : unsupported_halfword ? 2u : 1u)
+                                           : index == 1u ? 4u : 8u;
+        info.descriptor_format = index == 0u
+            ? (unsupported_halfword ? Prospero::BufferFormat::k16UInt
+                                    : Prospero::BufferFormat::k8UInt)
+            : Prospero::BufferFormat::kInvalid;
+        program.info.buffers.push_back(info);
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(base + offsets[index]);
+        descriptor.fields[2] = sizes[index]; // stride0: NUM_RECORDS is byte size.
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) | (1u << 24u);
+        if (index == 0u)
+          descriptor.fields[3] |= static_cast<uint32_t>(info.descriptor_format) << 12u;
+        DescriptorValue value{};
+        value.dword_count = 4u;
+        std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), value.dwords.begin());
+        runtime.resources.buffers.push_back(value);
+      }
+      AllocateBindings(program);
+      CompiledShaderInfo info{};
+      info.stage = program.stage;
+      info.info = std::move(program.info);
+      info.bindings = std::move(program.bindings);
+      runtime.program = &info;
+      if (boundary)
+        std::printf("KYTY_BYTE_OFFSET_BOUNDARY_READY %s\n", boundary_mode);
+      else
+        std::printf("KYTY_BYTE_OFFSET_BINDING_READY\n");
+      std::fflush(stdout);
+      auto prepared = executor.PrepareBindings(runtime);
+      executor.FindBuffers(prepared);
+      executor.RebindBuffers(prepared);
+      if (boundary) {
+        // An unproved mixed raw/typed resource cannot inherit byte-safe
+        // admission from its one formatted R8 use. The R16 case also remains
+        // unsupported until cross-DWORD subword access is implemented.
+        // Never dispatch a resource whose unsupported boundary was loosened.
+        std::printf("KYTY_BYTE_OFFSET_BOUNDARY_RETURNED %s\n", boundary_mode);
+        std::fflush(nullptr);
+        std::_Exit(0);
+      }
+      Require(name, "binding count", prepared.resources.buffers.size() == offsets.size(),
+              "byte-offset renderer omitted a declared resource");
+      for (uint32_t index = 0; index < offsets.size(); ++index) {
+        const auto& view = prepared.resources.buffers[index];
+        const uint64_t byte_offset = static_cast<uint64_t>(backing_offset) + offsets[index];
+        const uint64_t aligned_offset = byte_offset - byte_offset % alignment;
+        const uint64_t adjustment = byte_offset - aligned_offset;
+        Require(name, "representable adjustment", adjustment < 256u,
+                "fixture adjustment is wider than the packed ABI");
+        const auto packed = prepared.shader_data.at(info.bindings.memory_offset_dword + index / 4u);
+        const auto observed_adjustment = (packed >> ((index % 4u) * 8u)) & 0xffu;
+        Require(name, "exact byte view",
+                view.buffer == backing_handle && view.offset == aligned_offset &&
+                    view.range == sizes[index] + adjustment &&
+                    observed_adjustment == adjustment &&
+                    prepared.buffer_sources[index].first.Base48() == base + offsets[index],
+                "renderer lost the low byte offset, changed the range, or applied the offset twice");
+      }
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "byte-offset fixture unmap failed");
+    Require(name, "release backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "byte-offset fixture release failed");
+    std::printf("KYTY_BYTE_OFFSET_BINDING_PASS\n");
+  }
+
   void CheckImmutableSrtBindingCase(const char* mode) {
     using namespace ShaderRecompiler::IR;
     constexpr const char* name = "ImmutableSrtBindingAdmission";
@@ -13670,6 +13811,7 @@ private:
           physical.getFeatures2(&features);
           if (barycentric.fragmentShaderBarycentric != true ||
               features.features.shaderInt64 != true ||
+              features12.shaderBufferInt64Atomics != true ||
               features12.bufferDeviceAddress != true) {
             continue;
           }
@@ -13717,6 +13859,9 @@ private:
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
             "shaderInt64 is not supported");
     Require("VulkanHarness", "dispatch",
+            available_features12.shaderBufferInt64Atomics == true,
+            "shaderBufferInt64Atomics is not supported");
+    Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
 
@@ -13736,6 +13881,7 @@ private:
         vk::StructureType::ePhysicalDeviceVulkan12Features;
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
+    device_features12.shaderBufferInt64Atomics = true;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -20612,6 +20758,117 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   return test;
 }
 
+// Synthetic byte-host-offset oracles, independent of the emitter's implementation.
+TestCase BufferStoreByteAppliesByteHostOffset() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0u);
+  AppendVMovLiteral(&code, 0, 0xabu);
+  code.push_back(EncodeMubuf0(0x18u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferStoreByteAppliesByteHostOffset";
+  test.code = std::move(code);
+  test.initial = {0x10203040u, 0x50607080u, 0x90a0b0c0u, 0x11223344u,
+                  0x55667788u};
+  test.expected = test.initial;
+  // Little endian: byte13 is the second byte of DWORD3; every other byte stays.
+  test.expected[3] = 0x1122ab44u;
+  test.storage_buffer_range_dwords = 1u;
+  test.storage_buffer_offsets = {13u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(0u, 4u);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferStoreFormatXUint8AppliesByteHostOffset() {
+  using O = ShaderOpcode;
+  auto test = BufferStoreByteAppliesByteHostOffset();
+  test.name = "BufferStoreFormatXUint8AppliesByteHostOffset";
+  test.code.clear();
+  AppendVMovU32(&test.code, 20, 0u);
+  AppendVMovLiteral(&test.code, 0, 0xabu);
+  test.code.push_back(EncodeMubuf0(0x04u));
+  test.code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0u, 4u, false, static_cast<u32>(Prospero::BufferFormat::k8UInt));
+  return test;
+}
+
+TestCase BufferAtomic64AppliesHostOffsetOnce() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0u);
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0xaabbccddu);
+  code.push_back(EncodeMubuf0(0x50u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferAtomic64AppliesHostOffsetOnce";
+  test.code = std::move(code);
+  test.initial = {0x10101010u, 0x20202020u, 0x30303030u, 0x40404040u,
+                  0x50505050u, 0x60606060u, 0x70707070u, 0x80808080u};
+  test.expected = test.initial;
+  test.expected[2] = 0x11223344u;
+  test.expected[3] = 0xaabbccddu;
+  // Both byte8 (correct) and byte16 (double addition) are within the bound range.
+  test.storage_buffer_range_dwords = 6u;
+  test.storage_buffer_offsets = {8u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_SWAP_X2, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(0u, 24u);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferStoreByteHostOffsetOverflowStaysOutOfBounds() {
+  auto test = BufferStoreByteAppliesByteHostOffset();
+  test.name = "BufferStoreByteHostOffsetOverflowStaysOutOfBounds";
+  test.code.clear();
+  AppendVMovLiteral(&test.code, 20, 0xfffffffcu);
+  AppendVMovLiteral(&test.code, 0, 0xabu);
+  test.code.push_back(EncodeMubuf0(0x18u));
+  test.code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&test.code);
+  test.expected = test.initial;
+  // Guest byte0xfffffffc lies outside the four-byte descriptor. Adding the
+  // native residual13 must not wrap it to valid byte9 of the host backing.
+  return test;
+}
+
+TestCase BufferFormatUint8HostOffsetOverflowStaysOutOfBounds() {
+  auto test = BufferStoreFormatXUint8AppliesByteHostOffset();
+  test.name = "BufferFormatUint8HostOffsetOverflowStaysOutOfBounds";
+  test.code.clear();
+  AppendVMovLiteral(&test.code, 20, 0xfffffffcu);
+  AppendVMovLiteral(&test.code, 0, 0xabu);
+  test.code.push_back(EncodeMubuf0(0x04u));
+  test.code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&test.code);
+  test.expected = test.initial;
+  return test;
+}
+
+TestCase BufferAtomic64HostOffsetOverflowStaysOutOfBounds() {
+  auto test = BufferAtomic64AppliesHostOffsetOnce();
+  test.name = "BufferAtomic64HostOffsetOverflowStaysOutOfBounds";
+  test.code.clear();
+  AppendVMovLiteral(&test.code, 20, 0xfffffff8u);
+  AppendVMovLiteral(&test.code, 0, 0x11223344u);
+  AppendVMovLiteral(&test.code, 1, 0xaabbccddu);
+  test.code.push_back(EncodeMubuf0(0x50u));
+  test.code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&test.code);
+  test.expected = test.initial;
+  // This still has natural8byte alignment. The guest address is OOB; native
+  // residual8 must not wrap it to host byte0 and overwrite the poison there.
+  return test;
+}
+
 TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   using O = ShaderOpcode;
 
@@ -23734,6 +23991,139 @@ TestCase Wave64MultiWaveLdsDifferentIterationsBeforeBarrier() {
                   O::V_CMP_EQ_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
+
+// A bounded inter-wave publication test. GLC loads bypass the guest L0;
+// VSCNT, unlike ordinary S_WAITCNT, completes vector stores before publishing
+// the flag. Every observed payload is loaded with GLC as well. The producer's
+// four work iterations and consumer's fixed 128 polls guarantee a finite test.
+// The final observation is checked; no schedule-specific successful-poll count
+// is prescribed. A producer-starving schedule leaves that observation wrong.
+TestCase Wave64CooperativeBufferProducerConsumer() {
+  using O = ShaderOpcode;
+  constexpr u32 total = 512;
+  constexpr u32 communication = 2112; // After four output planes, 64-DWORD aligned.
+  constexpr u32 group_words = 64;
+  constexpr u32 payload_base = 0xabc00004u;
+  constexpr u32 flag_base = 0x600d0001u;
+  auto test = MakeMultiWaveLdsCase("Wave64CooperativeBufferProducerConsumer", 256, 0, 4);
+  // GLSL450 needs coherent SSBO accesses for publication between invocations,
+  // even on a driver whose caches happen to make the readback look correct.
+  test.required_spirv.push_back(" Coherent");
+  test.initial.resize(communication + 2u * group_words + 4u);
+  for (u32 word = 0; word < test.initial.size(); ++word)
+    test.initial[word] = 0xac000000u | word;
+  for (u32 group = 0; group < 2; ++group) {
+    test.initial[communication + group * group_words] = 0; // Not ready.
+    test.initial[communication + group * group_words + 2u] = 0; // Producer progress.
+  }
+  test.expected = test.initial;
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, 256);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, 4u); // All four waves participated.
+  code.push_back(EncodeSopk(0x17, 125, 0)); // S_WAITCNT_VSCNT null,0.
+  AppendMultiWaveGuestBarrier(&code); // All guest waves pass before any may exit.
+  AppendVop3(&code, 0x360, 20, Vgpr(8), InlineU32(0)); // Per-wave scalar ID.
+  code.push_back(EncodeVop1(0x01, 9, 16));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(8), 9));
+  AppendVMovLiteral(&code, 14, communication * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 9, Vgpr(14), 9)); // This group's mailbox byte base.
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(63), 6)); // Logical lane within wave.
+  code.push_back(EncodeSopc(0x06, 20, InlineU32(0)));
+  const size_t to_consumer = code.size();
+  code.push_back(EncodeSopp(0x05)); // SCC1 -> wave0 consumer.
+  code.push_back(EncodeSopc(0x06, 20, InlineU32(1)));
+  const size_t idle_exit = code.size();
+  code.push_back(EncodeSopp(0x04)); // SCC0 -> waves2/3 finish.
+
+  code.push_back(EncodeSMovB32(21, InlineU32(0)));
+  const size_t producer_loop = code.size();
+  code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  code.push_back(EncodeVop1(0x01, 10, 21));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // Exactly one producer store per group.
+  code.push_back(EncodeMubuf0(0x1c, 8, false, true, true));
+  code.push_back(EncodeMubuf1(10, 12, 9)); // Cyclic write; must not bypass admission proof.
+  code.push_back(EncodeSopk(0x17, 125, 0));
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSopc(0x0a, 21, InlineU32(4)));
+  const size_t producer_repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(producer_loop) - static_cast<int32_t>(producer_repeat) - 1)));
+
+  code.push_back(EncodeVop1(0x01, 11, 16));
+  code.push_back(EncodeVop2(0x1a, 11, InlineU32(8), 11));
+  AppendVMovLiteral(&code, 14, payload_base);
+  code.push_back(EncodeVop2(0x25, 11, Vgpr(14), 11));
+  code.push_back(EncodeVop1(0x01, 12, 16));
+  AppendVMovLiteral(&code, 14, flag_base);
+  code.push_back(EncodeVop2(0x25, 12, Vgpr(14), 12));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeMubuf0(0x1c, 4, false, true, true));
+  code.push_back(EncodeMubuf1(11, 12, 9));
+  code.push_back(EncodeSopk(0x17, 125, 0)); // Payload completes before the flag.
+  code.push_back(EncodeSopp(0x02, 0)); // A real guest branch yields before publication.
+  code.push_back(EncodeMubuf0(0x1c, 0, false, true, true));
+  code.push_back(EncodeMubuf1(12, 12, 9));
+  code.push_back(EncodeSopk(0x17, 125, 0));
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendStoreSgprAtLaneDwordOffset(&code, 21, 4, 4u + total * 3u);
+  const size_t producer_exit = code.size();
+  code.push_back(EncodeSopp(0x02));
+
+  const size_t consumer = code.size();
+  code.push_back(EncodeSMovB32(21, InlineU32(0)));
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+  AppendSMovLiteral(&code, 23, 128u); // Independent hard cap, not loaded from the mailbox.
+  const size_t consumer_loop = code.size();
+  code.push_back(EncodeMubuf0(0x0c, 0, false, true, true));
+  code.push_back(EncodeMubuf1(10, 12, 9)); // Flag, GLC=1, same descriptor as writes.
+  code.push_back(EncodeSopp(0x0c, 0)); // VMCNT completes before READLANE/use.
+  AppendVop3(&code, 0x360, 22, Vgpr(10), InlineU32(0));
+  code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 21, 23));
+  const size_t consumer_repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(consumer_loop) - static_cast<int32_t>(consumer_repeat) - 1)));
+  code.push_back(EncodeMubuf0(0x0c, 4, false, true, true));
+  code.push_back(EncodeMubuf1(11, 12, 9)); // GLC payload load cannot reuse a stale L0 line.
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendStoreSgprAtLaneDwordOffset(&code, 22, 4, 4u + total);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 4, 4u + total * 2u);
+  const size_t finish = code.size();
+  AppendEnd(&code);
+  const auto patch_branch = [&](size_t branch, u32 opcode, size_t target) {
+    code[branch] = EncodeSopp(opcode, static_cast<u32>(
+        static_cast<int32_t>(target) - static_cast<int32_t>(branch) - 1));
+  };
+  patch_branch(to_consumer, 0x05, consumer);
+  patch_branch(idle_exit, 0x04, finish);
+  patch_branch(producer_exit, 0x02, finish);
+  for (u32 group = 0; group < 2; ++group) {
+    const u32 payload = payload_base + (group << 8u);
+    const u32 flag = flag_base + group;
+    const u32 mailbox = communication + group * group_words;
+    test.expected[mailbox] = flag;
+    test.expected[mailbox + 1u] = payload;
+    test.expected[mailbox + 2u] = 4u;
+    for (u32 lane = 0; lane < 256; ++lane) {
+      const u32 index = group * 256u + lane;
+      test.expected[4u + index] = 0x1000u + (group << 16u) + lane;
+      if (lane < 64u) {
+        test.expected[4u + total + index] = flag;
+        test.expected[4u + total * 2u + index] = payload;
+      } else if (lane < 128u) {
+        test.expected[4u + total * 3u + index] = 4u;
+      }
+    }
+  }
+  test.opcodes = {O::V_READLANE_B32, O::S_BARRIER, O::S_WAITCNT,
+                  O::S_CMP_EQ_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC0, O::S_CBRANCH_SCC1, O::S_BRANCH,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 
 TestCase MakeWave64SingleGroupLdsTileCase(bool explicit_barrier) {
   using O = ShaderOpcode;
@@ -27381,6 +27771,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
+  AddCase(BufferStoreByteAppliesByteHostOffset);
+  AddCase(BufferStoreFormatXUint8AppliesByteHostOffset);
+  AddCase(BufferAtomic64AppliesHostOffsetOnce);
+  AddCase(BufferStoreByteHostOffsetOverflowStaysOutOfBounds);
+  AddCase(BufferFormatUint8HostOffsetOverflowStaysOutOfBounds);
+  AddCase(BufferAtomic64HostOffsetOverflowStaysOutOfBounds);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(DsAppendWave64ReturnsOneBaseAcrossNativeHalves);
   AddCase(DsAppendWave64BoundedLoopCompactsThreeReservations);
@@ -27478,6 +27874,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64MultiWaveLdsAtomicReduction);
   AddCase(Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit);
   AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
+  AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
   AddCase(Wave64SingleGroupLdsExplicitBarrier);
   AddCase(Wave64SingleGroupLdsUniformBranchOrdering);
@@ -32195,6 +32592,19 @@ void CheckSampledHtileAdmission() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // Place after CheckRendererFailureCases, outside VulkanHarness.
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckStorageBufferByteOffsetBoundary() {
+  const std::array cases{
+      RendererFailureCase{"unaligned-halfword", "storage buffer offset adjustment is unsupported"},
+      RendererFailureCase{"mixed-raw-word", "storage buffer offset adjustment is unsupported"},
+      RendererFailureCase{"mixed-typed-word", "storage buffer offset adjustment is unsupported"},
+      RendererFailureCase{"partial-dword-tail", "storage buffer offset adjustment is unsupported"},
+  };
+  CheckRendererFailureCases("StorageBufferByteOffsetBoundary",
+                           "--storage-buffer-byte-offset-reject",
+                           "KYTY_BYTE_OFFSET_BOUNDARY_READY ",
+                           "KYTY_BYTE_OFFSET_BOUNDARY_RETURNED ", cases);
+}
+
 void CheckImmutableSrtBindingAdmission() {
   constexpr const char* name="ImmutableSrtBindingAdmission";
   std::vector<RendererFailureCase> cases;
@@ -32344,6 +32754,26 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--storage-buffer-byte-offset-reject") == 0) {
+    const bool halfword = std::strcmp(argv[2], "unaligned-halfword") == 0;
+    if (!halfword && std::strcmp(argv[2], "mixed-raw-word") != 0 &&
+        std::strcmp(argv[2], "mixed-typed-word") != 0 &&
+        std::strcmp(argv[2], "partial-dword-tail") != 0) return 2;
+    VulkanHarness vulkan;
+    vulkan.CheckStorageBufferByteOffsetBinding(halfword, halfword ? nullptr : argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-byte-offset-boundary-only") == 0) {
+    CheckStorageBufferByteOffsetBoundary();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-byte-offset-binding-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageBufferByteOffsetBinding();
+    return 0;
+  }
+#endif
 // Insert before main's unknown-selector check.
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc==3 && std::strcmp(argv[1],"--immutable-srt-binding")==0) {
@@ -32398,6 +32828,11 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--f64-admission-positive-only") == 0) {
     CheckF64AdmissionPositive();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-cooperative-ssbo-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64CooperativeBufferProducerConsumer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-multiwave-lds-only") == 0) {
@@ -32803,6 +33238,7 @@ if (argc == 1) {
     std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);
     return 2;
   }
+  CheckStorageBufferByteOffsetBoundary();
   VulkanHarness vulkan;
   CheckRenderTargetFormatContract();
   CheckSampledColorViews();
@@ -32873,6 +33309,7 @@ if (argc == 1) {
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckStorageColorComparisonPromotion();
+  vulkan.CheckStorageBufferByteOffsetBinding();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();

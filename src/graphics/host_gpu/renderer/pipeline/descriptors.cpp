@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -129,6 +130,22 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// Descriptor-formatted byte components accept any byte alignment without a
+// two-word load/store. The proof covers every use of the
+// resource; one formatted use must not authorize a neighboring raw/typed access.
+static bool SupportsByteStorageOffset(const ShaderBufferResource& descriptor,
+                                      const ShaderRecompiler::IR::BufferResource& resource) {
+	if (!resource.descriptor_formatted_only || !resource.formatted || resource.scalar ||
+	    resource.atomic) return false;
+	const auto format = ShaderRecompiler::Format::GetFormatInfo(descriptor.Format());
+	if (format.type == ShaderRecompiler::Format::ComponentType::Unknown ||
+	    format.packed_bitfield || format.component_count == 0u) return false;
+	for (uint32_t component = 0; component < format.component_count; ++component) {
+		if (format.component_bits[component] != 8u) return false;
+	}
+	return true;
+}
+
 static BufferView NativeStorageBuffer(RenderContext&                              context,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -160,8 +177,15 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
+	if ((byte_adjustment && !SupportsByteStorageOffset(descriptor, resource)) ||
+	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
+	}
+	// Runtime-array length counts complete DWORDs. A partial last DWORD needs
+	// a separate guest-byte bound before its host backing can be rounded up.
+	if (byte_adjustment && (size + adjustment) % sizeof(uint32_t) != 0) {
+		EXIT("storage buffer offset adjustment is unsupported: partial DWORD tail\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	result.buffer = buffer->Handle();

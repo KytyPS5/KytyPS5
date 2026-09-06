@@ -9083,6 +9083,193 @@ void TestCooperativeWave64LegacyBarrierInsertionScope() {
 // TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
 // include the certificate header plus ShaderHostProfile.h. Register the five
 // TestF64Certificate* functions below. No compilation, Vulkan or game data.
+// Test-only admission boundaries for the bounded SSBO publication regression.
+// This does not admit image publication, DMA or scalar-buffer cache protocols.
+void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+  enum class Scenario {
+    CyclicImageRead, CyclicImageSample, ImageWriteBefore, ImageWriteAfter,
+    CyclicImageWrite, ImageAtomicBefore, ImageAtomicAfter,
+    CyclicAddressRead, CyclicAddressWrite, AddressWriteBefore,
+    CyclicScalarBufferRead, BufferAtomicBefore, CyclicBufferAtomic,
+    AcyclicAddressReadBefore, AcyclicAddressReadAfter,
+    VaryingBranch, Partitioned,
+    BufferCycle, SeparateWriterCycle, AcyclicInputImage,
+    ImmutableSnapshot, PlanningOnlyAddressTemplate
+  };
+  // First prove all neighboring rejections remain in force. The first positive
+  // below then produces the intended RED on the old cyclic-communication guard.
+  for (const auto scenario : {
+      Scenario::AcyclicAddressReadBefore, Scenario::AcyclicAddressReadAfter,
+      Scenario::CyclicImageRead, Scenario::CyclicImageSample,
+      Scenario::ImageWriteBefore, Scenario::ImageWriteAfter,
+      Scenario::CyclicImageWrite, Scenario::ImageAtomicBefore,
+      Scenario::ImageAtomicAfter, Scenario::CyclicAddressRead,
+      Scenario::CyclicAddressWrite, Scenario::AddressWriteBefore,
+      Scenario::CyclicScalarBufferRead, Scenario::BufferAtomicBefore,
+      Scenario::CyclicBufferAtomic, Scenario::VaryingBranch,
+      Scenario::Partitioned, Scenario::BufferCycle,
+      Scenario::SeparateWriterCycle, Scenario::AcyclicInputImage,
+      Scenario::ImmutableSnapshot, Scenario::PlanningOnlyAddressTemplate}) {
+    if (address_only && scenario != Scenario::AcyclicAddressReadBefore &&
+        scenario != Scenario::AcyclicAddressReadAfter) continue;
+    F f({16,16,1});
+    f.compute.lds_size_dwords = 0;
+    f.program.memory_info.clear(); // This matrix has no actual guest LDS accesses.
+    const auto loop = f.AddBlock(), after = f.AddBlock();
+    const auto memory = [&](uint32_t block, O opcode,
+                            std::initializer_list<V> args, IR::ResourceKind kind,
+                            bool planning_only = false) {
+      const auto value = f.Emit(block, opcode, args);
+      const auto index = static_cast<uint32_t>(f.program.memory_info.size());
+      IR::MemoryInfo info{};
+      info.kind = kind;
+      info.glc = true;
+      info.planning_only = planning_only;
+      f.program.memory_info.push_back(info);
+      value.TryInstruction()->SetFlags(IR::MemoryFlags{.index=index});
+      return value;
+    };
+    const auto buffer = f.Emit(0,O::GetBufferResource,
+        {V(0u),V(0u),V(4096u),V(0u)});
+    const auto image = f.Emit(0,O::GetImageResource,
+        {V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),V(0u)});
+    const auto sampler = f.Emit(0,O::GetSamplerResource,
+        {V(0u),V(0u),V(0u),V(0u)});
+    const auto address = f.Emit(0,O::GetAddressResource,{V(0u),V(0u)});
+    const auto coords = f.Emit(0,O::MakeImageAddress,
+        {V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),
+         V(0u),V(0u),V(0u),V(0u),V(0u),V(0u)});
+    const auto data = f.Emit(0,O::CompositeConstructU32x4,
+        {V(7u),V(0u),V(0u),V(0u)});
+    const auto image_read = [&](uint32_t block) {
+      const auto read = memory(block,O::ImageRead,{image,coords,V(true)},IR::ResourceKind::Image);
+      const auto word = f.Emit(block,O::CompositeExtractU32x4,{read,V(0u)});
+      f.Emit(block,O::ReferenceU32,{word});
+    };
+    const auto image_write = [&](uint32_t block) {
+      memory(block,O::ImageWrite,{image,coords,data,V(true)},IR::ResourceKind::Image);
+    };
+    const auto image_atomic = [&](uint32_t block) {
+      // Its return is deliberately dead: the earlier live-atomic guard must
+      // not be the reason this unproved image publication gets rejected.
+      memory(block,O::ImageAtomicOr32,{image,coords,V(1u),V(true)},IR::ResourceKind::Image);
+    };
+    const auto address_read = [&](uint32_t block) {
+      // BDA reads alias the same cached buffer through an unqualified physical
+      // pointer. Descriptor Coherent does not publish to this access path.
+      const auto raw = memory(block,O::LoadAddressU32,
+          {address,V(0u),V(0u),V(true)},IR::ResourceKind::Global);
+      f.Emit(block,O::ReferenceU32,{raw});
+    };
+    const auto address_write = [&](uint32_t block) {
+      memory(block,O::StoreAddressU32,{address,V(0u),V(0u),V(7u),V(true)},IR::ResourceKind::Global);
+    };
+    const auto buffer_write = [&](uint32_t block, V value) {
+      memory(block,O::StoreBufferU32,
+          {buffer,V(4u),V(0u),V(0u),value,V(true)},IR::ResourceKind::Buffer);
+    };
+    const auto buffer_atomic = [&](uint32_t block) {
+      memory(block,O::BufferAtomicOr32,
+          {buffer,V(4u),V(0u),V(0u),V(1u),V(true)},IR::ResourceKind::Buffer);
+    };
+    if (scenario == Scenario::AcyclicAddressReadBefore) address_read(0);
+    if (scenario == Scenario::ImageWriteBefore) image_write(0);
+    if (scenario == Scenario::ImageAtomicBefore) image_atomic(0);
+    if (scenario == Scenario::AddressWriteBefore) address_write(0);
+    if (scenario == Scenario::BufferAtomicBefore) buffer_atomic(0);
+    if (scenario == Scenario::AcyclicInputImage) image_read(0);
+    if (scenario != Scenario::Partitioned) f.Emit(0,O::Barrier);
+    f.Branch(0,loop);
+    auto& counter = f.program.blocks[loop]->AppendNewInst(
+        O::Phi,{},static_cast<uint64_t>(IR::Type::U32));
+    counter.AddPhiOperand(f.program.blocks[0],V(0u));
+    const auto read = memory(loop,O::LoadBufferU32,
+        {buffer,V(0u),V(0u),V(0u),V(true)},IR::ResourceKind::Buffer);
+    // A mutable read can drive a uniform wave condition. The original
+    // cross-workgroup partition proof must still reject this same shape.
+    const auto uniform_read = f.Emit(loop,O::ReadLane,{read,V(0u)});
+    const auto next = f.Emit(loop,O::IAdd32,{V(&counter),V(1u)});
+    counter.AddPhiOperand(f.program.blocks[loop],next);
+    const auto bounded = f.Emit(loop,O::ULessThan32,{next,V(4u)});
+    const auto pending = f.Emit(loop,O::IEqual32,
+        {scenario == Scenario::VaryingBranch ? read : uniform_read,V(0u)});
+    const auto condition = f.Emit(loop,O::LogicalAnd,{bounded,pending});
+    f.Conditional(loop,loop,after,condition);
+    f.program.block_info[loop].terminator.loop_header = true;
+    f.program.block_info[loop].terminator.continue_block = f.program.block_info[loop].id;
+    f.program.block_info[loop].terminator.merge_block = f.program.block_info[after].id;
+    if (scenario != Scenario::SeparateWriterCycle) buffer_write(loop,next);
+    if (scenario == Scenario::CyclicImageRead) image_read(loop);
+    if (scenario == Scenario::CyclicImageSample) {
+      const auto sample = memory(loop,O::ImageSampleRaw,{image,sampler,coords},IR::ResourceKind::Image);
+      f.Emit(loop,O::ReferenceU32,{f.Emit(loop,O::CompositeExtractU32x4,{sample,V(0u)})});
+    }
+    if (scenario == Scenario::CyclicImageWrite) image_write(loop);
+    if (scenario == Scenario::CyclicAddressRead ||
+        scenario == Scenario::PlanningOnlyAddressTemplate) {
+      const auto raw = memory(loop,O::LoadAddressU32,
+          {address,V(0u),V(0u),V(true)},IR::ResourceKind::Global,
+          scenario == Scenario::PlanningOnlyAddressTemplate);
+      f.Emit(loop,O::ReferenceU32,{raw});
+    }
+    if (scenario == Scenario::CyclicAddressWrite) address_write(loop);
+    if (scenario == Scenario::CyclicScalarBufferRead) {
+      const auto raw = memory(loop,O::ReadConstBuffer,{buffer,V(0u)},IR::ResourceKind::ScalarBuffer);
+      f.Emit(loop,O::ReferenceU32,{raw});
+    }
+    if (scenario == Scenario::CyclicBufferAtomic) buffer_atomic(loop);
+    if (scenario == Scenario::ImmutableSnapshot) {
+      const auto srt = f.Emit(loop,O::GetSrtResource);
+      const auto snapshot = f.Emit(loop,O::ReadConst,{srt,V(0u)});
+      f.Emit(loop,O::ReferenceU32,{snapshot});
+    }
+    if (scenario == Scenario::SeparateWriterCycle) {
+      const auto finish = f.AddBlock();
+      auto& writer_counter = f.program.blocks[after]->AppendNewInst(
+          O::Phi,{},static_cast<uint64_t>(IR::Type::U32));
+      writer_counter.AddPhiOperand(f.program.blocks[loop],V(0u));
+      const auto writer_next = f.Emit(after,O::IAdd32,{V(&writer_counter),V(1u)});
+      writer_counter.AddPhiOperand(f.program.blocks[after],writer_next);
+      buffer_write(after,writer_next);
+      f.Conditional(after,after,finish,f.Emit(after,O::ULessThan32,{writer_next,V(4u)}));
+      f.program.block_info[after].terminator.loop_header = true;
+      f.program.block_info[after].terminator.continue_block = f.program.block_info[after].id;
+      f.program.block_info[after].terminator.merge_block = f.program.block_info[finish].id;
+      f.KeepWave(finish);
+    } else {
+      if (scenario == Scenario::AcyclicAddressReadAfter) address_read(after);
+      if (scenario == Scenario::ImageWriteAfter) image_write(after);
+      if (scenario == Scenario::ImageAtomicAfter) image_atomic(after);
+      // Concrete counterexample to checking only image instructions inside SCCs:
+      // an image payload precedes the cyclic buffer flag, and is read afterward.
+      if (scenario == Scenario::ImageWriteBefore) image_read(after);
+      f.Emit(after,O::ReferenceU32,{uniform_read});
+      f.KeepWave(after);
+    }
+    const bool accepted = scenario == Scenario::BufferCycle ||
+        scenario == Scenario::SeparateWriterCycle || scenario == Scenario::AcyclicInputImage ||
+        scenario == Scenario::ImmutableSnapshot || scenario == Scenario::PlanningOnlyAddressTemplate;
+    const auto plan = f.Plan();
+    if (plan.error.empty() != accepted)
+      std::fprintf(stderr,"cooperative SSBO visibility scenario=%u: %s\n",
+          static_cast<unsigned>(scenario),plan.error.c_str());
+    if (accepted) {
+      Check(plan.error.empty() && plan.IsCooperativeWave64() && plan.IsSplitWave64() &&
+                plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 256u &&
+                plan.layout.guest_size == std::array<uint32_t,3>{16,16,1},
+            "cooperative buffer-only cyclic communication requires preserved whole-workgroup geometry");
+    } else {
+      Check(!plan.error.empty() && !plan.IsCooperativeWave64(),
+            "cooperative buffer visibility bypassed image, DMA, atomic, partition or convergence guards");
+    }
+  }
+}
+
 struct F64CertificateFixture {
   using Value = ShaderRecompiler::IR::Value;
   using Op = ShaderRecompiler::IR::ValueOpcode;
@@ -14105,6 +14292,16 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-acyclic-bda-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64BufferCycleVisibility(true);
+    std::puts("KYTY_COOPERATIVE_ACYCLIC_BDA_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-buffer-cycles-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64BufferCycleVisibility();
+    std::puts("KYTY_COOPERATIVE_BUFFER_CYCLES_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-wave64-admission-only") == 0) {
     Libs::Graphics::TestCooperativeWave64GeometryAndBudget();
     Libs::Graphics::TestCooperativeWave64BarrierOrderAndControl();
@@ -14243,6 +14440,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64BarrierOrderAndControl();
   TestCooperativeWave64OperationBoundaries();
   TestCooperativeWave64LegacyBarrierInsertionScope();
+  TestCooperativeWave64BufferCycleVisibility();
   TestComputeExecutionSingleWaveLds();
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();

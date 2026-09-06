@@ -102,11 +102,27 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	}
 
 	const auto soffset_value = inst.Arg(3).Resolve();
-	if (soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
-	    soffset_value.U32() == 0u) {
-		return address;
+	if (!(soffset_value.IsImmediate() && soffset_value.GetType() == IR::Type::U32 &&
+	      soffset_value.U32() == 0u)) {
+		address = Binary(state, OpIAdd, TypeU32(state), address, soffset);
 	}
-	return Binary(state, OpIAdd, TypeU32(state), address, soffset);
+
+	// Raw DWORD resources have a proven DWORD-aligned host residual. Their
+	// element-index addition cannot overflow and retains compact wide accesses.
+	if (BufferUsesDwordOffset(state, mem)) return address;
+
+	// Guest address arithmetic wraps above. This final addition rebases onto
+	// an aligned host view and must not wrap an out-of-range guest address into
+	// the beginning of that view. Each formatted/raw component reaches here
+	// after its guest offset is applied, before DWORD/byte decomposition.
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	const auto adjusted = Binary(state, OpIAdd, TypeU32(state), address,
+	                             state.memory_byte_offsets[array_index]);
+	const auto overflow = Binary(state, OpULessThan, TypeBool(state), adjusted, address);
+	// SSBO range is capped by the uint32 maxStorageBufferRange. UINT32_MAX's
+	// DWORD/u64 index is outside every complete element of such a range.
+	return Select(state, TypeU32(state), overflow, ConstantU32(state, UINT32_MAX), adjusted);
 }
 
 uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t add_low,
@@ -670,8 +686,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
-		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		    const auto byte_address = ByteAddress(ctx, inst, mem);
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(

@@ -1226,24 +1226,45 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 		}
 	}
 	TileSizeAlign stencil_size {}, htile_size {}, depth_size {};
+	const bool per_layer_layout =
+	    TileGetDepthSize(requested.extent.width, requested.extent.height, 0,
+	                     Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::kInvalid,
+	                     true, stencil_size, htile_size, depth_size, 0);
+	const uint64_t layers = requested.resources.layers;
 	const bool shape = requested.pixel_format == vk::Format::eD32Sfloat &&
 	    requested.guest_format == Prospero::BufferFormat::k32Float &&
 	    requested.type == Prospero::ImageType::kColor2D && requested.extent.depth == 1 &&
-	    requested.resources == ImageSubresources {1, 1} && requested.samples == 1 &&
+	    requested.resources.levels == 1 && layers != 0 && requested.samples == 1 &&
 	    requested.bytes_per_block == 4 && requested.tile_mode == Prospero::TileMode::kDepth &&
 	    !requested.HasStencil() && !requested.metadata.stencil_compressed &&
 	    requested.metadata.compression == VideoOutCompression::Uncompressed &&
-	    TileGetDepthSize(requested.extent.width, requested.extent.height, 0,
-	                     Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::kInvalid,
-	                     true, stencil_size, htile_size, depth_size, 0) &&
-	    requested.data.size == depth_size.size && metadata.size == htile_size.size &&
+	    per_layer_layout && requested.data.size == static_cast<uint64_t>(depth_size.size) * layers &&
+	    metadata.size == static_cast<uint64_t>(htile_size.size) * layers &&
 	    (metadata.address & (htile_size.align - 1u)) == 0 &&
 	    requested.pitch == TileGetTexturePitch(requested.guest_format, requested.extent.width,
 	                                           requested.tile_mode);
-	if (!shape ||
-	    !m_scheduler.Context().GetGpuResources().IsMapped(requested.data.address, requested.data.size) ||
-	    !m_scheduler.Context().GetGpuResources().IsMapped(metadata.address, metadata.size)) {
-		EXIT("unsupported sampled HTile clear import geometry or mapping\n");
+	const bool data_mapped =
+	    m_scheduler.Context().GetGpuResources().IsMapped(requested.data.address, requested.data.size);
+	const bool metadata_mapped =
+	    m_scheduler.Context().GetGpuResources().IsMapped(metadata.address, metadata.size);
+	if (!shape || !data_mapped || !metadata_mapped) {
+		EXIT("unsupported sampled HTile clear import geometry or mapping: shape=%d "
+		     "data_mapped=%d metadata_mapped=%d data=0x%016" PRIx64 "+0x%016" PRIx64
+		     " metadata=0x%016" PRIx64 "+0x%016" PRIx64
+		     " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u bpe=%u "
+		     "pixel_format=%u guest_format=%u type=%u tile=%u stencil=%d "
+		     "stencil_compressed=%d compression=%u expected_depth=0x%08x "
+		     "expected_htile=0x%08x htile_align=0x%08x\n",
+		     shape, data_mapped, metadata_mapped, requested.data.address,
+		     requested.data.size, metadata.address, metadata.size, requested.extent.width,
+		     requested.extent.height, requested.extent.depth, requested.pitch,
+		     requested.resources.levels, requested.resources.layers, requested.samples,
+		     requested.bytes_per_block, static_cast<uint32_t>(requested.pixel_format),
+		     static_cast<uint32_t>(requested.guest_format), static_cast<uint32_t>(requested.type),
+		     static_cast<uint32_t>(requested.tile_mode), requested.HasStencil(),
+		     requested.metadata.stencil_compressed,
+		     static_cast<uint32_t>(requested.metadata.compression), depth_size.size,
+		     htile_size.size, htile_size.align);
 	}
 	if (QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
 	    m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
@@ -1284,10 +1305,11 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 	auto& image = m_slot_images[id];
 	m_scheduler.EndRendering();
 	const auto command = m_scheduler.Current().Handle();
-	const ImageSubresourceRange subresource {0, 1, 0, 1};
+	const ImageSubresourceRange subresource {0, 1, 0, requested.resources.layers};
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	              subresource, command);
-	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0,
+	                                       requested.resources.layers};
 	const vk::ClearDepthStencilValue value {clear == 0 ? 0.0f : 1.0f, 0};
 	command.clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                               &value, 1, &range);

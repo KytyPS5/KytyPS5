@@ -9262,6 +9262,168 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckSampledHtileArrayClearDiscovery() {
+  constexpr const char* name = "SampledHtileArrayClearDiscovery";
+  constexpr uintptr_t base = 0x0000000206000000ull;
+  constexpr uint64_t allocation_alignment = 0x10000;
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  constexpr uint32_t layers = 4;
+  constexpr uint64_t depth_slice_size = 0x10000;
+  constexpr uint64_t htile_slice_size = 0x8000;
+  constexpr uint64_t depth_size = depth_slice_size * layers;
+  constexpr uint64_t metadata_address = base + depth_size;
+  constexpr uint64_t metadata_size = htile_slice_size * layers;
+  constexpr uint64_t allocation_size = depth_size + metadata_size;
+  constexpr uint32_t poison = 0x3e800000u;
+  constexpr uint32_t clear_one = 0xfffffff0u;
+
+  EnsureRuntimeContext();
+  TileSizeAlign stencil_layout{}, htile_layout{}, depth_layout{};
+  Require(name, "per-layer footprints",
+          TileGetDepthSize(width, height, 0, Prospero::DepthFormat::kZ32F,
+                           Prospero::StencilFormat::kInvalid, true,
+                           stencil_layout, htile_layout, depth_layout, 0) &&
+              depth_layout.size == depth_slice_size &&
+              htile_layout.size == htile_slice_size &&
+              metadata_address % htile_layout.align == 0,
+          "array fixture does not use independently tiled depth/HTile slices");
+
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+          "sampled HTile array direct allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset,
+              allocation_alignment) == 0 &&
+              mapped == reinterpret_cast<void*>(base),
+          "sampled HTile array mapping failed");
+  std::vector<uint32_t> depth_poison(depth_size / sizeof(uint32_t), poison);
+  std::vector<uint32_t> metadata_stale(metadata_size / sizeof(uint32_t), 0u);
+  std::memcpy(mapped, depth_poison.data(), depth_size);
+  std::memcpy(reinterpret_cast<uint8_t*>(mapped) + depth_size,
+              metadata_stale.data(), metadata_size);
+
+  {
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto& resources = context.GetGpuResources();
+    auto& cache = context.GetTextureCache();
+    auto& buffers = context.GetBufferCache();
+    auto& executor = context.GetRenderExecutor();
+    resources.MapMemory(base, allocation_size);
+
+    auto native = buffers.ObtainBuffer(metadata_address, metadata_size, true, false);
+    Require(name, "GPU metadata owner",
+            native.first != nullptr &&
+                buffers.HasGpuDirtyBytes(metadata_address, metadata_size),
+            "array metadata did not establish GPU buffer ownership");
+    buffers.FillBuffer(metadata_address, metadata_size, clear_one, false);
+    Require(name, "stale metadata backing",
+            Libs::LibKernel::Memory::TryReadBacking(
+                metadata_address, metadata_stale.data(), metadata_size) &&
+                std::ranges::all_of(metadata_stale,
+                                    [](uint32_t word) { return word == 0u; }),
+            "GPU metadata clear was mirrored into CPU backing before import");
+
+    ShaderTextureResource descriptor{};
+    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (((width - 1u) & 3u) << 30u);
+    descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+        (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+    descriptor.fields[4] = layers - 1u;
+    descriptor.fields[5] = 0x00700000u;
+    descriptor.fields[6] = 0x00280000u |
+        (static_cast<uint32_t>((metadata_address >> 8u) & 0xffu) << 24u);
+    descriptor.fields[7] = static_cast<uint32_t>(metadata_address >> 16u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+              value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+    resource.read = true;
+    resource.depth_compare = true;
+
+    std::printf("KYTY_SAMPLED_HTILE_ARRAY_READY\n");
+    std::fflush(stdout);
+    const auto binding =
+        RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+    auto& image = cache.GetImage(binding.image_id);
+    Require(name, "array owner",
+            image.backing.format == vk::Format::eD32Sfloat &&
+                image.backing.layers == layers &&
+                image.info.data == GuestRange{base, depth_size} &&
+                image.info.metadata.range ==
+                    GuestRange{metadata_address, metadata_size} &&
+                image.info.resources == ImageSubresources{1, layers},
+            "sampled HTile array did not materialize one native layered owner");
+    Require(name, "logical array readback",
+            TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+            "materialized HTile array could not be queued for readback");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+
+    std::vector<uint32_t> observed(depth_poison.size());
+    Require(name, "array depth backing",
+            Libs::LibKernel::Memory::TryReadBacking(base, observed.data(), depth_size),
+            "materialized HTile array backing is unavailable");
+    TileTextureBlockLayout tile_layout{};
+    Require(name, "array tile layout",
+            TileGetTextureBlockLayout(Prospero::BufferFormat::k32Float,
+                                      Prospero::TileMode::kDepth, false,
+                                      tile_layout),
+            "sampled HTile array has no supported depth tile layout");
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+      uint32_t block_xor = 0;
+      Require(name, "array layer xor",
+              TileGetBlockXor(tile_layout.block, 0, 0, layer, block_xor),
+              "sampled HTile array layer XOR is unavailable");
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          uint32_t offset = 0;
+          Require(name, "array texel address",
+                  TileGetBlockOffset(tile_layout.block, x, y, 0, offset),
+                  "sampled HTile array texel address is unavailable");
+          const auto index =
+              (depth_slice_size * layer + (offset ^ block_xor)) /
+              sizeof(uint32_t);
+          Require(name, "all layers materialized",
+                  index < observed.size() && observed[index] == 0x3f800000u,
+                  "an imported HTile array layer kept stale raw depth pixels");
+        }
+      }
+    }
+    resources.SetGpu(nullptr);
+    resources.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+  }
+  Require(name, "unmap direct backing",
+          Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "sampled HTile array mapping release failed");
+  Require(name, "release direct backing",
+          Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+              direct_offset, allocation_size) == 0,
+          "sampled HTile array allocation release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
   // Place inside VulkanHarness. Reaches actual renderer admission before any
   // binding mutation, without dispatching potentially conflicting resources.
   void CheckStorageBufferByteOffsetBinding(bool unsupported_halfword = false,
@@ -33649,6 +33811,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sampled-htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSampledHtileClearDiscovery();
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--sampled-htile-array-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledHtileArrayClearDiscovery();
     return 0;
   }
 // Insert before main's unknown-selector fallback. Parent never constructs Vulkan.

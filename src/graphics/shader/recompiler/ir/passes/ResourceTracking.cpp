@@ -1267,6 +1267,11 @@ private:
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
+		if (expected == ValueOpcode::GetBufferResource) {
+			for (uint32_t dword = 0; dword < handle->NumArgs(); ++dword) {
+				handle->SetArg(dword, LowerRuntimeDescriptorPhi(handle->Arg(dword), *handle));
+			}
+		}
 		if (expected == ValueOpcode::GetBufferResource && MakeBoundedBufferSource(*handle, source)) return;
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);

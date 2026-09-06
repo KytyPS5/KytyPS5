@@ -13138,13 +13138,27 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
     for (const auto format :
          {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8_8Srgb,
           Prospero::BufferFormat::k9_9_9_5Float}) {
-      for (const auto tile :
-           {Prospero::TileMode::kDepth, Prospero::TileMode::kRenderTarget}) {
-        TileTextureBlockLayout texture{};
-        Require(name, "RT format policy",
-                !TileGetTextureBlockLayout(format, tile, false, texture),
-                "non-render-target format admitted by an RT/depth tile family");
-      }
+      TileTextureBlockLayout render_target{};
+      TileTextureBlockLayout depth{};
+      Require(name, "RT sampled-view format policy",
+              TileGetTextureBlockLayout(format,
+                                        Prospero::TileMode::kRenderTarget,
+                                        false, render_target) &&
+                  render_target.block.family ==
+                      TileBlockFamily::RenderTarget64KB &&
+                  !TileGetTextureBlockLayout(format,
+                                             Prospero::TileMode::kDepth,
+                                             false, depth),
+              "an uncompressed sampled view could not reuse RT-tiled storage "
+              "or entered the depth tile family");
+    }
+    {
+      TileTextureBlockLayout compressed{};
+      Require(name, "RT compressed-view policy",
+              !TileGetTextureBlockLayout(Prospero::BufferFormat::kBc1UNorm,
+                                         Prospero::TileMode::kRenderTarget,
+                                         false, compressed),
+              "a block-compressed format entered the texel-based RT tile family");
     }
     {
       TileSurfaceLayout invalid{};
@@ -30926,6 +30940,92 @@ void CheckShaderRecompilerFatalContracts() {
 }
 #endif
 
+void CheckRenderTargetTiledSampledFormatLayout() {
+  constexpr const char *name = "RenderTargetTiledSampledFormat";
+  struct FormatCase {
+    Prospero::BufferFormat sampled;
+    Prospero::BufferFormat same_width;
+    uint32_t bytes_per_element;
+  };
+  constexpr FormatCase cases[] = {
+      {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8UNorm, 1},
+      {Prospero::BufferFormat::k8_8Srgb, Prospero::BufferFormat::k16UNorm, 2},
+      {Prospero::BufferFormat::k9_9_9_5Float,
+       Prospero::BufferFormat::k32Float, 4},
+  };
+
+  for (const auto &test : cases) {
+    TileTextureBlockLayout sampled_block{};
+    TileTextureBlockLayout same_width_block{};
+    Require(name, "sampled alias block layout",
+            Prospero::RenderTargetBytesPerElement(test.sampled) == 0 &&
+                Prospero::SampledTextureNumericClass(test.sampled) !=
+                    Prospero::TextureNumericClass::Unsupported &&
+                TileGetTextureBlockLayout(test.sampled,
+                                          Prospero::TileMode::kRenderTarget,
+                                          false, sampled_block),
+            "a sampled-only uncompressed format cannot describe RT-tiled memory");
+    Require(name, "same-width block geometry",
+            TileGetTextureBlockLayout(test.same_width,
+                                      Prospero::TileMode::kRenderTarget, false,
+                                      same_width_block) &&
+                sampled_block.block.family ==
+                    TileBlockFamily::RenderTarget64KB &&
+                sampled_block.block.bytes_per_element ==
+                    test.bytes_per_element &&
+                sampled_block.block.block_width ==
+                    same_width_block.block.block_width &&
+                sampled_block.block.block_height ==
+                    same_width_block.block.block_height &&
+                sampled_block.block.block_depth ==
+                    same_width_block.block.block_depth,
+            "equal-width sampled and writable views use different RT tiling");
+
+    constexpr uint32_t width = 3840;
+    constexpr uint32_t height = 2160;
+    constexpr uint32_t levels = 1;
+    const TileSurfaceDescription sampled_description{
+        test.sampled, Prospero::TileMode::kRenderTarget,
+        TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+    const TileSurfaceDescription same_width_description{
+        test.same_width, Prospero::TileMode::kRenderTarget,
+        TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+    TileSurfaceLayout sampled_surface{};
+    TileSurfaceLayout same_width_surface{};
+    Require(name, "sampled alias surface layout",
+            TileGetTiledTextureLayout(sampled_description, sampled_surface) &&
+                TileGetTiledTextureLayout(same_width_description,
+                                          same_width_surface) &&
+                sampled_surface.total_size == same_width_surface.total_size &&
+                sampled_surface.block_slice_size ==
+                    same_width_surface.block_slice_size &&
+                sampled_surface.mips[0].offset ==
+                    same_width_surface.mips[0].offset &&
+                sampled_surface.mips[0].size ==
+                    same_width_surface.mips[0].size &&
+                sampled_surface.mips[0].padded_width ==
+                    same_width_surface.mips[0].padded_width &&
+                sampled_surface.mips[0].padded_height ==
+                    same_width_surface.mips[0].padded_height,
+            "equal-width sampled and writable views disagree on the RT surface footprint");
+
+    TileTextureBlockLayout depth{};
+    Require(name, "depth boundary",
+            !TileGetTextureBlockLayout(test.sampled,
+                                       Prospero::TileMode::kDepth, false,
+                                       depth),
+            "a sampled-only color format entered the depth tile family");
+  }
+
+  TileTextureBlockLayout compressed{};
+  Require(name, "compressed boundary",
+          !TileGetTextureBlockLayout(Prospero::BufferFormat::kBc1UNorm,
+                                     Prospero::TileMode::kRenderTarget, false,
+                                     compressed),
+          "a block-compressed format entered the texel-based RT tile family");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckStorageTextureVolumeUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k16_16_16_16Float;
   constexpr uint32_t width = 33;
@@ -33402,6 +33502,11 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--rt-tiled-sampled-format-only") == 0) {
+    CheckRenderTargetTiledSampledFormatLayout();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 3 && std::strcmp(argv[1], "--storage-buffer-byte-offset-reject") == 0) {
     const bool halfword = std::strcmp(argv[2], "unaligned-halfword") == 0;
@@ -33920,6 +34025,7 @@ if (argc == 1) {
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
+  CheckRenderTargetTiledSampledFormatLayout();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureVolumeMipRegions();

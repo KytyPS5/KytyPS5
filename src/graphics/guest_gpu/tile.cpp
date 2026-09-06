@@ -305,8 +305,17 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
 	if (!TileGetTextureElementLayout(format, element)) {
 		return false;
 	}
-	if ((family == TileBlockFamily::Depth64KB || family == TileBlockFamily::RenderTarget64KB) &&
+	if (family == TileBlockFamily::Depth64KB &&
 	    Prospero::RenderTargetBytesPerElement(format) != element.bytes) {
+		return false;
+	}
+	// The render-target tile mode describes the storage swizzle. A sampled view
+	// may use a different uncompressed encoding with the same element width even
+	// when that encoding cannot itself be bound as a writable render target.
+	// Block-compressed formats use block dimensions rather than texel dimensions
+	// and are not compatible with this texel-based tile family.
+	if (family == TileBlockFamily::RenderTarget64KB &&
+	    (element.texel_width != 1 || element.texel_height != 1)) {
 		return false;
 	}
 

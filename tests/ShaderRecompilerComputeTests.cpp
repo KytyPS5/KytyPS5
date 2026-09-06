@@ -17635,6 +17635,120 @@ TestCase Buffers65FromSrtUsePackedOffsetsAndStorageFallback() {
   return test;
 }
 
+TestCase BufferD16LoadsPreserveHalvesAndSnapshotAddress() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferD16LoadsPreserveHalvesAndSnapshotAddress";
+  test.initial = {0x01020304u, 0x89abcdefu, 0xfedcba98u, 0xffffeeeeu,
+                  0x77665544u, 0x11223344u, 0x00aa00bbu, 0x55aa77ccu};
+  test.expected = {0x123489abu, 0x0000eeeeu, 0xffff000eu, 0xbeef3344u,
+                   0x33440001u, 0xaabb0000u, 0x0000ccddu, 0x246855aau};
+  test.has_user_data = true;
+  test.user_data = MakeStructuredStorageBufferData(8u, 4u);
+  test.user_data[4] = 2u;
+  test.user_data[50] = static_cast<u32>(test.expected.size() * sizeof(u32));
+  test.storage_buffer_range_dwords = 8;
+
+  auto &code = test.code;
+  const auto Load = [&](u32 opcode, u32 destination, u32 address,
+                         u32 offset = 0u, bool indexed = false,
+                         u32 soffset = 128u) {
+    code.push_back(EncodeMubuf0(opcode, offset, indexed, true));
+    code.push_back(EncodeMubuf1(destination, 0, address, soffset));
+  };
+  AppendVMovLiteral(&code, 2, 0x12345678u);
+  AppendVMovU32(&code, 10, 6u);
+  Load(0x24, 2, 10);
+  // Both destination halves must use the address before replacing any bits.
+  AppendVMovU32(&code, 0, 12u);
+  Load(0x24, 0, 0);
+  AppendVMovU32(&code, 1, 14u);
+  Load(0x25, 1, 1);
+
+  AppendVMovU32(&code, 20, 2u);
+  AppendVMovU32(&code, 21, 1u);
+  AppendVMovLiteral(&code, 4, 0xbeefabcdu);
+  // Address = index 2 * stride 8 + offset VGPR 1 + immediate 1 + SGPR 2.
+  Load(0x24, 4, 20, 1u, true, 4u);
+  Load(0x25, 21, 20, 1u, true, 4u);
+
+  AppendVMovLiteral(&code, 5, 0xaabbccddu);
+  AppendVMovU32(&code, 10, 32u);
+  Load(0x24, 5, 10);
+  AppendVMovLiteral(&code, 6, 0xaabbccddu);
+  AppendVMovU32(&code, 10, 34u);
+  Load(0x25, 6, 10);
+  // The last valid aligned halfword is read; OOB loads clear only their half.
+  AppendVMovLiteral(&code, 7, 0x2468ace0u);
+  AppendVMovU32(&code, 10, 30u);
+  Load(0x24, 7, 10);
+  const std::array results{2u, 0u, 1u, 4u, 21u, 5u, 6u, 7u};
+  for (u32 index = 0; index < results.size(); ++index) {
+    AppendStoreVgpr(&code, results[index], index);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_SHORT_D16,
+                  O::BUFFER_LOAD_SHORT_D16_HI, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"BUFFER_LOAD_SHORT_D16 ", 5u},
+                         {"BUFFER_LOAD_SHORT_D16_HI ", 3u}};
+  return test;
+}
+
+TestCase BufferD16StoresSelectHighBytesAndRespectBounds() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferD16StoresSelectHighBytesAndRespectBounds";
+  test.initial = {0xaabbccddu, 0xabcdef01u, 0xdeadbeefu, 0x11223344u,
+                  0x87654321u, 0x76543210u, 0x13579bdfu, 0x2468ace0u};
+  test.expected = {0x567834ddu, 0xabcdef01u, 0xdebcbeefu, 0xff003344u,
+                   0x87654321u, 0x76543210u, 0x13579bdfu, 0x2468ace0u};
+  test.has_user_data = true;
+  test.user_data = MakeStructuredStorageBufferData(4u, 4u);
+  test.user_data[4] = 1u;
+  // The trailing backing words remain accessible to readback, but outside the
+  // Vulkan descriptor range, so accidental OOB writes are observable.
+  test.storage_buffer_range_dwords = 4;
+
+  auto &code = test.code;
+  const auto Store = [&](u32 opcode, u32 source, u32 address,
+                          u32 offset = 0u, bool indexed = false,
+                          u32 soffset = 128u) {
+    code.push_back(EncodeMubuf0(opcode, offset, indexed, true));
+    code.push_back(EncodeMubuf1(source, 0, address, soffset));
+  };
+  AppendVMovLiteral(&code, 0, 0x1234abcdu);
+  AppendVMovU32(&code, 10, 1u);
+  Store(0x19, 0, 10);
+  AppendVMovLiteral(&code, 1, 0x5678eeeeu);
+  AppendVMovU32(&code, 10, 0u);
+  Store(0x1b, 1, 10, 2u);
+
+  AppendVMovLiteral(&code, 2, 0x9abc8888u);
+  AppendVMovU32(&code, 20, 2u);
+  AppendVMovU32(&code, 21, 0u);
+  // Index 2 * stride 4 + immediate 1 + SGPR 1 addresses byte 10.
+  Store(0x19, 2, 20, 1u, true, 4u);
+  AppendVMovU32(&code, 20, 3u);
+  AppendVMovU32(&code, 21, 1u);
+  // VDATA also supplies the offset: address 14, stored high half zero.
+  Store(0x1b, 21, 20, 0u, true, 4u);
+  AppendVMovLiteral(&code, 3, 0x7effbbbbu);
+  AppendVMovU32(&code, 10, 15u);
+  Store(0x19, 3, 10);
+
+  AppendVMovU32(&code, 10, 16u);
+  Store(0x1b, 1, 10);
+  AppendVMovU32(&code, 10, 17u);
+  Store(0x19, 0, 10);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_BYTE_D16_HI,
+                  O::BUFFER_STORE_SHORT_D16_HI, O::S_ENDPGM};
+  test.decoded_counts = {{"BUFFER_STORE_BYTE_D16_HI ", 4u},
+                         {"BUFFER_STORE_SHORT_D16_HI ", 3u}};
+  return test;
+}
+
 TestCase BufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -22751,6 +22865,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(Buffers65FromSrtUsePackedOffsetsAndStorageFallback);
+  AddCase(BufferD16LoadsPreserveHalvesAndSnapshotAddress);
+  AddCase(BufferD16StoresSelectHighBytesAndRespectBounds);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
@@ -27045,6 +27161,12 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Images65FromSrtWithDistinctSamplerOrigins());
     RunCase(&vulkan, Buffers65FromSrtUsePackedOffsetsAndStorageFallback());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-d16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferD16LoadsPreserveHalvesAndSnapshotAddress());
+    RunCase(&vulkan, BufferD16StoresSelectHighBytesAndRespectBounds());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {

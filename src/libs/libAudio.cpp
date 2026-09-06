@@ -775,23 +775,25 @@ static int32_t audiodec_validate_ctrl(const AudiodecCtrl* ctrl, uint32_t codec_t
 	if (ctrl->pBsiInfo == nullptr) {
 		return AUDIODEC_ERROR_INVALID_BSI_INFO_POINTER;
 	}
-	if (ctrl->pAuInfo == nullptr) {
-		return AUDIODEC_ERROR_INVALID_AU_INFO_POINTER;
-	}
-	if (ctrl->pPcmItem == nullptr) {
-		return AUDIODEC_ERROR_INVALID_PCM_ITEM_POINTER;
-	}
-	if (ctrl->pAuInfo->uiSize != sizeof(AudiodecAuInfo)) {
-		return AUDIODEC_ERROR_INVALID_AU_INFO_SIZE;
-	}
-	if (ctrl->pPcmItem->uiSize != sizeof(AudiodecPcmItem)) {
-		return AUDIODEC_ERROR_INVALID_PCM_ITEM_SIZE;
-	}
-	if (decode && ctrl->pAuInfo->pAuAddr == nullptr) {
-		return AUDIODEC_ERROR_INVALID_AU_POINTER;
-	}
-	if (decode && ctrl->pPcmItem->pPcmAddr == nullptr) {
-		return AUDIODEC_ERROR_INVALID_PCM_POINTER;
+	if (decode) {
+		if (ctrl->pAuInfo == nullptr) {
+			return AUDIODEC_ERROR_INVALID_AU_INFO_POINTER;
+		}
+		if (ctrl->pPcmItem == nullptr) {
+			return AUDIODEC_ERROR_INVALID_PCM_ITEM_POINTER;
+		}
+		if (ctrl->pAuInfo->uiSize != sizeof(AudiodecAuInfo)) {
+			return AUDIODEC_ERROR_INVALID_AU_INFO_SIZE;
+		}
+		if (ctrl->pPcmItem->uiSize != sizeof(AudiodecPcmItem)) {
+			return AUDIODEC_ERROR_INVALID_PCM_ITEM_SIZE;
+		}
+		if (ctrl->pAuInfo->pAuAddr == nullptr) {
+			return AUDIODEC_ERROR_INVALID_AU_POINTER;
+		}
+		if (ctrl->pPcmItem->pPcmAddr == nullptr) {
+			return AUDIODEC_ERROR_INVALID_PCM_POINTER;
+		}
 	}
 
 	switch (codec_type) {

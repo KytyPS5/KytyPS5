@@ -522,6 +522,14 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	}
 	if (cooperative_spills != nullptr) {
 		if (const auto slot = cooperative_spills->find(inst); slot != cooperative_spills->end()) {
+			if (cooperative_phase != 0 && cooperative_phases != nullptr) {
+				const auto phase  = cooperative_phases->find(inst);
+				const auto direct = definitions.find(inst);
+				if (phase != cooperative_phases->end() && phase->second == cooperative_phase &&
+				    direct != definitions.end()) {
+					return direct->second;
+				}
+			}
 			const auto type = TypeId(inst->GetType());
 			const auto loaded = state.builder.AllocateId();
 			state.builder.AddFunction({OpLoad, type, loaded, slot->second});
@@ -724,6 +732,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	if (state.compute_execution.IsCooperativeWave64()) {
 		cooperative.emplace(PrepareCooperativeFunction(ctx));
 		ctx.cooperative_spills = &cooperative->spills;
+		ctx.cooperative_phases = &cooperative->phases;
 	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {

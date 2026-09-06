@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -95,10 +96,12 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			// physical invocation must join the cross-subgroup rendezvous. Publish
 			// the raw host loads first, broadcast this wave's lane zero, then commit
 			// the architectural scalar result for the selected wave.
+			ctx.cooperative_phase = function.phases.at(&inst);
 			Guard(ctx.state, active, [&] {
 				EmitDirectValueInstruction(ctx, inst);
 				StoreResult(ctx, function, inst);
 			});
+			ctx.cooperative_phase = 0;
 			ctx.cooperative_collective_active = active;
 			const auto source = ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 			const auto value = EmitWaveReadLane(ctx.state, source, ConstantU32(ctx.state, 0));
@@ -110,14 +113,17 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			continue;
 		}
 		if (IsCollective(inst.GetOpcode())) {
+			ctx.cooperative_phase = function.phases.at(&inst);
 			ctx.cooperative_collective_active = active;
 			EmitDirectValueInstruction(ctx, inst);
 			ctx.cooperative_collective_active = 0;
+			ctx.cooperative_phase = 0;
 			Guard(ctx.state, active, [&] { StoreResult(ctx, function, inst); });
 			++index;
 			continue;
 		}
 		bool lds = false;
+		ctx.cooperative_phase = function.phases.at(segment.instructions[index]);
 		Guard(ctx.state, active, [&] {
 			// Coalesce ordinary instructions into one selection. A DS phase ends
 			// it, so its rendezvous remains outside every wave/EXEC/bounds guard.
@@ -131,6 +137,7 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			} while (!lds && index < segment.instructions.size() &&
 			         !IsCollective(segment.instructions[index]->GetOpcode()));
 		});
+		ctx.cooperative_phase = 0;
 		// Atomic completion is a phase too: OpMemoryBarrier in an active atomic
 		// path alone does not rendezvous the two native halves of a guest wave.
 		if (lds) Rendezvous(ctx.state);
@@ -162,14 +169,59 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 	CooperativeFunctionState function;
 	function.pc_variable = ctx.state.builder.AllocateId();
 	function.cursor_variable = ctx.state.builder.AllocateId();
+	uint32_t next_phase = 1;
+	for (const auto* block : ctx.program.blocks) {
+		uint32_t ordinary_phase = 0;
+		for (const auto& inst : *block) {
+			const auto op = inst.GetOpcode();
+			if (op == O::Phi) {
+				continue;
+			}
+			if (op == O::Barrier) {
+				ordinary_phase = 0;
+				continue;
+			}
+			if ((op == O::ReadConstBuffer && !ctx.Memory(inst).planning_only) ||
+			    IsCollective(op)) {
+				function.phases.emplace(&inst, next_phase++);
+				ordinary_phase = 0;
+				continue;
+			}
+			if (ordinary_phase == 0) {
+				ordinary_phase = next_phase++;
+			}
+			function.phases.emplace(&inst, ordinary_phase);
+			if (IsLds(ctx.program, inst)) {
+				ordinary_phase = 0;
+			}
+		}
+	}
+	std::unordered_set<const IR::Inst*> branch_conditions;
+	for (const auto& block : ctx.program.block_info) {
+		if (const auto* condition = block.condition.Resolve().TryInstruction(); condition != nullptr) {
+			branch_conditions.insert(condition);
+		}
+	}
 	for (const auto* block : ctx.program.blocks) for (const auto& inst : *block) {
-		// Opaque resource/address recipes are compile-time structures. Every
-		// runtime scalar/vector leaf receives a slot, even across a barrier
-		// inside one IR block. Planning-only raw SRT reads never execute.
+		// Opaque resource/address recipes are compile-time structures. Runtime
+		// values need Function storage only when a scheduler phase, CFG edge, or
+		// Phi assignment can separate their definition from a consumer.
 		if (ctx.TypeId(inst.GetType()) == 0) continue;
 		if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
 		    ctx.Memory(inst).planning_only) continue;
-		function.spills.emplace(&inst, ctx.state.builder.AllocateId());
+		const auto phase = function.phases.find(&inst);
+		bool spill = inst.GetOpcode() == O::Phi ||
+		             (inst.GetOpcode() == O::ReadConstBuffer && !ctx.Memory(inst).planning_only) ||
+		             branch_conditions.contains(&inst) || phase == function.phases.end();
+		for (const auto& use : inst.Uses()) {
+			const auto user_phase = function.phases.find(use.user);
+			if (phase == function.phases.end() || user_phase == function.phases.end() ||
+			    user_phase->second != phase->second) {
+				spill = true;
+				break;
+			}
+		}
+		if (spill) function.spills.emplace(&inst, ctx.state.builder.AllocateId());
 	}
 	return function;
 }

@@ -470,8 +470,10 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Block*, uint32_t>                     labels;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
-	// Cooperative execution retains every runtime value across guest segments.
+	// Cooperative execution spills only values that cross software scheduler phases.
 	const std::unordered_map<const IR::Inst*, uint32_t>*               cooperative_spills = nullptr;
+	const std::unordered_map<const IR::Inst*, uint32_t>*               cooperative_phases = nullptr;
+	uint32_t                                                           cooperative_phase = 0;
 	uint32_t                                                           cooperative_collective_active = 0;
 	const IR::Block*                                                   current_block = nullptr;
 	uint32_t                                                           scratch_u32_variable = 0;
@@ -483,6 +485,7 @@ struct ValueEmitContext {
 
 struct CooperativeFunctionState {
 	std::unordered_map<const IR::Inst*, uint32_t> spills;
+	std::unordered_map<const IR::Inst*, uint32_t> phases;
 	uint32_t pc_variable = 0;
 	uint32_t cursor_variable = 0;
 };

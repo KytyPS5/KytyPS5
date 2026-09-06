@@ -1187,6 +1187,8 @@ struct GraphicsCase {
   bool pixel_front_face = false;
   u32 layers = 1;
   vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1;
+  bool pixel_position_w = false;
+  float vertex_clip_w = 1.0f;
 };
 
 struct CompiledShader {
@@ -1530,6 +1532,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_no_perspective = test.pixel_no_perspective;
   pixel_info.ps_ancillary = test.pixel_ancillary;
   pixel_info.ps_front_face = test.pixel_front_face;
+  pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_system_input_base = 2;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
@@ -1615,7 +1618,7 @@ enum : u32 {
   OpReturn = 253,
 };
 
-std::vector<u32> MakePassthroughVertexSpirv(bool layered) {
+std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   using ShaderRecompiler::Spirv::Builder;
 
   Builder b;
@@ -1640,7 +1643,8 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered) {
   const auto func_type = b.Type(OpTypeFunction, {void_type});
   const auto const_u32_0 = b.Constant(OpConstant, uint_type, {0});
   const auto const_f32_0 = b.Constant(OpConstant, float_type, {0x00000000u});
-  const auto const_f32_1 = b.Constant(OpConstant, float_type, {0x3f800000u});
+  const auto const_f32_w =
+      b.Constant(OpConstant, float_type, {std::bit_cast<u32>(clip_w)});
   const auto in_pos = b.DefineGlobalVariable(ptr_input_vec2, StorageClassInput);
   const auto in_color =
       b.DefineGlobalVariable(ptr_input_vec4, StorageClassInput);
@@ -1685,7 +1689,7 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered) {
   b.AddFunction({OpCompositeExtract, float_type, pos_x, pos2, 0});
   b.AddFunction({OpCompositeExtract, float_type, pos_y, pos2, 1});
   b.AddFunction({OpCompositeConstruct, vec4_type, position, pos_x, pos_y,
-                 const_f32_0, const_f32_1});
+                 const_f32_0, const_f32_w});
   b.AddFunction(
       {OpAccessChain, ptr_output_vec4, position_ptr, per_vertex, const_u32_0});
   b.AddFunction({OpStore, position_ptr, position});
@@ -11475,7 +11479,8 @@ public:
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
-    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(test.layers > 1);
+    const auto vertex_spirv =
+        TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
@@ -23018,6 +23023,19 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsPositionWExport() {
+  GraphicsCase test;
+  test.name = "GraphicsPositionWExport";
+  test.pixel_position_w = true;
+  test.vertex_clip_w = 4.0f;
+  // POS_W occupies v2; the rasterizer supplies FragCoord.w=1/4 for this triangle.
+  test.fragment_code = {EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2)};
+  AppendEnd(&test.fragment_code);
+  test.expected_pixel = {0x40800000u, 0x40800000u, 0x40800000u, 0x40800000u};
+  test.opcodes = {ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   GraphicsCase test;
   test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
@@ -23638,6 +23656,7 @@ std::vector<TestCase> MakeCases() {
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
+      GraphicsPositionWExport(),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
@@ -27935,6 +27954,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPositionWExport());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {

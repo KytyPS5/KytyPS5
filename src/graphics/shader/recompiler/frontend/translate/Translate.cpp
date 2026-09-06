@@ -1162,8 +1162,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::FragCoord, 2));
 			}
 			if (ps->ps_pos_w) {
+				const auto reciprocal_w = entry_ir.BitCastF32(builtin(IR::StageInputKind::FragCoord, 3));
+				const auto w = IR::F32(entry_ir.Emit(IR::ValueOpcode::FPRecip32, {reciprocal_w}));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
-				                      builtin(IR::StageInputKind::FragCoord, 3));
+				                      entry_ir.BitCastU32(w));
 			}
 			if (ps->ps_front_face) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),

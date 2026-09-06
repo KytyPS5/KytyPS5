@@ -160,7 +160,9 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
         const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
         profiles.push_back({{"needs_lds_barriers", info.needs_lds_barriers},
                             {"blocks", translated.program.blocks.size()},
+                            {"buffers", plan.info.buffers.size()},
                             {"images", plan.info.images.size()}, {"samplers", plan.info.samplers.size()},
+                            {"sampled_pairs", plan.info.sampled_pairs.size()},
                             {"requires_specialization_memory", plan.requires_specialization_memory}});
       }
       result["checked_through"] = "resource_tracking";

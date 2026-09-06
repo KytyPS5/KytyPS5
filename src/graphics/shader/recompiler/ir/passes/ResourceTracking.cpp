@@ -880,7 +880,8 @@ private:
 			}
 		}
 		if (m_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
-			Fail(pc, "sampled image/sampler pair limit exceeded");
+			Fail(pc, fmt::format("sampled image/sampler pair limit exceeded (required={} limit={})",
+			                     m_info.sampled_pairs.size() + 1u, ShaderInfo::MaxSampledPairs));
 		}
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}
@@ -945,7 +946,8 @@ private:
 			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
-				Fail(flags.pc, "buffer resource limit exceeded");
+				Fail(flags.pc, fmt::format("buffer resource limit exceeded (required={} limit={})",
+				                           m_info.buffers.size() + 1u, ShaderInfo::MaxBuffers));
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
@@ -987,7 +989,8 @@ private:
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
+			Fail(flags.pc, fmt::format("image resource limit exceeded (required={} limit={})",
+			                           m_info.images.size() + 1u, ShaderInfo::MaxImages));
 		}
 		AddHandlePatch(handle, resource, flags.pc);
 		uint32_t sampler = 0;
@@ -1009,7 +1012,8 @@ private:
 			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
-				Fail(flags.pc, "sampler resource limit exceeded");
+				Fail(flags.pc, fmt::format("sampler resource limit exceeded (required={} limit={})",
+				                           m_info.samplers.size() + 1u, ShaderInfo::MaxSamplers));
 			}
 			AddHandlePatch(sampler_handle, sampler, flags.pc);
 			AddSampledPair(resource, sampler, flags.pc);

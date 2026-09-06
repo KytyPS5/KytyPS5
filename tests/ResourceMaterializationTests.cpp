@@ -95,7 +95,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   return ExtractResourcePlan(program);
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan(uint32_t sampler_count = 2u) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -134,6 +134,9 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
            Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm});
   program.info.samplers.push_back({.source = sampler0});
   program.info.samplers.push_back({.source = sampler1});
+  for (uint32_t index = 2u; index < sampler_count; index++) {
+    program.info.samplers.push_back({.source = AddSource(4, 0x30000000u + index)});
+  }
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
@@ -197,6 +200,33 @@ void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
   Check(snapshot.samplers[2] == snapshot.samplers[1] &&
             snapshot.samplers[2] != snapshot.samplers[0],
         "point sampler variant duplicated the wrong runtime descriptor");
+}
+
+void TestPointSamplerCapacityIsTransactional() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = MixedSamplerPlan(ShaderInfo::MaxSamplers - 1u);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization),
+        "ordinary samplers plus one point variant rejected the exact sampler capacity");
+  Check(snapshot.samplers.size() == ShaderInfo::MaxSamplers &&
+            specialization.sampler_origins.size() == ShaderInfo::MaxSamplers - 1u &&
+            snapshot.samplers.back() == snapshot.samplers[1] &&
+            snapshot.samplers.back() != snapshot.samplers[0],
+        "point sampler capacity dropped or cloned the wrong descriptor");
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  for (const uint32_t count : {ShaderInfo::MaxSamplers, ShaderInfo::MaxSamplers + 1u}) {
+    auto overflow = MixedSamplerPlan(count);
+    Check(!MaterializeResources(overflow, {}, snapshot, specialization),
+          "ordinary samplers plus point expansion exceeded the sampler capacity");
+    Check(snapshot.buffers == prior_snapshot.buffers && snapshot.images == prior_snapshot.images &&
+              snapshot.samplers == prior_snapshot.samplers &&
+              snapshot.flattened_srt == prior_snapshot.flattened_srt &&
+              snapshot.user_data == prior_snapshot.user_data &&
+              specialization == prior_specialization,
+          "sampler capacity failure partially replaced a successful materialization");
+  }
 }
 
 void TestAtomicFloatImageUsesRawUintSpecialization() {
@@ -269,6 +299,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationPreservesPriorStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestPointSamplerCapacityIsTransactional();
   TestAtomicFloatImageUsesRawUintSpecialization();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

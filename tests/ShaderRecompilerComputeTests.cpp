@@ -1027,6 +1027,11 @@ struct TestCase {
   std::vector<SampledImageFixture> sampled_image_fixtures;
   bool use_runtime_samplers = false;
   bool buffer_addresses_are_backing_offsets = false;
+  u32 expected_buffer_resources = 0;
+  u32 expected_image_resources = 0;
+  u32 expected_sampler_resources = 0;
+  u32 expected_sampled_pairs = 0;
+  bool expected_shader_data_storage = false;
 };
 
 struct GraphicsCase {
@@ -1255,6 +1260,40 @@ CompiledShader CompileCase(
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  const auto CheckResourceOrigins = [&](const auto &resources, u32 expected,
+                                         const char *kind) {
+    if (expected == 0) {
+      return;
+    }
+    std::set<u32> origins;
+    for (const auto &resource : resources) {
+      origins.insert(resource.source);
+    }
+    Require(test.name, "resource topology",
+            resources.size() == expected && origins.size() == expected,
+            std::string(kind) + " did not retain the expected distinct origins");
+  };
+  CheckResourceOrigins(result.program.info.buffers,
+                        test.expected_buffer_resources, "buffers");
+  CheckResourceOrigins(result.program.info.images,
+                        test.expected_image_resources, "images");
+  CheckResourceOrigins(result.program.info.samplers,
+                        test.expected_sampler_resources, "samplers");
+  if (test.expected_sampled_pairs != 0) {
+    Require(test.name, "sampled pair topology",
+            result.program.info.sampled_pairs.size() == test.expected_sampled_pairs,
+            "image/sampler pairs did not retain their expected count");
+  }
+  if (test.expected_shader_data_storage) {
+    Require(test.name, "shader data storage fallback",
+            result.program.bindings.ShaderDataDwords() >
+                    ShaderRecompiler::IR::PushData::DwordCount &&
+                !result.program.bindings.UsesPushData() &&
+                ShaderRecompiler::IR::FindBinding(
+                    result.program.bindings,
+                    ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr,
+            "live user data and packed offsets did not use storage fallback");
+  }
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -17530,6 +17569,72 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   return test;
 }
 
+TestCase Buffers65FromSrtUsePackedOffsetsAndStorageFallback() {
+  using O = ShaderOpcode;
+  constexpr u32 input_count = 64u;
+  constexpr u32 table_base = 0x8000u;
+  constexpr u32 data_base = 0x1000u;
+  constexpr u32 data_stride = 256u;
+
+  TestCase test;
+  test.name = "Buffers65FromSrtUsePackedOffsetsAndStorageFallback";
+  // Raw S_LOAD instructions address the same bytes as ReadTestMemory during
+  // materialization, independently of per-resource packed buffer offsets.
+  test.bda_mappings = {{0, 0}};
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.expected_buffer_resources = input_count + 1u;
+  test.expected_shader_data_storage = true;
+  test.initial.resize((table_base + input_count * 16u) / sizeof(u32), 0xdeadbeefu);
+  test.expected.resize(input_count + 1u);
+  test.user_data[8] = table_base;
+  test.user_data[50] = static_cast<u32>(test.expected.size() * sizeof(u32));
+
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 0);
+  // Sixteen live user-data words plus ceil(65 / 4) offset words exceed the
+  // 32-dword push bank. The checksum verifies the actual storage fallback.
+  for (u32 index = 0; index < 16u; ++index) {
+    test.user_data[32u + index] = 16u + index;
+    test.expected[0] += test.user_data[32u + index];
+    code.push_back(EncodeVop2(0x25, 2, 32u + index, 2));
+  }
+  // Register the output first, so input descriptors occupy resource IDs 1..64.
+  AppendStoreVgpr(&code, 2, 0);
+  for (u32 index = 0; index < input_count; ++index) {
+    const auto resource = index + 1u;
+    const auto packed_offset = ((resource * 13u + 7u) % 64u) * sizeof(u32);
+    const auto logical_offset = data_base + index * data_stride;
+    const auto value = 0xa5000000u | (resource * 0x0101u);
+    test.initial[(logical_offset + packed_offset) / sizeof(u32)] = value;
+    test.expected[resource] = value;
+    // Distinct SRT slots must remain distinct typed origins even where the
+    // synthetic host backing is shared. Poison padding catches wrong offsets.
+    const std::array descriptor{
+        static_cast<u32>(packed_offset), 0u,
+        static_cast<u32>(test.initial.size() * sizeof(u32) - packed_offset), 0u};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + table_base / sizeof(u32) + index * 4u);
+    code.push_back(EncodeSmem0(0x02, 16, 4));
+    code.push_back(EncodeSmem1(index * 16u));
+    AppendVMovU32(&code, 1, logical_offset);
+    code.push_back(EncodeMubuf0(0x0c));
+    code.push_back(EncodeMubuf1(0, 4, 1));
+    AppendStoreVgpr(&code, 0, resource);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"StorageBuffer", "OpShiftRightLogical"};
+  test.forbidden_spirv = {"PushConstant"};
+  return test;
+}
+
 TestCase BufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -21210,6 +21315,81 @@ TestCase ImageSampleLzFullDynamicMaterialStaticSampler() {
   return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::FullStaticSampler);
 }
 
+TestCase Images65FromSrtWithDistinctSamplerOrigins() {
+  using O = ShaderOpcode;
+  constexpr u32 resource_count = 65u;
+  constexpr u32 table_base = 0x400u;
+  constexpr u32 record_stride = 64u;
+
+  TestCase test;
+  test.name = "Images65FromSrtWithDistinctSamplerOrigins";
+  // Preserve the identity mapping used by ReadTestMemory for raw SRT loads.
+  test.bda_mappings = {{0, 0}};
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.use_runtime_samplers = true;
+  test.expected_buffer_resources = 1;
+  test.expected_image_resources = resource_count;
+  test.expected_sampler_resources = resource_count;
+  test.expected_sampled_pairs = resource_count;
+  test.initial.resize((table_base + resource_count * record_stride) / sizeof(u32));
+  std::fill_n(test.initial.begin(), resource_count, 0xdeadbeefu);
+  test.user_data[8] = table_base;
+  test.user_data[50] = resource_count * sizeof(u32);
+
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, std::bit_cast<u32>(1.3125f));
+  AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.375f));
+  for (u32 index = 0; index < resource_count; ++index) {
+    const uint64_t image_address = 0x100000u + index * 0x1000u;
+    const auto record = table_base + index * record_stride;
+    const std::array image{
+        static_cast<u32>(image_address >> 8u),
+        (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) |
+            (3u << 30u),
+        3u << 14u,
+        DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+        0u, 0x00700000u, 0u, 0u};
+    const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel);
+    const auto x_clamp = index % 2u == 0u
+                             ? clamp
+                             : static_cast<u32>(Prospero::SamplerClampMode::kWrap);
+    const std::array sampler{x_clamp | (clamp << 3u) | (clamp << 6u), 0u, 0u, 0u};
+    std::copy(image.begin(), image.end(), test.initial.begin() + record / sizeof(u32));
+    std::copy(sampler.begin(), sampler.end(),
+              test.initial.begin() + (record + 32u) / sizeof(u32));
+
+    auto rgba = MakeRgbaImage(4, 4);
+    const auto repeat_value = std::bit_cast<u32>(100.0f + static_cast<float>(index));
+    const auto clamp_value = std::bit_cast<u32>(1000.0f + static_cast<float>(index));
+    SetRgbaPixel(&rgba, 4, 1, 1, repeat_value, 0, 0, 0);
+    SetRgbaPixel(&rgba, 4, 3, 1, clamp_value, 0, 0, 0);
+    test.sampled_image_fixtures.push_back({image_address, std::move(rgba)});
+    test.expected.push_back(index % 2u == 0u ? clamp_value : repeat_value);
+
+    // Reuse SGPRs, but load each descriptor from a different constant SRT
+    // address. This exercises 65 origins rather than 65 uses of one image.
+    code.push_back(EncodeSmem0(0x03, 16, 4));
+    code.push_back(EncodeSmem1(index * record_stride));
+    code.push_back(EncodeSmem0(0x02, 24, 4));
+    code.push_back(EncodeSmem1(index * record_stride + 32u));
+    code.push_back(EncodeMimg0(0x27, 0x1));
+    code.push_back(EncodeMimg1(0, 20, 4, 6));
+    AppendStoreVgpr(&code, 0, index);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4,
+                  O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"image_sample_lz ", resource_count}, {"r128=1", 0u}};
+  test.required_spirv = {"OpImageSampleExplicitLod"};
+  return test;
+}
+
 void CheckIndirectImageKeySwitch() {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -22570,6 +22750,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
+  AddCase(Buffers65FromSrtUsePackedOffsetsAndStorageFallback);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
@@ -22680,6 +22861,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
+  AddCase(Images65FromSrtWithDistinctSamplerOrigins);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
@@ -26857,6 +27039,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--large-resources-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Images65FromSrtWithDistinctSamplerOrigins());
+    RunCase(&vulkan, Buffers65FromSrtUsePackedOffsetsAndStorageFallback());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {

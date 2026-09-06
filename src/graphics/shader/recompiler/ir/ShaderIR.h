@@ -404,10 +404,12 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxImages       = 32;
-	static constexpr uint32_t MaxSamplers     = 32;
-	static constexpr uint32_t MaxSampledPairs = 64;
+	// Bound compiler work independently of the host device. Final descriptor layouts
+	// must also fit the Vulkan device limits after resource specialization.
+	static constexpr uint32_t MaxBuffers      = 128;
+	static constexpr uint32_t MaxImages       = 128;
+	static constexpr uint32_t MaxSamplers     = 128;
+	static constexpr uint32_t MaxSampledPairs = 256;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;

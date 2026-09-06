@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/DescriptorBudget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -400,10 +401,31 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   uint32_t fragment_color_attachments = 0) {
+	uint64_t descriptor_count = 0;
+	std::vector<DescriptorBudgetBinding> budget_bindings;
+	budget_bindings.reserve(bindings.size());
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		budget_bindings.push_back({static_cast<VkDescriptorType>(binding.descriptorType),
+		                           binding.descriptorCount,
+		                           static_cast<VkShaderStageFlags>(binding.stageFlags)});
+	}
+	// These are the final specialized native bindings: arrays include every storage mip,
+	// sampler clone, and auxiliary buffer, and graphics contains both VS and PS bindings.
+	const auto& limits = static_cast<const VkPhysicalDeviceLimits&>(
+	    graphics.GetPhysicalDeviceProperties().limits);
+	if (const auto failure = ValidateDescriptorBudget(budget_bindings, limits,
+	                                                  fragment_color_attachments)) {
+		const char* stage = failure->stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex"
+		                    : failure->stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fragment"
+		                    : failure->stage == VK_SHADER_STAGE_COMPUTE_BIT ? "compute"
+		                    : failure->stage == 0u ? "pipeline" : "other";
+		EXIT("Vulkan descriptor budget exceeded: limit=%s required=%" PRIu64
+		     " available=%" PRIu64 " stage=%s (0x%08x) type=%s\n",
+		     failure->limit_name, failure->required, failure->limit, stage,
+		     failure->stage, failure->resource_type);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -789,7 +811,10 @@ void CreatePipelineInternal(
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	// The renderer supplies only real, non-null color attachments here. They count
+	// towards fragment maxPerStageResources, but not towards descriptor type limits.
+	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings,
+	                       ps_active ? rendering.color_count : 0u);
 	constexpr auto GraphicsStages =
 	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 	const vk::PushConstantRange push_constants {GraphicsStages, 0,

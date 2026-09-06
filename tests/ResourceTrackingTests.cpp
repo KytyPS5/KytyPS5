@@ -916,6 +916,70 @@ void TestInlineImageUniformSamplers() {
         "applied image-only specialization lost ordinary sampler bindings");
 }
 
+void TestInlineImageResourceLimits() {
+  auto fixture = MakeInlineDescriptorFixture(true);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  constexpr uint32_t stride = 872u;
+  constexpr uint32_t descriptor_offset = 588u;
+  // At most 112 KiB with the 128-image budget; the probe boundary below needs
+  // no backing allocation because its reader rejects the first payload read.
+  LinearTestMemory memory;
+  memory.words.resize(ShaderInfo::MaxImages * stride / sizeof(uint32_t));
+  for (uint32_t record = 0; record < ShaderInfo::MaxImages; record++) {
+    const auto start = (record * stride + descriptor_offset) / sizeof(uint32_t);
+    memory.words[start] = record + 1u;
+    memory.words[start + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[start + 2u] = 3u | (3u << 14u);
+    memory.words[start + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 8> user_data{0x1000u, stride << 16u,
+                                   ShaderInfo::MaxImages - 1u, 0u,
+                                   0x2000u, 0u, 16u, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == ShaderInfo::MaxImages &&
+            specialization.sampled_pairs.size() == ShaderInfo::MaxSampledPairs &&
+            specialization.sampler_origins == std::vector<uint32_t>{0u, 1u} &&
+            snapshot.samplers.size() == 2u,
+        "inline candidates and ordinary sampler pairs did not fill their configured capacities");
+  const auto last = InlineCandidateForKey(
+      snapshot, specialization, (ShaderInfo::MaxImages - 2u) * stride);
+  Check(snapshot.images[last].dwords[0] == ShaderInfo::MaxImages - 1u,
+        "inline candidate capacity silently truncated the last valid descriptor");
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  user_data[2] = ShaderInfo::MaxImages;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "inline candidate capacity plus one was accepted or partially committed");
+
+  uint32_t attempts = 0;
+  runtime.userdata = &attempts;
+  runtime.read_specialization_memory = [](void *userdata, uint64_t, uint32_t *) {
+    ++*static_cast<uint32_t *>(userdata);
+    return false;
+  };
+  constexpr uint32_t max_probes = 65'536u;
+  user_data[1] = 0u;
+  user_data[2] = descriptor_offset + (max_probes - 1u) * 8u + 4u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && attempts == 1u &&
+            SameResourceSnapshot(snapshot, prior_snapshot) && specialization == prior_specialization,
+        "exactly 65536 inline probes were rejected before reaching the payload reader");
+  attempts = 0u;
+  user_data[2] += 8u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && attempts == 0u &&
+            SameResourceSnapshot(snapshot, prior_snapshot) && specialization == prior_specialization,
+        "65537 inline probes performed memory reads or mutated prior resources");
+}
+
 void TestInlineFullWidthImages() {
   auto fixture = MakeInlineDescriptorFixture(true, false, true);
   fixture->PlanAndTrack();
@@ -2145,25 +2209,68 @@ void TestGraphicsPushConstantLayout() {
 }
 
 void TestResourceLimitIsTransactional() {
-  Fixture fixture;
-  MemoryInfo memory;
-  memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index <= ShaderInfo::MaxBuffers; index++) {
-    const auto handle = fixture.Buffer(
-        {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
-        index * 4u);
-    fixture.Emit(ValueOpcode::LoadBufferU32,
-                 {handle, Value(0u), Value(0u), Value(0u), Value(true)},
-                 fixture.AddMemory(memory, index * 4u));
+  enum class Limit { Buffers, Images, Samplers, Pairs };
+  struct Case {
+    Limit kind;
+    uint32_t count;
+    const char *error;
+  };
+  for (const auto test : {
+           Case{Limit::Buffers, ShaderInfo::MaxBuffers, "buffer resource limit exceeded"},
+           Case{Limit::Images, ShaderInfo::MaxImages, "image resource limit exceeded"},
+           Case{Limit::Samplers, ShaderInfo::MaxSamplers, "sampler resource limit exceeded"},
+           Case{Limit::Pairs, ShaderInfo::MaxSampledPairs,
+                "sampled image/sampler pair limit exceeded"}}) {
+    for (const uint32_t excess : {0u, 1u}) {
+      Fixture fixture;
+      for (uint32_t index = 0; index < test.count + excess; index++) {
+        MemoryInfo memory;
+        if (test.kind == Limit::Buffers) {
+          memory.kind = ResourceKind::Buffer;
+          const auto handle = fixture.Buffer(
+              {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
+              index * 4u);
+          fixture.Emit(ValueOpcode::LoadBufferU32,
+                       {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+                       fixture.AddMemory(memory, index * 4u));
+          continue;
+        }
+        const auto image_index = test.kind == Limit::Images ? index
+                                 : test.kind == Limit::Pairs ? index / ShaderInfo::MaxSamplers
+                                                           : 0u;
+        const auto sampler_index = test.kind == Limit::Samplers ? index
+                                   : test.kind == Limit::Pairs ? index % ShaderInfo::MaxSamplers
+                                                             : 0u;
+        const auto image = fixture.Image(
+            {Value(image_index + 1u), Value(0u), Value(0u), Value(0u),
+             Value(0u), Value(0u), Value(0u), Value(0u)}, index * 4u);
+        const auto sampler = fixture.Sampler(
+            {Value(sampler_index + 1u), Value(0u), Value(0u), Value(0u)}, index * 4u);
+        memory.kind = ResourceKind::Image;
+        memory.image_dimension = Decoder::ImageDimension::Dim2D;
+        fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                     fixture.AddMemory(memory, index * 4u));
+      }
+      BuildSrtPlan(fixture.program);
+      if (excess == 0u) {
+        TrackResources(fixture.program);
+        const auto actual = test.kind == Limit::Buffers ? fixture.program.info.buffers.size()
+                            : test.kind == Limit::Images ? fixture.program.info.images.size()
+                            : test.kind == Limit::Samplers ? fixture.program.info.samplers.size()
+                                                          : fixture.program.info.sampled_pairs.size();
+        Check(fixture.program.resource_tracking_complete && actual == test.count,
+              "resource tracking rejected or truncated its exact configured capacity");
+      } else {
+        CheckFatal([&] { TrackResources(fixture.program); }, test.error,
+                   "resource capacity plus one did not report its specific limit");
+        Check(!fixture.program.resource_tracking_complete &&
+                  fixture.program.info.buffers.empty() && fixture.program.info.images.empty() &&
+                  fixture.program.info.samplers.empty() && fixture.program.info.sampled_pairs.empty() &&
+                  fixture.program.descriptor_sources.empty(),
+              "resource-limit failure partially mutated typed resource state");
+      }
+    }
   }
-  BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program); },
-             "buffer resource limit exceeded",
-             "resource-limit failure was not reported");
-  Check(!fixture.program.resource_tracking_complete &&
-            fixture.program.info.buffers.empty() &&
-            fixture.program.descriptor_sources.empty(),
-        "resource-limit failure partially mutated typed resource state");
 }
 
 void TestMalformedMemoryKindsRejected() {
@@ -2220,6 +2327,7 @@ int main() {
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("inline descriptor pairs", TestInlineDescriptorPairs);
     Run("inline image uniform samplers", TestInlineImageUniformSamplers);
+    Run("inline image resource limits", TestInlineImageResourceLimits);
     Run("inline full-width images", TestInlineFullWidthImages);
     Run("inline image address table", TestInlineImageAddressTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

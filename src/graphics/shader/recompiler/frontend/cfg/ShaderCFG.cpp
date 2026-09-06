@@ -1499,12 +1499,7 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			       });
 		});
 		if (external != region.end()) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, block_id,
-			    fmt::format("selection header block {} has externally entered region block {}; "
-			                "semantic block cloning is disabled",
-			                block_id, *external));
-			return false;
+			continue;
 		}
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
 		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);

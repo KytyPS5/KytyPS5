@@ -501,36 +501,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
-	auto find_owner = [&]() -> Buffer* {
-		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-		if (owner == nullptr || !*owner) {
-			return nullptr;
-		}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
-		return buffer.IsInBounds(vaddr, size) ? &buffer : nullptr;
-	};
-
-	{
-		const bool cpu_modified            = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-		const bool gpu_modified            = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-		const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
-		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, vaddr, size,
-		                                           "image source");
-
-		auto* owner = find_owner();
-		if (has_dirty_buffer_source && owner == nullptr) {
-			if (!IsRegionRegistered(vaddr, size)) {
-				EXIT("BufferCache: GPU-dirty image source has no native buffer\n");
-			}
-			owner = &m_slot_buffers[FindBuffer(vaddr, size)];
+		if (buffer.IsInBounds(vaddr, size)) {
+			TouchBuffer(buffer);
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			return {&buffer, buffer.Offset(vaddr)};
 		}
-		if (owner != nullptr && !cpu_modified && (!gpu_modified || has_dirty_buffer_source)) {
-			TouchBuffer(*owner);
-			return {owner, owner->Offset(vaddr)};
-		}
-		if (has_dirty_buffer_source && owner == nullptr) {
-			EXIT("BufferCache: GPU-dirty image source could not resolve its native owner\n");
-		}
+	}
+	if (IsRegionGpuModified(vaddr, size)) {
+		return ObtainBuffer(vaddr, size, false, false);
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
@@ -539,32 +520,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();
-
-	const bool has_dirty_buffer_source = m_gpu_modified_ranges.Intersects(vaddr, size);
-	auto*      owner                   = find_owner();
-	if (has_dirty_buffer_source && owner == nullptr) {
-		EXIT("BufferCache: GPU-dirty image source lost its native owner\n");
-	}
-	if (owner == nullptr ||
-	    (m_memory_tracker.IsRegionGpuModified(vaddr, size) && !has_dirty_buffer_source)) {
-		return {&m_staging_buffer, stage_offset};
-	}
-
-	TouchBuffer(*owner);
-	std::vector<std::pair<uint64_t, uint64_t>> uploads;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, false,
-	    [&](uint64_t address, uint64_t upload_size) noexcept {
-		    uploads.emplace_back(address, upload_size);
-	    },
-	    [&]() noexcept {
-		    for (const auto& [address, upload_size]: uploads) {
-			    owner->CopyFrom(m_scheduler.Current(), m_staging_buffer,
-			                    stage_offset + address - vaddr, owner->Offset(address), upload_size,
-			                    vk::AccessFlagBits::eHostWrite);
-		    }
-	    });
-	return {owner, owner->Offset(vaddr)};
+	return {&m_staging_buffer, stage_offset};
 }
 
 void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data) {

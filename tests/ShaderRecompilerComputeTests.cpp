@@ -5585,6 +5585,15 @@ public:
               "same-page CPU write did not invalidate cached ownership");
       std::memcpy(memory + partial_clean_offset, &partial_cpu_refresh_value,
                   sizeof(partial_cpu_refresh_value));
+      constexpr std::array<uint32_t, 2> partial_neighbors{0x2468ace0u,
+                                                        0xfedcba98u};
+      std::memcpy(memory + partial_clean_offset - sizeof(uint32_t),
+                  &partial_neighbors[0], sizeof(uint32_t));
+      std::memcpy(memory + partial_clean_offset + sizeof(uint32_t),
+                  &partial_neighbors[1], sizeof(uint32_t));
+      std::vector<u32> partial_cpu_refresh_expected(TRACKER_PAGE_SIZE / sizeof(u32));
+      std::memcpy(partial_cpu_refresh_expected.data(), memory + partial_image_offset,
+                  TRACKER_PAGE_SIZE);
       const auto partial_cpu_refresh_source =
           resources.GetBufferCache().ObtainBufferForImage(
               base + partial_clean_offset, sizeof(partial_cpu_refresh_value));
@@ -5593,11 +5602,11 @@ public:
               "CPU-dirty same-page bytes did not resolve through the cached "
               "buffer");
       auto partial_cpu_refresh_readback =
-          CreateHostBuffer(name, sizeof(partial_cpu_refresh_value),
+          CreateHostBuffer(name, TRACKER_PAGE_SIZE,
                            vk::BufferUsageFlagBits::eTransferDst, {0});
       const vk::BufferCopy partial_cpu_refresh_copy{
-          partial_cpu_refresh_source.second, 0,
-          sizeof(partial_cpu_refresh_value)};
+          partial_cpu_refresh_source.first->Offset(base + partial_image_offset), 0,
+          TRACKER_PAGE_SIZE};
       command.Handle().copyBuffer(partial_cpu_refresh_source.first->Handle(),
                                   partial_cpu_refresh_readback.buffer, 1,
                                   &partial_cpu_refresh_copy);
@@ -6443,8 +6452,9 @@ public:
               "exact-format recreation initialized from "
               "stale guest bytes");
       Require(name, "partial-page CPU refresh content",
-              ReadBuffer(name, partial_cpu_refresh_readback, 1) ==
-                  std::vector<u32>{partial_cpu_refresh_value},
+              ReadBuffer(name, partial_cpu_refresh_readback,
+                         partial_cpu_refresh_expected.size()) ==
+                  partial_cpu_refresh_expected,
               "cached buffer uploaded bytes outside the exact "
               "staged guest range");
       const auto mixed_source_words = ReadBuffer(

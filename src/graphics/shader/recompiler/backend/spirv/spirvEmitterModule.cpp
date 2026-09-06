@@ -434,7 +434,7 @@ void AllocateInputVariables(EmitterState& state) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
 	}
-	if (state.requirements.subgroup_local_invocation_id) {
+	if (state.requirements.subgroup_local_invocation_id && !state.compute_execution.IsSplitWave64()) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
@@ -649,6 +649,11 @@ void AddVsharpAnnotationsAndNames(EmitterState& state) {
 
 void DefineModule(EmitterState& state) {
 	DefineDescriptorVariables(state);
+	if (state.compute_execution.IsSplitWave64()) {
+		state.wave_scratch_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, 64), StorageClassWorkgroup);
+		state.builder.AddName(state.wave_scratch_variable, "wave64_collective_scratch");
+	}
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
@@ -682,14 +687,14 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
-	if (state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id) {
+	if (!state.compute_execution.IsSplitWave64() && (state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
+	    state.requirements.subgroup_local_invocation_id)) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
 	}
-	if (state.requirements.subgroup_ballot) {
+	if (state.requirements.subgroup_ballot && !state.compute_execution.IsSplitWave64()) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);
 	}
-	if (state.requirements.subgroup_shuffle) {
+	if (state.requirements.subgroup_shuffle && !state.compute_execution.IsSplitWave64()) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformShuffle);
 	}
 	if (state.requirements.compute_derivatives && state.stage == ShaderType::Compute) {

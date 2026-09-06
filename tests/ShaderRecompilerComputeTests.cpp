@@ -35,6 +35,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -1052,6 +1053,7 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  u32 wave_partition_factor = 1;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1384,8 +1386,11 @@ CompiledShader CompileCase(
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
   }
+  const auto execution = ShaderRecompiler::PlanComputeExecution(
+      result.program, options.input_info, workgroup_limits);
+  Require(test.name, "compute execution plan", execution.error.empty(), execution.error);
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(resources), std::move(packed_user_data), execution.wave_partition_factor};
 }
 
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
@@ -1615,12 +1620,18 @@ public:
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
   [[nodiscard]] ShaderRecompiler::ComputeWorkgroupLimits WorkgroupLimits() const {
-    vk::PhysicalDeviceProperties properties{};
-    m_physical_device.getProperties(&properties);
-    return {{properties.limits.maxComputeWorkGroupSize[0],
-             properties.limits.maxComputeWorkGroupSize[1],
-             properties.limits.maxComputeWorkGroupSize[2]},
-            properties.limits.maxComputeWorkGroupInvocations};
+    vk::PhysicalDeviceSubgroupProperties subgroup{};
+    subgroup.sType = vk::StructureType::ePhysicalDeviceSubgroupProperties;
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.sType = vk::StructureType::ePhysicalDeviceProperties2;
+    properties.pNext = &subgroup;
+    m_physical_device.getProperties2(&properties);
+    return {{properties.properties.limits.maxComputeWorkGroupSize[0],
+             properties.properties.limits.maxComputeWorkGroupSize[1],
+             properties.properties.limits.maxComputeWorkGroupSize[2]},
+            properties.properties.limits.maxComputeWorkGroupInvocations,
+            subgroup.subgroupSize,
+            false}; // This harness does not enable required subgroup size control.
   }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
@@ -10249,7 +10260,15 @@ public:
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
-    cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    vk::PhysicalDeviceProperties dispatch_properties{};
+    m_physical_device.getProperties(&dispatch_properties);
+    const auto& dispatch_limits = dispatch_properties.limits.maxComputeWorkGroupCount;
+    const auto dispatch_groups = ShaderRecompiler::PlanComputeDispatchGroups(
+        {test.dispatch_x, test.dispatch_y, test.dispatch_z}, compiled.wave_partition_factor,
+        {dispatch_limits[0], dispatch_limits[1], dispatch_limits[2]});
+    Require(test.name, "compute dispatch plan", dispatch_groups.has_value(),
+            "expanded compute dispatch exceeds device limits");
+    cmd.dispatch((*dispatch_groups)[0], (*dispatch_groups)[1], (*dispatch_groups)[2]);
 
     if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -11581,6 +11600,7 @@ private:
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
+    m_runtime_context.subgroup_size = WorkgroupLimits().native_subgroup_size;
     m_physical_device.getProperties(
         &m_runtime_context.physical_device_properties);
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
@@ -13857,6 +13877,305 @@ TestCase ScalarMaskProvenanceOverlapAndMixedBinary() {
           {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_NOT_B64, O::S_CSELECT_B32,
            O::S_MOV_B32, O::S_NAND_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase MakeWave64NoLdsCase(const char *name, u32 output_blocks) {
+  TestCase test;
+  test.name = name;
+  test.initial.resize(512);
+  std::iota(test.initial.begin(), test.initial.end(), 0x1000u);
+  test.expected.resize(512 * output_blocks);
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 256;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 3;
+  test.compute_info.workgroup_register = 8;
+  test.compute_info.group_id[0] = true;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  return test;
+}
+
+void AppendWave64GlobalIndex(std::vector<u32> *code) {
+  // v4 is a stable global output index. Input s[0:3], output s[48:51], local
+  // v2=Z and workgroup s8=X use the ordinary harness/guest ABI.
+  code->push_back(EncodeVop1(0x01, 4, 8));
+  code->push_back(EncodeVop2(0x1a, 4, InlineU32(8), 4));
+  code->push_back(EncodeVop2(0x25, 4, Vgpr(2), 4));
+  code->push_back(EncodeVop2(0x1a, 7, InlineU32(2), 4));
+}
+
+TestCase Wave64MaskAndReadLane31AcrossNativeHalves() {
+  using O = ShaderOpcode;
+  auto test = MakeWave64NoLdsCase("Wave64MaskAndReadLane31AcrossNativeHalves", 4);
+  auto &code = test.code;
+  AppendWave64GlobalIndex(&code);
+  AppendBufferLoadDword(&code, 10, 7);
+  code.push_back(EncodeSop1(0x04, 12, 126)); // Numeric entry EXEC, both words.
+  // Lane 31 is valid on a native32 host: this RED has no out-of-range shuffle.
+  AppendVop3(&code, 0x360, 16, Vgpr(10), InlineU32(31));
+  AppendVMovU32(&code, 18, 0);
+  code.push_back(EncodeVop2(0x23, 17, 193u, 18)); // MBCNT_LO(-1,0)
+  code.push_back(EncodeVop2(0x24, 18, 193u, 17)); // MBCNT_HI(-1,lo)
+  AppendStoreSgprAtLaneDwordOffset(&code, 12, 4, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 13, 4, 512);
+  AppendStoreSgprAtLaneDwordOffset(&code, 16, 4, 1024);
+  AppendStoreVgprAtLaneDwordOffset(&code, 18, 4, 1536);
+  AppendEnd(&code);
+  for (u32 index = 0; index < 512; ++index) {
+    test.expected[index] = 0xffffffffu;
+    test.expected[512 + index] = 0xffffffffu;
+    test.expected[1024 + index] = test.initial[(index / 64) * 64 + 31];
+    test.expected[1536 + index] = index % 64;
+  }
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::S_MOV_B64, O::V_READLANE_B32,
+                  O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase Wave64ReadLaneAcrossAllHalves() {
+  using O = ShaderOpcode;
+  auto test = MakeWave64NoLdsCase("Wave64ReadLaneAcrossAllHalves", 3);
+  auto &code = test.code;
+  AppendWave64GlobalIndex(&code);
+  AppendBufferLoadDword(&code, 10, 7);
+  const std::array<u32, 3> source_lanes{31u, 32u, 63u};
+  for (u32 index = 0; index < source_lanes.size(); ++index) {
+    AppendVop3(&code, 0x360, 16u + index, Vgpr(10),
+               InlineU32(source_lanes[index]));
+  }
+  for (u32 block = 0; block < source_lanes.size(); ++block) {
+    AppendStoreSgprAtLaneDwordOffset(&code, 16u + block, 4, 512u * block);
+    for (u32 index = 0; index < 512; ++index) {
+      test.expected[512u * block + index] =
+          test.initial[(index / 64u) * 64u + source_lanes[block]];
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READLANE_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 3}};
+  return test;
+}
+
+TestCase Wave64SparseWaterfallIndependentWaves() {
+  using O = ShaderOpcode;
+  auto test = MakeWave64NoLdsCase("Wave64SparseWaterfallIndependentWaves", 10);
+  auto &code = test.code;
+  // Each guest workgroup contains four waves with respectively 2/3/1/3 buckets.
+  // Different loop counts are intentional: a single Workgroup barrier shared
+  // by all 256 guest lanes would be invalid and can deadlock.
+  for (u32 wave = 0; wave < 8; ++wave) {
+    test.initial[wave * 64 + 5] = 2;
+    test.initial[wave * 64 + 37] = (wave % 4 == 1 || wave % 4 == 3) ? 3 : 2;
+    test.initial[wave * 64 + 63] = wave % 4 == 2 ? 2 : 7;
+  }
+  AppendWave64GlobalIndex(&code);
+  AppendBufferLoadDword(&code, 6, 7); // Key retained even while guest EXEC is off.
+  code.push_back(EncodeVop2(0x1b, 5, InlineU32(63), 2)); // Logical lane 0..63.
+  for (u32 reg : {10u, 11u, 12u, 13u}) AppendVMovU32(&code, reg, 0);
+  code.push_back(EncodeVop2(0x16, 21, InlineU32(4), 5)); // lane / 16
+  AppendVMovU32(&code, 20, 1);
+  code.push_back(EncodeVop2(0x1a, 20, Vgpr(21), 20)); // contributions 1/4/8
+  code.push_back(EncodeVopc(0xc2, InlineU32(5), 5));
+  code.push_back(EncodeSop1(0x04, 8, 106));
+  for (u32 lane : {37u, 63u}) {
+    code.push_back(EncodeVopc(0xc2, InlineU32(lane), 5));
+    code.push_back(EncodeSop2(0x11, 8, 8, 106));
+  }
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  code.push_back(EncodeSop1(0x04, 12, 126)); // Numeric sparse EXEC snapshot.
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+
+  const size_t loop = code.size();
+  code.push_back(EncodeSop1(0x14, 20, 8));
+  AppendVop3(&code, 0x360, 21, Vgpr(6), 20);
+  code.push_back(EncodeVopc(0xc2, 21, 6));
+  code.push_back(EncodeSop1(0x04, 10, 106));
+  code.push_back(EncodeSop1(0x24, 24, 10));
+  const size_t skip_empty = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSop1(0x28, 106, 126)); // Save bucket; reactivate all64.
+  code.push_back(EncodeVop2(0x25, 12, InlineU32(1), 12));
+  code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 20)); // Bucket contribution.
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(0x1c, 3, 250u, 3));
+    code.push_back(EncodeVop2Dpp(3, 0x110u + shift));
+  }
+  AppendVop3(&code, 0x378, 7, Vgpr(3), 193u, 193u);
+  code.push_back(EncodeVop2(0x1c, 3, Vgpr(7), 3));
+  AppendVop3(&code, 0x360, 26, Vgpr(3), InlineU32(31));
+  AppendVop3(&code, 0x360, 27, Vgpr(3), InlineU32(63));
+  code.push_back(EncodeSop2(0x10, 28, 26, 27));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeSop2(0x01, 106, InlineU32(0), 106));
+  code.push_back(EncodeSop2(0x05, 107, InlineU32(0), 107));
+  code.push_back(EncodeSop2(0x0f, 126, 106, 126));
+  code.push_back(EncodeVop2(0x25, 10, InlineU32(1), 10));
+  code.push_back(EncodeVop1(0x01, 11, 21));
+  code.push_back(EncodeVop1(0x01, 13, 28));
+  const size_t skip_body = code.size();
+  code.push_back(EncodeSop2(0x15, 8, 8, 10));
+  code.push_back(EncodeSop1(0x04, 126, 24));
+  code.push_back(EncodeSop2(0x0a, 23, InlineU32(1), InlineU32(0)));
+  code.push_back(EncodeSop2(0x00, 22, 22, InlineU32(1)));
+  code.push_back(EncodeSopc(0x09, 22, InlineU32(8)));
+  const size_t bounded_exit = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
+  const size_t repeat = code.size();
+  code.push_back(0);
+  const size_t exit = code.size();
+  const auto patch_branch = [&](size_t at, u32 opcode, size_t target) {
+    code[at] = EncodeSopp(opcode, static_cast<u32>(
+        static_cast<int32_t>(target) - static_cast<int32_t>(at) - 1));
+  };
+  patch_branch(skip_empty, 0x08, skip_body);
+  patch_branch(bounded_exit, 0x05, exit);
+  patch_branch(repeat, 0x05, loop);
+  code.push_back(EncodeSop1(0x04, 126, 193));
+  AppendStoreSgprAtLaneDwordOffset(&code, 12, 4, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 13, 4, 512);
+  AppendStoreSgprAtLaneDwordOffset(&code, 22, 4, 1024);
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 4, 1536);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 2048);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 4, 2560);
+  AppendStoreVgprAtLaneDwordOffset(&code, 13, 4, 3072);
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 4, 3584);
+  AppendStoreSgprAtLaneDwordOffset(&code, 9, 4, 4096);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 4, 4608);
+  AppendEnd(&code);
+
+  for (u32 wave = 0; wave < 8; ++wave) {
+    const u32 base = wave * 64;
+    std::set<u32> keys;
+    for (u32 lane : {5u, 37u, 63u}) keys.insert(test.initial[base + lane]);
+    for (u32 lane = 0; lane < 64; ++lane) {
+      const u32 index = base + lane;
+      test.expected[index] = 0x20u;
+      test.expected[512 + index] = 0x80000020u;
+      test.expected[1024 + index] = static_cast<u32>(keys.size());
+      test.expected[1536 + index] = static_cast<u32>(keys.size());
+      test.expected[4608 + index] = index % 256;
+    }
+    for (u32 key : keys) {
+      u32 leader = 64;
+      u32 reduction = 0;
+      for (u32 lane : {5u, 37u, 63u}) {
+        if (test.initial[base + lane] == key) {
+          leader = std::min(leader, lane);
+          reduction |= 1u << (lane / 16);
+        }
+      }
+      test.expected[2048 + base + leader] = 1;
+      test.expected[2560 + base + leader] = key;
+      test.expected[3072 + base + leader] = reduction;
+    }
+  }
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::S_FF1_I32_B64, O::V_READLANE_B32,
+                  O::V_PERMLANEX16_B32, O::V_OR_B32, O::V_CNDMASK_B32,
+                  O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
+                  O::S_ANDN2_B64, O::S_CBRANCH_EXECZ, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 3}, {"V_PERMLANEX16_B32", 1}};
+  return test;
+}
+
+// Synthetic straight-line followup after the minimal wave64 regression is GREEN.
+// Guest 8x4x4 has two waves; a 2x2x2 dispatch must retain all three group IDs.
+TestCase Wave64MultidimensionalGuestGeometry() {
+  using O = ShaderOpcode;
+  constexpr u32 invocation_count = 8u * 4u * 4u * 2u * 2u * 2u;
+  constexpr u32 output_blocks = 9u;
+  TestCase test;
+  test.name = "Wave64MultidimensionalGuestGeometry";
+  // Every output is written. Missing/remapped invocations leave visible holes.
+  test.initial.assign(invocation_count * output_blocks, 0xdeadbeefu);
+  test.expected.resize(invocation_count * output_blocks);
+  test.compute_info = {}; // Override TestCase's default LDS allocation.
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 4;
+  test.compute_info.threads_num[2] = 4;
+  test.compute_info.thread_ids_num = 3;
+  test.compute_info.wave_size = 64;
+  test.compute_info.workgroup_register = 8;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.group_id[1] = true;
+  test.compute_info.group_id[2] = true;
+  test.compute_info.tg_size_en = true;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  test.dispatch_y = 2;
+  test.dispatch_z = 2;
+  auto &code = test.code;
+
+  // v0/v1/v2 = local X/Y/Z. Enabled group IDs pack into s8/s9/s10;
+  // TG_SIZE follows them in s11. Descriptors s[0:3]/s[48:51] stay intact.
+  // v3 = local X + 8 * (local Y + 4 * local Z).
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 2));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(1), 3));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(3), 3));
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  // v4 = 128 * (group X + 2 * (group Y + 2 * group Z)) + v3.
+  code.push_back(EncodeVop1(0x01, 4, 10));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(1), 4));
+  code.push_back(EncodeVop2(0x25, 4, 9, 4));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(1), 4));
+  code.push_back(EncodeVop2(0x25, 4, 8, 4));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(7), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(3), 4));
+
+  // Keep both LaneId and the numeric entry Ballot live, selecting wave64
+  // emulation even though this fixture has no guest cross-lane shuffle.
+  AppendVMovU32(&code, 12, 0);
+  code.push_back(EncodeVop2(0x23, 11, 193u, 12));
+  code.push_back(EncodeVop2(0x24, 13, 193u, 11));
+  code.push_back(EncodeSop1(0x04, 12, 126)); // s[12:13] = entry EXEC.
+  for (u32 axis = 0; axis < 3; ++axis) {
+    AppendStoreVgprAtLaneDwordOffset(&code, axis, 4, axis * invocation_count);
+    AppendStoreSgprAtLaneDwordOffset(&code, 8u + axis, 4,
+                                    (3u + axis) * invocation_count);
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 13, 4, 6u * invocation_count);
+  AppendStoreSgprAtLaneDwordOffset(&code, 11, 4, 7u * invocation_count);
+  AppendStoreSgprAtLaneDwordOffset(&code, 13, 4, 8u * invocation_count);
+  AppendEnd(&code);
+
+  // Independent coordinate enumeration, with X changing fastest at both levels.
+  u32 index = 0;
+  for (u32 group_z = 0; group_z < 2; ++group_z) {
+    for (u32 group_y = 0; group_y < 2; ++group_y) {
+      for (u32 group_x = 0; group_x < 2; ++group_x) {
+        u32 local_index = 0;
+        for (u32 z = 0; z < 4; ++z) {
+          for (u32 y = 0; y < 4; ++y) {
+            for (u32 x = 0; x < 8; ++x, ++index, ++local_index) {
+              test.expected[index] = x;
+              test.expected[invocation_count + index] = y;
+              test.expected[2u * invocation_count + index] = z;
+              test.expected[3u * invocation_count + index] = group_x;
+              test.expected[4u * invocation_count + index] = group_y;
+              test.expected[5u * invocation_count + index] = group_z;
+              test.expected[6u * invocation_count + index] = local_index % 64u;
+              const u32 wave = local_index / 64u;
+              test.expected[7u * invocation_count + index] =
+                  (wave << 20u) | 2u | (wave == 0u ? 0x80000000u : 0u);
+              test.expected[8u * invocation_count + index] = 0xffffffffu;
+            }
+          }
+        }
+      }
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MBCNT_LO_U32_B32", 1},
+                         {"V_MBCNT_HI_U32_B32", 1}, {"S_MOV_B64", 1}};
+  return test;
 }
 
 TestCase ScalarMaskWaterfallSparseExecAndReactivation() {
@@ -16312,7 +16631,7 @@ TestCase VectorDpp8Vop1RawWave64Permute() {
   }
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  // The full wave64 readback verifies exchange on both native and split hosts.
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -16367,7 +16686,7 @@ TestCase VectorDpp8Vop2RawInactiveSourceAndDestination() {
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B64,
                   O::V_AND_B32, O::V_CMP_EQ_U32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  // The full wave64 readback verifies exchange on both native and split hosts.
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -20561,6 +20880,74 @@ TestCase DsBpermuteCapturedExecOffsetAndWrap() {
   return test;
 }
 
+// Straight-line RDNA2 DS neighbor: full wave64, no guest LDS or synchronization.
+// Each 32-lane half has inactive lanes 2,6,...,30. Instructions execute under
+// sparse EXEC, then full EXEC is restored before reading every destination.
+TestCase DsWave64SparseSourceAndDestination() {
+  using O = ShaderOpcode;
+  constexpr u32 count = 64;
+  constexpr u32 sentinel = 0xdeadbeefu;
+  TestCase test;
+  test.name = "DsWave64SparseSourceAndDestination";
+  test.initial.assign(3u * count, sentinel);
+  test.expected.resize(3u * count);
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = count;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  auto &code = test.code;
+
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3)); // Source = 100 + lane.
+  code.push_back(EncodeVop2(0x1a, 17, InlineU32(2), 0)); // Byte address = lane * 4.
+  for (u32 destination : {1u, 2u, 4u}) {
+    AppendVMovLiteral(&code, destination, sentinel);
+  }
+  code.push_back(EncodeSop1(0x04, 4, 126)); // Save full EXEC in s[4:5].
+  AppendSMovLiteral(&code, 126, 0xbbbbbbbbu);
+  AppendSMovLiteral(&code, 127, 0xbbbbbbbbu);
+
+  // Adding 132 bytes selects the next lane modulo 32, independently in each
+  // half. This covers nonzero offset and ignored address bits above bit 6.
+  code.push_back(EncodeDs0(0xb3, 132));
+  code.push_back(EncodeDs1(1, 3, 17));
+  // Bit-mask mode: AND 31, OR 0, XOR 1 swaps adjacent lanes.
+  code.push_back(EncodeDs0(0x35, 0x041f));
+  code.push_back(EncodeDs1(2, 0, 3));
+  // Quad mode selector {3,2,1,0} reverses each group of four.
+  code.push_back(EncodeDs0(0x35, 0x801b));
+  code.push_back(EncodeDs1(4, 0, 3));
+
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, count);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 2u * count);
+  AppendEnd(&code);
+
+  // Architectural oracle expressed as independent coordinate mappings.
+  const auto active = [](u32 lane) { return lane % 4u != 2u; };
+  for (u32 lane = 0; lane < count; ++lane) {
+    const u32 half_begin = (lane / 32u) * 32u;
+    const u32 next = half_begin + ((lane % 32u + 1u) % 32u);
+    const u32 adjacent = (lane / 2u) * 2u + (1u - lane % 2u);
+    const u32 reverse_quad = (lane / 4u) * 4u + (3u - lane % 4u);
+    const u32 sources[] = {next, adjacent, reverse_quad};
+    for (u32 block = 0; block < 3; ++block) {
+      test.expected[block * count + lane] =
+          !active(lane) ? sentinel : active(sources[block]) ? 100u + sources[block] : 0u;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::S_MOV_B32, O::S_MOV_B64, O::DS_BPERMUTE_B32,
+                  O::DS_SWIZZLE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_BPERMUTE_B32", 1}, {"DS_SWIZZLE_B32", 2}};
+  test.ir_counts = {{"BpermuteU32", 1}, {"SwizzleU32", 2}};
+  return test;
+}
+
 TestCase DsBpermuteWave64UsesIndependentHalves() {
   using O = ShaderOpcode;
 
@@ -20582,7 +20969,7 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
   test.opcodes = {O::V_MOV_B32,       O::V_ADD_NC_U32,
                   O::DS_BPERMUTE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  // The full wave64 readback verifies exchange on both native and split hosts.
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -23326,6 +23713,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarSelectB64PreservesMaskProvenance);
   AddCase(ScalarWqmB64SelectsSccDomain);
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
+  AddCase(Wave64MaskAndReadLane31AcrossNativeHalves);
+  AddCase(Wave64ReadLaneAcrossAllHalves);
+  AddCase(Wave64SparseWaterfallIndependentWaves);
+  AddCase(Wave64MultidimensionalGuestGeometry);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);
   AddCase(ScalarSaveexecSccIsWaveUniform);
   AddCase(ScalarWqmSccIsWaveUniform);
@@ -23535,6 +23926,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
+  AddCase(DsWave64SparseSourceAndDestination);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicCmpSwapExactRaw);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);

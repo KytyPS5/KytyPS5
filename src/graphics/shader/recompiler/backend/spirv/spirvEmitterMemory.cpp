@@ -32,6 +32,15 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
+	if (state.compute_execution.IsSplitWave64()) {
+		// The caller retains RDNA2's independent 32-lane DS regions. Both
+		// collectives execute for every host invocation; guest EXEC controls
+		// source visibility here and destination writes in the translated IR.
+		const auto shuffled = EmitWaveReadLane(state, source, target);
+		const auto ballot = EmitWaveBallot(state, exec);
+		const auto source_active = EmitBallotLaneActiveBool(state, ballot, target);
+		return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
+	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
 	                           ConstantU32(state, ScopeSubgroup), source, target});

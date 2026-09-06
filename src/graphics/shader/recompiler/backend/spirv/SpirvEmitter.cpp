@@ -328,47 +328,37 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 		if (input_info.compute == nullptr) {
 			Fail(program, "compute shader requires stage input information");
 		}
-		const auto                    xy_default = state.requirements.compute_derivatives ? 2u : 1u;
-		const auto*                   cs         = input_info.compute;
-		const std::array<uint32_t, 3> guest_size = {
-		    cs->threads_num[0] != 0u ? cs->threads_num[0] : xy_default,
-		    cs->threads_num[1] != 0u ? cs->threads_num[1] : xy_default,
-		    cs->threads_num[2] != 0u ? cs->threads_num[2] : 1u};
-		const auto layout = PlanComputeWorkgroup(guest_size, compute_workgroup_limits);
-		if (!layout.has_value()) {
-			EXIT("compute workgroup cannot fit device: hash=0x%016" PRIx64
-			     " guest=%ux%ux%u limits=%ux%ux%u max_invocations=%u\n",
-			     program.shader_hash, guest_size[0], guest_size[1], guest_size[2],
-			     compute_workgroup_limits.max_size[0], compute_workgroup_limits.max_size[1],
-			     compute_workgroup_limits.max_size[2], compute_workgroup_limits.max_invocations);
+		state.compute_execution = PlanComputeExecution(program, input_info, compute_workgroup_limits);
+		if (!state.compute_execution.error.empty()) {
+			Fail(program, state.compute_execution.error.c_str());
 		}
-		state.compute_workgroup = *layout;
-		if (layout->IsReshaped()) {
-			// DerivativeGroupQuads imposes an XY quad topology in addition to linear order.
-			if (state.requirements.compute_derivatives) {
-				Fail(program, "compute derivative quad topology cannot be reshaped");
-			}
-			LOGF("compute workgroup reshaped: hash=0x%016" PRIx64 " guest=%ux%ux%u host=%ux%ux%u\n",
-			     program.shader_hash, guest_size[0], guest_size[1], guest_size[2],
-			     layout->host_size[0], layout->host_size[1], layout->host_size[2]);
+		state.compute_workgroup = state.compute_execution.layout;
+		if (state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) {
+			const auto& layout = state.compute_workgroup;
+			LOGF("compute execution geometry: hash=0x%016" PRIx64
+			     " guest=%ux%ux%u host=%ux%ux%u wave_partitions=%u split_wave64=%u\n",
+			     program.shader_hash, layout.guest_size[0], layout.guest_size[1], layout.guest_size[2],
+			     layout.host_size[0], layout.host_size[1], layout.host_size[2],
+			     state.compute_execution.wave_partition_factor,
+			     state.compute_execution.IsSplitWave64() ? 1u : 0u);
 		}
 	}
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
 	CopyProgramInputsAndOutputs(state, program);
-	if (state.compute_workgroup.IsReshaped()) {
+	if (state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) {
 		const auto HasInput = [&](IR::StageInputKind kind) {
 			return std::ranges::any_of(state.inputs,
 			                           [kind](const auto& input) { return input.kind == kind; });
 		};
 		const bool global_id = HasInput(IR::StageInputKind::GlobalInvocationId);
-		if ((global_id || HasInput(IR::StageInputKind::LocalInvocationId)) &&
+		if ((state.compute_execution.IsSplitWave64() || global_id || HasInput(IR::StageInputKind::LocalInvocationId)) &&
 		    !HasInput(IR::StageInputKind::LocalInvocationIndex)) {
 			state.inputs.push_back(
 			    {IR::StageInputKind::LocalInvocationIndex, 0, 1, 0, "gl_LocalInvocationIndex"});
 		}
-		if (global_id && !HasInput(IR::StageInputKind::WorkgroupId)) {
+		if ((global_id || state.compute_execution.IsSplitWave64()) && !HasInput(IR::StageInputKind::WorkgroupId)) {
 			state.inputs.push_back({IR::StageInputKind::WorkgroupId, 0, 3, 0, "gl_WorkGroupID"});
 		}
 	}

@@ -143,6 +143,7 @@ DppTargetLane EmitDpp8TargetLane(EmitterState& state, uint32_t lane_selectors) {
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.compute_execution.IsSplitWave64()) return EmitHostLocalInvocationIndex(state);
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -171,7 +172,7 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 }
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
-	if (state.compute_workgroup.IsReshaped() && (kind == IR::StageInputKind::LocalInvocationId ||
+	if ((state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) && (kind == IR::StageInputKind::LocalInvocationId ||
 	                                             kind == IR::StageInputKind::GlobalInvocationId)) {
 		EXIT_IF(component >= 3u);
 		const auto& guest = state.compute_workgroup.guest_size;
@@ -215,10 +216,14 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
 	                           pointer, variable, ConstantU32(state, component)});
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+	if (state.compute_execution.IsSplitWave64() && kind == IR::StageInputKind::WorkgroupId && component == 0) {
+		return EmitBinaryU32(state, OpUDiv, value,
+		                     ConstantU32(state, state.compute_execution.wave_partition_factor));
+	}
 	return value;
 }
 
-uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+uint32_t EmitHostLocalInvocationIndex(EmitterState& state) {
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
@@ -226,6 +231,23 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, variable});
 	return value;
+}
+
+uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	const auto local = EmitHostLocalInvocationIndex(state);
+	if (!state.compute_execution.IsSplitWave64() || state.compute_execution.wave_partition_factor == 1)
+		return local;
+	const auto variable = InputVariableForKind(state, IR::StageInputKind::WorkgroupId);
+	EXIT_IF(variable == 0);
+	const auto pointer = state.builder.AllocateId();
+	const auto host_group_x = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
+	                           pointer, variable, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), host_group_x, pointer});
+	const auto wave = EmitBinaryU32(state, OpUMod, host_group_x,
+	                                ConstantU32(state, state.compute_execution.wave_partition_factor));
+	const auto offset = EmitBinaryU32(state, OpIMul, wave, ConstantU32(state, 64));
+	return EmitBinaryU32(state, OpIAdd, offset, local);
 }
 
 uint32_t VertexInputDefaultComponentU32(EmitterState& state, VertexInputScalarKind kind,
@@ -266,9 +288,13 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                           ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});
+	if (state.compute_execution.IsSplitWave64()) {
+		// Eligibility proves full convergence of all 64 actual invocations.
+		const auto valid = state.builder.AllocateId();
+		state.builder.AddFunction({OpULessThan, TypeBool(state), valid, lane, ConstantU32(state, 64)});
+		return valid;
+	}
+	const auto active_ballot = EmitWaveBallot(state, EmitTrueBool(state));
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {

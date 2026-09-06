@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -311,6 +312,17 @@ struct PipelineCache::ProgramCache {
 		}();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		uint32_t wave_partition_factor = 1;
+		if constexpr (Stage == ShaderType::Compute) {
+			// The renderer no longer owns the CFG after TakeCompiledInfo. Preserve
+			// the exact dispatch geometry selected by the same compiler planner.
+			const auto execution = ShaderRecompiler::PlanComputeExecution(
+			    result.program, options.input_info, options.compute_workgroup_limits);
+			if (!execution.error.empty()) {
+				EXIT("compute execution plan failed: %s\n", execution.error.c_str());
+			}
+			wave_partition_factor = execution.wave_partition_factor;
+		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
@@ -335,9 +347,11 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		auto compiled_info = std::move(result.program).TakeCompiledInfo();
+		compiled_info.compute_wave_partition_factor = wave_partition_factor;
 		return {
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(compiled_info),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
 	}
@@ -448,6 +462,10 @@ struct PipelineCache::ProgramCache {
 		                                            limits.maxComputeWorkGroupSize[1],
 		                                            limits.maxComputeWorkGroupSize[2]};
 		compute_workgroup_limits.max_invocations = limits.maxComputeWorkGroupInvocations;
+		compute_workgroup_limits.native_subgroup_size = graphics.subgroup_size;
+		compute_workgroup_limits.can_require_subgroup_size_64 =
+		    graphics.compute_subgroup_size_control_enabled &&
+		    graphics.min_subgroup_size <= 64u && graphics.max_subgroup_size >= 64u;
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {

@@ -108,9 +108,7 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 
 uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 	auto&      state  = ctx.state;
-	const auto ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                           ConstantU32(state, ScopeSubgroup), active});
+	const auto ballot = EmitWaveBallot(state, active);
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 	const auto wqm_low  = EmitWqmWordU32(state, low);
@@ -561,17 +559,12 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::DppMoveU32: {
 			const auto flags    = inst.Flags<IR::DppMoveFlags>();
 			const auto target   = EmitDppTargetLane(state, flags.control);
-			const auto shuffled = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
-			                           target.lane});
+			const auto shuffled = EmitWaveReadLane(state, ctx.Arg(inst, 0), target.lane);
 			if (flags.fetch_inactive) {
 				ctx.Define(inst, shuffled);
 				return true;
 			}
-			const auto ballot = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 1)});
+			const auto ballot = EmitWaveBallot(state, ctx.Arg(inst, 1));
 			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
 			const auto can_fetch     = state.builder.AllocateId();
 			state.builder.AddFunction(
@@ -588,18 +581,13 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::Dpp8MoveU32: {
 			const auto flags    = inst.Flags<IR::Dpp8MoveFlags>();
 			const auto target   = EmitDpp8TargetLane(state, flags.lane_selectors);
-			const auto shuffled = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
-			                           target.lane});
+			const auto shuffled = EmitWaveReadLane(state, ctx.Arg(inst, 0), target.lane);
 			if (flags.fetch_inactive) {
 				ctx.Define(inst, shuffled);
 				return true;
 			}
 			// FI=0 substitutes zero for sources disabled by the guest EXEC mask.
-			const auto ballot = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 1)});
+			const auto ballot = EmitWaveBallot(state, ctx.Arg(inst, 1));
 			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
 			ctx.Emit(inst, OpSelect, IR::Type::U32,
 			         {source_active, shuffled, ConstantU32(state, 0)});
@@ -620,23 +608,16 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
-			ctx.Emit(inst, OpGroupNonUniformBallot, IR::Type::U32x4,
-			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0)});
+			ctx.Define(inst, EmitWaveBallot(state, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::ReadFirstLane: {
-			const auto ballot = state.builder.AllocateId();
-			const auto lane   = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 1)});
-			state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), lane,
-			                           ConstantU32(state, ScopeSubgroup), ballot});
-			ctx.Emit(inst, OpGroupNonUniformShuffle, IR::Type::U32,
-			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), lane});
+			const auto ballot = EmitWaveBallot(state, ctx.Arg(inst, 1));
+			const auto lane = EmitWaveFindFirst(state, ballot);
+			ctx.Define(inst, EmitWaveReadLane(state, ctx.Arg(inst, 0), lane));
 			return true;
 		}
 		case IR::ValueOpcode::ReadLane:
-			ctx.Emit(inst, OpGroupNonUniformShuffle, IR::Type::U32,
-			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
+			ctx.Define(inst, EmitWaveReadLane(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::WriteLane: {
 			const auto hit = state.builder.AllocateId();
@@ -681,16 +662,18 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(
 			    {OpBitwiseAnd, TypeU32(state), index, shifted, ConstantU32(state, 15)});
 			state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row_value, index});
-			const auto shuffled = state.builder.AllocateId();
-			state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-			                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0),
-			                           target});
+			const auto shuffled = EmitWaveReadLane(state, ctx.Arg(inst, 0), target);
 			uint32_t result = shuffled;
 			if (!flags.fetch_inactive) {
-				const auto source_exec = state.builder.AllocateId();
-				state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-				                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3),
-				                           target});
+				uint32_t source_exec;
+				if (state.compute_execution.IsSplitWave64()) {
+					const auto ballot = EmitWaveBallot(state, ctx.Arg(inst, 3));
+					source_exec = EmitBallotLaneActiveBool(state, ballot, target);
+				} else {
+					source_exec = state.builder.AllocateId();
+					state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+					                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3), target});
+				}
 				result = state.builder.AllocateId();
 				state.builder.AddFunction({OpSelect, TypeU32(state), result, source_exec, shuffled,
 				                           ConstantU32(state, 0)});

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ComputeWorkgroup.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -8550,6 +8551,375 @@ void CheckComputeWorkgroupLayout(
         "compute planner should preserve an already valid guest shape");
 }
 
+// Include ComputeExecution.h and place these synthetic unit tests beside the
+// existing compute planning tests. Register both functions in the CPU runner.
+ShaderRecompiler::IR::Block* AddExecutionPlanBlock(ShaderRecompiler::IR::Program& program) {
+  using namespace ShaderRecompiler::IR;
+  const auto id = static_cast<uint32_t>(program.blocks.size());
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto* block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = id});
+  return block;
+}
+
+void TestComputeExecutionPlanningBoundaries() {
+  using namespace ShaderRecompiler;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* block = AddExecutionPlanBlock(program);
+  auto& ballot = block->AppendNewInst(IR::ValueOpcode::Ballot, {IR::Value(true)});
+  block->AppendNewInst(IR::ValueOpcode::ReferenceU32,
+      {IR::Value(&block->AppendNewInst(IR::ValueOpcode::CompositeExtractU32x4,
+                                     {IR::Value(&ballot), IR::Value(0u)}))});
+  ShaderComputeInputInfo compute{};
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024};
+  limits.native_subgroup_size = 32;
+  struct Case { uint32_t size; bool accepted; uint32_t factor; };
+  for (const auto test : {Case{1,true,1}, Case{32,true,1}, Case{33,false,0},
+                          Case{63,false,0}, Case{64,true,1}, Case{65,false,0},
+                          Case{256,true,4}}) {
+    compute.threads_num[0] = 1;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = test.size;
+    const auto plan = PlanComputeExecution(program, input, limits);
+    Check(plan.error.empty() == test.accepted, "wave64 plan accepted/rejected the wrong active-lane boundary");
+    if (test.accepted) {
+      Check(plan.layout.guest_size == std::array<uint32_t,3>{1,1,test.size}, "wave64 plan changed guest geometry");
+      Check(plan.wave_partition_factor == test.factor && plan.IsSplitWave64() == (test.size >= 64),
+            "wave64 plan lost split mode or wave partition count");
+      Check(WorkgroupInvocationCount(plan.layout.host_size) == std::min(test.size,64u),
+            "wave64 plan added or discarded real invocations");
+    }
+  }
+  compute.threads_num[2] = 256;
+  for (const uint32_t native : {0u,64u}) {
+    auto profile = limits;
+    profile.native_subgroup_size = native;
+    const auto plan = PlanComputeExecution(program, input, profile);
+    Check(plan.error.empty() && !plan.IsSplitWave64() && plan.wave_partition_factor == 1 &&
+              WorkgroupInvocationCount(plan.layout.host_size) == 256,
+          "offline/native64 profile unexpectedly changed the guest workgroup count");
+  }
+  auto required64 = limits;
+  required64.can_require_subgroup_size_64 = true;
+  const auto native64 = PlanComputeExecution(program,input,required64);
+  Check(native64.error.empty() && !native64.IsSplitWave64() && native64.wave_partition_factor == 1,
+        "required native64 profile was rejected or emulated");
+  auto tiny = limits;
+  tiny.max_invocations = 63;
+  Check(!PlanComputeExecution(program,input,tiny).error.empty(), "wave64 plan exceeded host invocation budget");
+  compute.threads_num[0] = UINT32_MAX;
+  compute.threads_num[1] = UINT32_MAX;
+  compute.threads_num[2] = UINT32_MAX;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(), "wave64 planner overflowed invocation arithmetic");
+  IR::Program ordinary;
+  ordinary.stage = ShaderType::Compute;
+  ordinary.wave_size = 64;
+  AddExecutionPlanBlock(ordinary);
+  compute.threads_num[0] = 1;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 256;
+  compute.lds_size_dwords = 16;
+  const auto plain = PlanComputeExecution(ordinary,input,limits);
+  Check(plain.error.empty() && !plain.IsSplitWave64() && plain.wave_partition_factor == 1,
+        "shader without live wave operations unnecessarily split its LDS workgroup");
+}
+
+void TestComputeExecutionConvergenceProof() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024,1024,64},1024};
+  limits.native_subgroup_size = 32;
+  enum class Scenario { Uniform, Divergent, MutableRead, LoopRead, LoopSnapshot, LoopAtomic,
+                        LiveAtomic, Lds, Barrier, Dispatcher, UnknownSideEffect, UniformPhi, VaryingPhi, DppRowMask, DppInactiveBoundary };
+  for (const auto scenario : {Scenario::Uniform, Scenario::Divergent, Scenario::MutableRead,
+         Scenario::LoopRead, Scenario::LoopSnapshot, Scenario::LoopAtomic, Scenario::LiveAtomic,
+         Scenario::Lds, Scenario::Barrier, Scenario::Dispatcher, Scenario::UnknownSideEffect,
+         Scenario::UniformPhi, Scenario::VaryingPhi, Scenario::DppRowMask, Scenario::DppInactiveBoundary}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* exit = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    body->AddBranch(body);
+    body->AddBranch(exit);
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[1].terminator.loop_header = true;
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    auto& source = entry->AppendNewInst(O::GetBufferResource,
+        {IR::Value(0u),IR::Value(0u),IR::Value(256u),IR::Value(0u)});
+    auto& pred = body->AppendNewInst(O::IEqual32, {IR::Value(&lane), IR::Value(5u)});
+    auto& ballot = body->AppendNewInst(O::Ballot, {IR::Value(&pred)});
+    auto& low = body->AppendNewInst(O::CompositeExtractU32x4, {IR::Value(&ballot),IR::Value(0u)});
+    auto& uniform_cond = body->AppendNewInst(O::INotEqual32, {IR::Value(&low),IR::Value(0u)});
+    program.block_info[1].condition = IR::Value(&uniform_cond);
+    if (scenario == Scenario::Divergent) program.block_info[1].condition = IR::Value(&pred);
+    if (scenario == Scenario::MutableRead || scenario == Scenario::LoopRead) {
+      auto* target = scenario == Scenario::MutableRead ? entry : body;
+      auto& load = target->AppendNewInst(O::ReadConstBuffer, {IR::Value(&source),IR::Value(0u)});
+      if (scenario == Scenario::MutableRead) {
+        auto& condition = body->AppendNewInst(O::INotEqual32, {IR::Value(&load),IR::Value(0u)});
+        program.block_info[1].condition = IR::Value(&condition);
+      }
+    }
+    if (scenario == Scenario::LoopSnapshot) {
+      auto& srt = entry->AppendNewInst(O::GetSrtResource);
+      body->AppendNewInst(O::ReadConst, {IR::Value(&srt),IR::Value(0u)});
+    }
+    if (scenario == Scenario::LoopAtomic || scenario == Scenario::LiveAtomic) {
+      auto& atomic = body->AppendNewInst(O::BufferAtomicOr32,
+          {IR::Value(&source),IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(1u),IR::Value(true)});
+      if (scenario == Scenario::LiveAtomic) body->AppendNewInst(O::ReferenceU32, {IR::Value(&atomic)});
+    }
+    compute.lds_size_dwords = scenario == Scenario::Lds ? 16u : 0u;
+    if (scenario == Scenario::Lds) {
+      IR::MemoryInfo memory{};
+      memory.kind = IR::ResourceKind::Lds;
+      program.memory_info.push_back(memory);
+      auto& access = body->AppendNewInst(O::LoadSharedU32, {IR::Value(0u),IR::Value(true)});
+      access.SetFlags(IR::MemoryFlags{.index=0,.pc=0});
+      body->AppendNewInst(O::ReferenceU32, {IR::Value(&access)});
+    }
+    if (scenario == Scenario::Barrier) body->AppendNewInst(O::Barrier);
+    if (scenario == Scenario::UnknownSideEffect) body->AppendNewInst(O::Sendmsg);
+    program.dispatcher_fallback = scenario == Scenario::Dispatcher;
+    if (scenario == Scenario::UniformPhi || scenario == Scenario::VaryingPhi) {
+      auto it = body->PrependNewInst(body->begin(), O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+      it->AddPhiOperand(entry, scenario == Scenario::VaryingPhi ? IR::Value(&lane) : IR::Value(0u));
+      auto& increment = body->AppendNewInst(O::IAdd32, {IR::Value(&*it),IR::Value(1u)});
+      it->AddPhiOperand(body,IR::Value(&increment));
+      auto& condition = body->AppendNewInst(O::ULessThan32, {IR::Value(&increment),IR::Value(8u)});
+      program.block_info[1].condition = IR::Value(&condition);
+    }
+    if (scenario == Scenario::DppRowMask) {
+      auto& update = body->AppendNewInst(O::DppUpdateU32,
+          {IR::Value(1u),IR::Value(0u),IR::Value(true)});
+      IR::DppMoveFlags flags{};
+      flags.row_mask = 1;
+      flags.bank_mask = 15;
+      update.SetFlags(flags);
+      auto& condition = body->AppendNewInst(O::INotEqual32,{IR::Value(&update),IR::Value(0u)});
+      program.block_info[1].condition = IR::Value(&condition);
+    }
+    if (scenario == Scenario::DppInactiveBoundary) {
+      auto& move = body->AppendNewInst(O::DppMoveU32,{IR::Value(1u),IR::Value(true)});
+      IR::DppMoveFlags flags{};
+      flags.control = 0x101;
+      flags.fetch_inactive = true;
+      flags.bound_control = true;
+      move.SetFlags(flags);
+    }
+    const bool accepted = scenario == Scenario::Uniform || scenario == Scenario::LoopSnapshot ||
+                          scenario == Scenario::LoopAtomic || scenario == Scenario::UniformPhi;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    Check(plan.error.empty() == accepted, "split-wave convergence proof accepted/rejected the wrong invariant");
+  }
+}
+
+void TestComputeExecutionUnusedMemoryDeclarations() {
+  using namespace ShaderRecompiler;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* block = AddExecutionPlanBlock(program);
+  auto& ballot = block->AppendNewInst(IR::ValueOpcode::Ballot, {IR::Value(true)});
+  block->AppendNewInst(IR::ValueOpcode::ReferenceU32,
+      {IR::Value(&block->AppendNewInst(IR::ValueOpcode::CompositeExtractU32x4,
+                                     {IR::Value(&ballot), IR::Value(0u)}))});
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 128;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024};
+  limits.native_subgroup_size = 32;
+  // Reservation metadata alone neither accesses memory nor synchronizes waves.
+  for (const auto sizes : {std::array<uint32_t, 3>{1024, 0, 0},
+                          std::array<uint32_t, 3>{0, 1024, 0},
+                          std::array<uint32_t, 3>{0, 0, 1024},
+                          std::array<uint32_t, 3>{1024, 1024, 1024}}) {
+    compute.lds_size_dwords = sizes[0];
+    compute.scratch_size_dwords = sizes[1];
+    program.scratch_dwords = sizes[2];
+    const auto plan = PlanComputeExecution(program, input, limits);
+    Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 2,
+          "unused memory declarations must not reject independent complete waves");
+  }
+}
+
+void TestComputeExecutionRejectsActualStorageAndSynchronization() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  // All declarations are zero here. Rejection must come from the real operation
+  // or its typed resource, so removing a declaration-only gate cannot hide it.
+  for (const auto kind : {IR::ResourceKind::Lds,IR::ResourceKind::Gds,
+                         IR::ResourceKind::Scratch,IR::ResourceKind::None}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto& ballot = entry->AppendNewInst(O::Ballot,{IR::Value(true)});
+    auto& low = entry->AppendNewInst(O::CompositeExtractU32x4,
+                                    {IR::Value(&ballot),IR::Value(0u)});
+    entry->AppendNewInst(O::ReferenceU32,{IR::Value(&low)});
+    if (kind == IR::ResourceKind::None) {
+      entry->AppendNewInst(O::Barrier);
+    } else {
+      IR::MemoryInfo memory{};
+      memory.kind = kind;
+      program.memory_info.push_back(memory);
+      IR::Inst* access;
+      if (kind == IR::ResourceKind::Scratch) {
+        auto& resource = entry->AppendNewInst(O::GetScratchResource);
+        access = &entry->AppendNewInst(O::LoadAddressU32,
+            {IR::Value(&resource),IR::Value(0u),IR::Value(0u),IR::Value(true)});
+      } else {
+        access = &entry->AppendNewInst(O::LoadSharedU32,{IR::Value(0u),IR::Value(true)});
+      }
+      access->SetFlags(IR::MemoryFlags{.index=0,.pc=0});
+      entry->AppendNewInst(O::ReferenceU32,{IR::Value(access)});
+    }
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    Check(!plan.error.empty(),"split-wave execution accepted actual shared/scratch access or synchronization");
+  }
+}
+
+// Place after AddExecutionPlanBlock in shaderCfgTests.cpp and register
+// TestComputeExecutionDsLaneConvergence in the CPU runner.
+// This tests the planner only; it does not emit or execute a shader.
+void TestComputeExecutionDsLaneConvergence() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.wave_size = 64;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024};
+  limits.native_subgroup_size = 32;
+
+  for (const auto opcode : {O::BpermuteU32, O::SwizzleU32}) {
+    for (const bool branch_on_result : {false, true}) {
+      IR::Program program;
+      program.stage = ShaderType::Compute;
+      program.wave_size = 64;
+      auto* entry = AddExecutionPlanBlock(program);
+      // BPERMUTE wraps byte address 128 within each 32-lane half. SWIZZLE
+      // 0x00e0 selects lane 7 within each half. Both take U32,U32,U1.
+      const uint32_t control = opcode == O::BpermuteU32 ? 128u : 0x00e0u;
+      IR::Value source(17u);
+      IR::Value selector(control);
+      if (branch_on_result) {
+        auto& lane = entry->AppendNewInst(O::LaneId);
+        source = IR::Value(&lane);
+        if (opcode == O::BpermuteU32) {
+          auto& byte_address = entry->AppendNewInst(
+              O::ShiftLeftLogical32, {source, IR::Value(2u)});
+          selector = IR::Value(&byte_address);
+        } else {
+          selector = IR::Value(0x001fu); // Identity within each 32-lane half.
+        }
+      }
+      auto& lane_result = entry->AppendNewInst(
+          opcode, {source, selector, IR::Value(true)});
+      entry->AppendNewInst(O::ReferenceU32, {IR::Value(&lane_result)});
+
+      if (branch_on_result) {
+        auto* taken = AddExecutionPlanBlock(program);
+        auto* other = AddExecutionPlanBlock(program);
+        auto* merge = AddExecutionPlanBlock(program);
+        entry->AddBranch(taken);
+        entry->AddBranch(other);
+        taken->AddBranch(merge);
+        other->AddBranch(merge);
+        auto& condition = entry->AppendNewInst(
+            O::INotEqual32, {IR::Value(&lane_result), IR::Value(0u)});
+        entry->AppendNewInst(O::Reference, {IR::Value(&condition)});
+        auto& header = program.block_info[0];
+        header.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+        header.terminator.true_block = 1;
+        header.terminator.false_block = 2;
+        header.terminator.merge_block = 3;
+        header.condition = IR::Value(&condition);
+        for (const uint32_t arm : {1u, 2u}) {
+          program.block_info[arm].terminator.kind = CFG::TerminatorKind::Branch;
+          program.block_info[arm].terminator.true_block = 3;
+        }
+        // Keep a collective inside one arm: accepting an unproven condition
+        // would let only part of the logical wave reach its workgroup barriers.
+        auto& ballot = taken->AppendNewInst(O::Ballot, {IR::Value(true)});
+        auto& low = taken->AppendNewInst(
+            O::CompositeExtractU32x4, {IR::Value(&ballot), IR::Value(0u)});
+        taken->AppendNewInst(O::ReferenceU32, {IR::Value(&low)});
+      }
+
+      IR::ValidateProgram(program, true);
+      const auto plan = PlanComputeExecution(program, input, limits);
+      if (branch_on_result) {
+        // Each lane reads itself, so result != 0 is false only at lane zero.
+        // The remaining 63 lanes would reach the taken arm's collective alone.
+        Check(!plan.error.empty() &&
+                  Common::ContainsStr(plan.error, "wave-uniform branch"),
+              "DS lane branch was accepted or rejected before convergence analysis");
+        Check(!plan.IsSplitWave64(),
+              "rejected DS lane branch retained an executable split plan");
+      } else {
+        Check(plan.error.empty() && plan.IsSplitWave64() &&
+                  plan.wave_partition_factor == 1u &&
+                  plan.layout.guest_size == std::array<uint32_t, 3>{64, 1, 1} &&
+                  plan.layout.host_size == std::array<uint32_t, 3>{64, 1, 1},
+              "straight-line DS lane operation did not retain one complete split wave");
+      }
+    }
+  }
+}
+
+void TestComputeDispatchGroupExpansion() {
+  using ShaderRecompiler::PlanComputeDispatchGroups;
+  constexpr std::array<uint32_t, 3> limits{65535u, 65535u, 65535u};
+  const auto expanded = PlanComputeDispatchGroups({15u, 8u, 1u}, 4u, limits);
+  Check(expanded && *expanded == std::array<uint32_t, 3>{60u, 8u, 1u},
+        "wave split changed Y/Z or used the wrong X partition factor");
+  const auto boundary = PlanComputeDispatchGroups({65535u, 65535u, 65535u}, 1u, limits);
+  Check(boundary && *boundary == limits, "valid native dispatch limit was rejected");
+  Check(!PlanComputeDispatchGroups({16384u, 1u, 1u}, 4u, limits),
+        "expanded X exceeded the device group limit");
+  Check(!PlanComputeDispatchGroups({UINT32_MAX, 1u, 1u}, 2u,
+                                   {UINT32_MAX, UINT32_MAX, UINT32_MAX}),
+        "expanded X overflowed before bounds validation");
+  Check(!PlanComputeDispatchGroups({1u, 65536u, 1u}, 1u, limits) &&
+            !PlanComputeDispatchGroups({1u, 1u, 65536u}, 1u, limits),
+        "native Y/Z device group limits were not checked");
+  Check(!PlanComputeDispatchGroups({1u, 1u, 1u}, 0u, limits),
+        "an invalid partition factor dropped required work");
+  const auto empty = PlanComputeDispatchGroups({0u, 8u, 1u}, 4u, limits);
+  Check(empty && *empty == std::array<uint32_t, 3>{0u, 8u, 1u},
+        "wave splitting turned zero work into a dispatch");
+}
+
 void TestComputeWorkgroupPlanningBoundaries() {
   using ShaderRecompiler::ComputeWorkgroupLimits;
   using ShaderRecompiler::PlanComputeWorkgroup;
@@ -12174,6 +12544,12 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerU64PairTranslation();
   TestComputeDispatchWaveSize();
   TestComputeWorkgroupPlanningBoundaries();
+  TestComputeExecutionPlanningBoundaries();
+  TestComputeExecutionConvergenceProof();
+  TestComputeExecutionUnusedMemoryDeclarations();
+  TestComputeExecutionRejectsActualStorageAndSynchronization();
+  TestComputeExecutionDsLaneConvergence();
+  TestComputeDispatchGroupExpansion();
   TestComputeWorkgroupPlanningMatchesSmallExhaustiveOracle();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();

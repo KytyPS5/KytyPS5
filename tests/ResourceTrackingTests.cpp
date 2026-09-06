@@ -18,6 +18,18 @@
 #include <utility>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -2965,10 +2977,135 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   }
 }
 
+// Run each unsafe-baseline probe in its own bounded external child process.
+// The test never substitutes a callback for the production raw fallback.
+class RawFallbackTestPage {
+public:
+  explicit RawFallbackTestPage(std::string_view mode) {
+    if (mode == "null") return;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    size = info.dwPageSize;
+    const DWORD allocation = mode == "reserved" ? MEM_RESERVE : MEM_RESERVE | MEM_COMMIT;
+    const DWORD protection = mode == "readable" ? PAGE_READWRITE : PAGE_NOACCESS;
+    data = VirtualAlloc(nullptr, size, allocation, protection);
+    Check(data != nullptr, "raw fallback test could not allocate its host page");
+    MEMORY_BASIC_INFORMATION region{};
+    Check(VirtualQuery(data, &region, sizeof(region)) == sizeof(region),
+          "raw fallback test could not verify its host page");
+    Check(mode == "reserved" ? region.State == MEM_RESERVE : region.State == MEM_COMMIT,
+          "raw fallback host page has an unexpected commitment state");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+    const auto page_size = sysconf(_SC_PAGESIZE);
+    Check(page_size > 0, "raw fallback test could not query the host page size");
+    size = static_cast<size_t>(page_size);
+    const int protection = mode == "readable" ? PROT_READ | PROT_WRITE : PROT_NONE;
+    data = mmap(nullptr, size, protection, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Check(data != MAP_FAILED, "raw fallback test could not map its host page");
+#else
+    Check(false, "raw fallback test requires the Windows or Linux host readability implementation");
+#endif
+    Check(reinterpret_cast<uintptr_t>(data) <= 0x0000ffffffffffffull,
+          "raw fallback test host allocation is outside the evaluator address width");
+    if (mode == "readable") {
+      const uint32_t literal = 0x13579bdfu;
+      std::memcpy(data, &literal, sizeof(literal));
+    }
+  }
+  ~RawFallbackTestPage() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+    if (data != nullptr && data != MAP_FAILED) munmap(data, size);
+#endif
+  }
+  RawFallbackTestPage(const RawFallbackTestPage&) = delete;
+  RawFallbackTestPage& operator=(const RawFallbackTestPage&) = delete;
+  void* data = nullptr;
+  size_t size = 0;
+};
+
+void CheckSrtRawFallbackCase(std::string_view name) {
+  const auto separator = name.find('-');
+  Check(separator != std::string_view::npos, "raw fallback case has no resource kind");
+  const auto kind = name.substr(0, separator);
+  const auto mode = name.substr(separator + 1);
+  Check((kind == "address" || kind == "buffer") &&
+            (mode == "readable" || mode == "null" || mode == "reserved" || mode == "noaccess"),
+        "unknown raw fallback case");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  // Baseline AV must be reported to the parent instead of opening crash UI.
+  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+#endif
+  RawFallbackTestPage page(mode);
+  const auto address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(page.data));
+  const Value low(static_cast<uint32_t>(address));
+  const Value high(static_cast<uint32_t>(address >> 32));
+  Fixture fixture;
+  MemoryInfo memory;
+  memory.kind = kind == "address" ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+  memory.planning_only = true;
+  const auto handle = kind == "address" ? fixture.Address(low, high, 0x459u)
+                                         : fixture.Buffer({low, high, Value(4u), Value(0u)}, 0x459u);
+  const auto raw = kind == "address"
+      ? fixture.Emit(ValueOpcode::LoadAddressU32,
+                     {handle, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(memory, 0x459u))
+      : fixture.Emit(ValueOpcode::ReadConstBuffer,
+                     {handle, Value(0u)}, fixture.AddMemory(memory, 0x459u));
+  fixture.program.srt_plan_complete = true;
+  fixture.program.resource_tracking_complete = true;
+  fixture.program.srt_reads.push_back({raw, 0u});
+  DescriptorSource source;
+  source.dword_count = 2u;
+  // A successful earlier word must not leak into caller output on a failed read.
+  source.dwords[0] = Value(0x2468ace0u);
+  source.dwords[1] = raw;
+  fixture.program.descriptor_sources.push_back(source);
+  const auto plan = ExtractResourcePlan(fixture.program);
+  const SrtRuntime runtime{};
+  Check(runtime.read_memory == nullptr && runtime.read_specialization_memory == nullptr,
+        "raw fallback probe accidentally installed a memory reader");
+  const uint32_t source_id = 0;
+  std::vector<DescriptorValue> descriptors{{{0xfeed1111u, 0xfeed2222u}, 2u}};
+  std::vector<uint32_t> flat{0xfeed3333u, 0xfeed4444u};
+  const auto saved_descriptors = descriptors;
+  const auto saved_flat = flat;
+  std::cout << "KYTY_SRT_RAW_FALLBACK_READY " << name << std::endl;
+  const bool accepted = EvaluateRuntimeSources(plan, std::span{&source_id, 1}, runtime,
+                                               descriptors, flat, {});
+  if (mode == "readable") {
+    Check(accepted && descriptors.size() == 1 && descriptors[0].dword_count == 2u &&
+              descriptors[0].dwords[0] == 0x2468ace0u &&
+              descriptors[0].dwords[1] == 0x13579bdfu &&
+              flat == std::vector<uint32_t>{0x13579bdfu},
+          "raw fallback rejected or changed a readable literal host DWORD");
+  } else {
+    Check(!accepted, "raw fallback accepted unreadable host memory");
+    Check(descriptors == saved_descriptors && flat == saved_flat,
+          "raw fallback failed nontransactionally");
+  }
+  std::cout << "KYTY_SRT_RAW_FALLBACK_PASS " << name << std::endl;
+}
+
+void TestSrtRawFallbackReadability() {
+  for (const auto* name : {"address-readable", "buffer-readable", "address-null", "buffer-null",
+                           "address-reserved", "buffer-reserved", "address-noaccess", "buffer-noaccess"})
+    CheckSrtRawFallbackCase(name);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {
+      CheckSrtRawFallbackCase(argv[2]);
+      return 0;
+    }
+    if (argc != 1) {
+      std::cerr << "usage: resource_tracking_tests [--srt-raw-fallback-case CASE]\n";
+      return 2;
+    }
     const auto Run = [](const char *name, auto test) {
       try {
         test();
@@ -2989,6 +3126,7 @@ int main() {
     Run("inline full-width images", TestInlineFullWidthImages);
     Run("inline image address table", TestInlineImageAddressTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
+    Run("raw fallback readability", TestSrtRawFallbackReadability);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("bounded SRT tracking proof", TestBoundedSrtTrackingProofBoundaries);
     Run("bounded SRT split header", TestBoundedSrtSplitHeaderUniformCount);

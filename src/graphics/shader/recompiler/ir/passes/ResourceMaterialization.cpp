@@ -337,7 +337,8 @@ bool FinishIndirectImage(const ImageResource& image, std::vector<DescriptorValue
 
 bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indirect,
                                    const ImageResource&   image,
-                                   const DescriptorValue& heap_value, const SrtRuntime& runtime,
+                                   const DescriptorValue& heap_value,
+                                   const DescriptorValue* bound_value, const SrtRuntime& runtime,
                                    IndirectImage& result, std::string* reason) {
 	const auto note = [reason](const char* why) {
 		if (reason != nullptr) {
@@ -352,25 +353,39 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 	const auto base =
 	    ((static_cast<uint64_t>(heap_value.dwords[1]) << 32u) | heap_value.dwords[0]) & AddressMask;
 
+	uint32_t entries = indirect.key_bound;
+	if (indirect.bound_source != DescriptorSource::IndirectImage::NoBoundSource) {
+		if (bound_value == nullptr || bound_value->dword_count != 1u) {
+			return note("dense table loop bound did not evaluate");
+		}
+		const auto raw   = bound_value->dwords[0];
+		const auto count = indirect.bound_signed && (raw & 0x80000000u) != 0u ? 0u : raw;
+		if (count > indirect.key_bound) {
+			return note("dense table loop bound exceeds the enumeration cap");
+		}
+		entries = count;
+	}
+	const uint32_t enumerated = std::max(entries, 1u);
 	MakeRangeReadable(runtime, base + indirect.table_offset,
-	                  static_cast<uint64_t>(indirect.key_bound) << DenseDescriptorShift);
+	                  static_cast<uint64_t>(enumerated) << DenseDescriptorShift);
 	IndirectImage next;
 	std::vector<DescriptorValue> probed;
-	probed.reserve(indirect.key_bound);
-	next.keys.reserve(indirect.key_bound);
-	for (uint32_t key = 0; key < indirect.key_bound; key++) {
+	probed.reserve(enumerated);
+	next.keys.reserve(enumerated);
+	for (uint32_t key = 0; key < enumerated; key++) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
 		const auto entry      = static_cast<uint64_t>(indirect.table_offset) +
 		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
-		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+		for (uint32_t dword = 0; key < entries && dword < candidate.dword_count; dword++) {
 			const auto address = base + entry + dword * sizeof(uint32_t);
 			if (address > AddressMask ||
 			    !ReadSpecializationWord(runtime, address, candidate.dwords[dword])) {
 				return note("dense table entry is not readable");
 			}
 		}
-		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.r128) ||
+		if (key >= entries || NullImageDescriptor(candidate) ||
+		    !ValidImageDescriptor(candidate, image.r128) ||
 		    !ReservedImageBitsClear(candidate)) {
 			candidate.dwords.fill(0);
 		}
@@ -386,6 +401,79 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
 	result = std::move(next);
 	return true;
 }
+bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage& indirect,
+                                          const ImageResource&                   image,
+                                          const DescriptorValue&                 material_value,
+                                          const DescriptorValue&                 heap_value,
+                                          const SrtRuntime& runtime, IndirectImage& result,
+                                          std::string* reason) {
+	const auto note = [reason](const char* why) {
+		if (reason != nullptr) {
+			*reason = why;
+		}
+		return false;
+	};
+	if (material_value.dword_count != 2u || heap_value.dword_count != 2u ||
+	    indirect.item_bound == 0u || indirect.item_bound > MaxIndirectImageProbes ||
+	    indirect.selector_stride == 0u) {
+		return note("address probe tables are not address resources");
+	}
+	const auto material_base =
+	    ((static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0]) &
+	    AddressMask;
+	const auto heap_base =
+	    ((static_cast<uint64_t>(heap_value.dwords[1]) << 32u) | heap_value.dwords[0]) & AddressMask;
+	const auto records = static_cast<uint64_t>(indirect.item_bound);
+	MakeRangeReadable(runtime, material_base + indirect.selector_offset,
+	                  (records - 1u) * indirect.selector_stride + sizeof(uint32_t));
+	std::vector<uint32_t>        keys {0u};
+	std::unordered_set<uint32_t> seen {0u};
+	for (uint64_t item = 0; item < records; item++) {
+		const auto address =
+		    material_base + indirect.selector_offset + item * indirect.selector_stride;
+		uint32_t key = 0;
+		if (address > AddressMask || !ReadSpecializationWord(runtime, address, key)) {
+			return note("record key is not readable");
+		}
+		if (seen.insert(key).second) {
+			keys.push_back(key);
+		}
+	}
+
+	IndirectImage next;
+	next.keys = std::move(keys);
+	std::vector<DescriptorValue> probed;
+	probed.reserve(next.keys.size());
+	for (const auto key: next.keys) {
+		DescriptorValue candidate;
+		candidate.dword_count = 8u;
+		const auto entry      = heap_base + indirect.table_offset +
+		                   (static_cast<uint64_t>(key) << DenseDescriptorShift);
+		bool readable = entry + candidate.dword_count * sizeof(uint32_t) <= AddressMask;
+		if (readable) {
+			MakeRangeReadable(runtime, entry, candidate.dword_count * sizeof(uint32_t));
+			for (uint32_t dword = 0; readable && dword < candidate.dword_count; dword++) {
+				readable = ReadSpecializationWord(runtime, entry + dword * sizeof(uint32_t),
+				                                  candidate.dwords[dword]);
+			}
+		}
+		if (!readable || NullImageDescriptor(candidate) ||
+		    !ValidImageDescriptor(candidate, image.r128) || !ReservedImageBitsClear(candidate)) {
+			candidate.dwords.fill(0);
+		}
+		probed.push_back(candidate);
+	}
+	if (!FinishIndirectImage(image, probed, true,
+	                         fmt::format("address probe records={} stride={} table=0x{:x} keys={}",
+	                                     indirect.item_bound, indirect.selector_stride,
+	                                     indirect.table_offset, next.keys.size()),
+	                         next, reason)) {
+		return false;
+	}
+	result = std::move(next);
+	return true;
+}
+
 
 bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
                               const ImageResource& image, const DescriptorValue& material_value,
@@ -517,13 +605,18 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 				next.images[image_index].dword_count = 8u;
 				continue;
 			}
-			const auto&           indirect = *source->indirect_image;
-			const bool            dense    = indirect.key_bound != 0u;
+			const auto&           indirect  = *source->indirect_image;
+			const bool            dense     = indirect.key_bound != 0u;
+			const bool            has_bound = dense && indirect.bound_source !=
+			                                               DescriptorSource::IndirectImage::NoBoundSource;
 			std::vector<uint32_t> requests;
 			if (!dense) {
 				requests.push_back(indirect.material_source);
 			}
 			requests.push_back(indirect.heap_source);
+			if (has_bound) {
+				requests.push_back(indirect.bound_source);
+			}
 			SrtRuntime clean_runtime  = runtime;
 			clean_runtime.read_memory = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
@@ -532,10 +625,17 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			}
 			IndirectImage table;
 			std::string   detail;
-			if (dense ? !MaterializeDenseIndirectImage(indirect, image, tables.back(), runtime,
-			                                           table, &detail)
-			          : !MaterializeIndirectImage(indirect, image, tables.front(), tables.back(),
-			                                      runtime, table, &detail)) {
+			const auto&            heap_value  = tables[dense ? 0u : 1u];
+			const DescriptorValue* bound_value = has_bound ? &tables.back() : nullptr;
+			const bool             materialized =
+			    dense ? MaterializeDenseIndirectImage(indirect, image, heap_value, bound_value,
+			                                          runtime, table, &detail)
+			    : indirect.item_bound != 0u
+			        ? MaterializeAddressProbeIndirectImage(indirect, image, tables.front(),
+			                                               heap_value, runtime, table, &detail)
+			        : MaterializeIndirectImage(indirect, image, tables.front(), heap_value,
+			                                   runtime, table, &detail);
+			if (!materialized) {
 				return fail(detail.c_str());
 			}
 			if (report != nullptr) {
@@ -1176,6 +1276,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->heap_source),
 		                   plan.clean_flat_slots);
+		if (source->indirect_image->bound_source !=
+		    DescriptorSource::IndirectImage::NoBoundSource) {
+			MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->bound_source),
+			                   plan.clean_flat_slots);
+		}
 	}
 	return plan;
 }

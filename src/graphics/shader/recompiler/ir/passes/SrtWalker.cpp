@@ -1038,6 +1038,13 @@ bool ParseBoundedOffset(Value value, BoundedOffset& result,
 		result.scale = 1u;
 		return finish(true);
 	}
+	if (inst->GetOpcode() == ValueOpcode::BitFieldUExtract && inst->NumArgs() == 3u) {
+		// The extracted value is itself a dense selector. Its source may stay
+		// lane-varying; FiniteMaximum validates the immediate bit range below.
+		result.index = inst;
+		result.scale = 1u;
+		return finish(true);
+	}
 	if (inst->NumArgs() != 2u) return finish(false);
 	const Inst* arithmetic = inst;
 	auto op = inst->GetOpcode();
@@ -1253,6 +1260,17 @@ private:
 			const auto yes = FiniteMaximum(inst->Arg(1));
 			const auto no = FiniteMaximum(inst->Arg(2));
 			return finish(yes && no ? std::optional(std::max(*yes, *no)) : std::nullopt);
+		}
+		if (inst->GetOpcode() == ValueOpcode::BitFieldUExtract && inst->NumArgs() == 3u) {
+			const auto offset = inst->Arg(1).Resolve();
+			const auto width  = inst->Arg(2).Resolve();
+			if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+			    !width.IsImmediate() || width.GetType() != Type::U32 ||
+			    offset.U32() > 32u || width.U32() > 32u - offset.U32()) {
+				return finish({});
+			}
+			if (width.U32() == 32u) return finish(UINT32_MAX);
+			return finish(width.U32() == 0u ? 0u : (uint32_t {1} << width.U32()) - 1u);
 		}
 		if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0u &&
 		    inst->NumArgs() == inst->NumPhiBlocks() &&

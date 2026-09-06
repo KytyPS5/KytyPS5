@@ -49,6 +49,8 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Supported whole-surface TC clears, with coherent metadata on every acquisition.
+	[[nodiscard]] ImageId       FindSampledHtileImage(ImageDesc& desc);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);

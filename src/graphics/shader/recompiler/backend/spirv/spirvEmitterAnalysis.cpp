@@ -157,8 +157,12 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
+	// Vulkan determines comparison behavior from the sampling instruction.
+	// Preserve the known depth role in the type as well; binding isolation is
+	// provided separately by DescriptorBindingForImage.
+	const uint32_t depth = image.depth_compare ? 1u : 0u;
 	return state.builder.Type(OpTypeImage,
-	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, 0,
+	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, depth,
 	                           info.arrayed, info.multisampled, sampled, format});
 }
 

@@ -1534,6 +1534,148 @@ constexpr uint32_t EncodeMimg1(uint32_t vdata, uint32_t srsrc, uint32_t ssamp,
          ((vdata & 0xffu) << 8u) | (vaddr & 0xffu) | (a16 ? (1u << 30u) : 0u);
 }
 
+// Insert in tests/shaderCfgTests.cpp after EncodeMimg0/1 and call
+// TestMixedComparisonImagesUseSeparateSpirvVariables() from its main.
+// CPU-only end-to-end guest decode -> tracking -> specialization -> SPIR-V.
+// No native image/device or guest payload is required. The Vulkan Depth type
+// operand is intentionally not the oracle: descriptor-variable isolation is.
+void TestMixedComparisonImagesUseSeparateSpirvVariables() {
+  using namespace ShaderRecompiler::IR;
+  for (const bool comparison_first : {false, true}) {
+    std::array<uint32_t, 64> user_data{};
+    for (const uint32_t sgpr : {0u, 8u, 16u, 32u}) {
+      user_data[sgpr] = 0x1000u + sgpr * 0x100u;
+      user_data[sgpr + 1u] =
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (1u << 30u); // width2
+      user_data[sgpr + 2u] = 0; // height1
+      user_data[sgpr + 3u] = 0x924u |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      user_data[sgpr + 5u] = 0x00700000u;
+    }
+    user_data[33] =
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (3u << 30u); // output width4 for three distinct stores
+    // Independent sampler in s[28:31], comparison LESS, clamp to edge.
+    user_data[28] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
+    std::vector<uint32_t> shader;
+    const auto mimg = [&](uint32_t opcode, uint32_t output, uint32_t resource,
+                          uint32_t sampler, uint32_t address) {
+      shader.push_back(EncodeMimg0(opcode, 1));
+      shader.push_back(EncodeMimg1(output, resource, sampler, address));
+    };
+    const auto load = [&] { mimg(0x00, 8, 0, 0, 1); };
+    const auto compare = [&] { mimg(0x2f, 12, 2, 7, 4); };
+    if (comparison_first) {
+      compare();
+      load();
+    } else {
+      load();
+      compare();
+    }
+    mimg(0x00, 16, 4, 0, 1);
+    // Keep each operation live through independent observable side effects.
+    // The test does not execute these stores or dereference descriptor bases.
+    shader.push_back(EncodeVop1(0x01, 21, 128)); // output y=0
+    uint32_t output_x = 0;
+    for (const auto value : {8u, 12u, 16u}) {
+      shader.push_back(EncodeVop1(0x01, 20, 128u + output_x++));
+      mimg(0x08, value, 8, 0, 20);
+    }
+    shader.push_back(0xbf810000u);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(result.program.info.images.size() == 4u,
+          "mixed comparison fixture lost an image resource");
+
+    struct Definition {
+      uint32_t opcode;
+      std::vector<uint32_t> operands;
+    };
+    std::unordered_map<uint32_t, Definition> definitions;
+    std::unordered_map<uint32_t, uint32_t> bindings;
+    std::unordered_set<uint32_t> fetch_values;
+    std::unordered_set<uint32_t> comparison_values;
+    for (size_t offset = 5; offset < result.spirv.size();) {
+      const uint32_t count = result.spirv[offset] >> 16u;
+      const uint32_t opcode = result.spirv[offset] & 0xffffu;
+      Check(count != 0 && count <= result.spirv.size() - offset,
+            "mixed comparison SPIR-V stream is malformed");
+      const auto* words = result.spirv.data() + offset;
+      // Variable, Load, AccessChain, InBoundsAccessChain, CopyObject,
+      // SampledImage, Image: every tracked instruction has type then result.
+      if (opcode == 59 || opcode == 61 || opcode == 65 || opcode == 66 ||
+          opcode == 83 || opcode == 86 || opcode == 100) {
+        Check(count >= 4, "mixed comparison descriptor definition is malformed");
+        definitions.emplace(words[2], Definition{
+            opcode, std::vector<uint32_t>(words + 1, words + count)});
+      } else if (opcode == 71 && count >= 4 && words[2] == 33u) {
+        bindings[words[1]] = words[3]; // OpDecorate Binding
+      } else if (opcode == 95 || opcode == 90) {
+        Check(count >= 4, "mixed comparison image operation is malformed");
+        (opcode == 95 ? fetch_values : comparison_values).insert(words[3]);
+      }
+      offset += count;
+    }
+    const auto variable_root = [&](uint32_t value) {
+      std::unordered_set<uint32_t> visited;
+      while (visited.insert(value).second) {
+        const auto found = definitions.find(value);
+        Check(found != definitions.end(),
+              "mixed comparison image operand lacks a tracked descriptor origin");
+        if (found->second.opcode == 59) {
+          return value;
+        }
+        value = found->second.operands[2];
+      }
+      Check(false, "mixed comparison descriptor origin is cyclic");
+      return 0u;
+    };
+    std::unordered_set<uint32_t> ordinary_roots;
+    std::unordered_set<uint32_t> comparison_roots;
+    for (const auto value : fetch_values) ordinary_roots.insert(variable_root(value));
+    for (const auto value : comparison_values) comparison_roots.insert(variable_root(value));
+    Check(fetch_values.size() == 2 && comparison_values.size() == 1 &&
+              ordinary_roots.size() == 1 && comparison_roots.size() == 1,
+          "mixed fixture did not retain two ordinary fetches and one comparison");
+    const auto ordinary_root = *ordinary_roots.begin();
+    const auto comparison_root = *comparison_roots.begin();
+    Check(ordinary_root != comparison_root,
+          "ordinary image fetch and depth comparison share one SPIR-V descriptor variable");
+    Check(bindings.contains(ordinary_root) && bindings.contains(comparison_root) &&
+              bindings.at(ordinary_root) != bindings.at(comparison_root),
+          "separate SPIR-V image variables still share one descriptor binding");
+
+    const DescriptorBinding* ordinary_binding = nullptr;
+    const DescriptorBinding* comparison_binding = nullptr;
+    std::vector<uint32_t> ordinary_indices;
+    std::vector<uint32_t> comparison_indices;
+    for (uint32_t index = 0; index < result.program.info.images.size(); ++index) {
+      const auto& image = result.program.info.images[index];
+      if (image.resource_class != ImageResourceClass::Sampled) continue;
+      const auto kind = DescriptorBindingForImage(image);
+      Check(kind.has_value(), "mixed image resource lacks a descriptor kind");
+      const auto* binding = FindBinding(result.program.bindings, *kind);
+      if (image.depth_compare) {
+        comparison_binding = binding;
+        comparison_indices.push_back(index);
+      } else {
+        ordinary_binding = binding;
+        ordinary_indices.push_back(index);
+      }
+    }
+    Check(ordinary_binding != nullptr && comparison_binding != nullptr &&
+              ordinary_indices.size() == 2 && comparison_indices.size() == 1 &&
+              ordinary_binding->resources == ordinary_indices &&
+              comparison_binding->resources == comparison_indices &&
+              bindings.at(ordinary_root) == NativeBinding(ShaderType::Compute, ordinary_binding->kind) &&
+              bindings.at(comparison_root) == NativeBinding(ShaderType::Compute, comparison_binding->kind),
+          "SPIR-V variable isolation disagrees with actual resource binding membership");
+  }
+}
+
 constexpr uint32_t EncodeVintrp(uint32_t opcode, uint32_t vdst, uint32_t attr,
                                 uint32_t chan, uint32_t vsrc) {
   return (0x32u << 26u) | ((opcode & 0x3u) << 16u) | ((vdst & 0xffu) << 18u) |
@@ -5167,10 +5309,10 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_22 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_29 "),
         "1D store did not access the 1D storage descriptor binding");
   Check(
-      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_23 "),
+      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_30 "),
       "1D-array store did not access the 1D-array storage descriptor binding");
 }
 
@@ -5466,7 +5608,7 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_33 "),
         "storage image store did not access the 3D storage descriptor binding");
 }
 
@@ -5502,13 +5644,13 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_24 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_31 "),
         "2D descriptor storage image store did not access the base storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_25 "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_32 "),
         "2D descriptor storage image store unexpectedly used the array storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_33 "),
         "2D descriptor storage image store unexpectedly used the 3D storage "
         "binding");
 }
@@ -13144,6 +13286,7 @@ int main(int argc, char* argv[]) {
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();
+  TestMixedComparisonImagesUseSeparateSpirvVariables();
   TestComputeExecutionWaveScratchBudget();
   TestComputeExecutionSingleWaveLds();
   TestComputeExecutionUnusedMemoryDeclarations();

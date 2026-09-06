@@ -144,6 +144,8 @@ public:
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
+	// Imported from a sampled HTile clear; never denotes attachment ownership.
+	bool             sampled_htile_clear_import = false;
 	bool             registered     = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;

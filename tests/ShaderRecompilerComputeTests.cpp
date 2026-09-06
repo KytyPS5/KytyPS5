@@ -1589,6 +1589,34 @@ std::vector<u32> MakePassthroughVertexSpirv() {
 
 } // namespace TestSpv
 
+// Shared by the actual renderer worker and its bounded parent. All addresses
+// are constructed inside the worker from synthetic allocation footprints.
+struct SampledHtileWriteScenario {
+  const char* mode;
+  bool graphics;
+  bool writer_first;
+  bool image_writer;
+  bool targets_metadata;
+  bool disjoint;
+  bool shared_native = false;
+};
+constexpr std::array SampledHtileWriteScenarios {
+    SampledHtileWriteScenario{"cs-buffer-data", false, false, false, false, false},
+    SampledHtileWriteScenario{"cs-buffer-meta", false, false, false, true, false},
+    SampledHtileWriteScenario{"cs-image-data", false, false, true, false, false},
+    SampledHtileWriteScenario{"cs-image-meta", false, false, true, true, false},
+    SampledHtileWriteScenario{"vs-read-ps-buffer-data", true, false, false, false, false},
+    SampledHtileWriteScenario{"vs-read-ps-buffer-meta", true, false, false, true, false},
+    SampledHtileWriteScenario{"vs-read-ps-image-data", true, false, true, false, false},
+    SampledHtileWriteScenario{"vs-read-ps-image-meta", true, false, true, true, false},
+    SampledHtileWriteScenario{"vs-buffer-meta-ps-read", true, true, false, true, false},
+    SampledHtileWriteScenario{"vs-image-data-ps-read", true, true, true, false, false},
+    SampledHtileWriteScenario{"cs-buffer-disjoint", false, false, false, true, true},
+    SampledHtileWriteScenario{"vs-read-ps-buffer-disjoint", true, false, false, true, true},
+    SampledHtileWriteScenario{"cs-buffer-shared-native", false, false, false, true, true, true},
+    SampledHtileWriteScenario{"vs-read-ps-buffer-shared-native", true, false, false, true, true, true},
+};
+
 class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
@@ -8702,6 +8730,852 @@ OpFunctionEnd
   std::_Exit(0);
 }
 
+void CheckNativeHtileArraySubset() {
+  constexpr const char* name = "NativeHtileArraySubset";
+  constexpr uintptr_t base = 0x0000000204c00000ull;
+  constexpr uint64_t allocation_size = 0x80000;
+  constexpr uint64_t allocation_alignment = 0x10000;
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  constexpr uint32_t layers = 4;
+  constexpr uint64_t slice_size = 0x10000;
+  constexpr uint64_t data_size = slice_size * layers;
+  constexpr uint64_t metadata_address = base + data_size;
+  constexpr uint64_t metadata_size = 0x8000 * layers;
+  constexpr std::array<float, layers> native_values{0.25f, 0.5f, 0.75f, 1.0f};
+  EnsureRuntimeContext();
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+          "native HTile array allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset,
+              allocation_alignment) == 0 && mapped == reinterpret_cast<void*>(base),
+          "native HTile array mapping failed");
+  std::memset(mapped, 0, allocation_size);
+  {
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto& resources = context.GetGpuResources();
+    auto& cache = context.GetTextureCache();
+    auto& executor = context.GetRenderExecutor();
+    resources.MapMemory(base, allocation_size);
+    const auto pitch = TileGetTexturePitch(Prospero::BufferFormat::k32Float,
+                                            width, Prospero::TileMode::kDepth);
+    TextureCache::ImageDesc depth{};
+    depth.type = TextureCache::BindingType::DepthTarget;
+    depth.info.data = {base, data_size};
+    depth.info.pixel_format = vk::Format::eD32Sfloat;
+    depth.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth.info.type = Prospero::ImageType::kColor2D;
+    depth.info.extent = {width, height, 1};
+    depth.info.resources = {1, layers};
+    depth.info.pitch = pitch;
+    depth.info.bytes_per_block = 4;
+    depth.info.samples = 1;
+    depth.info.tile_mode = Prospero::TileMode::kDepth;
+    depth.info.mip_layout[0] = {0, data_size, pitch, height};
+    depth.info.metadata.kind = ImageMetadataKind::Htile;
+    depth.info.metadata.range = {metadata_address, metadata_size};
+    depth.info.htile_clear_mask = 0;
+    depth.view_info.format = vk::Format::eD32Sfloat;
+    depth.view_info.type = vk::ImageViewType::e2DArray;
+    depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth.view_info.base_level = 0;
+    depth.view_info.level_count = 1;
+    depth.view_info.base_layer = 0;
+    depth.view_info.layer_count = layers;
+    depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto native_id = cache.FindImage(depth);
+    Require(name, "native depth acquisition",
+            cache.FindDepthTarget(native_id, depth) != nullptr &&
+                cache.IsMeta(metadata_address) &&
+                cache.GetImage(native_id).usage.depth_target,
+            "fixture did not establish an existing attachment-owned HTile surface");
+    auto& native = cache.GetImage(native_id);
+    native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                   vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+      const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eDepth, 0, 1, layer, 1};
+      const vk::ClearDepthStencilValue clear{native_values[layer], 0};
+      scheduler.Current().Handle().clearDepthStencilImage(
+          native.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+    }
+    cache.MarkGpuWritten(native_id);
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    // Real native contents differ in every layer. Both raw allocations stay at
+    // zero: sampling must preserve the existing native owner rather than treat
+    // its stale canonical-clear HTile as a new imported surface.
+    std::vector<uint32_t> stale_data(data_size / sizeof(uint32_t));
+    std::vector<uint32_t> stale_metadata(metadata_size / sizeof(uint32_t));
+    Require(name, "contradictory guest backing",
+            Libs::LibKernel::Memory::TryWriteBacking(base, stale_data.data(), data_size) &&
+                Libs::LibKernel::Memory::TryWriteBacking(
+                    metadata_address, stale_metadata.data(), metadata_size) &&
+                cache.GetImage(native_id).IsGpuModified(),
+            "could not establish stale raw depth and HTile backing");
+
+    ShaderTextureResource descriptor{};
+    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (((width - 1u) & 3u) << 30u);
+    descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+        (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+    // The descriptor exposes a two-layer allocation but selects only layer1.
+    descriptor.fields[4] = 1u | (1u << 16u);
+    descriptor.fields[5] = 0x00700000u;
+    descriptor.fields[6] = 0x00280000u |
+        (static_cast<uint32_t>((metadata_address >> 8u) & 0xffu) << 24u);
+    descriptor.fields[7] = static_cast<uint32_t>(metadata_address >> 16u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+    resource.read = true;
+    resource.depth_compare = true;
+    std::printf("KYTY_NATIVE_HTILE_SUBSET_READY\n");
+    std::fflush(stdout);
+    const auto sampled = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+    Require(name, "native array prefix identity",
+            sampled.image_id == native_id && sampled.desc.info.data.size == 2 * slice_size &&
+                sampled.desc.view_info.base_layer == 1 && sampled.desc.view_info.layer_count == 1 &&
+                cache.GetImage(native_id).info.resources.layers == layers,
+            "a valid array subset replaced or rejected the existing native depth owner");
+    const auto view = cache.FindTexture(sampled.image_id, sampled.desc);
+    Require(name, "native subset depth view",
+            view != nullptr && std::ranges::any_of(cache.GetImage(native_id).views,
+                [&](const auto& cached) {
+                  return cached.view == view && cached.info.type == vk::ImageViewType::e2DArray &&
+                      cached.info.aspect == vk::ImageAspectFlagBits::eDepth &&
+                      cached.info.base_layer == 1 && cached.info.layer_count == 1;
+                }),
+            "sampled native depth array lost the requested single-layer subview");
+    Require(name, "native owner readback",
+            TextureCacheTestAccess::TryDownload(cache, native_id),
+            "native depth array readback could not be queued after subset sampling");
+    RenderExecutorTestAccess::ResetBindings(executor);
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    std::vector<uint32_t> observed(stale_data.size());
+    Require(name, "native array backing",
+            Libs::LibKernel::Memory::TryReadBacking(base, observed.data(), data_size),
+            "native depth array readback is unavailable");
+    TileTextureBlockLayout tile_layout{};
+    Require(name, "array depth tile layout",
+            TileGetTextureBlockLayout(Prospero::BufferFormat::k32Float,
+                                      Prospero::TileMode::kDepth, false, tile_layout),
+            "array readback tile layout is unavailable");
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+      uint32_t block_xor = 0;
+      Require(name, "array layer block xor",
+              TileGetBlockXor(tile_layout.block, 0, 0, layer, block_xor),
+              "array layer block XOR is unavailable");
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          uint32_t offset = 0;
+          Require(name, "array readback texel address",
+                  TileGetBlockOffset(tile_layout.block, x, y, 0, offset),
+                  "array readback texel address is unavailable");
+          const auto index = (slice_size * layer + (offset ^ block_xor)) / sizeof(uint32_t);
+          Require(name, "native pixels survive subset sampling",
+                  index < observed.size() && observed[index] == std::bit_cast<uint32_t>(native_values[layer]),
+                  "sampled array subset recreated native depth from stale clear0 metadata");
+        }
+      }
+    }
+    resources.SetGpu(nullptr);
+    resources.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+  }
+  Require(name, "unmap direct backing",
+          Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "native HTile array mapping release failed");
+  Require(name, "release direct backing",
+          Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "native HTile array allocation release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
+  constexpr const char* name = "SampledHtileClearDiscovery";
+  if (negative_scenario != nullptr) {
+    Require(name, "negative scenario",
+            std::strcmp(negative_scenario, "tail-unknown") == 0 ||
+                std::strcmp(negative_scenario, "mixed-clears") == 0 ||
+                std::strcmp(negative_scenario, "clear-image") == 0,
+            "unknown sampled HTile negative scenario");
+  }
+  constexpr uintptr_t base = 0x0000000204800000ull;
+  constexpr uint64_t allocation_size = 0x20000;
+  constexpr uint64_t allocation_alignment = 0x10000;
+  constexpr uint64_t depth_size = 0x10000;
+  constexpr uint64_t metadata_address = base + depth_size;
+  constexpr uint64_t metadata_size = 0x8000;
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  constexpr uint32_t poison = 0x3e800000u; // .25f, distinct from both TC clears.
+  constexpr uint32_t clear_zero = 0x00000000u;
+  constexpr uint32_t clear_one = 0xfffffff0u; // Z-only: min=max=0x3fff, ZMask=0.
+  // Primary AMD PAL: gfx9MaskRam.cpp Gfx9Htile::GetClearValue and
+  // gfx9Image.cpp Image::IsFastClearDepthMetaFetchable. TC fast clears are 0/1;
+  // raw depth bytes need not contain the logical clear value.
+  EnsureRuntimeContext();
+  TileSizeAlign stencil_layout{}, htile_layout{}, depth_layout{};
+  Require(name, "depth and metadata footprint",
+          TileGetDepthSize(width, height, 0, Prospero::DepthFormat::kZ32F,
+                           Prospero::StencilFormat::kInvalid, true,
+                           stencil_layout, htile_layout, depth_layout, 0) &&
+              depth_layout.size == depth_size &&
+              htile_layout.size == metadata_size &&
+              htile_layout.align == 0x8000,
+          "standalone single-sample HTile fixture has an invalid footprint");
+
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+          "sampled HTile direct allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset,
+              allocation_alignment) == 0 &&
+              mapped == reinterpret_cast<void*>(base),
+          "sampled HTile direct mapping failed");
+  std::vector<uint32_t> depth_poison(depth_size / sizeof(uint32_t), poison);
+  std::vector<uint32_t> metadata_stale(metadata_size / sizeof(uint32_t), clear_one);
+  std::memcpy(mapped, depth_poison.data(), depth_size);
+  std::memcpy(reinterpret_cast<uint8_t*>(mapped) + depth_size,
+              metadata_stale.data(), metadata_size);
+
+  {
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    // Coherent metadata acquisition uses BufferCache::ReadMemory, which must
+    // serialize through this real context's GPU command worker.
+    context.InitializeGpu(nullptr);
+    auto& resources = context.GetGpuResources();
+    auto& cache = context.GetTextureCache();
+    auto& buffers = context.GetBufferCache();
+    auto& executor = context.GetRenderExecutor();
+    resources.MapMemory(base, allocation_size);
+
+    ShaderTextureResource descriptor{};
+    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (((width - 1u) & 3u) << 30u);
+    descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+        (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    descriptor.fields[5] = 0x00700000u;
+    descriptor.fields[6] = 0x00280000u |
+        (static_cast<uint32_t>((metadata_address >> 8u) & 0xffu) << 24u);
+    descriptor.fields[7] = static_cast<uint32_t>(metadata_address >> 16u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+              value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.read = true;
+    resource.depth_compare = true;
+    Require(name, "first sampled discovery",
+            !cache.IsMeta(metadata_address) &&
+                !cache.QueryRegion(base, depth_size).image_bytes &&
+                descriptor.MetaAddr() << 8u == metadata_address,
+            "fixture accidentally acquired a prior depth/metadata owner");
+
+    const auto gpu_metadata_fill = [&](uint32_t value_to_write,
+                                       uint32_t stale_value) {
+      // Force actual native-buffer ownership. FillBuffer otherwise optimizes a
+      // clean, unowned region into a CPU write, which would miss this regression.
+      auto native = buffers.ObtainBuffer(metadata_address, metadata_size, true, false);
+      Require(name, "GPU metadata owner", native.first != nullptr &&
+                  buffers.HasGpuDirtyBytes(metadata_address, metadata_size),
+              "metadata fixture did not establish GPU buffer ownership");
+      buffers.FillBuffer(metadata_address, metadata_size, value_to_write, false);
+      std::vector<uint32_t> backing(metadata_stale.size());
+      Require(name, "stale metadata backing",
+              buffers.HasGpuDirtyBytes(metadata_address, metadata_size) &&
+                  Libs::LibKernel::Memory::TryReadBacking(
+                      metadata_address, backing.data(), metadata_size) &&
+                  std::ranges::all_of(backing, [=](uint32_t word) {
+                    return word == stale_value;
+                  }),
+              "GPU metadata fill was mirrored into CPU backing before discovery");
+    };
+    if (negative_scenario != nullptr &&
+        std::strcmp(negative_scenario, "clear-image") != 0) {
+      // Both scenarios start with a native clear0 and an entirely stale CPU
+      // clear1 allocation. Patch the native buffer only, beyond diagnostic
+      // prefixes, so classification must inspect the full coherent metadata.
+      gpu_metadata_fill(clear_zero, clear_one);
+      if (std::strcmp(negative_scenario, "tail-unknown") == 0) {
+        buffers.FillBuffer(metadata_address + metadata_size - sizeof(uint32_t),
+                           sizeof(uint32_t), 1u, false);
+      } else {
+        // Each half contains a supported clear encoding; the allocation as a
+        // whole is not one clear. Neither first-word nor known-code-only
+        // validation is sufficient.
+        buffers.FillBuffer(metadata_address + metadata_size / 2,
+                           metadata_size / 2, clear_one, false);
+      }
+      std::vector<uint32_t> stale(metadata_stale.size());
+      Require(name, "negative metadata remains GPU-owned",
+              buffers.HasGpuDirtyBytes(metadata_address, metadata_size) &&
+                  Libs::LibKernel::Memory::TryReadBacking(
+                      metadata_address, stale.data(), metadata_size) &&
+                  std::ranges::all_of(stale, [](uint32_t word) {
+                    return word == clear_one;
+                  }),
+              "negative metadata mutation did not leave CPU backing stale");
+      std::printf("KYTY_SAMPLED_HTILE_NEGATIVE_READY %s\n", negative_scenario);
+      std::fflush(stdout);
+      const auto binding =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      // Missing guard is RED. Do not sample or submit a comparison with this
+      // unsupported metadata; the bounded parent owns child cleanup.
+      std::printf("KYTY_SAMPLED_HTILE_NEGATIVE_RETURNED %s\n", negative_scenario);
+      std::fflush(nullptr);
+      std::_Exit(0);
+    }
+    const std::array<float, 2> left_uv{0.5f / width, 0.5f / height};
+    const std::array<float, 2> right_uv{63.5f / width, 63.5f / height};
+    const auto sample_clear = [&](const char* phase, float reference,
+                                   float expected_comparison) {
+      std::printf("KYTY_SAMPLED_HTILE_READY %s\n", phase);
+      std::fflush(stdout);
+      auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      auto& image = cache.GetImage(binding.image_id);
+      Require(name, phase, image.backing.format == vk::Format::eD32Sfloat &&
+                  image.info.data.address == base,
+              "sampled HTile did not materialize a native D32 owner");
+      const auto view = cache.FindTexture(binding.image_id, binding.desc);
+      Require(name, "sampled depth view",
+              view != nullptr && std::ranges::any_of(image.views, [&](const auto& cached) {
+                return cached.view == view &&
+                    cached.info.format == vk::Format::eD32Sfloat &&
+                    cached.info.aspect == vk::ImageAspectFlagBits::eDepth;
+              }),
+              "sampled HTile returned a color view for depth comparison");
+      image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::AccessFlagBits2::eShaderRead, {}, scheduler.Current().Handle());
+      const auto observed = ProbeDepthComparison(
+          name, scheduler, view, vk::ImageLayout::eShaderReadOnlyOptimal,
+          left_uv, right_uv, reference, vk::Filter::eNearest);
+      Require(name, phase,
+              observed == std::array{expected_comparison, expected_comparison,
+                                     expected_comparison},
+              "sampling used raw/stale depth instead of the coherent HTile clear");
+      scheduler.DrainPriorityOperations();
+      return binding.image_id;
+    };
+
+    if (negative_scenario != nullptr) {
+      // Establish a real imported owner through the unchanged native sampling
+      // oracle first. The accelerated buffer-clear entry must not silently
+      // replace its pixels while leaving stale HTile authoritative.
+      gpu_metadata_fill(clear_zero, clear_one);
+      (void)sample_clear("import-before-image-clear", 0.125f, 0.0f);
+      std::printf("KYTY_SAMPLED_HTILE_NEGATIVE_READY %s\n", negative_scenario);
+      std::fflush(stdout);
+      const bool accepted = cache.ClearImageFromBuffer(
+          scheduler.Current(), base, depth_size, 0x3f800000u);
+      // Both a successful mutation and an unrelated false fallback miss this
+      // specific ownership guard. The native clear would be legal, but no
+      // further command submission is needed to prove that it was admitted.
+      std::printf("KYTY_SAMPLED_HTILE_NEGATIVE_RETURNED %s accepted=%d\n",
+                  negative_scenario, accepted);
+      std::fflush(nullptr);
+      std::_Exit(0);
+    }
+
+    gpu_metadata_fill(clear_zero, clear_one);
+    (void)sample_clear("first-clear-zero", 0.125f, 0.0f);
+    // No depth readback or CPU-depth write between acquisitions: the second
+    // acquisition must react solely to the metadata update.
+    std::vector<uint32_t> untouched_depth(depth_poison.size());
+    Require(name, "depth remains poison before metadata-only transition",
+            Libs::LibKernel::Memory::TryReadBacking(base, untouched_depth.data(), depth_size) &&
+                untouched_depth == depth_poison,
+            "first sampling changed the raw depth backing and weakened the transition oracle");
+    // Keep CPU HTile stale at clear0 while the next native fill changes it to1.
+    // This backing-only write deliberately does not publish a GPU update.
+    std::fill(metadata_stale.begin(), metadata_stale.end(), clear_zero);
+    Require(name, "metadata stale zero backing",
+            Libs::LibKernel::Memory::TryWriteBacking(
+                metadata_address, metadata_stale.data(), metadata_size),
+            "could not establish stale metadata backing for the second acquisition");
+    gpu_metadata_fill(clear_one, clear_zero);
+    const auto final_id = sample_clear("metadata-only-clear-one", 0.75f, 1.0f);
+
+    Require(name, "final logical depth readback",
+            TextureCacheTestAccess::TryDownload(cache, final_id),
+            "materialized HTile depth could not be queued for readback");
+    RenderExecutorTestAccess::ResetBindings(executor);
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    std::vector<uint32_t> observed(depth_poison.size());
+    Require(name, "depth readback backing",
+            Libs::LibKernel::Memory::TryReadBacking(base, observed.data(), depth_size),
+            "materialized HTile depth backing is unavailable");
+    TileTextureBlockLayout tile_layout{};
+    uint32_t block_xor = 0;
+    Require(name, "readback tile layout",
+            TileGetTextureBlockLayout(Prospero::BufferFormat::k32Float,
+                                      Prospero::TileMode::kDepth, false, tile_layout) &&
+                TileGetBlockXor(tile_layout.block, 0, 0, 0, block_xor),
+            "depth readback fixture has no supported tiled layout");
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        uint32_t offset = 0;
+        Require(name, "readback texel address",
+                TileGetBlockOffset(tile_layout.block, x, y, 0, offset) &&
+                    ((offset ^ block_xor) / sizeof(uint32_t)) < observed.size(),
+                "depth readback texel escaped the fixture allocation");
+        Require(name, "all materialized depth texels",
+                observed[(offset ^ block_xor) / sizeof(uint32_t)] == 0x3f800000u,
+                "HTile clear1 readback contains stale clear0 or raw poison texels");
+      }
+    }
+    // Match existing runtime buffer fixtures: detach callbacks before unmap,
+    // finish recorded work, then stop the worker before context destruction.
+    resources.SetGpu(nullptr);
+    resources.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+  }
+  Require(name, "unmap direct backing",
+          Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "sampled HTile direct mapping release failed");
+  Require(name, "release direct backing",
+          Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+              direct_offset, allocation_size) == 0,
+          "sampled HTile direct allocation release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+  void CheckSampledHtileWriteCase(const char* mode) {
+    using namespace ShaderRecompiler::IR;
+    constexpr const char* name = "SampledHtileWriteAdmission";
+    const auto found = std::ranges::find_if(SampledHtileWriteScenarios,
+        [&](const auto& scenario) { return std::strcmp(mode, scenario.mode) == 0; });
+    Require(name, "scenario", found != SampledHtileWriteScenarios.end(),
+            "unknown sampled HTile write admission scenario");
+    const auto scenario = *found;
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t allocation_size = 0x30000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 64, height = 64;
+    constexpr uint64_t depth_size = 0x10000, metadata_size = 0x8000;
+    constexpr uint64_t metadata_address = base + depth_size;
+    constexpr uint64_t independent_metadata_address = metadata_address + metadata_size;
+    EnsureRuntimeContext();
+    TileSizeAlign stencil_layout{}, htile_layout{}, depth_layout{};
+    Require(name, "synthetic depth layout",
+            TileGetDepthSize(width, height, 0, Prospero::DepthFormat::kZ32F,
+                Prospero::StencilFormat::kInvalid, true, stencil_layout,
+                htile_layout, depth_layout, 0) &&
+                depth_layout.size == depth_size && htile_layout.size == metadata_size,
+            "sampled HTile write fixture has the wrong allocation footprint");
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(0,
+                Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "sampled HTile write fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size,
+                0x3, 0x10, direct_offset, allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void*>(base),
+            "sampled HTile write fixture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    std::fill_n(static_cast<uint32_t*>(mapped), depth_size / sizeof(uint32_t),
+                0x3e800000u); // raw .25 poison; logical HTile clear will be 0.
+    std::fill_n(reinterpret_cast<uint32_t*>(metadata_address),
+                metadata_size / sizeof(uint32_t), 0xfffffff0u);
+    {
+      RenderContext context(m_runtime_context);
+      auto& scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      auto& resources = context.GetGpuResources();
+      auto& cache = context.GetTextureCache();
+      auto& buffers = context.GetBufferCache();
+      auto& executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      ShaderTextureResource descriptor{};
+      descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+      descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (((width - 1u) & 3u) << 30u);
+      descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+      descriptor.fields[3] = DstSel(4,4,4,4) |
+          (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      descriptor.fields[5] = 0x00700000u;
+      descriptor.fields[6] = 0x00280000u |
+          (static_cast<uint32_t>((metadata_address >> 8u) & 0xffu) << 24u);
+      descriptor.fields[7] = static_cast<uint32_t>(metadata_address >> 16u);
+      DescriptorValue read_value{};
+      read_value.dword_count = 8;
+      std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+                read_value.dwords.begin());
+      ImageResource read_resource{};
+      read_resource.resource_class = ImageResourceClass::Sampled;
+      read_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      read_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      read_resource.read = true;
+      // Ordinary Float fetches also depend on HTile. Omitting Dref prevents
+      // the older comparison/storage guard from impersonating this boundary.
+      read_resource.depth_compare = false;
+      auto write_resource = read_resource;
+      write_resource.resource_class = ImageResourceClass::Storage;
+      write_resource.read = false;
+      write_resource.written = true;
+      auto write_value = read_value;
+      const auto image_write_address = scenario.targets_metadata ? metadata_address : base;
+      write_value.dwords[0] = static_cast<uint32_t>(image_write_address >> 8u);
+      write_value.dwords[1] = (write_value.dwords[1] & ~0xffu) |
+          static_cast<uint32_t>(image_write_address >> 40u);
+      write_value.dwords[6] = write_value.dwords[7] = 0;
+
+      // The metadata overlap is the final DWORD, not just the start of the
+      // range. The allowed second metadata buffer begins exactly at End().
+      const uint64_t buffer_address = scenario.disjoint
+          ? independent_metadata_address
+          : (scenario.targets_metadata ? metadata_address + metadata_size - sizeof(uint32_t)
+                                       : base);
+      const uint32_t buffer_size = scenario.disjoint ? metadata_size : sizeof(uint32_t);
+      ShaderBufferResource buffer_descriptor{};
+      buffer_descriptor.UpdateAddress48(buffer_address);
+      buffer_descriptor.fields[2] = buffer_size;
+      buffer_descriptor.fields[3] = DstSel(4,5,6,7);
+      DescriptorValue buffer_value{};
+      buffer_value.dword_count = 4;
+      std::copy(std::begin(buffer_descriptor.fields), std::end(buffer_descriptor.fields),
+                buffer_value.dwords.begin());
+      BufferResource buffer_resource{};
+      buffer_resource.written = true;
+
+      Require(name, "unowned sampled input", !cache.IsMeta(metadata_address) &&
+                  !cache.QueryRegion(base, depth_size).image_bytes,
+              "sampled HTile fixture acquired an earlier image owner");
+      // Force one native owner for both logically disjoint ranges in the
+      // shared variant. A widened metadata drain must not consume the later
+      // writable binding's claim before its GPU write is even recorded.
+      const uint64_t native_owner_size = scenario.shared_native ? metadata_size * 2u : metadata_size;
+      auto metadata_buffer = buffers.ObtainBuffer(metadata_address, native_owner_size, true, false);
+      if (scenario.shared_native) {
+        Require(name, "shared native owner", metadata_buffer.first != nullptr &&
+                    metadata_buffer.first->IsInBounds(metadata_address, metadata_size * 2u),
+                "metadata and its adjacent writer did not acquire one native owner");
+      }
+      Require(name, "native metadata owner", metadata_buffer.first != nullptr &&
+                  buffers.HasGpuDirtyBytes(metadata_address, metadata_size),
+              "sampled HTile fixture failed to establish native metadata ownership");
+      buffers.FillBuffer(metadata_address, metadata_size, 0u, false);
+      // A valid coherent clear0 must remain available if an absent preflight
+      // reaches acquisition; malformed metadata is not an alias-test oracle.
+      std::vector<uint32_t> stale(metadata_size / sizeof(uint32_t));
+      Require(name, "stale metadata backing",
+              Libs::LibKernel::Memory::TryReadBacking(metadata_address,
+                  stale.data(), metadata_size) &&
+                  std::ranges::all_of(stale, [](uint32_t word) { return word == 0xfffffff0u; }),
+              "native metadata preparation unexpectedly changed its CPU backing");
+
+      const auto make_info = [&](ShaderType stage, bool include_read, bool include_write) {
+        Program program{};
+        program.stage = stage;
+        program.shader_info_complete = true;
+        program.resource_tracking_complete = true;
+        if (include_read) program.info.images.push_back(read_resource);
+        if (include_write) {
+          if (scenario.image_writer) program.info.images.push_back(write_resource);
+          else program.info.buffers.push_back(buffer_resource);
+        }
+        uint32_t source = 0;
+        for (auto& image : program.info.images) image.source = source++;
+        for (auto& buffer : program.info.buffers) buffer.source = source++;
+        AllocateBindings(program);
+        CompiledShaderInfo result{};
+        result.stage = stage;
+        result.info = std::move(program.info);
+        result.bindings = std::move(program.bindings);
+        return result;
+      };
+      auto first_info = make_info(scenario.graphics ? ShaderType::Vertex : ShaderType::Compute,
+                                 !scenario.graphics || !scenario.writer_first,
+                                 !scenario.graphics || scenario.writer_first);
+      auto second_info = make_info(ShaderType::Pixel, scenario.writer_first,
+                                   !scenario.writer_first);
+      const auto runtime = [&](const CompiledShaderInfo& info) {
+        ShaderStageRuntime result{.program = &info};
+        for (const auto& image : info.info.images) {
+          result.resources.images.push_back(image.written ? write_value : read_value);
+        }
+        result.resources.buffers.assign(info.info.buffers.size(), buffer_value);
+        return result;
+      };
+      const auto first = runtime(first_info);
+      const auto second = runtime(second_info);
+      BufferView preserved_write_view{};
+      const auto check_allowed = [&](const PreparedBindings& prepared) {
+        Require(name, mode, prepared.resources.images.size() == prepared.program->info.images.size() &&
+                    prepared.resources.buffers.size() == prepared.program->info.buffers.size(),
+                "allowed HTile bindings omitted a declared resource");
+        for (const auto& image : prepared.resources.images) {
+          const auto& native = cache.GetImage(image.image_id);
+          Require(name, mode, image.image_view != nullptr &&
+                      native.backing.format == vk::Format::eD32Sfloat &&
+                      native.info.data.address == base &&
+                      native.info.metadata.range.address == metadata_address &&
+                      native.info.metadata.range.size == metadata_size,
+                  "allowed ordinary read did not retain the native HTile depth owner");
+        }
+        for (size_t i = 0; i < prepared.resources.buffers.size(); ++i) {
+          const auto& buffer = prepared.resources.buffers[i];
+          preserved_write_view = buffer;
+          Require(name, mode, buffer.buffer != nullptr && buffer.range >= buffer_size &&
+                      prepared.buffer_sources[i].first.Base48() == independent_metadata_address &&
+                      prepared.buffer_sources[i].first.NumRecords() == metadata_size,
+                  "allowed adjacent metadata buffer was omitted or rebound to the wrong range");
+        }
+      };
+      std::printf("KYTY_SAMPLED_HTILE_ALIAS_READY %s\n", mode);
+      std::fflush(stdout);
+      if (!scenario.graphics) {
+        auto prepared = executor.PrepareBindings(first);
+        if (scenario.disjoint) {
+          executor.FindBuffers(prepared);
+          executor.RebindBuffers(prepared);
+          executor.RebindImages(prepared);
+          check_allowed(prepared);
+        }
+      } else {
+        auto prepared = RenderExecutorTestAccess::PrepareGraphicsBindings(executor, first, second, true);
+        if (scenario.disjoint) {
+          Require(name, mode, prepared.pixel.has_value(), "allowed pixel stage was omitted");
+          check_allowed(prepared.vertex);
+          check_allowed(*prepared.pixel);
+        }
+      }
+      if (!scenario.disjoint) {
+        // Missing admission is RED; do not dispatch or submit potentially
+        // conflicting resource copies to force a later GPU/ownership failure.
+        std::printf("KYTY_SAMPLED_HTILE_ALIAS_RETURNED %s\n", mode);
+        std::fflush(nullptr);
+        std::_Exit(0);
+      }
+      if (scenario.shared_native) {
+        Require(name, "pending adjacent GPU writer",
+                buffers.HasGpuDirtyBytes(buffer_address, buffer_size),
+                "HTile metadata acquisition consumed a disjoint pending GPU write");
+        Require(name, "exact writer view", preserved_write_view.buffer != nullptr &&
+                    preserved_write_view.range == buffer_size,
+                "shared native writer fixture has an adjusted or missing buffer view");
+        // Record a native GPU write through the binding obtained above without
+        // marking ownership again. Calling BufferCache::FillBuffer here would
+        // recreate the lost claim and conceal the ordering defect.
+        constexpr uint32_t written_word = 0x13579bdfu;
+        const auto command = scheduler.Current().Handle();
+        vk::MemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+        command.fillBuffer(preserved_write_view.buffer, preserved_write_view.offset,
+                           buffer_size, written_word);
+        scheduler.Finish();
+        // Before coherence, the backing must still be stale: this proves the
+        // observed result subsequently came from the native GPU write.
+        std::vector<uint32_t> written(buffer_size / sizeof(uint32_t));
+        Require(name, "stale adjacent backing",
+                Libs::LibKernel::Memory::TryReadBacking(buffer_address, written.data(), buffer_size) &&
+                    std::ranges::all_of(written, [](uint32_t word) { return word == 0u; }),
+                "shared writer fixture no longer has stale CPU backing");
+        buffers.ReadMemory(buffer_address, buffer_size);
+        Require(name, "adjacent GPU write readback",
+                Libs::LibKernel::Memory::TryReadBacking(buffer_address, written.data(), buffer_size) &&
+                    std::ranges::all_of(written, [](uint32_t word) { return word == written_word; }),
+                "GPU readback lost a logically disjoint write after HTile acquisition");
+      }
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "sampled HTile write fixture unmap failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "sampled HTile write fixture release failed");
+    std::printf("KYTY_SAMPLED_HTILE_ALIAS_RETURNED %s\n", mode);
+    std::fflush(stdout);
+  }
+
+  // Exercise the guest compiler's actual descriptor layout with two native
+  // formats. The depth view is borrowed from the runtime texture cache: never
+  // recreate it with the harness's color-only image helper or destroy it here.
+  void CheckMixedComparisonBindings(
+      CommandScheduler& scheduler, vk::ImageView actual_depth_view,
+      vk::ImageLayout depth_layout,
+      const ShaderTextureResource& depth_descriptor,
+      std::array<float, 2> depth_one_uv) {
+    constexpr const char* name = "MixedComparisonBindings";
+    Require(name, "borrowed depth view", actual_depth_view != nullptr,
+            "runtime depth comparison view is null");
+    // Dispatch submits its own command buffer. Complete runtime image copies
+    // and transitions before either test worker reads the borrowed view.
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+
+    auto ordinary = CreateImage2D(
+        name, 1, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {0x3e800000u}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Image depth{};
+    depth.view = actual_depth_view;
+    depth.layout = depth_layout;
+    depth.format = vk::Format::eD32Sfloat;
+
+    vk::SamplerCreateInfo sampler_info{};
+    sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
+    sampler_info.magFilter = vk::Filter::eNearest;
+    sampler_info.minFilter = vk::Filter::eNearest;
+    sampler_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
+    sampler_info.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+    sampler_info.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+    sampler_info.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+    sampler_info.compareEnable = VK_TRUE;
+    sampler_info.compareOp = vk::CompareOp::eLess;
+    sampler_info.maxLod = 0.0f;
+    vk::Sampler sampler = nullptr;
+    RequireVk(name, "comparison sampler",
+              m_device.createSampler(&sampler_info, nullptr, &sampler),
+              "vkCreateSampler");
+
+    for (const bool comparison_first : {false, true}) {
+      TestCase test{};
+      test.name = comparison_first ? "MixedComparisonBindingsComparisonFirst"
+                                   : "MixedComparisonBindingsOrdinaryFirst";
+      test.has_compute_info = true;
+      test.compute_info = {};
+      test.compute_info.threads_num[0] = 1;
+      test.compute_info.threads_num[1] = 1;
+      test.compute_info.threads_num[2] = 1;
+      test.compute_info.wave_size = 32;
+      test.has_user_data = true;
+      // Ordinary 1x1 R32 descriptor in s[0:7]. The harness maps this resource
+      // to its native image directly; its guest base is only descriptor data.
+      test.user_data[0] = 0x1000u;
+      test.user_data[1] =
+          static_cast<u32>(Prospero::BufferFormat::k32Float) << 20u;
+      test.user_data[3] = DstSel(4,4,4,4) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      test.user_data[5] = 0x00700000u;
+      // The actual runtime descriptor remains unchanged in s[8:15].
+      std::copy(std::begin(depth_descriptor.fields),
+                std::end(depth_descriptor.fields), test.user_data.begin() + 8);
+      // Nearest normalized LESS comparison, clamp-to-edge, s[16:19].
+      test.user_data[16] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
+      // AppendStoreVgpr uses s[48:51], an unstructured byte-range buffer.
+      test.user_data[50] = 2u * sizeof(u32);
+      test.initial = {0xdeadbeefu, 0xdeadbeefu};
+      test.expected = {0x3e800000u, 0x3f800000u};
+      test.expected_image_resources = 2;
+      test.expected_sampler_resources = 1;
+      test.expected_buffer_resources = 1;
+      test.expected_sampled_pairs = 1;
+
+      AppendVMovU32(&test.code, 0, 0); // ordinary integer texel x
+      AppendVMovU32(&test.code, 1, 0); // ordinary integer texel y
+      AppendVMovLiteral(&test.code, 4, std::bit_cast<u32>(0.75f));
+      AppendVMovLiteral(&test.code, 5, std::bit_cast<u32>(depth_one_uv[0]));
+      AppendVMovLiteral(&test.code, 6, std::bit_cast<u32>(depth_one_uv[1]));
+      const auto load = [&] {
+        test.code.push_back(EncodeMimg0(0x00, 1)); // IMAGE_LOAD
+        test.code.push_back(EncodeMimg1(8, 0, 0));
+      };
+      const auto compare = [&] {
+        test.code.push_back(EncodeMimg0(0x2f, 1)); // IMAGE_SAMPLE_C_LZ
+        test.code.push_back(EncodeMimg1(12, 4, 2, 4));
+      };
+      if (comparison_first) {
+        compare();
+        load();
+      } else {
+        load();
+        compare();
+      }
+      test.code.push_back(0xbf8c0000u); // S_WAITCNT, all counters zero
+      AppendStoreVgpr(&test.code, 8, 0);
+      AppendStoreVgpr(&test.code, 12, 1);
+      AppendEnd(&test.code);
+
+      const auto compiled = CompileCase(test, WorkgroupLimits());
+      std::vector<const Image*> images(compiled.program.info.images.size());
+      for (size_t resource = 0; resource < images.size(); ++resource) {
+        const auto& info = compiled.program.info.images[resource];
+        Require(test.name, "compiled image class",
+                info.resource_class ==
+                    ShaderRecompiler::IR::ImageResourceClass::Sampled,
+                "mixed comparison fixture unexpectedly uses a storage image");
+        images[resource] = info.depth_compare ? &depth : &ordinary;
+      }
+      auto output = CreateStorageBuffer(test.name, test.initial, test.expected.size());
+      // Layout, bindings and image resource indices all come from CompileCase;
+      // no manually assembled SPIR-V or hard-coded native binding numbers.
+      Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr,
+               sampler, images);
+      const auto observed = ReadBuffer(test.name, output, test.expected.size());
+      Require(test.name, "mixed comparison readback", observed == test.expected,
+              "ordinary R32 fetch or runtime D32 comparison produced wrong bits");
+      DestroyBuffer(&output);
+      std::printf("[gpu]     %-32s ok\n", test.name);
+    }
+    m_device.destroySampler(sampler, nullptr);
+    DestroyImage(&ordinary);
+    // depth is a borrowed view; its owner stays alive in the runtime cache.
+  }
+
   void CheckStorageColorComparisonPromotion() {
     constexpr const char *name = "StorageColorComparisonPromotion";
     constexpr uintptr_t base = 0x0000000203e00000ull;
@@ -8845,6 +9719,10 @@ OpFunctionEnd
           vk::Filter::eNearest);
       Require(name, "nearest comparison", nearest[0] == 0.0f && nearest[2] == 1.0f,
               "nearest comparison did not preserve endpoint texels");
+      // Compile and dispatch mixed ordinary R32 and comparison D32 resources
+      // using the real allocator; x=2 is exactly depth 1 in this fixture.
+      CheckMixedComparisonBindings(scheduler, comparison_view,
+          vk::ImageLayout::eShaderReadOnlyOptimal, descriptor, right_uv);
       Require(name, "readback queue",
               TextureCacheTestAccess::TryDownload(texture_cache, comparison.image_id),
               "promoted depth image could not be queued for readback");
@@ -10991,7 +11869,8 @@ OpFunctionEnd
       write.pBufferInfo = &gds_info;
       writes.push_back(write);
     }
-    const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
+    std::vector<const ShaderRecompiler::IR::DescriptorBinding*> sampled_bindings;
+    size_t sampled_descriptor_count = 0;
     const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
     const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
     const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
@@ -11004,10 +11883,8 @@ OpFunctionEnd
       const auto &image =
           compiled.program.info.images.at(binding.resources.front());
       if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
-        Require(test.name, "dispatch", sampled == nullptr,
-                "Vulkan test harness needs separate sampled images for mixed "
-                "descriptor classes");
-        sampled = &binding;
+        sampled_bindings.push_back(&binding);
+        sampled_descriptor_count += binding.resources.size();
       } else if (image.atomic) {
         storage_atomic = &binding;
       } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
@@ -11016,13 +11893,16 @@ OpFunctionEnd
         storage_uint = &binding;
       }
     }
-    if (sampled != nullptr) {
+    // Allocate the full backing array before saving pImageInfo pointers in
+    // writes: multiple sampled classes must not invalidate earlier groups.
+    sampled_infos.resize(sampled_descriptor_count);
+    size_t sampled_offset = 0;
+    for (const auto* sampled : sampled_bindings) {
       Require(test.name, "dispatch",
               sampled_image != nullptr || !sampled_images_by_resource.empty(),
               "sampled image descriptor requested but no sampled image was "
               "provided");
-      sampled_infos.resize(sampled->resources.size());
-      for (size_t slot = 0; slot < sampled_infos.size(); ++slot) {
+      for (size_t slot = 0; slot < sampled->resources.size(); ++slot) {
         const auto resource = sampled->resources[slot];
         const auto *image = sampled_image;
         if (!sampled_images_by_resource.empty()) {
@@ -11032,17 +11912,18 @@ OpFunctionEnd
         }
         Require(test.name, "dispatch", image != nullptr,
                 "sampled image resource has a null fixture binding");
-        sampled_infos[slot].imageView = image->view;
-        sampled_infos[slot].imageLayout = image->layout;
+        sampled_infos[sampled_offset + slot].imageView = image->view;
+        sampled_infos[sampled_offset + slot].imageLayout = image->layout;
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
       write.dstBinding = Native(sampled->kind);
-      write.descriptorCount = static_cast<u32>(sampled_infos.size());
+      write.descriptorCount = static_cast<u32>(sampled->resources.size());
       write.descriptorType = vk::DescriptorType::eSampledImage;
-      write.pImageInfo = sampled_infos.data();
+      write.pImageInfo = sampled_infos.data() + sampled_offset;
       writes.push_back(write);
+      sampled_offset += sampled->resources.size();
     }
     const auto BindStorage =
         [&](const ShaderRecompiler::IR::DescriptorBinding *binding,
@@ -29715,6 +30596,191 @@ void CheckComparisonAliasPositive() {
 }
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct RendererFailureCase {
+  const char* mode;
+  const char* diagnostic;
+};
+
+// Sequential Windows child admission checks. Run without a parent VulkanHarness;
+// missing or unrelated failures are not proof of the intended runtime boundary.
+void CheckRendererFailureCases(const char* name, const char* child_selector,
+                               const char* ready_prefix,
+                               const char* returned_prefix,
+                               std::span<const RendererFailureCase> cases) {
+  const auto valid_token = [](const char* token) {
+    return token != nullptr && token[0] != '\0' &&
+        std::ranges::all_of(std::string_view(token), [](unsigned char c) {
+          return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        });
+  };
+  Require(name, "child selector", valid_token(child_selector),
+          "child selector must be a fixed ASCII command-line token");
+  char executable[MAX_PATH]{};
+  const auto executable_length = GetModuleFileNameA(nullptr, executable, MAX_PATH);
+  Require(name, "executable path",
+          executable_length != 0 && executable_length < MAX_PATH,
+          "GetModuleFileName failed or truncated the executable path");
+  std::string failures;
+  for (const auto& test : cases) {
+    const auto* mode = test.mode;
+    Require(name, "child case", valid_token(mode) && test.diagnostic != nullptr &&
+                test.diagnostic[0] != '\0',
+            "child case requires a fixed mode and an exact diagnostic");
+    char directory[MAX_PATH]{};
+    char filename[MAX_PATH]{};
+    Require(name, "temporary log",
+            GetTempPathA(MAX_PATH, directory) != 0 &&
+                GetTempFileNameA(directory, "KCA", 0, filename) != 0,
+            "temporary child log allocation failed");
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    const HANDLE log = CreateFileA(filename, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    const HANDLE input = CreateFileA("NUL", GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(name, "child handles", log != INVALID_HANDLE_VALUE &&
+                input != INVALID_HANDLE_VALUE,
+            "child standard handles could not be opened");
+    const HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    Require(name, "bounded child job", job != nullptr &&
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                         &limits, sizeof(limits)) != 0,
+            "child cleanup job could not be created");
+    std::string command = std::string("\"") + executable +
+        "\" " + child_selector + " " + mode;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = log;
+    startup.hStdError = log;
+    startup.hStdInput = input;
+    PROCESS_INFORMATION process{};
+    const bool created = CreateProcessA(nullptr, mutable_command.data(),
+        nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+        nullptr, &startup, &process) != 0;
+    bool assigned = false;
+    bool resumed = false;
+    DWORD wait = WAIT_FAILED;
+    DWORD termination_wait = WAIT_FAILED;
+    if (created) {
+      assigned = AssignProcessToJobObject(job, process.hProcess) != 0;
+      resumed = assigned && ResumeThread(process.hThread) != DWORD(-1);
+      if (resumed) {
+        wait = WaitForSingleObject(process.hProcess, 30000);
+      }
+      termination_wait = wait;
+      if (wait != WAIT_OBJECT_0) {
+        // Even setup failures leave no suspended orphan. Job closure is a
+        // second cleanup guarantee; no unbounded wait is used.
+        if (assigned) {
+          (void)TerminateJobObject(job, 0x7du);
+        } else {
+          (void)TerminateProcess(process.hProcess, 0x7du);
+        }
+        termination_wait = WaitForSingleObject(process.hProcess, 5000);
+      }
+    }
+    // Closing the job is the fallback kill. Keep the process handle until a
+    // final bounded wait confirms the child cannot overlap the next case.
+    CloseHandle(job);
+    if (created && termination_wait != WAIT_OBJECT_0) {
+      termination_wait = WaitForSingleObject(process.hProcess, 5000);
+    }
+    DWORD exit_code = STILL_ACTIVE;
+    const bool exited = created && termination_wait == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
+        exit_code != STILL_ACTIVE;
+    if (created) {
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+    CloseHandle(input);
+    if (created && !exited) {
+      CloseHandle(log);
+      // Fail immediately: the other modes must not launch while termination
+      // is unconfirmed. This is a cleanup failure, never RED or GREEN.
+      Require(name, "confirmed child termination", false,
+              std::string(mode) + " cleanup did not confirm child termination");
+    }
+    LARGE_INTEGER zero{};
+    LARGE_INTEGER length{};
+    std::string output;
+    const bool sized = GetFileSizeEx(log, &length) != 0 &&
+        length.QuadPart >= 0 && length.QuadPart <= 4 * 1024 * 1024 &&
+        SetFilePointerEx(log, zero, nullptr, FILE_BEGIN) != 0;
+    DWORD read = 0;
+    if (sized) {
+      output.resize(static_cast<size_t>(length.QuadPart));
+      if (!ReadFile(log, output.data(), static_cast<DWORD>(output.size()),
+                    &read, nullptr)) {
+        output.clear();
+      } else {
+        output.resize(read);
+      }
+    }
+    CloseHandle(log); // Deletes the temporary file after the child has exited.
+    std::printf("[guard] %s exit=%lu completed=%d timeout=%d\n%s", mode,
+                static_cast<unsigned long>(exit_code),
+                wait == WAIT_OBJECT_0 && exited, wait == WAIT_TIMEOUT,
+                output.c_str());
+    const auto ready = std::string(ready_prefix) + mode;
+    const bool intended =
+        (output.find(ready + "\n") != std::string::npos ||
+         output.find(ready + "\r\n") != std::string::npos) &&
+        output.find(test.diagnostic) != std::string::npos &&
+        output.find(std::string(returned_prefix) + mode) == std::string::npos;
+    if (!created || !assigned || !resumed || wait != WAIT_OBJECT_0 ||
+        !exited || exit_code != 321 || !intended) {
+      failures += std::string(mode) + " exit=" + std::to_string(exit_code) + "; ";
+    }
+  }
+  Require(name, "specific renderer admission failures", failures.empty(), failures);
+  std::printf("[host]    %-32s ok (%zu cases)\n", name, cases.size());
+}
+void CheckSampledHtileAdmission() {
+  constexpr std::array cases {
+      RendererFailureCase{"tail-unknown",
+          "sampled HTile metadata is not a uniform supported clear"},
+      RendererFailureCase{"mixed-clears",
+          "sampled HTile metadata is not a uniform supported clear"},
+      RendererFailureCase{"clear-image",
+          "sampled HTile import cannot change image ownership"},
+  };
+  CheckRendererFailureCases("SampledHtileAdmission", "--sampled-htile-negative",
+                           "KYTY_SAMPLED_HTILE_NEGATIVE_READY ",
+                           "KYTY_SAMPLED_HTILE_NEGATIVE_RETURNED ", cases);
+}
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckSampledHtileWriteAdmission() {
+  constexpr const char* name = "SampledHtileWriteAdmission";
+  std::vector<RendererFailureCase> rejected;
+  for (const auto& scenario : SampledHtileWriteScenarios) {
+    if (!scenario.disjoint) {
+      rejected.push_back({scenario.mode,
+          "simultaneous sampled HTile and writable resource overlap"});
+    }
+  }
+  CheckRendererFailureCases(name, "--sampled-htile-alias",
+                           "KYTY_SAMPLED_HTILE_ALIAS_READY ",
+                           "KYTY_SAMPLED_HTILE_ALIAS_RETURNED ", rejected);
+  // Construct the parent GPU harness only after every rejection child is
+  // confirmed terminated. These legal boundaries complete their queued work.
+  VulkanHarness vulkan;
+  for (const auto& scenario : SampledHtileWriteScenarios) {
+    if (scenario.disjoint) vulkan.CheckSampledHtileWriteCase(scenario.mode);
+  }
+  std::printf("[host]    %-32s ok (10 rejected, 4 allowed)\n", name);
+}
+#endif
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -29723,6 +30789,38 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--sampled-htile-alias") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledHtileWriteCase(argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sampled-htile-write-admission-only") == 0) {
+    CheckSampledHtileWriteAdmission();
+    return 0;
+  }
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--sampled-htile-admission-only") == 0) {
+    CheckSampledHtileAdmission();
+    return 0;
+  }
+#endif
+  if (argc == 3 && std::strcmp(argv[1], "--sampled-htile-negative") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledHtileClearDiscovery(argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--native-htile-subset-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNativeHtileArraySubset();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sampled-htile-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledHtileClearDiscovery();
+    return 0;
+  }
 // Insert before main's unknown-selector fallback. Parent never constructs Vulkan.
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 if (argc == 3 && std::strcmp(argv[1], "--comparison-alias-positive") == 0) {

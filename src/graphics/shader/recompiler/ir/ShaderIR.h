@@ -252,9 +252,10 @@ struct StageOutput {
 	bool operator==(const StageOutput& other) const = default;
 };
 
-inline constexpr uint32_t FirstImageBinding        = 1u;
-inline constexpr uint32_t FirstStorageImageBinding = 22u;
-inline constexpr uint32_t ImageBindingCount        = 36u;
+inline constexpr uint32_t FirstImageBinding           = 1u;
+inline constexpr uint32_t FirstComparisonImageBinding = 22u;
+inline constexpr uint32_t FirstStorageImageBinding    = FirstComparisonImageBinding + 7u;
+inline constexpr uint32_t ImageBindingCount           = 43u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -267,8 +268,8 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 37u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 43u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -312,9 +313,17 @@ DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledFloatBinding = 1u;
 	constexpr uint32_t SampledUintBinding  = 8u;
 	constexpr uint32_t SampledSintBinding  = 15u;
-	constexpr uint32_t StorageFloatBinding = 22u;
-	constexpr uint32_t StorageUintBinding  = 27u;
-	constexpr uint32_t AtomicUintBinding   = 32u;
+	constexpr uint32_t StorageFloatBinding = FirstStorageImageBinding;
+	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 5u;
+	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 5u;
+
+	// One descriptor variable must not mix ordinary image reads and Dref
+	// accesses: static descriptor validation combines its image operations.
+	if (image.depth_compare &&
+	    (image.resource_class != ImageResourceClass::Sampled ||
+	     image.numeric_class != Prospero::TextureNumericClass::Float)) {
+		return std::nullopt;
+	}
 
 	uint32_t base    = 0;
 	bool     sampled = false;
@@ -324,7 +333,9 @@ DescriptorBindingForImage(const ImageResource& image) {
 		}
 		sampled = true;
 		switch (image.numeric_class) {
-			case Prospero::TextureNumericClass::Float: base = SampledFloatBinding; break;
+			case Prospero::TextureNumericClass::Float:
+				base = image.depth_compare ? FirstComparisonImageBinding : SampledFloatBinding;
+				break;
 			case Prospero::TextureNumericClass::Uint: base = SampledUintBinding; break;
 			case Prospero::TextureNumericClass::Sint: base = SampledSintBinding; break;
 			case Prospero::TextureNumericClass::Unsupported: return std::nullopt;

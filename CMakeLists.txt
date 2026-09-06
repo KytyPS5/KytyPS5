@@ -587,6 +587,17 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 
 	if(WIN32)
+		add_test(NAME sampled_htile_clear_import
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-clear-only)
+		add_test(NAME native_htile_array_subset
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-htile-subset-only)
+		add_test(NAME sampled_htile_write_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-write-admission-only)
+		add_test(NAME sampled_htile_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-admission-only)
+		set_tests_properties(sampled_htile_clear_import native_htile_array_subset PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+		set_tests_properties(sampled_htile_admission PROPERTIES TIMEOUT 150 RUN_SERIAL TRUE)
+		set_tests_properties(sampled_htile_write_admission PROPERTIES TIMEOUT 450 RUN_SERIAL TRUE)
 		# These tests still depend on the Windows multisample-depth path.
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)

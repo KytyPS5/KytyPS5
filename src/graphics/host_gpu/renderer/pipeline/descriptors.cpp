@@ -784,6 +784,135 @@ NormalizeTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
 	return {descriptor, std::move(desc), shader_conversion};
 }
 
+
+// Pure HTile interpretation shared by preflight and actual sampled acquisition.
+// This recognizes Float reads regardless of whether the shader uses Dref.
+static bool NormalizeSampledHtileRead(
+    const ShaderRecompiler::IR::ImageResource& resource, NormalizedTextureDescriptor& normalized) {
+	const auto& descriptor = normalized.descriptor;
+	if (descriptor.IsNull() || !descriptor.MetaCompress() ||
+	    descriptor.TileMode() != Prospero::TileMode::kDepth ||
+	    descriptor.Format() != Prospero::BufferFormat::k32Float ||
+	    resource.numeric_class != Prospero::TextureNumericClass::Float ||
+	    !IsSupportedSampledDepthResource(resource)) {
+		return false;
+	}
+	const uint32_t field3 = descriptor.DstSelXYZW() |
+	    (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
+	    (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
+	    (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
+	    (static_cast<uint32_t>(descriptor.Type()) << 28u);
+	const uint32_t field4 = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
+	const uint32_t field5 = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	    (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
+	const uint32_t control = 0x00280000u | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
+	if (resource.r128 || (descriptor.fields[1] & 0x200fff00u) != 0 ||
+	    (descriptor.fields[2] & 0xf0003000u) != 0 || descriptor.fields[3] != field3 ||
+	    descriptor.fields[4] != field4 || descriptor.fields[5] != field5 ||
+	    (descriptor.fields[6] & 0x00ffffffu) != control) {
+		EXIT("unsupported sampled HTile descriptor encoding\n");
+	}
+	auto& info = normalized.desc.info;
+	const bool multisampled = IsMultisampledTexture(descriptor.Type());
+	if (descriptor.BaseLevel() != 0 || info.resources.levels != 1 ||
+	    (!multisampled && (descriptor.LastLevel() != 0 || descriptor.MaxMip() != 0 ||
+	                      descriptor.MsaaDepth())) ||
+	    (multisampled && descriptor.MaxMip() != descriptor.LastLevel())) {
+		EXIT("unsupported sampled HTile mip layout\n");
+	}
+	TileSizeAlign stencil_size {}, htile_size {}, depth_size {};
+	if (!TileGetDepthSize(info.extent.width, info.extent.height, 0,
+	                      Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::kInvalid,
+	                      true, stencil_size, htile_size, depth_size,
+	                      multisampled ? descriptor.LastLevel() : 0) ||
+	    info.resources.layers == 0 ||
+	    static_cast<uint64_t>(depth_size.size) * info.resources.layers != info.data.size) {
+		EXIT("unsupported sampled HTile allocation footprint\n");
+	}
+	const GuestRange metadata {descriptor.MetaAddr() << 8u,
+	                           static_cast<uint64_t>(htile_size.size) * info.resources.layers};
+	if (!metadata.Valid() || (metadata.address & (htile_size.align - 1u)) != 0 ||
+	    (info.data.address < metadata.End() && metadata.address < info.data.End())) {
+		EXIT("invalid sampled HTile metadata range\n");
+	}
+	info.pixel_format = vk::Format::eD32Sfloat;
+	info.metadata.kind = ImageMetadataKind::Htile;
+	info.metadata.range = metadata;
+	info.metadata.control = control;
+	return true;
+}
+
+static void ValidateSampledHtileWriteAliases(
+    std::span<const ShaderStageRuntime* const> stages) {
+	struct ReadDependency { GuestRange data; GuestRange metadata; };
+	std::vector<ReadDependency> reads;
+	for (const auto* stage: stages) {
+		EXIT_IF(stage == nullptr || !*stage);
+		const auto& images = stage->program->info.images;
+		EXIT_IF(stage->resources.images.size() != images.size());
+		for (uint32_t index = 0; index < images.size(); ++index) {
+			const auto& image = images[index];
+			if (!image.read || image.written || image.atomic ||
+			    image.numeric_class != Prospero::TextureNumericClass::Float) {
+				continue;
+			}
+			auto normalized = NormalizeTextureDescriptor(image, stage->resources.images[index]);
+			if (NormalizeSampledHtileRead(image, normalized)) {
+				reads.push_back({normalized.desc.info.data, normalized.desc.info.metadata.range});
+			}
+		}
+	}
+	if (reads.empty()) {
+		return;
+	}
+	const auto validate_write = [&](GuestRange written) {
+		if (!written.Valid()) {
+			EXIT("invalid writable resource range during sampled HTile admission\n");
+		}
+		for (const auto& read: reads) {
+			for (const auto dependency: {read.data, read.metadata}) {
+				if (written.address < dependency.End() && dependency.address < written.End()) {
+					EXIT("simultaneous sampled HTile and writable resource overlap\n");
+				}
+			}
+		}
+	};
+	for (const auto* stage: stages) {
+		const auto& info = stage->program->info;
+		if (info.uses_dma) {
+			EXIT("sampled HTile admission cannot prove DMA write dependencies\n");
+		}
+		for (uint32_t index = 0; index < info.images.size(); ++index) {
+			const auto& image = info.images[index];
+			if (!image.written && !image.atomic) {
+				continue;
+			}
+			const auto normalized = NormalizeTextureDescriptor(image, stage->resources.images[index]);
+			if (!normalized.descriptor.IsNull()) {
+				validate_write(normalized.desc.info.data);
+			}
+		}
+		EXIT_IF(stage->resources.buffers.size() != info.buffers.size());
+		for (uint32_t index = 0; index < info.buffers.size(); ++index) {
+			if (!info.buffers[index].written && !info.buffers[index].atomic) {
+				continue;
+			}
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(
+			    stage->resources.buffers[index]);
+			const uint64_t address = descriptor.Base48();
+			const uint64_t records = descriptor.NumRecords();
+			const uint64_t stride = descriptor.Stride();
+			if (stride != 0 && records > UINT64_MAX / stride) {
+				EXIT("sampled HTile writable buffer footprint overflow\n");
+			}
+			const uint64_t size = stride == 0 ? records : records * stride;
+			if (address != 0 && size != 0) {
+				validate_write({address, size});
+			}
+		}
+	}
+}
+
 static void ValidateComparisonStorageAliases(
     std::span<const ShaderStageRuntime* const> stages) {
 	bool has_comparison = false;
@@ -862,6 +991,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {id, nullptr, std::move(desc)};
 	}
 	const auto pixel_format = desc.info.pixel_format;
+	const bool sampled_htile = NormalizeSampledHtileRead(resource, normalized);
 	const auto view_format = desc.view_info.format;
 	const auto type = TextureType(descriptor);
 	const bool depth_tile = descriptor.TileMode() == Prospero::TileMode::kDepth;
@@ -884,7 +1014,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.pixel_format = vk::Format::eD32Sfloat;
 	}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	auto       id                  = sampled_htile ? texture_cache.FindSampledHtileImage(desc)
+	                                                : texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -902,7 +1033,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		if (resource.depth_compare) {
 			EXIT("color depth comparison requires a supported depth image representation "
-			     "and enabled VK_EXT_depth_range_unrestricted\n");
+			     "and enabled VK_EXT_depth_range_unrestricted: extension=%d eligible=%d "
+			     "source=%u class=%u numeric=%u dimension=%u mip=%u read=%d write=%d atomic=%d "
+			     "addr=0x%016" PRIx64 " format=%u type=%u tile=%u "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     m_context.GetGraphics().depth_range_unrestricted_enabled, promote_comparison,
+			     resource.source, static_cast<uint32_t>(resource.resource_class),
+			     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
+			     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
+			     descriptor.Base40(), static_cast<uint32_t>(format), static_cast<uint32_t>(type),
+			     static_cast<uint32_t>(descriptor.TileMode()), descriptor.fields[0], descriptor.fields[1],
+			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
 		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
@@ -973,6 +1115,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	EXIT_IF(!runtime);
 	const ShaderStageRuntime* stage = &runtime;
 	ValidateComparisonStorageAliases(std::span<const ShaderStageRuntime* const>{&stage, 1u});
+	ValidateSampledHtileWriteAliases(std::span<const ShaderStageRuntime* const>{&stage, 1u});
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
 	PreparedBindings prepared;
@@ -1121,6 +1264,8 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	// vertex stage first could already replace an image needed by the pixel stage.
 	const std::array<const ShaderStageRuntime*, 2> stages {&vertex, &pixel};
 	ValidateComparisonStorageAliases(std::span<const ShaderStageRuntime* const>{
+	    stages.data(), pixel_active ? 2u : 1u});
+	ValidateSampledHtileWriteAliases(std::span<const ShaderStageRuntime* const>{
 	    stages.data(), pixel_active ? 2u : 1u});
 	GraphicsBindings bindings {
 	    .vertex = PrepareBindings(vertex),

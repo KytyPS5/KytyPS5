@@ -147,3 +147,26 @@ Required tests:
   differing loop counts, and same-address writes on a native subgroup-32 device.
 - Native Windows capture of `916ea8893e5b276a`, comparing generated instruction counts and
   steady dispatch time while preserving the full output and guard readback.
+
+## Depth comparison on non-depth color images
+
+Status: upstream implementation selected; automated regression deferred.
+
+Observed trigger: after reaching frame 93, a sampled color image with format 56 requested a
+depth comparison. RDNA2 permits comparison sampling for this descriptor use, while Vulkan
+`OpImageSampleDref*` requires a host format with native depth-comparison support. Treating the
+color image as a Vulkan depth image fails specialization before the next frame.
+
+Required tests:
+
+- Resource-specialization cases for native depth formats and non-depth UNORM/sRGB/compressed
+  formats, checking that only unsupported host formats select manual comparison.
+- Single-sample, gather, offset, projected and bindless paths covering all eight comparison
+  functions and the guest-defined `Dref op Dtexel` operand order.
+- Sampler-splitting cases proving comparison state survives point/linear sampler cloning.
+- Swizzle cases proving manual comparison reads the descriptor-selected source component.
+- sRGB color formats checked through an equivalent UNORM view so depth-like values are not
+  changed by hardware gamma decoding.
+- Texture upload/view aspect tests for native depth images and ordinary color images.
+- Native Vulkan readback comparing manual and hardware comparison where both are available,
+  followed by a Yotei run beyond the frame-93 specialization failure.

@@ -512,6 +512,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
 		case IR::StageInputKind::Layer: return BuiltInLayer;
+		case IR::StageInputKind::SampleId: return BuiltInSampleId;
 		case IR::StageInputKind::BaryCoordSmooth: return BuiltInBaryCoordKHR;
 		case IR::StageInputKind::BaryCoordNoPerspective: return BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return BuiltInWorkgroupId;
@@ -535,7 +536,7 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 	}
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
-		if (input.kind == IR::StageInputKind::Layer) {
+		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 		}
 		if (input.kind == IR::StageInputKind::Parameter) {
@@ -711,6 +712,9 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireVersion(0x00010500u);
 		state.builder.RequireCapability(CapabilityShaderLayer);
 	}
+	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
+		state.builder.RequireCapability(CapabilitySampleRateShading);
+	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
@@ -803,6 +807,7 @@ void DefineModule(EmitterState& state) {
 			case IR::StageInputKind::VertexIndex:
 			case IR::StageInputKind::InstanceIndex:
 			case IR::StageInputKind::Layer:
+			case IR::StageInputKind::SampleId:
 				ptr_type = TypePointer(state, StorageClassInput, TypeI32(state));
 				break;
 			case IR::StageInputKind::WorkgroupId:

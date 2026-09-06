@@ -162,6 +162,7 @@ enum class StageInputKind {
 	FrontFacing,
 	PackedAncillary,
 	Layer,
+	SampleId,
 	BaryCoordSmooth,
 	BaryCoordNoPerspective,
 	WorkgroupId,

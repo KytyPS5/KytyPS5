@@ -1048,6 +1048,7 @@ struct GraphicsCase {
   bool pixel_ancillary = false;
   bool pixel_front_face = false;
   u32 layers = 1;
+  vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1;
 };
 
 struct CompiledShader {
@@ -10252,7 +10253,8 @@ public:
                         u32 dwords_per_pixel, vk::ImageLayout final_layout,
                         vk::ImageType image_type, vk::ImageViewType view_type,
                         u32 layers, u32 view_base_layer = 0,
-                        u32 view_layers = 0) {
+                        u32 view_layers = 0,
+                        vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
     Image ret;
     ret.format = format;
     ret.width = width;
@@ -10270,7 +10272,7 @@ public:
     image_info.extent.depth = 1;
     image_info.mipLevels = ret.mip_levels;
     image_info.arrayLayers = layers;
-    image_info.samples = vk::SampleCountFlagBits::e1;
+    image_info.samples = samples;
     image_info.tiling = vk::ImageTiling::eOptimal;
     image_info.usage = usage | vk::ImageUsageFlagBits::eTransferDst |
                        vk::ImageUsageFlagBits::eTransferSrc;
@@ -10914,7 +10916,15 @@ public:
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
-                      test.layers);
+                      test.layers, 0, 0, test.samples);
+    Image resolved;
+    if (test.samples != vk::SampleCountFlagBits::e1) {
+      resolved = CreateImageMips(
+          test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
+          {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+          test.layers);
+    }
     const std::vector<u32> default_vertices = {
         0xbf800000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u,
         0x3f800000u, 0x40400000u, 0xbf800000u, 0x3e800000u, 0x3f000000u,
@@ -11028,7 +11038,7 @@ public:
 
     vk::PipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
-    multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    multisample.rasterizationSamples = test.samples;
 
     vk::PipelineColorBlendAttachmentState color_attachment{};
     color_attachment.colorWriteMask =
@@ -11069,6 +11079,11 @@ public:
     color.imageLayout = vk::ImageLayout::eGeneral;
     color.loadOp = vk::AttachmentLoadOp::eClear;
     color.storeOp = vk::AttachmentStoreOp::eStore;
+    if (resolved.image != nullptr) {
+      color.resolveMode = vk::ResolveModeFlagBits::eAverage;
+      color.resolveImageView = resolved.view;
+      color.resolveImageLayout = vk::ImageLayout::eGeneral;
+    }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
     rendering.renderArea.extent = {1, 1};
@@ -11091,7 +11106,7 @@ public:
     EndSubmitAndFree(test.name, "graphics", cmd);
     target.layout = vk::ImageLayout::eGeneral;
 
-    auto pixel = ReadImage(test.name, &target);
+    auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
     pixel.resize(4 * test.layers);
 
     m_device.destroyPipeline(pipeline, nullptr);
@@ -11099,6 +11114,7 @@ public:
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
+    DestroyImage(&resolved);
     DestroyImage(&target);
     return pixel;
   }
@@ -22449,6 +22465,29 @@ GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   return test;
 }
 
+GraphicsCase GraphicsAncillarySampleId() {
+  GraphicsCase test;
+  test.name = "GraphicsAncillarySampleId";
+  test.pixel_ancillary = true;
+  test.samples = vk::SampleCountFlagBits::e4;
+  AppendVop3(&test.fragment_code, 0x148, 4, Vgpr(2), InlineU32(8), InlineU32(4));
+  AppendVop3(&test.fragment_code, 0x149, 5, Vgpr(2), InlineU32(8), InlineU32(2));
+  AppendVop3(&test.fragment_code, 0x148, 6, Vgpr(2), InlineU32(9), InlineU32(1));
+  test.fragment_code.push_back(EncodeVop1(0x06, 0, Vgpr(4)));
+  test.fragment_code.push_back(EncodeVop1(0x05, 1, Vgpr(5)));
+  test.fragment_code.push_back(EncodeVop1(0x06, 2, Vgpr(6)));
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_BFE_U32, ShaderOpcode::V_BFE_I32,
+                  ShaderOpcode::V_CVT_F32_U32, ShaderOpcode::V_CVT_F32_I32,
+                  ShaderOpcode::V_MOV_B32, ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  // Average samples 0..3, their signed low two bits, and their second bit.
+  test.expected_pixel = {0x3fc00000u, 0xbf000000u, 0x3f000000u, 0x3f800000u};
+  return test;
+}
+
 GraphicsCase GraphicsFlatInterpolatorExport() {
   using O = ShaderOpcode;
 
@@ -23012,6 +23051,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsInterpolationExport(),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
+      GraphicsAncillarySampleId(),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
       GraphicsDirectSgprPushConstantExport(),

@@ -72,7 +72,7 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
-	    kind == IR::StageInputKind::Layer) {
+	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction({OpLoad, TypeI32(state), value, variable});

@@ -6011,8 +6011,22 @@ void TestPixelAncillaryLayerInput() {
             unused_result.spirv[1] == 0x00010300u &&
             !SpirvContainsCapability(unused_result.spirv, 69u),
         "unused ancillary input changed the module requirements");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+
   shader[1] = EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4);
+  auto sample_result = RecompileForTest(shader, options);
+  Check(ProgramHasInput(sample_result.program, StageInputKind::SampleId) &&
+            ProgramHasInput(sample_result.program, StageInputKind::Layer) &&
+            !ProgramHasInput(sample_result.program, StageInputKind::PackedAncillary),
+        "sample index extraction discarded another live ancillary field");
+  Check(SpirvHasDecorationValueWithDecoration(sample_result.spirv, 11u, 18u, 14u) &&
+            SpirvContainsCapability(sample_result.spirv, 35u),
+        "sample index lacks its flat builtin or sample-rate capability");
+  const auto sample_source = DisassembleSpirvBinary(sample_result.spirv);
+  Check(SpirvSourceHasInstructionUsing(sample_source, "OpLoad", "%int %gl_SampleID"),
+        "sample index was not loaded from its scalar integer input");
+  CheckSpirvBinaryValidates(sample_result.spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  shader[1] = EncodeVop3Word1(5 + 256, 128 + 12, 128 + 4);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "unsupported live ancillary field was silently replaced");
 #endif

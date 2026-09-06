@@ -310,17 +310,24 @@ void FoldInstruction(Block& block, Block::iterator instruction) {
 			const auto* source = value.TryInstruction();
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
 			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
-			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) &&
-			    offset.U32() >= 16u && offset.U32() < 27u && count.U32() != 0u &&
-			    count.U32() <= 27u - offset.U32()) {
-				// Preserve the extraction (including sign extension) while exposing only its
-				// used hardware field. Other live ancillary fields remain unsupported.
-				const auto layer = block.PrependNewInst(
-				    instruction, ValueOpcode::GetBuiltin,
-				    {Value(static_cast<uint32_t>(StageInputKind::Layer)), Value(0u)});
-				inst.SetArg(0, Value(&*layer));
-				inst.SetArg(1, Value(offset.U32() - 16u));
-				return;
+			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
+				constexpr struct {
+					uint32_t       start;
+					uint32_t       end;
+					StageInputKind kind;
+				} fields[] = {{8u, 12u, StageInputKind::SampleId}, {16u, 27u, StageInputKind::Layer}};
+				for (const auto& field: fields) {
+					if (offset.U32() >= field.start && offset.U32() < field.end &&
+					    count.U32() <= field.end - offset.U32()) {
+						// Preserve extraction and sign extension while exposing only the used field.
+						const auto input = block.PrependNewInst(
+						    instruction, ValueOpcode::GetBuiltin,
+						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
+						inst.SetArg(0, Value(&*input));
+						inst.SetArg(1, Value(offset.U32() - field.start));
+						return;
+					}
+				}
 			}
 			if (!IsImmediate(value, Type::U32) || !IsImmediate(offset, Type::U32) ||
 			    !IsImmediate(count, Type::U32) || offset.U32() > 32u ||

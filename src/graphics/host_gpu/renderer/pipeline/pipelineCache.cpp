@@ -37,6 +37,28 @@ namespace Libs::Graphics {
 
 namespace {
 
+vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
+	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
+	if (mode.poly_mode == 0) {
+		return vk::PolygonMode::eFill;
+	}
+	EXIT_NOT_IMPLEMENTED(mode.poly_mode != 1);
+	if (cull_front && cull_back) {
+		return vk::PolygonMode::eFill;
+	}
+	if (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype) {
+		EXIT("Pipeline: different polygon modes for two visible faces are unsupported\n");
+	}
+	// Vulkan has one polygon mode. A culled face does not constrain that mode.
+	const auto polygon_mode = cull_front ? mode.polymode_back_ptype : mode.polymode_front_ptype;
+	switch (polygon_mode) {
+		case 0: return vk::PolygonMode::ePoint;
+		case 1: return vk::PolygonMode::eLine;
+		case 2: return vk::PolygonMode::eFill;
+		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
+	}
+}
+
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -693,6 +715,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
 	static_params.face       = mc.face;
+	static_params.polygon_mode =
+	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);

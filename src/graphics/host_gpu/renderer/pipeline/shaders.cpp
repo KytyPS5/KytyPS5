@@ -597,6 +597,7 @@ void CreatePipelineInternal(
 #endif
 	rasterizer.cullMode  = cull_mode;
 	rasterizer.frontFace = front_face;
+	rasterizer.polygonMode = static_params.polygon_mode;
 	rasterizer.lineWidth = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};

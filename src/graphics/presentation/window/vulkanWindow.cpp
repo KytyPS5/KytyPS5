@@ -330,6 +330,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("multiViewport is not supported\n");
 			skip_device = true;
 		}
+		if (device_features2.features.fillModeNonSolid != VK_TRUE) {
+			LOGF("fillModeNonSolid is not supported\n");
+			skip_device = true;
+		}
 		if (device_features2.features.fragmentStoresAndAtomics != VK_TRUE) {
 			LOGF("fragmentStoresAndAtomics is not supported\n");
 			skip_device = true;
@@ -647,6 +651,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderCullDistance != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.largePoints != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.multiViewport != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.fillModeNonSolid != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
@@ -677,6 +682,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
+	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;

@@ -540,16 +540,6 @@ static void McCheck(const HW::ModeControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.cull_front != false);
 	// EXIT_NOT_IMPLEMENTED(c.cull_back != false);
 	// EXIT_NOT_IMPLEMENTED(c.face != false);
-	if (c.poly_mode != 0) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.POLY_MODE is not fully implemented; continuing "
-			     "with filled polygons\n");
-			logged = true;
-		}
-	}
-	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype != 0 && c.polymode_front_ptype != 2);
-	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype != 0 && c.polymode_back_ptype != 2);
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {

@@ -11264,6 +11264,145 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  void CheckPolygonModeRasterization() {
+    constexpr const char *name = "PolygonModeRasterization";
+    constexpr uint32_t extent = 32;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    registers.SetRenderTargetMask(0xf);
+    scheduler.Begin(registers, user_config, shaders);
+
+    GraphicsCase test;
+    test.name = name;
+    AppendVMovLiteral(&test.fragment_code, 0, 0x3f800000u);
+    test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+    test.fragment_code.push_back(EncodeExp1(0, 0, 0, 0));
+    AppendEnd(&test.fragment_code);
+    auto fragment = CompileFragmentCase(test);
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
+    const ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
+    const ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
+    ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
+    vertex_program.stage = ShaderType::Vertex;
+    vertex_program.info.vertex_fetch_components[0] = 2;
+    vertex_program.info.vertex_fetch_components[1] = 4;
+    ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
+    pixel_program.stage = ShaderType::Pixel;
+    pixel_program.info = fragment.program.info;
+    pixel_program.bindings = fragment.program.bindings;
+    ShaderVertexInputInfo vertex{};
+    vertex.stage.program = &vertex_program;
+    vertex.resources_num = 2;
+    vertex.buffers_num = 1;
+    vertex.buffers[0].stride = 6 * sizeof(float);
+    vertex.buffers[0].attr_num = 2;
+    vertex.buffers[0].attr_indices[1] = 1;
+    vertex.buffers[0].attr_offsets[1] = 2 * sizeof(float);
+    for (uint32_t i = 0; i < 2; i++) {
+      const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float
+                                 : Prospero::BufferFormat::k32_32_32_32Float;
+      vertex.resources[i].fields[3] = DstSel(4, 5, 6, 7) |
+                                      (static_cast<uint32_t>(format) << 12u);
+      vertex.resources_dst[i].registers_num = i == 0 ? 2 : 4;
+    }
+    ShaderPixelInputInfo pixel{};
+    pixel.stage.program = &pixel_program;
+
+    RenderColorInfo color{};
+    color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+    color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+    color.desc.info.extent = {extent, extent, 1};
+    color.desc.info.pitch = extent;
+    color.desc.info.bytes_per_block = 16;
+    color.desc.view_info.format = color.desc.info.pixel_format;
+    color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    auto &cache = context.GetTextureCache();
+    color.image_id = TextureCacheTestAccess::InsertImage(cache, color.desc.info);
+    auto &native = cache.GetImage(color.image_id);
+    Image target{};
+    target.image = native.backing.image;
+    target.view = native.FindView(color.desc.view_info);
+    target.width = target.height = extent;
+    target.dwords_per_pixel = 4;
+    const std::array<float, 18> vertices{
+        -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 1, 1, 1, 1,
+        0.0f, 0.75f, 1, 1, 1, 1};
+    std::vector<u32> vertex_words(vertices.size());
+    std::memcpy(vertex_words.data(), vertices.data(), sizeof(vertices));
+    auto buffer = CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
+                                   vertex_words);
+    const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back) -> PipelineCache::Pipeline & {
+      HW::ModeControl mode{};
+      mode.poly_mode = enabled;
+      mode.polymode_front_ptype = front;
+      mode.polymode_back_ptype = back;
+      registers.SetModeControl(mode);
+      return context.GetPipelineCache().CreateGraphicsPipeline(
+          std::span{&color, 1u}, {}, vertex, scheduler.Current(), &pixel,
+          vk::PrimitiveTopology::eTriangleList, false, vertex_shader, pixel_shader);
+    };
+    auto &filled = pipeline(true, 2, 2);
+    auto &wireframe = pipeline(true, 1, 1);
+    Require(name, "pipeline cache", filled.pipeline != wireframe.pipeline &&
+                pipeline(true, 2, 2).pipeline == filled.pipeline &&
+                pipeline(false, 1, 0).pipeline == filled.pipeline,
+            "polygon mode was lost from the cache key or dormant face modes were applied");
+    const auto draw = [&](const PipelineCache::Pipeline &selected) {
+      auto cmd = BeginCommands(name, "rasterization");
+      AddImageBarrier(cmd, target.image, target.layout, vk::ImageLayout::eGeneral,
+                      vk::PipelineStageFlagBits::eAllCommands,
+                      vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                      vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                      vk::AccessFlagBits::eColorAttachmentWrite);
+      vk::RenderingAttachmentInfo attachment{};
+      attachment.imageView = target.view;
+      attachment.imageLayout = vk::ImageLayout::eGeneral;
+      attachment.loadOp = vk::AttachmentLoadOp::eClear;
+      attachment.storeOp = vk::AttachmentStoreOp::eStore;
+      vk::RenderingInfo rendering{};
+      rendering.renderArea.extent = {extent, extent};
+      rendering.layerCount = 1;
+      rendering.colorAttachmentCount = 1;
+      rendering.pColorAttachments = &attachment;
+      cmd.beginRendering(rendering);
+      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
+      const vk::Viewport viewport{0, 0, extent, extent, 0, 1};
+      const vk::Rect2D scissor{{0, 0}, {extent, extent}};
+      cmd.setViewportWithCount(1, &viewport);
+      cmd.setScissorWithCount(1, &scissor);
+      cmd.setLineWidth(1);
+      cmd.setDepthTestEnable(false);
+      cmd.setDepthWriteEnable(false);
+      cmd.setDepthCompareOp(vk::CompareOp::eAlways);
+      cmd.setDepthBiasEnable(false);
+      const vk::Bool32 write = true;
+      cmd.setColorWriteEnableEXT(1, &write);
+      const vk::DeviceSize offset = 0;
+      cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
+      cmd.draw(3, 1, 0, 0);
+      cmd.endRendering();
+      EndSubmitAndFree(name, "rasterization", cmd);
+      target.layout = vk::ImageLayout::eGeneral;
+      return ReadImage(name, &target);
+    };
+    const auto solid_pixels = draw(filled);
+    const auto line_pixels = draw(wireframe);
+    const auto interior = 4 * (16 * extent + 16);
+    Require(name, "GPU coverage", solid_pixels[interior] == 0x3f800000u &&
+                line_pixels[interior] == 0 &&
+                std::ranges::any_of(line_pixels, [](u32 value) { return value == 0x3f800000u; }),
+            "wireframe did not preserve triangle edges while leaving its interior empty");
+    scheduler.Finish();
+    DestroyBuffer(&buffer);
+    m_device.destroyShaderModule(pixel_shader.module);
+    m_device.destroyShaderModule(vertex_shader.module);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(test.layers > 1);
@@ -11297,19 +11436,8 @@ public:
         CreateHostBuffer(test.name, vertices.size() * sizeof(u32),
                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
 
-    auto make_module = [&](const std::vector<u32> &spirv) {
-      vk::ShaderModuleCreateInfo module_info{};
-      module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
-      module_info.codeSize = spirv.size() * sizeof(u32);
-      module_info.pCode = spirv.data();
-      vk::ShaderModule module = nullptr;
-      RequireVk(test.name, "graphics",
-                m_device.createShaderModule(&module_info, nullptr, &module),
-                "vkCreateShaderModule");
-      return module;
-    };
-    vk::ShaderModule vertex_module = make_module(vertex_spirv);
-    vk::ShaderModule fragment_module = make_module(fragment.spirv);
+    vk::ShaderModule vertex_module = CreateShaderModule(test.name, vertex_spirv);
+    vk::ShaderModule fragment_module = CreateShaderModule(test.name, fragment.spirv);
 
     const auto &fragment_bind = fragment.program.bindings;
     vk::PushConstantRange push_constant_range{};
@@ -12672,9 +12800,15 @@ private:
     available_features13.pNext = &available_features12;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR available_derivatives{};
     available_derivatives.pNext = &available_features13;
+    vk::PhysicalDeviceDepthClipEnableFeaturesEXT available_depth_clip{};
+    available_depth_clip.pNext = &available_derivatives;
+    vk::PhysicalDeviceDepthClipControlFeaturesEXT available_clip_control{};
+    available_clip_control.pNext = &available_depth_clip;
+    vk::PhysicalDeviceColorWriteEnableFeaturesEXT available_color_write{};
+    available_color_write.pNext = &available_clip_control;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_derivatives;
+    available_features2.pNext = &available_color_write;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -12702,6 +12836,10 @@ private:
             "bufferDeviceAddress is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
+                available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
+                available_color_write.colorWriteEnable,
+            "production rasterization features are not supported");
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -12733,17 +12871,30 @@ private:
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
-    device_info.pNext = &derivatives;
+    vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
+    depth_clip.pNext = &derivatives;
+    depth_clip.depthClipEnable = true;
+    vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
+    clip_control.pNext = &depth_clip;
+    clip_control.depthClipControl = true;
+    vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write{};
+    color_write.pNext = &clip_control;
+    color_write.colorWriteEnable = true;
+    device_info.pNext = &color_write;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
+    device_features.fillModeNonSolid = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME};
+        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
+        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME};
     device_info.enabledExtensionCount = std::size(device_extensions);
     device_info.ppEnabledExtensionNames = device_extensions;
     RequireVk("VulkanHarness", "dispatch",
@@ -12809,6 +12960,16 @@ private:
     default:
       return {};
     }
+  }
+
+  vk::ShaderModule CreateShaderModule(const char *shader_name, const std::vector<u32> &spirv) {
+    vk::ShaderModuleCreateInfo info{};
+    info.codeSize = spirv.size() * sizeof(u32);
+    info.pCode = spirv.data();
+    vk::ShaderModule module{};
+    RequireVk(shader_name, "graphics", m_device.createShaderModule(&info, nullptr, &module),
+              "vkCreateShaderModule");
+    return module;
   }
 
   vk::CommandBuffer BeginCommands(const char *shader_name, const char *stage) {
@@ -27831,6 +27992,7 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
+    vulkan.CheckPolygonModeRasterization();
     vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
@@ -27839,6 +28001,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPolygonModeRasterization();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -28037,6 +28204,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
+  vulkan.CheckPolygonModeRasterization();
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
   vulkan.CheckUnifiedImageViewCache();

@@ -255,6 +255,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	// Snapshot bounds and the eventual dispatch must use the same guest grid.
+	// Compute it before materialization, without putting counts in the static shader key.
+	const auto guest_groups = ShaderRecompiler::ComputeGuestWorkgroups(
+	    {thread_group_x, thread_group_y, thread_group_z},
+	    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+	     cs_regs.cs_regs.num_thread_z}, use_thread_dimensions);
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) {
@@ -340,18 +346,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (use_thread_dimensions) {
-		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
-			return (threads == 0
-			            ? 0u
-			            : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
-		};
-
 		const uint32_t old_x = thread_group_x;
 		const uint32_t old_y = thread_group_y;
 		const uint32_t old_z = thread_group_z;
-		thread_group_x       = groups_from_threads(thread_group_x, cs_regs.cs_regs.num_thread_x);
-		thread_group_y       = groups_from_threads(thread_group_y, cs_regs.cs_regs.num_thread_y);
-		thread_group_z       = groups_from_threads(thread_group_z, cs_regs.cs_regs.num_thread_z);
+		thread_group_x = guest_groups[0];
+		thread_group_y = guest_groups[1];
+		thread_group_z = guest_groups[2];
 
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {

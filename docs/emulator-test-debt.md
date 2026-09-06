@@ -63,3 +63,23 @@ Required tests:
   probe or resource limits.
 - Equivalence checks against raw scalar-buffer reads and `ReadFirstLane`, followed by
   native Windows audits and a bounded Vulkan readback before upstream submission.
+
+## Acyclic WorkgroupId coefficient reads stay on the GPU
+
+Status: production fix validated in a bounded game run; automated regression deferred.
+
+Observed trigger: a small acyclic compute shader reads one immutable coefficient per
+`WorkgroupId` through a raw address. Eager CPU snapshotting fails when the source was
+written by the GPU and is therefore unavailable to the coherent specialization reader,
+although the existing BDA emitter can execute the same read directly on the GPU.
+
+Required tests:
+
+- An acyclic compute case where `WorkgroupId` indexes a raw scalar payload and resource
+  tracking preserves `LoadAddressU32` instead of creating `ReadBoundedSrtU32`.
+- GPU readback for the live BDA path across several workgroups, including wave64 split
+  on a native subgroup-32 device.
+- A neighboring cyclic/cooperative case proving that bounded immutable coefficient
+  snapshots remain enabled where cross-wave scheduling requires them.
+- Runtime rejection coverage for dirty specialization memory without converting an
+  otherwise executable acyclic shader into a fatal materialization failure.

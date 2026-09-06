@@ -1125,6 +1125,15 @@ public:
 		}
 		if (!BuildGraph()) return {};
 		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
+		if (workgroup) {
+			// Acyclic shaders can execute this uniform-per-workgroup scalar read
+			// directly through the existing BDA emitter. Keep CPU snapshots for
+			// cyclic programs whose cooperative wave scheduling needs immutable
+			// coefficients; eagerly reading GPU-produced acyclic inputs would fail.
+			std::unordered_set<const Block*> active;
+			std::unordered_set<const Block*> complete;
+			if (!GraphHasCycle(m_program.blocks.front(), active, complete)) return {};
+		}
 		const auto maximum = workgroup ? std::optional<uint32_t>{} :
 		                                FiniteMaximum(Value(const_cast<Inst*>(offset.index)));
 		if (workgroup || maximum.has_value()) {

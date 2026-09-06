@@ -24,6 +24,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
+		uint32_t                      indirect_sampler           = UINT32_MAX;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          operator==(const Image&) const = default;
@@ -31,6 +32,10 @@ struct ResourceSpecialization {
 
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
+	// Candidate sampler slots clone a base sampler's metadata. Descriptor payloads stay in
+	// ResourceSnapshot; only the slot topology and sampled pairs affect shader permutations.
+	std::vector<uint32_t> sampler_origins;
+	std::vector<SampledResourcePair> sampled_pairs;
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };

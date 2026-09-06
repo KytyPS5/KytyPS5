@@ -99,6 +99,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		PlanInlineDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -127,9 +128,19 @@ public:
 				m_program.memory_info[index].planning_only = true;
 			}
 		}
+		for (const auto& plan: m_inline_descriptors) {
+			plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 1; dword < plan.handle->NumArgs(); dword++) {
+				plan.handle->SetArg(dword, dword <= plan.root_count ? plan.roots[dword - 1u] : plan.key);
+			}
+		}
+		for (const auto index: m_inline_planning_memory) {
+			m_program.memory_info[index].planning_only = true;
+		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
-			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+			return std::ranges::find(m_inline_planning_reads, inst) != m_inline_planning_reads.end() ||
+			       std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
@@ -159,6 +170,17 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+	};
+
+	struct InlineDescriptorPlan {
+		Inst*                      handle = nullptr;
+		uint32_t                   source = 0;
+		Value                      key;
+		std::array<Value, 6>        roots {};
+		std::array<uint32_t, 8>     memory {};
+		std::array<const Inst*, 8>  reads {};
+		uint32_t                   root_count = 4;
+		uint32_t                   read_count = 4;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -989,7 +1011,8 @@ private:
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+		return std::ranges::find(m_inline_planning_memory, index) != m_inline_planning_memory.end() ||
+		       std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
 			return std::ranges::find(plan.memory, index) != plan.memory.end();
 		});
@@ -1252,8 +1275,11 @@ private:
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
+		const auto* inline_descriptor = handle != nullptr ? FindInlineDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
+		} else if (inline_descriptor != nullptr) {
+			source = inline_descriptor->source;
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
 		}
@@ -1271,8 +1297,14 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
+			const auto* inline_sampler = sampler_handle != nullptr ? FindInlineDescriptor(*sampler_handle) : nullptr;
+			if (inline_sampler != nullptr) {
+				sampler_source = inline_sampler->source;
+			} else {
+				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
+				          sampler_source, true, sample_adjust);
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -1296,7 +1328,7 @@ private:
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
 				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_image.has_value()) {
+				    image_source->indirect_image.has_value() || image_source->inline_descriptor.has_value()) {
 					continue;
 				}
 				bool alias = true;

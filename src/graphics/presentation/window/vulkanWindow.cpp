@@ -72,6 +72,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputLayer        = VK_TRUE;
 	features.bufferDeviceAddress      = VK_TRUE;
 	features.shaderBufferInt64Atomics = VK_TRUE;
+	features.shaderSharedInt64Atomics = VK_TRUE;
 	return features;
 }
 
@@ -285,6 +286,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 		    features12.shaderBufferInt64Atomics != VK_TRUE) {
 			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.shaderSharedInt64Atomics == VK_TRUE &&
+		    features12.shaderSharedInt64Atomics != VK_TRUE) {
+			LOGF("shaderSharedInt64Atomics is not supported\n");
 			skip_device = true;
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
@@ -640,6 +646,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.shaderSharedInt64Atomics == VK_TRUE &&
+	                     supported_features12.shaderSharedInt64Atomics != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif

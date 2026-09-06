@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <list>
 #include <thread>
 #include <vector>
@@ -206,6 +208,9 @@ public:
 	void WaitForSubmitSlot();
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
+	[[nodiscard]] VideoOutDiagnostics GetDiagnostics();
+	void RecordOutputStatus(uint32_t resolution);
+	void RecordOutputSupport(uint64_t mode, int supported);
 	void Wait(VideoOutConfig& cfg, int index);
 
 private:
@@ -233,6 +238,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	VideoOutDiagnostics  m_diagnostics;
 };
 
 struct VideoOutDriver::Impl {
@@ -593,6 +599,13 @@ void VideoOutShutdown() {
 	g_video_out_driver.reset();
 }
 
+VideoOutDiagnostics VideoOutGetDiagnostics() {
+	if (g_video_out_driver == nullptr) {
+		return {};
+	}
+	return g_video_out_driver->State().GetFlipQueue().GetDiagnostics();
+}
+
 VideoOutDriver::Impl::~Impl() {
 	if (m_present_thread.joinable()) {
 		m_present_thread.request_stop();
@@ -871,6 +884,12 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	m_diagnostics.last_submitted_index = index;
+	if (source == FlipRequestSource::GpuEop) {
+		m_diagnostics.gpu_submitted++;
+	} else {
+		m_diagnostics.cpu_submitted++;
+	}
 
 	cfg.flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1028,6 +1047,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		EXIT("video-out request changed while recording, id=%" PRIu64 "\n", request_id);
 	}
 	prepared->frame = frame;
+	m_diagnostics.prepared++;
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1040,6 +1060,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		m_diagnostics.ready++;
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1138,6 +1159,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
 	r.cfg->flip_status.flipArg                  = r.flip_arg;
 	r.cfg->flip_status.currentBuffer            = r.index;
+	m_diagnostics.presented++;
+	m_diagnostics.last_presented_index = r.index;
 	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
 	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
 		r.cfg->flip_status.gcQueueNum--;
@@ -1162,6 +1185,24 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 	Common::LockGuard lock(cfg.mutex);
 
 	out = cfg.flip_status;
+}
+
+VideoOutDiagnostics FlipQueue::GetDiagnostics() {
+	Common::LockGuard lock(m_mutex);
+	return m_diagnostics;
+}
+
+void FlipQueue::RecordOutputStatus(uint32_t resolution) {
+	Common::LockGuard lock(m_mutex);
+	m_diagnostics.output_status_calls++;
+	m_diagnostics.last_output_resolution = resolution;
+}
+
+void FlipQueue::RecordOutputSupport(uint64_t mode, int supported) {
+	Common::LockGuard lock(m_mutex);
+	m_diagnostics.output_support_calls++;
+	m_diagnostics.last_output_mode    = mode;
+	m_diagnostics.last_output_support = supported;
 }
 
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
@@ -1466,6 +1507,32 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	return OK;
 }
 
+struct VideoOutVrrStatus {
+	std::array<uint8_t, 0x80> data;
+};
+
+static_assert(sizeof(VideoOutVrrStatus) == 0x80);
+
+KYTY_SYSV_ABI int VideoOutVrrStatusInitialize() {
+	PRINT_NAME();
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, VideoOutVrrStatus* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+
+	// Kyty currently presents at a fixed refresh rate. A zeroed status reports
+	// that no VRR range or active VRR mode is available, while initializing the
+	// complete ABI output rather than leaving guest stack bytes undefined.
+	(void)handle;
+	*status = {};
+	return OK;
+}
+
 int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index,
                                       int flip_mode, int64_t flip_arg, uint64_t& request_id) {
 	EXIT_IF(buffer.IsInvalid());
@@ -1648,13 +1715,21 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) {
 	PRINT_NAME();
+	const bool trace_output_status = std::getenv("KYTY_VIDEO_OUT_TRACE") != nullptr;
 
 	if (status == nullptr) {
+		if (trace_output_status) {
+			std::printf("VideoOutGetOutputStatus: handle=%d status=null result=invalid-address\n",
+			            handle);
+		}
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
 	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
+		if (trace_output_status) {
+			std::printf("VideoOutGetOutputStatus: handle=%d result=invalid-handle\n", handle);
+		}
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
@@ -1670,6 +1745,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
+	if (trace_output_status) {
+		std::printf("VideoOutGetOutputStatus: handle=%d size=%ux%u resolution=%u\n", handle,
+		            ctx->width, ctx->height, status->resolution);
+	}
+	DriverState().GetFlipQueue().RecordOutputStatus(status->resolution);
 
 	return OK;
 }
@@ -1723,11 +1803,12 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 		return result;
 	}
 
-	if (mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
-		return (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_TRUE : VIDEO_OUT_FALSE);
-	}
-
-	return VIDEO_OUT_TRUE;
+	const int supported = mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ
+	                          ? (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_TRUE
+	                                                                     : VIDEO_OUT_FALSE)
+	                          : VIDEO_OUT_TRUE;
+	DriverState().GetFlipQueue().RecordOutputSupport(mode, supported);
+	return supported;
 }
 
 KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,

@@ -886,13 +886,13 @@ static void ValidateImmutableSrtWriteAliases(
 	if (reads.empty()) {
 		return;
 	}
-	// The admitted snapshot proof currently covers compute without additional
-	// DMA accesses. In a combined draw this check precedes either stage's work.
+	// Read-only DMA does not mutate the snapshotted source. Dynamic DMA writes
+	// have no bounded footprint to compare, so keep rejecting them here.
 	for (const auto* stage: stages) {
 		const auto& info = stage->program->info;
-		if (stage->program->stage != ShaderType::Compute || info.uses_dma) {
-			EXIT("immutable SRT snapshot requires compute without DMA accesses: stage=%u dma=%d\n",
-			     static_cast<uint32_t>(stage->program->stage), info.uses_dma);
+		if (stage->program->stage != ShaderType::Compute || info.writes_dma) {
+			EXIT("immutable SRT snapshot requires compute without DMA writes: stage=%u dma_write=%d\n",
+			     static_cast<uint32_t>(stage->program->stage), info.writes_dma);
 		}
 		if (stage->resources.buffers.size() != info.buffers.size() ||
 		    stage->resources.images.size() != info.images.size()) {
@@ -988,7 +988,7 @@ static void ValidateSampledHtileWriteAliases(
 	};
 	for (const auto* stage: stages) {
 		const auto& info = stage->program->info;
-		if (info.uses_dma) {
+		if (info.writes_dma) {
 			EXIT("sampled HTile admission cannot prove DMA write dependencies\n");
 		}
 		for (uint32_t index = 0; index < info.images.size(); ++index) {

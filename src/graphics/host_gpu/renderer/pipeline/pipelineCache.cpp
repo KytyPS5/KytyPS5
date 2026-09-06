@@ -23,7 +23,9 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fmt/format.h>
@@ -32,6 +34,7 @@
 #include <nlohmann/json.hpp>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/optimizer.hpp>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -278,6 +281,50 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+std::vector<uint32_t> OptimizeShaderSpirv(
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization) {
+	if (optimization == Config::ShaderOptimizationType::None || spirv.empty()) {
+		return spirv;
+	}
+
+	spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+	std::string         messages;
+	optimizer.SetMessageConsumer([&messages](spv_message_level_t, const char*,
+	                                         const spv_position_t& position,
+	                                         const char* message) {
+		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
+		                        static_cast<int>(position.column),
+		                        static_cast<int>(position.index), message);
+	});
+	// The stock -O/-Os recipes include exhaustive inlining, scalar replacement and forced loop
+	// unrolling. Generated dispatcher/cooperative modules can contain hundreds of thousands of
+	// words, making those passes super-linear and stalling first launch for minutes. Keep the
+	// bounded passes that remove dead/control-flow work without cloning or unrolling code.
+	optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
+	    .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
+	    .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
+	    .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
+	    .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
+	    .RegisterPass(spvtools::CreateSimplificationPass())
+	    .RegisterPass(spvtools::CreateRedundancyEliminationPass())
+	    .RegisterPass(spvtools::CreateBlockMergePass());
+	if (optimization == Config::ShaderOptimizationType::Size) {
+		optimizer.RegisterPass(spvtools::CreateStripDebugInfoPass());
+	}
+
+	std::vector<uint32_t> optimized;
+	if (!optimizer.Run(spirv.data(), spirv.size(), &optimized) || optimized.empty()) {
+		LOGF("SPIR-V optimization failed; using generated module:\n%s", messages.c_str());
+		return spirv;
+	}
+	return optimized;
+}
+
+bool ShouldOptimizeShaderSpirv(bool dispatcher_fallback,
+                               Config::ShaderOptimizationType optimization) {
+	return optimization != Config::ShaderOptimizationType::None && !dispatcher_fallback;
+}
+
 } // namespace
 
 // Test access to the exact production validation/configuration path. This does
@@ -285,6 +332,16 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
                                const std::vector<uint32_t>& spirv) {
 	return ValidateShaderSpirv(label, shader_hash, spirv);
+}
+
+std::vector<uint32_t> OptimizeShaderSpirvForTest(
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization) {
+	return OptimizeShaderSpirv(spirv, optimization);
+}
+
+bool ShouldOptimizeShaderSpirvForTest(bool dispatcher_fallback,
+                                      Config::ShaderOptimizationType optimization) {
+	return ShouldOptimizeShaderSpirv(dispatcher_fallback, optimization);
 }
 
 struct PipelineCache::ProgramCache {
@@ -350,6 +407,28 @@ struct PipelineCache::ProgramCache {
 		}();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		const char* optimization_trace = std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE");
+		const auto  optimization_start = std::chrono::steady_clock::now();
+		const auto  original_words     = result.spirv.size();
+		if (optimization_trace != nullptr && *optimization_trace != '\0') {
+			std::printf("SpirvOptimizeBegin: stage=%s hash=0x%016" PRIx64 " words=%zu mode=%u\n",
+			            stage_name, options.shader_hash, original_words,
+			            static_cast<uint32_t>(Config::GetShaderOptimizationType()));
+			std::fflush(stdout);
+		}
+		if (ShouldOptimizeShaderSpirv(result.program.dispatcher_fallback,
+		                              Config::GetShaderOptimizationType())) {
+			result.spirv = OptimizeShaderSpirv(result.spirv, Config::GetShaderOptimizationType());
+		}
+		if (optimization_trace != nullptr && *optimization_trace != '\0') {
+			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                         std::chrono::steady_clock::now() - optimization_start)
+			                         .count();
+			std::printf("SpirvOptimizeEnd: stage=%s hash=0x%016" PRIx64
+			            " words=%zu->%zu elapsed_ms=%" PRId64 "\n",
+			            stage_name, options.shader_hash, original_words, result.spirv.size(), elapsed);
+			std::fflush(stdout);
+		}
 		uint32_t wave_partition_factor = 1;
 		if constexpr (Stage == ShaderType::Compute) {
 			// The renderer no longer owns the CFG after TakeCompiledInfo. Preserve

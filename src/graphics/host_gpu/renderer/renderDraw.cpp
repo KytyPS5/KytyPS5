@@ -34,6 +34,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -87,6 +88,7 @@ static std::atomic<uint32_t> g_draw_state_log_count   = 0;
 static std::atomic<uint32_t> g_draw_input_log_count   = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
 static std::atomic<uint32_t> g_shader_stage_log_count = 0;
+static std::atomic<uint32_t> g_video_out_draw_trace_count = 0;
 
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 
@@ -1179,6 +1181,59 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	LogDrawPhase(draw.name, "PrepareBindings");
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
+	const char* video_out_trace = std::getenv("KYTY_VIDEO_OUT_DRAW_TRACE");
+	if (video_out_trace != nullptr && *video_out_trace != '\0' && bindings.pixel.has_value()) {
+		auto& cache = m_context.GetTextureCache();
+		bool  video_out_target = false;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			if (state.color_info[i].image_id &&
+			    cache.GetImage(state.color_info[i].image_id).usage.video_out) {
+				video_out_target = true;
+				break;
+			}
+		}
+		if (video_out_target) {
+			const auto trace_id =
+			    g_video_out_draw_trace_count.fetch_add(1, std::memory_order_relaxed);
+			if (trace_id < 64) {
+				const auto& pixel = *bindings.pixel;
+				EXIT_IF(pixel.program == nullptr);
+				std::printf(
+				    "VideoOutDraw[%u]: submit=%" PRIu64
+				    " frame=%d name=%s shader=0x%016" PRIx64 " targets=%u images=%zu\n",
+				    trace_id, submit_id, m_context.GetGpu().GetFrameNum(), draw.name,
+				    pixel.program->shader_hash, state.color_count, pixel.resources.images.size());
+				for (uint32_t i = 0; i < state.color_count; i++) {
+					const auto& target = state.color_info[i];
+					std::printf(
+					    "  target[%u]: addr=0x%016" PRIx64
+					    " extent=%ux%u slot=%u video_out=%d\n",
+					    i, target.base_addr, target.extent.width, target.extent.height,
+					    target.target_slot,
+					    target.image_id && cache.GetImage(target.image_id).usage.video_out ? 1 : 0);
+				}
+				EXIT_IF(pixel.resources.images.size() != pixel.program->info.images.size());
+				for (uint32_t i = 0; i < pixel.resources.images.size(); i++) {
+					const auto& binding  = pixel.resources.images[i];
+					const auto& resource = pixel.program->info.images[i];
+					const auto& image    = cache.GetImage(binding.image_id);
+					std::printf(
+					    "  pixel_image[%u]: class=%u source=%u addr=0x%016" PRIx64
+					    " size=0x%016" PRIx64
+					    " extent=%ux%ux%u format=%d usage=t%d/s%d/r%d/v%d dirty=g%d/b%d/c%d\n",
+					    i, static_cast<uint32_t>(resource.resource_class), resource.source,
+					    binding.desc.info.data.address, binding.desc.info.data.size,
+					    binding.desc.info.extent.width, binding.desc.info.extent.height,
+					    binding.desc.info.extent.depth,
+					    static_cast<int>(binding.desc.info.pixel_format), image.usage.texture ? 1 : 0,
+					    image.usage.storage ? 1 : 0, image.usage.render_target ? 1 : 0,
+					    image.usage.video_out ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+					    image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0);
+				}
+				std::fflush(stdout);
+			}
+		}
+	}
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
 	state.rendering =

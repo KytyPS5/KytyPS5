@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -103,6 +105,34 @@ void ValidateDepthComparisonPromotionLayout(const ImageInfo& requested,
 	    cached.backing.mip_levels == 1 && cached.backing.layers == 1 &&
 	    cached.backing.samples == 1;
 	if (!matches) {
+		if (std::getenv("KYTY_DEPTH_PROMOTION_TRACE") != nullptr) {
+			std::fprintf(stderr,
+			             "DepthPromotionLayout requested addr=0x%016" PRIx64 " size=0x%" PRIx64
+			             " extent=%ux%ux%u levels=%u layers=%u pitch=%u samples=%u type=%u tile=%u"
+			             " format=%u guest=%u bpb=%u mip0=0x%" PRIx64 "+0x%" PRIx64 "\n"
+			             "DepthPromotionLayout source addr=0x%016" PRIx64 " size=0x%" PRIx64
+			             " extent=%ux%ux%u levels=%u layers=%u pitch=%u samples=%u type=%u tile=%u"
+			             " format=%u guest=%u bpb=%u mip0=0x%" PRIx64 "+0x%" PRIx64
+			             " backing extent=%ux%ux%u levels=%u layers=%u pitch=%u samples=%u format=%u\n",
+			             requested.data.address, requested.data.size, requested.extent.width,
+			             requested.extent.height, requested.extent.depth, requested.resources.levels,
+			             requested.resources.layers, requested.pitch, requested.samples,
+			             static_cast<uint32_t>(requested.type), static_cast<uint32_t>(requested.tile_mode),
+			             static_cast<uint32_t>(requested.pixel_format),
+			             static_cast<uint32_t>(requested.guest_format), requested.bytes_per_block,
+			             requested.mip_layout[0].offset, requested.mip_layout[0].size,
+			             source.data.address, source.data.size, source.extent.width, source.extent.height,
+			             source.extent.depth, source.resources.levels, source.resources.layers,
+			             source.pitch, source.samples, static_cast<uint32_t>(source.type),
+			             static_cast<uint32_t>(source.tile_mode), static_cast<uint32_t>(source.pixel_format),
+			             static_cast<uint32_t>(source.guest_format), source.bytes_per_block,
+			             source.mip_layout[0].offset, source.mip_layout[0].size,
+			             cached.backing.extent.width, cached.backing.extent.height,
+			             cached.backing.extent.depth, cached.backing.mip_levels, cached.backing.layers,
+			             cached.backing.guest_pitch, cached.backing.samples,
+			             static_cast<uint32_t>(cached.backing.format));
+			std::fflush(stderr);
+		}
 		EXIT("depth comparison promotion requires matching color backing layout\n");
 	}
 }
@@ -693,6 +723,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	// ResolveDepthOverlap is reached only for images with the same guest base.
+	// Validate the color-to-depth conversion at the point where it is selected;
+	// unrelated heap allocations may overlap this range and must remain ordinary
+	// overlap candidates.
+	ValidateDepthComparisonPromotionLayout(requested, binding, cached);
 	RefreshImage(cached_id,
 	             ImageDesc {.info = cached.info, .view_info = {}, .type = UploadBinding(cached)});
 	auto info = requested;
@@ -1332,6 +1367,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 
 	ImageId result {};
+	bool    inserted_new = false;
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
@@ -1341,7 +1377,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_slot_images[id].sampled_htile_clear_import) {
 				EXIT("sampled HTile import requires its metadata-aware lookup path\n");
 			}
-			ValidateDepthComparisonPromotionLayout(desc.info, desc.type, m_slot_images[id]);
 		}
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1377,6 +1412,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
+			inserted_new   = true;
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
@@ -1390,6 +1426,58 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			const bool native_current =
 			    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
 			if (!native_current) {
+				if (std::getenv("KYTY_COMPRESSED_VIDEO_OUT_TRACE") != nullptr) {
+					std::fprintf(
+					    stderr,
+					    "CompressedVideoOut inserted=%d addr=0x%016" PRIx64
+					    " size=0x%" PRIx64 " metadata=0x%016" PRIx64 "+0x%" PRIx64
+					    " compression=%u extent=%ux%ux%u pitch=%u format=%u guest=%u tile=%u"
+					    " usage=t%d/s%d/r%d/v%d dirty=g%d/b%d/c%d candidates=%zu"
+					    " requested_addr=0x%016" PRIx64 " requested_size=0x%" PRIx64
+					    " requested_metadata=0x%016" PRIx64 "+0x%" PRIx64
+					    " requested_compression=%u requested_extent=%ux%ux%u requested_pitch=%u"
+					    " requested_format=%u requested_guest=%u requested_tile=%u\n",
+					    inserted_new ? 1 : 0, image.info.data.address, image.info.data.size,
+					    image.info.metadata.range.address, image.info.metadata.range.size,
+					    static_cast<uint32_t>(image.info.metadata.compression),
+					    image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+					    image.info.pitch, static_cast<uint32_t>(image.info.pixel_format),
+					    static_cast<uint32_t>(image.info.guest_format),
+					    static_cast<uint32_t>(image.info.tile_mode), image.usage.texture ? 1 : 0,
+					    image.usage.storage ? 1 : 0, image.usage.render_target ? 1 : 0,
+					    image.usage.video_out ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+					    image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0,
+					    candidates.size(), desc.info.data.address, desc.info.data.size,
+					    desc.info.metadata.range.address, desc.info.metadata.range.size,
+					    static_cast<uint32_t>(desc.info.metadata.compression), desc.info.extent.width,
+					    desc.info.extent.height, desc.info.extent.depth, desc.info.pitch,
+					    static_cast<uint32_t>(desc.info.pixel_format),
+					    static_cast<uint32_t>(desc.info.guest_format),
+					    static_cast<uint32_t>(desc.info.tile_mode));
+					for (size_t candidate_index = 0; candidate_index < candidates.size();
+					     candidate_index++) {
+						const auto& candidate = m_slot_images[candidates[candidate_index]];
+						std::fprintf(
+						    stderr,
+						    "CompressedVideoOutCandidate index=%zu addr=0x%016" PRIx64
+						    " size=0x%" PRIx64 " metadata=0x%016" PRIx64 "+0x%" PRIx64
+						    " compression=%u extent=%ux%ux%u pitch=%u format=%u guest=%u tile=%u"
+						    " usage=t%d/s%d/r%d/v%d dirty=g%d/b%d/c%d\n",
+						    candidate_index, candidate.info.data.address, candidate.info.data.size,
+						    candidate.info.metadata.range.address, candidate.info.metadata.range.size,
+						    static_cast<uint32_t>(candidate.info.metadata.compression),
+						    candidate.info.extent.width, candidate.info.extent.height,
+						    candidate.info.extent.depth, candidate.info.pitch,
+						    static_cast<uint32_t>(candidate.info.pixel_format),
+						    static_cast<uint32_t>(candidate.info.guest_format),
+						    static_cast<uint32_t>(candidate.info.tile_mode),
+						    candidate.usage.texture ? 1 : 0, candidate.usage.storage ? 1 : 0,
+						    candidate.usage.render_target ? 1 : 0, candidate.usage.video_out ? 1 : 0,
+						    candidate.IsGpuModified() ? 1 : 0, candidate.IsBufferModified() ? 1 : 0,
+						    candidate.IsCpuDirty() ? 1 : 0);
+					}
+					std::fflush(stderr);
+				}
 				EXIT("TextureCache: compressed video-out read requires clean native GPU "
 				     "contents\n");
 			}
@@ -1955,6 +2043,24 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		auto& image = m_slot_images[id];
 		if (image.depth_id || !image.Overlaps(address, size)) {
 			continue;
+		}
+		if (std::getenv("KYTY_IMAGE_INVALIDATE_TRACE") != nullptr &&
+		    image.info.data.size >= 1024 * 1024) {
+			static std::atomic<uint32_t> trace_count {0};
+			const auto count = trace_count.fetch_add(1, std::memory_order_relaxed);
+			if (count < 256) {
+				std::fprintf(stderr,
+				             "ImageInvalidate index=%u write=0x%016" PRIx64 "+0x%" PRIx64
+				             " image=0x%016" PRIx64 "+0x%" PRIx64
+				             " extent=%ux%ux%u usage=t%d/s%d/r%d/v%d dirty=g%d/b%d/c%d\n",
+				             count, address, size, image.info.data.address, image.info.data.size,
+				             image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+				             image.usage.texture ? 1 : 0, image.usage.storage ? 1 : 0,
+				             image.usage.render_target ? 1 : 0, image.usage.video_out ? 1 : 0,
+				             image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+				             image.IsCpuDirty() ? 1 : 0);
+				std::fflush(stderr);
+			}
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();

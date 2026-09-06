@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/imeOverlay.h"
@@ -15,6 +16,8 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -31,8 +34,9 @@ namespace Libs::Graphics {
 struct Presenter::Frame {
 	VulkanImage image;
 	uint64_t    present_tick = 0;
-	bool        busy         = false;
-	bool        reusing_last = false;
+	bool        busy          = false;
+	bool        reusing_last  = false;
+	bool        guest_surface = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -103,8 +107,9 @@ public:
 		if (m_last_frame == frame) {
 			m_last_frame = nullptr;
 		}
-		frame->busy         = true;
-		frame->reusing_last = false;
+		frame->busy          = true;
+		frame->reusing_last  = false;
+		frame->guest_surface = false;
 		m_mutex.Unlock();
 
 		WaitForFrame(*frame);
@@ -335,6 +340,96 @@ struct Presenter::Impl {
 		frames.SetFormat(swapchain.Format());
 	}
 
+	void CapturePreparedFrame(Presenter::Frame& frame) {
+		const char* path = std::getenv("KYTY_PRESENT_READBACK_PATH");
+		static uint32_t trace_count = 0;
+		if (path != nullptr && *path != '\0' && trace_count < 16) {
+			std::printf("PresentReadback: guest=%d format=%d extent=%ux%u count=%" PRIu64 "\n",
+			            frame.guest_surface ? 1 : 0, static_cast<int>(frame.image.format),
+			            frame.image.extent.width, frame.image.extent.height, present_readback_count);
+			std::fflush(stdout);
+			trace_count++;
+		}
+		if (!frame.guest_surface || path == nullptr || *path == '\0' ||
+		    present_readback_count >= 8) {
+			return;
+		}
+		if (frame.image.format != vk::Format::eA2B10G10R10UnormPack32 &&
+		    frame.image.format != vk::Format::eR8G8B8A8Unorm &&
+		    frame.image.format != vk::Format::eB8G8R8A8Unorm &&
+		    frame.image.format != vk::Format::eR8G8B8A8Srgb &&
+		    frame.image.format != vk::Format::eB8G8R8A8Srgb) {
+			return;
+		}
+		const uint64_t size = uint64_t {frame.image.extent.width} * frame.image.extent.height * 4u;
+		Buffer download(window.graphic_ctx, present_scheduler, MemoryUsage::Download, 0,
+		                vk::BufferUsageFlagBits::eTransferDst, size);
+		auto& command = present_scheduler.BeginCommand();
+		vk::BufferImageCopy copy {};
+		copy.bufferRowLength = frame.image.extent.width;
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent = frame.image.extent;
+		command.Handle().copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                                   download.Handle(), 1, &copy);
+		vk::BufferMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eHost;
+		barrier.dstAccessMask       = vk::AccessFlagBits2::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download.Handle();
+		barrier.offset              = 0;
+		barrier.size                = size;
+		vk::DependencyInfo dependency {};
+		dependency.bufferMemoryBarrierCount = 1;
+		dependency.pBufferMemoryBarriers    = &barrier;
+		command.Handle().pipelineBarrier2(dependency);
+		const auto tick = present_scheduler.Submit();
+		present_scheduler.Wait(tick);
+		download.Invalidate(0, size);
+
+		std::array<uint32_t, 4> minimum {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		std::array<uint32_t, 4> maximum {0, 0, 0, 0};
+		std::array<uint64_t, 4> nonzero {};
+		uint64_t colored_pixels = 0;
+		const auto bytes = download.Mapped();
+		for (uint64_t offset = 0; offset < size; offset += 4) {
+			std::array<uint32_t, 4> values {};
+			if (frame.image.format == vk::Format::eA2B10G10R10UnormPack32) {
+				uint32_t packed = 0;
+				std::memcpy(&packed, bytes.data() + static_cast<size_t>(offset), sizeof(packed));
+				values = {packed & 0x3ffu, (packed >> 10u) & 0x3ffu,
+				          (packed >> 20u) & 0x3ffu, packed >> 30u};
+			} else {
+				for (uint32_t channel = 0; channel < 4; channel++) {
+					values[channel] = bytes[static_cast<size_t>(offset + channel)];
+				}
+			}
+			bool colored = false;
+			for (uint32_t channel = 0; channel < 4; channel++) {
+				const auto value = values[channel];
+				minimum[channel] = std::min(minimum[channel], value);
+				maximum[channel] = std::max(maximum[channel], value);
+				nonzero[channel] += value != 0 ? 1u : 0u;
+				if (channel < 3 && value != 0) colored = true;
+			}
+			colored_pixels += colored ? 1u : 0u;
+		}
+		if (auto* output = std::fopen(path, "ab"); output != nullptr) {
+			std::fprintf(output,
+			             "frame=%" PRIu64 " width=%u height=%u format=%d colored=%" PRIu64
+			             " nonzero=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			             " min=%u,%u,%u,%u max=%u,%u,%u,%u\n",
+			             present_readback_count, frame.image.extent.width, frame.image.extent.height,
+			             static_cast<int>(frame.image.format), colored_pixels, nonzero[0], nonzero[1],
+			             nonzero[2], nonzero[3], minimum[0], minimum[1], minimum[2], minimum[3],
+			             maximum[0], maximum[1], maximum[2], maximum[3]);
+			std::fclose(output);
+		}
+		present_readback_count++;
+	}
+
 	Image& ResolveSurface(const ImageInfo& info) {
 		TextureCache::ImageDesc desc {};
 		desc.info                  = info;
@@ -353,6 +448,22 @@ struct Presenter::Impl {
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
+		const char* readback_path = std::getenv("KYTY_PRESENT_READBACK_PATH");
+		if (readback_path != nullptr && *readback_path != '\0' && present_source_trace_count < 8) {
+			std::printf(
+			    "PresentSource: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			    " metadata=0x%016" PRIx64 " compression=%u usage=t%d/s%d/r%d/v%d "
+			    "dirty=g%d/b%d/c%d backing=%d %ux%u\n",
+			    image.info.data.address, image.info.data.size, image.info.metadata.range.address,
+			    static_cast<uint32_t>(image.info.metadata.compression), image.usage.texture ? 1 : 0,
+			    image.usage.storage ? 1 : 0, image.usage.render_target ? 1 : 0,
+			    image.usage.video_out ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			    image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0,
+			    static_cast<int>(image.backing.format), image.backing.extent.width,
+			    image.backing.extent.height);
+			std::fflush(stdout);
+			present_source_trace_count++;
+		}
 		return image;
 	}
 
@@ -362,6 +473,8 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_ime_revision {0};
+	uint64_t              present_readback_count = 0;
+	uint32_t              present_source_trace_count = 0;
 };
 
 void Swapchain::Create() {
@@ -715,6 +828,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto*             frame = m_impl->frames.Acquire();
+	frame->guest_surface = true;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -776,7 +890,11 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto ime_visual = GetImeVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	{
+		Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+		m_impl->CapturePreparedFrame(frame);
+	}
+	auto& swapchain = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {

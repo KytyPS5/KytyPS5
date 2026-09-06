@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1102,12 +1103,14 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}();
 		const bool trace_dispatch = sync_diagnostics && thread_group_x != 0 &&
 		                            thread_group_y != 0 && thread_group_z != 0;
+		uint64_t dispatch_begin = 0;
 		if (trace_dispatch) {
 			LOGF("GpuDispatchSync: phase=before-wait submit=%" PRIu64 " cs=0x%016" PRIx64
 			     " groups=%ux%ux%u\n", m_submit_id, cs.data_addr, thread_group_x,
 			     thread_group_y, thread_group_z);
 			Log::Flush();
 			BufferFlushAndWait();
+			dispatch_begin = Common::Timer::QueryPerformanceCounter();
 			LOGF("GpuDispatchSync: phase=before-complete cs=0x%016" PRIx64 "\n", cs.data_addr);
 			Log::Flush();
 		}
@@ -1131,7 +1134,13 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			LOGF("GpuDispatchSync: phase=after-wait cs=0x%016" PRIx64 "\n", cs.data_addr);
 			Log::Flush();
 			BufferFlushAndWait();
-			LOGF("GpuDispatchSync: phase=after-complete cs=0x%016" PRIx64 "\n", cs.data_addr);
+			const auto dispatch_end = Common::Timer::QueryPerformanceCounter();
+			const auto frequency    = Common::Timer::QueryPerformanceFrequency();
+			const auto elapsed_us =
+			    frequency == 0 ? 0 : (dispatch_end - dispatch_begin) * 1000000u / frequency;
+			LOGF("GpuDispatchSync: phase=after-complete cs=0x%016" PRIx64
+			     " groups=%ux%ux%u elapsed_us=%" PRIu64 "\n",
+			     cs.data_addr, thread_group_x, thread_group_y, thread_group_z, elapsed_us);
 			Log::Flush();
 		}
 	}

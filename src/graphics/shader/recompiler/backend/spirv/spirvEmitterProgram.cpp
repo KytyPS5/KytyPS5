@@ -782,6 +782,10 @@ void EmitProgram(EmitterState& state) {
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
 	}
+	if (state.compute_execution.IsCooperativeWave64()) {
+		cooperative.emplace(PrepareCooperativeFunction(ctx));
+		ctx.cooperative_spills = &cooperative->spills;
+	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
@@ -851,6 +855,8 @@ void EmitProgram(EmitterState& state) {
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
+	} else if (cooperative) {
+		EmitCooperativeFunction(ctx, *cooperative);
 	} else if (state.program.dispatcher_fallback) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {

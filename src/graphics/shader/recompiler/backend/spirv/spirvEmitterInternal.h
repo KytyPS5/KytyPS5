@@ -229,6 +229,17 @@ struct ValueEmitContext {
 	uint32_t                                                           half       = 0;
 };
 
+struct CooperativeFunctionState {
+	std::unordered_map<const IR::Inst*, uint32_t> spills;
+	uint32_t pc_variable = 0;
+	uint32_t cursor_variable = 0;
+};
+
+CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx);
+void DeclareCooperativeFunctionVariables(ValueEmitContext& ctx, const CooperativeFunctionState& function);
+void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionState& function);
+void EmitDirectValueInstruction(ValueEmitContext& ctx, const IR::Inst& inst);
+
 enum class VertexInputScalarKind { Float, Sint, Uint };
 
 constexpr uint32_t NoImageComponent = 0xffffffffu;

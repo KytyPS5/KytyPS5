@@ -10,12 +10,16 @@ namespace IR { struct Program; }
 
 struct ComputeExecutionPlan {
 	ComputeWorkgroupLayout layout;
-	// Split mode dispatches one host workgroup for each complete guest wave64.
+	// Independent-wave mode partitions a guest group; cooperative mode keeps
+	// the complete guest group together and schedules its waves in software.
 	uint32_t wave_partition_factor = 1;
 	bool split_wave64 = false;
+	bool cooperative_wave64 = false;
 	std::string error;
 
+	// Both modes split a logical wave across native32 halves and use software collectives.
 	[[nodiscard]] bool IsSplitWave64() const { return split_wave64; }
+	[[nodiscard]] bool IsCooperativeWave64() const { return cooperative_wave64; }
 };
 
 // Pure, deterministic and shared by emission and the runtime pipeline cache.

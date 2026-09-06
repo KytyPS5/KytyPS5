@@ -14,8 +14,19 @@ uint32_t WavePointer(EmitterState& state, uint32_t lane) {
 	                           pointer, state.wave_scratch_variable, lane});
 	return pointer;
 }
-uint32_t WaveLoad(EmitterState& state, uint32_t lane) {
-	const auto pointer = WavePointer(state, lane);
+uint32_t WaveBase(EmitterState& state) {
+	if (!state.compute_execution.IsCooperativeWave64()) {
+		return ConstantU32(state, 0);
+	}
+	return EmitBinaryU32(state, OpBitwiseAnd, EmitHostLocalInvocationIndex(state),
+	                     ConstantU32(state, ~63u));
+}
+uint32_t WaveLoad(EmitterState& state, uint32_t lane, uint32_t wave_base) {
+	// Cooperative workgroups contain multiple logical waves. Only reads are
+	// wave-relative: publishing already uses the full host invocation index.
+	const auto index = state.compute_execution.IsCooperativeWave64()
+	                       ? EmitBinaryU32(state, OpIAdd, wave_base, lane) : lane;
+	const auto pointer = WavePointer(state, index);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), result, pointer});
 	return result;
@@ -48,10 +59,11 @@ uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate) {
 	const auto contribution = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelect, TypeU32(state), contribution, predicate, bit, ConstantU32(state, 0)});
 	WavePublish(state, contribution);
+	const auto wave_base = WaveBase(state);
 	std::array<uint32_t, 2> words{ConstantU32(state, 0), ConstantU32(state, 0)};
 	for (uint32_t index = 0; index < 64; ++index) {
 		words[index / 32] = EmitBinaryU32(state, OpBitwiseOr, words[index / 32],
-		                                 WaveLoad(state, ConstantU32(state, index)));
+		                                 WaveLoad(state, ConstantU32(state, index), wave_base));
 	}
 	// No invocation may overwrite this shared array until all peers have read it.
 	WaveBarrier(state);
@@ -76,7 +88,8 @@ uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target)
 	const auto safe_target = state.builder.AllocateId();
 	state.builder.AddFunction({OpULessThan, TypeBool(state), valid, target, ConstantU32(state, 64)});
 	state.builder.AddFunction({OpSelect, TypeU32(state), safe_target, valid, target, ConstantU32(state, 0)});
-	const auto loaded = WaveLoad(state, safe_target);
+	// Validate the logical target before adding this wave's scratch base.
+	const auto loaded = WaveLoad(state, safe_target, WaveBase(state));
 	WaveBarrier(state);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelect, TypeU32(state), result, valid, loaded, ConstantU32(state, 0)});

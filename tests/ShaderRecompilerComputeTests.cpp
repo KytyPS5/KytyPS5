@@ -7620,6 +7620,52 @@ public:
       m_device.destroyDescriptorSetLayout(observer_set_layout, nullptr);
       m_device.destroyShaderModule(ms_depth_module, nullptr);
 
+      constexpr uint64_t mapped_end = base + allocation_size;
+      constexpr uint64_t final_word_address = mapped_end - sizeof(uint32_t);
+      auto *final_word = reinterpret_cast<volatile uint32_t *>(final_word_address);
+      auto *final_byte = reinterpret_cast<volatile uint8_t *>(mapped_end - 1);
+      Require(name, "fault boundary containment",
+              resources.IsMapped(final_word_address, sizeof(uint32_t)) &&
+                  !resources.IsMapped(final_word_address, sizeof(uint64_t)) &&
+                  !resources.HandleFault(PageFaultAccess::Write, mapped_end) &&
+                  !resources.HandleFault(PageFaultAccess::Read, mapped_end),
+              "fault handling changed the mapped range's exclusive end");
+      Require(name, "fault boundary setup",
+              resources.InvalidateMemory(final_word_address, sizeof(uint32_t)),
+              "the final mapped word could not be initialized");
+      *final_word = 0;
+      auto final_word_desc = MakeLinearDesc(
+          final_word_address, sizeof(uint32_t), vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      const auto final_word_image = texture_cache.FindImage(final_word_desc);
+      (void)texture_cache.FindTexture(final_word_image, final_word_desc);
+      Require(name, "fault boundary image tracking",
+              texture_cache.GetImage(final_word_image).IsTracked() &&
+                  !texture_cache.GetImage(final_word_image).IsCpuDirty(),
+              "the final mapped word's image was not clean before its CPU store");
+      *final_word = 45;
+      Require(name, "fault boundary CPU store",
+              *final_word == 45 &&
+                  texture_cache.GetImage(final_word_image).IsDefinitelyCpuDirty(),
+              "a valid four-byte store at the mapping end did not invalidate its image");
+
+      constexpr uint32_t final_gpu_value = 0xa1b2c3d4u;
+      auto &boundary_buffer_cache = resources.GetBufferCache();
+      (void)boundary_buffer_cache.ObtainBuffer(final_word_address, sizeof(uint32_t), true);
+      boundary_buffer_cache.FillBuffer(final_word_address, sizeof(uint32_t),
+                                       final_gpu_value, false);
+      Require(name, "fault boundary GPU ownership",
+              boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)) &&
+                  !HostMemoryIsReadable(mapped_end - 1),
+              "the final mapped byte was not protected by GPU ownership");
+      const uint8_t final_gpu_byte = *final_byte;
+      Require(name, "fault boundary GPU readback",
+              final_gpu_byte == static_cast<uint8_t>(final_gpu_value >> 24u) &&
+                  *final_word == final_gpu_value &&
+                  !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
+              "a final-byte CPU read did not publish the GPU-owned final word");
+
       resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();

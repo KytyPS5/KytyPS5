@@ -12,7 +12,9 @@ GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandSchedule
 GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	constexpr uint64_t fault_size = 8;
+	// The host reports the faulting byte, not the instruction's access width. Both caches
+	// resolve its page; guessing a width can cross the end of a valid guest mapping.
+	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}

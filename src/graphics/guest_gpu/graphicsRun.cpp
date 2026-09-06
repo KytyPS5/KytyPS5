@@ -25,10 +25,12 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -1092,6 +1094,23 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		const auto& cs = m_sh_ctx.GetCs().cs_regs;
+		// Opt-in fault localization: prove completion before and after each guest dispatch.
+		// Keep normal queue scheduling asynchronous when this diagnostic is disabled.
+		static const bool sync_diagnostics = [] {
+			const auto* setting = std::getenv("KYTY_GPU_SYNC_DIAGNOSTICS");
+			return setting != nullptr && std::string_view(setting) == "1";
+		}();
+		const bool trace_dispatch = sync_diagnostics && thread_group_x != 0 &&
+		                            thread_group_y != 0 && thread_group_z != 0;
+		if (trace_dispatch) {
+			LOGF("GpuDispatchSync: phase=before-wait submit=%" PRIu64 " cs=0x%016" PRIx64
+			     " groups=%ux%ux%u\n", m_submit_id, cs.data_addr, thread_group_x,
+			     thread_group_y, thread_group_z);
+			Log::Flush();
+			BufferFlushAndWait();
+			LOGF("GpuDispatchSync: phase=before-complete cs=0x%016" PRIx64 "\n", cs.data_addr);
+			Log::Flush();
+		}
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
@@ -1108,6 +1127,13 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		if (trace_dispatch) {
+			LOGF("GpuDispatchSync: phase=after-wait cs=0x%016" PRIx64 "\n", cs.data_addr);
+			Log::Flush();
+			BufferFlushAndWait();
+			LOGF("GpuDispatchSync: phase=after-complete cs=0x%016" PRIx64 "\n", cs.data_addr);
+			Log::Flush();
+		}
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;

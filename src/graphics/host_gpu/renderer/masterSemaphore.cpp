@@ -3,6 +3,9 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <bit>
+#include <cinttypes>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -28,7 +31,18 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// NextTick advances before submission, so even concurrent submissions cannot
+	// complete a value at or beyond a freshly observed CurrentTick. Reject an
+	// anomalous driver counter before it makes every pending resource appear free.
+	const auto current = CurrentTick();
+	if (result != vk::Result::eSuccess || counter >= current) {
+		EXIT("vkGetSemaphoreCounterValue %s: semaphore=0x%016" PRIx64
+		     " result=%s (%d) counter=%" PRIu64 " current_tick=%" PRIu64 "\n",
+		     result == vk::Result::eSuccess ? "returned an unissued timeline value" : "failed",
+		     std::bit_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
+		     VulkanToString(result).c_str(), static_cast<int>(result), counter, current);
+		return;
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -53,7 +67,15 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkWaitSemaphores failed: semaphore=0x%016" PRIx64
+		     " result=%s (%d) wait_tick=%" PRIu64 " current_tick=%" PRIu64
+		     " known_gpu_tick=%" PRIu64 "\n",
+		     std::bit_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
+		     VulkanToString(result).c_str(), static_cast<int>(result), tick, CurrentTick(),
+		     KnownGpuTick());
+		return;
+	}
 	Refresh();
 }
 

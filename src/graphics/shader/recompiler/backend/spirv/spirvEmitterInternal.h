@@ -231,6 +231,7 @@ struct ValueEmitContext {
 
 struct CooperativeFunctionState {
 	std::unordered_map<const IR::Inst*, uint32_t> spills;
+	std::unordered_map<const IR::Inst*, uint32_t> phases;
 	uint32_t pc_variable = 0;
 	uint32_t cursor_variable = 0;
 };

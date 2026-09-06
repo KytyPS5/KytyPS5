@@ -112,3 +112,38 @@ Required tests:
 - Native Windows audit of captured shader `e52e19c6923301d0`, SPIR-V validation, and a
   bounded game run comparing compile time and generated word count with the dispatcher
   fallback baseline.
+
+## Cooperative wave64 values live across scheduler phases
+
+Status: implementation and native game validation complete; automated regression deferred.
+
+Observed trigger: cooperative wave64 execution divides a guest CFG into software-scheduled
+phases around LDS operations, subgroup collectives, guest barriers, and control-flow edges.
+The previous backend assigned Function-storage slots to every typed runtime instruction, so
+values used only inside one phase are repeatedly stored and loaded. In the captured
+`916ea8893e5b276a` shader this produces roughly 11,561 `OpLoad` and 3,408 `OpStore`
+instructions after optimization and makes a 120x68 dispatch take about 6.1 seconds.
+
+The phase-liveness implementation reduced the optimized module from 170,999 to 146,134 words,
+`OpLoad` from 11,561 to 8,993, and `OpStore` from 3,408 to 1,410. Vulkan and SPIR-V validation
+passed in the native capture, but the measured dispatch remained about 6.05 seconds. The next
+performance work therefore belongs to the cooperative scheduler/control-flow layer; the
+regressions below still need to lock in this code-size improvement and its semantics.
+
+Required tests:
+
+- A compiler case with several ordinary arithmetic values used only within one cooperative
+  phase, checking that they remain SSA values and receive no Function-storage spill slots.
+- Cross-phase cases for guest barriers, LDS phases, subgroup collectives, CFG edges, branch
+  conditions, and loop-carried Phi values, checking that every surviving value is spilled
+  and reloaded before use.
+- An immediate conditional-branch predicate, checking that spill analysis accepts constants
+  without treating them as instruction-backed values.
+- A mixed-use case where one definition has both same-phase and later-phase consumers,
+  checking direct SSA use in its defining phase and a spill load in later phases.
+- `ReadConstBuffer` broadcast and inactive-wave cases proving that stale private values cannot
+  affect collective control flow or architectural results.
+- SPIR-V validation plus GPU readback for multiwave LDS/SSBO ordering, early wave completion,
+  differing loop counts, and same-address writes on a native subgroup-32 device.
+- Native Windows capture of `916ea8893e5b276a`, comparing generated instruction counts and
+  steady dispatch time while preserving the full output and guard readback.

@@ -785,6 +785,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.compute_execution.IsCooperativeWave64()) {
 		cooperative.emplace(PrepareCooperativeFunction(ctx));
 		ctx.cooperative_spills = &cooperative->spills;
+		ctx.cooperative_phases = &cooperative->phases;
 	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {

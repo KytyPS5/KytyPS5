@@ -1744,16 +1744,11 @@ int KYTY_SYSV_ABI Listen(int s, int backlog) {
 		return -1;
 	}
 
-#if defined(_WIN32)
-	if (::listen(socket, backlog) == SOCKET_ERROR) {
+	if (::listen(socket, backlog) != 0) {
 		return SetHostSocketError();
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {

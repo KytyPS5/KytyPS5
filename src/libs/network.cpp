@@ -1712,23 +1712,17 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	sockaddr_storage host_addr {};
-	int              host_addrlen = 0;
+	SocketLength     host_addrlen = 0;
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 		return -1;
 	}
 
-	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) ==
-	    SOCKET_ERROR) {
+	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
 		return SetHostSocketError();
 	}
 
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Listen(int s, int backlog) {
@@ -1765,9 +1759,8 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return -1;
 	}
 
-#if defined(_WIN32)
 	sockaddr_storage host_addr {};
-	int              host_addrlen = sizeof(host_addr);
+	SocketLength     host_addrlen = sizeof(host_addr);
 	NativeSocket     accepted =
 	    ::accept(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
 	if (accepted == INVALID_NATIVE_SOCKET) {
@@ -1776,7 +1769,11 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 
 	const int fd = AllocSocketFd(accepted);
 	if (fd < 0) {
+#if defined(_WIN32)
 		closesocket(accepted);
+#else
+		::close(accepted);
+#endif
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
 		return -1;
 	}
@@ -1794,10 +1791,6 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	}
 
 	return fd;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Shutdown(int s, int how) {

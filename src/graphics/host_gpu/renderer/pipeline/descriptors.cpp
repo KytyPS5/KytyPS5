@@ -646,9 +646,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto pixel_format = surface_format.vk_format;
 	if (resource.depth_compare) {
-		const auto* depth_format = FindGuestDepthFormatPolicy(format);
-		EXIT_NOT_IMPLEMENTED(depth_format == nullptr);
-		pixel_format = depth_format->depth_attachment_format;
+		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
+			pixel_format = depth_format->depth_attachment_format;
+		}
 	}
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint

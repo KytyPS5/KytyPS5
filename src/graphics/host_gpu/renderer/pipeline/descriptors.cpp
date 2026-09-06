@@ -29,6 +29,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <fmt/format.h>
 #include <limits>
@@ -651,20 +652,28 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+// Pure descriptor interpretation shared by alias admission and cache acquisition.
+// It reads descriptor values only: no guest-memory access, image/view creation,
+// ownership changes or GPU commands are allowed in this function.
+struct NormalizedTextureDescriptor {
+	ShaderTextureResource   descriptor;
+	TextureCache::ImageDesc desc;
+	bool                   shader_conversion = false;
+};
+
+static NormalizedTextureDescriptor
+NormalizeTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
+                           const ShaderRecompiler::IR::DescriptorValue& value) {
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
-
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return {descriptor,
+		        NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                          : TextureCache::BindingType::Texture),
+		        false};
 	}
 
 	const auto address      = descriptor.Base40();
@@ -772,6 +781,108 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	return {descriptor, std::move(desc), shader_conversion};
+}
+
+static void ValidateComparisonStorageAliases(
+    std::span<const ShaderStageRuntime* const> stages) {
+	bool has_comparison = false;
+	bool has_write = false;
+	for (const auto* stage: stages) {
+		EXIT_IF(stage == nullptr || !*stage);
+		const auto& images = stage->program->info.images;
+		EXIT_IF(stage->resources.images.size() != images.size());
+		for (const auto& image: images) {
+			has_comparison |= image.depth_compare;
+			has_write |= image.written || image.atomic;
+		}
+	}
+	if (!has_comparison || !has_write) {
+		return;
+	}
+
+	struct Access {
+		GuestRange range;
+		ShaderType stage;
+		uint32_t index;
+		bool comparison;
+		bool write;
+	};
+	std::vector<Access> accesses;
+	for (const auto* stage: stages) {
+		const auto& images = stage->program->info.images;
+		for (uint32_t index = 0; index < images.size(); ++index) {
+			const auto& image = images[index];
+			const bool written = image.written || image.atomic;
+			if (!image.depth_compare && !written) {
+				continue;
+			}
+			// This is the exact same full padded allocation (all levels/layers)
+			// that ResolveTexture will hand to the cache. Do not compare only
+			// base-address equality or the shader's selected view rectangle.
+			const auto normalized = NormalizeTextureDescriptor(
+			    image, stage->resources.images[index]);
+			if (normalized.descriptor.IsNull()) {
+				continue;
+			}
+			const auto range = normalized.desc.info.data;
+			if (!range.Valid()) {
+				EXIT("invalid shader image allocation during comparison/storage admission\n");
+			}
+			accesses.push_back({range, stage->program->stage, index,
+			                    image.depth_compare, written});
+		}
+	}
+	for (const auto& comparison: accesses) {
+		if (!comparison.comparison) {
+			continue;
+		}
+		for (const auto& storage: accesses) {
+			if (storage.write && comparison.range.address < storage.range.End() &&
+			    storage.range.address < comparison.range.End()) {
+				EXIT("simultaneous depth comparison and storage image overlap: "
+				     "compare_stage=%u compare_image=%u storage_stage=%u storage_image=%u\n",
+				     static_cast<uint32_t>(comparison.stage), comparison.index,
+				     static_cast<uint32_t>(storage.stage), storage.index);
+			}
+		}
+	}
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto normalized = NormalizeTextureDescriptor(resource, value);
+	const auto& descriptor = normalized.descriptor;
+	auto& desc = normalized.desc;
+	const bool shader_conversion = normalized.shader_conversion;
+	const bool storage = resource.written;
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	const auto pixel_format = desc.info.pixel_format;
+	const auto view_format = desc.view_info.format;
+	const auto type = TextureType(descriptor);
+	const bool depth_tile = descriptor.TileMode() == Prospero::TileMode::kDepth;
+	const auto format = descriptor.Format();
+	const auto samples = desc.info.samples;
+	const auto levels = desc.info.resources.levels;
+	// A depth-tiled R32 intermediate can be written as color and subsequently
+	// compared as depth. Ask the cache for a separate native depth image so its
+	// existing overlap/copy path preserves current GPU contents. Vulkan does not
+	// permit a D32 view of the same R32 image. Unrestricted depth copies preserve
+	// arbitrary guest float values rather than silently clamping them to [0,1].
+	const bool promote_comparison = resource.depth_compare &&
+	    IsSupportedSampledDepthResource(resource) &&
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+	    type == Prospero::ImageType::kColor2D && depth_tile &&
+	    format == Prospero::BufferFormat::k32Float && samples == 1 && levels == 1 &&
+	    descriptor.BaseArray5() == 0 && descriptor.Depth() == 0 &&
+	    !descriptor.MsaaDepth() && descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
+	if (promote_comparison && m_context.GetGraphics().depth_range_unrestricted_enabled) {
+		desc.info.pixel_format = vk::Format::eD32Sfloat;
+	}
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
@@ -783,12 +894,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateDepthTargetBinding(resource, descriptor, image, pixel_format, size.size);
+		ValidateDepthTargetBinding(resource, descriptor, image, pixel_format, desc.info.data.size);
 		(void)SelectSampledDepthView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		if (resource.depth_compare) {
+			EXIT("color depth comparison requires a supported depth image representation "
+			     "and enabled VK_EXT_depth_range_unrestricted\n");
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
@@ -856,6 +971,8 @@ void RenderExecutor::ResetBindings() {
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
+	const ShaderStageRuntime* stage = &runtime;
+	ValidateComparisonStorageAliases(std::span<const ShaderStageRuntime* const>{&stage, 1u});
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
 	PreparedBindings prepared;
@@ -1000,6 +1117,11 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
+	// Validate the complete draw before preparing either stage: preparing the
+	// vertex stage first could already replace an image needed by the pixel stage.
+	const std::array<const ShaderStageRuntime*, 2> stages {&vertex, &pixel};
+	ValidateComparisonStorageAliases(std::span<const ShaderStageRuntime* const>{
+	    stages.data(), pixel_active ? 2u : 1u});
 	GraphicsBindings bindings {
 	    .vertex = PrepareBindings(vertex),
 	};

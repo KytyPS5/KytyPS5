@@ -1076,6 +1076,10 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 		}
+		if (HasExtension(available_extensions, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+			graphic_ctx.depth_range_unrestricted_enabled = true;
+		}
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);

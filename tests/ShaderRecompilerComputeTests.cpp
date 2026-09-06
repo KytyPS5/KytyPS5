@@ -7986,6 +7986,904 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Insert in VulkanHarness's public section. This borrows the ACTUAL view
+  // resolved by the runtime; it neither creates an image nor uploads texels.
+  // Caller must first Image::Transit the promoted runtime image to `layout`
+  // on scheduler.Current().Handle(). Do not use the harness's color-only
+  // AddImageBarrier/TransitionImage helpers for this depth image.
+  // Caller must verify the view's depth comparison support. The exact linear
+  // oracle below additionally requires SAMPLED_IMAGE_FILTER_LINEAR support;
+  // Vulkan permits implementation-dependent PCF without that format bit.
+  //
+  // For a 2x1 image containing depths [0,1], use left_uv={.25f,.5f},
+  // right_uv={.75f,.5f}, reference=.75f. Linear + Less/LessOrEqual returns
+  // {0,.5,1}; Greater/GreaterOrEqual returns {1,.5,0}. Nearest must return
+  // the endpoint results {0,*,1}; the midpoint is intentionally not an oracle
+  // for nearest because it lies on the boundary between the texels.
+  std::array<float, 3> ProbeDepthComparison(
+      const char* name, CommandScheduler& scheduler, vk::ImageView actual_view,
+      vk::ImageLayout layout, std::array<float, 2> left_uv,
+      std::array<float, 2> right_uv, float reference = 0.75f,
+      vk::Filter filter = vk::Filter::eLinear,
+      vk::CompareOp compare = vk::CompareOp::eLess) {
+    Require(name, "depth comparison probe", actual_view != nullptr,
+            "runtime-resolved image view is null");
+    Require(name, "depth comparison probe",
+            filter == vk::Filter::eNearest || filter == vk::Filter::eLinear,
+            "probe only supports nearest or linear filtering");
+    constexpr const char* source = R"spv(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %texture DescriptorSet 0
+OpDecorate %texture Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+OpDecorate %values ArrayStride 4
+OpDecorate %Output Block
+OpMemberDecorate %Output 0 Offset 0
+OpDecorate %Parameters Block
+OpMemberDecorate %Parameters 0 Offset 0
+OpMemberDecorate %Parameters 1 Offset 8
+OpMemberDecorate %Parameters 2 Offset 16
+OpMemberDecorate %Parameters 3 Offset 24
+%void = OpTypeVoid
+%function = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%three = OpConstant %uint 3
+%lod_zero = OpConstant %float 0
+%depth_image = OpTypeImage %float 2D 1 0 0 1 Unknown
+%sampled_depth = OpTypeSampledImage %depth_image
+%texture_pointer = OpTypePointer UniformConstant %sampled_depth
+%texture = OpVariable %texture_pointer UniformConstant
+%values = OpTypeArray %float %three
+%Output = OpTypeStruct %values
+%output_pointer = OpTypePointer StorageBuffer %Output
+%output_float_pointer = OpTypePointer StorageBuffer %float
+%output = OpVariable %output_pointer StorageBuffer
+%Parameters = OpTypeStruct %v2float %v2float %v2float %float
+%parameters_pointer = OpTypePointer PushConstant %Parameters
+%parameters_vector_pointer = OpTypePointer PushConstant %v2float
+%parameters_float_pointer = OpTypePointer PushConstant %float
+%parameters = OpVariable %parameters_pointer PushConstant
+%main = OpFunction %void None %function
+%entry = OpLabel
+%sampled = OpLoad %sampled_depth %texture
+%left_pointer = OpAccessChain %parameters_vector_pointer %parameters %zero
+%middle_pointer = OpAccessChain %parameters_vector_pointer %parameters %one
+%right_pointer = OpAccessChain %parameters_vector_pointer %parameters %two
+%reference_pointer = OpAccessChain %parameters_float_pointer %parameters %three
+%left = OpLoad %v2float %left_pointer
+%middle = OpLoad %v2float %middle_pointer
+%right = OpLoad %v2float %right_pointer
+%reference = OpLoad %float %reference_pointer
+%left_result = OpImageSampleDrefExplicitLod %float %sampled %left %reference Lod %lod_zero
+%middle_result = OpImageSampleDrefExplicitLod %float %sampled %middle %reference Lod %lod_zero
+%right_result = OpImageSampleDrefExplicitLod %float %sampled %right %reference Lod %lod_zero
+%out_left = OpAccessChain %output_float_pointer %output %zero %zero
+%out_middle = OpAccessChain %output_float_pointer %output %zero %one
+%out_right = OpAccessChain %output_float_pointer %output %zero %two
+OpStore %out_left %left_result
+OpStore %out_middle %middle_result
+OpStore %out_right %right_result
+OpReturn
+OpFunctionEnd
+)spv";
+    // Vulkan 1.1 selects SPIR-V 1.3, whose entry-point interface does not list
+    // descriptor/push-constant globals. The harness validates it for Vulkan1.2.
+    spvtools::SpirvTools assembler(SPV_ENV_VULKAN_1_1);
+    std::string messages;
+    assembler.SetMessageConsumer([&](spv_message_level_t, const char*,
+                                     const spv_position_t&, const char* text) {
+      messages += text;
+      messages += '\n';
+    });
+    std::vector<u32> spirv;
+    Require(name, "depth comparison SPIR-V", assembler.Assemble(source, &spirv),
+            messages);
+    ValidateSpirv(name, spirv);
+
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+    module_info.codeSize = spirv.size() * sizeof(u32);
+    module_info.pCode = spirv.data();
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+
+    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+        {0, vk::DescriptorType::eCombinedImageSampler, 1,
+         vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1,
+         vk::ShaderStageFlagBits::eCompute}}};
+    vk::DescriptorSetLayoutCreateInfo set_info{};
+    set_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+    set_info.bindingCount = static_cast<u32>(bindings.size());
+    set_info.pBindings = bindings.data();
+    vk::DescriptorSetLayout set_layout = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.createDescriptorSetLayout(&set_info, nullptr, &set_layout),
+              "vkCreateDescriptorSetLayout");
+    const vk::PushConstantRange push_range{
+        vk::ShaderStageFlagBits::eCompute, 0, 7 * sizeof(float)};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.createPipelineLayout(&layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
+    pipeline_info.stage.sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr,
+                                             &pipeline),
+              "vkCreateComputePipelines");
+
+    vk::SamplerCreateInfo sampler_info{};
+    sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
+    sampler_info.magFilter = filter;
+    sampler_info.minFilter = filter;
+    sampler_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
+    sampler_info.addressModeU = sampler_info.addressModeV =
+        sampler_info.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+    sampler_info.compareEnable = true;
+    sampler_info.compareOp = compare;
+    sampler_info.minLod = sampler_info.maxLod = 0.0f;
+    vk::Sampler sampler = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.createSampler(&sampler_info, nullptr, &sampler),
+              "vkCreateSampler");
+    const std::array<vk::DescriptorPoolSize, 2> sizes{{
+        {vk::DescriptorType::eCombinedImageSampler, 1},
+        {vk::DescriptorType::eStorageBuffer, 1}}};
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = static_cast<u32>(sizes.size());
+    pool_info.pPoolSizes = sizes.data();
+    vk::DescriptorPool pool = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.createDescriptorPool(&pool_info, nullptr, &pool),
+              "vkCreateDescriptorPool");
+    vk::DescriptorSetAllocateInfo allocate{};
+    allocate.sType = vk::StructureType::eDescriptorSetAllocateInfo;
+    allocate.descriptorPool = pool;
+    allocate.descriptorSetCount = 1;
+    allocate.pSetLayouts = &set_layout;
+    vk::DescriptorSet set = nullptr;
+    RequireVk(name, "depth comparison probe",
+              m_device.allocateDescriptorSets(&allocate, &set),
+              "vkAllocateDescriptorSets");
+    auto output = CreateHostBuffer(name, 3 * sizeof(u32),
+                                   vk::BufferUsageFlagBits::eStorageBuffer,
+                                   std::vector<u32>(3, 0xdeadbeefu));
+    const vk::DescriptorImageInfo image_info{sampler, actual_view, layout};
+    const vk::DescriptorBufferInfo buffer_info{output.buffer, 0, output.size};
+    std::array<vk::WriteDescriptorSet, 2> writes{};
+    writes[0].sType = writes[1].sType = vk::StructureType::eWriteDescriptorSet;
+    writes[0].dstSet = writes[1].dstSet = set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    writes[0].pImageInfo = &image_info;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = vk::DescriptorType::eStorageBuffer;
+    writes[1].pBufferInfo = &buffer_info;
+    m_device.updateDescriptorSets(static_cast<u32>(writes.size()), writes.data(),
+                                  0, nullptr);
+
+    const std::array<float, 7> parameters{
+        left_uv[0], left_uv[1],
+        (left_uv[0] + right_uv[0]) * 0.5f,
+        (left_uv[1] + right_uv[1]) * 0.5f,
+        right_uv[0], right_uv[1], reference};
+    const auto command = scheduler.Current().Handle();
+    command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+    command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
+                              0, 1, &set, 0, nullptr);
+    command.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                          sizeof(parameters), parameters.data());
+    command.dispatch(1, 1, 1);
+    vk::BufferMemoryBarrier host_read{};
+    host_read.sType = vk::StructureType::eBufferMemoryBarrier;
+    host_read.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    host_read.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    host_read.srcQueueFamilyIndex = host_read.dstQueueFamilyIndex =
+        VK_QUEUE_FAMILY_IGNORED;
+    host_read.buffer = output.buffer;
+    host_read.size = output.size;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+                            1, &host_read, 0, nullptr);
+    // Includes the runtime's earlier promotion/copy/transition commands. All
+    // descriptors, sampler, view and output stay alive until GPU completion.
+    // Finish may replace the scheduler's current command buffer; the caller
+    // must reacquire Current().Handle() before recording later commands.
+    scheduler.Finish();
+    const auto words = ReadBuffer(name, output, 3);
+    const std::array<float, 3> result{
+        std::bit_cast<float>(words[0]), std::bit_cast<float>(words[1]),
+        std::bit_cast<float>(words[2])};
+    DestroyBuffer(&output);
+    m_device.destroyDescriptorPool(pool, nullptr);
+    m_device.destroySampler(sampler, nullptr);
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    return result;
+  }
+
+// Insert in VulkanHarness's public section. TEST ONLY, no shader dispatch.
+// Four independent processes exercise existing production entry points.
+[[noreturn]] void RunComparisonAliasDeathCase(const char* mode) {
+  using namespace ShaderRecompiler::IR;
+  constexpr const char* name = "ComparisonAliasAdmission";
+  const bool same_compute = std::strcmp(mode, "cs-compare-first") == 0 ||
+                            std::strcmp(mode, "cs-storage-first") == 0;
+  const bool compare_first = std::strcmp(mode, "cs-compare-first") == 0 ||
+                            std::strcmp(mode, "vs-compare-ps-storage") == 0;
+  const bool known = same_compute ||
+      std::strcmp(mode, "vs-compare-ps-storage") == 0 ||
+      std::strcmp(mode, "vs-storage-ps-compare") == 0;
+  if (!known) {
+    std::fprintf(stderr, "unknown comparison alias mode: %s\n", mode);
+    std::_Exit(2);
+  }
+  constexpr uintptr_t base = 0x0000000203e00000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  EnsureRuntimeContext();
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, allocation_size, 0, &direct_offset) == 0,
+          "comparison alias allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset,
+              allocation_size) == 0 && mapped == reinterpret_cast<void*>(base),
+          "comparison alias mapping failed");
+  std::memset(mapped, 0, allocation_size);
+  RenderContext context(m_runtime_context);
+  auto& scheduler = context.GetCommandScheduler();
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  auto& resources = context.GetGpuResources();
+  auto& cache = resources.GetTextureCache();
+  auto& executor = context.GetRenderExecutor();
+  resources.MapMemory(base, allocation_size);
+
+  ShaderTextureResource descriptor{};
+  descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+  descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+      (((width - 1u) & 3u) << 30u);
+  descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+  descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+      (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+  descriptor.fields[5] = 0x00700000u;
+  DescriptorValue image_value{};
+  std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+            image_value.dwords.begin());
+  image_value.dword_count = 8;
+  ImageResource storage_resource{};
+  storage_resource.resource_class = ImageResourceClass::Storage;
+  storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
+  storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  storage_resource.written = true;
+  auto compare_resource = storage_resource;
+  compare_resource.resource_class = ImageResourceClass::Sampled;
+  compare_resource.written = false;
+  compare_resource.read = true;
+  compare_resource.depth_compare = true;
+
+  // Establish the same legal GPU-current R32 starting state as the promotion
+  // regression. No comparison descriptor has been resolved yet.
+  const auto source = RenderExecutorTestAccess::ResolveTexture(
+      executor, storage_resource, image_value);
+  Require(name, "source upload",
+          cache.FindTexture(source.image_id, source.desc) != nullptr &&
+              cache.GetImage(source.image_id).backing.format == vk::Format::eR32Sfloat &&
+              cache.GetImage(source.image_id).info.data.address == base &&
+              cache.GetImage(source.image_id).info.data.size == allocation_size,
+          "alias fixture did not establish the expected R32 allocation");
+  cache.MarkGpuWritten(source.image_id);
+  scheduler.Finish();
+  scheduler.DrainPriorityOperations();
+
+  const auto compile_info = [&](ShaderType stage,
+                                std::vector<ImageResource> images) {
+    Program program{};
+    program.stage = stage;
+    program.shader_info_complete = true;
+    program.resource_tracking_complete = true;
+    program.info.images = std::move(images);
+    for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+      program.info.images[i].source = i;
+      if (program.info.images[i].depth_compare) {
+        SamplerResource sampler{};
+        sampler.source = static_cast<uint32_t>(program.info.images.size());
+        sampler.depth_compare = true;
+        program.info.samplers.push_back(sampler);
+        program.info.sampled_pairs.push_back({i, 0, 0});
+      }
+    }
+    AllocateBindings(program);
+    CompiledShaderInfo result{};
+    result.stage = stage;
+    result.info = std::move(program.info);
+    result.bindings = std::move(program.bindings);
+    return result;
+  };
+  auto first_info = compile_info(
+      same_compute ? ShaderType::Compute : ShaderType::Vertex,
+      same_compute
+          ? (compare_first ? std::vector{compare_resource, storage_resource}
+                           : std::vector{storage_resource, compare_resource})
+          : std::vector{compare_first ? compare_resource : storage_resource});
+  auto second_info = compile_info(
+      ShaderType::Pixel,
+      std::vector{compare_first ? storage_resource : compare_resource});
+  const auto runtime = [&](const CompiledShaderInfo& info) {
+    ShaderStageRuntime result{.program = &info};
+    result.resources.images.assign(info.info.images.size(), image_value);
+    if (!info.info.samplers.empty()) {
+      DescriptorValue sampler{};
+      sampler.dword_count = 4;
+      // LESS comparison, nearest, normalized coordinates, clamp to edge.
+      sampler.dwords[0] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
+      result.resources.samplers.push_back(sampler);
+    }
+    return result;
+  };
+  const auto first = runtime(first_info);
+  const auto second = runtime(second_info);
+  std::printf("KYTY_COMPARISON_ALIAS_READY %s\n", mode);
+  std::fflush(stdout);
+  if (same_compute) {
+    // Public production entry; no new TestAccess hook is needed.
+    (void)executor.PrepareBindings(first);
+  } else {
+    (void)RenderExecutorTestAccess::PrepareGraphicsBindings(
+        executor, first, second, true);
+  }
+  // Deliberate old-code success exit: do not dispatch the incompatible set or
+  // let context teardown turn a missing guard into an unrelated fatal error.
+  std::printf("KYTY_COMPARISON_ALIAS_RETURNED %s\n", mode);
+  std::fflush(nullptr);
+  std::_Exit(0);
+}
+
+// Insert in VulkanHarness's public section. Test-only actual ResolveTexture
+// regression; the malformed copy is never submitted if the guard is absent.
+[[noreturn]] void RunComparisonPromotionLayoutDeathCase(const char* mode) {
+  using namespace ShaderRecompiler::IR;
+  constexpr const char* name = "ComparisonPromotionLayout";
+  if (std::strcmp(mode, "extent") != 0) {
+    std::fprintf(stderr, "unknown comparison promotion layout mode: %s\n", mode);
+    std::_Exit(2);
+  }
+  constexpr uintptr_t base = 0x0000000203e00000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  constexpr uint32_t source_width = 128;
+  constexpr uint32_t requested_width = 64;
+  constexpr uint32_t height = 64;
+  EnsureRuntimeContext();
+  Require(name, "promotion capability",
+          m_runtime_context.depth_range_unrestricted_enabled,
+          "layout regression requires the actual enabled promotion extension");
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, allocation_size, 0, &direct_offset) == 0,
+          "comparison promotion layout allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset,
+              allocation_size) == 0 && mapped == reinterpret_cast<void*>(base),
+          "comparison promotion layout mapping failed");
+  std::memset(mapped, 0, allocation_size);
+  RenderContext context(m_runtime_context);
+  auto& scheduler = context.GetCommandScheduler();
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  auto& resources = context.GetGpuResources();
+  auto& cache = resources.GetTextureCache();
+  auto& executor = context.GetRenderExecutor();
+  resources.MapMemory(base, allocation_size);
+
+  const auto make_descriptor = [&](uint32_t width) {
+    ShaderTextureResource descriptor{};
+    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (((width - 1u) & 3u) << 30u);
+    descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+        (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    descriptor.fields[5] = 0x00700000u;
+    DescriptorValue value{};
+    std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+              value.dwords.begin());
+    value.dword_count = 8;
+    return value;
+  };
+  ImageResource resource{};
+  resource.resource_class = ImageResourceClass::Storage;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
+  resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  resource.written = true;
+  const auto source = RenderExecutorTestAccess::ResolveTexture(
+      executor, resource, make_descriptor(source_width));
+  Require(name, "source upload",
+          cache.FindTexture(source.image_id, source.desc) != nullptr,
+          "layout fixture could not acquire the native source image");
+  const auto& cached = cache.GetImage(source.image_id);
+  Require(name, "128x64 source profile",
+          cached.backing.format == vk::Format::eR32Sfloat &&
+              cached.backing.extent.width == source_width &&
+              cached.backing.extent.height == height &&
+              cached.backing.mip_levels == 1 && cached.backing.layers == 1 &&
+              cached.backing.samples == 1 &&
+              cached.info.data.address == base &&
+              cached.info.data.size == allocation_size,
+          "layout fixture did not establish the expected R32 allocation");
+  cache.MarkGpuWritten(source.image_id);
+  scheduler.Finish();
+  scheduler.DrainPriorityOperations();
+  resource.resource_class = ImageResourceClass::Sampled;
+  resource.written = false;
+  resource.read = true;
+  resource.depth_compare = true;
+  std::printf("KYTY_COMPARISON_LAYOUT_READY %s\n", mode);
+  std::fflush(stdout);
+  // Both descriptors are individually legal and address the same 64-KiB
+  // depth-tiled allocation. Their visible widths differ. The old cache path
+  // creates a 64-wide D32 replacement, then records a 128-wide buffer-to-image
+  // copy using the cached source extent. The intended guard must run before
+  // that copy and report its specific admission failure.
+  (void)RenderExecutorTestAccess::ResolveTexture(
+      executor, resource, make_descriptor(requested_width));
+  std::printf("KYTY_COMPARISON_LAYOUT_RETURNED %s\n", mode);
+  std::fflush(nullptr);
+  // Do not submit the invalid copy or let teardown submit it implicitly.
+  std::_Exit(0);
+}
+
+// Insert in VulkanHarness's public section. TEST ONLY.
+// Successful boundary cases use actual renderer entry points and submit legal
+// upload/promotion copies, but no draw or guest shader dispatch is needed.
+[[noreturn]] void RunComparisonAliasPositiveCase(const char* mode) {
+  using namespace ShaderRecompiler::IR;
+  constexpr const char* name = "ComparisonAliasPositive";
+  struct Mode { const char* name; bool compute; bool compare_first; bool disjoint; };
+  constexpr std::array<Mode, 8> modes{{
+      {"cs-compare-read", true, true, false},
+      {"cs-read-compare", true, false, false},
+      {"vs-compare-ps-read", false, true, false},
+      {"vs-read-ps-compare", false, false, false},
+      {"cs-compare-disjoint-storage", true, true, true},
+      {"cs-disjoint-storage-compare", true, false, true},
+      {"vs-compare-ps-disjoint-storage", false, true, true},
+      {"vs-disjoint-storage-ps-compare", false, false, true}}};
+  const auto selected = std::find_if(modes.begin(), modes.end(), [&](const Mode& m) {
+    return std::strcmp(mode, m.name) == 0;
+  });
+  if (selected == modes.end()) {
+    std::fprintf(stderr, "unknown comparison positive mode: %s\n", mode);
+    std::_Exit(2);
+  }
+  const bool same_compute = selected->compute;
+  const bool compare_first = selected->compare_first;
+  const bool disjoint = selected->disjoint;
+  constexpr uintptr_t base = 0x0000000203e00000ull;
+  constexpr uint64_t image_size = 0x10000;
+  constexpr uint64_t allocation_size = image_size * 2;
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  EnsureRuntimeContext();
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, image_size, 0, &direct_offset) == 0,
+          "comparison alias allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset,
+              image_size) == 0 && mapped == reinterpret_cast<void*>(base),
+          "comparison alias mapping failed");
+  std::memset(mapped, 0, allocation_size);
+  RenderContext context(m_runtime_context);
+  auto& scheduler = context.GetCommandScheduler();
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  auto& resources = context.GetGpuResources();
+  auto& cache = resources.GetTextureCache();
+  auto& executor = context.GetRenderExecutor();
+  resources.MapMemory(base, allocation_size);
+
+  ShaderTextureResource descriptor{};
+  descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+  descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+      (((width - 1u) & 3u) << 30u);
+  descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+  descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+      (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+  descriptor.fields[5] = 0x00700000u;
+  DescriptorValue image_value{};
+  std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+            image_value.dwords.begin());
+  image_value.dword_count = 8;
+  ImageResource storage_resource{};
+  storage_resource.resource_class = ImageResourceClass::Storage;
+  storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
+  storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  storage_resource.written = true;
+  auto compare_resource = storage_resource;
+  compare_resource.resource_class = ImageResourceClass::Sampled;
+  compare_resource.written = false;
+  compare_resource.read = true;
+  compare_resource.depth_compare = true;
+
+  // Establish the same legal GPU-current R32 starting state as the promotion
+  // regression. No comparison descriptor has been resolved yet.
+  const auto source = RenderExecutorTestAccess::ResolveTexture(
+      executor, storage_resource, image_value);
+  Require(name, "source upload",
+          cache.FindTexture(source.image_id, source.desc) != nullptr &&
+              cache.GetImage(source.image_id).backing.format == vk::Format::eR32Sfloat &&
+              cache.GetImage(source.image_id).info.data.address == base &&
+              cache.GetImage(source.image_id).info.data.size == image_size,
+          "alias fixture did not establish the expected R32 allocation");
+  cache.MarkGpuWritten(source.image_id);
+  scheduler.Finish();
+  scheduler.DrainPriorityOperations();
+
+  // Ordinary image fetch shares the comparison range. Storage touches the
+  // adjacent half-open range, exactly testing end==begin as NON-overlap.
+  auto other_resource = storage_resource;
+  auto other_value = image_value;
+  if (disjoint) {
+    const auto other_address = base + image_size;
+    other_value.dwords[0] = static_cast<uint32_t>(other_address >> 8u);
+    other_value.dwords[1] = (other_value.dwords[1] & ~0xffu) |
+        static_cast<uint32_t>(other_address >> 40u);
+  } else {
+    other_resource.resource_class = ImageResourceClass::Sampled;
+    other_resource.written = false;
+    other_resource.read = true;
+    // An ordinary ImageRead uses an image binding without a sampler.
+  }
+
+  const auto compile_info = [&](ShaderType stage,
+                                std::vector<ImageResource> images) {
+    Program program{};
+    program.stage = stage;
+    program.shader_info_complete = true;
+    program.resource_tracking_complete = true;
+    program.info.images = std::move(images);
+    for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+      program.info.images[i].source = i;
+      if (program.info.images[i].depth_compare) {
+        SamplerResource sampler{};
+        sampler.source = static_cast<uint32_t>(program.info.images.size());
+        sampler.depth_compare = true;
+        program.info.samplers.push_back(sampler);
+        program.info.sampled_pairs.push_back({i, 0, 0});
+      }
+    }
+    AllocateBindings(program);
+    CompiledShaderInfo result{};
+    result.stage = stage;
+    result.info = std::move(program.info);
+    result.bindings = std::move(program.bindings);
+    return result;
+  };
+  auto first_info = compile_info(
+      same_compute ? ShaderType::Compute : ShaderType::Vertex,
+      same_compute
+          ? (compare_first ? std::vector{compare_resource, other_resource}
+                           : std::vector{other_resource, compare_resource})
+          : std::vector{compare_first ? compare_resource : other_resource});
+  auto second_info = compile_info(
+      ShaderType::Pixel,
+      std::vector{compare_first ? other_resource : compare_resource});
+  const auto runtime = [&](const CompiledShaderInfo& info) {
+    ShaderStageRuntime result{.program = &info};
+    for (const auto& image : info.info.images) {
+      result.resources.images.push_back(image.depth_compare ? image_value : other_value);
+    }
+    if (!info.info.samplers.empty()) {
+      DescriptorValue sampler{};
+      sampler.dword_count = 4;
+      // LESS comparison, nearest, normalized coordinates, clamp to edge.
+      sampler.dwords[0] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
+      result.resources.samplers.push_back(sampler);
+    }
+    return result;
+  };
+  const auto first = runtime(first_info);
+  const auto second = runtime(second_info);
+  const auto check = [&](const PreparedBindings& bindings) {
+    const auto& images = bindings.program->info.images;
+    Require(name, mode, bindings.resources.images.size() == images.size(),
+            "actual renderer omitted an image binding");
+    for (uint32_t i = 0; i < images.size(); ++i) {
+      const auto& bound = bindings.resources.images[i];
+      const auto expected_base = images[i].depth_compare || !disjoint
+                                     ? base : base + image_size;
+      const auto expected_type = images[i].written
+                                     ? TextureCache::BindingType::Storage
+                                     : TextureCache::BindingType::Texture;
+      Require(name, mode,
+              bound.image_view != nullptr && bound.desc.type == expected_type &&
+                  bound.desc.info.data.address == expected_base &&
+                  bound.desc.info.data.size == image_size &&
+                  cache.GetImage(bound.image_id).info.data.address == expected_base,
+              "actual renderer returned an incomplete or wrong-range binding");
+    }
+  };
+  const auto check_pair = [&](const TextureBinding& first_binding,
+                              const TextureBinding& second_binding) {
+    const auto& comparison = compare_first ? first_binding : second_binding;
+    const auto& other = compare_first ? second_binding : first_binding;
+    Require(name, mode,
+            cache.GetImage(comparison.image_id).backing.format == vk::Format::eD32Sfloat,
+            "comparison did not resolve to a native depth owner");
+    if (disjoint) {
+      Require(name, mode,
+              comparison.image_id != other.image_id &&
+                  cache.GetImage(other.image_id).backing.format == vk::Format::eR32Sfloat,
+              "disjoint storage must retain its separate R32 owner");
+    } else {
+      Require(name, mode, comparison.image_id == other.image_id,
+              "ordinary read must rebind to the same live promoted depth owner");
+    }
+  };
+  std::printf("KYTY_COMPARISON_POSITIVE_READY %s\n", mode);
+  std::fflush(stdout);
+  if (same_compute) {
+    auto bindings = executor.PrepareBindings(first);
+    // This is the normal second image stage of compute binding preparation.
+    executor.RebindImages(bindings);
+    check(bindings);
+    check_pair(bindings.resources.images[0], bindings.resources.images[1]);
+  } else {
+    auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
+        executor, first, second, true);
+    Require(name, mode, bindings.pixel.has_value(), "pixel stage was omitted");
+    check(bindings.vertex);
+    check(*bindings.pixel);
+    check_pair(bindings.vertex.resources.images[0], bindings.pixel->resources.images[0]);
+  }
+  // Successful positives must also tolerate the commands they recorded.
+  // This differs from the negative child, which must never submit bad copies.
+  scheduler.Finish();
+  scheduler.DrainPriorityOperations();
+  RenderExecutorTestAccess::ResetBindings(executor);
+  std::printf("KYTY_COMPARISON_POSITIVE_RETURNED %s\n", mode);
+  std::fflush(nullptr);
+  std::_Exit(0);
+}
+
+  void CheckStorageColorComparisonPromotion() {
+    constexpr const char *name = "StorageColorComparisonPromotion";
+    constexpr uintptr_t base = 0x0000000203e00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "depth-tiled color allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "depth-tiled color mapping failed");
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    TileTextureBlockLayout tile_layout{};
+    Require(name, "tile layout",
+            TileGetTextureBlockLayout(Prospero::BufferFormat::k32Float,
+                                      Prospero::TileMode::kDepth, false,
+                                      tile_layout),
+            "depth-tiled color block layout is unavailable");
+    uint32_t block_xor = 0;
+    Require(name, "block xor",
+            TileGetBlockXor(tile_layout.block, 0, 0, 0, block_xor),
+            "depth-tiled color block XOR is unavailable");
+    std::vector<uint32_t> expected(allocation_size / sizeof(uint32_t));
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        uint32_t offset = 0;
+        Require(name, "texel offset",
+                TileGetBlockOffset(tile_layout.block, x, y, 0, offset),
+                "depth-tiled color texel offset is unavailable");
+        const auto index = (offset ^ block_xor) / sizeof(uint32_t);
+        Require(name, "texel address", index < expected.size(),
+                "depth-tiled color texel address exceeds its backing");
+        const float values[] = {-2.0f, 0.0f, 1.0f, 2.0f};
+        expected[index] = std::bit_cast<uint32_t>(values[x % 4]);
+      }
+    }
+    std::memcpy(mapped, expected.data(), allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      ShaderTextureResource descriptor{};
+      descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+      descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (((width - 1u) & 3u) << 30u);
+      descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+      descriptor.fields[3] = DstSel(4,4,4,4) |
+          (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      descriptor.fields[5] = 0x00700000u;
+      ShaderRecompiler::IR::DescriptorValue value{};
+      std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), value.dwords.begin());
+      value.dword_count = 8;
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.written = true;
+      auto storage = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "source upload", texture_cache.FindTexture(storage.image_id, storage.desc) != nullptr,
+              "storage color source did not acquire its native image");
+      const auto source_backing = texture_cache.GetImage(storage.image_id).backing.image;
+      Require(name, "source format", texture_cache.GetImage(storage.image_id).backing.format == vk::Format::eR32Sfloat,
+              "storage source must retain its ordinary R32 color representation");
+      // Make the native image authoritative, then poison only its CPU backing.
+      texture_cache.MarkGpuWritten(storage.image_id);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint8_t> cleared(allocation_size);
+      Require(name, "clear guest backing",
+              Libs::LibKernel::Memory::TryWriteBacking(base, cleared.data(),
+                                                       allocation_size),
+              "depth-tiled color backing could not be cleared");
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.written = false;
+      resource.read = true;
+      resource.depth_compare = true;
+      auto comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      const auto& promoted = texture_cache.GetImage(comparison.image_id);
+      Require(name, "comparison-compatible backing",
+              promoted.backing.format == vk::Format::eD32Sfloat &&
+                  promoted.backing.image != source_backing && promoted.IsGpuModified(),
+              "GPU-current R32 color was not promoted to a separate depth-comparison image");
+      const auto comparison_view = texture_cache.FindTexture(comparison.image_id, comparison.desc);
+      Require(name, "comparison depth view",
+              std::ranges::any_of(promoted.views, [&](const auto& cached) {
+                return cached.view == comparison_view && cached.info.format == vk::Format::eD32Sfloat &&
+                       cached.info.aspect == vk::ImageAspectFlagBits::eDepth;
+              }), "comparison did not use a legal depth aspect/view");
+      resource.depth_compare = false;
+      auto ordinary = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "ordinary sampled alias", ordinary.image_id == comparison.image_id &&
+                  texture_cache.FindTexture(ordinary.image_id, ordinary.desc) != nullptr,
+              "ordinary sampling invalidated the comparison backing");
+      // Sample the actual promoted view on the same runtime command stream.
+      // Adjacent texels x=1,2 contain 0 and 1 in every row. Comparing the
+      // bilinear average would return 0 here; correct per-texel PCF returns .5.
+      vk::FormatProperties depth_properties{};
+      m_physical_device.getFormatProperties(vk::Format::eD32Sfloat, &depth_properties);
+      Require(name, "linear depth filtering",
+              bool(depth_properties.optimalTilingFeatures &
+                   vk::FormatFeatureFlagBits::eSampledImageFilterLinear),
+              "PCF oracle requires linear filtering support for D32");
+      texture_cache.GetImage(comparison.image_id).Transit(
+          vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+          {}, scheduler.Current().Handle());
+      const std::array<float, 2> left_uv{1.5f / width, 0.5f / height};
+      const std::array<float, 2> right_uv{2.5f / width, 0.5f / height};
+      const auto less = ProbeDepthComparison(name, scheduler, comparison_view,
+          vk::ImageLayout::eShaderReadOnlyOptimal, left_uv, right_uv);
+      Require(name, "linear LESS PCF", less == std::array{0.0f, 0.5f, 1.0f},
+              "comparison must filter per-texel comparison results");
+      const auto greater = ProbeDepthComparison(name, scheduler, comparison_view,
+          vk::ImageLayout::eShaderReadOnlyOptimal, left_uv, right_uv, 0.75f,
+          vk::Filter::eLinear, vk::CompareOp::eGreater);
+      Require(name, "linear GREATER PCF", greater == std::array{1.0f, 0.5f, 0.0f},
+              "depth comparison operation or filtered values are incorrect");
+      const auto nearest = ProbeDepthComparison(name, scheduler, comparison_view,
+          vk::ImageLayout::eShaderReadOnlyOptimal, left_uv, right_uv, 0.75f,
+          vk::Filter::eNearest);
+      Require(name, "nearest comparison", nearest[0] == 0.0f && nearest[2] == 1.0f,
+              "nearest comparison did not preserve endpoint texels");
+      Require(name, "readback queue",
+              TextureCacheTestAccess::TryDownload(texture_cache, comparison.image_id),
+              "promoted depth image could not be queued for readback");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::vector<uint32_t> observed(expected.size());
+      Require(name, "readback backing",
+              Libs::LibKernel::Memory::TryReadBacking(base, observed.data(),
+                                                      allocation_size),
+              "depth-tiled color readback is unavailable");
+      bool recovered = true;
+      for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+          uint32_t offset = 0;
+          const auto valid =
+              TileGetBlockOffset(tile_layout.block, x, y, 0, offset);
+          const auto index = (offset ^ block_xor) / sizeof(uint32_t);
+          recovered &= valid && index < observed.size() &&
+                       observed[index] == expected[index];
+        }
+      }
+      Require(name, "round trip", recovered,
+              "promotion clamped depth values or copied stale CPU contents instead of native color data");
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "depth-tiled color mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "depth-tiled color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -11601,6 +12499,7 @@ private:
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
+    m_runtime_context.depth_range_unrestricted_enabled = m_depth_range_unrestricted_enabled;
     m_runtime_context.subgroup_size = WorkgroupLimits().native_subgroup_size;
     m_physical_device.getProperties(
         &m_runtime_context.physical_device_properties);
@@ -11764,11 +12663,20 @@ private:
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    const auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+        "vkEnumerateDeviceExtensionProperties", [&](uint32_t* count, vk::ExtensionProperties* values) {
+          return m_physical_device.enumerateDeviceExtensionProperties(nullptr, count, values);
+        });
+    m_depth_range_unrestricted_enabled = std::ranges::any_of(available_extensions, [](const auto& extension) {
+      return std::strcmp(extension.extensionName.data(), VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+    });
+    if (m_depth_range_unrestricted_enabled)
+      device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+    device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -12075,6 +12983,7 @@ private:
 
   vk::Instance m_instance = nullptr;
   vk::PhysicalDevice m_physical_device = nullptr;
+  bool m_depth_range_unrestricted_enabled = false;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
@@ -28418,6 +29327,394 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+// Insert after VulkanHarness / before main, inside the existing test namespace.
+// No VulkanHarness is constructed in the parent. All four children are run,
+// then the aggregate verdict fails if any guard was missing or unrelated.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckComparisonAliasAdmission() {
+  constexpr const char* name = "ComparisonAliasAdmission";
+  char executable[MAX_PATH]{};
+  Require(name, "executable path",
+          GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string failures;
+  for (const char* mode : {"cs-compare-first", "cs-storage-first",
+                           "vs-compare-ps-storage", "vs-storage-ps-compare"}) {
+    char directory[MAX_PATH]{};
+    char filename[MAX_PATH]{};
+    Require(name, "temporary log",
+            GetTempPathA(MAX_PATH, directory) != 0 &&
+                GetTempFileNameA(directory, "KCA", 0, filename) != 0,
+            "temporary child log allocation failed");
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    const HANDLE log = CreateFileA(filename, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    const HANDLE input = CreateFileA("NUL", GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(name, "child handles", log != INVALID_HANDLE_VALUE &&
+                input != INVALID_HANDLE_VALUE,
+            "child standard handles could not be opened");
+    const HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    Require(name, "bounded child job", job != nullptr &&
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                         &limits, sizeof(limits)) != 0,
+            "child cleanup job could not be created");
+    std::string command = std::string("\"") + executable +
+        "\" --comparison-alias-death " + mode;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = log;
+    startup.hStdError = log;
+    startup.hStdInput = input;
+    PROCESS_INFORMATION process{};
+    const bool created = CreateProcessA(nullptr, mutable_command.data(),
+        nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+        nullptr, &startup, &process) != 0;
+    bool assigned = false;
+    bool resumed = false;
+    DWORD wait = WAIT_FAILED;
+    DWORD termination_wait = WAIT_FAILED;
+    if (created) {
+      assigned = AssignProcessToJobObject(job, process.hProcess) != 0;
+      resumed = assigned && ResumeThread(process.hThread) != DWORD(-1);
+      if (resumed) {
+        wait = WaitForSingleObject(process.hProcess, 30000);
+      }
+      termination_wait = wait;
+      if (wait != WAIT_OBJECT_0) {
+        // Even setup failures leave no suspended orphan. Job closure is a
+        // second cleanup guarantee; no unbounded wait is used.
+        if (assigned) {
+          (void)TerminateJobObject(job, 0x7du);
+        } else {
+          (void)TerminateProcess(process.hProcess, 0x7du);
+        }
+        termination_wait = WaitForSingleObject(process.hProcess, 5000);
+      }
+    }
+    // Closing the job is the fallback kill. Keep the process handle until a
+    // final bounded wait confirms the child cannot overlap the next case.
+    CloseHandle(job);
+    if (created && termination_wait != WAIT_OBJECT_0) {
+      termination_wait = WaitForSingleObject(process.hProcess, 5000);
+    }
+    DWORD exit_code = STILL_ACTIVE;
+    const bool exited = created && termination_wait == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
+        exit_code != STILL_ACTIVE;
+    if (created) {
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+    CloseHandle(input);
+    if (created && !exited) {
+      CloseHandle(log);
+      // Fail immediately: the other modes must not launch while termination
+      // is unconfirmed. This is a cleanup failure, never RED or GREEN.
+      Require(name, "confirmed child termination", false,
+              std::string(mode) + " cleanup did not confirm child termination");
+    }
+    LARGE_INTEGER zero{};
+    LARGE_INTEGER length{};
+    std::string output;
+    const bool sized = GetFileSizeEx(log, &length) != 0 &&
+        length.QuadPart >= 0 && length.QuadPart <= 4 * 1024 * 1024 &&
+        SetFilePointerEx(log, zero, nullptr, FILE_BEGIN) != 0;
+    DWORD read = 0;
+    if (sized) {
+      output.resize(static_cast<size_t>(length.QuadPart));
+      if (!ReadFile(log, output.data(), static_cast<DWORD>(output.size()),
+                    &read, nullptr)) {
+        output.clear();
+      } else {
+        output.resize(read);
+      }
+    }
+    CloseHandle(log); // Deletes the temporary file after the child has exited.
+    std::printf("[alias] %s exit=%lu completed=%d timeout=%d\n%s", mode,
+                static_cast<unsigned long>(exit_code),
+                wait == WAIT_OBJECT_0 && exited, wait == WAIT_TIMEOUT,
+                output.c_str());
+    const bool intended = output.find(
+        std::string("KYTY_COMPARISON_ALIAS_READY ") + mode) != std::string::npos &&
+        output.find("simultaneous depth comparison and storage image") !=
+            std::string::npos;
+    if (!created || !assigned || !resumed || wait != WAIT_OBJECT_0 ||
+        !exited || exit_code != 321 || !intended) {
+      failures += std::string(mode) + " exit=" + std::to_string(exit_code) + "; ";
+    }
+  }
+  Require(name, "four actual renderer entry guards", failures.empty(), failures);
+  std::printf("[host]    %-32s ok (4 cases)\n", name);
+}
+#endif
+
+// Insert after VulkanHarness / before main, inside the existing test namespace.
+// No VulkanHarness is constructed in the parent. The single child is run,
+// then the aggregate verdict fails if any guard was missing or unrelated.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckComparisonPromotionLayoutAdmission() {
+  constexpr const char* name = "ComparisonPromotionLayout";
+  char executable[MAX_PATH]{};
+  Require(name, "executable path",
+          GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string failures;
+  for (const char* mode : {"extent"}) {
+    char directory[MAX_PATH]{};
+    char filename[MAX_PATH]{};
+    Require(name, "temporary log",
+            GetTempPathA(MAX_PATH, directory) != 0 &&
+                GetTempFileNameA(directory, "KCA", 0, filename) != 0,
+            "temporary child log allocation failed");
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    const HANDLE log = CreateFileA(filename, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    const HANDLE input = CreateFileA("NUL", GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(name, "child handles", log != INVALID_HANDLE_VALUE &&
+                input != INVALID_HANDLE_VALUE,
+            "child standard handles could not be opened");
+    const HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    Require(name, "bounded child job", job != nullptr &&
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                         &limits, sizeof(limits)) != 0,
+            "child cleanup job could not be created");
+    std::string command = std::string("\"") + executable +
+        "\" --comparison-layout-death " + mode;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = log;
+    startup.hStdError = log;
+    startup.hStdInput = input;
+    PROCESS_INFORMATION process{};
+    const bool created = CreateProcessA(nullptr, mutable_command.data(),
+        nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+        nullptr, &startup, &process) != 0;
+    bool assigned = false;
+    bool resumed = false;
+    DWORD wait = WAIT_FAILED;
+    DWORD termination_wait = WAIT_FAILED;
+    if (created) {
+      assigned = AssignProcessToJobObject(job, process.hProcess) != 0;
+      resumed = assigned && ResumeThread(process.hThread) != DWORD(-1);
+      if (resumed) {
+        wait = WaitForSingleObject(process.hProcess, 30000);
+      }
+      termination_wait = wait;
+      if (wait != WAIT_OBJECT_0) {
+        // Even setup failures leave no suspended orphan. Job closure is a
+        // second cleanup guarantee; no unbounded wait is used.
+        if (assigned) {
+          (void)TerminateJobObject(job, 0x7du);
+        } else {
+          (void)TerminateProcess(process.hProcess, 0x7du);
+        }
+        termination_wait = WaitForSingleObject(process.hProcess, 5000);
+      }
+    }
+    // Closing the job is the fallback kill. Keep the process handle until a
+    // final bounded wait confirms the child cannot overlap the next case.
+    CloseHandle(job);
+    if (created && termination_wait != WAIT_OBJECT_0) {
+      termination_wait = WaitForSingleObject(process.hProcess, 5000);
+    }
+    DWORD exit_code = STILL_ACTIVE;
+    const bool exited = created && termination_wait == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
+        exit_code != STILL_ACTIVE;
+    if (created) {
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+    CloseHandle(input);
+    if (created && !exited) {
+      CloseHandle(log);
+      // Fail immediately: the other modes must not launch while termination
+      // is unconfirmed. This is a cleanup failure, never RED or GREEN.
+      Require(name, "confirmed child termination", false,
+              std::string(mode) + " cleanup did not confirm child termination");
+    }
+    LARGE_INTEGER zero{};
+    LARGE_INTEGER length{};
+    std::string output;
+    const bool sized = GetFileSizeEx(log, &length) != 0 &&
+        length.QuadPart >= 0 && length.QuadPart <= 4 * 1024 * 1024 &&
+        SetFilePointerEx(log, zero, nullptr, FILE_BEGIN) != 0;
+    DWORD read = 0;
+    if (sized) {
+      output.resize(static_cast<size_t>(length.QuadPart));
+      if (!ReadFile(log, output.data(), static_cast<DWORD>(output.size()),
+                    &read, nullptr)) {
+        output.clear();
+      } else {
+        output.resize(read);
+      }
+    }
+    CloseHandle(log); // Deletes the temporary file after the child has exited.
+    std::printf("[layout] %s exit=%lu completed=%d timeout=%d\n%s", mode,
+                static_cast<unsigned long>(exit_code),
+                wait == WAIT_OBJECT_0 && exited, wait == WAIT_TIMEOUT,
+                output.c_str());
+    const bool intended = output.find(
+        std::string("KYTY_COMPARISON_LAYOUT_READY ") + mode) != std::string::npos &&
+        output.find("depth comparison promotion requires matching color backing layout") !=
+            std::string::npos;
+    if (!created || !assigned || !resumed || wait != WAIT_OBJECT_0 ||
+        !exited || exit_code != 321 || !intended) {
+      failures += std::string(mode) + " exit=" + std::to_string(exit_code) + "; ";
+    }
+  }
+  Require(name, "actual ResolveTexture layout guard", failures.empty(), failures);
+  std::printf("[host]    %-32s ok (1 case)\n", name);
+}
+#endif
+
+// Insert after VulkanHarness / before main, inside the existing test namespace.
+// No VulkanHarness is constructed in the parent. All eight children are run,
+// then the aggregate verdict fails if any guard was missing or unrelated.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckComparisonAliasPositive() {
+  constexpr const char* name = "ComparisonAliasPositive";
+  char executable[MAX_PATH]{};
+  Require(name, "executable path",
+          GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string failures;
+  for (const char* mode : {"cs-compare-read", "cs-read-compare",
+                           "vs-compare-ps-read", "vs-read-ps-compare",
+                           "cs-compare-disjoint-storage", "cs-disjoint-storage-compare",
+                           "vs-compare-ps-disjoint-storage", "vs-disjoint-storage-ps-compare"}) {
+    char directory[MAX_PATH]{};
+    char filename[MAX_PATH]{};
+    Require(name, "temporary log",
+            GetTempPathA(MAX_PATH, directory) != 0 &&
+                GetTempFileNameA(directory, "KCA", 0, filename) != 0,
+            "temporary child log allocation failed");
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    const HANDLE log = CreateFileA(filename, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    const HANDLE input = CreateFileA("NUL", GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    Require(name, "child handles", log != INVALID_HANDLE_VALUE &&
+                input != INVALID_HANDLE_VALUE,
+            "child standard handles could not be opened");
+    const HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    Require(name, "bounded child job", job != nullptr &&
+                SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                         &limits, sizeof(limits)) != 0,
+            "child cleanup job could not be created");
+    std::string command = std::string("\"") + executable +
+        "\" --comparison-alias-positive " + mode;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = log;
+    startup.hStdError = log;
+    startup.hStdInput = input;
+    PROCESS_INFORMATION process{};
+    const bool created = CreateProcessA(nullptr, mutable_command.data(),
+        nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+        nullptr, &startup, &process) != 0;
+    bool assigned = false;
+    bool resumed = false;
+    DWORD wait = WAIT_FAILED;
+    DWORD termination_wait = WAIT_FAILED;
+    if (created) {
+      assigned = AssignProcessToJobObject(job, process.hProcess) != 0;
+      resumed = assigned && ResumeThread(process.hThread) != DWORD(-1);
+      if (resumed) {
+        wait = WaitForSingleObject(process.hProcess, 30000);
+      }
+      termination_wait = wait;
+      if (wait != WAIT_OBJECT_0) {
+        // Even setup failures leave no suspended orphan. Job closure is a
+        // second cleanup guarantee; no unbounded wait is used.
+        if (assigned) {
+          (void)TerminateJobObject(job, 0x7du);
+        } else {
+          (void)TerminateProcess(process.hProcess, 0x7du);
+        }
+        termination_wait = WaitForSingleObject(process.hProcess, 5000);
+      }
+    }
+    // Closing the job is the fallback kill. Keep the process handle until a
+    // final bounded wait confirms the child cannot overlap the next case.
+    CloseHandle(job);
+    if (created && termination_wait != WAIT_OBJECT_0) {
+      termination_wait = WaitForSingleObject(process.hProcess, 5000);
+    }
+    DWORD exit_code = STILL_ACTIVE;
+    const bool exited = created && termination_wait == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(process.hProcess, &exit_code) != 0 &&
+        exit_code != STILL_ACTIVE;
+    if (created) {
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+    CloseHandle(input);
+    if (created && !exited) {
+      CloseHandle(log);
+      // Fail immediately: the other modes must not launch while termination
+      // is unconfirmed. This is a cleanup failure, never RED or GREEN.
+      Require(name, "confirmed child termination", false,
+              std::string(mode) + " cleanup did not confirm child termination");
+    }
+    LARGE_INTEGER zero{};
+    LARGE_INTEGER length{};
+    std::string output;
+    const bool sized = GetFileSizeEx(log, &length) != 0 &&
+        length.QuadPart >= 0 && length.QuadPart <= 4 * 1024 * 1024 &&
+        SetFilePointerEx(log, zero, nullptr, FILE_BEGIN) != 0;
+    DWORD read = 0;
+    if (sized) {
+      output.resize(static_cast<size_t>(length.QuadPart));
+      if (!ReadFile(log, output.data(), static_cast<DWORD>(output.size()),
+                    &read, nullptr)) {
+        output.clear();
+      } else {
+        output.resize(read);
+      }
+    }
+    CloseHandle(log); // Deletes the temporary file after the child has exited.
+    std::printf("[positive] %s exit=%lu completed=%d timeout=%d\n%s", mode,
+                static_cast<unsigned long>(exit_code),
+                wait == WAIT_OBJECT_0 && exited, wait == WAIT_TIMEOUT,
+                output.c_str());
+    const bool intended = output.find(
+        std::string("KYTY_COMPARISON_POSITIVE_READY ") + mode) != std::string::npos &&
+        output.find(std::string("KYTY_COMPARISON_POSITIVE_RETURNED ") + mode) !=
+            std::string::npos;
+    if (!created || !assigned || !resumed || wait != WAIT_OBJECT_0 ||
+        !exited || exit_code != 0 || !intended) {
+      failures += std::string(mode) + " exit=" + std::to_string(exit_code) + "; ";
+    }
+  }
+  Require(name, "eight allowed renderer alias boundaries", failures.empty(), failures);
+  std::printf("[host]    %-32s ok (8 cases)\n", name);
+}
+#endif
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -28426,6 +29723,49 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+// Insert before main's unknown-selector fallback. Parent never constructs Vulkan.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+if (argc == 3 && std::strcmp(argv[1], "--comparison-alias-positive") == 0) {
+  VulkanHarness vulkan;
+  vulkan.RunComparisonAliasPositiveCase(argv[2]);
+}
+if (argc == 2 && std::strcmp(argv[1], "--comparison-alias-positive-only") == 0) {
+  CheckComparisonAliasPositive();
+  return 0;
+}
+// If admitted to the default suite, call CheckComparisonAliasPositive() beside
+// the existing alias/layout parent checks in the argc==1 path.
+#endif
+
+// Insert before the generic unknown-selector fallback. Test-only selectors.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+if (argc == 3 && std::strcmp(argv[1], "--comparison-layout-death") == 0) {
+  VulkanHarness vulkan;
+  vulkan.RunComparisonPromotionLayoutDeathCase(argv[2]);
+}
+if (argc == 2 && std::strcmp(argv[1], "--comparison-layout-only") == 0) {
+  CheckComparisonPromotionLayoutAdmission();
+  return 0;
+}
+#endif
+
+// Insert before main's generic unknown-selector fallback; TEST ONLY.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+if (argc == 3 && std::strcmp(argv[1], "--comparison-alias-death") == 0) {
+  VulkanHarness vulkan;
+  vulkan.RunComparisonAliasDeathCase(argv[2]);
+}
+if (argc == 2 && std::strcmp(argv[1], "--comparison-alias-only") == 0) {
+  CheckComparisonAliasAdmission();
+  return 0;
+}
+if (argc == 1) {
+  CheckComparisonAliasAdmission();
+  CheckComparisonPromotionLayoutAdmission();
+  CheckComparisonAliasPositive();
+}
+#endif
+
   if (argc == 2 && std::strcmp(argv[1], "--list-compute-cases") == 0) {
     for (const auto &test : MakeCases()) {
       std::printf("KYTY_COMPUTE_CASE %s\n", test.name);
@@ -28603,9 +29943,15 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
+    vulkan.CheckStorageColorComparisonPromotion();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--comparison-promotion-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageColorComparisonPromotion();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -28799,6 +30145,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
+  vulkan.CheckStorageColorComparisonPromotion();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();

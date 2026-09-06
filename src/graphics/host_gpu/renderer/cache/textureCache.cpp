@@ -62,6 +62,50 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	    view_info.level_count, view_info.base_layer, view_info.layer_count);
 }
 
+// ResolveTexture requests this native representation only for the bounded
+// depth-comparison promotion path. Existing native depth candidates need no
+// color conversion and retain the ordinary depth-overlap policy.
+void ValidateDepthComparisonPromotionLayout(const ImageInfo& requested,
+                                            TextureCache::BindingType binding,
+                                            const Image& cached) {
+	if (binding != TextureCache::BindingType::Texture ||
+	    requested.pixel_format != vk::Format::eD32Sfloat ||
+	    requested.guest_format != Prospero::BufferFormat::k32Float || cached.info.IsDepth()) {
+		return;
+	}
+	// A full native color-to-depth copy preserves texels only when both images
+	// describe the same guest allocation and layout. Do not inherit extra mips,
+	// clamp a larger source extent, or upload stale CPU bytes for an unmatched
+	// overlapping color image. Validate every candidate before cache mutation.
+	const auto& source = cached.info;
+	const bool matches =
+	    requested.data.Valid() && source.data == requested.data &&
+	    requested.type == Prospero::ImageType::kColor2D && source.type == requested.type &&
+	    requested.extent.depth == 1 && source.extent == requested.extent &&
+	    requested.resources == ImageSubresources {1, 1} &&
+	    source.resources == requested.resources && source.pitch == requested.pitch &&
+	    requested.samples == 1 && source.samples == requested.samples &&
+	    requested.bytes_per_block == 4 && source.bytes_per_block == requested.bytes_per_block &&
+	    requested.tile_mode == Prospero::TileMode::kDepth && source.tile_mode == requested.tile_mode &&
+	    source.pixel_format == vk::Format::eR32Sfloat && source.guest_format == requested.guest_format &&
+	    !requested.bgra16 && !source.bgra16 &&
+	    !requested.HasStencil() && !source.HasStencil() &&
+	    !requested.HasMetadata() && !source.HasMetadata() &&
+	    requested.metadata.range.Empty() && source.metadata.range.Empty() &&
+	    requested.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].size == requested.data.size &&
+	    source.mip_layout == requested.mip_layout &&
+	    cached.backing.format == vk::Format::eR32Sfloat &&
+	    cached.backing.image_type == vk::ImageType::e2D &&
+	    cached.backing.extent == requested.extent &&
+	    cached.backing.guest_pitch == requested.pitch &&
+	    cached.backing.mip_levels == 1 && cached.backing.layers == 1 &&
+	    cached.backing.samples == 1;
+	if (!matches) {
+		EXIT("depth comparison promotion requires matching color backing layout\n");
+	}
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1125,6 +1169,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
+		for (const auto id: candidates) {
+			ValidateDepthComparisonPromotionLayout(desc.info, desc.type, m_slot_images[id]);
+		}
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {

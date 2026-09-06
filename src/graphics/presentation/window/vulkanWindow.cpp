@@ -65,12 +65,13 @@ struct VulkanExtensions {
 
 vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noexcept {
 	vk::PhysicalDeviceVulkan12Features features {};
-	features.sType                    = vk::StructureType::ePhysicalDeviceVulkan12Features;
-	features.samplerMirrorClampToEdge = VK_TRUE;
-	features.timelineSemaphore        = VK_TRUE;
-	features.shaderOutputLayer        = VK_TRUE;
-	features.bufferDeviceAddress      = VK_TRUE;
-	features.shaderBufferInt64Atomics = VK_TRUE;
+	features.sType                     = vk::StructureType::ePhysicalDeviceVulkan12Features;
+	features.samplerMirrorClampToEdge  = VK_TRUE;
+	features.timelineSemaphore         = VK_TRUE;
+	features.shaderOutputLayer         = VK_TRUE;
+	features.shaderOutputViewportIndex = VK_TRUE;
+	features.bufferDeviceAddress       = VK_TRUE;
+	features.shaderBufferInt64Atomics  = VK_TRUE;
 	return features;
 }
 
@@ -276,6 +277,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("shaderOutputLayer is not supported\n");
 			skip_device = true;
 		}
+		if (required_features12.shaderOutputViewportIndex == VK_TRUE &&
+		    features12.shaderOutputViewportIndex != VK_TRUE) {
+			LOGF("shaderOutputViewportIndex is not supported\n");
+			skip_device = true;
+		}
 		if (required_features12.bufferDeviceAddress == VK_TRUE &&
 		    features12.bufferDeviceAddress != VK_TRUE) {
 			LOGF("bufferDeviceAddress is not supported\n");
@@ -318,6 +324,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 		if (device_features2.features.largePoints != VK_TRUE) {
 			LOGF("largePoints is not supported\n");
+			skip_device = true;
+		}
+		if (device_features2.features.multiViewport != VK_TRUE) {
+			LOGF("multiViewport is not supported\n");
 			skip_device = true;
 		}
 		if (device_features2.features.fragmentStoresAndAtomics != VK_TRUE) {
@@ -636,10 +646,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderClipDistance != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderCullDistance != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.largePoints != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.multiViewport != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
 	                     supported_features12.shaderOutputLayer != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputViewportIndex == VK_TRUE &&
+	                     supported_features12.shaderOutputViewportIndex != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.bufferDeviceAddress == VK_TRUE &&
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
@@ -663,6 +676,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderClipDistance                   = VK_TRUE;
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
+	device_features.multiViewport                        = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;

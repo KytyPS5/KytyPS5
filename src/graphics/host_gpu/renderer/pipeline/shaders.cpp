@@ -573,9 +573,7 @@ void CreatePipelineInternal(
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
 
 	vk::PipelineViewportStateCreateInfo viewport_state {};
-	viewport_state.pNext         = &depth_clip_control;
-	viewport_state.viewportCount = 1;
-	viewport_state.scissorCount  = 1;
+	viewport_state.pNext = &depth_clip_control;
 
 	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
 	if (static_params.cull_back) {
@@ -704,8 +702,8 @@ void CreatePipelineInternal(
 	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	const vk::DynamicState dynamic_states[] = {
-	    vk::DynamicState::eViewport,
-	    vk::DynamicState::eScissor,
+	    vk::DynamicState::eViewportWithCount,
+	    vk::DynamicState::eScissorWithCount,
 	    vk::DynamicState::eLineWidth,
 	    vk::DynamicState::eDepthTestEnable,
 	    vk::DynamicState::eDepthWriteEnable,

@@ -210,7 +210,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    });
 
 	const auto extent = color.Extent();
-	const auto sc     = calc_final_scissor(vp, ctx.GetScanModeControl(), extent);
+	const auto sc     = calc_final_scissor(vp, ctx.GetScanModeControl(), extent, 0);
 
 	LOGF(
 	    "DrawTargetState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64
@@ -315,6 +315,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 }
 
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+                                     const ShaderVertexInputInfo& vs_input_info,
                                      const RenderColorInfo* colors, uint32_t color_count,
                                      const RenderDepthInfo& depth) {
 	KYTY_PROFILER_FUNCTION();
@@ -333,31 +334,46 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
 
-	const auto final_scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent);
+	const auto& outputs = vs_input_info.stage.program->info.outputs;
+	const bool  indexed_viewports =
+	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+	    });
+	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	std::array<vk::Viewport, viewport_slots> viewports {};
+	std::array<vk::Rect2D, viewport_slots>   scissors {};
+	const uint32_t viewport_count = indexed_viewports ? viewport_slots : 1;
+	for (uint32_t i = 0; i < viewport_count; i++) {
+		const auto& guest    = vp.viewports[i];
+		auto&       viewport = viewports[i];
+		if (ctx.GetClipControl().clip_disable) {
+			const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+			viewport.width  = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
+			viewport.height = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
+		} else {
+			viewport.x      = guest.xoffset - guest.xscale;
+			viewport.y      = guest.yoffset - guest.yscale;
+			viewport.width  = guest.xscale * 2.0f;
+			viewport.height = guest.yscale * 2.0f;
+		}
+		viewport.minDepth =
+		    guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
+		viewport.maxDepth = guest.zscale + guest.zoffset;
 
-	vk::Viewport viewport {};
-	if (ctx.GetClipControl().clip_disable) {
-		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
-		viewport.x         = 0.0f;
-		viewport.y         = 0.0f;
-		viewport.width     = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
-		viewport.height    = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
-	} else {
-		viewport.x      = vp.viewports[0].xoffset - vp.viewports[0].xscale;
-		viewport.y      = vp.viewports[0].yoffset - vp.viewports[0].yscale;
-		viewport.width  = vp.viewports[0].xscale * 2.0f;
-		viewport.height = vp.viewports[0].yscale * 2.0f;
+		const auto final_scissor =
+		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
+		auto& scissor  = scissors[i];
+		scissor.offset = {final_scissor.left, final_scissor.top};
+		scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
+		                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
+		if (viewport.width == 0.0f) {
+			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
+			viewport.width = 1.0f;
+			scissor.extent = {0, 0};
+		}
 	}
-	viewport.minDepth = vp.viewports[0].zoffset -
-	                    (ctx.GetClipControl().dx_clip_space ? 0.0f : vp.viewports[0].zscale);
-	viewport.maxDepth = vp.viewports[0].zscale + vp.viewports[0].zoffset;
-	vk_buffer.setViewport(0, 1, &viewport);
-
-	vk::Rect2D scissor {};
-	scissor.offset = {final_scissor.left, final_scissor.top};
-	scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
-	                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
-	vk_buffer.setScissor(0, 1, &scissor);
+	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -1125,8 +1141,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
-	                         state.depth_info);
+	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
+	                         state.color_count, state.depth_info);
 
 	LogDrawPhase(draw.name, "BeginRendering");
 	if (set_auto_debug) {

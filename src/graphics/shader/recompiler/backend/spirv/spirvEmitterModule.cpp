@@ -490,6 +490,10 @@ void AllocateOutputVariables(EmitterState& state) {
 			case IR::StageOutputKind::Layer:
 				binding.variable_id = AllocateSharedOutputVariable(state, state.layer_variable);
 				break;
+			case IR::StageOutputKind::ViewportIndex:
+				binding.variable_id =
+				    AllocateSharedOutputVariable(state, state.viewport_index_variable);
+				break;
 			case IR::StageOutputKind::Depth:
 				binding.variable_id = AllocateSharedOutputVariable(state, state.depth_variable);
 				break;
@@ -583,6 +587,7 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 	AddBuiltIn(state.clip_distance_variable, "gl_ClipDistance", BuiltInClipDistance);
 	AddBuiltIn(state.cull_distance_variable, "gl_CullDistance", BuiltInCullDistance);
 	AddBuiltIn(state.layer_variable, "gl_Layer", BuiltInLayer);
+	AddBuiltIn(state.viewport_index_variable, "gl_ViewportIndex", BuiltInViewportIndex);
 	if (state.depth_variable != 0) {
 		state.builder.AddName(state.depth_variable, "gl_FragDepth");
 		state.builder.AddAnnotation(
@@ -711,6 +716,10 @@ void DefineModule(EmitterState& state) {
 	if (state.layer_variable != 0 || InputVariableForKind(state, IR::StageInputKind::Layer) != 0) {
 		state.builder.RequireVersion(0x00010500u);
 		state.builder.RequireCapability(CapabilityShaderLayer);
+	}
+	if (state.viewport_index_variable != 0) {
+		state.builder.RequireVersion(0x00010500u);
+		state.builder.RequireCapability(CapabilityShaderViewportIndex);
 	}
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(CapabilitySampleRateShading);
@@ -872,6 +881,11 @@ void DefineModule(EmitterState& state) {
 	if (state.layer_variable != 0) {
 		state.builder.DefineGlobalVariable(
 		    state.layer_variable, TypePointer(state, StorageClassOutput, TypeU32(state)),
+		    StorageClassOutput);
+	}
+	if (state.viewport_index_variable != 0) {
+		state.builder.DefineGlobalVariable(
+		    state.viewport_index_variable, TypePointer(state, StorageClassOutput, TypeU32(state)),
 		    StorageClassOutput);
 	}
 	for (const auto& binding: state.outputs) {

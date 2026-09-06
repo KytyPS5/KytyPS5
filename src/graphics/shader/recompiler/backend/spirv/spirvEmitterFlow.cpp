@@ -338,15 +338,24 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 		}
 		const auto output = IR::DecodePositionExportComponent(
 		    state.input_info.vertex->pa_cl_vs_out_cntl, exp.index, component);
-		if (output.layer) {
-			const auto raw   = ExportRawComponent(ctx, data, component);
-			const auto layer = state.builder.AllocateId();
-			state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), layer, raw,
-			                           ConstantU32(state, 0x7ffu)});
-			const auto pointer = state.stage == ShaderType::Mesh
-			                         ? MeshOutputPointer(state, IR::StageOutputKind::Layer)
-			                         : state.layer_variable;
-			state.builder.AddFunction({OpStore, pointer, layer});
+		if (output.layer || output.viewport) {
+			const auto raw = ExportRawComponent(ctx, data, component);
+			if (output.layer) {
+				const auto layer = state.builder.AllocateId();
+				state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), layer, raw,
+				                           ConstantU32(state, 0x7ffu)});
+				const auto pointer = state.stage == ShaderType::Mesh
+				                         ? MeshOutputPointer(state, IR::StageOutputKind::Layer)
+				                         : state.layer_variable;
+				state.builder.AddFunction({OpStore, pointer, layer});
+			}
+			if (output.viewport) {
+				// GFX10 MISC.z packs the viewport index in bits 16..19 alongside the layer.
+				const auto viewport = state.builder.AllocateId();
+				state.builder.AddFunction({OpBitFieldUExtract, TypeU32(state), viewport, raw,
+				                           ConstantU32(state, 16), ConstantU32(state, 4)});
+				state.builder.AddFunction({OpStore, state.viewport_index_variable, viewport});
+			}
 			continue;
 		}
 		if (!output.point_size && output.clip_distance == UINT32_MAX &&

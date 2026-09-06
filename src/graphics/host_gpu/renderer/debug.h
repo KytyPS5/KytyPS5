@@ -39,7 +39,7 @@ void                     hw_print(const CommandBuffer& buffer);
 void                     hw_check(const CommandBuffer& buffer);
 void                     LogDrawPhase(const char* draw_name, const char* phase);
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
-                               vk::Extent2D extent);
+                               vk::Extent2D extent, uint32_t viewport_index);
 
 } // namespace Libs::Graphics
 

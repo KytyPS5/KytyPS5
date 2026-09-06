@@ -324,7 +324,7 @@ void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 						const auto output = DecodePositionExportComponent(
 						    vertex->pa_cl_vs_out_cntl, export_info.index, component);
 						if (output.viewport) {
-							return Fail("vertex viewport-index export is unsupported");
+							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0, "gl_ViewportIndex");
 						}
 						if (output.point_size) {
 							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");

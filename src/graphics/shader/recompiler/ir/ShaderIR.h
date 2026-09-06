@@ -181,7 +181,8 @@ enum class StageOutputKind {
 	PointSize,
 	ClipDistance,
 	CullDistance,
-	Layer
+	Layer,
+	ViewportIndex
 };
 
 struct PositionExportComponent {

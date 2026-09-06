@@ -52,6 +52,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityShaderLayer                    = 69,
+	CapabilityShaderViewportIndex            = 70,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
@@ -91,6 +92,7 @@ enum : uint32_t {
 	BuiltInClipDistance              = 3,
 	BuiltInCullDistance              = 4,
 	BuiltInLayer                     = 9,
+	BuiltInViewportIndex              = 10,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
 	BuiltInSampleId                  = 18,
@@ -391,6 +393,7 @@ struct EmitterState {
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
+	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   clip_distance_count                   = 0;
 	uint32_t                   cull_distance_count                   = 0;
 	uint32_t                   depth_variable                        = 0;

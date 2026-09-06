@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <iterator>
 #include <span>
 #include <sstream>
@@ -907,12 +908,12 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
   return elements;
 }
 
-bool SpirvBuiltInStoreUsesAndConstant(const std::vector<uint32_t> &binary,
-                                      uint32_t builtin,
-                                      uint32_t constant) {
+bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
+                                    uint32_t builtin, uint32_t operation,
+                                    std::initializer_list<uint32_t> literals) {
   std::unordered_set<uint32_t> variables;
   std::unordered_map<uint32_t, uint32_t> constants;
-  std::unordered_map<uint32_t, std::array<uint32_t, 2>> bitwise_ands;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> operations;
   std::unordered_map<uint32_t, uint32_t> stores;
   for (size_t i = 5; i < binary.size();) {
     const uint32_t opcode = binary[i] & 0xffffu;
@@ -925,8 +926,8 @@ bool SpirvBuiltInStoreUsesAndConstant(const std::vector<uint32_t> &binary,
       variables.insert(binary[i + 1]);
     } else if (opcode == 43u && count >= 4u) {
       constants[binary[i + 2]] = binary[i + 3];
-    } else if (opcode == 199u && count == 5u) {
-      bitwise_ands[binary[i + 2]] = {binary[i + 3], binary[i + 4]};
+    } else if (opcode == operation && count == 4u + literals.size()) {
+      operations[binary[i + 2]] = {binary.begin() + i + 4, binary.begin() + i + count};
     } else if (opcode == 62u && count >= 3u) {
       stores[binary[i + 1]] = binary[i + 2];
     }
@@ -937,15 +938,16 @@ bool SpirvBuiltInStoreUsesAndConstant(const std::vector<uint32_t> &binary,
     if (store == stores.end()) {
       continue;
     }
-    const auto value = bitwise_ands.find(store->second);
-    if (value == bitwise_ands.end()) {
+    const auto value = operations.find(store->second);
+    if (value == operations.end()) {
       continue;
     }
-    for (const auto operand : value->second) {
-      const auto literal = constants.find(operand);
-      if (literal != constants.end() && literal->second == constant) {
-        return true;
-      }
+    if (std::equal(value->second.begin(), value->second.end(), literals.begin(),
+                   [&](uint32_t id, uint32_t expected) {
+                     const auto literal = constants.find(id);
+                     return literal != constants.end() && literal->second == expected;
+                   })) {
+      return true;
     }
   }
   return false;
@@ -9722,7 +9724,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
   const auto all_source = DisassembleSpirvBinary(all.spirv);
   Check(all.spirv[1] == 0x00010500u &&
             !Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
-            SpirvBuiltInStoreUsesAndConstant(all.spirv, 9u, 0x7ffu),
+            SpirvBuiltInStoreUsesOperation(all.spirv, 9u, 199u, {0x7ffu}),
         "layer export module version or GFX10 layer mask is incorrect");
   const auto positions = std::count_if(
       all.program.info.outputs.begin(), all.program.info.outputs.end(),
@@ -9776,25 +9778,23 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 ShaderRecompiler::IR::StageOutputKind::Position,
         "unmapped auxiliary position export was not ignored");
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  const auto rejects = [](uint32_t control, uint32_t en,
-                          const char *message) {
-    const uint32_t shader[] = {
-        EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
-        EncodeExp0(0x0d, en), EncodeExp1(4, 5, 6, 7),
-        0xbf810000u,
-    };
-    ShaderVertexInputInfo vertex{};
-    vertex.pa_cl_vs_out_cntl = control;
-    auto options = MakeCompileOptions(ShaderType::Vertex);
-    options.input_info.vertex = &vertex;
-    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-                message);
-  };
-  rejects(0x00280000u, 0x4u,
-          "viewport-index auxiliary position export did not terminate "
-          "compilation");
-#endif
+  // R-Type Final 3 packs a dynamic viewport index into POS1.z bits 16..19.
+  // The same component can carry an independent render-target layer in bits 0..10.
+  for (const uint32_t control : {0x01280000u, 0x012c0000u}) {
+    const auto indexed = compile(unmapped, control);
+    CheckSpirvBinaryValidates(indexed.spirv);
+    Check(indexed.spirv[1] == 0x00010500u &&
+              SpirvContainsCapability(indexed.spirv, 70u) &&
+              SpirvBuiltInStoreUsesOperation(indexed.spirv, 10u, 203u, {16u, 4u}),
+          "viewport export did not store the GFX10 four-bit index");
+    const bool layered = (control & (1u << 18u)) != 0;
+    Check(SpirvBuiltInStoreUsesOperation(indexed.spirv, 9u, 199u, {0x7ffu}) == layered,
+          "packed layer/viewport export dropped or invented a layer store");
+    Check(std::ranges::any_of(indexed.program.info.outputs, [](const auto &output) {
+            return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+          }),
+          "viewport export was omitted from shader reflection");
+  }
 
   ShaderVertexInputInfo key0{};
   ShaderVertexInputInfo key1{};

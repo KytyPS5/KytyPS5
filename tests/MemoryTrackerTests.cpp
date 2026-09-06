@@ -1,3 +1,4 @@
+#include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -21,6 +22,7 @@
 #undef min
 #undef max
 #else
+#include <csignal>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -832,6 +834,68 @@ void TestFatalPaths() {
   }
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+void *g_fault_stack = nullptr;
+constexpr size_t FAULT_STACK_SIZE = 64 * 1024;
+volatile sig_atomic_t g_stack_faults = 0;
+
+bool HandleStackFault(const Common::HostException::ExceptionInfo &info) {
+  using namespace Common::HostException;
+  stack_t active_stack{};
+  const auto fault_address = reinterpret_cast<uintptr_t>(g_fault_stack) +
+                             FAULT_STACK_SIZE - sizeof(uintptr_t);
+  if (info.type != ExceptionType::AccessViolation ||
+      info.access_violation_type != AccessViolationType::Write ||
+      info.access_violation_vaddr != fault_address ||
+      ::sigaltstack(nullptr, &active_stack) != 0 ||
+      (active_stack.ss_flags & SS_ONSTACK) == 0) {
+    std::_Exit(1);
+  }
+  g_stack_faults = 1;
+  return ::mprotect(g_fault_stack, FAULT_STACK_SIZE,
+                    PROT_READ | PROT_WRITE) == 0;
+}
+
+// A stack write must fault before any signal frame can use the protected stack.
+__attribute__((naked)) void WriteProtectedStack(void *) {
+  asm volatile("mov %rsp, %rax\n"
+               "mov %rdi, %rsp\n"
+               "push %rax\n"
+               "pop %rsp\n"
+               "ret\n");
+}
+
+void TestFaultOnProtectedStack() {
+  const pid_t pid = ::fork();
+  Check(pid >= 0, "stack fault fork failed");
+  if (pid == 0) {
+    std::thread worker([] {
+      Check(Common::HostException::InitializeThreadSignalStack(),
+            "initialize thread signal stack failed");
+      Check(Common::HostException::InstallHandler(HandleStackFault),
+            "install stack fault handler failed");
+      g_fault_stack = ::mmap(nullptr, FAULT_STACK_SIZE, PROT_READ,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      Check(g_fault_stack != MAP_FAILED, "allocate protected stack failed");
+      WriteProtectedStack(static_cast<char *>(g_fault_stack) + FAULT_STACK_SIZE);
+      Check(g_stack_faults == 1, "protected stack write did not resume");
+      struct sigaction action{};
+      Check(::sigaction(SIGSEGV, nullptr, &action) == 0 &&
+                action.sa_handler != SIG_DFL,
+            "stack fault reset the process handler");
+      Check(::munmap(g_fault_stack, FAULT_STACK_SIZE) == 0,
+            "release protected stack failed");
+    });
+    worker.join();
+    std::_Exit(0);
+  }
+  int status = 0;
+  Check(::waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "fault on a protected stack did not recover");
+}
+#endif
+
 } // namespace
 
 namespace Libs::LibKernel::Memory {
@@ -863,6 +927,9 @@ int main(int argc, char **argv) {
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  TestFaultOnProtectedStack();
+#endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;
 }

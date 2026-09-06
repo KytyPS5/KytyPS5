@@ -83,3 +83,32 @@ Required tests:
   snapshots remain enabled where cross-wave scheduling requires them.
 - Runtime rejection coverage for dirty specialization memory without converting an
   otherwise executable acyclic shader into a fatal materialization failure.
+
+## Nested selection with an externally entered linear tail
+
+Status: production fix and native shader validation in progress; automated regression
+deferred.
+
+Observed trigger: one arm of a nested conditional joins a straight-line tail that is also
+entered by a sibling arm of the enclosing conditional. Global post-dominance assigns both
+headers the same merge block. Giving the nested header an earlier merge allows a branch to
+exit its selection illegally; retaining the shared merge sends the reducible shader through
+the dispatcher fallback. The safe transformation clones the shared linear tail for the
+nested path and gives that path a dedicated synthetic merge.
+
+Required tests:
+
+- A compiler case where either inner arm reaches a linear tail shared with a sibling arm of
+  the enclosing selection, checking the cloned instruction range and dedicated inner merge.
+- Nested and sequential variants proving that each `OpSelectionMerge` owns a distinct
+  merge block and the result contains no dispatcher `OpSwitch`.
+- Phi and register-state cases proving that mutually exclusive clones preserve edge values
+  and execute the shared guest instructions exactly once on each original path.
+- A positive case where the acyclic shared tail lies inside an enclosing loop, plus rejection
+  cases for conditional or cyclic shared regions, multiple exits, and irreducible graphs;
+  these require full semantic region cloning.
+- Complexity-bound cases showing that large CFGs and graphs exceeding the small semantic-clone
+  budget fall back promptly instead of repeatedly expanding the graph.
+- Native Windows audit of captured shader `e52e19c6923301d0`, SPIR-V validation, and a
+  bounded game run comparing compile time and generated word count with the dispatcher
+  fallback baseline.

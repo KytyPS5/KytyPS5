@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <stack>
+#include <tuple>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -1452,6 +1453,159 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
+bool CloneExternallyEnteredLinearTail(Graph& graph, uint32_t header, uint32_t merge,
+	                                  const std::vector<uint32_t>& region) {
+	constexpr size_t kMaxSemanticCloneGraphBlocks = 192;
+	if (graph.blocks.size() > kMaxSemanticCloneGraphBlocks) {
+		return false;
+	}
+	std::vector<uint32_t> shared_blocks;
+	for (auto member: region) {
+		if (!graph.Dominates(header, member)) {
+			shared_blocks.push_back(member);
+		}
+	}
+	if (shared_blocks.empty()) {
+		return false;
+	}
+	if (shared_blocks.size() != 1u) {
+		return false;
+	}
+	const auto* shared_tail = graph.FindBlock(shared_blocks.front());
+	if (shared_tail == nullptr || shared_tail->inst_end - shared_tail->inst_begin > 16u) {
+		return false;
+	}
+
+	// Node splitting is safe here because every copied block is a straight-line suffix leading
+	// to the common merge. More general side-entered regions need full semantic region cloning.
+	for (auto member: shared_blocks) {
+		const auto* block = graph.FindBlock(member);
+		if (block == nullptr || block->terminator.kind != TerminatorKind::Branch ||
+		    block->successors.size() != 1u ||
+		    (block->successors.front() != merge &&
+		     !Contains(shared_blocks, block->successors.front()))) {
+			return false;
+		}
+		std::vector<uint32_t> visited;
+		auto                  cursor = member;
+		while (cursor != merge) {
+			if (Contains(visited, cursor)) {
+				return false;
+			}
+			visited.push_back(cursor);
+			const auto* cursor_block = graph.FindBlock(cursor);
+			if (cursor_block == nullptr || cursor_block->successors.size() != 1u) {
+				return false;
+			}
+			cursor = cursor_block->successors.front();
+		}
+	}
+
+	std::map<uint32_t, uint32_t> clones;
+	for (auto member: shared_blocks) {
+		const auto* source = graph.FindBlock(member);
+		if (source == nullptr) {
+			return false;
+		}
+		BasicBlock clone       = *source;
+		clone.id               = static_cast<uint32_t>(graph.blocks.size());
+		clone.predecessors.clear();
+		clone.dominators.clear();
+		clone.post_dominators.clear();
+		clones.emplace(member, clone.id);
+		graph.blocks.push_back(std::move(clone));
+	}
+
+	for (const auto& [source_id, clone_id]: clones) {
+		auto* clone = graph.FindBlock(clone_id);
+		if (clone == nullptr) {
+			return false;
+		}
+		for (const auto& [old_target, new_target]: clones) {
+			ReplaceValue(clone->successors, old_target, new_target);
+			ReplaceTerminatorTarget(clone->terminator, old_target, new_target);
+		}
+	}
+
+	bool redirected = false;
+	for (const auto& [source_id, clone_id]: clones) {
+		const auto* source = graph.FindBlock(source_id);
+		if (source == nullptr) {
+			return false;
+		}
+		const auto predecessors = source->predecessors;
+		for (auto predecessor: predecessors) {
+			if (!graph.Dominates(header, predecessor)) {
+				continue;
+			}
+			auto* block = graph.FindBlock(predecessor);
+			if (block != nullptr) {
+				redirected |= ReplaceValue(block->successors, source_id, clone_id);
+				ReplaceTerminatorTarget(block->terminator, source_id, clone_id);
+			}
+		}
+	}
+	return redirected;
+}
+
+bool CloneOneNestedSelectionTail(Graph& graph) {
+	std::vector<uint32_t> loop_headers;
+	for (const auto& loop: graph.natural_loops) {
+		AddUnique(loop_headers, loop.header);
+	}
+	struct Candidate {
+		uint32_t              header = UINT32_MAX;
+		uint32_t              merge  = UINT32_MAX;
+		uint32_t              cost   = UINT32_MAX;
+		uint32_t              depth  = UINT32_MAX;
+		std::vector<uint32_t> region;
+	};
+	std::vector<Candidate> candidates;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
+		    Contains(loop_headers, block.id) || IsInnermostLoopControlConditional(graph, block)) {
+			continue;
+		}
+		const auto merge  = FindSelectionMerge(graph, block);
+		const auto region = SelectionRegion(graph, block, merge);
+		const auto external = std::find_if(region.begin(), region.end(), [&](uint32_t member) {
+			const auto* member_block = graph.FindBlock(member);
+			return member_block != nullptr &&
+			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
+				       return predecessor != block.id && !Contains(region, predecessor);
+			       });
+		});
+		if (external == region.end()) {
+			continue;
+		}
+		const bool shared_with_enclosing_header =
+		    std::ranges::any_of(graph.blocks, [&](const BasicBlock& candidate) {
+			    return candidate.id != block.id &&
+			           candidate.terminator.kind == TerminatorKind::ConditionalBranch &&
+			           !Contains(loop_headers, candidate.id) &&
+			           graph.Dominates(candidate.id, block.id) &&
+			           !IsInnermostLoopControlConditional(graph, candidate) &&
+			           FindSelectionMerge(graph, candidate) == merge;
+		    });
+		const auto* external_block = graph.FindBlock(*external);
+		if (shared_with_enclosing_header && external_block != nullptr) {
+			candidates.push_back({block.id, merge,
+			                      external_block->inst_end - external_block->inst_begin,
+			                      static_cast<uint32_t>(block.dominators.size()), region});
+		}
+	}
+	std::ranges::sort(candidates, {}, [](const Candidate& candidate) {
+		return std::tuple {candidate.cost, candidate.depth, candidate.header};
+	});
+	for (const auto& candidate: candidates) {
+		if (CloneExternallyEnteredLinearTail(graph, candidate.header, candidate.merge,
+		                                     candidate.region)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool SplitOneSelectionMerge(Graph& graph) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
@@ -1510,6 +1664,12 @@ bool SplitOneSelectionMerge(Graph& graph) {
 bool SplitSharedMergeBlocks(Graph& graph) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
+	constexpr uint32_t kSemanticCloneBudget = 4;
+	for (uint32_t clone = 0; clone < kSemanticCloneBudget && CloneOneNestedSelectionTail(graph);
+	     clone++) {
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
 		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
 			return !graph.unsupported;

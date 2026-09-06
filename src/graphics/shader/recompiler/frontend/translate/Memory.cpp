@@ -1,8 +1,11 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -1055,6 +1058,11 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: {
 			// Stub : sémantique inerte « aucune intersection » — 4 canaux 0xFFFFFFFF
 			// (pointeur d'enfant absent pour un nœud boîte / temps NaN pour un nœud triangle)
+			static std::atomic<bool> bvh_stub_warned {false};
+			if (!bvh_stub_warned.exchange(true)) {
+				LOGF("MIMG BVH intersect-ray translated with inert stub (no intersection); "
+				     "ray tracing is not implemented. Results are approximate.\n");
+			}
 			const auto memory = MemoryInfoFromDecoded(inst);
 			const auto result = ir.Emit(IR::ValueOpcode::ImageBvhIntersectRay);
 			WriteImageComponents(inst.dst, result, memory, 4u);

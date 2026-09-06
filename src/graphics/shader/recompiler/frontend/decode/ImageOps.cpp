@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
 
 #include <algorithm>
@@ -380,6 +381,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	}
+	if ((inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY || inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) &&
+	    !Config::BvhStubEnabled()) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG BVH opcode requires --stub-bvh (ray tracing is not implemented)");
 	}
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

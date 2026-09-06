@@ -23419,6 +23419,322 @@ TestCase DsBpermuteCapturedExecOffsetAndWrap() {
   return test;
 }
 
+// Synthetic complete wave64 workgroups: LDS belongs to the whole guest group,
+// while lane collectives and scalar control belong to each individual wave.
+// Existing output stores use s[48:51]; helpers below reserve v30/v31 for stores.
+TestCase MakeMultiWaveLdsCase(const char* name, u32 local_count,
+                              u32 lds_dwords, u32 output_planes) {
+  TestCase test;
+  test.name = name;
+  test.initial.resize(8u + 2u * local_count * output_planes);
+  for (u32 word = 0; word < test.initial.size(); ++word)
+    test.initial[word] = 0xac000000u | word;
+  test.expected = test.initial;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 16;
+  test.compute_info.threads_num[1] = local_count / 16;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 2;
+  test.compute_info.wave_size = 64;
+  test.compute_info.lds_size_dwords = lds_dwords;
+  test.compute_info.needs_lds_barriers = false; // All communication uses explicit guest barriers.
+  test.compute_info.workgroup_register = 16;
+  test.compute_info.group_id[0] = true;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  return test;
+}
+
+void AppendMultiWaveLdsIndices(std::vector<u32>* code, u32 local_count) {
+  // v6=local linear index, v4=global output index, v5=group-specific payload,
+  // v7=own LDS byte address, v8=wave index within the guest workgroup.
+  code->push_back(EncodeSop1(0x04, 126, 193u)); // Full EXEC in every wave.
+  code->push_back(EncodeVop2(0x1a, 6, InlineU32(4), 1));
+  code->push_back(EncodeVop2(0x25, 6, Vgpr(0), 6));
+  code->push_back(EncodeVop1(0x01, 4, 16));
+  code->push_back(EncodeVop2(0x1a, 4, InlineU32(local_count == 128u ? 7u : 8u), 4));
+  code->push_back(EncodeVop2(0x25, 4, Vgpr(6), 4));
+  code->push_back(EncodeVop1(0x01, 5, 16));
+  code->push_back(EncodeVop2(0x1a, 5, InlineU32(16), 5));
+  code->push_back(EncodeVop2(0x25, 5, Vgpr(6), 5));
+  AppendVMovLiteral(code, 9, 0x1000u);
+  code->push_back(EncodeVop2(0x25, 5, Vgpr(9), 5));
+  code->push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));
+  code->push_back(EncodeVop2(0x16, 8, InlineU32(6), 6));
+}
+
+void AppendMultiWaveLdsStore(std::vector<u32>* code, u32 data_vgpr,
+                             u32 address_vgpr, u32 byte_offset = 0) {
+  code->push_back(EncodeDs0(0x0d, byte_offset));
+  code->push_back(EncodeDs1(0, data_vgpr, address_vgpr));
+}
+
+void AppendMultiWaveLdsRead(std::vector<u32>* code, u32 dst_vgpr,
+                            u32 address_vgpr, u32 byte_offset = 0) {
+  code->push_back(EncodeDs0(0x36, byte_offset));
+  code->push_back(EncodeDs1(dst_vgpr, 0, address_vgpr));
+  code->push_back(EncodeSopp(0x0c, 0)); // Complete the LDS result before use.
+}
+
+void AppendMultiWaveGuestBarrier(std::vector<u32>* code) {
+  code->push_back(EncodeSopp(0x0c, 0)); // Complete preceding guest memory operations.
+  code->push_back(EncodeSopp(0x0a));
+}
+
+TestCase MakeWave64MultiWaveLdsExchange(u32 local_count) {
+  using O = ShaderOpcode;
+  auto test = MakeMultiWaveLdsCase(local_count == 128u
+      ? "Wave64MultiWaveLdsExchange128" : "Wave64MultiWaveLdsExchange256",
+      local_count, local_count, 3);
+  const u32 total = 2u * local_count;
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendMultiWaveLdsStore(&code, 5, 7);
+  AppendMultiWaveGuestBarrier(&code);
+
+  // ReadLane is wave-local even though the live LDS allocation is group-wide.
+  // Its scratch must not overwrite any guest LDS element.
+  AppendVop3(&code, 0x360, 20, Vgpr(5), InlineU32(63));
+  code.push_back(EncodeVop2(0x25, 9, InlineU32(64), 6));
+  AppendVMovLiteral(&code, 10, local_count - 1u);
+  code.push_back(EncodeVop2(0x1b, 9, Vgpr(10), 9));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 9));
+  AppendMultiWaveLdsRead(&code, 11, 9);
+  AppendMultiWaveLdsRead(&code, 12, 7);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 4, 4u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 4, 4u + total);
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 4, 4u + total * 2u);
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 base = 0x1000u + (group << 16u);
+    for (u32 lane = 0; lane < local_count; ++lane) {
+      const u32 index = group * local_count + lane;
+      test.expected[4u + index] = base + ((lane + 64u) & (local_count - 1u));
+      test.expected[4u + total + index] = base + (lane / 64u) * 64u + 63u;
+      test.expected[4u + total * 2u + index] = base + lane;
+    }
+  }
+  test.opcodes = {O::S_MOV_B64, O::V_LSHLREV_B32, O::V_LSHRREV_B32,
+                  O::V_ADD_NC_U32, O::DS_WRITE_B32, O::DS_READ_B32,
+                  O::S_BARRIER, O::S_WAITCNT, O::V_READLANE_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase Wave64MultiWaveLdsExchange128() { return MakeWave64MultiWaveLdsExchange(128u); }
+TestCase Wave64MultiWaveLdsExchange256() { return MakeWave64MultiWaveLdsExchange(256u); }
+
+TestCase Wave64MultiWaveLdsAtomicReduction() {
+  using O = ShaderOpcode;
+  constexpr u32 total = 512;
+  auto test = MakeMultiWaveLdsCase("Wave64MultiWaveLdsAtomicReduction", 256, 3, 4);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, 256);
+  AppendVMovU32(&code, 9, 0);
+  AppendVMovLiteral(&code, 10, 0x7fffffffu);
+  AppendVMovLiteral(&code, 11, 0x80000000u);
+  AppendVMovU32(&code, 12, 0);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 6));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // Only group-local lane 0 initializes.
+  AppendMultiWaveLdsStore(&code, 10, 9, 0);
+  AppendMultiWaveLdsStore(&code, 11, 9, 4);
+  AppendMultiWaveLdsStore(&code, 12, 9, 8);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendMultiWaveGuestBarrier(&code);
+
+  // Each wave contributes a distinct signed value. A different group adds128,
+  // so accidental sharing between workgroups cannot satisfy both oracles.
+  AppendVMovLiteral(&code, 10, static_cast<u32>(-7));
+  constexpr std::array<u32, 3> other_values{5u, static_cast<u32>(-2), 19u};
+  for (u32 wave = 1u; wave < 4u; ++wave) {
+    AppendVMovLiteral(&code, 11, other_values[wave - 1u]);
+    code.push_back(EncodeVopc(0xc2, InlineU32(wave), 8));
+    code.push_back(EncodeVop2(0x01, 10, Vgpr(10), 11));
+  }
+  code.push_back(EncodeVop1(0x01, 12, 16));
+  code.push_back(EncodeVop2(0x1a, 12, InlineU32(7), 12));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(12), 10));
+  AppendVMovU32(&code, 11, 1);
+  code.push_back(EncodeVop2(0x1a, 11, Vgpr(8), 11));
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(63), 6));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // One leader per logical wave64.
+  code.push_back(EncodeDs0(0x05, 0)); // DS_MIN_I32, no returned value.
+  code.push_back(EncodeDs1(0, 10, 9));
+  code.push_back(EncodeDs0(0x06, 4)); // DS_MAX_I32.
+  code.push_back(EncodeDs1(0, 10, 9));
+  code.push_back(EncodeDs0(0x0a, 8)); // DS_OR_B32.
+  code.push_back(EncodeDs1(0, 11, 9));
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendMultiWaveGuestBarrier(&code);
+  AppendMultiWaveLdsRead(&code, 14, 9, 0);
+  AppendMultiWaveLdsRead(&code, 15, 9, 4);
+  AppendMultiWaveLdsRead(&code, 17, 9, 8);
+  AppendVop3(&code, 0x360, 20, Vgpr(5), InlineU32(63));
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 4, 4u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 15, 4, 4u + total);
+  AppendStoreVgprAtLaneDwordOffset(&code, 17, 4, 4u + 2u * total);
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 4, 4u + 3u * total);
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2u; ++group) {
+    for (u32 lane = 0; lane < 256u; ++lane) {
+      const u32 index = group * 256u + lane;
+      test.expected[4u + index] = static_cast<u32>(-7 + static_cast<int32_t>(group * 128u));
+      test.expected[4u + total + index] = 19u + group * 128u;
+      test.expected[4u + 2u * total + index] = 15u;
+      test.expected[4u + 3u * total + index] = 0x1000u + (group << 16u) + (lane / 64u) * 64u + 63u;
+    }
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::DS_MIN_I32, O::DS_MAX_I32, O::DS_OR_B32,
+                  O::DS_READ_B32, O::S_BARRIER, O::S_WAITCNT, O::S_MOV_B64,
+                  O::V_CMP_EQ_U32, O::V_CNDMASK_B32, O::V_READLANE_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit() {
+  using O = ShaderOpcode;
+  constexpr u32 total = 512;
+  auto test = MakeMultiWaveLdsCase("Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit", 256, 256, 7);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, 256);
+  AppendMultiWaveLdsStore(&code, 5, 7);
+  // Every invocation leaves a participation marker before some waves finish.
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 4, 4u);
+  AppendMultiWaveGuestBarrier(&code);
+  AppendVMovU32(&code, 9, 64);
+  code.push_back(EncodeVopc(0xc1, Vgpr(6), 9));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  const size_t peers_exit = code.size();
+  code.push_back(0); // EXECZ targets the final S_ENDPGM.
+
+  // Wave 0 reads data produced by now-finished wave 3, then uses wave-local
+  // collectives repeatedly. Peers must not be needed at these rendezvous.
+  AppendVMovU32(&code, 9, 192);
+  code.push_back(EncodeVop2(0x25, 9, Vgpr(6), 9));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 9));
+  AppendMultiWaveLdsRead(&code, 11, 9);
+  AppendVMovU32(&code, 10, 0);
+  AppendVMovU32(&code, 13, 0);
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));
+  const size_t loop = code.size();
+  AppendVop3(&code, 0x360, 21, Vgpr(11), InlineU32(63));
+  code.push_back(EncodeVop2(0x25, 12, 250u, 13));
+  code.push_back(EncodeVop2Dpp(11, 0x01bu)); // Reverse each four-lane quad.
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(12), 10));
+  code.push_back(EncodeVopc(0xc2, Vgpr(11), 11));
+  code.push_back(EncodeSop1(0x04, 22, 106)); // Both real ballot words.
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 20, InlineU32(3)));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 4, 4u + total);
+  AppendStoreSgprAtLaneDwordOffset(&code, 21, 4, 4u + 2u * total);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 4u + 3u * total);
+  AppendStoreSgprAtLaneDwordOffset(&code, 22, 4, 4u + 4u * total);
+  AppendStoreSgprAtLaneDwordOffset(&code, 23, 4, 4u + 5u * total);
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 4, 4u + 6u * total);
+  code[peers_exit] = EncodeSopp(0x08, static_cast<u32>(code.size() - peers_exit - 1));
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 base = 0x1000u + (group << 16u);
+    for (u32 lane = 0; lane < 256u; ++lane) {
+      const u32 index = group * 256u + lane;
+      test.expected[4u + index] = base + lane;
+      if (lane >= 64u) continue;
+      test.expected[4u + total + index] = base + 192u + lane;
+      test.expected[4u + 2u * total + index] = base + 255u;
+      test.expected[4u + 3u * total + index] = 3u * (base + 192u + (lane ^ 3u));
+      test.expected[4u + 4u * total + index] = 0xffffffffu;
+      test.expected[4u + 5u * total + index] = 0xffffffffu;
+      test.expected[4u + 6u * total + index] = 3u;
+    }
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::DS_READ_B32, O::S_BARRIER, O::S_WAITCNT,
+                  O::V_CMP_LT_U32, O::V_CMP_EQ_U32, O::S_MOV_B64,
+                  O::S_CBRANCH_EXECZ, O::V_READLANE_B32, O::V_ADD_NC_U32,
+                  O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// Each wave reaches the same guest barrier after a different number of
+// collective-bearing iterations. Early arrival must preserve that wave's state
+// and allow the other waves to progress, then release all of them together.
+TestCase Wave64MultiWaveLdsDifferentIterationsBeforeBarrier() {
+  using O = ShaderOpcode;
+  constexpr u32 total = 512;
+  auto test = MakeMultiWaveLdsCase("Wave64MultiWaveLdsDifferentIterationsBeforeBarrier", 256, 4, 6);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, 256);
+  AppendVop3(&code, 0x360, 20, Vgpr(8), InlineU32(0)); // Wave ID, scalar within each wave.
+  code.push_back(EncodeSop2(0x00, 21, 20, InlineU32(1)));
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+  AppendVMovU32(&code, 10, 0);
+  AppendSMovLiteral(&code, 25, 0x13579bdfu);
+  AppendSMovLiteral(&code, 26, 0x2468ace0u);
+  const size_t loop = code.size();
+  code.push_back(EncodeVop2(0x25, 11, 22, 5));
+  AppendVop3(&code, 0x360, 23, Vgpr(11), InlineU32(63));
+  code.push_back(EncodeVop2(0x25, 10, 23, 10));
+  // The loop header has mutually dependent Phi values. Backedge copies must
+  // be parallel: sequentially overwriting A before reading old A loses it.
+  code.push_back(EncodeSMovB32(27, 25));
+  code.push_back(EncodeSMovB32(25, 26));
+  code.push_back(EncodeSMovB32(26, 27));
+  code.push_back(EncodeSop2(0x00, 22, 22, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 22, 21));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 8));
+  code.push_back(EncodeVop2(0x1b, 13, InlineU32(63), 6));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 13));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  AppendMultiWaveLdsStore(&code, 10, 9);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendMultiWaveGuestBarrier(&code);
+
+  code.push_back(EncodeVop2(0x25, 9, InlineU32(1), 8));
+  code.push_back(EncodeVop2(0x1b, 9, InlineU32(3), 9));
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 9));
+  AppendMultiWaveLdsRead(&code, 12, 9);
+  AppendVop3(&code, 0x360, 24, Vgpr(5), InlineU32(63));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 4u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 4, 4u + total);
+  AppendStoreSgprAtLaneDwordOffset(&code, 22, 4, 4u + total * 2u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 24, 4, 4u + total * 3u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 25, 4, 4u + total * 4u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 26, 4, 4u + total * 5u);
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 base = 0x1000u + (group << 16u);
+    const auto accumulated = [&](u32 wave) {
+      const u32 iterations = wave + 1u;
+      return iterations * (base + wave * 64u + 63u) +
+             iterations * (iterations - 1u) / 2u;
+    };
+    for (u32 lane = 0; lane < 256u; ++lane) {
+      const u32 index = group * 256u + lane;
+      const u32 wave = lane / 64u;
+      test.expected[4u + index] = accumulated(wave);
+      test.expected[4u + total + index] = accumulated((wave + 1u) % 4u);
+      test.expected[4u + total * 2u + index] = wave + 1u;
+      test.expected[4u + total * 3u + index] = base + wave * 64u + 63u;
+      const bool swapped = (wave + 1u) % 2u != 0u;
+      test.expected[4u + total * 4u + index] = swapped ? 0x2468ace0u : 0x13579bdfu;
+      test.expected[4u + total * 5u + index] = swapped ? 0x13579bdfu : 0x2468ace0u;
+    }
+  }
+  test.opcodes = {O::V_READLANE_B32, O::V_ADD_NC_U32, O::S_ADD_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::DS_WRITE_B32,
+                  O::DS_READ_B32, O::S_BARRIER, O::S_WAITCNT, O::S_MOV_B64, O::S_MOV_B32,
+                  O::V_CMP_EQ_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase MakeWave64SingleGroupLdsTileCase(bool explicit_barrier) {
   using O = ShaderOpcode;
   constexpr u32 count = 128;
@@ -27157,6 +27473,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(DsWave64SparseSourceAndDestination);
+  AddCase(Wave64MultiWaveLdsExchange128);
+  AddCase(Wave64MultiWaveLdsExchange256);
+  AddCase(Wave64MultiWaveLdsAtomicReduction);
+  AddCase(Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit);
+  AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
   AddCase(Wave64SingleGroupLdsExplicitBarrier);
   AddCase(Wave64SingleGroupLdsUniformBranchOrdering);
@@ -32077,6 +32398,15 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--f64-admission-positive-only") == 0) {
     CheckF64AdmissionPositive();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-multiwave-lds-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64MultiWaveLdsExchange128());
+    RunCase(&vulkan, Wave64MultiWaveLdsExchange256());
+    RunCase(&vulkan, Wave64MultiWaveLdsAtomicReduction());
+    RunCase(&vulkan, Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit());
+    RunCase(&vulkan, Wave64MultiWaveLdsDifferentIterationsBeforeBarrier());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-descriptor-neighbors-only") == 0) {

@@ -275,6 +275,7 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    EmitValueImage(ctx, inst)) {
 		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
 		if (ctx.state.compute_execution.IsSplitWave64() &&
+		    !ctx.state.compute_execution.IsCooperativeWave64() &&
 		    (shared_access == IR::SharedAccess::Read || shared_access == IR::SharedAccess::Write)) {
 			// The planner admits LDS only when one complete guest wave remains
 			// one host workgroup and every branch is wave-uniform. Finish each
@@ -455,6 +456,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 
 } // namespace
 
+void EmitDirectValueInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	EmitDirectInstruction(ctx, inst);
+}
+
 uint32_t ValueEmitContext::TypeId(IR::Type type) const {
 	switch (type) {
 		case IR::Type::U1: return TypeBool(state);
@@ -492,6 +497,49 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	const auto* inst = value.ResolveInstruction();
 	if (inst == nullptr) {
 		Fail("direct SPIR-V emitter received a non-value argument");
+	}
+	if (cooperative_spills != nullptr) {
+		if (const auto slot = cooperative_spills->find(inst); slot != cooperative_spills->end()) {
+			const auto type = TypeId(inst->GetType());
+			const auto loaded = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, type, loaded, slot->second});
+			if (cooperative_collective_active == 0) return loaded;
+			// Other guest waves participate only in the physical rendezvous.
+			// Their uninitialized/stale private values must not affect even the
+			// temporary collective's control flow. No guest state is committed.
+			if (inst->GetType() == IR::Type::U32x2) {
+				std::array<uint32_t, 2> selected_words{};
+				for (uint32_t word = 0; word < 2; ++word) {
+					const auto raw = state.builder.AllocateId();
+					selected_words[word] = state.builder.AllocateId();
+					state.builder.AddFunction({OpCompositeExtract, TypeU32(state), raw, loaded, word});
+					state.builder.AddFunction({OpSelect, TypeU32(state), selected_words[word],
+					                           cooperative_collective_active, raw, ConstantU32(state, 0)});
+				}
+				const auto pair = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeConstruct, type, pair, selected_words[0], selected_words[1]});
+				return pair;
+			}
+			uint32_t components = 1;
+			switch (inst->GetType()) {
+				case IR::Type::U64: case IR::Type::F64: case IR::Type::F32x2:
+					components = 2; break;
+				case IR::Type::U32x3: components = 3; break;
+				case IR::Type::U32x4: components = 4; break;
+				default: break;
+			}
+			uint32_t condition = cooperative_collective_active;
+			if (components != 1) {
+				condition = state.builder.AllocateId();
+				std::vector<uint32_t> words{OpCompositeConstruct, TypeBoolVector(state, components), condition};
+				words.insert(words.end(), components, cooperative_collective_active);
+				state.builder.AddFunction(words);
+			}
+			const auto selected = state.builder.AllocateId();
+			state.builder.AddFunction({OpSelect, type, selected, condition, loaded,
+			                           state.builder.Constant(OpConstantNull, type)});
+			return selected;
+		}
 	}
 	if (dispatcher_spills != nullptr && current_block != nullptr &&
 	    inst->Parent() != current_block) {
@@ -594,6 +642,7 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 void EmitProgram(EmitterState& state, const IR::Program& program) {
 	ValueEmitContext                       ctx(state, program);
 	std::optional<DispatcherFunctionState> dispatcher;
+	std::optional<CooperativeFunctionState> cooperative;
 	if (state.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
@@ -650,6 +699,10 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills;
 	}
+	if (state.compute_execution.IsCooperativeWave64()) {
+		cooperative.emplace(PrepareCooperativeFunction(ctx));
+		ctx.cooperative_spills = &cooperative->spills;
+	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
@@ -680,6 +733,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           state.pixel_valid_mask_variable, StorageClassFunction});
 	}
+	if (cooperative) DeclareCooperativeFunctionVariables(ctx, *cooperative);
 	if (state.program.dispatcher_fallback) {
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
@@ -708,6 +762,8 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
+	} else if (cooperative) {
+		EmitCooperativeFunction(ctx, *cooperative);
 	} else if (state.program.dispatcher_fallback) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {

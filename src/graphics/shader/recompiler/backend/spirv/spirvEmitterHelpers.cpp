@@ -143,6 +143,10 @@ DppTargetLane EmitDpp8TargetLane(EmitterState& state, uint32_t lane_selectors) {
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.compute_execution.IsCooperativeWave64()) {
+		return EmitBinaryU32(state, OpBitwiseAnd, EmitHostLocalInvocationIndex(state),
+		                     ConstantU32(state, 63));
+	}
 	if (state.compute_execution.IsSplitWave64()) return EmitHostLocalInvocationIndex(state);
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");

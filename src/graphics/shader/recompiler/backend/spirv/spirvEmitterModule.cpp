@@ -654,8 +654,18 @@ void AddVsharpAnnotationsAndNames(EmitterState& state) {
 void DefineModule(EmitterState& state) {
 	DefineDescriptorVariables(state);
 	if (state.compute_execution.IsSplitWave64()) {
+		uint32_t scratch_dwords = 64;
+		if (state.compute_execution.IsCooperativeWave64()) {
+			scratch_dwords = 1;
+			for (const auto size: state.compute_execution.layout.host_size) {
+				EXIT_IF(size == 0 || scratch_dwords > UINT32_MAX / size);
+				scratch_dwords *= size;
+			}
+			EXIT_IF(scratch_dwords % 64u != 0u);
+		}
+		// One slot per actual host invocation; guest LDS is a separate array.
 		state.wave_scratch_variable = state.builder.DefineGlobalVariable(
-		    TypeU32ArrayPointer(state, StorageClassWorkgroup, 64), StorageClassWorkgroup);
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, scratch_dwords), StorageClassWorkgroup);
 		state.builder.AddName(state.wave_scratch_variable, "wave64_collective_scratch");
 	}
 	if (state.requirements.function_lds) {

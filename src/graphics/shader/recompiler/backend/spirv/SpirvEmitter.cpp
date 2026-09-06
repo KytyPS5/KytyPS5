@@ -384,11 +384,12 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 		if (state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) {
 			const auto& layout = state.compute_workgroup;
 			LOGF("compute execution geometry: hash=0x%016" PRIx64
-			     " guest=%ux%ux%u host=%ux%ux%u wave_partitions=%u split_wave64=%u\n",
+			     " guest=%ux%ux%u host=%ux%ux%u wave_partitions=%u split_wave64=%u cooperative_wave64=%u\n",
 			     program.shader_hash, layout.guest_size[0], layout.guest_size[1], layout.guest_size[2],
 			     layout.host_size[0], layout.host_size[1], layout.host_size[2],
 			     state.compute_execution.wave_partition_factor,
-			     state.compute_execution.IsSplitWave64() ? 1u : 0u);
+			     state.compute_execution.IsSplitWave64() ? 1u : 0u,
+			     state.compute_execution.IsCooperativeWave64() ? 1u : 0u);
 		}
 	}
 	state.inputs.reserve(program.info.inputs.size());

@@ -8834,6 +8834,252 @@ ShaderRecompiler::IR::Block* AddExecutionPlanBlock(ShaderRecompiler::IR::Program
   return block;
 }
 
+struct CooperativeExecutionFixture {
+  using O = ShaderRecompiler::IR::ValueOpcode;
+  using V = ShaderRecompiler::IR::Value;
+  ShaderRecompiler::IR::Program program;
+  ShaderComputeInputInfo compute{};
+  ShaderRecompiler::ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  V local;
+  V lane;
+
+  explicit CooperativeExecutionFixture(std::array<uint32_t,3> shape = {128,1,1}) {
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    for (uint32_t axis=0; axis<3; ++axis) compute.threads_num[axis] = shape[axis];
+    compute.wave_size = 64;
+    compute.lds_size_dwords = shape[0]*shape[1]*shape[2] + 3u;
+    compute.needs_lds_barriers = true;
+    AddBlock();
+    local = Emit(0,O::GetBuiltin,{V(static_cast<uint32_t>(
+        ShaderRecompiler::IR::StageInputKind::LocalInvocationIndex)),V(0u)});
+    lane = Emit(0,O::LaneId);
+    program.memory_info.push_back({.kind=ShaderRecompiler::IR::ResourceKind::Lds});
+  }
+  uint32_t AddBlock() {
+    const auto index = static_cast<uint32_t>(program.blocks.size());
+    AddExecutionPlanBlock(program);
+    program.block_info.back().terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    return index;
+  }
+  V Emit(uint32_t block,O op,std::initializer_list<V> args={}) {
+    return V(&program.blocks[block]->AppendNewInst(op,args));
+  }
+  V Shared(uint32_t block,O op,std::initializer_list<V> args,uint32_t memory=0u) {
+    const auto value=Emit(block,op,args);
+    value.TryInstruction()->SetFlags(ShaderRecompiler::IR::MemoryFlags{.index=memory});
+    return value;
+  }
+  void Branch(uint32_t from,uint32_t to) {
+    program.blocks[from]->AddBranch(program.blocks[to]);
+    auto& term=program.block_info[from].terminator;
+    term.kind=ShaderRecompiler::CFG::TerminatorKind::Branch;
+    term.true_block=program.block_info[to].id;
+  }
+  void Conditional(uint32_t from,uint32_t yes,uint32_t no,V condition) {
+    program.blocks[from]->AddBranch(program.blocks[yes]);
+    program.blocks[from]->AddBranch(program.blocks[no]);
+    auto& info=program.block_info[from];
+    info.terminator.kind=ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    info.terminator.true_block=program.block_info[yes].id;
+    info.terminator.false_block=program.block_info[no].id;
+    info.condition=condition;
+  }
+  V FirstWave(uint32_t block) {
+    const auto pred=Emit(block,O::ULessThan32,{local,V(64u)});
+    const auto ballot=Emit(block,O::Ballot,{pred});
+    const auto low=Emit(block,O::CompositeExtractU32x4,{ballot,V(0u)});
+    return Emit(block,O::INotEqual32,{low,V(0u)});
+  }
+  void KeepWave(uint32_t block) {
+    const auto value=Emit(block,O::ReadLane,{local,V(63u)});
+    Emit(block,O::ReferenceU32,{value});
+  }
+  auto Plan() {
+    ShaderRecompiler::IR::ValidateProgram(program,true);
+    ShaderStageInputInfo input{};
+    input.compute=&compute;
+    return ShaderRecompiler::PlanComputeExecution(program,input,limits);
+  }
+  void RequireWholeGroup(const char* message) {
+    const auto plan=Plan();
+    const std::array<uint32_t,3> guest{compute.threads_num[0],compute.threads_num[1],compute.threads_num[2]};
+    Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor==1u &&
+          plan.layout.guest_size==guest &&
+          WorkgroupInvocationCount(plan.layout.host_size)==WorkgroupInvocationCount(guest),message);
+  }
+};
+
+void TestCooperativeWave64GeometryAndBudget() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  for (const auto shape : {std::array<uint32_t,3>{128,1,1},
+                          std::array<uint32_t,3>{8,4,4},
+                          std::array<uint32_t,3>{16,16,1}}) {
+    F f(shape);
+    const auto count=static_cast<uint32_t>(WorkgroupInvocationCount(shape));
+    const auto own=f.Emit(0,O::ShiftLeftLogical32,{f.local,V(2u)});
+    f.Shared(0,O::WriteSharedU32,{own,f.local,V(true)});
+    f.Emit(0,O::Barrier);
+    const auto next=f.Emit(0,O::IAdd32,{f.local,V(64u)});
+    const auto peer=f.Emit(0,O::BitwiseAnd32,{next,V(count-1u)});
+    const auto address=f.Emit(0,O::ShiftLeftLogical32,{peer,V(2u)});
+    const auto read=f.Shared(0,O::LoadSharedU32,{address,V(true)});
+    f.Emit(0,O::ReferenceU32,{read});
+    f.KeepWave(0);
+    f.RequireWholeGroup("multi-wave LDS requires one full host workgroup and isolated wave64 collectives");
+    // Collective scratch doubles as the scheduler's PC publication storage.
+    // Guest LDS stays a separate full allocation; neither allocation may wrap.
+    const uint64_t bytes=(uint64_t{count}+f.compute.lds_size_dwords)*sizeof(uint32_t);
+    f.limits.max_shared_memory_bytes=static_cast<uint32_t>(bytes);
+    f.RequireWholeGroup("cooperative LDS and collective scratch must fit at the exact byte limit");
+    f.limits.max_shared_memory_bytes=static_cast<uint32_t>(bytes-1u);
+    Check(!f.Plan().error.empty(),"cooperative shared memory accepted one byte beyond its device limit");
+    f.limits.max_shared_memory_bytes=UINT32_MAX;
+    f.compute.lds_size_dwords=UINT32_MAX;
+    Check(!f.Plan().error.empty(),"cooperative LDS byte multiplication wrapped past the shared-memory guard");
+    f.compute.lds_size_dwords=count+3u;
+    f.limits.max_invocations=count-1u;
+    Check(!f.Plan().error.empty(),"cooperative mode partitioned a guest workgroup that did not fit the device");
+  }
+}
+
+void TestCooperativeWave64BarrierOrderAndControl() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  // Both divergent arms rendezvous at the same two ordered, acyclic barriers.
+  // After the last barrier waves can take different paths or finish at different times.
+  {
+    F f;
+    const auto left=f.AddBlock(),right=f.AddBlock(),phase=f.AddBlock();
+    const auto finish=f.AddBlock(),work=f.AddBlock();
+    f.Conditional(0,left,right,f.FirstWave(0));
+    f.Shared(left,O::WriteSharedU32,{V(0u),V(7u),
+        f.Emit(left,O::IEqual32,{f.local,V(0u)})});
+    f.Branch(left,phase); f.Branch(right,phase);
+    f.Emit(phase,O::Barrier);
+    f.Emit(phase,O::Barrier); // distinct sites within the same original IR block
+    f.Conditional(phase,work,finish,f.FirstWave(phase));
+    f.KeepWave(work); f.Branch(work,finish);
+    f.RequireWholeGroup("ordered guest barriers must allow different per-wave control before and after rendezvous");
+  }
+  // A fixed loop lies between barrier phases; the scheduler must yield at
+  // its backedge instead of executing the complete loop as one quantum.
+  {
+    F f;
+    const auto loop=f.AddBlock(),phase=f.AddBlock(),finish=f.AddBlock();
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    f.Emit(0,O::Barrier); f.Branch(0,loop);
+    auto& phi=f.program.blocks[loop]->AppendNewInst(O::Phi,{},
+        static_cast<uint64_t>(ShaderRecompiler::IR::Type::U32));
+    phi.AddPhiOperand(f.program.blocks[0],V(0u));
+    const auto next=f.Emit(loop,O::IAdd32,{V(&phi),V(1u)});
+    phi.AddPhiOperand(f.program.blocks[loop],next);
+    f.KeepWave(loop);
+    f.Conditional(loop,loop,phase,f.Emit(loop,O::ULessThan32,{next,V(3u)}));
+    f.program.block_info[loop].terminator.loop_header=true;
+    f.program.block_info[loop].terminator.continue_block=f.program.block_info[loop].id;
+    f.program.block_info[loop].terminator.merge_block=f.program.block_info[phase].id;
+    f.Emit(phase,O::Barrier); f.Branch(phase,finish); f.KeepWave(finish);
+    f.RequireWholeGroup("a bounded per-wave loop between ordered barriers must remain schedulable");
+  }
+  // These are limits of the first static barrier-order proof, not a claim
+  // that AMD forbids every early-terminated wave or every barrier in a loop.
+  for (const bool cyclic : {false,true}) {
+    F f;
+    const auto body=f.AddBlock(),finish=f.AddBlock();
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    if (cyclic) {
+      f.Branch(0,body);
+      f.Emit(body,O::Barrier);
+      f.Conditional(body,body,finish,f.FirstWave(body));
+      f.program.block_info[body].terminator.loop_header=true;
+      f.program.block_info[body].terminator.continue_block=f.program.block_info[body].id;
+      f.program.block_info[body].terminator.merge_block=f.program.block_info[finish].id;
+    } else {
+      f.Conditional(0,body,finish,f.FirstWave(0));
+      f.Emit(body,O::Barrier); f.Branch(body,finish);
+    }
+    f.KeepWave(finish);
+    Check(!f.Plan().error.empty(),
+          "cooperative admission silently broadened its ordered acyclic barrier contract");
+  }
+}
+
+void TestCooperativeWave64OperationBoundaries() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  enum class Scenario { IntegerAtomic,LiveAtomic,Gds,Scratch,WithinWaveBranch };
+  for (const auto scenario : {Scenario::IntegerAtomic,Scenario::LiveAtomic,
+       Scenario::Gds,Scenario::Scratch,Scenario::WithinWaveBranch}) {
+    F f({16,16,1});
+    const auto finish=f.AddBlock();
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    f.Emit(0,O::Barrier);
+    if (scenario==Scenario::IntegerAtomic || scenario==Scenario::LiveAtomic) {
+      const auto old=f.Shared(0,O::SharedAtomicOr32,{V(0u),V(1u),V(true)});
+      if (scenario==Scenario::LiveAtomic) f.Emit(0,O::ReferenceU32,{old});
+    }
+    if (scenario==Scenario::Gds || scenario==Scenario::Scratch) {
+      ShaderRecompiler::IR::MemoryInfo memory{};
+      memory.kind=scenario==Scenario::Gds ? ShaderRecompiler::IR::ResourceKind::Gds :
+                                          ShaderRecompiler::IR::ResourceKind::Scratch;
+      f.program.memory_info.push_back(memory);
+      if (scenario==Scenario::Gds) {
+        // factor==1 must not accidentally enable the earlier one-wave GDS path.
+        const auto append=f.Shared(0,O::DataAppend,
+            {V(0x00040004u),V(true),V(0xffffffffu),V(0xffffffffu)},1u);
+        f.Emit(0,O::ReferenceU32,{append});
+      } else {
+        const auto handle=f.Emit(0,O::GetScratchResource);
+        const auto read=f.Shared(0,O::LoadAddressU32,{handle,V(0u),V(0u),V(true)},1u);
+        f.Emit(0,O::ReferenceU32,{read});
+      }
+    }
+    f.Emit(0,O::Barrier);
+    if (scenario==Scenario::WithinWaveBranch) {
+      const auto body=f.AddBlock();
+      f.Conditional(0,body,finish,f.Emit(0,O::INotEqual32,{f.lane,V(0u)}));
+      f.KeepWave(body); f.Branch(body,finish);
+    } else {
+      f.Branch(0,finish);
+    }
+    f.KeepWave(finish);
+    if (scenario==Scenario::IntegerAtomic)
+      f.RequireWholeGroup("cooperative LDS integer atomics lost their whole-workgroup allocation");
+    else
+      Check(!f.Plan().error.empty(),
+            "cooperative LDS support bypassed GDS, scratch, live-atomic or within-wave convergence boundaries");
+  }
+}
+
+void TestCooperativeWave64LegacyBarrierInsertionScope() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  for (const uint32_t count : {128u,256u}) {
+    F f({count,1,1});
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(1u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    const auto read=f.Shared(0,O::LoadSharedU32,{V(0u),V(true)});
+    f.Emit(0,O::ReferenceU32,{read}); f.KeepWave(0);
+    const auto stats=ShaderRecompiler::IR::InsertSharedMemoryBarriers(
+        f.program,64u,f.compute);
+    Check(stats.inserted_barriers==0u,
+          "single-wave implicit LDS barriers became guest workgroup rendezvous in cooperative mode");
+    for (const auto* block : f.program.blocks)
+      for (const auto& inst : *block)
+        Check(inst.GetOpcode()!=O::Barrier,
+              "cooperative static barrier phases contain an unmarked heuristic barrier");
+  }
+}
+
 // TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
 // include the certificate header plus ShaderHostProfile.h. Register the five
 // TestF64Certificate* functions below. No compilation, Vulkan or game data.
@@ -9348,8 +9594,8 @@ void TestComputeExecutionConvergenceProof() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
   ShaderComputeInputInfo compute{};
-  // Preserve the partitioned-workgroup safety boundary; single-wave LDS is
-  // covered separately with valid storage, barriers, and divergent negatives.
+  // Preserve the partitioned-workgroup safety boundary for independent waves;
+  // live LDS selects the separate cooperative execution contract.
   compute.threads_num[0] = 128;
   compute.threads_num[1] = compute.threads_num[2] = 1;
   ShaderStageInputInfo input{};
@@ -9445,9 +9691,13 @@ void TestComputeExecutionConvergenceProof() {
     // feedback cases below retain rejection of polling and cyclic writes.
     const bool accepted = scenario == Scenario::Uniform || scenario == Scenario::LoopSnapshot ||
                           scenario == Scenario::LoopAtomic || scenario == Scenario::UniformPhi ||
-                          scenario == Scenario::LoopRead;
+                          scenario == Scenario::LoopRead || scenario == Scenario::Lds;
     const auto plan = PlanComputeExecution(program,input,limits);
     Check(plan.error.empty() == accepted, "split-wave convergence proof accepted/rejected the wrong invariant");
+    if (scenario == Scenario::Lds)
+      Check(plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 128u,
+            "live multi-wave LDS was admitted by partitioning its shared allocation");
   }
 }
 
@@ -9822,16 +10072,17 @@ void TestComputeExecutionSingleWaveLds() {
       ShaderStageInputInfo input{};
       input.compute = &compute;
       const auto plan = PlanComputeExecution(program,input,limits);
-      const bool accepted = WorkgroupInvocationCount(shape) == 64 &&
-                            (scenario == Scenario::Lds || scenario == Scenario::BarrierOnly);
+      // Multi-wave LDS/barriers now require a cooperative, unpartitioned
+      // host group; all other rejected resource/control classes stay rejected.
+      const bool accepted = scenario == Scenario::Lds || scenario == Scenario::BarrierOnly;
       if (accepted) {
         Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 1 &&
                   plan.layout.guest_size == shape &&
-                  WorkgroupInvocationCount(plan.layout.host_size) == 64,
-              "one complete guest wave must preserve valid LDS and workgroup barrier semantics");
+                  WorkgroupInvocationCount(plan.layout.host_size) == WorkgroupInvocationCount(shape),
+              "LDS and workgroup barriers must retain every guest invocation in one host group");
       } else {
         Check(!plan.error.empty() && !plan.IsSplitWave64(),
-              "LDS support bypassed partition, resource, live-atomic, convergence, or declaration guards");
+              "LDS support bypassed resource, live-atomic, convergence, or declaration guards");
       }
     }
   }
@@ -9872,9 +10123,9 @@ void TestComputeExecutionRejectsActualStorageAndSynchronization() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
   const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
-  // Partitioned guest groups must still reject actual storage and barriers.
-  // All declarations are zero here. Rejection must come from the real operation
-  // or its typed resource, so removing a declaration-only gate cannot hide it.
+  // All storage declarations are zero here: real LDS without allocation,
+  // GDS and scratch remain unsupported. A barrier alone needs no LDS and
+  // may be executed cooperatively, retaining the whole guest workgroup.
   for (const auto kind : {IR::ResourceKind::Lds,IR::ResourceKind::Gds,
                          IR::ResourceKind::Scratch,IR::ResourceKind::None}) {
     IR::Program program;
@@ -9908,7 +10159,13 @@ void TestComputeExecutionRejectsActualStorageAndSynchronization() {
     ShaderStageInputInfo input{};
     input.compute = &compute;
     const auto plan = PlanComputeExecution(program,input,limits);
-    Check(!plan.error.empty(),"split-wave execution accepted actual shared/scratch access or synchronization");
+    if (kind == IR::ResourceKind::None) {
+      Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 128u,
+            "guest barrier without LDS must retain a complete cooperative host group");
+    } else {
+      Check(!plan.error.empty(),"cooperative execution accepted missing LDS allocation, GDS or scratch");
+    }
   }
 }
 
@@ -13848,6 +14105,13 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-wave64-admission-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64GeometryAndBudget();
+    Libs::Graphics::TestCooperativeWave64BarrierOrderAndControl();
+    Libs::Graphics::TestCooperativeWave64OperationBoundaries();
+    Libs::Graphics::TestCooperativeWave64LegacyBarrierInsertionScope();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gds-append-admission-only") == 0) {
     Libs::Graphics::TestComputeExecutionGdsAppendAdmission();
     std::puts("KYTY_GDS_APPEND_ADMISSION_PASS");
@@ -13975,6 +14239,10 @@ int main(int argc, char* argv[]) {
   TestSingleWaveLdsSpirvPhaseOrdering();
   TestMixedComparisonImagesUseSeparateSpirvVariables();
   TestComputeExecutionWaveScratchBudget();
+  TestCooperativeWave64GeometryAndBudget();
+  TestCooperativeWave64BarrierOrderAndControl();
+  TestCooperativeWave64OperationBoundaries();
+  TestCooperativeWave64LegacyBarrierInsertionScope();
   TestComputeExecutionSingleWaveLds();
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();

@@ -23611,6 +23611,61 @@ GraphicsCase GraphicsFlatInterpolatorExport() {
   return test;
 }
 
+GraphicsCase GraphicsDefaultValueInterpolatorExport() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 chan = 0; chan < 4u; chan++) {
+    code.push_back(EncodeVintrp(0x02, chan, 1, chan, 2));
+  }
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = "GraphicsDefaultValueInterpolatorExport";
+  test.fragment_code = code;
+  test.expected_pixel = {0x00000000u, 0x00000000u, 0x00000000u, 0x3f800000u};
+  test.opcodes = {O::V_INTERP_MOV_F32, O::EXP, O::S_ENDPGM};
+  test.pixel_interpolator_settings = {0x00000000u, 0x00000120u};
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3e800000u, 0x00000000u, 0x00000000u,
+      0x3f800000u, 0x40400000u, 0xbf800000u, 0x3f400000u, 0x00000000u,
+      0x00000000u, 0x3f800000u, 0xbf800000u, 0x40400000u, 0x3e800000u,
+      0x00000000u, 0x00000000u, 0x3f800000u,
+  };
+  return test;
+}
+
+GraphicsCase GraphicsSharedParameterPerVertexExport() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVintrp(0x00, 0, 0, 3, 0));
+  code.push_back(EncodeVintrp(0x01, 0, 0, 3, 0));
+  code.push_back(EncodeVintrp(0x02, 1, 1, 0, 2));
+  code.push_back(EncodeVintrp(0x02, 2, 1, 0, 0));
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = "GraphicsSharedParameterPerVertexExport";
+  test.fragment_code = code;
+  test.expected_pixel = {0x3f800000u, 0x3e800000u, 0x3f000000u, 0x3f800000u};
+  test.opcodes = {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_INTERP_MOV_F32,
+                  O::V_MOV_B32, O::EXP, O::S_ENDPGM};
+  test.pixel_interpolator_settings = {0x00000000u, 0x00000420u};
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3e800000u, 0x00000000u, 0x00000000u,
+      0x3f800000u, 0x40400000u, 0xbf800000u, 0x3f400000u, 0x00000000u,
+      0x00000000u, 0x3f800000u, 0xbf800000u, 0x40400000u, 0x3e800000u,
+      0x00000000u, 0x00000000u, 0x3f800000u,
+  };
+  return test;
+}
+
 GraphicsCase GraphicsDsAddtidScratchExport() {
   using O = ShaderOpcode;
 
@@ -24157,6 +24212,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
       GraphicsFlatInterpolatorExport(),
+      GraphicsDefaultValueInterpolatorExport(),
+      GraphicsSharedParameterPerVertexExport(),
       GraphicsDsAddtidScratchExport(),
       GraphicsDirectSgprPushConstantExport(),
       GraphicsInlineSrtScalarPromotionExport(),
@@ -28409,6 +28466,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--default-interpolator-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsDefaultValueInterpolatorExport());
+    RunGraphicsCase(&vulkan, GraphicsSharedParameterPerVertexExport());
+    RunGraphicsCase(&vulkan, GraphicsFlatInterpolatorExport());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {

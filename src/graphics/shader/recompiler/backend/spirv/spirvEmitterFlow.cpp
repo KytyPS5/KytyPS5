@@ -154,7 +154,12 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 }
 
 uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
-	auto&       state = ctx.state;
+	auto&    state        = ctx.state;
+	uint32_t default_bits = 0;
+	if (state.stage == ShaderType::Pixel &&
+	    ShaderPixelParameterDefault(*state.input_info.pixel, attr, chan & 3u, default_bits)) {
+		return ConstantU32(state, default_bits);
+	}
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -172,6 +177,12 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 		return value;
 	};
 	if (input->per_vertex) {
+		if (PixelParameterIsFlat(state, attr)) {
+			const auto provoking = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpBitcast, TypeU32(state), provoking, load_per_vertex(0)});
+			return provoking;
+		}
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
@@ -212,7 +223,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
                                     uint32_t mode) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
-	if (!input->per_vertex) {
+	if (input == nullptr || !input->per_vertex) {
 		return EmitAttribute(ctx, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {

@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 
@@ -232,6 +233,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+
+bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
+                                             std::string_view git_revision,
+                                             std::string_view worktree_fingerprint);
 
 } // namespace Libs::Graphics
 

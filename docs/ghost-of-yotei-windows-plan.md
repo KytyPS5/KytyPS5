@@ -4,11 +4,11 @@
 Рабочая ветка — `main` fork `fxpw/KytyPS5`.
 
 **Эмулятор собирается, тесты проходят, но кадр игры, меню и управляемая игровая
-сцена пока не подтверждены.** В сборке `ad580fa` исправление конкурирующих
-LDS-записей позволило выполнить `916ea8893e5b276a` и следующий dispatch.
-Подтверждены **108 завершённых dispatch**, без сообщений GPUAV data race и VUID
-в этом запуске; окно осталось чёрным. Следующий отказ — **GDS append с
-неподдержанным смещением счётчика** в шейдере `7655afaf219f230f`.
+сцена пока не подтверждены.** В сборке `c226b41` расширение GDS append
+позволило выполнить `7655afaf219f230f`. Подтверждены **122 завершённых dispatch**,
+без сообщений GPUAV data race и VUID в этом запуске. Следующий отказ —
+**неподтверждённое происхождение buffer descriptor** в `86da5eb7b8257bb0`,
+PC `0x530`. Снимок окна этого запуска не сохранён.
 
 Этот документ — текущая сводка, а не первоначальный план от 5 сентября.
 Ожидание загрузки файлов, первый запуск Windows-сборки и поиск начального
@@ -21,14 +21,23 @@ MIMG/DPP8 препятствия уже пройдены. Исторически
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Commit `ad580fa278e0ea6066342dc187b5bd6a8aed33bb`; Windows executable пересобран и установлен, баннер `ad580fa` без dirty-суффикса. SHA-256 указан в карточке запуска. | Чистый баннер не означает готовность игры. |
-| Полная native Windows-сборка и CTest | **47/47 PASS, 44,31 с** после исправления конкурирующих LDS-записей и отдельной проверки LDS без конкурирующих invocations. | CTest проверяет свои сценарии, а не все игровые шейдеры и ресурсы. |
-| Дополнительные CPU-проверки | Проверены Workgroup/Function storage classes, host local size 1 и 2, atomic-store scope/semantics и сохранение барьеров. Прежние WG proof/materialization и расчёт guest groups (**14 случаев / 42 оси**) также проходят. | Это не исполнение всех диспетчеризаций игры. |
-| Дополнительные проверки GPU/Vulkan | **14 полных readback PASS с работающей GPUAV-инструментацией**: четыре collision-регрессии, пять multiwave LDS и пять соседних LDS/GDS/scratch случаев. Все процессы exit 0, без timeout и ошибок validation. | Эти сценарии не доказывают произвольные гонки памяти или правильность игрового изображения. |
-| CPU-аудит корпуса | Последний предыдущий аудит: **825 manifests: 681 passed / 144 failed**, 39,078 с. Он выполнен на этапе workgroup snapshots; после backend-исправления LDS новый batch не запускался. | У 172 compute-шейдеров нет безусловного раннего отказа; ещё 509 прошли только CFG. Это **не 681 готовый к GPU шейдер**. |
-| Реальная игра | Запуск `105553-f26fe5`: **108 завершённых dispatch**, exit **321**, без timeout. `916e…` и следующий dispatch завершены; следующий шейдер остановлен planner-ограничением GDS append. **0 GPUAV data race, 0 VUID** в сохранённых журналах. | Окно чёрное; кадр игры, меню и геймплей не подтверждены. |
+| Установленный эмулятор | Commit `c226b412db0ca492deac417c79d7d77a1e6ef889`; Windows executable чисто пересобран и установлен. Баннер `c226b41`, SHA-256 указан в карточке запуска. | Чистая сборка не означает готовность игры. |
+| Полная native Windows-сборка и CTest | **47/47 PASS, 42,20 с** после расширения GDS append на aligned 16-bit byte offsets. | CTest проверяет свои сценарии, а не все игровые шейдеры и ресурсы. |
+| Дополнительные CPU-проверки | **18 случаев GDS admission — PASS**, включая допустимые offset и оставшиеся отрицательные границы. Предыдущие LDS, WG proof/materialization и расчёт guest groups (**14 случаев / 42 оси**) сохранены. | Это не исполнение всех диспетчеризаций игры. |
+| Дополнительные проверки GPU/Vulkan | **5 полных GPUAV readback PASS**: два новых GDS offset-сценария и три прежних соседа. Все процессы exit 0, без timeout и ошибок validation. Прежний LDS-этап с 14 readbacks сохранён ниже. | Это не аппаратная проверка GDS-семантики на RDNA2 и не доказательство игрового изображения. |
+| CPU-аудит корпуса | **825 manifests: 686 passed / 139 failed**, 43,378 с. Пять прежних GDS offset-отказов сняты; 820 результатов без семантических изменений. | У 177 compute-шейдеров нет безусловного раннего отказа; ещё 509 прошли только CFG. Это **не 686 готовых к GPU шейдеров**. |
+| Реальная игра | Запуск `111603-11370e`: **122 завершённых dispatch**, exit **321**, без timeout. `7655…` выполнен; следующий отказ в ResourceTracking для `86da…`, PC `0x530`. **0 GPUAV data race, 0 VUID** в сохранённых журналах. | Снимка этого запуска нет; кадр игры, меню и геймплей не подтверждены. |
 
-Доказательства текущего LDS-этапа:
+Доказательства текущего GDS-этапа:
+`_Build/gds-append-offset-regression/native-validation.json` и
+`_Build/logs/gds-offset-final-ctest.log`. Пять GPUAV readbacks используют
+compute-test SHA-256
+`53590ffe5ceedd42c3c4440dae54fbf7b5967b8cfa059399071d66a0d3890cc4`;
+CPU admission и новый аудит — shader-cfg executable
+`e0b017f2e1988ec47e6851b1409c27beb4d1511ebb237b8f028842e019f1e5cf`.
+Их hashes не относятся к установленному emulator.
+
+Предыдущий LDS-этап, **47/47 CTest за 44,31 с**:
 `_Build/lds-same-address-regression/native-validation.json` и
 `_Build/logs/lds-store-final-ctest.log`. Все 14 заключительных GPUAV readback
 используют compute-test executable SHA-256
@@ -63,25 +72,31 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` из журнала запуска |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог запуска | `_Build/runs/yotei-integrated-20260906-105553-f26fe5` |
-| Commit исходников | `ad580fa278e0ea6066342dc187b5bd6a8aed33bb` |
-| SHA-256 установленного emulator | `f609d22d2682f0434a549efd981eb49159b1fb9d66d21e548334787064505e9d` |
-| Баннер | `Fork build fxpw/KytyPS5 ad580fa`, без dirty-суффикса |
-| Время UTC | `2026-09-06T10:55:53.185Z` → `10:57:49.510Z`, **116,33 с** |
+| Каталог запуска | `_Build/runs/yotei-integrated-20260906-111603-11370e` |
+| Commit исходников | `c226b412db0ca492deac417c79d7d77a1e6ef889` |
+| SHA-256 установленного emulator | `9be4b4fa4a6c865064eca1992c4224f5e2471c4fc3fb9fc25c3107b598962145` |
+| Баннер | `Fork build fxpw/KytyPS5 c226b41`, без dirty-суффикса |
+| Время UTC | `2026-09-06T11:16:03.912Z` → `11:16:54.982Z`, **51,07 с** |
 | Режим | Shader capture, Vulkan/GPU-assisted validation, синхронная диагностика dispatch |
 | Завершение | exit `321`; `timedOut = false`; ошибка runner отсутствует |
-| Наблюдаемое исполнение | **108 `after-complete`**; `916e…` (`cs=0x8000375600`) и следующий dispatch (`cs=0x800040c100`) завершены |
-| Компиляция `916e…` | Materialization выполнена; **218394 слова SPIR-V**; pipeline создан, dispatch выполнен |
+| Наблюдаемое исполнение | **122 `after-complete`**; прежний GDS-blocker `7655…` (`cs=0x80003a8a00`) завершён |
 | Validation | В `_kyty.txt`, `stdout.txt`, `stderr.txt` нет сообщений GPUAV data race и VUID |
-| Изображение | Сохранённый снимок окна чёрный; кадр игры, меню и управляемая сцена **не подтверждены** |
-| Следующий блокер | Compute shader `7655afaf219f230f`, **808 слов guest-кода**: `wave64 GDS append requires a zero-offset DWORD counter` |
+| Изображение | Снимок этого запуска не сохранён; кадр игры, меню и управляемая сцена **не подтверждены** |
+| Следующий блокер | Compute shader `86da5eb7b8257bb0`, **428 слов guest-кода**, PC `0x530`: `GetBufferResource dword 0 is not a valid runtime value` |
 
-Новый отказ возникает после decode/CFG/IR translation, при выборе допустимого
-исполнения в `EmitProgram`. Префикс журнала `SPIR-V validation failed` здесь
-сопровождает внутренний planner-отказ; это не сообщение Vulkan о выполнении
-нового шейдера. Текущий GDS append контракт допускает только DWORD-счётчик с
-нулевым offset. Расширение адресации требует отдельной синтетической регрессии;
-снимать ограничение без проверки фактического счётчика нельзя.
+Новый отказ возникает после IR translation, в `ResourceTracking.cpp:194`,
+до выпуска SPIR-V и dispatch этого шейдера. Перед загрузкой descriptor
+`V_READFIRSTLANE` выбирает результат `CNDMASK` между константами, далее
+`S_LSHL4_ADD` со смещением 32 формирует адрес для `S_LOAD_DWORDX4`.
+Нужно доказать и сохранить runtime-выбор целого descriptor, его границы и
+все четыре согласованных DWORD. Подставлять одну выбранную заранее ветвь нельзя.
+
+Предыдущий запуск `105553-f26fe5` на `ad580fa` завершился за **116,33 с**,
+exit 321, без timeout, после **108 dispatch**. Тогда `916e…` и следующий
+dispatch выполнились без LDS race, но `7655…` (808 слов) был отвергнут
+zero-offset GDS guard. Окно именно того запуска было чёрным; этот снимок не
+описывает изображение нового запуска. В `111603-11370e` прежний GDS-отказ снят
+и выполнение `7655…` подтверждено.
 
 `916e…` использует guest local size **16×16×1 = 256 потоков**, четыре wave64,
 dispatch **240×135×1**, LDS **640 DWORD = 2560 байт**, scratch **0**. Четыре
@@ -133,13 +148,59 @@ SPIR-V и выполнился, а `916e…` упирался в shared/scratch 
 | Bounded scalar loops | Доказанное `i=0; i<N; ++i`, invariant bound, clean SRT snapshots, четыре коррелированных столбца buffer descriptor, разные strides, zero-trip и alias guards. `d895…` прошёл в игре. | Нельзя выбирать начальную ветвь Phi или считать изменяемую память константой без доказательства. |
 | Коэффициенты по workgroup ID | Доказанные affine-адреса scalar reads по X/Y/Z преобразуются в индексируемые immutable SRT snapshots. Границы берутся из фактической guest-сетки до host partitioning; общие roots сохраняются при DCE. | Не произвольный BDA доступ. Нужны доказанные адреса, доступная coherent память, ограниченный размер и отсутствие writable aliases. |
 | Dispatch и ускоренные clear | Безопасный ceil для перевода числа потоков в guest groups; исходная сетка согласована со snapshot/cache layout. Оба fastpath отказывают при bounded snapshots/immutable ranges до изменения image, HTile или DCC state. | Constant-clear baseline сохранён. Snapshot-зависимый store нельзя заменять значением из user data без отдельного доказательства. |
+| GDS append offset | Для одной полной wave64 допускается aligned 16-bit byte offset **0…65532** к DWORD-счётчику. Общий predicate planner/emitter, прежние M0/backing/EXEC проверки; 18 CPU и 5 GPUAV случаев проходят. `7655…` выполнился в игре. | Интерпретация поддержана LLVM и синтетическими тестами, но не отдельной аппаратной проверкой RDNA2; противоречие руководства описано ниже. Не добавлены CONSUME, LDS append или multiwave cooperative GDS. |
 | #459 / #476 | Безопасный raw host-read fallback; сохранение младших битов host byte offset, overflow guards и однократное применение offset для atomic64. RED/GREEN и соседние отрицательные сценарии сохранены. | #459 не назван исправлением текущего игрового пути: ProgramCache уже имел bounded callbacks. Новая renderer admission #476 ограничена доказанными 8-bit компонентами и полным последним DWORD. R16, смешанные обращения и partial tail не объявлены поддержанными. |
 
 Первоначальная Windows baseline `74a78f3` и её **36/36 CTest** относятся к
 5 сентября. Они полезны для истории и сравнения, но не являются результатом
 текущей установки. Прежние этапы и счётчики корпуса сохраняются для сравнения;
-последний полный CTest — 47/47 за 44,31 с. Последний расширенный аудит —
-681/144; он предшествует backend-исправлению LDS.
+последний полный CTest — 47/47 за 42,20 с, расширенный аудит — 686/139.
+
+### Доказательства GDS append offset в `c226b41`
+
+До production-правки получены три намеренных native RED: один CPU admission
+и два GPU-сценария отвергнуты прежним zero-offset guard, без timeout.
+Сохранённые oracles затем прошли: **18 CPU случаев и 5 GPUAV readbacks**,
+включая два новых сценария и три прежних соседа.
+
+| Новый GPU-сценарий | Полный readback |
+| --- | --- |
+| `DsAppendWave64OffsetsSelectIndependentCounters` | 1160 DWORD output и 70 DWORD GDS; разные counters, full/sparse/upper/lower/empty EXEC и guards |
+| `DsAppendWave64OffsetLoopCompactsSparseReservations` | 520 DWORD output и 70 DWORD GDS; три ограниченных sparse reservations, counter 7 → 19 |
+
+В первом тесте M0 base равен 8 байтам, size — 272; offsets **4, 12, 0x104**
+выбирают три независимых счётчика. Проверяются общий pre-operation result для
+активных lanes и отдельный MBCNT prefix. Во втором активны lanes 1, 31, 33, 63;
+два native subgroup32 не должны выполнять две guest reservations вместо одной.
+Соседи: `DsAppendWave64ReturnsOneBaseAcrossNativeHalves`,
+`DsAppendWave64BoundedLoopCompactsThreeReservations`, `DsAppendGdsSelector`.
+
+Общий predicate допускает только DWORD-aligned unsigned 16-bit byte offset
+**0…65532**. Существующая формула M0 base + byte offset, проверки runtime
+backing, EXEC и broadcast результата сохранены. Offset не умножается на четыре
+и не обрезается при сложении. Это расширение одной полной гостевой wave64;
+CONSUME, LDS append, разделённые multiwave GDS и неподтверждённые зависимости
+управления остаются отдельными ограничениями. Новая семантика misaligned M0,
+нулевого size или адреса за backing этим изменением не установлена.
+
+Основание именно компиляторное: [LLVM 18.1.8 codegen test](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.ds.append.ll#L92-L102)
+сворачивает GDS pointer + 16383 DWORD в byte offset 65532;
+[instruction selector](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/lib/Target/AMDGPU/AMDGPUISelDAGToDAG.cpp#L2280-L2314)
+обрабатывает byte displacement отдельно от признака GDS. Эти codegen-тесты
+нацелены на gfx6–9 и не являются аппаратной проверкой RDNA2. Подробное описание
+DS_APPEND в [AMD RDNA2 ISA](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content)
+требует zero GDS immediate, несмотря на общую
+формулу base+offset и приведённое compiler/capture evidence. Поэтому здесь
+зафиксирован ограниченный compiler-supported контракт, **не безусловная
+аппаратная гарантия консоли**. Разбор источников:
+`_Build/data-append-regression/nonzero-offset-contract.md`;
+`hardware_conformance_tested = false` сохранён в validation manifest.
+
+Доказательства RED/GREEN: `_Build/gds-append-offset-regression/native-red.json`
+и `native-validation.json`. Новый игровой запуск `111603-11370e` на
+установленном `c226b41` подтвердил выполнение `7655…`, после чего обнаружен
+отдельный ResourceTracking-отказ. Это игровой результат сверх CPU-аудита;
+сам precheck такого исполнения не доказывает.
 
 ### Доказательства LDS-исправления в `ad580fa`
 
@@ -194,7 +255,8 @@ compute-test SHA-256
 Заключительные GREEN, hashes исходников, **47/47 CTest за 44,31 с** и hash
 установленного emulator: соседний `native-validation.json`.
 Последующий реальный запуск `105553-f26fe5` подтвердил выполнение `916e…`
-без прежней LDS race; следующий GDS append отказ остаётся отдельной задачей.
+без прежней LDS race; найденный тогда GDS append отказ затем исправлен и
+проверен отдельным этапом `c226b41`, описанным выше.
 
 ### Доказательства workgroup snapshots в `975f9e3`
 
@@ -225,45 +287,55 @@ lowering в SPIR-V и не доказывает произвольный обм�
 
 ### Последний расширенный прогон
 
-Этот аудит выполнен на этапе `975f9e3`, **до backend-исправления LDS в
-`ad580fa`**. Новый batch после этой правки не запускался; ниже сохраняется
-последний измеренный результат, а не новый PASS текущего executable.
-
-Отчёт: `_Build/shader-audits/yotei-workgroup-snapshots-20260906/report.json`,
+Отчёт этапа GDS offset:
+`_Build/shader-audits/yotei-gds-offsets-20260906/report.json`,
 сравнение по всем manifests — соседний `comparison.json`.
-Начало **10:24:01.528 UTC**, время **39,078 с**, timeout **0**.
-Auditor SHA-256: `b5ac81a9cc14856050526547015430c0d38081cc7534f729463b9d2bc35b3e71`.
+Начало **11:13:19.699 UTC**, время **43,378 с**, timeout **0**.
+Auditor SHA-256: `e0b017f2e1988ec47e6851b1409c27beb4d1511ebb237b8f028842e019f1e5cf`.
 Профиль RTX 4060 сохранён вместе с отчётом: native subgroup 32,
 максимальная workgroup `(1024,1024,64)` / 1024 потока, 49152 байта shared memory.
 
 | Результат нового этапа | Шейдеров | Значение |
 | --- | ---: | --- |
-| `not_rejected` | 172 | До специализации ресурсов планировщик не нашёл безусловного отказа. У одного шейдера сохранён условный отказ, зависящий от неизвестного ADD_TID. |
-| `rejected` | 50 | Дополнительные ранние отказы при выбранном host/header profile. |
+| `not_rejected` | 177 | До специализации ресурсов планировщик не нашёл безусловного отказа. У одного шейдера сохранён условный отказ, зависящий от неизвестного ADD_TID. |
+| `rejected` | 45 | Дополнительные ранние отказы при выбранном host/header profile. |
 | `not_checked` | 603 | 94 прежних отказа на более ранних стадиях и 509 manifests, проверенных только до CFG. |
 
-Итог доступных стадий — **681 passed / 144 failed**. При том же inventory и
-host profile относительно предыдущего precheck-прогона **680/145** изменился
-ровно один manifest: **`cs_00010744.json`**, чей код точно сопоставлен с игровым
-`916ea8893e5b276a`. Его ранний отказ снят, **824 остальных статуса неизменны**,
-регрессий и новых timeout нет. Варианты с LDS barriers on/off и ADD_TID on/off
-допускают cooperative план; теперь требуется specialization memory.
+Итог доступных стадий — **686 passed / 139 failed**. При том же inventory и
+host profile относительно предыдущего **681/144** улучшились ровно пять
+manifests: `cs_00005474.json`, `cs_00006174.json`, `cs_0000b604.json`,
+`cs_000156f4.json`, `cs_00017314.json`. Последние два содержат один и тот же
+код, точно совпадающий с игровым `7655afaf219f230f`; это две записи корпуса,
+а не два доказательства аппаратного исполнения.
+**820 результатов семантически неизменны, регрессий и timeout нет.**
+У всех пяти снят zero-offset GDS guard при обоих LDS-barrier и ADD_TID
+предположениях. Runtime context, descriptors, materialization, SPIR-V и GPU
+этим аудитом по-прежнему не проверены.
+
+Предыдущий snapshot-аудит сохранён:
+`_Build/shader-audits/yotei-workgroup-snapshots-20260906/report.json`,
+**681/144 за 39,078 с**, 172 precheck / 509 CFG, auditor
+`b5ac81a9cc14856050526547015430c0d38081cc7534f729463b9d2bc35b3e71`.
+Тогда относительно precheck **680/145** изменился только `cs_00010744.json`
+(`916e…`), остальные 824 результата сохранились. Это история отдельного
+snapshot-механизма; нынешние пять улучшений относятся к GDS offset.
 
 Прежний baseline **731/94** проверял более ранние стадии. Добавленный precheck
-сначала выявил 51 дополнительный отказ, из которых один теперь устранён.
-Сравнивать 731 с 681 как ухудшение исполнения игры нельзя: глубина аудита разная.
+сначала выявил 51 дополнительный отказ, из которых шесть теперь устранены.
+Сравнивать 731 с 686 как ухудшение исполнения игры нельзя: глубина аудита разная.
 Новый этап использует общий `PlanComputeExecution`, но **не читает гостевые
 адреса, не материализует runtime descriptors, не выпускает SPIR-V и не исполняет
 GPU-код**. Даже допущенный здесь `916e…` затем выявил реальную LDS race,
 исправленную и проверенную отдельным native GPUAV/игровым этапом.
 
-Все **11 групп** оставшихся ранних отказов (вместе с 32 базовыми — **43 группы**):
+Все **10 групп** оставшихся ранних отказов (вместе с 32 базовыми — **42 группы**).
+Из прежних 43 удалена только zero-offset GDS группа из пяти manifests;
+числа и состав остальных групп сохранены:
 
 | Причина | Шейдеров |
 | --- | ---: |
 | Используется возвращаемое значение атомарной операции в wave64 | 12 |
 | Не доказана независимость памяти цикла от условия ветвления | 10 |
-| GDS append выходит за поддержанный DWORD-счётчик с нулевым смещением | 5 |
 | Не доказано одинаковое решение ветвления внутри гостевой волны | 5 |
 | Неподдержанная shared/scratch память для выбранного режима wave64 | 4 |
 | Для выбранного режима wave64 не получен структурированный control flow | 4 |
@@ -309,7 +381,7 @@ SRT contents и host properties; `metadata_complete` и
 **пересекаются и не суммируются в 94**. Числовые opcodes оставлены там, где
 точная семантика ещё требует самостоятельного разбора поколения ISA. Имена
 форматных D16 load `0x80`/`0x83` сверены с определениями GFX10 в
-[LLVM BUFInstructions.td, tag llvmorg-18.1.8](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/lib/Target/AMDGPU/BUFInstructions.td#L2494).
+[LLVM BUFInstructions.td, tag llvmorg-18.1.8](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/lib/Target/AMDGPU/BUFInstructions.td#L2740-L2747).
 
 | Слой / причина | Шейдеров | Что известно |
 | --- | ---: | --- |
@@ -361,17 +433,17 @@ derivatives определяется по живому ImageQueryLod. Успех
 ## Как выбираются следующие исправления
 
 Первый приоритет — **подтверждённый следующий отказ реального запуска**:
-сейчас GDS append в `7655afaf219f230f`, чей счётчик выходит за прежний контракт
-нулевого offset. Коэффициентные snapshots и LDS-исправление доставлены;
-`916e…` завершился в игре без прежней гонки.
+сейчас ResourceTracking для descriptor из `86da5eb7b8257bb0`, PC `0x530`.
+Коэффициентные snapshots, LDS-записи и aligned GDS append доставлены;
+`916e…` и `7655…` завершились в игре без прежних отказов.
 Полный корпус нужен параллельно, чтобы собирать общие группы ошибок и не
-исправлять инструкции по одному hash. Закрытие всех 144 текущих отказов не
+исправлять инструкции по одному hash. Закрытие всех 139 текущих отказов не
 является доказанным условием первого кадра; неизвестны ни все реально
 исполняемые пути, ни будущие runtime отказы.
 
 | Приоритет / слой | Следующая проверяемая работа | Условие завершения |
 | --- | --- | --- |
-| 1. GDS append / адресация счётчика | Воспроизвести ненулевой offset счётчика из нового класса `7655…`; доказать адрес, ширину, границы и возвращаемые значения без привязки к игре. | Native RED до правки, общий механизм, неизменный полный readback с GPUAV и повторный запуск игры. |
+| 1. Runtime buffer descriptor | Воспроизвести выбор descriptor через CNDMASK/ReadFirstLane и scalar address arithmetic из нового класса `86da…`; доказать согласованность четырёх DWORD, bounds и aliases. | Native RED до правки, общий механизм, неизменный полный readback с GPUAV и повторный запуск игры. |
 | 2. Batch diagnostics | Ранний planner-аудит выполнен по всему корпусу. Следом — capture недостающих runtime descriptors и параметров графических стадий для materialization/SPIR-V. | Полные стадии проверены с реальным контекстом; неизвестные данные не заменены фиктивными ресурсами. |
 | 3. ISA-группы из корпуса | WQM_B32; затем подтверждённые MUBUF/VOPC/SOP/DS/MIMG семейства по семантике, а не только частоте. | Независимые exact oracles, decoder/CPU/GPU проверки; повторный корпус. Для D16 отдельно доказать packing, unused half, преобразования/rounding и OOB. |
 | 4. Resource provenance | Оставшиеся buffer/image origins, неоднородные candidates и динамические runtime зависимости. | Корректные correlation/bounds/lifetime/alias правила без подмены ненулевого дескриптора «похожим». |
@@ -558,6 +630,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run-compute-case
 .\_Build\windows\resource_tracking_tests.exe --workgroup-srt-proof-only
 .\_Build\windows\resource_tracking_tests.exe --workgroup-srt-materialization-only
 .\_Build\windows\shader_cfg_tests.exe --compute-guest-workgroups-only
+.\_Build\windows\shader_cfg_tests.exe --gds-append-admission-only
 .\_Build\windows\shader_recompiler_compute_tests.exe --cooperative-bda-coefficients-only
 .\_Build\windows\shader_recompiler_compute_tests.exe --compute-clear-snapshots-only
 ```
@@ -604,6 +677,12 @@ try {
 и подтверждённое завершение процессов. Одних переменных окружения, отсутствия
 VUID или совпавшего readback недостаточно. Соседние пять multiwave-сценариев
 доступны через `--wave64-multiwave-lds-only`.
+
+Для GDS offset используются то же GPUAV-окружение и существующие имена:
+`--compute-case DsAppendWave64OffsetsSelectIndependentCounters` и
+`--compute-case DsAppendWave64OffsetLoopCompactsSparseReservations`.
+В runner им соответствует `-CasePattern '^DsAppendWave64Offset'`; CPU selector
+`--gds-append-admission-only` отдельно проверяет 18 случаев допуска и отказа.
 
 `--list-compute-cases` перечисляет имена без GPU init, `--compute-case NAME`
 выполняет один случай; неизвестное имя — ошибка. Общий runner сохраняет все

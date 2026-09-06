@@ -8724,8 +8724,11 @@ void TestComputeExecutionConvergenceProof() {
       flags.bound_control = true;
       move.SetFlags(flags);
     }
+    // A discarded loop read cannot feed a branch or another wave; the separate
+    // feedback cases below retain rejection of polling and cyclic writes.
     const bool accepted = scenario == Scenario::Uniform || scenario == Scenario::LoopSnapshot ||
-                          scenario == Scenario::LoopAtomic || scenario == Scenario::UniformPhi;
+                          scenario == Scenario::LoopAtomic || scenario == Scenario::UniformPhi ||
+                          scenario == Scenario::LoopRead;
     const auto plan = PlanComputeExecution(program,input,limits);
     Check(plan.error.empty() == accepted, "split-wave convergence proof accepted/rejected the wrong invariant");
   }
@@ -8893,6 +8896,198 @@ void TestComputeExecutionDsLaneConvergence() {
                   plan.layout.host_size == std::array<uint32_t, 3>{64, 1, 1},
               "straight-line DS lane operation did not retain one complete split wave");
       }
+    }
+  }
+}
+
+// Test-only draft. Insert beside AddExecutionPlanBlock and register
+// TestComputeExecutionLoopReadFeedback(). No proprietary shader bytes.
+void TestComputeExecutionLoopReadFeedback() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  enum class Scenario {
+    ImageOutput, BufferOutput, AddressOutput, PollDirect, PollBallot,
+    PollReadLane, PollReadFirst, PollPhi, PostLoopBranch,
+    CyclicImageWrite, CyclicBufferWrite, CyclicAtomic, OtherCycleWrite
+  };
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const auto scenario : {
+      Scenario::ImageOutput, Scenario::BufferOutput, Scenario::AddressOutput,
+      Scenario::PollDirect, Scenario::PollBallot, Scenario::PollReadLane,
+      Scenario::PollReadFirst, Scenario::PollPhi, Scenario::PostLoopBranch,
+      Scenario::CyclicImageWrite, Scenario::CyclicBufferWrite,
+      Scenario::CyclicAtomic, Scenario::OtherCycleWrite}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* after = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    body->AddBranch(body);
+    body->AddBranch(after);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[1].terminator.loop_header = true;
+    auto& image = entry->AppendNewInst(O::GetImageResource,
+        {IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u)});
+    auto& buffer = entry->AppendNewInst(O::GetBufferResource,
+        {IR::Value(0u),IR::Value(0u),IR::Value(4096u),IR::Value(0u)});
+    auto& address = entry->AppendNewInst(O::GetAddressResource,
+        {IR::Value(0u),IR::Value(0u)});
+    const auto tag_memory = [&](IR::Inst& inst, IR::ResourceKind kind) {
+      const auto index = static_cast<uint32_t>(program.memory_info.size());
+      IR::MemoryInfo memory{};
+      memory.kind = kind;
+      program.memory_info.push_back(memory);
+      inst.SetFlags(IR::MemoryFlags{.index=index,.pc=0});
+    };
+    auto counter_it = body->PrependNewInst(body->begin(),O::Phi,{},
+                                         static_cast<uint64_t>(IR::Type::U32));
+    auto* counter = &*counter_it;
+    counter->AddPhiOperand(entry,IR::Value(0u));
+    auto accumulator_it = body->PrependNewInst(body->begin(),O::Phi,{},
+                                             static_cast<uint64_t>(IR::Type::U32));
+    auto* accumulator = &*accumulator_it;
+    accumulator->AddPhiOperand(entry,IR::Value(0u));
+    auto& coords = body->AppendNewInst(O::MakeImageAddress,
+        {IR::Value(counter),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u)});
+    IR::Value pixel;
+    if (scenario == Scenario::BufferOutput) {
+      auto& read = body->AppendNewInst(O::ReadConstBuffer,
+          {IR::Value(&buffer),IR::Value(counter)});
+      tag_memory(read,IR::ResourceKind::ScalarBuffer);
+      pixel = IR::Value(&read);
+    } else if (scenario == Scenario::AddressOutput) {
+      auto& read = body->AppendNewInst(O::LoadAddressU32,
+          {IR::Value(&address),IR::Value(counter),IR::Value(0u),IR::Value(true)});
+      tag_memory(read,IR::ResourceKind::Global);
+      pixel = IR::Value(&read);
+    } else {
+      auto& read = body->AppendNewInst(O::ImageRead,
+          {IR::Value(&image),IR::Value(&coords),IR::Value(true)});
+      tag_memory(read,IR::ResourceKind::Image);
+      auto& extract = body->AppendNewInst(O::CompositeExtractU32x4,
+          {IR::Value(&read),IR::Value(0u)});
+      pixel = IR::Value(&extract);
+    }
+    // The positive contract has a live loop-carried result and a real output,
+    // but its four-iteration counter is independent of every loaded value.
+    auto& sum = body->AppendNewInst(O::IAdd32,{IR::Value(accumulator),pixel});
+    accumulator->AddPhiOperand(body,IR::Value(&sum));
+    auto& increment = body->AppendNewInst(O::IAdd32,
+        {IR::Value(counter),IR::Value(1u)});
+    counter->AddPhiOperand(body,IR::Value(&increment));
+    auto& bounded_condition = body->AppendNewInst(O::ULessThan32,
+        {IR::Value(&increment),IR::Value(4u)});
+    IR::Value condition(&bounded_condition);
+    if (scenario == Scenario::PollDirect || scenario == Scenario::PollBallot ||
+        scenario == Scenario::PollReadLane || scenario == Scenario::PollReadFirst ||
+        scenario == Scenario::PollPhi) {
+      IR::Value control = pixel;
+      if (scenario == Scenario::PollPhi) control = IR::Value(accumulator);
+      if (scenario == Scenario::PollReadLane || scenario == Scenario::PollPhi) {
+        auto& lane = body->AppendNewInst(O::ReadLane,{control,IR::Value(31u)});
+        control = IR::Value(&lane);
+      } else if (scenario == Scenario::PollReadFirst) {
+        auto& first = body->AppendNewInst(O::ReadFirstLane,{control,IR::Value(true)});
+        control = IR::Value(&first);
+      }
+      auto& nonzero = body->AppendNewInst(O::INotEqual32,{control,IR::Value(0u)});
+      IR::Value poll(&nonzero);
+      if (scenario == Scenario::PollBallot) {
+        auto& ballot = body->AppendNewInst(O::Ballot,{poll});
+        auto& low = body->AppendNewInst(O::CompositeExtractU32x4,
+            {IR::Value(&ballot),IR::Value(0u)});
+        auto& any = body->AppendNewInst(O::INotEqual32,{IR::Value(&low),IR::Value(0u)});
+        poll = IR::Value(&any);
+      }
+      // A bound prevents accidental hangs if this synthetic shape is ever run;
+      // it must not make memory-dependent loop control eligible for splitting.
+      auto& keep_going = body->AppendNewInst(O::LogicalAnd,{condition,poll});
+      condition = IR::Value(&keep_going);
+    }
+    program.block_info[1].condition = condition;
+    body->AppendNewInst(O::Reference,{condition});
+    auto& wave_result = after->AppendNewInst(O::ReadLane,
+        {IR::Value(&sum),IR::Value(63u)});
+    auto& output = after->AppendNewInst(O::StoreBufferU32,
+        {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(&wave_result),IR::Value(true)});
+    tag_memory(output,IR::ResourceKind::Buffer);
+    if (scenario == Scenario::CyclicImageWrite) {
+      auto& data = body->AppendNewInst(O::CompositeConstructU32x4,
+          {pixel,IR::Value(0u),IR::Value(0u),IR::Value(0u)});
+      auto& write = body->AppendNewInst(O::ImageWrite,
+          {IR::Value(&image),IR::Value(&coords),IR::Value(&data),IR::Value(true)});
+      tag_memory(write,IR::ResourceKind::Image);
+    }
+    if (scenario == Scenario::CyclicBufferWrite) {
+      auto& write = body->AppendNewInst(O::StoreBufferU32,
+          {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),pixel,IR::Value(true)});
+      tag_memory(write,IR::ResourceKind::Buffer);
+    }
+    if (scenario == Scenario::CyclicAtomic) {
+      // Even a discarded atomic result may couple different guest waves.
+      auto& atomic = body->AppendNewInst(O::BufferAtomicOr32,
+          {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(1u),IR::Value(true)});
+      tag_memory(atomic,IR::ResourceKind::Buffer);
+    }
+    if (scenario == Scenario::PostLoopBranch) {
+      auto* yes = AddExecutionPlanBlock(program);
+      auto* no = AddExecutionPlanBlock(program);
+      after->AddBranch(yes);
+      after->AddBranch(no);
+      auto& post_condition = after->AppendNewInst(O::INotEqual32,
+          {IR::Value(&wave_result),IR::Value(0u)});
+      after->AppendNewInst(O::Reference,{IR::Value(&post_condition)});
+      program.block_info[2].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[2].terminator.true_block = 3;
+      program.block_info[2].terminator.false_block = 4;
+      program.block_info[2].condition = IR::Value(&post_condition);
+      // This condition is outside every SCC. Rejecting it prevents implicit
+      // control dependence from being laundered through later constant phis.
+    }
+    if (scenario == Scenario::OtherCycleWrite) {
+      auto* done = AddExecutionPlanBlock(program);
+      after->AddBranch(after);
+      after->AddBranch(done);
+      auto it = after->PrependNewInst(after->begin(),O::Phi,{},
+                                     static_cast<uint64_t>(IR::Type::U32));
+      it->AddPhiOperand(body,IR::Value(0u));
+      auto& next = after->AppendNewInst(O::IAdd32,{IR::Value(&*it),IR::Value(1u)});
+      it->AddPhiOperand(after,IR::Value(&next));
+      auto& condition2 = after->AppendNewInst(O::ULessThan32,
+          {IR::Value(&next),IR::Value(4u)});
+      after->AppendNewInst(O::Reference,{IR::Value(&condition2)});
+      program.block_info[2].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[2].terminator.true_block = 2;
+      program.block_info[2].terminator.false_block = 3;
+      program.block_info[2].condition = IR::Value(&condition2);
+      // Its existing output store is now in a DIFFERENT cyclic SCC.
+    }
+    IR::ValidateProgram(program,true);
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 128;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    const bool accepted = scenario == Scenario::ImageOutput ||
+                          scenario == Scenario::BufferOutput || scenario == Scenario::AddressOutput;
+    if (accepted) {
+      Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 2,
+            "independent counter-loop reads with live output must permit complete-wave splitting");
+    } else {
+      Check(!plan.error.empty() && !plan.IsSplitWave64(),
+            "split-wave proof accepted mutable loop feedback or cyclic memory communication");
     }
   }
 }
@@ -12549,6 +12744,7 @@ int main(int argc, char* argv[]) {
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();
   TestComputeExecutionDsLaneConvergence();
+  TestComputeExecutionLoopReadFeedback();
   TestComputeDispatchGroupExpansion();
   TestComputeWorkgroupPlanningMatchesSmallExhaustiveOracle();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();

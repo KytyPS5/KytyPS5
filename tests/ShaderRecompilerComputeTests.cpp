@@ -14086,6 +14086,60 @@ TestCase Wave64SparseWaterfallIndependentWaves() {
 
 // Synthetic straight-line followup after the minimal wave64 regression is GREEN.
 // Guest 8x4x4 has two waves; a 2x2x2 dispatch must retain all three group IDs.
+// Two complete waves read four image rows. Loop bounds do not depend on pixels.
+TestCase Wave64ImageReadLoopAccumulatesWithoutFeedback() {
+  using O = ShaderOpcode;
+  constexpr u32 count = 128;
+  TestCase test;
+  test.name = "Wave64ImageReadLoopAccumulatesWithoutFeedback";
+  test.initial.assign(count * 2, 0xdeadbeefu);
+  test.expected.resize(count * 2);
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = count;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.sampled_image_rgba.resize(16);
+  for (u32 y = 0; y < 4; ++y)
+    for (u32 x = 0; x < 4; ++x)
+      test.sampled_image_rgba[y * 4 + x] = (y + 1) * 10 + x;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  auto& code = test.code;
+  code.push_back(EncodeVop1(0x01, 4, Vgpr(0)));
+  code.push_back(EncodeVop2(0x1b, 20, InlineU32(3), 0));
+  AppendVMovU32(&code, 10, 0);
+  code.push_back(EncodeSMovB32(8, InlineU32(0)));
+  const size_t loop = code.size();
+  code.push_back(EncodeVop1(0x01, 21, 8));
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(11, 20));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(11), 10));
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 8, InlineU32(4)));
+  const auto branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(branch) - 1)));
+  // The lane exchange also makes guest wave64 execution observable.
+  AppendVop3(&code, 0x360, 12, Vgpr(10), InlineU32(63));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 12, 4, count);
+  AppendEnd(&code);
+  for (u32 lane = 0; lane < count; ++lane) {
+    test.expected[lane] = 100 + 4 * (lane % 4);
+    test.expected[count + lane] = 112;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_AND_B32, O::S_MOV_B32, O::IMAGE_LOAD,
+                  O::V_ADD_NC_U32, O::S_ADD_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::V_READLANE_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"IMAGE_LOAD", 1}, {"V_READLANE_B32", 1}};
+  return test;
+}
+
 TestCase Wave64MultidimensionalGuestGeometry() {
   using O = ShaderOpcode;
   constexpr u32 invocation_count = 8u * 4u * 4u * 2u * 2u * 2u;
@@ -23717,6 +23771,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64ReadLaneAcrossAllHalves);
   AddCase(Wave64SparseWaterfallIndependentWaves);
   AddCase(Wave64MultidimensionalGuestGeometry);
+  AddCase(Wave64ImageReadLoopAccumulatesWithoutFeedback);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);
   AddCase(ScalarSaveexecSccIsWaveUniform);
   AddCase(ScalarWqmSccIsWaveUniform);

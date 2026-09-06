@@ -57,6 +57,11 @@ bool IsGuestRead(O op) {
 	       IR::AddressOpcodeInfoOf(op).access == IR::AddressAccess::Read ||
 	       IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Read;
 }
+bool IsGuestWrite(O op) {
+	return IR::BufferAccessOf(op) == IR::BufferAccess::Write ||
+	       IR::AddressOpcodeInfoOf(op).access == IR::AddressAccess::Write ||
+	       IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Write;
+}
 bool IsGuestAtomic(O op) {
 	return IR::BufferAccessOf(op) == IR::BufferAccess::Atomic ||
 	       IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic;
@@ -139,6 +144,8 @@ std::string ProveSplitWaveConvergence(const IR::Program& program) {
 			return "wave64 splitting does not support guest shared or scratch memory";
 	}
 	const auto cyclic = CyclicBlocks(program);
+	std::vector<const IR::Inst*> cyclic_reads;
+	bool has_cyclic_write = false;
 	std::unordered_set<const IR::Inst*> instructions;
 	std::function<void(IR::Value)> collect = [&](IR::Value value) {
 		const auto* inst = value.TryInstruction();
@@ -167,10 +174,10 @@ std::string ProveSplitWaveConvergence(const IR::Program& program) {
 			    op == O::DataAppend || op == O::DataConsume ||
 			    op == O::Sendmsg || op == O::TtraceData || op == O::InstPrefetch || op == O::SetAttribute)
 				return "wave64 splitting does not support guest workgroup or DS operations";
-			// Prevent inter-wave polling/progress dependencies, including indirect feedback
-			// through ReadLane/Ballot. This intentionally rejects more than proven unsafe.
-			if (!planning_only && cyclic.contains(block) && IsGuestRead(op))
-				return "wave64 splitting cannot prove memory reads inside a loop independent of other waves";
+			if (cyclic.contains(block)) {
+				if (!planning_only && IsGuestRead(op)) cyclic_reads.push_back(&inst);
+				has_cyclic_write |= IsGuestWrite(op) || IsGuestAtomic(op);
+			}
 			if (IsGuestAtomic(op) && inst.HasUses())
 				return "wave64 splitting does not support live atomic return values";
 		}
@@ -180,6 +187,35 @@ std::string ProveSplitWaveConvergence(const IR::Program& program) {
 		if (block.terminator.kind == CFG::TerminatorKind::IndirectBranch ||
 		    block.terminator.kind == CFG::TerminatorKind::Unsupported)
 			return "wave64 splitting requires statically known branch targets";
+	}
+
+	if (!cyclic_reads.empty()) {
+		// Without an alias/progress proof, a write in any loop may communicate
+		// with a read in another loop or guest wave. Write-only shaders keep
+		// their existing path; post-loop output stores remain permitted.
+		if (has_cyclic_write)
+			return "wave64 splitting cannot prove cyclic reads and writes independent of other waves";
+
+		// Memory dependence is separate from lane uniformity. Ballot and
+		// ReadLane can make a polling value uniform without making it safe.
+		// The monotone worklist follows every SSA use, including phi backedges,
+		// source/selector operands and EXEC predicates; cycles never clear taint.
+		std::unordered_set<const IR::Inst*> memory_dependent(cyclic_reads.begin(), cyclic_reads.end());
+		for (size_t cursor = 0; cursor < cyclic_reads.size(); ++cursor) {
+			for (const auto& use : cyclic_reads[cursor]->Uses()) {
+				if (instructions.contains(use.user) && memory_dependent.insert(use.user).second)
+					cyclic_reads.push_back(use.user);
+			}
+		}
+		// Check every conditional, including those outside SCCs: an acyclic
+		// branch can otherwise hide memory dependence in the edge selection of
+		// constant phis feeding a later loop. Indirect targets were rejected above.
+		for (const auto& block : program.block_info) {
+			if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    memory_dependent.contains(block.condition.TryInstruction()))
+				return "wave64 splitting cannot prove loop memory independent of branch at pc " +
+				       std::to_string(block.start_pc);
+		}
 	}
 
 	// Greatest fixed point: a loop-carried uniform phi stays uniform until a

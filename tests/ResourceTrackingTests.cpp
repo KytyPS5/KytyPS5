@@ -2643,6 +2643,64 @@ void TestShaderInfoAndBindingLayout() {
         "binding layout did not collect live typed user-data values");
 }
 
+// Insert in tests/ResourceTrackingTests.cpp's existing test namespace and call
+// TestComparisonBindingsAreIsolated() from its main. Existing APIs only: this
+// compiles before the fix and must fail because comparison shares the ordinary
+// sampled-image group. No Vulkan/device/guest-memory access.
+void TestComparisonBindingsAreIsolated() {
+  ImageResource ordinary{};
+  ordinary.resource_class = ImageResourceClass::Sampled;
+  ordinary.numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+  ordinary.dimension = Decoder::ImageDimension::Dim2D;
+  ordinary.read = true;
+  ImageResource comparison = ordinary;
+  comparison.depth_compare = true;
+  const auto ordinary_kind = DescriptorBindingForImage(ordinary);
+  const auto comparison_kind = DescriptorBindingForImage(comparison);
+  Check(ordinary_kind.has_value() && comparison_kind.has_value(),
+        "valid ordinary/comparison images lack descriptor classes");
+  Check(*ordinary_kind != *comparison_kind,
+        "ordinary and comparison images share one descriptor binding class");
+
+  // Both discovery orders and two ordinary resources: isolate comparison
+  // without splitting every ordinary image into its own binding.
+  for (const auto stage : {ShaderType::Compute, ShaderType::Vertex, ShaderType::Pixel}) {
+    for (const bool comparison_first : {false, true}) {
+      Program program{};
+      program.stage = stage;
+      program.shader_info_complete = true;
+      program.resource_tracking_complete = true;
+      program.info.images = comparison_first
+          ? std::vector<ImageResource>{comparison, ordinary, ordinary}
+          : std::vector<ImageResource>{ordinary, comparison, ordinary};
+      for (uint32_t index = 0; index < program.info.images.size(); ++index) {
+        program.info.images[index].source = index;
+      }
+      SamplerResource sampler{};
+      sampler.source = 3;
+      sampler.depth_compare = true;
+      program.info.samplers.push_back(sampler);
+      const uint32_t comparison_index = comparison_first ? 0u : 1u;
+      program.info.sampled_pairs.push_back({comparison_index, 0, 0});
+      AllocateBindings(program);
+      const auto* ordinary_binding = FindBinding(program.bindings, *ordinary_kind);
+      const auto* comparison_binding = FindBinding(program.bindings, *comparison_kind);
+      const auto* samplers = FindBinding(program.bindings, DescriptorBindingKind::Samplers);
+      const std::vector<uint32_t> ordinary_indices = comparison_first
+          ? std::vector<uint32_t>{1, 2} : std::vector<uint32_t>{0, 2};
+      Check(ordinary_binding != nullptr && comparison_binding != nullptr &&
+                ordinary_binding != comparison_binding &&
+                ordinary_binding->resources == ordinary_indices &&
+                comparison_binding->resources == std::vector<uint32_t>{comparison_index},
+            "mixed image binding arrays did not preserve isolated resource membership");
+      Check(NativeBinding(stage, *ordinary_kind) != NativeBinding(stage, *comparison_kind),
+            "ordinary and comparison image bindings collide in the native stage");
+      Check(samplers != nullptr && samplers->resources == std::vector<uint32_t>{0},
+            "image binding isolation changed sampler identity or multiplicity");
+    }
+  }
+}
+
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
@@ -2744,6 +2802,14 @@ void TestImageBindingAbi() {
   Check(Invalid(image),
         "invalid sampled dimension received a descriptor binding");
   image.dimension = Decoder::ImageDimension::Dim2D;
+  image.depth_compare = true;
+  image.numeric_class = NumericClass::Uint;
+  Check(Invalid(image), "integer comparison image received a descriptor binding");
+  image.numeric_class = NumericClass::Float;
+  image.resource_class = ImageResourceClass::Storage;
+  Check(Invalid(image), "storage comparison image received a descriptor binding");
+  image.resource_class = ImageResourceClass::Sampled;
+  image.depth_compare = false;
   image.atomic = true;
   Check(Invalid(image), "atomic sampled image received a descriptor binding");
   image.resource_class = ImageResourceClass::Storage;
@@ -2953,6 +3019,7 @@ int main() {
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
+    Run("comparison binding isolation", TestComparisonBindingsAreIsolated);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);

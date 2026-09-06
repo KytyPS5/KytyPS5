@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -1120,6 +1121,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	if (image.sampled_htile_clear_import) {
+		EXIT("sampled HTile import cannot upload raw depth backing\n");
+	}
 	if (image.info.data.Empty()) {
 		return;
 	}
@@ -1274,6 +1278,138 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+
+ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
+	ValidateImageDesc(desc);
+	const auto requested = desc.info;
+	if (desc.type != BindingType::Texture || !requested.data.Valid() ||
+	    requested.metadata.kind != ImageMetadataKind::Htile ||
+	    !requested.metadata.range.Valid()) {
+		EXIT("invalid sampled HTile image description\n");
+	}
+	const auto metadata = requested.metadata.range;
+	if (requested.data.address < metadata.End() && metadata.address < requested.data.End()) {
+		EXIT("sampled HTile metadata overlaps its depth allocation\n");
+	}
+	// Inspect every overlapping owner before any cache mutation. Native depth
+	// targets keep their GPU pixels; their guest HTile may deliberately be stale.
+	const auto lookup = [&]() {
+		ImageId result {};
+		for (const auto id: FindImagesInRegion(requested.data.address, requested.data.size, false)) {
+			const auto& image = m_slot_images[id];
+			const auto& info = image.info;
+			const bool exact_ranges = info.data == requested.data &&
+			    info.resources == requested.resources && info.metadata.range == metadata;
+			// Preserve existing native depth-array views of a prefix allocation.
+			// Imported clears themselves still require the exact single-layer owner.
+			const bool native_prefix = !image.sampled_htile_clear_import &&
+			    info.data.Valid() && info.metadata.range.Valid() &&
+			    info.resources.levels == 1 && requested.resources.levels == 1 &&
+			    info.resources.layers >= requested.resources.layers && requested.resources.layers != 0 &&
+			    info.data.address == requested.data.address && info.data.size >= requested.data.size &&
+			    info.data.size % info.resources.layers == 0 &&
+			    requested.data.size % requested.resources.layers == 0 &&
+			    info.data.size / info.resources.layers ==
+			        requested.data.size / requested.resources.layers &&
+			    info.metadata.range.address == metadata.address && info.metadata.range.size >= metadata.size &&
+			    info.metadata.range.size % info.resources.layers == 0 &&
+			    metadata.size % requested.resources.layers == 0 &&
+			    info.metadata.range.size / info.resources.layers ==
+			        metadata.size / requested.resources.layers;
+			const bool matches = !image.depth_id && info.IsDepth() &&
+			    (exact_ranges || native_prefix) && info.extent == requested.extent &&
+			    info.type == requested.type && info.pitch == requested.pitch &&
+			    info.samples == requested.samples && info.bytes_per_block == requested.bytes_per_block &&
+			    info.guest_format == requested.guest_format && info.tile_mode == requested.tile_mode &&
+			    info.metadata.kind == ImageMetadataKind::Htile;
+			if (!matches || (result && result != id)) {
+				EXIT("sampled HTile import requires an exact nonoverlapping depth owner\n");
+			}
+			result = id;
+		}
+		return result;
+	};
+	{
+		std::scoped_lock lock {m_lock};
+		const auto existing = lookup();
+		if (existing && !m_slot_images[existing].sampled_htile_clear_import) {
+			TouchImage(m_slot_images[existing]);
+			return existing;
+		}
+	}
+	TileSizeAlign stencil_size {}, htile_size {}, depth_size {};
+	const bool shape = requested.pixel_format == vk::Format::eD32Sfloat &&
+	    requested.guest_format == Prospero::BufferFormat::k32Float &&
+	    requested.type == Prospero::ImageType::kColor2D && requested.extent.depth == 1 &&
+	    requested.resources == ImageSubresources {1, 1} && requested.samples == 1 &&
+	    requested.bytes_per_block == 4 && requested.tile_mode == Prospero::TileMode::kDepth &&
+	    !requested.HasStencil() && !requested.metadata.stencil_compressed &&
+	    requested.metadata.compression == VideoOutCompression::Uncompressed &&
+	    TileGetDepthSize(requested.extent.width, requested.extent.height, 0,
+	                     Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::kInvalid,
+	                     true, stencil_size, htile_size, depth_size, 0) &&
+	    requested.data.size == depth_size.size && metadata.size == htile_size.size &&
+	    (metadata.address & (htile_size.align - 1u)) == 0 &&
+	    requested.pitch == TileGetTexturePitch(requested.guest_format, requested.extent.width,
+	                                           requested.tile_mode);
+	if (!shape ||
+	    !m_scheduler.Context().GetGpuResources().IsMapped(requested.data.address, requested.data.size) ||
+	    !m_scheduler.Context().GetGpuResources().IsMapped(metadata.address, metadata.size)) {
+		EXIT("unsupported sampled HTile clear import geometry or mapping\n");
+	}
+	if (QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
+	    m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
+		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
+	}
+	// ReadMemory may submit/wait and reenter cache maintenance. No cache lock,
+	// image reference, or command-buffer reference may survive this call.
+	// ReadMemory widens its download window. A clean metadata range must not
+	// drain a disjoint writable binding whose GPU work is still to be recorded.
+	if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size)) {
+		m_buffer_cache.ReadMemory(metadata.address, metadata.size);
+	}
+	std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
+	if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size) ||
+	    QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
+	    !LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size)) {
+		EXIT("sampled HTile metadata is not coherent and readable\n");
+	}
+	// AMD PAL Gfx9Htile::GetClearValue: Z-only clear has ZMask=0 and min=max.
+	// TC depth clears support exact 0/1; mixed/other encodings need decompression.
+	const uint32_t clear = words.front();
+	if ((clear != 0 && clear != 0xfffffff0u) ||
+	    !std::all_of(words.begin(), words.end(), [clear](uint32_t word) { return word == clear; })) {
+		EXIT("sampled HTile metadata is not a uniform supported clear\n");
+	}
+	std::scoped_lock lock {m_lock};
+	auto id = lookup();
+	if (id && !m_slot_images[id].sampled_htile_clear_import) {
+		TouchImage(m_slot_images[id]);
+		return id;
+	}
+	if (!id) {
+		auto info = requested;
+		info.htile_clear_mask = 0;
+		id = InsertImage(info);
+		m_slot_images[id].sampled_htile_clear_import = true;
+	}
+	auto& image = m_slot_images[id];
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	const ImageSubresourceRange subresource {0, 1, 0, 1};
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	              subresource, command);
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+	const vk::ClearDepthStencilValue value {clear == 0 ? 0.0f : 1.0f, 0};
+	command.clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                               &value, 1, &range);
+	TrackImage(id);
+	CommitGpuWrite(image);
+	image.tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(image);
+	return id;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
@@ -1293,6 +1429,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
+			if (m_slot_images[id].sampled_htile_clear_import) {
+				EXIT("sampled HTile import requires its metadata-aware lookup path\n");
+			}
 			ValidateDepthComparisonPromotionLayout(desc.info, desc.type, m_slot_images[id]);
 		}
 		for (const auto id: candidates) {
@@ -1409,6 +1548,20 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	bool imported = false;
+	{
+		std::scoped_lock lock {m_lock};
+		imported = m_slot_images[id].sampled_htile_clear_import;
+	}
+	if (imported) {
+		if (desc.type != BindingType::Texture) {
+			EXIT("sampled HTile import cannot change image ownership\n");
+		}
+		auto sampled = desc;
+		if (FindSampledHtileImage(sampled) != id) {
+			EXIT("sampled HTile texture changed before final acquisition\n");
+		}
+	}
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1460,6 +1613,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
+	if (image.sampled_htile_clear_import) {
+		EXIT("sampled HTile import cannot change image ownership\n");
+	}
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
@@ -1479,6 +1635,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+	}
+	if (image.sampled_htile_clear_import) {
+		EXIT("sampled HTile import cannot change image ownership\n");
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
@@ -1503,7 +1662,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 void TextureCache::MarkGpuWritten(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id) {
+	if (!image.registered || image.depth_id || image.sampled_htile_clear_import) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
 	TrackImage(id);

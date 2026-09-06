@@ -395,9 +395,18 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 					cyclic_writes.push_back(&inst);
 				if (op == O::DataAppend) cyclic_appends.push_back(&inst);
 			}
+			// A single complete guest wave remains one 64-invocation host workgroup.
+			// An acyclic device-buffer atomic therefore produces one lane-local old
+			// value exactly where the direct emitter defines it; native subgroup
+			// splitting does not duplicate or transfer that value between phases.
+			// Keep cyclic, partitioned, cooperative and LDS returns behind their
+			// separate ordering/publication proofs.
+			const bool direct_single_wave_buffer_atomic_return =
+			    !partitions_guest_workgroup && !cooperative && !cyclic.contains(block) &&
+			    IR::BufferAccessOf(op) == IR::BufferAccess::Atomic;
 			const bool cooperative_image_atomic_return =
 			    cooperative && IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic;
-			if (!cooperative_image_atomic_return &&
+			if (!direct_single_wave_buffer_atomic_return && !cooperative_image_atomic_return &&
 			    (IsGuestAtomic(op) || IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) && inst.HasUses())
 				return "wave64 splitting does not support live atomic return values";
 		}

@@ -34,10 +34,10 @@ uint32_t LoadPc(EmitterState& state, uint32_t variable) {
 	return id;
 }
 
-void Rendezvous(EmitterState& state) {
+void Rendezvous(EmitterState& state, uint32_t memory = MemorySemanticsWorkgroupMemory) {
 	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
 	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
-	                           MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
+	                           MemorySemanticsAcquireRelease | memory)});
 }
 
 uint32_t ScratchPointer(EmitterState& state, uint32_t index) {
@@ -208,7 +208,11 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 	const auto own_pc = LoadPc(state, function.pc_variable);
 	const auto cursor = LoadPc(state, function.cursor_variable);
 	state.builder.AddFunction({OpStore, ScratchPointer(state, EmitHostLocalInvocationIndex(state)), own_pc});
-	Rendezvous(state);
+	// Every physical invocation, including finished guest waves, publishes its
+	// previous quantum before any wave starts the next one. UniformMemory and
+	// coherent SSBO declarations jointly provide peer-buffer visibility; the
+	// scratch-only rendezvous below does not need the extra storage class.
+	Rendezvous(state, MemorySemanticsWorkgroupMemory | MemorySemanticsUniformMemory);
 	std::vector<uint32_t> pcs;
 	for (uint32_t wave = 0; wave < wave_count; ++wave)
 		pcs.push_back(LoadPc(state, ScratchPointer(state, ConstantU32(state, wave * 64u))));

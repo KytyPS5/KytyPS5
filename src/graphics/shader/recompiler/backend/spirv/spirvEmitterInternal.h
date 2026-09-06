@@ -388,6 +388,9 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
+// Shared address/index decision; use effective per-instruction MemoryInfo.
+bool BufferUsesDwordOffset(const EmitterState& state, const IR::MemoryInfo& mem);
+
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);

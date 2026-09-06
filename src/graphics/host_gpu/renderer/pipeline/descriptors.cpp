@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -145,8 +146,15 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
+	if ((byte_adjustment && !SupportsByteStorageOffset(descriptor, resource)) ||
+	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
+	}
+	// Runtime-array length counts complete DWORDs. A partial last DWORD needs
+	// a separate guest-byte bound before its host backing can be rounded up.
+	if (byte_adjustment && (size + adjustment) % sizeof(uint32_t) != 0) {
+		EXIT("storage buffer offset adjustment is unsupported: partial DWORD tail\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};

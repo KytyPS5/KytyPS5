@@ -292,6 +292,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 	std::vector<const IR::Inst*> cyclic_reads;
 	std::vector<const IR::Inst*> cyclic_appends;
 	bool has_cyclic_write = false;
+	bool unproved_cooperative_publication = false;
 	std::unordered_set<const IR::Inst*> instructions;
 	std::function<void(IR::Value)> collect = [&](IR::Value value) {
 		const auto* inst = value.TryInstruction();
@@ -323,6 +324,20 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			if (op == O::LoadAddressU32 || op == O::ReadConstBuffer) {
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
 				planning_only = index < program.memory_info.size() && program.memory_info[index].planning_only;
+			}
+			if (!planning_only) {
+				const auto image_access = IR::ImageOpcodeInfoOf(op).access;
+				const auto buffer_access = IR::BufferAccessOf(op);
+				// The cooperative scheduler publishes SSBO writes between quanta.
+				// An image payload may be outside the polling SCC, so checking only
+				// cyclic image writes would miss publication through a buffer flag.
+				unproved_cooperative_publication |= image_access == IR::ImageAccess::Write ||
+				    image_access == IR::ImageAccess::Atomic || buffer_access == IR::BufferAccess::Atomic ||
+				    IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None;
+				// Physical pointers do not inherit the SSBO's Coherent decoration,
+				// and scalar reads retain their own guest cache protocol.
+				unproved_cooperative_publication |= cyclic.contains(block) && IsGuestRead(op) &&
+				    (buffer_access != IR::BufferAccess::Read || op == O::ReadConstBuffer);
 			}
 			if ((op == O::Barrier && partitions_guest_workgroup) ||
 			    op == O::DataConsume ||
@@ -370,18 +385,22 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		}
 	}
 
-	// Cyclic external-memory communication remains unsupported until both fair
-	// progress and inter-wave visibility are proved by a bounded regression.
 	if (!cyclic_reads.empty()) {
+		// A complete host workgroup can fairly interleave logical waves and
+		// publish coherent buffer accesses at each PC publication barrier. Keep
+		// image, raw-address, scalar-cache and atomic communication unsupported
+		// until their distinct visibility protocols have executable regressions.
+		if (cooperative && unproved_cooperative_publication)
+			return "cooperative wave64 cyclic communication requires ordinary buffer reads and writes";
 		// Without an alias/progress proof, a write in any loop may communicate
 		// with a read in another loop or guest wave. Write-only shaders keep
 		// their existing path; post-loop output stores remain permitted.
-		if (has_cyclic_write)
+		if (has_cyclic_write && !cooperative)
 			return "wave64 splitting cannot prove cyclic reads and writes independent of other waves";
 
 		// A single complete guest wave remains one host workgroup. Only actual
 		// partitioning can introduce new inter-wave progress dependencies here.
-		// Convergence and the cyclic communication guard still apply to both modes.
+		// Convergence still applies to every mode.
 		if (partitions_guest_workgroup) {
 			// Memory dependence is separate from lane uniformity. Ballot and
 			// ReadLane can make a polling value uniform without making it safe.

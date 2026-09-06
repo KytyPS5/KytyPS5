@@ -1269,6 +1269,7 @@ private:
 			return UINT32_MAX;
 		}
 		BufferResource resource;
+		resource.descriptor_formatted_only = true;
 		resource.source       = source;
 		resource.first_use_pc = pc;
 		Merge(resource, memory, op, pc);
@@ -1287,6 +1288,9 @@ private:
 		resource.written         = resource.written || write;
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
+		resource.descriptor_formatted_only =
+		    resource.descriptor_formatted_only && memory.kind == ResourceKind::Buffer &&
+		    memory.formatted && !memory.typed && !atomic;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}

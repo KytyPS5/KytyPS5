@@ -47,6 +47,19 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+bool BufferUsesDwordOffset(const EmitterState& state, const IR::MemoryInfo& mem) {
+	if (mem.kind != IR::ResourceKind::Buffer || mem.formatted || mem.typed ||
+	    mem.data_bits != 32u) return false;
+	if (mem.resource >= state.program.info.buffers.size()) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer specialization is missing");
+	}
+	// Atomic64 descriptors also have data_bits32; keep every atomic resource
+	// on byte addressing. This fact is stable when wide accesses rebase each
+	// component and when a bounded table selects a specialized descriptor.
+	return !state.program.info.buffers[mem.resource].atomic;
+}
+
 void EmitMemoryOffsets(EmitterState& state) {
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		const auto word =

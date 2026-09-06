@@ -362,6 +362,28 @@ struct SamplerPlan {
 	uint32_t                                      sampler_count = 0;
 };
 
+struct ImageRemap {
+	explicit ImageRemap(const ResourceSpecialization& specialization) {
+		for (const auto& image: specialization.images) {
+			indices.push_back(image.fmask ? UINT32_MAX : count++);
+		}
+	}
+
+	template <typename T>
+	void Apply(std::vector<T>& images) const {
+		EXIT_IF(images.size() != indices.size());
+		for (uint32_t index = 0; index < indices.size(); index++) {
+			if (indices[index] != UINT32_MAX && indices[index] != index) {
+				images[indices[index]] = std::move(images[index]);
+			}
+		}
+		images.resize(count);
+	}
+
+	std::vector<uint32_t> indices;
+	uint32_t              count = 0;
+};
+
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
@@ -495,6 +517,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			                static_cast<uint32_t>(format)));
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
+		image.fmask             = Prospero::IsFmaskTextureFormat(format);
+		if (image.fmask) {
+			if (storage || base.depth_compare ||
+			    image.indirect_root != ImageResource::NoIndirectImage ||
+			    std::ranges::any_of(program.info.sampled_pairs,
+			                        [&](const auto& pair) { return pair.image == i; })) {
+				return SpecializationFail("FMASK requires a direct image load");
+			}
+		}
 		image.conversion_format = ImageConversionFormat(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
@@ -585,6 +616,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			next_snapshot.samplers.push_back(next_snapshot.samplers[index]);
 		}
 	}
+	ImageRemap(next_specialization).Apply(next_snapshot.images);
 	specialization       = std::move(next_specialization);
 	specialized_snapshot = std::move(next_snapshot);
 	return true;
@@ -1012,8 +1044,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 
 	auto memory_info = program.memory_info;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
+	const ImageRemap image_remap(specialization);
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
 			const auto image_opcode = ImageOpcodeInfoOf(inst.GetOpcode());
 			if (image_opcode.access == ImageAccess::None) {
 				continue;
@@ -1023,6 +1057,23 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			auto& memory = memory_info[index];
 			EXIT_IF(memory.resource >= images.size());
 			const auto& image = images[memory.resource];
+			if (specialization.images[memory.resource].fmask) {
+				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
+				// Vulkan MSAA stores each sample directly; FMASK's four-bit fragment indices
+				// therefore map each coverage sample to the same host sample.
+				constexpr uint32_t indices[] = {0x76543210u, 0xfedcba98u};
+				std::array<Value, 2> fragments;
+				for (uint32_t component = 0; component < fragments.size(); component++) {
+					const auto selected = block->PrependNewInst(
+					    it, ValueOpcode::SelectU32, {inst.Arg(2), Value(indices[component]), Value(0u)});
+					fragments[component] = Value(&*selected);
+				}
+				const auto result = block->PrependNewInst(
+				    it, ValueOpcode::CompositeConstructU32x4,
+				    {fragments[0], fragments[1], Value(0u), Value(0u)});
+				inst.ReplaceUsesWith(Value(&*result));
+				continue;
+			}
 			if (image_opcode.needs_sampler && RequiresPointSampler(image) &&
 			    memory.sampler < program.info.samplers.size()) {
 				EXIT_IF(sampler_plan.point_sampler[memory.sampler] == UINT32_MAX);
@@ -1032,6 +1083,35 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
+				inst.SetFlags(image_remap.indices.at(inst.Flags<uint32_t>()));
+			}
+		}
+	}
+	for (auto& memory: memory_info) {
+		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+			memory.resource = image_remap.indices.at(memory.resource);
+		}
+	}
+	for (auto& buffer: buffers) {
+		if (buffer.image_alias != BufferResource::NoImageAlias) {
+			buffer.image_alias = image_remap.indices.at(buffer.image_alias);
+		}
+	}
+	for (auto& pair: sampled_pairs) {
+		pair.image = image_remap.indices.at(pair.image);
+	}
+	for (auto& image: images) {
+		if (image.indirect_root != ImageResource::NoIndirectImage) {
+			image.indirect_root = image_remap.indices.at(image.indirect_root);
+		}
+		for (auto& resource: image.indirect_resources) {
+			resource = image_remap.indices.at(resource);
+		}
+	}
+	image_remap.Apply(images);
 	program.info.buffers       = std::move(buffers);
 	program.info.images        = std::move(images);
 	program.info.samplers      = std::move(samplers);

@@ -11597,8 +11597,7 @@ public:
          raw_format <= static_cast<uint32_t>(Prospero::BufferFormat::kBc7Srgb);
          ++raw_format) {
       const auto format = static_cast<Prospero::BufferFormat>(raw_format);
-      // FMASK is synthesized as identity metadata by TextureUploadFmask; it is
-      // deliberately not a texel surface and must never enter the GPU tiler.
+      // FMASK contains sample-to-fragment metadata, not texels for the GPU tiler.
       if (Prospero::IsFmaskTextureFormat(format)) {
         continue;
       }
@@ -12729,10 +12728,10 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
-  if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
+  if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
+      !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
-            !compiled.program.info.images.empty() &&
-                compiled.program.info.images[0].shader_swizzle ==
+            compiled.program.info.images[0].shader_swizzle ==
                     test.image_descriptor_swizzle,
             "storage image descriptor swizzle did not reach the specialized "
             "program");
@@ -21089,6 +21088,19 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   return test;
 }
 
+TestCase ImageLoadFmaskUsesNativeSampleMapping() {
+  auto test = ImageLoadR32UintUsesIntegerSampledImage();
+  test.name = "ImageLoadFmaskUsesNativeSampleMapping";
+  test.expected = {0x76543210u};
+  test.user_data = {0x303ac300u, 0xca100000u, 0x021bc3bfu, 0x91800004u,
+                    0u, 0x00700000u, 0u, 0u};
+  test.image_descriptor_swizzle = DstSel(4, 0, 0, 0);
+  test.sampled_image_rgba.clear();
+  test.required_spirv = {"OpConstant %uint 1985229328"};
+  test.forbidden_spirv = {"OpTypeImage", "OpImageFetch"};
+  return test;
+}
+
 TestCase ImageLoadR32SintUsesSignedSampledImage() {
   using O = ShaderOpcode;
 
@@ -22950,6 +22962,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
@@ -27251,6 +27264,12 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--fmask-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageLoadFmaskUsesNativeSampleMapping());
+    RunCase(&vulkan, ImageLoadR32UintUsesIntegerSampledImage());
+    return 0;
+  }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--shader-fatal-only") == 0) {
     CheckShaderRecompilerFatalContracts();

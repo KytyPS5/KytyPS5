@@ -825,6 +825,96 @@ void TestSampleAdjustSamplerScratch() {
                 "SampleAdjust canonicalization discarded border-mode bits");
 }
 
+void TestFmaskLoadSpecialization() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  Fixture fixture;
+  std::array<Value, 8> words;
+  for (uint32_t i = 0; i < words.size(); i++) {
+    words[i] = fixture.UserData(i);
+  }
+  const auto fmask = fixture.Image(words, 4);
+  const auto active = fixture.Emit(ValueOpcode::IEqual32,
+                                    {fixture.UserData(8), Value(0u)});
+  MemoryInfo load;
+  load.kind = ResourceKind::Image;
+  load.image_dimension = Decoder::ImageDimension::Dim2D;
+  load.image_address_components = 2;
+  load.dmask = 1;
+  const auto mapping = fixture.Emit(
+      ValueOpcode::ImageRead, {fmask, fixture.ImageAddress(), active},
+      fixture.AddMemory(load, 4));
+  const auto ordinary = fixture.Image(
+      {Value(0x2000u),
+       Value(static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u),
+       Value(3u | (3u << 14u)),
+       Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+             (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u)),
+       Value(0u), Value(0u), Value(0u), Value(0u)}, 8);
+  const auto ordinary_flags = fixture.AddMemory(load, 8);
+  const auto color = fixture.Emit(
+      ValueOpcode::ImageRead, {ordinary, fixture.ImageAddress(), Value(true)},
+      ordinary_flags);
+  const auto output = fixture.Buffer(
+      {Value(0x3000u), Value(0u), Value(12u), Value(0u)}, 12);
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  Value result;
+  for (uint32_t i = 0; i < 2; i++) {
+    const auto value = fixture.Emit(
+        ValueOpcode::CompositeExtractU32x4,
+        {i == 0 ? mapping : color, Value(0u)});
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {output, Value(0u), Value(i * 4u), Value(0u), value, Value(true)},
+                 fixture.AddMemory(store, 12 + i * 4u));
+    if (i == 0) result = value;
+  }
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  std::array<uint32_t, 9> user_data{
+      0x303ac300u, 0xca100000u, 0x021bc3bfu, 0x91800004u,
+      0u, 0x00700000u, 0u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
+                             specialization),
+        "FMASK resources did not materialize");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+  Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1 &&
+            snapshot.images[0].dwords[0] == 0x2000u &&
+            ordinary.Instruction()->Flags<uint32_t>() == 0 &&
+            fixture.program.memory_info[ordinary_flags.index].resource == 0,
+        "FMASK removal did not preserve the remaining image and runtime descriptor");
+  const auto *vector = result.Instruction()->Arg(0).Resolve().TryInstruction();
+  Check(vector != nullptr &&
+            vector->GetOpcode() == ValueOpcode::CompositeConstructU32x4,
+        "FMASK load did not lower to a value vector");
+  result = vector->Arg(0);
+  uint32_t value = 0;
+  Check(EvaluateUniformValues(plan, {&result, 1}, {.user_data = user_data}, {&value, 1}) &&
+            value == 0x76543210u,
+        "FMASK load did not return the native sample-to-fragment mapping");
+  user_data[8] = 1;
+  Check(EvaluateUniformValues(plan, {&result, 1}, {.user_data = user_data}, {&value, 1}) &&
+            value == 0u,
+        "inactive FMASK load did not preserve the execution mask");
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  AllocateBindings(fixture.program);
+  const auto kind = DescriptorBindingForImage(fixture.program.info.images[0]);
+  Check(kind.has_value() &&
+            FindBinding(fixture.program.bindings, *kind)->resources ==
+                std::vector<uint32_t>{0},
+        "FMASK allocated an ordinary image descriptor");
+  user_data[8] = 0;
+  user_data[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u;
+  ResourceSpecialization rebound;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, rebound) &&
+            rebound != specialization && snapshot.images.size() == 2,
+        "rebinding FMASK as a texture reused the metadata specialization");
+}
+
 void TestDynamicStorageMipTracking() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -1760,6 +1850,7 @@ int main() {
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
+    Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

@@ -687,6 +687,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	IR::RemoveIdentities(ir.blocks);
+	IR::EliminateDeadCode(ir.blocks);
 
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;

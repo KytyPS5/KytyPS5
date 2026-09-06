@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$CorpusDirectory,
     [string]$Auditor,
     [string]$OutputDirectory,
+    [string]$ComputeHostProfile,
     [ValidateRange(1, 16)][int]$Jobs = 4,
     [ValidateRange(1, 300)][int]$TimeoutSeconds = 30
 )
@@ -60,6 +61,16 @@ if (-not $OutputDirectory) {
 }
 $Auditor = (Get-Item -LiteralPath $Auditor).FullName
 $CorpusDirectory = (Get-Item -LiteralPath $CorpusDirectory).FullName
+$OutputDirectory = [IO.Path]::GetFullPath(
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory))
+$corpusPrefix = $CorpusDirectory.TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+if ($OutputDirectory.Equals($CorpusDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+    $OutputDirectory.StartsWith($corpusPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'OutputDirectory must be outside CorpusDirectory; audit artifacts are not shader manifests.'
+}
+# Freeze the input inventory before writing any audit artifact.
+$manifests = @(Get-ChildItem -LiteralPath $CorpusDirectory -Filter '*.json' -File -Recurse | Sort-Object FullName)
+if ($manifests.Count -eq 0) { throw 'No shader manifests found.' }
 if (Test-Path -LiteralPath $OutputDirectory) {
     if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container) -or
         @(Get-ChildItem -LiteralPath $OutputDirectory -Force).Count -gt 0) {
@@ -68,8 +79,15 @@ if (Test-Path -LiteralPath $OutputDirectory) {
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $OutputDirectory = (Get-Item -LiteralPath $OutputDirectory).FullName
-$manifests = @(Get-ChildItem -LiteralPath $CorpusDirectory -Filter '*.json' -File -Recurse | Sort-Object FullName)
-if ($manifests.Count -eq 0) { throw 'No shader manifests found.' }
+$profileSnapshot = $null
+$profileHash = $null
+if ($ComputeHostProfile) {
+    $ComputeHostProfile = (Get-Item -LiteralPath $ComputeHostProfile).FullName
+    # Every worker consumes the same preserved host input, never a changing file.
+    $profileSnapshot = Join-Path $OutputDirectory 'compute-host-profile.json'
+    [IO.File]::Copy($ComputeHostProfile, $profileSnapshot, $false)
+    $profileHash = (Get-FileHash -LiteralPath $profileSnapshot -Algorithm SHA256).Hash.ToLowerInvariant()
+}
 $pending = New-Object 'System.Collections.Generic.List[object]'
 $results = New-Object 'System.Collections.Generic.List[object]'
 $next = 0
@@ -86,6 +104,10 @@ try {
             $startInfo = New-Object Diagnostics.ProcessStartInfo
             $startInfo.FileName = $Auditor
             $startInfo.Arguments = '--audit-shader "' + $manifest.FullName + '"'
+            if ($profileSnapshot) {
+                # These are resolved Windows file paths: no embedded quote or trailing slash.
+                $startInfo.Arguments += ' --compute-host-profile "' + $profileSnapshot + '"'
+            }
             $startInfo.WorkingDirectory = $jobDirectory
             $startInfo.UseShellExecute = $false
             $startInfo.CreateNoWindow = $true
@@ -208,7 +230,28 @@ $groups = @($unsupported | Group-Object -Property key | ForEach-Object {
         })
     }
 })
-$groups += @($failed | Where-Object { -not $_.result.unsupported_instructions.Count } | Group-Object -Property {
+# Preserve independent planner failures as independent groups. Conditional
+# possible_errors are retained in each profile, never counted as proven rejects.
+$precheckReasons = @($failed | ForEach-Object {
+    $row = $_
+    foreach ($reason in @($row.result.compute_execution_precheck.errors)) {
+        if ($null -ne $reason) {
+            $groupReason = [string]$reason -replace '\bat pc\s+[0-9]+\b', 'at pc <instruction>'
+            [pscustomobject]@{ reason = $groupReason; manifest = $row.manifest }
+        }
+    }
+})
+$groups += @($precheckReasons | Group-Object -Property reason | ForEach-Object {
+    $shaders = @($_.Group.manifest | Select-Object -Unique)
+    [pscustomobject]@{
+        count = $shaders.Count; distinct_shaders = $shaders.Count
+        reason = 'compute_execution_precheck: ' + $_.Name; manifests = $shaders
+    }
+})
+$groups += @($failed | Where-Object {
+    -not $_.result.unsupported_instructions.Count -and
+    -not $_.result.compute_execution_precheck.errors.Count
+} | Group-Object -Property {
     $text = $_.error -replace 'hash=0x[0-9a-fA-F]+', 'hash=<shader>'
     $text = $text -replace '\bpc(?:\s*=\s*|\s+)0x[0-9a-fA-F]+', 'pc=<instruction>'
     $text = $text -replace '0x[0-9a-fA-F]+(?=: unsupported)', '<instruction>'
@@ -227,13 +270,23 @@ $coverage = @($results | Where-Object status -eq 'passed' | Group-Object -Proper
 } | ForEach-Object {
     [pscustomobject]@{ checked_through = $_.Name; count = $_.Count }
 })
+$precheckCoverage = @()
+if ($profileSnapshot) {
+    $precheckCoverage = @($results | Group-Object -Property {
+        if ($null -ne $_.result.compute_execution_precheck) {
+            $_.result.compute_execution_precheck.status
+        } else { 'not_checked' }
+    } | ForEach-Object { [pscustomobject]@{ status = $_.Name; count = $_.Count } })
+}
 $report = [ordered]@{
     corpus = $CorpusDirectory; auditor = $Auditor
     auditor_sha256 = (Get-FileHash -LiteralPath $Auditor -Algorithm SHA256).Hash.ToLowerInvariant()
     started_utc = $started.ToString('o'); elapsed_seconds = [Math]::Round($watch.Elapsed.TotalSeconds, 3)
     total = $results.Count; passed = $results.Count - $failed.Count; failed = $failed.Count
     coverage = $coverage; error_groups = $groups
-    limitations = @('A passed CFG check does not prove translation or GPU compatibility.', 'CFG dispatcher fallback requirements are reported separately; the fallback IR is not checked by CFG-only jobs.', 'Resource tracking checks do not materialize guest memory or execute SPIR-V.', 'Each shader runs in a separate bounded process; failure does not stop remaining shaders.', 'Error groups overlap: a shader may have several unsupported instructions, so group counts must not be added to obtain the failed-shader count.')
+    compute_host_profile = $profileSnapshot; compute_host_profile_sha256 = $profileHash
+    compute_execution_precheck_coverage = $precheckCoverage
+    limitations = @('A passed CFG check does not prove translation or GPU compatibility.', 'CFG dispatcher fallback requirements are reported separately; the fallback IR is not checked by CFG-only jobs.', 'Resource tracking checks do not materialize guest memory or execute SPIR-V.', 'Optional compute_execution_precheck runs the real CPU planner before specialization; not_rejected is not emitted or GPU compatibility. Unknown descriptor ADD_TID is checked under both assumptions; all successfully translated profiles and planner hypotheses are retained; a fatal translation can stop remaining profiles for that manifest. Missing stage metadata remains not_checked.', 'Each shader runs in a separate bounded process; failure does not stop remaining shaders.', 'Error groups overlap: a shader may have several unsupported instructions, so group counts must not be added to obtain the failed-shader count.')
     results = $results.ToArray()
 }
 $report | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'report.json') -Encoding UTF8
@@ -245,6 +298,10 @@ $markdown.Add('')
 $markdown.Add('Passing this audit is not proof of a working game: captured metadata determines the checked phases, and guest memory/GPU execution are not checked.')
 $markdown.Add('')
 foreach ($item in $coverage) { $markdown.Add(('- {0}: {1}' -f $item.checked_through, $item.count)) }
+foreach ($item in $precheckCoverage) { $markdown.Add(('- compute_execution_precheck {0}: {1}' -f $item.status, $item.count)) }
+if ($profileSnapshot) {
+    $markdown.Add('Compute precheck is before resource specialization; not_rejected is conditional, and not_checked entries did not reach this phase. SPIR-V, runtime descriptors and GPU execution are not verified.')
+}
 $markdown.Add('')
 foreach ($group in $groups) {
     $markdown.Add(('## {0} shader(s)' -f $group.count))

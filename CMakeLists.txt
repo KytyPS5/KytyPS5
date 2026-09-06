@@ -550,6 +550,11 @@ if(BUILD_TESTING)
 	                 $<TARGET_FILE:shader_cfg_tests>
 	                 --output-root "${CMAKE_CURRENT_BINARY_DIR}/shader-audit-metadata")
 	set_tests_properties(shader_audit_metadata PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+	add_test(NAME shader_audit_compute
+	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ShaderAuditComputeTests.py"
+	                 $<TARGET_FILE:shader_cfg_tests>
+	                 --output-root "${CMAKE_CURRENT_BINARY_DIR}/shader-audit-compute")
+	set_tests_properties(shader_audit_compute PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 	add_test(NAME shader_fma_khr_validator COMMAND $<TARGET_FILE:shader_cfg_tests> --fma-khr-validator-only)
 	set_tests_properties(shader_fma_khr_validator PROPERTIES TIMEOUT 30)
 	if(WIN32)

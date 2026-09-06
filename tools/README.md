@@ -57,7 +57,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\audit-shaders.ps
   -Jobs 4 -TimeoutSeconds 30
 ```
 
-For live captures, replace `-CorpusDirectory` with the `registered` or `dispatched` directory. `-OutputDirectory` must be new or empty; existing results are preserved and a nonempty destination is rejected. Omit it to create a unique directory under `_Build/shader-audits`.
+For live captures, replace `-CorpusDirectory` with the `registered` or `dispatched` directory. `-OutputDirectory` must be new or empty and outside the corpus; existing results are preserved and audit artifacts cannot become shader inputs. Omit it to create a unique directory under `_Build/shader-audits`.
 
 Each manifest runs in a separate worker process, with up to `-Jobs` workers active. Workers create no console windows and both output streams are drained asynchronously. A failure or timeout is recorded and the batch continues. Timeout handling kills the affected worker and waits for termination with a bound; normal completion and script cleanup dispose of worker processes. Forcibly terminating the PowerShell host can bypass script cleanup.
 
@@ -70,6 +70,44 @@ The runner writes:
 
 The runner exits with code 1 if any manifest fails or times out, and 0 if all pass. Input or runner errors also produce a nonzero exit code. Counts refer to manifests, not unique binaries. Unsupported instructions are grouped by family, opcode and reason, with distinct shader counts and PC examples; one shader can appear in several groups.
 
+### Check compute execution planning for a host
+
+Add `-ComputeHostProfile path\to\host.json` to run the shared CPU compute planner
+after resource tracking. Supply measured device limits rather than inferred defaults.
+The following profile describes the tested RTX 4060; other hosts need their own values:
+
+```json
+{
+  "schema_version": 1,
+  "max_size": [1024, 1024, 64],
+  "max_invocations": 1024,
+  "native_subgroup_size": 32,
+  "can_require_subgroup_size_64": false,
+  "max_shared_memory_bytes": 49152
+}
+```
+
+Keep this JSON outside the corpus. The runner copies and hashes it in the output
+directory so all workers use the same input. The worker can also be invoked directly:
+
+```powershell
+.\_Build\windows\shader_cfg_tests.exe --audit-shader path\to\shader.json `
+  --compute-host-profile path\to\host.json
+```
+
+`compute_execution_precheck` reports `rejected`, `not_rejected` or `not_checked`.
+It runs before resource specialization, with no runtime descriptor values or guest
+memory reads. Unknown buffer ADD_TID is checked both ways: rejection under both
+assumptions is counted as an early failure; a conditional rejection remains in
+`possible_errors`. The individual attempts and successfully translated LDS-barrier
+profiles are retained. A fatal translation still ends that worker; later profiles
+of that manifest remain unchecked, while the batch proceeds to other manifests.
+
+The report groups independent planner reasons separately and records precheck
+coverage for all manifests. Missing stage metadata remains `not_checked`.
+`not_rejected` does not establish post-specialization admission, valid SPIR-V or GPU
+execution. Compare counts only between audits using the same stages and host profile.
+
 ## Interpret coverage
 
 | Coverage | What was checked |
@@ -77,6 +115,7 @@ The runner exits with code 1 if any manifest fails or times out, and 0 if all pa
 | `cfg_structured` | Instructions decoded and control flow structured. |
 | `cfg_dispatcher_fallback_required` | Instructions decoded and a control-flow graph was built; structured control flow requires the dispatcher fallback. Fallback translation was not validated. |
 | `resource_tracking` | Compute IR translation and resource-plan extraction completed, using captured dispatch parameters or the explicitly assumed header profile. |
+| `compute_execution_precheck` | The CPU compute planner checked the available profiles before specialization; individual outcomes and unknown descriptor requirements are recorded. |
 
 A passing result applies only to the reported coverage. Non-compute stages and compute captures without sufficient metadata stop at control-flow analysis. The audit does not materialize runtime descriptors, emit or validate SPIR-V, execute GPU work, or prove that a game renders correctly. Use targeted compiler tests, GPU regression tests and runtime checks to validate fixes beyond the audit's scope.
 

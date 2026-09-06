@@ -51,3 +51,11 @@ Documentation and workflow-only changes do not require artificial code tests.
 
 The versioned skill linked above is the shared source for Windows and WSL. Keep any installed
 personal copies synchronized with it when changing this workflow.
+
+## Launch progress record
+
+Maintain [the Ghost of Yōtei launch plan](docs/ghost-of-yotei-windows-plan.md) after
+meaningful fixes, shader batch audits and game retries. Record the tested source revision,
+artifact/log references, current runtime blocker and next required work. Distinguish build,
+CPU audit, GPU regression, rendered frame, menu and gameplay results. Keep untested stages
+explicitly pending; group batch failures by shared cause and note overlapping shader counts.

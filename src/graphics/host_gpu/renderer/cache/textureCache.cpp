@@ -1136,6 +1136,58 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_offset) {
+	const auto&     info = image.info;
+	TileBlockLayout block {};
+	if (!info.HasStencil() || info.samples != 1 || image.backing.samples != 1 ||
+	    info.resources.layers == 0 || info.stencil.size % info.resources.layers != 0 ||
+	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, block) ||
+	    (info.pixel_format != vk::Format::eD32SfloatS8Uint &&
+	     info.pixel_format != vk::Format::eD24UnormS8Uint &&
+	     info.pixel_format != vk::Format::eD16UnormS8Uint)) {
+		EXIT("TextureCache: invalid stencil upload: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " layers=%u samples=%u format=%u\n",
+		     info.stencil.address, info.stencil.size, info.resources.layers, info.samples,
+		     static_cast<uint32_t>(info.pixel_format));
+	}
+	const auto     layers     = info.resources.layers;
+	const uint64_t slice_size = info.stencil.size / layers;
+	const auto     align      = [](uint64_t value, uint64_t alignment) {
+        return (value + alignment - 1) / alignment * alignment;
+	};
+	const uint64_t pitch = align(info.extent.width, block.block_width);
+	const uint64_t rows  = align(info.extent.height, block.block_height);
+	if (info.tile_mode == Prospero::TileMode::kLinear || pitch * rows != slice_size ||
+	    pitch > UINT32_MAX) {
+		LOGF("TextureCache: stencil upload skipped addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " extent=%ux%u pitch=%" PRIu64 " rows=%" PRIu64 " layers=%u tile=%u\n",
+		     info.stencil.address, info.stencil.size, info.extent.width, info.extent.height, pitch,
+		     rows, layers, static_cast<uint32_t>(info.tile_mode));
+		return;
+	}
+	std::vector<GpuTileInfo>         tiles;
+	std::vector<vk::BufferImageCopy> copies(layers);
+	tiles.reserve(layers);
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		const uint64_t offset  = slice_size * layer;
+		auto&          copy    = copies[layer];
+		copy.bufferOffset      = offset;
+		copy.bufferRowLength   = static_cast<uint32_t>(pitch);
+		copy.bufferImageHeight = info.extent.height;
+		copy.imageSubresource  = {vk::ImageAspectFlagBits::eStencil, 0, layer, 1};
+		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+		tiles.push_back({block.family, 1, offset, slice_size, offset, slice_size, 0,
+		                 info.extent.width, info.extent.height, 1, static_cast<uint32_t>(pitch)});
+		tiles.back().surface_z = layer;
+	}
+	const auto linear =
+	    m_tiler.Detile(source.Handle(), source_offset, info.stencil.size, info.stencil.size, tiles);
+	for (auto& copy: copies) {
+		copy.bufferOffset += linear.offset;
+	}
+	image.Upload(copies, linear.buffer, linear.offset, linear.size);
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -1219,6 +1271,15 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 void TextureCache::RefreshImage(ImageId id) {
 	TrackImage(id);
 	auto& image = m_slot_images[id];
+	if (image.IsStencilModified()) {
+		const auto [source, source_offset] =
+		    m_buffer_cache.ObtainBufferForImage(image.info.stencil.address, image.info.stencil.size);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain stencil upload source\n");
+		}
+		UploadStencil(image, *source, source_offset);
+		image.ClearStencilModified();
+	}
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
@@ -1870,7 +1931,14 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.depth_id || !image.Overlaps(address, size)) {
+		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (image.depth_id) {
+			auto* depth = m_slot_images.try_get(image.depth_id);
+			if (depth != nullptr && depth->info.HasStencil() && depth->backing.image != nullptr) {
+				depth->MarkStencilModified();
+			}
 			continue;
 		}
 		if (image.IsGpuModified()) {

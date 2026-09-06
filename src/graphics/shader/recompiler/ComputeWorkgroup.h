@@ -13,6 +13,9 @@ struct ComputeWorkgroupLimits {
 	// Offline compilation preserves the guest geometry unless a device is supplied.
 	std::array<uint32_t, 3> max_size        = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
 	uint32_t                max_invocations = UINT32_MAX;
+	// Zero preserves offline compilation without assuming a native subgroup width.
+	uint32_t                native_subgroup_size = 0;
+	bool                    can_require_subgroup_size_64 = false;
 };
 
 struct ComputeWorkgroupLayout {

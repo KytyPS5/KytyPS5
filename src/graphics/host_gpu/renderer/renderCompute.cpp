@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -364,6 +365,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	const auto& dispatch_limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const auto dispatch_groups = ShaderRecompiler::PlanComputeDispatchGroups(
+	    {thread_group_x, thread_group_y, thread_group_z}, program.compute_wave_partition_factor,
+	    {dispatch_limits.maxComputeWorkGroupCount[0], dispatch_limits.maxComputeWorkGroupCount[1],
+	     dispatch_limits.maxComputeWorkGroupCount[2]});
+	if (!dispatch_groups) {
+		EXIT("compute dispatch exceeds device limits: guest=%ux%ux%u wave_partition_factor=%u "
+		     "limits=%ux%ux%u\n", thread_group_x, thread_group_y, thread_group_z,
+		     program.compute_wave_partition_factor, dispatch_limits.maxComputeWorkGroupCount[0],
+		     dispatch_limits.maxComputeWorkGroupCount[1], dispatch_limits.maxComputeWorkGroupCount[2]);
+	}
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -394,7 +406,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	vk_buffer.dispatch((*dispatch_groups)[0], (*dispatch_groups)[1], (*dispatch_groups)[2]);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

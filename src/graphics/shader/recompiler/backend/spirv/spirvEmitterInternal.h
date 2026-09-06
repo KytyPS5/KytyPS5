@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ComputeWorkgroup.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -355,6 +356,10 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component);
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
+uint32_t EmitHostLocalInvocationIndex(EmitterState& state);
+uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate);
+uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target);
+uint32_t EmitWaveFindFirst(EmitterState& state, uint32_t ballot);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 

@@ -148,6 +148,7 @@ DppTargetLane EmitDpp8TargetLane(EmitterState& state, uint32_t lane_selectors) {
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.compute_execution.IsSplitWave64()) return EmitHostLocalInvocationIndex(state);
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -176,7 +177,7 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 }
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
-	if (state.compute_workgroup.IsReshaped() && (kind == IR::StageInputKind::LocalInvocationId ||
+	if ((state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) && (kind == IR::StageInputKind::LocalInvocationId ||
 	                                             kind == IR::StageInputKind::GlobalInvocationId)) {
 		EXIT_IF(component >= 3u);
 		const auto& guest = state.compute_workgroup.guest_size;
@@ -224,7 +225,7 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 	return value;
 }
 
-uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+uint32_t EmitHostLocalInvocationIndex(EmitterState& state) {
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);

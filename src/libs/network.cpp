@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #endif
 
@@ -30,6 +31,7 @@
 #include "libs/libs.h"
 #include "libs/network.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -37,6 +39,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -832,10 +835,12 @@ struct NetEtherAddr {
 using NativeSocket                                  = SOCKET;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
 using SocketLength                                  = int;
+using SocketIoLength                                = int;
 #else
 using NativeSocket                                  = int;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
 using SocketLength                                  = socklen_t;
+using SocketIoLength                                = size_t;
 #endif
 
 struct SocketSlot {
@@ -953,6 +958,7 @@ static int SetHostSocketError(int error) {
 		case EADDRINUSE: posix_error = Posix::POSIX_EADDRINUSE; break;
 		case EADDRNOTAVAIL: posix_error = Posix::POSIX_EADDRNOTAVAIL; break;
 		case EAFNOSUPPORT: posix_error = Posix::POSIX_EAFNOSUPPORT; break;
+		case EAGAIN: posix_error = Posix::POSIX_EWOULDBLOCK; break;
 		case EBADF: posix_error = Posix::POSIX_EBADF; break;
 		case EFAULT: posix_error = Posix::POSIX_EFAULT; break;
 		case EINVAL: posix_error = Posix::POSIX_EINVAL; break;
@@ -989,7 +995,6 @@ static int ConvertSocketOptionLevel(int level) {
 }
 
 static int ConvertMessageFlags(int flags) {
-#if defined(_WIN32)
 	constexpr int guest_msg_peek      = 0x00000002;
 	constexpr int guest_msg_dontroute = 0x00000004;
 	constexpr int guest_msg_waitall   = 0x00000040;
@@ -1006,6 +1011,14 @@ static int ConvertMessageFlags(int flags) {
 	if ((flags & guest_msg_waitall) != 0) {
 		host_flags |= MSG_WAITALL;
 	}
+#if !defined(_WIN32)
+	if ((flags & guest_msg_dontwait) != 0) {
+		host_flags |= MSG_DONTWAIT;
+	}
+	if ((flags & guest_msg_nosignal) != 0) {
+		host_flags |= MSG_NOSIGNAL;
+	}
+#endif
 
 	flags &= ~(guest_msg_peek | guest_msg_dontroute | guest_msg_waitall | guest_msg_dontwait |
 	           guest_msg_nosignal);
@@ -1015,9 +1028,6 @@ static int ConvertMessageFlags(int flags) {
 	}
 
 	return host_flags;
-#else
-	return flags;
-#endif
 }
 
 static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_storage* out,
@@ -1942,34 +1952,30 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 		return -1;
 	}
 
-#if defined(_WIN32)
 	const int host_flags = ConvertMessageFlags(flags);
 	if (host_flags < 0) {
 		return -1;
 	}
 
-	const int host_len = static_cast<int>(len > 0x7fffffffu ? 0x7fffffffu : len);
-	int       result   = 0;
+	const auto host_len = static_cast<SocketIoLength>(
+	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
+	int64_t result = 0;
 	if (addr == nullptr) {
 		result = ::send(socket, static_cast<const char*>(buf), host_len, host_flags);
 	} else {
 		sockaddr_storage host_addr {};
-		int              host_addrlen = 0;
+		SocketLength     host_addrlen = 0;
 		if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 			return -1;
 		}
 		result = ::sendto(socket, static_cast<const char*>(buf), host_len, host_flags,
 		                  reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen);
 	}
-	if (result == SOCKET_ERROR) {
+	if (result < 0) {
 		return SetHostSocketError();
 	}
 
 	return result;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags) {
@@ -2000,35 +2006,31 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		return -1;
 	}
 
-#if defined(_WIN32)
 	const int host_flags = ConvertMessageFlags(flags);
 	if (host_flags < 0) {
 		return -1;
 	}
 
-	const int host_len = static_cast<int>(len > 0x7fffffffu ? 0x7fffffffu : len);
-	int       result   = 0;
+	const auto host_len = static_cast<SocketIoLength>(
+	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
+	int64_t result = 0;
 	if (addr == nullptr) {
 		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
 	} else {
 		sockaddr_storage host_addr {};
-		int              host_addrlen = sizeof(host_addr);
+		SocketLength     host_addrlen = sizeof(host_addr);
 		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
 		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
-		if (result != SOCKET_ERROR &&
+		if (result >= 0 &&
 		    ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
 			return -1;
 		}
 	}
-	if (result == SOCKET_ERROR) {
+	if (result < 0) {
 		return SetHostSocketError();
 	}
 
 	return result;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfds,
@@ -2062,7 +2064,6 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		LOGF("\n");
 	}
 
-#if defined(_WIN32)
 	fd_set host_read {};
 	fd_set host_write {};
 	fd_set host_except {};
@@ -2070,91 +2071,92 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	FD_ZERO(&host_write);
 	FD_ZERO(&host_except);
 
-	std::array<int, FD_SETSIZE> read_map {};
-	std::array<int, FD_SETSIZE> write_map {};
-	std::array<int, FD_SETSIZE> except_map {};
-	int                         read_count   = 0;
-	int                         write_count  = 0;
-	int                         except_count = 0;
-
+	std::vector<std::pair<int, NativeSocket>> descriptors;
+	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
-		NativeSocket socket = INVALID_NATIVE_SOCKET;
-		if (!GetSocketBackend(fd, &socket)) {
+		const bool read = GuestFdIsSet(readfds, fd);
+		const bool write = GuestFdIsSet(writefds, fd);
+		const bool except = GuestFdIsSet(exceptfds, fd);
+		if (!read && !write && !except) {
 			continue;
 		}
-		if (GuestFdIsSet(readfds, fd) && read_count < FD_SETSIZE) {
+		NativeSocket socket = INVALID_NATIVE_SOCKET;
+#if !defined(_WIN32)
+		if (fd < 3) {
+			socket = fd;
+		} else
+#endif
+		if (!GetSocketBackend(fd, &socket)) {
+			return SetGuestSocketError(Posix::POSIX_EBADF);
+		}
+#if defined(_WIN32)
+		if ((read && host_read.fd_count == FD_SETSIZE) ||
+		    (write && host_write.fd_count == FD_SETSIZE) ||
+		    (except && host_except.fd_count == FD_SETSIZE)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+#else
+		if (socket >= FD_SETSIZE) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		host_nfds = std::max(host_nfds, socket + 1);
+#endif
+		descriptors.emplace_back(fd, socket);
+		if (read) {
 			FD_SET(socket, &host_read);
-			read_map[static_cast<size_t>(read_count++)] = fd;
 		}
-		if (GuestFdIsSet(writefds, fd) && write_count < FD_SETSIZE) {
+		if (write) {
 			FD_SET(socket, &host_write);
-			write_map[static_cast<size_t>(write_count++)] = fd;
 		}
-		if (GuestFdIsSet(exceptfds, fd) && except_count < FD_SETSIZE) {
+		if (except) {
 			FD_SET(socket, &host_except);
-			except_map[static_cast<size_t>(except_count++)] = fd;
 		}
 	}
 
-	timeval  host_timeout {};
+	timeval host_timeout {};
 	timeval* host_timeout_ptr = nullptr;
 	if (timeout != nullptr) {
 		const auto* guest_timeout = static_cast<const NetTimeval*>(timeout);
-		host_timeout.tv_sec       = static_cast<long>(guest_timeout->tv_sec);
-		host_timeout.tv_usec      = static_cast<long>(guest_timeout->tv_usec);
-		host_timeout_ptr          = &host_timeout;
-	}
-
-	fd_set* read_ptr   = (read_count != 0 ? &host_read : nullptr);
-	fd_set* write_ptr  = (write_count != 0 ? &host_write : nullptr);
-	fd_set* except_ptr = (except_count != 0 ? &host_except : nullptr);
-	if (read_ptr == nullptr && write_ptr == nullptr && except_ptr == nullptr) {
-		if (host_timeout_ptr != nullptr) {
-			const auto sleep_ms =
-			    static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000);
-			Sleep(sleep_ms);
+		if (guest_timeout->tv_sec < 0 || guest_timeout->tv_usec < 0 ||
+		    guest_timeout->tv_usec >= 1'000'000) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
-		GuestFdZero(readfds, nfds);
-		GuestFdZero(writefds, nfds);
-		GuestFdZero(exceptfds, nfds);
-		return 0;
+		host_timeout.tv_sec = static_cast<decltype(host_timeout.tv_sec)>(guest_timeout->tv_sec);
+		host_timeout.tv_usec = static_cast<decltype(host_timeout.tv_usec)>(guest_timeout->tv_usec);
+		host_timeout_ptr = &host_timeout;
 	}
 
-	const int result = ::select(0, read_ptr, write_ptr, except_ptr, host_timeout_ptr);
-	if (result == SOCKET_ERROR) {
-		return SetHostSocketError();
+	int result = 0;
+#if defined(_WIN32)
+	if (descriptors.empty()) {
+		Sleep(host_timeout_ptr == nullptr ? INFINITE :
+		      static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
+	} else
+#endif
+	{
+		result = ::select(host_nfds, readfds != nullptr ? &host_read : nullptr,
+		                  writefds != nullptr ? &host_write : nullptr,
+		                  exceptfds != nullptr ? &host_except : nullptr, host_timeout_ptr);
+		if (result < 0) {
+			return SetHostSocketError();
+		}
 	}
 
 	GuestFdZero(readfds, nfds);
 	GuestFdZero(writefds, nfds);
 	GuestFdZero(exceptfds, nfds);
-	for (int i = 0; i < read_count; i++) {
-		NativeSocket socket = INVALID_NATIVE_SOCKET;
-		if (GetSocketBackend(read_map[static_cast<size_t>(i)], &socket) &&
-		    FD_ISSET(socket, &host_read)) {
-			GuestFdSet(readfds, read_map[static_cast<size_t>(i)]);
+	for (const auto& [fd, socket]: descriptors) {
+		if (FD_ISSET(socket, &host_read)) {
+			GuestFdSet(readfds, fd);
+		}
+		if (FD_ISSET(socket, &host_write)) {
+			GuestFdSet(writefds, fd);
+		}
+		if (FD_ISSET(socket, &host_except)) {
+			GuestFdSet(exceptfds, fd);
 		}
 	}
-	for (int i = 0; i < write_count; i++) {
-		NativeSocket socket = INVALID_NATIVE_SOCKET;
-		if (GetSocketBackend(write_map[static_cast<size_t>(i)], &socket) &&
-		    FD_ISSET(socket, &host_write)) {
-			GuestFdSet(writefds, write_map[static_cast<size_t>(i)]);
-		}
-	}
-	for (int i = 0; i < except_count; i++) {
-		NativeSocket socket = INVALID_NATIVE_SOCKET;
-		if (GetSocketBackend(except_map[static_cast<size_t>(i)], &socket) &&
-		    FD_ISSET(socket, &host_except)) {
-			GuestFdSet(exceptfds, except_map[static_cast<size_t>(i)]);
-		}
-	}
-
 	return result;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 } // namespace Net

@@ -5,6 +5,9 @@
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
+#include "libs/network.h"
+
+#include <array>
 
 #include <chrono>
 #include <cstdio>
@@ -76,6 +79,63 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void CheckSocketWakeup() {
+  namespace Net = Libs::Network::Net;
+  // Guest sockaddr_in: length, family, network-order port/address, padding.
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int listener = Net::Socket(2, 1, 0);
+  Check(listener >= 0, "create loopback listener");
+  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
+  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
+  uint32_t address_size = address.size();
+  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
+        "get assigned loopback port");
+  const int writer = Net::Socket(2, 1, 0);
+  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
+        "connect wake socket");
+  const int reader = Net::Accept(listener, nullptr, nullptr);
+  Check(reader >= 0, "accept wake socket");
+  Check(Net::SocketClose(listener) == 0, "close listener");
+  const int enabled = 1;
+  Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
+        "enable TCP_NODELAY");
+
+  std::array<uint64_t, 16> readable {};
+  const auto bit = uint64_t {1} << (reader % 64);
+  readable[reader / 64] = bit;
+  const std::array<int64_t, 2> immediate {0, 0};
+  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
+                    immediate.data()) == 0 && readable[reader / 64] == 0,
+        "empty socket is not readable");
+  const char payload[] = "wake";
+  Check(Net::Send(writer, payload, sizeof(payload), 0x20000) == sizeof(payload),
+        "send wake bytes with guest MSG_NOSIGNAL");
+  readable[reader / 64] = bit;
+  const std::array<int64_t, 2> deadline {1, 0};
+  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
+                    deadline.data()) == 1 && readable[reader / 64] == bit,
+        "select reports the guest descriptor after wake");
+  std::array<char, sizeof(payload)> received {};
+  Check(Net::Recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "guest PEEK and WAITALL preserve the wake bytes");
+  Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
+        "consume wake bytes with guest WAITALL");
+#if !defined(_WIN32)
+  Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty nonblocking receive translates guest errno");
+#endif
+  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
+        "close wake sockets");
+  readable[reader / 64] = bit;
+  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
+                    immediate.data()) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF &&
+            readable[reader / 64] == bit,
+        "closed descriptor fails without clearing input fd_set");
+}
+
 } // namespace
 
 int main() {
@@ -93,6 +153,7 @@ int main() {
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
+  CheckSocketWakeup();
   subsystems.Destroy();
 
   std::printf("KernelFileSystemTests: all cases passed\n");

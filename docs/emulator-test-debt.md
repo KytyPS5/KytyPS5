@@ -42,3 +42,24 @@ Required tests:
   and arms that are not valid runtime descriptor values.
 - Neighboring checks showing invariant Phi handling and bounded descriptor tables remain
   unchanged, plus native Windows audits for every captured shader in this failure group.
+
+## ReadLane-indexed descriptor tables behind scalar buffers
+
+Status: production fix and corpus validation in progress; automated regression deferred.
+
+Observed trigger: four correlated descriptor words are read through `ReadConstBuffer`.
+Their record offset is selected with `ReadLane`; both the selected value and lane are
+provably finite, but the runtime resource planner previously supported bounded tables
+only when their backing source was a two-word raw address.
+
+Required tests:
+
+- A positive compiler case where a finite `ReadLane` key indexes four correlated
+  `ReadConstBuffer` words and preserves the live GPU key in the specialized table.
+- Materialization cases for zero and nonzero buffer stride, exact final-word access,
+  base/offset overflow, negative immediate offsets, and coherent snapshot failures.
+- Rejection cases for an unbounded source value, an out-of-wave lane selector,
+  undefined lanes, malformed source descriptors, mixed table columns, and exceeded
+  probe or resource limits.
+- Equivalence checks against raw scalar-buffer reads and `ReadFirstLane`, followed by
+  native Windows audits and a bounded Vulkan readback before upstream submission.

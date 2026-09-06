@@ -451,6 +451,11 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
+bool LdsHasCompetingInvocations(const EmitterState& state) {
+	return !state.requirements.function_lds &&
+	       state.compute_workgroup.host_size != std::array<uint32_t, 3>{1u, 1u, 1u};
+}
+
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
@@ -471,7 +476,9 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		                     Unary(ctx.state, spv::OpNot, TypeU32(ctx.state), mask)),
 		              value);
 	};
-	if (mem.kind == IR::ResourceKind::Scratch) {
+	if (mem.kind == IR::ResourceKind::Scratch ||
+	    (mem.kind == IR::ResourceKind::Lds && !LdsHasCompetingInvocations(ctx.state))) {
+		// Private storage has no other writer that could be lost by this RMW.
 		const auto old = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), old, pointer);
 		ctx.state.builder.AddFunction(spv::OpStore, pointer, merge(old));

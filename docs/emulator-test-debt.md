@@ -168,5 +168,11 @@ Required tests:
 - sRGB color formats checked through an equivalent UNORM view so depth-like values are not
   changed by hardware gamma decoding.
 - Texture upload/view aspect tests for native depth images and ordinary color images.
+- Cache-alias coverage where a single-sample `D32_SFLOAT_S8_UINT` depth target is later
+  sampled through an equal-address, equal-footprint `R16G16_SFLOAT` color descriptor. The
+  cache must replace the incompatible native image, preserve the raw 32-bit depth texels via
+  the buffer-copy path, and create a color-aspect view without Vulkan validation errors.
+- Neighboring depth-to-color alias cases for compatible byte widths, plus rejection or a
+  diagnostic for unequal byte widths and multisample representations that cannot be copied.
 - Native Vulkan readback comparing manual and hardware comparison where both are available,
   followed by a Yotei run beyond the frame-93 specialization failure.

@@ -79,3 +79,17 @@ The runner exits with code 1 if any manifest fails or times out, and 0 if all pa
 | `resource_tracking` | Compute IR translation and resource-plan extraction completed, using captured dispatch parameters or the explicitly assumed header profile. |
 
 A passing result applies only to the reported coverage. Non-compute stages and compute captures without sufficient metadata stop at control-flow analysis. The audit does not materialize runtime descriptors, emit or validate SPIR-V, execute GPU work, or prove that a game renders correctly. Use targeted compiler tests, GPU regression tests and runtime checks to validate fixes beyond the audit's scope.
+
+## Localize GPU execution faults
+
+For a diagnostic run, set `KYTY_GPU_SYNC_DIAGNOSTICS=1` in the emulator process environment.
+The command processor submits and waits immediately before and after each nonempty guest
+compute dispatch, logging `GpuDispatchSync` phases and the guest shader address. A failed
+`before-wait` points to earlier queued work; a failed `after-wait` identifies a candidate
+interval containing the dispatch and its resource preparation. Presentation can also
+submit work to the shared queue during that interval. A matching `after-complete`
+confirms that batch completed. This does not identify an individual failing GPU instruction.
+
+The setting changes scheduling and can hide timing-dependent faults. Keep the normal
+asynchronous run as a separate check. Unset the variable after diagnosis; no extra waits
+are added by default. The waits do not replace Vulkan or shader validation.

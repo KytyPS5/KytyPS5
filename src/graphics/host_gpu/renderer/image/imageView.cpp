@@ -346,13 +346,22 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u "
+		     "guest=0x%016llx+0x%llx info_format=%d guest_format=%u image_type=%u "
+		     "tile=%u samples=%u extent=%ux%ux%u info_levels=%u info_layers=%u "
+		     "stencil=0x%016llx+0x%llx depth_association=%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
 		     static_cast<int>(normalized.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		     image.layers, static_cast<unsigned long long>(info.data.address),
+		     static_cast<unsigned long long>(info.data.size), static_cast<int>(info.pixel_format),
+		     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
+		     static_cast<uint32_t>(info.tile_mode), info.samples, info.extent.width,
+		     info.extent.height, info.extent.depth, info.resources.levels, info.resources.layers,
+		     static_cast<unsigned long long>(info.stencil.address),
+		     static_cast<unsigned long long>(info.stencil.size), depth_id.index);
 	}
 
 	for (const auto& cached: views) {

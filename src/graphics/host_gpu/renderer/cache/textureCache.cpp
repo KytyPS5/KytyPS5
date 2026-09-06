@@ -710,6 +710,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
+			// Vulkan image views cannot cross the depth/stencil and color format
+			// classes. Guest software may reinterpret the same allocation through a
+			// color texture descriptor, so replace the native depth image and preserve
+			// its depth-aspect bits through the existing buffer copy path.
+			recreate |= cached.info.IsDepth() && !requested.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;

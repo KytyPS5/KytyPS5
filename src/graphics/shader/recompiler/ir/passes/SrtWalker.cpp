@@ -1064,7 +1064,7 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
                                                      const Inst& read) {
-	return BoundedLoopProof(program).Run(read);
+	return BoundedReadProof(program).Run(read);
 }
 
 void BuildSrtPlan(Program& program) {

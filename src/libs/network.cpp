@@ -918,7 +918,10 @@ static int SetGuestSocketError(int error) {
 	return -1;
 }
 
-static int SetHostSocketError(int error) {
+static int ConvertHostSocketError(int error) {
+	if (error == 0) {
+		return 0;
+	}
 	int posix_error = Posix::POSIX_EIO;
 #if defined(_WIN32)
 	switch (error) {
@@ -971,14 +974,14 @@ static int SetHostSocketError(int error) {
 		default: break;
 	}
 #endif
-	return SetGuestSocketError(posix_error);
+	return posix_error;
 }
 
 static int SetHostSocketError() {
 #if defined(_WIN32)
-	return SetHostSocketError(WSAGetLastError());
+	return SetGuestSocketError(ConvertHostSocketError(WSAGetLastError()));
 #else
-	return SetHostSocketError(errno);
+	return SetGuestSocketError(ConvertHostSocketError(errno));
 #endif
 }
 
@@ -1873,18 +1876,27 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		return -1;
 	}
 
-#if defined(_WIN32)
-	int len = static_cast<int>(*optlen);
+	// Guest socket options: SOL_SOCKET=0xffff, SO_ERROR=0x1007.
+	const bool socket_error = (level == 0xffff && optname == 0x1007);
+#if !defined(_WIN32)
+	if (!socket_error) {
+		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
+	}
+#endif
+	if (socket_error) {
+		optname = SO_ERROR;
+	}
+	SocketLength len = static_cast<SocketLength>(*optlen);
 	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(optval),
-	                 &len) == SOCKET_ERROR) {
+	                 &len) != 0) {
 		return SetHostSocketError();
+	}
+	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
+		auto* error = static_cast<int*>(optval);
+		*error = ConvertHostSocketError(*error);
 	}
 	*optlen = static_cast<uint32_t>(len);
 	return 0;
-#else
-	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
-	return -1;
-#endif
 }
 
 int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, uint32_t optlen) {

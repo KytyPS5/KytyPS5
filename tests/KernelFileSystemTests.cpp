@@ -99,6 +99,13 @@ void CheckSocketWakeup() {
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
         "enable TCP_NODELAY");
+  int socket_error = -1;
+  uint32_t error_size = sizeof(socket_error);
+  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+  Check(Net::Getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
+            socket_error == 0 && error_size == sizeof(socket_error) &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "SO_ERROR reports socket status without changing guest errno");
 
   std::array<uint64_t, 16> readable {};
   const auto bit = uint64_t {1} << (reader % 64);

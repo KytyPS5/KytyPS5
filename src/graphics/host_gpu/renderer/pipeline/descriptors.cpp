@@ -437,6 +437,31 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
+	switch (resource.dimension) {
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
+			desc.info.samples = 4;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
+			desc.info.samples   = 4;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		default: break;
+	}
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage

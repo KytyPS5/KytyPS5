@@ -128,9 +128,6 @@ public:
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
 		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
-	[[nodiscard]] bool GpuOverlaps(uint64_t address, uint64_t size) const noexcept {
-		return IsGpuModified() && Overlaps(address, size);
-	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}

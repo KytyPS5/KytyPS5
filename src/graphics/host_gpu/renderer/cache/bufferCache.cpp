@@ -13,7 +13,6 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
-#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -523,26 +522,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
-void BufferCache::WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data) {
-	if (vaddr == 0 || data.empty() || data.size() > UINT64_MAX - vaddr) {
-		EXIT("BufferCache: invalid host DMA write\n");
-	}
-	Libs::LibKernel::Memory::WriteBacking(vaddr, data.data(), data.size());
-
-	const auto end = vaddr + data.size();
-	for (const auto& [address, id]: m_buffers) {
-		auto&      buffer     = m_slot_buffers[id];
-		const auto buffer_end = address + buffer.Size();
-		const auto begin      = std::max(vaddr, address);
-		const auto range_end  = std::min(end, buffer_end);
-		if (begin >= range_end) {
-			continue;
-		}
-		WriteDataBuffer(buffer, begin, data.data() + begin - vaddr, range_end - begin);
-		TouchBuffer(buffer);
-	}
-}
-
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
@@ -558,23 +537,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
-	{
-		const auto region = m_texture_cache.QueryRegion(vaddr, size);
-		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {
-			if (region.image_bytes) {
-				m_texture_cache.InvalidateMemory(vaddr, size);
-			}
-			std::array<uint32_t, 4096> values;
-			values.fill(value);
-			const std::span<const uint8_t> bytes {reinterpret_cast<const uint8_t*>(values.data()),
-			                                      sizeof(values)};
-			for (uint64_t offset = 0; offset < size;) {
-				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
-				WriteHostMemory(vaddr + offset, bytes.first(chunk));
-				offset += chunk;
-			}
-			return;
-		}
+	if (!IsRegionGpuModified(vaddr, size)) {
+		// Access the guest mapping so write faults invalidate cached buffers and images.
+		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
+		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		return;
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
@@ -597,26 +564,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	const auto src_region =
-	    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
-	const auto dst_region =
-	    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
-	if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
-	    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
-	    !dst_region.gpu_image_bytes) {
-		if (dst_region.image_bytes) {
-			m_texture_cache.InvalidateMemory(dst_vaddr, size);
-		}
-		std::array<uint8_t, 64 * 1024> bytes;
-		for (uint64_t offset = 0; offset < size;) {
-			const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
-			if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
-			                                             chunk)) {
-				EXIT("BufferCache: host DMA source has no direct backing\n");
-			}
-			WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
-			offset += chunk;
-		}
+	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
+	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
+		            size);
 		return;
 	}
 

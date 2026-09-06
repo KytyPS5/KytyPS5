@@ -107,7 +107,6 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
-	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 
 	GraphicContext&                                   m_graphics;

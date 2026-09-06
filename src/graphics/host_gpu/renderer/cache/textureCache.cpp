@@ -1836,22 +1836,18 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
-TextureCache::RegionInfo TextureCache::QueryRegion(uint64_t address, uint64_t size) {
-	RegionInfo result {};
+bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
-		return result;
+		return false;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
-		if (image.depth_id) {
-			continue;
+		if (!image.depth_id && image.IsGpuModified()) {
+			return true;
 		}
-		result.image_pages = true;
-		result.image_bytes |= image.Overlaps(address, size);
-		result.gpu_image_bytes |= image.GpuOverlaps(address, size);
 	}
-	return result;
+	return false;
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {

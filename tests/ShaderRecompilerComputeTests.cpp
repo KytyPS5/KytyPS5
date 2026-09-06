@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -4290,6 +4291,21 @@ public:
     {
       GpuResourceManager resources(m_runtime_context, scheduler);
       resources.SetGpu(&gpu);
+      namespace Exception = Common::HostException;
+      Require(name, "guest fault handler",
+              Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
+                if (info.type != Exception::ExceptionType::AccessViolation ||
+                    (info.access_violation_type != Exception::AccessViolationType::Read &&
+                     info.access_violation_type != Exception::AccessViolationType::Write)) {
+                  return false;
+                }
+                const auto access =
+                    info.access_violation_type == Exception::AccessViolationType::Write
+                        ? PageFaultAccess::Write : PageFaultAccess::Read;
+                return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              }),
+              "failed to install the production guest-memory fault route");
+      LibKernel::Memory::InstallGpuResources(&resources);
       auto &texture_cache = resources.GetTextureCache();
       const auto [narrow_download, narrow_download_offset] =
           TextureCacheTestAccess::MapDownload(texture_cache, 4, 4);
@@ -5303,9 +5319,8 @@ public:
               !texture_cache.IsMetaCleared(ms_htile_address, 0) &&
               !resources.GetBufferCache().HasGpuDirtyBytes(
                   base + ms_stencil_offset, ms_stencil_size) &&
-              !texture_cache
-                   .QueryRegion(base + ms_stencil_offset, ms_stencil_size)
-                   .gpu_image_bytes,
+              !texture_cache.IsRegionGpuModified(base + ms_stencil_offset,
+                                                 ms_stencil_size),
           "unequal-sample overlap did not run the color-to-MS-depth pass "
           "without manufacturing stencil ownership");
       auto &oversized_ms = texture_cache.GetImage(ms_depth_image);
@@ -7558,6 +7573,7 @@ public:
       resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
     }
     context.ShutdownGpu();
     Require(name, "unmap direct backing",

@@ -37,12 +37,6 @@ public:
 		BindingType   type = BindingType::Texture;
 	};
 
-	struct RegionInfo {
-		bool image_pages     = false;
-		bool image_bytes     = false;
-		bool gpu_image_bytes = false;
-	};
-
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
 	~TextureCache();
@@ -66,7 +60,7 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
-	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,

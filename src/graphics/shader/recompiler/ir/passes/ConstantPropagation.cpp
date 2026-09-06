@@ -125,9 +125,17 @@ bool IsSelect(ValueOpcode opcode) {
 
 bool Implies(Value condition, Value required, uint32_t depth = 0) {
 	condition = condition.Resolve();
+	required = required.Resolve();
 	if (condition == required) return true;
+	if (depth >= 64u) return false;
+	const auto* target = required.TryInstruction();
+	if (target != nullptr && target->GetOpcode() == ValueOpcode::LogicalOr &&
+	    (Implies(condition, target->Arg(0), depth + 1u) ||
+	     Implies(condition, target->Arg(1), depth + 1u))) {
+		return true;
+	}
 	const auto* inst = condition.TryInstruction();
-	return depth < 64u && inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
+	return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
 	       (Implies(inst->Arg(0), required, depth + 1u) ||
 	        Implies(inst->Arg(1), required, depth + 1u));
 }

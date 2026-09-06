@@ -6036,10 +6036,13 @@ void TestPixelAncillaryLayerInput() {
 
 void TestMaskedValueDemand() {
   using namespace ShaderRecompiler::IR;
-  enum class Use { Guarded, Conjunction, TrueArm, Unguarded, OtherGuard, Predicate,
+  enum class Use { Guarded, Conjunction, Wqm, WqmConjunction, WqmOtherGuard,
+                   TrueArm, Unguarded, OtherGuard, Predicate,
                    ReadLane, ExplicitLod, ExplicitGradient, LevelZero, ImplicitLod,
                    Mixed, Phi, Loop };
-  for (const auto use : {Use::Guarded, Use::Conjunction, Use::TrueArm, Use::Unguarded,
+  for (const auto use : {Use::Guarded, Use::Conjunction, Use::Wqm,
+                         Use::WqmConjunction, Use::WqmOtherGuard,
+                         Use::TrueArm, Use::Unguarded,
                          Use::OtherGuard, Use::Predicate, Use::ReadLane,
                          Use::ExplicitLod, Use::ExplicitGradient, Use::LevelZero,
                          Use::ImplicitLod, Use::Mixed, Use::Phi, Use::Loop}) {
@@ -6061,8 +6064,17 @@ void TestMaskedValueDemand() {
                                                       {input, Value(0u)}));
     const auto other = Value(&entry.AppendNewInst(ValueOpcode::IEqual32,
                                                   {input, Value(2u)}));
+    auto mask = predicate;
+    if (use == Use::Wqm || use == Use::WqmConjunction || use == Use::WqmOtherGuard) {
+      // WQM includes the original active lanes and additional helper lanes.
+      const auto helpers = Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
+                                                       {Value(static_cast<ScalarReg>(1))}));
+      const auto helper = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32,
+                                                      {helpers, Value(0u)}));
+      mask = Value(&entry.AppendNewInst(ValueOpcode::LogicalOr, {predicate, helper}));
+    }
     auto &masked = entry.AppendNewInst(ValueOpcode::SelectU32,
-                                        {predicate, Value(10u), Value(20u)});
+                                        {mask, Value(10u), Value(20u)});
     Value value(&masked);
     if (use == Use::Phi || use == Use::Loop) {
       auto &phi = join.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
@@ -6107,8 +6119,10 @@ void TestMaskedValueDemand() {
       value = Value(&join.AppendNewInst(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}));
     }
     auto guard = predicate;
-    if (use == Use::Conjunction) {
+    if (use == Use::Conjunction || use == Use::WqmConjunction) {
       guard = Value(&join.AppendNewInst(ValueOpcode::LogicalAnd, {predicate, other}));
+    } else if (use == Use::WqmOtherGuard) {
+      guard = Value(&join.AppendNewInst(ValueOpcode::IEqual32, {input, Value(0u)}));
     } else if (use == Use::OtherGuard) {
       guard = other;
     } else if (use == Use::Unguarded) {
@@ -6125,7 +6139,8 @@ void TestMaskedValueDemand() {
     if (use == Use::Mixed) join.AppendNewInst(ValueOpcode::SetAttribute, {value, Value(true)});
     EliminateMaskedValues(program);
     const bool removed = Value(&masked).Resolve() == Value(10u);
-    const bool safe = use == Use::Guarded || use == Use::Conjunction || use == Use::TrueArm ||
+    const bool safe = use == Use::Guarded || use == Use::Conjunction ||
+                      use == Use::Wqm || use == Use::WqmConjunction || use == Use::TrueArm ||
                       use == Use::ExplicitLod || use == Use::ExplicitGradient ||
                       use == Use::LevelZero || use == Use::Phi;
     Check(removed == safe, "masked value demand crossed an unguarded or nonlocal use");

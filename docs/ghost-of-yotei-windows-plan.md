@@ -5,12 +5,15 @@
 
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** В
-последнем диагностическом запуске `230213-36c462` счётчик дошёл до frame 20,
-эмулятор подготовил 8 GPU flips и показал 7. Проверочный readback соседнего
-запуска доказал, что исходная поверхность 1920×1080 действительно содержит
-нулевой RGB, поэтому чёрное окно уже нельзя объяснить одним swapchain. Это всё
-ещё может быть штатным ранним чёрным экраном: при текущих 0,13–0,16 FPS игра
-продвигается слишком медленно, чтобы считать отсутствие изображения зависанием.
+последнем диагностическом запуске `233223-46a8f0` счётчик дошёл до frame 116,
+эмулятор подготовил 105 GPU flips и показал 104. После прогрева скорость дошла
+до 2,307803 FPS при внутреннем разрешении 480×270. Исправление общего
+depth/stencil → color alias path прошло прежний `invalid image view` на
+`D32_SFLOAT_S8_UINT`/`R16G16_SFLOAT`. Текущий блокер — shader
+`f802a6b9d9904f74`: cooperative wave64 пока отвергает используемое значение,
+возвращённое атомарной операцией. Проверочный readback первых восьми source
+frames соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый
+полезный кадр пока не доказан.
 
 Persistent Vulkan pipeline cache работает и переживает перезапуск. Он убрал
 примерно 60-секундную первую компиляцию самого тяжёлого pipeline, но не устранил
@@ -72,17 +75,17 @@ flowchart TD
 
 | № | Этап | Что происходит | Как подтверждаем | Текущий статус |
 | ---: | --- | --- | --- | --- |
-| 0 | Входные данные | Runner проверяет каталог игры, `eboot.bin` и выбранный executable. | Preflight без `-Run`, затем `run.json` с абсолютными путями и SHA-256 emulator. | **PASS** для `PPSA26344`, APP_VER `01.512.000`. Текущий `eboot.bin` локально и обратимо переведён с 3840×2160 на 1920×1080; оригинал сохранён отдельно. |
-| 1 | Сборка | CMake/Ninja собирают Release `kyty_emulator`, тесты и install tree с DLL/plugins. | Native Windows build, CTest, hash установленного executable. | **PASS для build/install `dc1b0ce`**. Последняя полная стабильная серия CTest остаётся 48/48; новые regression-тесты временно записываются как техдолг. |
+| 0 | Входные данные | Runner проверяет каталог игры, `eboot.bin` и выбранный executable. | Preflight без `-Run`, затем `run.json` с абсолютными путями и SHA-256 emulator. | **PASS** для `PPSA26344`, APP_VER `01.512.000`. Текущий `eboot.bin` локально и обратимо переведён с 3840×2160 на 480×270; оригинал сохранён отдельно. |
+| 1 | Сборка | CMake/Ninja собирают Release `kyty_emulator`, тесты и install tree с DLL/plugins. | Native Windows build, CTest, hash установленного executable. | **PASS для build/install кода `c47c3d5`**. Последняя полная стабильная серия CTest остаётся 48/48; новые regression-тесты временно записываются как техдолг. |
 | 2 | Загрузка гостя | Loader читает executable и модули, разрешает импорты, создаёт память и стартовые потоки. | Отсутствие loader/import fatal; прогресс гостевого лога. | **PASS**. Игра многократно доходит до графической инициализации. |
 | 3 | Команды GPU | Guest записывает PM4/compute/draw команды; Kyty разбирает очереди и формирует renderer calls. | Логи `GraphicsRenderDispatchDirect`, draw/dispatch counters. | **PASS** для достигнутого пути. Выполнены сотни команд и повторяющиеся кадры. |
 | 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **Частично**. Текущий строгий batch: 714/825 дошли до своей проверяемой границы; 111 остановились. Это не означает 714 готовых Vulkan pipeline. |
 | 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **PASS для текущего игрового пути**. Ранее блокировавшие finite selectors, SRT snapshots, HTile/DCC и wave64 случаи пройдены. |
-| 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **PASS для `e52e19c6923301d0`.** Внешне введённые короткие linear tails клонируются с жёстким budget; 176-блочный CFG выпускает 221 088 слов до optimizer без dispatcher и без structured validation ошибки. |
+| 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **Частично.** `e52e19c6923301d0` проходит как structured CFG; текущий `f802a6b9d9904f74` останавливается до SPIR-V на live atomic return в cooperative wave64. |
 | 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для persistent cache.** Загружено 5,4 MiB, после запуска сохранено обновлённое содержимое. Жёсткое убийство процесса всё ещё не гарантирует сохранение новых записей. |
 | 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **Частично.** `e52e…` исправлен до 14–16 мс steady; главный известный compute-блокер `916e…` остаётся около 6,1 с. |
-| 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 7 GPU flips, 6 shown. Это ещё не доказывает полезные пиксели. |
-| 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **FAIL / текущий correctness-блокер.** Два readback 1920×1080: RGB полностью 0, alpha 3. |
+| 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 105 GPU flips, 104 shown. Это ещё не доказывает полезные пиксели. |
+| 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **FAIL / текущий correctness-блокер.** Первые восемь readback 960×540: RGB полностью 0, alpha 3. |
 | 11 | Видимый кадр | Swapchain показывает ненулевое изображение, затем должны появиться меню и ввод. | Screenshot/readback + стабильный прогон без fatal/VUID. | **Не достигнут.** Служебные `frame` и `shown` нельзя считать первым кадром. |
 
 ### Где кэшируются шейдеры и что это даёт
@@ -129,11 +132,12 @@ resource specialization, layout, render state и выбранных игрой p
 поток: обязательные CPU/GPU regression-тесты, полный CTest, Vulkan validation и
 длинный стабильный прогон должны быть закрыты до отправки изменений upstream.
 
-Сейчас быстрый цикл довёл текущую сборку до frame 19. Runtime-регрессия
-`5be616…` устранена, а `e52e…` переведён с dispatcher на валидный structured
-CFG с bounded node splitting. Следующие практические цели — найти первую
-неверную запись в source image и затем уменьшить оставшуюся стоимость
-`916e…`.
+Сейчас быстрый цикл довёл текущую сборку до frame 116. Runtime-регрессия
+`5be616…` устранена, `e52e…` переведён с dispatcher на валидный structured CFG,
+а несовместимый sampled color view поверх depth/stencil backing заменяется
+отдельным цветовым образом с переносом 32-битных texel-данных. Следующая цель —
+поддержать live atomic return в доказанном cooperative wave64 режиме для
+`f802a6b9d9904f74`, затем продолжить поиск первого ненулевого source frame.
 
 ## Состояние по уровням проверки
 
@@ -141,12 +145,12 @@ CFG с bounded node splitting. Следующие практические це�
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Чистая Windows-сборка `dc1b0ce`, SHA-256 `c1e4f7b814a91d34b124765d5fa30c077e56117237fed6d4b28df70527b40bc8`; build и install завершились успешно. | После commit-only metadata rebuild игра повторно не запускалась; проверенный runtime binary содержал тот же код и отличался banner/fingerprint. |
+| Установленный эмулятор | Windows build/install кода `c47c3d5` завершён; проверенный runtime binary SHA-256 `2000f0af28178b3e5cdc33c8075bbcb63bdad257a9c5739b60b8f1fa633044f2`. | Binary собран до коммита и поэтому имеет banner `9edeb01-dirty`; source-код соответствует последующему `c47c3d5`, commit-only banner ещё не пересобран. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache создан, загружен и сохранён при graceful timeout; прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сокращает steady GPU execution автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `223812-1388a0`: frame 19, FPS 0,109889, 7 GPU flips, 6 shown; graceful timeout, exit 0. Предыдущий half-resolution readback подтвердил полностью нулевой RGB. | Первый ненулевой видимый кадр ещё не достигнут. |
+| Реальная игра | `233223-46a8f0`: frame 116, FPS 2,307803, 105 GPU flips, 104 shown; прежний depth/color view blocker пройден, затем exit 321 на live atomic return shader `f802a6b9d9904f74`. | Первый ненулевой видимый кадр ещё не достигнут; текущий запуск завершился shader admission fatal. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -192,21 +196,22 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260906-230213-36c462` |
-| SHA-256 запущенного emulator | `7ee727218e06538c36ff19932a0fa51f3305f0cbe28bc656d4539f9a1eaf2d83` |
-| Время UTC | `2026-09-06T23:02:13.5932387Z` → `23:03:56.8230279Z` |
-| Режим | Diagnostic capture, Vulkan/SPIR-V validation, FIFO, окно 640×360; внутренние основные targets 1920×1080 |
-| Завершение | Лимит 90 с; graceful close выполнен успешно; exit 0; pipeline cache сохранён |
-| Наблюдаемое исполнение | frame 20; FPS 0,155441; flips CPU/GPU 0/8; prepared 8, ready 8, shown 7 |
-| Изображение | Чёрное. Отдельный readback двух source frames 1920×1080: RGB min=max=0, alpha=3 |
-| Главные bottlenecks | `916ea8893e5b276a` ≈6,05 с после сокращения SPIR-V; `e52e19c6923301d0` снижен до ≈13,9–15,6 мс steady (первый вызов ≈3,11 с с созданием pipeline) |
-| Точность состояния | Новый `916e…` прошёл Vulkan/SPIR-V validation: 194 459 слов до optimizer, 146 134 после; полный batch остался 714/825 |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260906-233223-46a8f0` |
+| SHA-256 запущенного emulator | `2000f0af28178b3e5cdc33c8075bbcb63bdad257a9c5739b60b8f1fa633044f2` |
+| Время UTC | `2026-09-06T23:32:24.0296766Z` → `23:34:37.0580941Z` |
+| Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 960×540; внутренние основные targets 480×270 |
+| Завершение | Самостоятельный exit 321 на текущем shader admission blocker; процессов Kyty после выхода нет |
+| Наблюдаемое исполнение | frame 116; FPS 2,307803; flips CPU/GPU 0/105; prepared 105, ready 105, shown 104 |
+| Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
+| Пройденный блокер | `c47c3d5` заменяет несовместимый sampled color alias закэшированного depth/stencil image; прежний fatal `D32_SFLOAT_S8_UINT` → `R16G16_SFLOAT` не повторился |
+| Текущий блокер | `f802a6b9d9904f74`, compute stage: `wave64 splitting does not support live atomic return values` до выпуска SPIR-V |
+| Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым
 диагностическим преобразованием. Все три начальных значения 3840×2160 и полная
-16-уровневая таблица dynamic resolution согласованно уменьшены вдвое. Исходный
+16-уровневая таблица dynamic resolution согласованно уменьшены в восемь раз. Исходный
 SHA-256 — `5178cf80b86e3b6644a3324ebb4f61a3336ee5ccc17d83e84f71bfee86134d86`;
-полученный — `7bc35323d468239219bca56b1fec0c67e57ac4cba2cd00e18f7771d543972ad5`.
+полученный — `4d98c4cfe549f9fd679e71c82e37dac7aae0e476fd7187df60f896c74302557d`.
 Это локальная диагностическая модификация игры, не production-условие Kyty и не
 основание для title/hash-specific кода в эмуляторе.
 
@@ -225,6 +230,11 @@ dispatcher-SPIR-V через bounded optimizer уменьшила модуль �
 слов, но не улучшила минимальное runtime-время (примерно 8,367 → 8,365 с) и
 добавила compile cost. Изменение отклонено и убрано из исходников.
 
+Для текущего короткого bring-up внутреннее разрешение дополнительно снижено до
+480×270. После начальной компиляции наблюдаемый FPS вырос до 2,307803, и за
+133 секунды запуск достиг frame 116. Это ускоряет поиск последовательных
+блокеров, но не считается пользовательским качеством изображения.
+
 Последующее CFG-исправление решило причину fallback до выпуска SPIR-V: для
 малого графа клонируется только короткий straight-line tail, в который внешний
 переход входит мимо внутреннего selection header. После этого внутренний
@@ -233,9 +243,9 @@ selection получает собственный merge. Для `e52e…` ито
 dispatch занимает примерно 13,9–15,6 мс. Сложные, циклические и большие графы
 по-прежнему сохраняют безопасный dispatcher fallback.
 
-Readback `_Build/analysis/yotei-half-resolution-readback.txt` снят с source
-image до оконного масштабирования. В обоих кадрах все 2 073 600 пикселей имели
-R=G=B=0 и A=3. Поэтому presentation path способен принять и показать surface,
+Readback `_Build/analysis/yotei-quarter-resolution-readback.txt` снят с source
+image до оконного масштабирования. В первых восьми кадрах 960×540 все пиксели
+имели R=G=B=0 и A=3. Поэтому presentation path способен принять и показать surface,
 но полезное содержимое либо не записывается предыдущим render/compute pass,
 либо обнуляется/теряется до flip. Поиск продолжится от первой записи в эту image
 с проверкой layout, format, compression metadata, alias ownership и barriers.

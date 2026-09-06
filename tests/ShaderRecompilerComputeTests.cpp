@@ -1631,7 +1631,8 @@ public:
              properties.properties.limits.maxComputeWorkGroupSize[2]},
             properties.properties.limits.maxComputeWorkGroupInvocations,
             subgroup.subgroupSize,
-            false}; // This harness does not enable required subgroup size control.
+            false, // This harness does not enable required subgroup size control.
+            properties.properties.limits.maxComputeSharedMemorySize};
   }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
@@ -20999,6 +21000,211 @@ TestCase DsBpermuteCapturedExecOffsetAndWrap() {
   return test;
 }
 
+TestCase MakeWave64SingleGroupLdsTileCase(bool explicit_barrier) {
+  using O = ShaderOpcode;
+  constexpr u32 count = 128;
+  constexpr u32 sentinel = 0xdeadbeefu;
+  TestCase test;
+  test.name = explicit_barrier ? "Wave64SingleGroupLdsExplicitBarrier"
+                               : "Wave64SingleGroupLdsImplicitOrdering";
+  test.initial.assign(count * 7, sentinel);
+  test.expected.assign(count * 7, sentinel);
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = 8;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 2;
+  test.compute_info.wave_size = 64;
+  test.compute_info.lds_size_dwords = 64;
+  test.compute_info.needs_lds_barriers = !explicit_barrier;
+  test.compute_info.workgroup_register = 16;
+  test.compute_info.group_id[0] = true;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  auto& code = test.code;
+
+  // Global output index is group*64 + y*8+x; LDS is deliberately transposed.
+  code.push_back(EncodeVop1(0x01, 4, 16));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(6), 4));
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(3), 1));
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(0), 7));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(7), 4));
+  AppendVMovU32(&code, 5, 1000);
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(4), 5));
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(3), 0));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(1), 6));
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 6));
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 5, 6));
+  if (explicit_barrier) code.push_back(EncodeSopp(0x0a, 0));
+
+  // Wave collectives must use storage distinct from the live guest LDS tile.
+  AppendVop3(&code, 0x360, 17, Vgpr(5), InlineU32(63));
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  for (u32 reg = 10; reg <= 13; ++reg) AppendVMovLiteral(&code, reg, sentinel);
+  AppendSMovLiteral(&code, 126, 0x00550055u);
+  AppendSMovLiteral(&code, 127, 0x00550055u);
+  const auto skip = code.size();
+  code.push_back(0);
+  code.push_back(EncodeDs0(0x37, 1u << 8));
+  code.push_back(EncodeDs1Ex(10, 0, 0, 6));
+  code.push_back(EncodeDs0(0x37, (9u << 8) | 8u));
+  code.push_back(EncodeDs1Ex(12, 0, 0, 6));
+  code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
+  code.push_back(EncodeSop1(0x04, 126, 12));
+  for (u32 plane = 0; plane < 4; ++plane)
+    AppendStoreVgprAtLaneDwordOffset(&code, 10 + plane, 4, plane * count);
+  AppendStoreSgprAtLaneDwordOffset(&code, 17, 4, 4 * count);
+  AppendStoreSgprAtLaneDwordOffset(&code, 13, 4, 5 * count);
+
+  // Independently require communication across the two native32 halves.
+  code.push_back(EncodeVop2(0x1d, 9, InlineU32(16), 6));
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(14, 0, 9));
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 4, 6 * count);
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2; ++group) {
+    for (u32 lane = 0; lane < 64; ++lane) {
+      const u32 index = group * 64 + lane;
+      const u32 x = lane % 8, y = lane / 8;
+      if (x % 2 == 0 && y % 2 == 0) {
+        const u32 neighbors[] = {lane, lane + 8, lane + 1, lane + 9};
+        for (u32 plane = 0; plane < 4; ++plane)
+          test.expected[plane * count + index] = 1000 + group * 64 + neighbors[plane];
+      }
+      test.expected[4 * count + index] = 1000 + group * 64 + 63;
+      test.expected[5 * count + index] = 0xffffffffu;
+      test.expected[6 * count + index] = 1000 + group * 64 + (lane ^ 32u);
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_XOR_B32, O::DS_WRITE_B32, O::DS_READ_B32,
+                  O::DS_READ2_B32, O::V_READLANE_B32, O::S_MOV_B32,
+                  O::S_MOV_B64, O::S_CBRANCH_EXECZ, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  if (explicit_barrier) test.opcodes.push_back(O::S_BARRIER);
+  return test;
+}
+
+TestCase Wave64SingleGroupLdsImplicitOrdering() {
+  return MakeWave64SingleGroupLdsTileCase(false);
+}
+
+TestCase Wave64SingleGroupLdsExplicitBarrier() {
+  return MakeWave64SingleGroupLdsTileCase(true);
+}
+
+// One guest wave64 per workgroup. Sparse EXEC is obtained through a live
+// Ballot, so its EXECZ branch is uniform even though the predicate depends on
+// LocalInvocationId. Disable the legacy LDS insertion pass deliberately.
+TestCase Wave64SingleGroupLdsUniformBranchOrdering() {
+  using O = ShaderOpcode;
+  constexpr u32 groups = 3;
+  constexpr u32 count = groups * 64;
+  constexpr u32 sentinel = 0xdeadbeefu;
+  TestCase test;
+  test.name = "Wave64SingleGroupLdsUniformBranchOrdering";
+  test.initial.assign(count * 5, sentinel);
+  test.expected.assign(count * 5, sentinel);
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.lds_size_dwords = 64;
+  test.compute_info.needs_lds_barriers = false;
+  test.compute_info.workgroup_register = 16;
+  test.compute_info.group_id[0] = true;
+  test.has_compute_info = true;
+  test.dispatch_x = groups;
+  auto& code = test.code;
+
+  // Prepare all addresses/data under full EXEC. The four DS operations inside
+  // the branch below have no intervening wave collective or explicit barrier.
+  // v4 = global output index; v9 = own LDS byte address; v12 = peer address.
+  code.push_back(EncodeVop1(0x01, 4, 16));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(6), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(0), 4));
+  for (u32 generation = 0; generation < 3; ++generation) {
+    AppendVMovU32(&code, 5 + generation, 1000 * (generation + 1));
+    code.push_back(EncodeVop2(0x25, 5 + generation, Vgpr(4), 5 + generation));
+  }
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 0));
+  code.push_back(EncodeVop2(0x1d, 12, InlineU32(32), 0));
+  code.push_back(EncodeVop2(0x1a, 12, InlineU32(2), 12));
+  AppendVMovLiteral(&code, 10, sentinel);
+  AppendVMovLiteral(&code, 11, sentinel);
+
+  // Full initialization makes reads from inactive source lanes well-defined.
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 5, 9));
+  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT; no host control barrier.
+
+  // Groups 0/2 execute the body with lanes 0..47 active; group 1 skips it.
+  // Keep the numeric VCC words live in the output as an independent mask oracle.
+  code.push_back(EncodeSopc(0x06, 16, InlineU32(1)));
+  code.push_back(EncodeSop2(0x0a, 20, InlineU32(0), InlineU32(48)));
+  code.push_back(EncodeVop1(0x01, 8, 20));
+  code.push_back(EncodeVopc(0xc1, Vgpr(0), 8));
+  code.push_back(EncodeSop1(0x04, 12, 106));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  const auto skip = code.size();
+  code.push_back(0);
+
+  // Exercise RAW, WAR, and RAW ordering across the native32 halves. Guest
+  // WAITCNT makes each LDS phase complete; its current backend emitter is a
+  // no-op, so it cannot accidentally provide the synchronization under test.
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 6, 9));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(10, 0, 12));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 7, 9));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(11, 0, 12));
+  code.push_back(EncodeSopp(0x0c, 0));
+
+  code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // S_MOV_B64 EXEC, -1.
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(13, 0, 9));
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 4, count);
+  AppendStoreVgprAtLaneDwordOffset(&code, 13, 4, count * 2);
+  AppendStoreSgprAtLaneDwordOffset(&code, 12, 4, count * 3);
+  AppendStoreSgprAtLaneDwordOffset(&code, 13, 4, count * 4);
+  AppendEnd(&code);
+
+  for (u32 group = 0; group < groups; ++group) {
+    const bool body_taken = group != 1;
+    for (u32 lane = 0; lane < 64; ++lane) {
+      const u32 index = group * 64 + lane;
+      const bool active = body_taken && lane < 48;
+      const u32 peer = lane ^ 32u;
+      if (active) {
+        const bool peer_writes = peer < 48;
+        test.expected[index] = (peer_writes ? 2000 : 1000) + group * 64 + peer;
+        test.expected[count + index] = (peer_writes ? 3000 : 1000) + group * 64 + peer;
+      }
+      test.expected[count * 2 + index] = (active ? 3000 : 1000) + index;
+      test.expected[count * 3 + index] = body_taken ? 0xffffffffu : 0u;
+      test.expected[count * 4 + index] = body_taken ? 0x0000ffffu : 0u;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_XOR_B32, O::DS_WRITE_B32, O::DS_READ_B32,
+                  O::S_WAITCNT, O::S_CMP_EQ_U32, O::S_CSELECT_B32,
+                  O::V_CMP_LT_U32, O::S_MOV_B64, O::S_CBRANCH_EXECZ,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_WRITE_B32", 3}, {"DS_READ_B32", 3},
+                         {"S_WAITCNT", 6}, {"V_CMP_LT_U32", 1},
+                         {"S_CBRANCH_EXECZ", 1}};
+  return test;
+}
+
 // Straight-line RDNA2 DS neighbor: full wave64, no guest LDS or synchronization.
 // Each 32-lane half has inactive lanes 2,6,...,30. Instructions execute under
 // sparse EXEC, then full EXEC is restored before reading every destination.
@@ -24048,6 +24254,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(DsWave64SparseSourceAndDestination);
+  AddCase(Wave64SingleGroupLdsImplicitOrdering);
+  AddCase(Wave64SingleGroupLdsExplicitBarrier);
+  AddCase(Wave64SingleGroupLdsUniformBranchOrdering);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicCmpSwapExactRaw);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);

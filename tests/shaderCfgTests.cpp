@@ -8633,7 +8633,9 @@ void TestComputeExecutionConvergenceProof() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
   ShaderComputeInputInfo compute{};
-  compute.threads_num[0] = 64;
+  // Preserve the partitioned-workgroup safety boundary; single-wave LDS is
+  // covered separately with valid storage, barriers, and divergent negatives.
+  compute.threads_num[0] = 128;
   compute.threads_num[1] = compute.threads_num[2] = 1;
   ShaderStageInputInfo input{};
   input.compute = &compute;
@@ -8734,6 +8736,162 @@ void TestComputeExecutionConvergenceProof() {
   }
 }
 
+void TestComputeExecutionWaveScratchBudget() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* entry = AddExecutionPlanBlock(program);
+  auto& ballot = entry->AppendNewInst(O::Ballot,{IR::Value(true)});
+  auto& high = entry->AppendNewInst(O::CompositeExtractU32x4,
+      {IR::Value(&ballot),IR::Value(1u)});
+  entry->AppendNewInst(O::ReferenceU32,{IR::Value(&high)});
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  // No LDS access: unused declarations must not inflate the actual allocation.
+  compute.lds_size_dwords = UINT32_MAX;
+  limits.max_shared_memory_bytes = 256;
+  Check(PlanComputeExecution(program,input,limits).IsSplitWave64(),
+        "wave scratch should fit exactly 256 shared bytes");
+  limits.max_shared_memory_bytes = 255;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(),
+        "software wave64 scratch exceeded the device shared memory limit");
+  IR::MemoryInfo memory{};
+  memory.kind = IR::ResourceKind::Lds;
+  program.memory_info.push_back(memory);
+  auto& read = entry->AppendNewInst(O::LoadSharedU32,{IR::Value(0u),IR::Value(true)});
+  read.SetFlags(IR::MemoryFlags{.index=0});
+  entry->AppendNewInst(O::ReferenceU32,{IR::Value(&read)});
+  compute.lds_size_dwords = 128;
+  limits.max_shared_memory_bytes = 768;
+  Check(PlanComputeExecution(program,input,limits).IsSplitWave64(),
+        "guest LDS and wave scratch should fit their exact combined limit");
+  limits.max_shared_memory_bytes = 767;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(),
+        "combined guest LDS and wave scratch exceeded the device limit");
+  limits.max_shared_memory_bytes = UINT32_MAX;
+  compute.lds_size_dwords = UINT32_MAX;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(),
+        "overflowed guest LDS size bypassed the device limit");
+}
+
+void TestComputeExecutionSingleWaveLds() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  enum class Scenario { Lds, BarrierOnly, Gds, Scratch, LiveAtomic,
+                        DivergentBranch, MissingLdsSize };
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const auto shape : {std::array<uint32_t,3>{64,1,1},
+                          std::array<uint32_t,3>{8,8,1},
+                          std::array<uint32_t,3>{1,1,64},
+                          std::array<uint32_t,3>{8,8,2}}) {
+    for (const auto scenario : {Scenario::Lds,Scenario::BarrierOnly,Scenario::Gds,
+         Scenario::Scratch,Scenario::LiveAtomic,Scenario::DivergentBranch,
+         Scenario::MissingLdsSize}) {
+      IR::Program program;
+      program.stage = ShaderType::Compute;
+      program.wave_size = 64;
+      auto* entry = AddExecutionPlanBlock(program);
+      auto& lane = entry->AppendNewInst(O::LaneId);
+      auto& byte_address = entry->AppendNewInst(O::ShiftLeftLogical32,
+          {IR::Value(&lane),IR::Value(2u)});
+      IR::Inst* read = nullptr;
+      if (scenario == Scenario::BarrierOnly) {
+        entry->AppendNewInst(O::Barrier);
+      } else {
+        IR::MemoryInfo memory{};
+        memory.kind = scenario == Scenario::Gds ? IR::ResourceKind::Gds :
+                      scenario == Scenario::Scratch ? IR::ResourceKind::Scratch : IR::ResourceKind::Lds;
+        program.memory_info.push_back(memory);
+        const auto tag = [](IR::Inst& inst) {
+          inst.SetFlags(IR::MemoryFlags{.index=0,.pc=0});
+        };
+        if (scenario == Scenario::Scratch) {
+          auto& scratch = entry->AppendNewInst(O::GetScratchResource);
+          read = &entry->AppendNewInst(O::LoadAddressU32,
+              {IR::Value(&scratch),IR::Value(&byte_address),IR::Value(0u),IR::Value(true)});
+          tag(*read);
+        } else {
+          auto& write = entry->AppendNewInst(O::WriteSharedU32,
+              {IR::Value(&byte_address),IR::Value(&lane),IR::Value(true)});
+          tag(write);
+          // Explicit guest barrier keeps the synchronization contract separate
+          // from the frontend's implicit LDS phase-barrier insertion heuristic.
+          entry->AppendNewInst(O::Barrier);
+          auto& partner = entry->AppendNewInst(O::BitwiseXor32,
+              {IR::Value(&lane),IR::Value(32u)});
+          auto& partner_address = entry->AppendNewInst(O::ShiftLeftLogical32,
+              {IR::Value(&partner),IR::Value(2u)});
+          read = &entry->AppendNewInst(O::LoadSharedU32,
+              {IR::Value(&partner_address),IR::Value(true)});
+          tag(*read);
+          if (scenario == Scenario::LiveAtomic) {
+            auto& atomic = entry->AppendNewInst(O::SharedAtomicIAdd32,
+                {IR::Value(0u),IR::Value(1u),IR::Value(true)});
+            tag(atomic);
+            entry->AppendNewInst(O::ReferenceU32,{IR::Value(&atomic)});
+          }
+        }
+        entry->AppendNewInst(O::ReferenceU32,{IR::Value(read)});
+      }
+      auto* collective_block = entry;
+      if (scenario == Scenario::DivergentBranch) {
+        auto* yes = AddExecutionPlanBlock(program);
+        auto* no = AddExecutionPlanBlock(program);
+        auto* merge = AddExecutionPlanBlock(program);
+        entry->AddBranch(yes);
+        entry->AddBranch(no);
+        yes->AddBranch(merge);
+        no->AddBranch(merge);
+        // LDS[partner] is zero only for logical lane32. Accepting this branch
+        // would strand that lane outside the taken arm's collective barriers.
+        auto& condition = entry->AppendNewInst(O::INotEqual32,
+            {IR::Value(read),IR::Value(0u)});
+        entry->AppendNewInst(O::Reference,{IR::Value(&condition)});
+        program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+        program.block_info[0].terminator.true_block = 1;
+        program.block_info[0].terminator.false_block = 2;
+        program.block_info[0].terminator.merge_block = 3;
+        program.block_info[0].condition = IR::Value(&condition);
+        for (const uint32_t index : {1u,2u}) {
+          program.block_info[index].terminator.kind = CFG::TerminatorKind::Branch;
+          program.block_info[index].terminator.true_block = 3;
+        }
+        collective_block = yes;
+      }
+      auto& ballot = collective_block->AppendNewInst(O::Ballot,{IR::Value(true)});
+      auto& high = collective_block->AppendNewInst(O::CompositeExtractU32x4,
+          {IR::Value(&ballot),IR::Value(1u)});
+      collective_block->AppendNewInst(O::ReferenceU32,{IR::Value(&high)});
+      IR::ValidateProgram(program,true);
+      ShaderComputeInputInfo compute{};
+      for (uint32_t axis=0;axis<3;++axis) compute.threads_num[axis]=shape[axis];
+      compute.wave_size = 64;
+      compute.lds_size_dwords = scenario == Scenario::MissingLdsSize ||
+                               scenario == Scenario::BarrierOnly ? 0u : 64u;
+      ShaderStageInputInfo input{};
+      input.compute = &compute;
+      const auto plan = PlanComputeExecution(program,input,limits);
+      const bool accepted = WorkgroupInvocationCount(shape) == 64 &&
+                            (scenario == Scenario::Lds || scenario == Scenario::BarrierOnly);
+      if (accepted) {
+        Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 1 &&
+                  plan.layout.guest_size == shape &&
+                  WorkgroupInvocationCount(plan.layout.host_size) == 64,
+              "one complete guest wave must preserve valid LDS and workgroup barrier semantics");
+      } else {
+        Check(!plan.error.empty() && !plan.IsSplitWave64(),
+              "LDS support bypassed partition, resource, live-atomic, convergence, or declaration guards");
+      }
+    }
+  }
+}
+
 void TestComputeExecutionUnusedMemoryDeclarations() {
   using namespace ShaderRecompiler;
   IR::Program program;
@@ -8769,6 +8927,7 @@ void TestComputeExecutionRejectsActualStorageAndSynchronization() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
   const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  // Partitioned guest groups must still reject actual storage and barriers.
   // All declarations are zero here. Rejection must come from the real operation
   // or its typed resource, so removing a declaration-only gate cannot hide it.
   for (const auto kind : {IR::ResourceKind::Lds,IR::ResourceKind::Gds,
@@ -8799,7 +8958,7 @@ void TestComputeExecutionRejectsActualStorageAndSynchronization() {
       entry->AppendNewInst(O::ReferenceU32,{IR::Value(access)});
     }
     ShaderComputeInputInfo compute{};
-    compute.threads_num[0] = 64;
+    compute.threads_num[0] = 128;
     compute.threads_num[1] = compute.threads_num[2] = 1;
     ShaderStageInputInfo input{};
     input.compute = &compute;
@@ -12754,6 +12913,8 @@ int main(int argc, char* argv[]) {
   TestComputeWorkgroupPlanningBoundaries();
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
+  TestComputeExecutionWaveScratchBudget();
+  TestComputeExecutionSingleWaveLds();
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();
   TestComputeExecutionDsLaneConvergence();

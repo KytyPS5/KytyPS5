@@ -462,6 +462,7 @@ struct PipelineCache::ProgramCache {
 		                                            limits.maxComputeWorkGroupSize[1],
 		                                            limits.maxComputeWorkGroupSize[2]};
 		compute_workgroup_limits.max_invocations = limits.maxComputeWorkGroupInvocations;
+		compute_workgroup_limits.max_shared_memory_bytes = limits.maxComputeSharedMemorySize;
 		compute_workgroup_limits.native_subgroup_size = graphics.subgroup_size;
 		compute_workgroup_limits.can_require_subgroup_size_64 =
 		    graphics.compute_subgroup_size_control_enabled &&

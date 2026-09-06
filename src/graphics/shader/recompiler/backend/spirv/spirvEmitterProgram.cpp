@@ -200,6 +200,20 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (EmitValueFlow(ctx, inst) || EmitValueAlu(ctx, inst) || EmitValueMemory(ctx, inst) ||
 	    EmitValueImage(ctx, inst)) {
+		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+		if (ctx.state.compute_execution.IsSplitWave64() &&
+		    (shared_access == IR::SharedAccess::Read || shared_access == IR::SharedAccess::Write)) {
+			// The planner admits LDS only when one complete guest wave remains
+			// one host workgroup and every branch is wave-uniform. Finish each
+			// DS instruction across both native halves, including reads before
+			// a later overwrite. EXEC and bounds guards have merged at this point,
+			// so inactive lanes also reach the barrier. Guest LDS and collective
+			// scratch are distinct Workgroup variables covered by these semantics.
+			auto& state = ctx.state;
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
+			                           MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
+		}
 		return;
 	}
 	ctx.Fail(inst, "has no direct SPIR-V emitter");

@@ -32,6 +32,9 @@ struct BoundedSrtReadProof {
 	Value count;
 	Value address_low;
 	Value address_high;
+	Value descriptor_word2;
+	Value descriptor_word3;
+	uint32_t source_dwords = 2;
 	uint32_t offset_scale = 0;
 	uint32_t offset_bias = 0;
 	uint32_t memory_offset = 0;

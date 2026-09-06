@@ -533,7 +533,8 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
 		const auto& read = program.bounded_srt_reads[id];
 		const auto* address_source = Source(program, read.address_source);
-		if (address_source == nullptr || address_source->dword_count != 2u) {
+		if (address_source == nullptr ||
+		    (address_source->dword_count != 2u && address_source->dword_count != 4u)) {
 			return SpecializationFail("bounded SRT read has invalid address source width");
 		}
 		uint32_t size = 0;
@@ -577,12 +578,32 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 		if (!EvaluateDescriptorSource(program, read.address_source, clean_runtime, address_words)) {
 			return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its address", id));
 		}
-		const uint64_t base = ((uint64_t{address_words.dwords[1]} << 32u) |
-		                       address_words.dwords[0]) & AddressMask & ~uint64_t{3};
-		const int64_t immediate = static_cast<int64_t>(static_cast<int32_t>(read.memory_offset)) & ~int64_t{3};
+		const uint64_t base = (((uint64_t{address_words.dwords[1]} << 32u) |
+		                        address_words.dwords[0]) & AddressMask) & ~uint64_t{3};
+		const int64_t immediate = static_cast<int64_t>(static_cast<int32_t>(read.memory_offset));
 		for (uint32_t index = 0; index < size; index++) {
 			const uint32_t dynamic = index * read.offset_scale + read.offset_bias;
-			const int64_t offset = immediate + static_cast<int64_t>(dynamic & ~uint32_t{3});
+			int64_t offset = 0;
+			if (address_source->dword_count == 4u) {
+				if (immediate < 0) {
+					return SpecializationFail(fmt::format(
+					    "bounded buffer read {} has a negative immediate offset", id));
+				}
+				const uint64_t byte_offset = static_cast<uint64_t>(immediate) + dynamic;
+				const uint64_t aligned = byte_offset & ~uint64_t{3};
+				const uint32_t stride = (address_words.dwords[1] >> 16u) & 0x3fffu;
+				const uint64_t bytes = stride == 0u
+				                           ? uint64_t{address_words.dwords[2]}
+				                           : uint64_t{stride} * address_words.dwords[2];
+				if (aligned > bytes || bytes - aligned < sizeof(uint32_t)) {
+					return SpecializationFail(fmt::format(
+					    "bounded buffer read {} index {} exceeds its source descriptor", id, index));
+				}
+				offset = static_cast<int64_t>(aligned);
+			} else {
+				offset = (immediate & ~int64_t{3}) +
+				         static_cast<int64_t>(dynamic & ~uint32_t{3});
+			}
 			if ((offset < 0 && base < static_cast<uint64_t>(-offset)) ||
 			    (offset >= 0 && base > AddressMask - static_cast<uint64_t>(offset))) {
 				return SpecializationFail(fmt::format("bounded SRT read {} index {} overflows its 48-bit address", id, index));

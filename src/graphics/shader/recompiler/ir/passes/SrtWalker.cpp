@@ -1033,7 +1033,8 @@ bool ParseBoundedOffset(Value value, BoundedOffset& result,
 	}
 	if (inst->GetOpcode() == ValueOpcode::Phi ||
 	    inst->GetOpcode() == ValueOpcode::SelectU32 ||
-	    inst->GetOpcode() == ValueOpcode::ReadFirstLane) {
+	    inst->GetOpcode() == ValueOpcode::ReadFirstLane ||
+	    inst->GetOpcode() == ValueOpcode::ReadLane) {
 		result.index = inst;
 		result.scale = 1u;
 		return finish(true);
@@ -1097,24 +1098,31 @@ public:
 
 	std::optional<BoundedSrtReadProof> Run(const Inst& read) {
 		if (m_program.stage != ShaderType::Compute || m_program.dispatcher_fallback || m_program.blocks.empty() ||
-		    m_program.blocks.size() != m_program.block_info.size() ||
-		    read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() != 4u)
+		    m_program.blocks.size() != m_program.block_info.size())
 			return {};
+		const auto opcode = read.GetOpcode();
+		const bool address_read = opcode == ValueOpcode::LoadAddressU32 && read.NumArgs() == 4u;
+		const bool buffer_read = opcode == ValueOpcode::ReadConstBuffer && read.NumArgs() == 2u;
+		if (!address_read && !buffer_read) return {};
 		const auto flags = read.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) return {};
 		const auto& memory = m_program.memory_info[flags.index];
-		if (memory.kind != ResourceKind::ScalarAddress || memory.planning_only ||
+		const auto expected_kind = address_read ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+		if (memory.kind != expected_kind || memory.planning_only ||
 		    memory.data_dwords != 1u || memory.data_bits != 32u ||
-		    !Immediate(read.Arg(2), 0u) || read.Arg(3).Resolve() != Value(true)) return {};
+		    (address_read && (!Immediate(read.Arg(2), 0u) || read.Arg(3).Resolve() != Value(true)))) return {};
 		const auto* address = read.Arg(0).Resolve().TryInstruction();
-		if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
-		    address->NumArgs() != 2u ||
-		    !ValidateRuntimeValue(m_program, address->Arg(0)) ||
-		    !ValidateRuntimeValue(m_program, address->Arg(1))) return {};
+		const uint32_t source_dwords = address_read ? 2u : 4u;
+		const auto expected_handle = address_read ? ValueOpcode::GetAddressResource : ValueOpcode::GetBufferResource;
+		if (address == nullptr || address->GetOpcode() != expected_handle ||
+		    address->NumArgs() != source_dwords) return {};
+		for (uint32_t word = 0; word < source_dwords; ++word)
+			if (!ValidateRuntimeValue(m_program, address->Arg(word))) return {};
 		BoundedOffset offset;
 		std::unordered_set<const Inst*> visiting;
-		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr)
+		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr) {
 			return {};
+		}
 		if (!BuildGraph()) return {};
 		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
 		const auto maximum = workgroup ? std::optional<uint32_t>{} :
@@ -1138,13 +1146,25 @@ public:
 				if (next->ImmPredecessors().size() != 1u || next->ImmPredecessors().front() != prefix) break;
 				prefix = next;
 			}
-			if (!RuntimeReadsDominate(address->Arg(0), prefix, &read) ||
-			    !RuntimeReadsDominate(address->Arg(1), prefix, &read)) return {};
-			return BoundedSrtReadProof {Value(const_cast<Inst*>(offset.index)),
-			                           workgroup ? Value {} : Value(*maximum + 1u),
-			                           address->Arg(0).Resolve(), address->Arg(1).Resolve(),
-			                           offset.scale, offset.bias, memory.offset,
-			                           workgroup ? offset.index->Arg(1).Resolve().U32() : UINT32_MAX};
+			// Buffer-backed tables can inherit their source descriptor from an
+			// unavoidable scalar load on the path to this read. Snapshotting may
+			// then fail closed when that guest address is unavailable, while the
+			// direct-address form retains the stricter unconditional entry prefix.
+			const Block* source_scope = buffer_read ? read.Parent() : prefix;
+			for (uint32_t word = 0; word < source_dwords; ++word)
+				if (!RuntimeReadsDominate(address->Arg(word), source_scope, &read)) return {};
+			return BoundedSrtReadProof {
+			    .index = Value(const_cast<Inst*>(offset.index)),
+			    .count = workgroup ? Value {} : Value(*maximum + 1u),
+			    .address_low = address->Arg(0).Resolve(),
+			    .address_high = address->Arg(1).Resolve(),
+			    .descriptor_word2 = source_dwords == 4u ? address->Arg(2).Resolve() : Value {},
+			    .descriptor_word3 = source_dwords == 4u ? address->Arg(3).Resolve() : Value {},
+			    .source_dwords = source_dwords,
+			    .offset_scale = offset.scale,
+			    .offset_bias = offset.bias,
+			    .memory_offset = memory.offset,
+			    .workgroup_axis = workgroup ? offset.index->Arg(1).Resolve().U32() : UINT32_MAX};
 		}
 		const auto* phi = offset.index;
 		if (phi->GetOpcode() != ValueOpcode::Phi) return {};
@@ -1214,15 +1234,25 @@ public:
 		// Roots may be loaded in the preheader or in this unavoidable guard
 		// chain. Both execute even when N is zero; success-only pointer loads
 		// remain ineligible for eager snapshot evaluation.
-		if (!RuntimeReadsDominate(count, guard) || !RuntimeReadsDominate(address->Arg(0), guard) ||
-		    !RuntimeReadsDominate(address->Arg(1), guard)) return {};
+		if (!RuntimeReadsDominate(count, guard)) return {};
+		for (uint32_t word = 0; word < source_dwords; ++word)
+			if (!RuntimeReadsDominate(address->Arg(word), guard)) return {};
 		const auto success_id = invert ? info.terminator.false_block : info.terminator.true_block;
 		const auto* success = m_by_id.at(success_id);
 		// Removing the successful i<N edge must make the actual read unreachable.
 		// Block dominance alone is insufficient when the guard's false path merges.
 		if (Reachable(read.Parent(), nullptr, guard, success)) return {};
-		return BoundedSrtReadProof {index, count, address->Arg(0).Resolve(), address->Arg(1).Resolve(),
-		                           offset.scale, offset.bias, memory.offset};
+		return BoundedSrtReadProof {
+		    .index = index,
+		    .count = count,
+		    .address_low = address->Arg(0).Resolve(),
+		    .address_high = address->Arg(1).Resolve(),
+		    .descriptor_word2 = source_dwords == 4u ? address->Arg(2).Resolve() : Value {},
+		    .descriptor_word3 = source_dwords == 4u ? address->Arg(3).Resolve() : Value {},
+		    .source_dwords = source_dwords,
+		    .offset_scale = offset.scale,
+		    .offset_bias = offset.bias,
+		    .memory_offset = memory.offset};
 	}
 
 private:
@@ -1251,6 +1281,28 @@ private:
 			if (!ProveActiveMaskNonempty(*inst, active)) return finish({});
 			std::unordered_set<const Inst*> active_visiting;
 			return finish(FiniteMaximumActive(inst->Arg(0), active, active_visiting));
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadLane && inst->NumArgs() == 2u) {
+			const auto lane = FiniteMaximum(inst->Arg(1));
+			if (!lane || *lane >= m_program.wave_size) return finish({});
+			return finish(FiniteMaximum(inst->Arg(0)));
+		}
+		if (inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 && inst->NumArgs() == 2u) {
+			const auto shift = inst->Arg(1).Resolve();
+			if (!shift.IsImmediate() || shift.GetType() != Type::U32) return finish({});
+			const auto bits = shift.U32() & 31u;
+			const auto source = FiniteMaximum(inst->Arg(0));
+			return finish(source ? *source >> bits : UINT32_MAX >> bits);
+		}
+		if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && inst->NumArgs() == 2u) {
+			const auto left = inst->Arg(0).Resolve();
+			const auto right = inst->Arg(1).Resolve();
+			if (left.IsImmediate() && left.GetType() == Type::U32) return finish(left.U32());
+			if (right.IsImmediate() && right.GetType() == Type::U32) return finish(right.U32());
+			const auto left_bound = FiniteMaximum(left);
+			const auto right_bound = FiniteMaximum(right);
+			return finish(left_bound && right_bound ? std::optional(std::min(*left_bound, *right_bound))
+			                                         : std::nullopt);
 		}
 		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
 			const auto condition = inst->Arg(0).Resolve();

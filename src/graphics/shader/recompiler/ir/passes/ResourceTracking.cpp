@@ -251,10 +251,18 @@ private:
 				if (proof->workgroup_axis == UINT32_MAX) PlanBoundedRootReads(proof->count);
 				PlanBoundedRootReads(proof->address_low);
 				PlanBoundedRootReads(proof->address_high);
+				if (proof->source_dwords == 4u) {
+					PlanBoundedRootReads(proof->descriptor_word2);
+					PlanBoundedRootReads(proof->descriptor_word3);
+				}
 				DescriptorSource address;
-				address.dword_count = 2u;
+				address.dword_count = proof->source_dwords;
 				address.dwords[0] = proof->address_low;
 				address.dwords[1] = proof->address_high;
+				if (proof->source_dwords == 4u) {
+					address.dwords[2] = proof->descriptor_word2;
+					address.dwords[3] = proof->descriptor_word3;
+				}
 				const auto address_source = InternSource(address);
 				uint32_t count_source = UINT32_MAX;
 				if (proof->workgroup_axis == UINT32_MAX) {
@@ -302,8 +310,12 @@ private:
 		descriptor.dword_count = 4u;
 		descriptor.dwords[0] = words[0]->proof.address_low;
 		descriptor.dwords[1] = words[0]->proof.address_high;
-		descriptor.dwords[2] = words[0]->proof.count;
-		descriptor.dwords[3] = Value(0u);
+		descriptor.dwords[2] = words[0]->proof.source_dwords == 4u
+		                           ? words[0]->proof.descriptor_word2
+		                           : words[0]->proof.count;
+		descriptor.dwords[3] = words[0]->proof.source_dwords == 4u
+		                           ? words[0]->proof.descriptor_word3
+		                           : Value(0u);
 		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer {};
 		for (uint32_t word = 0; word < words.size(); ++word)
 			descriptor.bounded_buffer->reads[word] = words[word]->read_id;

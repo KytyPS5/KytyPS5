@@ -525,6 +525,8 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	KYTY_PROFILER_FUNCTION();
 
 	info = {};
+	info.initial_fp_state = {true, regs.gs_regs.rsrc1.float_mode, regs.gs_regs.rsrc1.ieee_mode,
+	                         regs.gs_regs.rsrc1.dx10_clamp};
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -576,6 +578,8 @@ static void ShaderGetStaticInputInfoPS(
 	KYTY_PROFILER_FUNCTION();
 
 	ps_info = {};
+	ps_info.initial_fp_state = {true, regs.ps_regs.rsrc1.float_mode, regs.ps_regs.rsrc1.ieee_mode,
+	                         regs.ps_regs.rsrc1.dx10_clamp};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
@@ -653,6 +657,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
@@ -710,6 +715,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.input_num);
 	key.push_back(info.wave_size);
@@ -744,6 +750,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.workgroup_register);
 	key.push_back(info.wave_size);
 	key.push_back(info.host_subgroup_size);

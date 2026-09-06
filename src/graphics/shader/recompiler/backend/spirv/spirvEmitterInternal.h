@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/F64Certificate.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -141,6 +142,7 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeNativeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);

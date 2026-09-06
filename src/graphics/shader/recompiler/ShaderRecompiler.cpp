@@ -595,6 +595,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	// HW_REG_MODE is id 1 in RDNA2's encoded hardware-register operand.
+	// Scan the complete decoded stream conservatively, including unreachable
+	// instructions: S_SETREG translation otherwise discards this information.
+	ir.fp_mode_inspected = true;
+	for (const auto& instruction: decoded.instructions) {
+		if (instruction.opcode == Decoder::Opcode::S_SETREG_B32 &&
+		    (instruction.src1.value & 0x3fu) == 1u) {
+			if (!ir.writes_fp_mode) { ir.first_fp_mode_write_pc = instruction.pc; }
+			ir.writes_fp_mode = true;
+		}
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

@@ -94,6 +94,54 @@ The listing and every case have the specified timeout. A failure or timeout is r
 
 `-OutputDirectory` must be new or empty; by default a unique directory is created under `_Build/compute-tests`. It contains `report.json`, incrementally written `results.jsonl`, listing logs, and numbered per-case directories with `stdout.txt` and `stderr.txt`. Exit code is 1 for any failed/timed-out case, listing error, or empty selection, and 0 when all selected cases pass. Results apply to these fixtures and the current GPU; they do not prove that a game renders correctly.
 
+## Finite FP64 arithmetic
+
+The recompiler represents binary64 values as exact pairs of 32-bit words. Signed
+and unsigned 32-bit integer conversions require no native Float64 feature.
+
+Native multiplication, fused multiply-add, reciprocal and narrowing to FP32 are
+admitted only when the compiler proves finite operands and results that are zero
+or normal. It uses known constants and typed integer-derived dataflow; unknown
+runtime bit pairs, unproved pair provenance, subnormal/overflow ranges and possible
+zero reciprocal denominators are rejected. Reciprocal currently requires a proved
+nonzero integer with magnitude below 2^32. Guest FP state must be known, relevant
+rounding modes must be nearest-even, and shaders that write MODE are rejected for
+this arithmetic path.
+
+The logical Vulkan device must have the required Float64, FMA and float-control
+features enabled. Multiplication and FMA use guaranteed `OpFmaKHR`; reciprocal
+uses a fused Newton correction to meet the guest ISA error bound. Native
+capabilities cover every retained arithmetic instruction after dead-code
+elimination. Signed zero is preserved
+explicitly. Supported arithmetic sources are SGPR/VGPR pairs. MUL/FMA accept source
+absolute-value and negation modifiers. Literal/inline FP64 sources, DPP/SDWA
+forms, output modifiers and e64 forms of reciprocal/narrowing remain outside
+this supported contract.
+
+Run the focused compiler checks from PowerShell:
+
+```powershell
+cmake --build _Build/windows --target shader_cfg_tests shader_recompiler_compute_tests
+.\_Build\windows\shader_cfg_tests.exe --fma-khr-validator-only
+.\_Build\windows\shader_cfg_tests.exe --f64-certificate-only
+.\_Build\windows\shader_cfg_tests.exe --unused-f64-emission-only
+.\_Build\windows\shader_recompiler_compute_tests.exe --f64-admission-only
+```
+
+Run the synthetic GPU cases sequentially, retaining every result:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run-compute-cases.ps1 `
+  -CasePattern '^(CvtF64|MulF64|FmaF64|RcpF64|CvtF32F64|F64IntegerDerived)' `
+  -TimeoutSeconds 30
+```
+
+These cases check exact conversion/product/FMA words, a fused-versus-unfused
+residual, rounding boundaries, signed zeros, register aliases and reciprocal
+intervals allowed by the ISA. Other buffer words and sentinels compare exactly.
+The bounded arithmetic class and results on the tested GPU do not establish
+support for arbitrary FP64 shaders or successful game rendering.
+
 ## Localize GPU execution faults
 
 For a diagnostic run, set `KYTY_GPU_SYNC_DIAGNOSTICS=1` in the emulator process environment.

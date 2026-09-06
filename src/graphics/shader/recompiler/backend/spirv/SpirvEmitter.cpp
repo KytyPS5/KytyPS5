@@ -320,7 +320,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
-                                  const ComputeWorkgroupLimits& compute_workgroup_limits) {
+                                  const ComputeWorkgroupLimits& compute_workgroup_limits,
+                                  const ShaderHostProfile& host_profile) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -335,6 +336,18 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	}
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
+	ShaderFloatingPointState initial_fp_state{};
+	if (program.stage == ShaderType::Compute && input_info.compute != nullptr) {
+		initial_fp_state = input_info.compute->initial_fp_state;
+	} else if (program.stage == ShaderType::Vertex && input_info.vertex != nullptr) {
+		initial_fp_state = input_info.vertex->initial_fp_state;
+	} else if (program.stage == ShaderType::Pixel && input_info.pixel != nullptr) {
+		initial_fp_state = input_info.pixel->initial_fp_state;
+	}
+	const auto f64 = IR::AnalyzeF64Program(program, initial_fp_state, host_profile);
+	if (!f64.error.empty()) {
+		Fail(program, f64.error.c_str());
+	}
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =

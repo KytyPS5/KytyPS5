@@ -155,6 +155,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 };
 
 struct ShaderPixelInputInfo {
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;

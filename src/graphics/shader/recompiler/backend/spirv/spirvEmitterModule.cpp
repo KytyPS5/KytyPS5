@@ -43,6 +43,10 @@ uint32_t TypeI32Pair(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeStruct, element, element);
 }
 
+uint32_t TypeNativeF64(EmitterState& state) {
+	return state.builder.Type(OpTypeFloat, {64});
+}
+
 uint32_t TypeF32(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeFloat, 32);
 }

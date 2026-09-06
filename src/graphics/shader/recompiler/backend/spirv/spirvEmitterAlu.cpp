@@ -23,6 +23,7 @@ uint32_t MakePair(EmitterState& state, uint32_t low, uint32_t high) {
 	return result;
 }
 
+
 uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
                         bool not_equal) {
 	const auto compare = Binary(state, not_equal ? spv::OpINotEqual : spv::OpIEqual,
@@ -166,6 +167,95 @@ uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
 	words.insert(words.end(), args.begin(), args.end());
 	state.builder.AddFunction(words);
 	return result;
+}
+
+uint32_t EmitNativeFma64(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpFmaKHR, TypeNativeF64(state), result, a, b, c});
+	state.builder.AddAnnotation({OpDecorate, result, DecorationNoContraction});
+	// This finite RTE class has no underflow. An exact zero FMA is negative
+	// only when both its exact product and addend are negative zeros; all
+	// nonzero cancellation produces +0. Preserve that contract with bits,
+	// independently of whether a host extends SignedZeroInfNanPreserve to
+	// the recently introduced OpFmaKHR operation.
+	const auto to_pair = [&](uint32_t value) {
+		return ExtractPair(state, NewUnary(state, OpBitcast, TypeU64(state), value));
+	};
+	const auto is_zero = [&](Pair value) {
+		const auto magnitude_high = NewBinary(state, OpBitwiseAnd, TypeU32(state),
+		                                      value.high, ConstantU32(state, 0x7fffffffu));
+		const auto magnitude = NewBinary(state, OpBitwiseOr, TypeU32(state),
+		                                 value.low, magnitude_high);
+		return NewBinary(state, OpIEqual, TypeBool(state), magnitude, ConstantU32(state, 0u));
+	};
+	const auto lhs = to_pair(a);
+	const auto rhs = to_pair(b);
+	const auto addend = to_pair(c);
+	const auto output = to_pair(result);
+	const auto product_zero = NewBinary(state, OpLogicalOr, TypeBool(state),
+	                                    is_zero(lhs), is_zero(rhs));
+	const auto product_sign = NewBinary(state, OpBitwiseXor, TypeU32(state), lhs.high, rhs.high);
+	const auto common_sign = NewBinary(state, OpBitwiseAnd, TypeU32(state), product_sign,
+	                                   NewBinary(state, OpBitwiseAnd, TypeU32(state),
+	                                             addend.high, ConstantU32(state, 0x80000000u)));
+	const auto both_zero = NewBinary(state, OpLogicalAnd, TypeBool(state),
+	                                 product_zero, is_zero(addend));
+	const auto zero_sign = NewSelect(state, TypeU32(state), both_zero, common_sign,
+	                                 ConstantU32(state, 0u));
+	const auto high = NewSelect(state, TypeU32(state), is_zero(output), zero_sign, output.high);
+	return NewUnary(state, OpBitcast, TypeNativeF64(state), MakePair(state, output.low, high));
+}
+
+uint32_t EmitNativeReciprocal64(EmitterState& state, uint32_t source) {
+	const auto type = TypeNativeF64(state);
+	const auto one = state.builder.Constant(OpConstant, type, {0u, 0x3ff00000u});
+	// Vulkan only promises at least single-precision accuracy for double FDiv.
+	// A fused Newton correction reduces that bounded initial relative error
+	// quadratically, meeting RDNA2 RCP_F64's 2^29 binary64-ULP bound. The input
+	// certificate restricts this path to proved nonzero converted32 integers;
+	// all correction operands/results are zero or normal in that range.
+	const auto estimate = NewBinary(state, OpFDiv, type, one, source);
+	state.builder.AddAnnotation({OpDecorate, estimate, DecorationNoContraction});
+	const auto negative_source = NewUnary(state, OpFNegate, type, source);
+	const auto residual = EmitNativeFma64(state, negative_source, estimate, one);
+	return EmitNativeFma64(state, estimate, residual, estimate);
+}
+
+// Every I32/U32 value is exactly representable in binary64. Construct its
+// encoding with integer operations: no F32 rounding, host Float64 feature,
+// guest FP rounding mode, or denormal mode is involved.
+uint32_t EmitIntegerToF64(EmitterState& state, uint32_t source, bool signed_value) {
+	const auto type = TypeU32(state);
+	const auto zero = ConstantU32(state, 0);
+	const auto sign = signed_value
+	                      ? NewBinary(state, OpBitwiseAnd, type, source,
+	                                  ConstantU32(state, 0x80000000u))
+	                      : zero;
+	const auto negative = NewBinary(state, OpINotEqual, TypeBool(state), sign, zero);
+	// Unsigned subtraction also handles the magnitude of INT32_MIN exactly.
+	const auto magnitude = signed_value
+	                           ? NewSelect(state, type, negative,
+	                                       NewBinary(state, OpISub, type, zero, source), source)
+	                           : source;
+	const auto nonzero = NewBinary(state, OpINotEqual, TypeBool(state), magnitude, zero);
+	const auto msb_i = EmitExt(state, TypeI32(state), GlslFindUMsb, {magnitude});
+	const auto msb_u = NewUnary(state, OpBitcast, type, msb_i);
+	// FindUMsb(0) is -1. Sanitize before computing any shift, rather than
+	// selecting away an out-of-range shift result afterward.
+	const auto msb = NewSelect(state, type, nonzero, msb_u, zero);
+	const auto shift = NewBinary(state, OpISub, type, ConstantU32(state, 31), msb);
+	const auto normalized = NewBinary(state, OpShiftLeftLogical, type, magnitude, shift);
+	const auto exponent = NewBinary(
+	    state, OpShiftLeftLogical, type,
+	    NewBinary(state, OpIAdd, type, msb, ConstantU32(state, 1023)), ConstantU32(state, 20));
+	const auto fraction_high = NewBinary(
+	    state, OpBitwiseAnd, type,
+	    NewBinary(state, OpShiftRightLogical, type, normalized, ConstantU32(state, 11)),
+	    ConstantU32(state, 0xfffffu));
+	const auto high = NewBinary(state, OpBitwiseOr, type, sign,
+	                            NewBinary(state, OpBitwiseOr, type, exponent, fraction_high));
+	const auto low = NewBinary(state, OpShiftLeftLogical, type, normalized, ConstantU32(state, 21));
+	return MakePair(state, low, NewSelect(state, type, nonzero, high, zero));
 }
 
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {

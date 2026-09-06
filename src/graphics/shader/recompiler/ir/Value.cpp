@@ -25,6 +25,10 @@ Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
 }
 
+Value Value::F64(uint64_t bits) {
+	return Value(Type::F64, bits);
+}
+
 bool Value::IsEmpty() const {
 	return type == Type::Void;
 }
@@ -114,6 +118,11 @@ float Value::F32Value() const {
 	return std::bit_cast<float>(imm_u32);
 }
 
+uint64_t Value::F64Bits() const {
+	EXIT_IF(type != Type::F64);
+	return imm_u64;
+}
+
 bool Value::operator==(const Value& other) const {
 	if (type != other.type) {
 		return false;
@@ -129,7 +138,8 @@ bool Value::operator==(const Value& other) const {
 		case Type::F16: return imm_u16 == other.imm_u16;
 		case Type::U32:
 		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
+		case Type::U64:
+		case Type::F64: return imm_u64 == other.imm_u64;
 		default: return false;
 	}
 }

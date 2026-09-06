@@ -37,6 +37,34 @@ void ReadTriple(const Json& json, const char* name, T (&target)[3]) {
   const auto values = json.at(name).get<std::array<T, 3>>();
   std::copy(values.begin(), values.end(), target);
 }
+
+ShaderFloatingPointState ReadInitialFloatingPointState(const Json& input) {
+  if (!input.contains("initial_fp_state")) {
+    return {}; // Legacy manifests did not capture these registers.
+  }
+  const auto& state = input.at("initial_fp_state");
+  if (!state.is_object() || !state.contains("known") || !state.at("known").is_boolean()) {
+    throw std::runtime_error("initial_fp_state requires an object with boolean known");
+  }
+  const bool known = state.at("known").get<bool>();
+  for (const char* field : {"ieee_mode", "dx10_clamp"}) {
+    if ((known || state.contains(field)) &&
+        (!state.contains(field) || !state.at(field).is_boolean())) {
+      throw std::runtime_error(std::string("initial_fp_state requires boolean ") + field);
+    }
+  }
+  if (known || state.contains("float_mode")) {
+    if (!state.contains("float_mode") || !state.at("float_mode").is_number_integer() ||
+        state.at("float_mode") < 0 || state.at("float_mode") > 255) {
+      throw std::runtime_error("initial_fp_state.float_mode must be an integer in [0,255]");
+    }
+  }
+  if (!known) {
+    return {}; // Validate supplied fields, then canonicalize the unknown state.
+  }
+  return {true, state.at("float_mode").get<uint8_t>(), state.at("ieee_mode").get<bool>(),
+          state.at("dx10_clamp").get<bool>()};
+}
 } // namespace
 
 // One manifest per process: production fatal exits and timeouts stay isolated.
@@ -120,6 +148,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     if (compute && (manifest.value("metadata_complete", false) || header_profile) && manifest.contains("compute")) {
       const auto& input = manifest.at("compute");
       ShaderComputeInputInfo info;
+      info.initial_fp_state = ReadInitialFloatingPointState(input);
       ReadTriple(input, "threads_num", info.threads_num);
       ReadTriple(input, "dispatch_threads_num", info.dispatch_threads_num);
       ReadTriple(input, "group_id", info.group_id);
@@ -138,6 +167,13 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
           (info.wave_size != 32u && info.wave_size != 64u)) {
         throw std::runtime_error("invalid compute capture metadata");
       }
+      // Report the parsed compiler input, not the untrusted manifest object.
+      // Legacy captures must retain the default unknown state.
+      result["initial_fp_state"] = {
+          {"known", info.initial_fp_state.known},
+          {"float_mode", info.initial_fp_state.float_mode},
+          {"ieee_mode", info.initial_fp_state.ieee_mode},
+          {"dx10_clamp", info.initial_fp_state.dx10_clamp}};
       // Translation needs the register count, not runtime descriptor payloads.
       std::vector<uint32_t> user_data(user_count);
       ShaderRecompiler::CompileOptions options;

@@ -150,6 +150,7 @@ U32 IREmitter::CompositeExtract(Value composite, uint32_t index) {
 	ValueOpcode opcode;
 	switch (composite.GetType()) {
 		case Type::U64: opcode = ValueOpcode::CompositeExtractU64; break;
+		case Type::F64: opcode = ValueOpcode::CompositeExtractF64; break;
 		case Type::U32x2: opcode = ValueOpcode::CompositeExtractU32x2; break;
 		case Type::U32x3: opcode = ValueOpcode::CompositeExtractU32x3; break;
 		case Type::U32x4: opcode = ValueOpcode::CompositeExtractU32x4; break;

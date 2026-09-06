@@ -328,7 +328,15 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
-		m_surface_metas.erase(image->info.metadata.range.address);
+		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
+		if (metadata != m_surface_metas.end() &&
+		    ((image->info.metadata.kind == ImageMetadataKind::Dcc &&
+		      metadata->second.type == MetaDataInfo::Type::Dcc) ||
+		     (image->info.metadata.kind == ImageMetadataKind::Htile &&
+		      metadata->second.type == MetaDataInfo::Type::HTile))) {
+			// A later binding may have reused this address for another metadata type.
+			m_surface_metas.erase(metadata);
+		}
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1436,15 +1444,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
 		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
 		                                              .clear_mask = image.info.htile_clear_mask});
-		if (!inserted && metadata->second.type == MetaDataInfo::Type::PendingDcc) {
-			// PendingDcc fills use DCC-specific encoding. Do not reinterpret a speculative
-			// DCC/buffer fill as HTile state if the address is later classified as depth metadata.
-			metadata->second.type       = MetaDataInfo::Type::HTile;
-			metadata->second.clear_mask = image.info.htile_clear_mask;
-			metadata->second.fill_value = 0xffffffffu;
-			metadata->second.fill_size  = 0;
-		} else if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
-			EXIT("TextureCache: depth target reuses non-HTile metadata\n");
+		if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
+			// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
+			// The depth binding defines the new type; incompatible fill state cannot carry over.
+			metadata->second = {.type       = MetaDataInfo::Type::HTile,
+			                    .clear_mask = image.info.htile_clear_mask};
 		}
 	}
 	CommitGpuWrite(image);

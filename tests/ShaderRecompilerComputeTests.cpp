@@ -6025,6 +6025,56 @@ public:
           texture_cache.IsMetaCleared(base + metadata_b, 0),
           "BufferCache fill did not publish an exact-address metadata clear");
 
+      // R-Type Final 3 reuses an old color allocation inside a new stencil plane,
+      // with the same metadata address changing from DCC to HTile.
+      auto reused_depth = MakeMetadataDepth(0x12300, 0x13200);
+      reused_depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      reused_depth.info.stencil = {base + 0x12200, 0x80};
+      reused_depth.info.htile_clear_mask = 0;
+      reused_depth.view_info.format = vk::Format::eD32SfloatS8Uint;
+      reused_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
+                                      vk::ImageAspectFlagBits::eStencil;
+      auto reused_color = MakeLinearDesc(
+          base + 0x12240, sizeof(uint32_t), vk::Format::eR8G8B8A8Unorm,
+          Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      reused_color.type = BindingType::RenderTarget;
+      reused_color.info.metadata.kind = ImageMetadataKind::Dcc;
+      reused_color.info.metadata.range = {base + 0x13200, 0x20};
+      reused_color.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto reused_color_id = texture_cache.FindImage(reused_color);
+      (void)texture_cache.FindRenderTarget(reused_color_id, reused_color);
+      texture_cache.TrackDccFill(base + 0x13200, 0x80, 0);
+      texture_cache.InvalidateMemoryFromGPU(reused_depth.info.stencil.address,
+                                           reused_depth.info.stencil.size);
+      const auto reused_depth_id = texture_cache.FindImage(reused_depth);
+      (void)texture_cache.FindDepthTarget(reused_depth_id, reused_depth);
+      uint32_t reused_fill = 0;
+      Require(
+          name, "DCC allocation reused as HTile",
+          TextureCacheTestAccess::Contains(texture_cache, reused_color_id) &&
+              texture_cache.GetImage(reused_color_id).IsBufferModified() &&
+              !texture_cache.GetImage(reused_color_id).IsGpuModified() &&
+              !texture_cache.IsMetaCleared(base + 0x13200, 0, &reused_fill) &&
+              reused_fill == UINT32_MAX &&
+              texture_cache.ClearMeta(base + 0x13200) &&
+              texture_cache.TouchMeta(base + 0x13200, 0, false),
+          "depth binding retained incompatible DCC clear state");
+      TextureCacheTestAccess::DeleteImage(texture_cache, reused_color_id);
+      (void)texture_cache.FindDepthTarget(reused_depth_id, reused_depth);
+      Require(
+          name, "reused metadata owner retirement",
+          !TextureCacheTestAccess::Contains(texture_cache, reused_color_id) &&
+              texture_cache.IsMeta(base + 0x13200) &&
+              !texture_cache.IsMetaCleared(base + 0x13200, 0) &&
+              texture_cache.IsMetaCleared(base + 0x13200, 1),
+          "retiring the old DCC image erased the live HTile slice state");
+      texture_cache.UnmapMemory(reused_depth.info.data.address,
+                                reused_depth.info.data.size);
+      Require(name, "reused metadata final retirement",
+              !texture_cache.IsMeta(base + 0x13200),
+              "retiring the HTile image left its metadata registered");
+
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =
           MakeLinearDesc(base + partial_unmap_image_offset, 0x2000,

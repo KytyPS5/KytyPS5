@@ -32,8 +32,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
@@ -513,7 +513,7 @@ void WindowContext::ProcessEvent(double time_s) {
 		}
 		return;
 	}
-	if (ProcessImeInput(*event)) {
+	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}
 
@@ -824,7 +824,7 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
-	InitializeImeInput();
+	InitializeSystemOverlayInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 

@@ -46,6 +46,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "libs/dialog.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
 
@@ -933,6 +934,142 @@ void Require(const char *shader_name, const char *stage, bool value,
   if (!value) {
     Fail(shader_name, stage, message);
   }
+}
+
+void CheckErrorDialogLifecycle() {
+  namespace ErrorDialog = Libs::Dialog::ErrorDialog;
+  struct Param {
+    int32_t size = 16;
+    int32_t error_code = static_cast<int32_t>(0x80550006u);
+    int32_t user_id = 1;
+    int32_t reserved = 0;
+  } param;
+  static_assert(sizeof(Param) == 16);
+  constexpr int invalid_state = static_cast<int>(0x80ed0005u);
+  constexpr int invalid_param = static_cast<int>(0x80ed0003u);
+  static std::vector<ErrorDialog::VisualState> notifications;
+  notifications.clear();
+  ErrorDialog::SetVisibilityCallback([] {
+    const auto visual = ErrorDialog::GetVisualState();
+    ErrorDialog::HostSnapshot snapshot{};
+    Require("ErrorDialog", "callback reentry",
+            ErrorDialog::GetHostSnapshot(&snapshot) == visual.active &&
+                (ErrorDialog::ErrorDialogGetStatus() == 2) == visual.active,
+            "visibility callback observed inconsistent dialog state");
+    notifications.push_back(visual);
+  });
+  const auto initial_revision = ErrorDialog::GetVisualState().revision;
+  const auto check_state = [&](const char *stage, int status,
+                               size_t visibility_changes) {
+    const auto visual = ErrorDialog::GetVisualState();
+    ErrorDialog::HostSnapshot snapshot{};
+    Require("ErrorDialog", stage,
+            ErrorDialog::ErrorDialogGetStatus() == status &&
+                ErrorDialog::ErrorDialogUpdateStatus() == status &&
+                visual.active == (status == 2) &&
+                ErrorDialog::GetHostSnapshot(&snapshot) == visual.active &&
+                visual.revision == initial_revision + visibility_changes &&
+                notifications.size() == visibility_changes &&
+                (notifications.empty() ||
+                 (notifications.back().active == visual.active &&
+                  notifications.back().revision == visual.revision)),
+            "status, host visibility, or visibility notification changed "
+            "unexpectedly");
+  };
+  check_state("uninitialized", 0, 0);
+  Require("ErrorDialog", "uninitialized operations",
+          ErrorDialog::ErrorDialogTerminate() ==
+                  static_cast<int>(0x80ed0001u) &&
+              ErrorDialog::ErrorDialogClose() == invalid_state,
+          "uninitialized dialog accepted termination or close");
+  Require("ErrorDialog", "initialize",
+          ErrorDialog::ErrorDialogInitialize() == 0 &&
+              ErrorDialog::ErrorDialogInitialize() ==
+                  static_cast<int>(0x80ed0002u),
+          "initialization did not reject a second initialization");
+  Param invalid = param;
+  invalid.size--;
+  Require("ErrorDialog", "invalid open",
+          ErrorDialog::ErrorDialogOpen(nullptr) == invalid_param &&
+              ErrorDialog::ErrorDialogOpen(&invalid) == invalid_param &&
+              ErrorDialog::ErrorDialogClose() == invalid_state,
+          "invalid parameters or close were accepted before opening");
+  check_state("failed open preserves initialized state", 1, 0);
+  Require("ErrorDialog", "open", ErrorDialog::ErrorDialogOpen(&param) == 0,
+          "valid error dialog did not open");
+  ErrorDialog::HostSnapshot first{};
+  Require("ErrorDialog", "copied error code",
+          ErrorDialog::GetHostSnapshot(&first) &&
+              first.error_code == param.error_code,
+          "host dialog did not expose the guest error code");
+  param.error_code = static_cast<int32_t>(0x8055000au);
+  for (int poll = 0; poll < 8; ++poll) {
+    check_state("polling waits for acknowledgement", 2, 1);
+  }
+  Require(
+      "ErrorDialog", "running failures",
+      ErrorDialog::ErrorDialogOpen(&param) == invalid_state &&
+          !ErrorDialog::HostAccept(first.generation + 1),
+      "an invalid open or stale acknowledgement replaced the active dialog");
+  ErrorDialog::HostSnapshot current{};
+  Require("ErrorDialog", "failed open preserves active dialog",
+          ErrorDialog::GetHostSnapshot(&current) &&
+              current.generation == first.generation &&
+              current.error_code == first.error_code,
+          "active error code or generation changed after a failed open");
+  check_state("failed operations preserve running state", 2, 1);
+  Require("ErrorDialog", "acknowledge",
+          ErrorDialog::HostAccept(first.generation),
+          "current host acknowledgement did not finish the dialog");
+  check_state("acknowledged", 3, 2);
+  Require("ErrorDialog", "finished operations",
+          !ErrorDialog::HostAccept(first.generation) &&
+              ErrorDialog::ErrorDialogClose() == invalid_state &&
+              ErrorDialog::ErrorDialogOpen(&invalid) == invalid_param,
+          "finished dialog accepted duplicate completion or an invalid open");
+  check_state("failed operations preserve finished state", 3, 2);
+  Require("ErrorDialog", "reopen and stale acknowledgement",
+          ErrorDialog::ErrorDialogOpen(&param) == 0 &&
+              ErrorDialog::GetHostSnapshot(&current) &&
+              current.generation != first.generation &&
+              current.error_code == param.error_code &&
+              !ErrorDialog::HostAccept(first.generation),
+          "reopened dialog accepted acknowledgement from its predecessor");
+  check_state("reopened", 2, 3);
+  Require("ErrorDialog", "guest close", ErrorDialog::ErrorDialogClose() == 0,
+          "guest close did not finish the running dialog");
+  check_state("closed", 3, 4);
+  Require("ErrorDialog", "terminate running dialog",
+          ErrorDialog::ErrorDialogOpen(&param) == 0 &&
+              ErrorDialog::GetHostSnapshot(&current) &&
+              ErrorDialog::ErrorDialogTerminate() == 0 &&
+              !ErrorDialog::HostAccept(current.generation),
+          "termination failed to remove the active dialog");
+  check_state("terminated", 0, 6);
+  Require("ErrorDialog", "reinitialize and stale acknowledgement",
+          ErrorDialog::ErrorDialogInitialize() == 0 &&
+              ErrorDialog::ErrorDialogOpen(&param) == 0 &&
+              !ErrorDialog::HostAccept(current.generation),
+          "reinitialization reused an old dialog generation");
+  check_state("reinitialized", 2, 7);
+  Require("ErrorDialog", "final termination",
+          ErrorDialog::ErrorDialogTerminate() == 0 &&
+              ErrorDialog::ErrorDialogTerminate() ==
+                  static_cast<int>(0x80ed0001u),
+          "termination did not restore the uninitialized state");
+  check_state("final state", 0, 8);
+  ErrorDialog::SetVisibilityCallback(nullptr);
+  Require("ErrorDialog", "lifecycle without a visibility listener",
+          ErrorDialog::ErrorDialogInitialize() == 0 &&
+              ErrorDialog::ErrorDialogOpen(&param) == 0 &&
+              ErrorDialog::ErrorDialogClose() == 0 &&
+              ErrorDialog::ErrorDialogTerminate() == 0 &&
+              ErrorDialog::ErrorDialogGetStatus() == 0 &&
+              !ErrorDialog::GetVisualState().active &&
+              ErrorDialog::GetVisualState().revision == initial_revision + 10 &&
+              notifications.size() == 8,
+          "guest lifecycle depended on a registered host visibility listener");
+  std::printf("[host]    %-32s ok\n", "ErrorDialogLifecycle");
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -27438,6 +27575,10 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--error-dialog-only") == 0) {
+    CheckErrorDialogLifecycle();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--fmask-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageLoadFmaskUsesNativeSampleMapping());
@@ -27768,6 +27909,7 @@ int main(int argc, char **argv) {
   CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
+  CheckErrorDialogLifecycle();
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());

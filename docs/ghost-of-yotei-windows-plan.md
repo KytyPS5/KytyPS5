@@ -25,10 +25,13 @@ MIMG/DPP8 препятствия уже пройдены. Исторически
 где индекс образован unsigned bitfield extraction. Native Windows-сборка
 `shader_cfg_tests` прошла, а `cs_00010f14` и `cs_000153d4` теперь доходят до
 `compute_execution_precheck` в обеих конфигурациях барьеров. Из прежней группы
-из семи shader ещё три блокируются Phi-выбором SRT descriptor, два — более
-сложным lane/selector выражением. Полный batch после этого изменения ещё не
-запускался, поэтому итог `731/825` ниже пока не пересчитан. Требуемые позже
-регрессии записываются в [emulator-test-debt.md](emulator-test-debt.md).
+из семи shader Phi-барьер также снят для `cs_00016ff4`, `cs_00016cd4` и
+`cs_00017c74`: они доходят до следующего общего precheck и останавливаются уже
+на ограничениях cooperative wave64/ImageWrite либо loop memory independence.
+Два shader пока остаются на сложном lane/selector выражении. Полный batch после
+этих изменений ещё не запускался, поэтому итог `731/825` ниже пока не пересчитан.
+Требуемые позже регрессии записываются в
+[emulator-test-debt.md](emulator-test-debt.md).
 
 ## Полный поток от запуска до кадра
 

@@ -23,3 +23,22 @@ Required tests:
   signed extraction, mismatched descriptor columns, and the existing resource/probe limits.
 - A native Windows shader audit covering every captured manifest in the same normalized
   failure group, followed by a bounded Vulkan readback case before upstream submission.
+
+## Uniform diamond Phi descriptor selection
+
+Status: production fix and corpus validation in progress; automated regression deferred.
+
+Observed trigger: four buffer descriptor words are Phi nodes at the merge of a direct
+two-arm diamond. Each arm supplies host-evaluable SRT words, and the split condition is
+also host-evaluable. The compact runtime resource plan does not retain the shader CFG,
+so the selection must be lowered to typed `SelectU32` values before CFG disposal.
+
+Required tests:
+
+- A positive compiler-level case for both true/false edge orderings and four correlated
+  descriptor words, checking that runtime materialization selects the expected descriptor.
+- Rejection cases for divergent or undefined conditions, non-diamond control flow,
+  loop-carried Phi nodes, mismatched Phi blocks, conditional raw reads, non-U32 values,
+  and arms that are not valid runtime descriptor values.
+- Neighboring checks showing invariant Phi handling and bounded descriptor tables remain
+  unchanged, plus native Windows audits for every captured shader in this failure group.

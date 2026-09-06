@@ -974,11 +974,98 @@ private:
 		}
 	}
 
+	const BlockInfo* BlockMetadata(const Block* block) const {
+		const auto found = std::ranges::find(m_program.blocks, block);
+		if (found == m_program.blocks.end()) return nullptr;
+		const auto index = static_cast<size_t>(found - m_program.blocks.begin());
+		return index < m_program.block_info.size() ? &m_program.block_info[index] : nullptr;
+	}
+
+	Value LowerRuntimeDescriptorPhi(Value value, Inst& anchor) {
+		value = value.Resolve();
+		auto* phi = value.TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->NumArgs() != 2u ||
+		    phi->NumPhiBlocks() != 2u || phi->Parent() == nullptr || anchor.Parent() == nullptr ||
+		    phi->Parent()->ImmPredecessors().size() != 2u) return value;
+		auto* yes_block = phi->PhiBlock(0u);
+		auto* no_block  = phi->PhiBlock(1u);
+		if (yes_block == nullptr || no_block == nullptr || yes_block == no_block ||
+		    std::ranges::find(phi->Parent()->ImmPredecessors(), yes_block) ==
+		        phi->Parent()->ImmPredecessors().end() ||
+		    std::ranges::find(phi->Parent()->ImmPredecessors(), no_block) ==
+		        phi->Parent()->ImmPredecessors().end() ||
+		    yes_block->ImmPredecessors().size() != 1u ||
+		    no_block->ImmPredecessors().size() != 1u ||
+		    yes_block->ImmPredecessors().front() != no_block->ImmPredecessors().front()) return value;
+		auto* split = yes_block->ImmPredecessors().front();
+		const auto* split_info = BlockMetadata(split);
+		const auto* yes_info   = BlockMetadata(yes_block);
+		const auto* no_info    = BlockMetadata(no_block);
+		const auto* merge_info = BlockMetadata(phi->Parent());
+		if (split_info == nullptr || yes_info == nullptr || no_info == nullptr || merge_info == nullptr ||
+		    split_info->terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    yes_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    no_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    yes_info->terminator.true_block != merge_info->id ||
+		    no_info->terminator.true_block != merge_info->id) return value;
+		Value yes;
+		Value no;
+		if (split_info->terminator.true_block == yes_info->id &&
+		    split_info->terminator.false_block == no_info->id) {
+			yes = phi->Arg(0u).Resolve();
+			no  = phi->Arg(1u).Resolve();
+		} else if (split_info->terminator.true_block == no_info->id &&
+		           split_info->terminator.false_block == yes_info->id) {
+			yes = phi->Arg(1u).Resolve();
+			no  = phi->Arg(0u).Resolve();
+		} else {
+			return value;
+		}
+		const auto condition = split_info->condition.Resolve();
+		if (condition.GetType() != Type::U1 || yes.GetType() != Type::U32 ||
+		    no.GetType() != Type::U32 || !ValidateRuntimeValue(m_program, condition) ||
+		    !ValidateRuntimeValue(m_program, yes) || !ValidateRuntimeValue(m_program, no)) return value;
+		const auto clonable_arm = [&](Value arm) {
+			arm = arm.Resolve();
+			if (arm.IsImmediate()) return true;
+			const auto* read = arm.TryInstruction();
+			const auto slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+			                          read->NumArgs() == 2u
+			                      ? read->Arg(1).Resolve()
+			                      : Value {};
+			return slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			       slot.U32() < m_program.srt_reads.size();
+		};
+		if (!clonable_arm(yes) || !clonable_arm(no)) return value;
+		auto* block = anchor.Parent();
+		auto where = std::ranges::find_if(block->Instructions(),
+		    [&](const Inst& inst) { return &inst == &anchor; });
+		if (where == block->Instructions().end()) return value;
+		const auto clone_arm = [&](Value arm) {
+			arm = arm.Resolve();
+			if (arm.IsImmediate()) return arm;
+			const auto* read = arm.TryInstruction();
+			if (read == nullptr) return Value {};
+			const auto slot = read->Arg(1).Resolve();
+			const auto resource = Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource, {}));
+			return Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst, {resource, slot}));
+		};
+		yes = clone_arm(yes);
+		no  = clone_arm(no);
+		if (yes.IsEmpty() || no.IsEmpty()) return value;
+		return Value(&*block->PrependNewInst(where, ValueOpcode::SelectU32, {condition, yes, no}));
+	}
+
 	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
+		}
+		if (expected == ValueOpcode::GetBufferResource) {
+			for (uint32_t dword = 0; dword < handle->NumArgs(); ++dword) {
+				handle->SetArg(dword, LowerRuntimeDescriptorPhi(handle->Arg(dword), *handle));
+			}
 		}
 		if (expected == ValueOpcode::GetBufferResource && MakeBoundedBufferSource(*handle, source)) return;
 		DescriptorSource descriptor;

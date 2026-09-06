@@ -54,8 +54,15 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                      ShaderBufferResource& resolved_descriptor,
+                                      uint32_t& resolved_clear, uint64_t& resolved_size);
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+                                                const CommandBuffer& buffer, uint32_t group_x,
+                                                uint32_t group_y, uint32_t group_z,
+                                                uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -73,12 +80,23 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		ShaderBufferResource fill_descriptor;
+		uint32_t             fill_value   = 0;
+		uint64_t             fill_size    = 0;
+		const bool           uniform_fill =
+		    ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, fill_descriptor,
+		                             fill_value, fill_size) ||
+		    ResolveComputePatternFill(input, group_x, group_y, group_z, mode, fill_descriptor,
+		                              fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const bool known =
+				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
+				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
+				          : cache.ClearMeta(descriptor.Base48())) {
 					return true;
 				}
 			}
@@ -327,7 +345,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y,
+	                               thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}

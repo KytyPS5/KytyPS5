@@ -544,11 +544,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
-		depth.depth_meta_clear_enable =
+		uint32_t   htile_fill       = 0;
+		bool       htile_fill_known = false;
+		const bool meta_cleared =
 		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer,
+		                        &htile_fill, &htile_fill_known);
+		depth.depth_meta_clear_enable =
+		    meta_cleared && (!htile_fill_known || htile_fill_clears_depth(htile_fill));
+		depth.stencil_meta_clear_enable = meta_cleared && htile_fill_known &&
+		                                  depth.desc.info.metadata.stencil_compressed &&
+		                                  htile_fill_clears_stencil(htile_fill);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
-		if (depth.depth_meta_clear_enable &&
+		if (meta_cleared &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
@@ -612,7 +620,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear  = depth.stencil_clear_enable || depth.stencil_meta_clear_enable;
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;

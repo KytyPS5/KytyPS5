@@ -2816,25 +2816,68 @@ void TestGraphicsPushConstantLayout() {
 }
 
 void TestResourceLimitIsTransactional() {
-  Fixture fixture;
-  MemoryInfo memory;
-  memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index <= ShaderInfo::MaxBuffers; index++) {
-    const auto handle = fixture.Buffer(
-        {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
-        index * 4u);
-    fixture.Emit(ValueOpcode::LoadBufferU32,
-                 {handle, Value(0u), Value(0u), Value(0u), Value(true)},
-                 fixture.AddMemory(memory, index * 4u));
+  enum class Limit { Buffers, Images, Samplers, Pairs };
+  struct Case {
+    Limit kind;
+    uint32_t count;
+    const char *error;
+  };
+  for (const auto test : {
+           Case{Limit::Buffers, ShaderInfo::MaxBuffers, "buffer resource limit exceeded"},
+           Case{Limit::Images, ShaderInfo::MaxImages, "image resource limit exceeded"},
+           Case{Limit::Samplers, ShaderInfo::MaxSamplers, "sampler resource limit exceeded"},
+           Case{Limit::Pairs, ShaderInfo::MaxSampledPairs,
+                "sampled image/sampler pair limit exceeded"}}) {
+    for (const uint32_t excess : {0u, 1u}) {
+      Fixture fixture;
+      for (uint32_t index = 0; index < test.count + excess; index++) {
+        MemoryInfo memory;
+        if (test.kind == Limit::Buffers) {
+          memory.kind = ResourceKind::Buffer;
+          const auto handle = fixture.Buffer(
+              {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
+              index * 4u);
+          fixture.Emit(ValueOpcode::LoadBufferU32,
+                       {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+                       fixture.AddMemory(memory, index * 4u));
+          continue;
+        }
+        const auto image_index = test.kind == Limit::Images ? index
+                                 : test.kind == Limit::Pairs ? index / ShaderInfo::MaxSamplers
+                                                           : 0u;
+        const auto sampler_index = test.kind == Limit::Samplers ? index
+                                   : test.kind == Limit::Pairs ? index % ShaderInfo::MaxSamplers
+                                                             : 0u;
+        const auto image = fixture.Image(
+            {Value(image_index + 1u), Value(0u), Value(0u), Value(0u),
+             Value(0u), Value(0u), Value(0u), Value(0u)}, index * 4u);
+        const auto sampler = fixture.Sampler(
+            {Value(sampler_index + 1u), Value(0u), Value(0u), Value(0u)}, index * 4u);
+        memory.kind = ResourceKind::Image;
+        memory.image_dimension = Decoder::ImageDimension::Dim2D;
+        fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                     fixture.AddMemory(memory, index * 4u));
+      }
+      BuildSrtPlan(fixture.program);
+      if (excess == 0u) {
+        TrackResources(fixture.program);
+        const auto actual = test.kind == Limit::Buffers ? fixture.program.info.buffers.size()
+                            : test.kind == Limit::Images ? fixture.program.info.images.size()
+                            : test.kind == Limit::Samplers ? fixture.program.info.samplers.size()
+                                                          : fixture.program.info.sampled_pairs.size();
+        Check(fixture.program.resource_tracking_complete && actual == test.count,
+              "resource tracking rejected or truncated its exact configured capacity");
+      } else {
+        CheckFatal([&] { TrackResources(fixture.program); }, test.error,
+                   "resource capacity plus one did not report its specific limit");
+        Check(!fixture.program.resource_tracking_complete &&
+                  fixture.program.info.buffers.empty() && fixture.program.info.images.empty() &&
+                  fixture.program.info.samplers.empty() && fixture.program.info.sampled_pairs.empty() &&
+                  fixture.program.descriptor_sources.empty(),
+              "resource-limit failure partially mutated typed resource state");
+      }
+    }
   }
-  BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program); },
-             "buffer resource limit exceeded",
-             "resource-limit failure was not reported");
-  Check(!fixture.program.resource_tracking_complete &&
-            fixture.program.info.buffers.empty() &&
-            fixture.program.descriptor_sources.empty(),
-        "resource-limit failure partially mutated typed resource state");
 }
 
 void TestMalformedMemoryKindsRejected() {

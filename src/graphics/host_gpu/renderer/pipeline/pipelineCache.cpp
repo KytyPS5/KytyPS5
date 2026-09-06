@@ -42,6 +42,20 @@ namespace Libs::Graphics {
 
 namespace {
 
+bool IsLowerHex(std::string_view value, size_t expected_size) {
+	return value.size() == expected_size &&
+	       std::ranges::all_of(value, [](unsigned char c) {
+		       return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+	       });
+}
+
+bool IsDriverCacheBuildIdentityUsable(std::string_view git_hash,
+                                      std::string_view git_revision,
+                                      std::string_view worktree_fingerprint) {
+	return git_hash != "unknown" && IsLowerHex(git_revision, 40) &&
+	       IsLowerHex(worktree_fingerprint, 64);
+}
+
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -49,8 +63,9 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	return fmt::format("KytyPC2:{}:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	                   KYTY_GIT_WORKTREE_FINGERPRINT, properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -537,6 +552,12 @@ PipelineCache::~PipelineCache() {
 	}
 }
 
+bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
+                                             std::string_view git_revision,
+                                             std::string_view worktree_fingerprint) {
+	return IsDriverCacheBuildIdentityUsable(git_hash, git_revision, worktree_fingerprint);
+}
+
 void PipelineCache::InitializeDriverCache() {
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
@@ -548,12 +569,9 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	const std::string_view git_hash     = KYTY_GIT_HASH;
 	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+	const std::string_view worktree_fingerprint = KYTY_GIT_WORKTREE_FINGERPRINT;
+	if (!IsDriverCacheBuildIdentityUsable(git_hash, git_revision, worktree_fingerprint)) {
+		PipelineCacheLog("Vulkan pipeline cache: disabled (incomplete build identity)");
 		return;
 	}
 

@@ -557,6 +557,8 @@ if(BUILD_TESTING)
 	set_tests_properties(shader_audit_compute PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 	add_test(NAME shader_fma_khr_validator COMMAND $<TARGET_FILE:shader_cfg_tests> --fma-khr-validator-only)
 	set_tests_properties(shader_fma_khr_validator PROPERTIES TIMEOUT 30)
+	add_test(NAME pipeline_cache_identity
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
 	if(WIN32)
 		add_test(NAME shader_f64_admission
 		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-only)

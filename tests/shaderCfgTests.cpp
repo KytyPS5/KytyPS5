@@ -59,6 +59,9 @@
 namespace Libs::Graphics {
 bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
                                const std::vector<uint32_t>& spirv);
+bool IsDriverCacheBuildIdentityUsableForTest(
+    std::string_view git_hash, std::string_view git_revision,
+    std::string_view worktree_fingerprint);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -66,6 +69,28 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+void TestDriverPipelineCacheBuildIdentity() {
+  constexpr std::string_view revision =
+      "0123456789abcdef0123456789abcdef01234567";
+  constexpr std::string_view fingerprint =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  Check(IsDriverCacheBuildIdentityUsableForTest(
+            "0123456-dirty", revision, fingerprint),
+        "a dirty build with an exact worktree fingerprint disabled the driver cache");
+  Check(IsDriverCacheBuildIdentityUsableForTest(
+            "0123456", revision, fingerprint),
+        "a clean build with an exact fingerprint disabled the driver cache");
+  Check(!IsDriverCacheBuildIdentityUsableForTest(
+             "unknown", revision, fingerprint) &&
+            !IsDriverCacheBuildIdentityUsableForTest(
+                "0123456-dirty", "unknown", fingerprint) &&
+            !IsDriverCacheBuildIdentityUsableForTest(
+                "0123456-dirty", revision, "unknown") &&
+            !IsDriverCacheBuildIdentityUsableForTest(
+                "0123456-dirty", revision, "1234"),
+        "driver cache accepted an incomplete build identity");
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -14466,6 +14491,11 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-identity-only") == 0) {
+    Libs::Graphics::TestDriverPipelineCacheBuildIdentity();
+    std::puts("KYTY_PIPELINE_CACHE_IDENTITY_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--compute-guest-workgroups-only") == 0) {
     Libs::Graphics::TestComputeGuestWorkgroups();
     std::puts("KYTY_COMPUTE_GUEST_WORKGROUPS_PASS");

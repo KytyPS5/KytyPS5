@@ -133,6 +133,12 @@
           <property name="text"><string>Fullscreen</string></property>
          </widget>
         </item>
+        <item row="5" column="1">
+         <widget class="QCheckBox" name="checkBox_readback">
+          <property name="toolTip"><string>Read back writable linear images</string></property>
+          <property name="text"><string>Enable readback</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

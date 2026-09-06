@@ -1448,6 +1448,301 @@ void TestDenseIndirectImageMaterialization() {
         "dense indirect image accepted a table it could not read");
 }
 
+void TestLoopBoundedDenseIndirectImage() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
+  auto *body = fixture.AddBlock();
+  auto *latch = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(header);
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  body->AddBranch(latch);
+  latch->AddBranch(header);
+  const auto block_id = [&](Block *block) {
+    return static_cast<uint32_t>(
+        std::ranges::find(fixture.program.blocks, block) -
+        fixture.program.blocks.begin());
+  };
+  const auto terminate = [&](Block *block, Block *taken, Block *not_taken,
+                             Value condition) {
+    auto &info = fixture.program.block_info[block_id(block)];
+    using Kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+    info.terminator.kind =
+        not_taken != nullptr ? Kind::ConditionalBranch : Kind::Branch;
+    info.terminator.true_block = block_id(taken);
+    if (not_taken != nullptr) {
+      info.terminator.false_block = block_id(not_taken);
+    }
+    info.condition = condition;
+  };
+
+  const auto low = fixture.UserData(0);
+  const auto high = fixture.UserData(1);
+  const auto count = fixture.UserData(5);
+  const auto other = fixture.Emit(
+      ValueOpcode::IEqual32,
+      {fixture.Emit(ValueOpcode::BitwiseAnd32,
+                    {fixture.Emit(ValueOpcode::LaneId), Value(1u)}),
+       Value(0u)});
+  auto *phi = &header->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+  const auto key = Value(phi);
+  const auto below =
+      fixture.Emit(ValueOpcode::SLessThan32, {key, count}, 0, header);
+  const auto gated = fixture.Emit(ValueOpcode::SelectU1,
+                                  {below, other, Value(false)}, 0, header);
+  const auto not_other =
+      fixture.Emit(ValueOpcode::LogicalNot, {other}, 0, header);
+  const auto either =
+      fixture.Emit(ValueOpcode::LogicalOr, {gated, not_other}, 0, header);
+  const auto active =
+      fixture.Emit(ValueOpcode::LogicalAnd, {other, either}, 0, header);
+  const auto any_active =
+      fixture.Emit(ValueOpcode::AnyLane, {active}, 0, header);
+  const auto leave =
+      fixture.Emit(ValueOpcode::LogicalNot, {any_active}, 0, header);
+  fixture.Emit(ValueOpcode::Reference, {leave}, 0, header);
+  terminate(entry, header, nullptr, Value());
+  terminate(header, exit, body, leave);
+  terminate(body, latch, nullptr, Value());
+  terminate(latch, header, nullptr, Value());
+
+  const auto scaled =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}, 0, body);
+  const auto based =
+      fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x6b0u)}, 0, body);
+  const auto second =
+      fixture.Emit(ValueOpcode::IAdd32, {Value(16u), based}, 0, body);
+  const auto first_half = fixture.Address(low, high, 0x29c);
+  const auto second_half = fixture.Address(low, high, 0x29c);
+  std::array<Value, 8> dwords{};
+  for (uint32_t index = 0; index < dwords.size(); index++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarAddress;
+    word.offset = (index % 4u) * sizeof(uint32_t);
+    dwords[index] = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {index < 4u ? first_half : second_half, index < 4u ? based : second,
+         Value(0u), Value(true)},
+        fixture.AddMemory(word, 0x29c), body);
+  }
+  const auto image_handle =
+      fixture.Emit(ValueOpcode::GetImageResource,
+                   {dwords[0], dwords[1], dwords[2], dwords[3], dwords[4],
+                    dwords[5], dwords[6], dwords[7]},
+                   MemoryFlags{0, 0x29c}, body);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image_handle,
+                fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)},
+                                0x29c),
+                fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x29c), body);
+  const auto next = fixture.Emit(ValueOpcode::IAdd32, {key, Value(1u)}, 0, latch);
+  phi->AddPhiOperand(entry, Value(0u));
+  phi->AddPhiOperand(latch, next);
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.images.size() == 1,
+        "loop-bounded dense image was not tracked as one image");
+  const auto &source = fixture.program
+                           .descriptor_sources[fixture.program.info.images[0].source];
+  Check(source.indirect_image.has_value() &&
+            source.indirect_image->key_bound != 0u &&
+            source.indirect_image->table_offset == 0x6b0u &&
+            source.indirect_image->bound_source !=
+                DescriptorSource::IndirectImage::NoBoundSource &&
+            source.indirect_image->bound_signed,
+        "loop counter key was not planned as a runtime-bounded dense table");
+
+  LinearTestMemory memory_image;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x40u;
+  descriptor[1] =
+      static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm)
+      << 20u;
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  for (uint32_t entry_index = 0; entry_index < 3u; entry_index++) {
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      const auto at = (0x6b0u + entry_index * 32u) / 4u + dword;
+      memory_image.words[at] = descriptor[dword];
+    }
+    memory_image.words[(0x6b0u + entry_index * 32u) / 4u] += entry_index;
+  }
+  std::array<uint32_t, 8> user_data{static_cast<uint32_t>(memory_image.base),
+                                    0u, 0u, 0u, 0u, 3u, 0u, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory_image,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "loop-bounded dense table did not materialize");
+  const auto mapping = specialization.images.empty()
+                           ? UINT32_MAX
+                           : specialization.images[0].indirect_mapping_offset;
+  Check(specialization.images.size() == 3u && snapshot.images.size() == 3u &&
+            mapping != UINT32_MAX &&
+            mapping + 1u + 3u * 2u <= snapshot.flattened_srt.size() &&
+            snapshot.flattened_srt[mapping] == 3u,
+        "loop-bounded dense table did not enumerate the runtime count");
+  for (uint32_t entry_index = 0; entry_index < 3u; entry_index++) {
+    const auto offset = mapping + 1u + entry_index * 2u;
+    Check(snapshot.flattened_srt[offset] == entry_index &&
+              snapshot.images[snapshot.flattened_srt[offset + 1u]].dwords[0] ==
+                  0x40u + entry_index,
+          "loop-bounded dense table read the wrong entry");
+  }
+  user_data[5] = 0x80000000u;
+  ResourceSnapshot zero_snapshot;
+  ResourceSpecialization zero_specialization;
+  Check(MaterializeResources(resource_plan, runtime, zero_snapshot,
+                             zero_specialization),
+        "zero-trip loop table did not materialize");
+  Check(zero_specialization.images.size() == 1u &&
+            zero_snapshot.images.size() == 1u &&
+            std::ranges::all_of(zero_snapshot.images[0].dwords,
+                                [](uint32_t dword) { return dword == 0u; }),
+        "a zero-trip loop enumerated live descriptors");
+  user_data[5] = 5000u;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a loop bound past the enumeration cap was accepted");
+}
+
+void TestReadLaneProbeIndirectImage() {
+  Fixture fixture;
+  const auto low = fixture.UserData(0);
+  const auto high = fixture.UserData(1);
+  const auto mask = fixture.UserData(4);
+  const auto other =
+      fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(6), Value(0u)});
+  const auto nonzero = fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), mask});
+  const auto scan = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+  const auto item =
+      fixture.Emit(ValueOpcode::SelectU32, {nonzero, scan, Value(32u)});
+  const auto below =
+      fixture.Emit(ValueOpcode::SGreaterThan32, {Value(32u), item});
+  const auto enable = fixture.Emit(ValueOpcode::LogicalAnd, {other, below});
+  const auto sixteen =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {item, Value(4u)});
+  const auto gated =
+      fixture.Emit(ValueOpcode::SelectU32, {enable, sixteen, Value(0u)});
+  const auto eight =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {gated, Value(3u)});
+  const auto nine = fixture.Emit(ValueOpcode::IAdd32, {eight, gated});
+  const auto offset = fixture.Emit(ValueOpcode::IAdd32, {Value(0xc00u), nine});
+  const auto records = fixture.Address(low, high, 0x1aec);
+  MemoryInfo key_word;
+  key_word.kind = ResourceKind::Flat;
+  const auto loaded = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                   {records, offset, Value(0u), enable},
+                                   fixture.AddMemory(key_word, 0x1aec));
+  const auto per_lane =
+      fixture.Emit(ValueOpcode::SelectU32, {enable, loaded, Value(0u)});
+  const auto lane = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(5)}), Value(63u)});
+  const auto key = fixture.Emit(ValueOpcode::ReadLane, {per_lane, lane});
+  const auto scaled =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  const auto based = fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x20e0u)});
+  const auto second = fixture.Emit(ValueOpcode::IAdd32, {Value(16u), based});
+  const auto first_half = fixture.Address(low, high, 0x1aec);
+  const auto second_half = fixture.Address(low, high, 0x1aec);
+  std::array<Value, 8> dwords{};
+  for (uint32_t index = 0; index < dwords.size(); index++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarAddress;
+    word.offset = (index % 4u) * sizeof(uint32_t);
+    dwords[index] = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {index < 4u ? first_half : second_half, index < 4u ? based : second,
+         Value(0u), Value(true)},
+        fixture.AddMemory(word, 0x1aec));
+  }
+  const auto image_handle =
+      fixture.Emit(ValueOpcode::GetImageResource,
+                   {dwords[0], dwords[1], dwords[2], dwords[3], dwords[4],
+                    dwords[5], dwords[6], dwords[7]},
+                   MemoryFlags{0, 0x1aec});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image_handle,
+                fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)},
+                                0x1aec),
+                fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x1aec));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.images.size() == 1,
+        "readlane probe fixture did not track one image");
+  const auto &source = fixture.program
+                           .descriptor_sources[fixture.program.info.images[0].source];
+  Check(source.indirect_image.has_value() &&
+            source.indirect_image->item_bound == 32u &&
+            source.indirect_image->selector_stride == 144u &&
+            source.indirect_image->selector_offset == 0xc00u &&
+            source.indirect_image->table_offset == 0x20e0u &&
+            source.indirect_image->key_bound == 0u,
+        "readlane waterfall was not planned as an address probe over its records");
+
+  LinearTestMemory memory_image;
+  for (uint32_t item = 0; item < 32u; item++) {
+    memory_image.words[(0xc00u + item * 144u) / 4u] = item % 3u;
+  }
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x40u;
+  descriptor[1] =
+      static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm)
+      << 20u;
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  for (uint32_t key_value = 0; key_value < 3u; key_value++) {
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory_image.words[(0x20e0u + key_value * 32u) / 4u + dword] =
+          descriptor[dword];
+    }
+    memory_image.words[(0x20e0u + key_value * 32u) / 4u] += key_value;
+  }
+  std::array<uint32_t, 8> user_data{static_cast<uint32_t>(memory_image.base),
+                                    0u, 0u, 0u, 0u, 0u, 0u, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory_image,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "address probe table did not materialize");
+  const auto mapping = specialization.images.empty()
+                           ? UINT32_MAX
+                           : specialization.images[0].indirect_mapping_offset;
+  Check(specialization.images.size() == 3u && snapshot.images.size() == 3u &&
+            mapping != UINT32_MAX &&
+            mapping + 1u + 3u * 2u <= snapshot.flattened_srt.size() &&
+            snapshot.flattened_srt[mapping] == 3u,
+        "address probe did not collect the records' distinct keys");
+  for (uint32_t key_value = 0; key_value < 3u; key_value++) {
+    const auto offset = mapping + 1u + key_value * 2u;
+    Check(snapshot.flattened_srt[offset] == key_value &&
+              snapshot.images[snapshot.flattened_srt[offset + 1u]].dwords[0] ==
+                  0x40u + key_value,
+          "address probe read the wrong table entry for a key");
+  }
+}
+
 void TestWaterfallDescriptorMatch() {
   WaterfallFixture built;
   const auto matches = FindWaterfallDescriptors(built.fixture.program);
@@ -2221,6 +2516,8 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("dense indirect images", TestDenseIndirectImageMaterialization);
+    Run("loop-bounded dense images", TestLoopBoundedDenseIndirectImage);
+    Run("readlane probe images", TestReadLaneProbeIndirectImage);
     Run("waterfall descriptor match", TestWaterfallDescriptorMatch);
     Run("waterfall near misses", TestWaterfallNearMissesRejected);
     Run("waterfall rewrite", TestWaterfallRewriteDescalarizes);

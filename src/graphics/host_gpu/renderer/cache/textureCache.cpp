@@ -1293,6 +1293,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
+			ValidateDepthComparisonPromotionLayout(desc.info, desc.type, m_slot_images[id]);
+		}
+		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;

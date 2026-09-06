@@ -15,6 +15,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -162,6 +163,7 @@ struct LinearTestMemory {
   uint64_t base = 0x1000;
   std::vector<uint32_t> words = std::vector<uint32_t>(0x2200 / 4);
   uint64_t fail_address = UINT64_MAX;
+  uint32_t reads = 0;
 };
 
 bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
@@ -172,6 +174,7 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
     return false;
   }
   *value = memory->words[(address - memory->base) / sizeof(uint32_t)];
+  memory->reads++;
   return true;
 }
 
@@ -455,6 +458,747 @@ void TestInvariantIndirectImageMaterialization() {
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
         "wrapped scalar immediate entered the invariant image proof");
+}
+
+std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = false,
+                                                    bool image_table = false,
+                                                    bool full_width_images = false) {
+  auto fixture = std::make_unique<Fixture>();
+  std::array<Value, 4> material_words;
+  std::array<Value, 4> index_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    material_words[dword] = fixture->UserData(dword);
+    index_words[dword] = fixture->UserData(dword + 4u);
+  }
+  const auto material = fixture->Buffer(material_words, 0x244);
+  const auto indices = fixture->Buffer(index_words, 0x24c);
+  auto *entry = fixture->block;
+  auto *loop = fixture->AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  for (auto &info : fixture->program.block_info) {
+    info.terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    info.terminator.true_block = 1u;
+  }
+  fixture->block = loop;
+  auto &counter = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U32));
+  const auto next =
+      fixture->Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
+  counter.AddPhiOperand(entry, Value(0u));
+  counter.AddPhiOperand(loop, next);
+  const auto index_offset =
+      fixture->Emit(ValueOpcode::IMul32, {Value(&counter), Value(4u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto index =
+      fixture->Emit(ValueOpcode::ReadConstBuffer, {indices, index_offset},
+                    fixture->AddMemory(scalar, 0x260));
+  const auto byte_offset =
+      fixture->Emit(ValueOpcode::IMul32,
+                    {index, Value(full_width_images ? 440u : 872u)});
+  if (full_width_images) {
+    const auto sampler = fixture->Sampler(
+        {Value(146u), Value(0x00fff000u), Value(0x05000000u), Value(0u)}, 0x1c30);
+    for (uint32_t image_index = 0; image_index < 2u; image_index++) {
+      std::array<Value, 8> image_words;
+      for (uint32_t dword = 0; dword < 8u; dword++) {
+        auto component = scalar;
+        component.offset = image_index * 32u + dword * 4u;
+        component.component_count = 8u;
+        component.component_index = dword;
+        image_words[dword] = fixture->Emit(
+            ValueOpcode::ReadConstBuffer, {material, byte_offset},
+            fixture->AddMemory(component, 0x1c10 + image_index * 8u));
+      }
+      const auto image = fixture->Image(image_words, 0x1c30 + image_index * 8u);
+      MemoryInfo sample;
+      sample.kind = ResourceKind::Image;
+      sample.image_dimension = Decoder::ImageDimension::Dim2D;
+      sample.image_r128 = false;
+      const auto sampled = fixture->Emit(
+          ValueOpcode::ImageSampleRaw, {image, sampler, fixture->ImageAddress()},
+          fixture->AddMemory(sample, 0x1c30 + image_index * 8u));
+      const auto sampled_x =
+          fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+      fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+    }
+    return fixture;
+  }
+  std::array<Value, 4> sampler_words;
+  std::array<Value, 8> image_words;
+  image_words.fill(Value(0u));
+  for (uint32_t dword = 0; dword < 8u; dword++) {
+    if ((ordinary_samplers && dword < 4u) || (image_table && dword >= 4u)) {
+      continue;
+    }
+    auto component = scalar;
+    component.offset = (ordinary_samplers ? 572u : 136u) + dword * 4u;
+    component.component_count = ordinary_samplers || image_table ? 4u : 8u;
+    component.component_index = ordinary_samplers ? dword - 4u : dword;
+    const auto word = fixture->Emit(
+        ValueOpcode::ReadConstBuffer, {material, byte_offset},
+        fixture->AddMemory(component, 0x5bc));
+    if (dword < 4u) {
+      sampler_words[dword] = word;
+    } else {
+      image_words[dword - 4u] = word;
+    }
+  }
+  if (image_table) {
+    auto selector_memory = scalar;
+    selector_memory.offset = 564u;
+    const auto selector = fixture->Emit(
+        ValueOpcode::ReadConstBuffer, {material, byte_offset},
+        fixture->AddMemory(selector_memory, 0xbec));
+    const auto table_index =
+        fixture->Emit(ValueOpcode::BitwiseAnd32, {selector, Value(255u)});
+    const auto table_offset =
+        fixture->Emit(ValueOpcode::ShiftLeftLogical32, {table_index, Value(5u)});
+    const auto address =
+        fixture->Address(fixture->UserData(8), fixture->UserData(9), 0xbf8);
+    for (uint32_t dword = 0; dword < 8u; dword++) {
+      MemoryInfo component;
+      component.kind = ResourceKind::ScalarAddress;
+      component.offset = 544u + dword * 4u;
+      component.component_count = 8u;
+      component.component_index = dword;
+      image_words[dword] = fixture->Emit(
+          ValueOpcode::LoadAddressU32, {address, table_offset, Value(0u), Value(true)},
+          fixture->AddMemory(component, 0xbf8));
+    }
+  }
+  const auto image = fixture->Image(image_words, 0x5c8);
+  if (ordinary_samplers) {
+    sampler_words = {Value(146u), Value(0x00fff000u), Value(0x05000000u), Value(0u)};
+  }
+  const auto sampler = fixture->Sampler(sampler_words, 0x5c8);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  sample.image_r128 = !image_table;
+  const auto sampled = fixture->Emit(
+      ValueOpcode::ImageSampleRaw, {image, sampler, fixture->ImageAddress()},
+      fixture->AddMemory(sample, 0x5c8));
+  const auto sampled_x =
+      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+  fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  if (ordinary_samplers) {
+    sampler_words[0] = Value(0u);
+    const auto repeat = fixture->Sampler(sampler_words, 0x5d0);
+    const auto repeated = fixture->Emit(
+        ValueOpcode::ImageSampleRaw, {image, repeat, fixture->ImageAddress()},
+        fixture->AddMemory(sample, 0x5d0));
+    const auto repeated_x =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {repeated, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {repeated_x});
+  }
+  return fixture;
+}
+
+uint32_t InlineCandidateForKey(const ResourceSnapshot &snapshot,
+                                const ResourceSpecialization &specialization,
+                                uint32_t key, uint32_t root = 0u) {
+  Check(root < specialization.images.size(), "inline image specialization is missing");
+  const auto offset = specialization.images[root].indirect_mapping_offset;
+  Check(offset < snapshot.flattened_srt.size(), "inline mapping is missing");
+  const auto count = snapshot.flattened_srt[offset];
+  Check(static_cast<uint64_t>(offset) + 1u + 2ull * count <=
+            snapshot.flattened_srt.size(),
+        "inline mapping exceeds its SRT allocation");
+  for (uint32_t entry = 0; entry < count; entry++) {
+    const auto position = offset + 1u + entry * 2u;
+    if (entry != 0u) {
+      Check(snapshot.flattened_srt[position - 2u] <
+                snapshot.flattened_srt[position],
+            "inline keys are not unique and sorted");
+    }
+    if (snapshot.flattened_srt[position] == key) {
+      const auto candidate = snapshot.flattened_srt[position + 1u];
+      uint32_t ordinal = 0;
+      for (uint32_t image = 0; image < specialization.images.size(); image++) {
+        if (specialization.images[image].indirect_root == root) {
+          if (ordinal++ == candidate) {
+            Check(image < snapshot.images.size(),
+                  "inline key selects an absent image descriptor");
+            return image;
+          }
+        }
+      }
+      Check(false, "inline key selects an absent image candidate");
+    }
+  }
+  return root;
+}
+
+void TestInlineDescriptorPairs() {
+  auto fixture = MakeInlineDescriptorFixture();
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(fixture->program.info.images.size() == 1u &&
+            fixture->program.info.samplers.size() == 1u,
+        "inline descriptor pair was not tracked");
+  const auto &image_source = fixture->program.descriptor_sources.at(
+      fixture->program.info.images[0].source);
+  const auto &sampler_source = fixture->program.descriptor_sources.at(
+      fixture->program.info.samplers[0].source);
+  Check(image_source.inline_descriptor.has_value() &&
+            sampler_source.inline_descriptor.has_value(),
+        "inline image or sampler lost its materialization provenance");
+  const auto &image_plan = *image_source.inline_descriptor;
+  const auto &sampler_plan = *sampler_source.inline_descriptor;
+  Check(image_plan.buffer_source == sampler_plan.buffer_source &&
+            image_plan.selector_stride == 872u &&
+            sampler_plan.selector_stride == 872u &&
+            image_plan.descriptor_offset == 152u &&
+            sampler_plan.descriptor_offset == 136u,
+        "inline descriptor offsets or shared material buffer are incorrect");
+  Value live_key;
+  for (const auto [opcode, key_arg] :
+       {std::pair{ValueOpcode::GetImageResource, image_plan.key_arg},
+        std::pair{ValueOpcode::GetSamplerResource, sampler_plan.key_arg}}) {
+    const auto handle = std::ranges::find_if(
+        *fixture->block, [&](const Inst &inst) { return inst.GetOpcode() == opcode; });
+    Check(handle != fixture->block->end() && key_arg < handle->NumArgs(),
+          "inline descriptor handle disappeared during DCE");
+    const auto key = handle->Arg(key_arg).Resolve();
+    const auto *multiply = key.TryInstruction();
+    Check(multiply != nullptr && multiply->GetOpcode() == ValueOpcode::IMul32,
+          "inline descriptor discarded the live wrapped byte offset");
+    const auto *index = multiply->Arg(0).ResolveInstruction();
+    Check(index != nullptr && index->GetOpcode() == ValueOpcode::ReadConstBuffer,
+          "loop-dependent material index was flattened or removed");
+    if (!live_key.IsEmpty()) {
+      Check(key == live_key, "image and sampler use different live selection keys");
+    }
+    live_key = key;
+  }
+
+  std::array<uint32_t, 8> user_data{0x1000u, 872u << 16u, 4u, 0u,
+                                   0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  DescriptorValue image_a;
+  image_a.dword_count = 8u;
+  image_a.dwords[0] = 0x20u;
+  image_a.dwords[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  image_a.dwords[2] = 3u | (3u << 14u);
+  image_a.dwords[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  auto image_b = image_a;
+  image_b.dwords[0] = 0x40u;
+  DescriptorValue repeat;
+  repeat.dword_count = 4u;
+  auto clamp = repeat;
+  const auto clamp_mode = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::SamplerClampMode::kClampLastTexel);
+  clamp.dwords[0] = clamp_mode | (clamp_mode << 3u) | (clamp_mode << 6u);
+  for (uint32_t record = 0; record < 4u; record++) {
+    const auto &image = record < 2u ? image_a : image_b;
+    const auto &sampler = record % 2u == 0u ? clamp : repeat;
+    for (uint32_t dword = 0; dword < 4u; dword++) {
+      memory.words[(record * 872u + 136u) / 4u + dword] = sampler.dwords[dword];
+      memory.words[(record * 872u + 152u) / 4u + dword] = image.dwords[dword];
+    }
+  }
+  // This index is outside NumRecords but wraps to the interior byte offset 8.
+  constexpr uint32_t wrapped_index = 443287909u;
+  static_assert(static_cast<uint32_t>(uint64_t{wrapped_index} * 872u) == 8u);
+  memory.words[(0x2000u - memory.base) / 4u] = wrapped_index;
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // The loop selector belongs to the GPU. Materialization must not evaluate it.
+  memory.fail_address = 0x2000u;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "inline image/sampler table did not materialize independently of its loop selector");
+  memory.fail_address = UINT64_MAX;
+  std::array<uint32_t, 4> candidates;
+  for (uint32_t record = 0; record < 4u; record++) {
+    const auto candidate = InlineCandidateForKey(snapshot, specialization, record * 872u);
+    candidates[record] = candidate;
+    const auto sampler = specialization.images[candidate].indirect_sampler;
+    Check(candidate != 0u && sampler < snapshot.samplers.size() &&
+              snapshot.images[candidate] == (record < 2u ? image_a : image_b) &&
+              snapshot.samplers[sampler] == (record % 2u == 0u ? clamp : repeat),
+          "inline record selected the wrong image/sampler pair");
+    for (uint32_t previous = 0; previous < record; previous++) {
+      Check(candidates[previous] != candidate,
+            "inline specialization merged distinct image/sampler pairs");
+    }
+  }
+  const auto wrapped = InlineCandidateForKey(snapshot, specialization, 8u);
+  Check(wrapped != 0u, "wrapped interior offset was omitted from inline mapping");
+  const auto wrapped_sampler = specialization.images[wrapped].indirect_sampler;
+  auto overlapping_sampler = repeat;
+  overlapping_sampler.dwords[2] = image_a.dwords[0];
+  overlapping_sampler.dwords[3] = image_a.dwords[1];
+  Check(wrapped_sampler < snapshot.samplers.size() &&
+            snapshot.samplers[wrapped_sampler] == overlapping_sampler &&
+            std::ranges::all_of(snapshot.images[wrapped].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "wrapped interior descriptor words were read from the wrong byte offsets");
+  Check(InlineCandidateForKey(snapshot, specialization, UINT32_MAX - 7u) == 0u &&
+            std::ranges::all_of(snapshot.images[0].dwords,
+                                [](uint32_t word) { return word == 0u; }) &&
+            std::ranges::all_of(snapshot.samplers[0].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "out-of-bounds inline keys did not retain an explicit null pair");
+
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  user_data[3] = 1u << 30u;
+  const auto reads_before_invalid_type = memory.reads;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            memory.reads == reads_before_invalid_type &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "unsupported inline scalar-buffer type read memory or partially updated resources");
+  user_data[3] = 0u;
+  memory.fail_address = memory.base + 2u * 872u + 152u;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "failed inline descriptor read partially updated resource state");
+  memory.fail_address = UINT64_MAX;
+  user_data[2] = 602u;
+  const auto prior_reads = memory.reads;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            memory.reads == prior_reads &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "excessive wrapped-offset probes were not rejected before reading memory");
+  user_data[2] = 4u;
+
+  for (uint32_t dword = 0; dword < 4u; dword++) {
+    memory.words[(3u * 872u + 136u) / 4u + dword] = clamp.dwords[dword];
+  }
+  ResourceSnapshot collapsed;
+  ResourceSpecialization collapsed_specialization;
+  Check(MaterializeResources(resource_plan, runtime, collapsed, collapsed_specialization) &&
+            InlineCandidateForKey(collapsed, collapsed_specialization, 2u * 872u) ==
+                InlineCandidateForKey(collapsed, collapsed_specialization, 3u * 872u) &&
+            collapsed.images.size() < snapshot.images.size(),
+        "identical inline image/sampler pairs were not deduplicated");
+
+  // A final partial dword must be zero even if backing memory contains that word.
+  user_data[1] = 0u;
+  user_data[2] = 166u;
+  memory.fail_address = memory.base + 164u;
+  ResourceSnapshot partial;
+  ResourceSpecialization partial_specialization;
+  Check(MaterializeResources(resource_plan, runtime, partial, partial_specialization),
+        "partial inline descriptor read escaped the scalar buffer bounds");
+  const auto partial_candidate = InlineCandidateForKey(partial, partial_specialization, 0u);
+  Check(std::ranges::all_of(partial.images[partial_candidate].dwords,
+                           [](uint32_t word) { return word == 0u; }),
+        "partial compact image descriptor consumed its out-of-bounds type word");
+
+  ApplyResourceSpecialization(fixture->program, prior_specialization);
+  Check(fixture->program.info.images.size() == prior_snapshot.images.size(),
+        "inline pair specialization did not expand the native image resources");
+  for (const auto candidate : candidates) {
+    const auto sampler = fixture->program.info.images[candidate].indirect_sampler;
+    Check(sampler < fixture->program.info.samplers.size() &&
+              std::ranges::any_of(fixture->program.info.sampled_pairs,
+                                  [&](const SampledResourcePair &pair) {
+                                    return pair.image == candidate && pair.sampler == sampler;
+                                  }),
+          "specialized inline candidate lost its paired sampler binding");
+  }
+}
+
+void TestInlineImageUniformSamplers() {
+  auto fixture = MakeInlineDescriptorFixture(true);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(fixture->program.info.images.size() == 1u &&
+            fixture->program.info.samplers.size() == 2u &&
+            fixture->program.info.sampled_pairs.size() == 2u,
+        "one inline image with two ordinary samplers was not tracked");
+  const auto &image_source = fixture->program.descriptor_sources.at(
+      fixture->program.info.images[0].source);
+  Check(image_source.inline_descriptor.has_value() &&
+            image_source.inline_descriptor->descriptor_offset == 588u &&
+            image_source.inline_descriptor->selector_stride == 872u,
+        "image-only inline source lost its descriptor offset");
+  for (const auto &sampler : fixture->program.info.samplers) {
+    Check(!fixture->program.descriptor_sources.at(sampler.source).inline_descriptor.has_value(),
+          "ordinary sampler was incorrectly marked as an inline descriptor");
+  }
+
+  std::array<uint32_t, 8> user_data{0x1000u, 872u << 16u, 2u, 0u,
+                                   0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  DescriptorValue image_a;
+  image_a.dword_count = 8u;
+  image_a.dwords[0] = 0x20u;
+  image_a.dwords[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  image_a.dwords[2] = 3u | (3u << 14u);
+  image_a.dwords[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  auto image_b = image_a;
+  image_b.dwords[0] = 0x40u;
+  for (uint32_t dword = 0; dword < 4u; dword++) {
+    memory.words[588u / 4u + dword] = image_a.dwords[dword];
+    memory.words[(872u + 588u) / 4u + dword] = image_b.dwords[dword];
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "inline image with ordinary samplers did not materialize");
+  const auto first = InlineCandidateForKey(snapshot, specialization, 0u);
+  const auto second = InlineCandidateForKey(snapshot, specialization, 872u);
+  Check(snapshot.images.size() == 3u && first != 0u && second != 0u && first != second &&
+            snapshot.images[first] == image_a && snapshot.images[second] == image_b &&
+            InlineCandidateForKey(snapshot, specialization, UINT32_MAX - 7u) == 0u &&
+            std::ranges::all_of(snapshot.images[0].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "image-only inline mapping lost a texture or its null fallback");
+  DescriptorValue clamp;
+  clamp.dword_count = 4u;
+  clamp.dwords = {146u, 0x00fff000u, 0x05000000u, 0u, 0u, 0u, 0u, 0u};
+  auto repeat = clamp;
+  repeat.dwords[0] = 0u;
+  Check(snapshot.samplers == std::vector<DescriptorValue>{clamp, repeat} &&
+            specialization.sampler_origins == std::vector<uint32_t>{0u, 1u} &&
+            std::ranges::all_of(specialization.images, [](const auto &image) {
+              return image.indirect_sampler == UINT32_MAX;
+            }),
+        "image-only specialization replaced or cloned ordinary samplers");
+  Check(specialization.sampled_pairs.size() == 6u,
+        "image-only specialization did not expand both ordinary sampler uses");
+  for (uint32_t image = 0; image < snapshot.images.size(); image++) {
+    for (uint32_t sampler = 0; sampler < 2u; sampler++) {
+      Check(std::ranges::any_of(specialization.sampled_pairs,
+                                [&](const SampledResourcePair &pair) {
+                                  return pair.image == image && pair.sampler == sampler;
+                                }),
+            "inline image candidate lost one of its ordinary sampler uses");
+    }
+  }
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  const auto prior_reads = memory.reads;
+  user_data[3] = 1u << 30u;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            memory.reads == prior_reads &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "image-only inline source accepted an unsupported scalar-buffer type");
+  user_data[3] = 0u;
+  ApplyResourceSpecialization(fixture->program, specialization);
+  Check(fixture->program.info.images.size() == 3u &&
+            fixture->program.info.samplers.size() == 2u &&
+            fixture->program.info.sampled_pairs == specialization.sampled_pairs &&
+            std::ranges::all_of(fixture->program.info.images, [](const auto &image) {
+              return image.indirect_sampler == UINT32_MAX;
+            }),
+        "applied image-only specialization lost ordinary sampler bindings");
+}
+
+void TestInlineFullWidthImages() {
+  auto fixture = MakeInlineDescriptorFixture(true, false, true);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(fixture->program.info.images.size() == 2u &&
+            fixture->program.info.samplers.size() == 1u &&
+            fixture->program.info.sampled_pairs.size() == 2u,
+        "two full-width inline images with an ordinary sampler were not tracked");
+  uint32_t material_source = UINT32_MAX;
+  for (uint32_t image = 0; image < 2u; image++) {
+    const auto source = fixture->program.info.images[image].source;
+    const auto &descriptor = resource_plan.descriptor_sources.at(source);
+    Check(!fixture->program.info.images[image].r128 &&
+              descriptor.inline_descriptor.has_value() &&
+              !descriptor.inline_descriptor->image_table.has_value() &&
+              descriptor.inline_descriptor->descriptor_dwords == 8u &&
+              descriptor.inline_descriptor->descriptor_offset == image * 32u &&
+              descriptor.inline_descriptor->selector_stride == 440u,
+          "full-width inline descriptor lost its width, offset, or selector stride");
+    if (material_source == UINT32_MAX) {
+      material_source = descriptor.inline_descriptor->buffer_source;
+    }
+    Check(descriptor.inline_descriptor->buffer_source == material_source,
+          "full-width inline images lost their shared material buffer");
+  }
+  Check(!resource_plan.descriptor_sources.at(
+             fixture->program.info.samplers[0].source).inline_descriptor.has_value(),
+        "full-width inline image incorrectly tagged its ordinary sampler");
+  Value selection_key;
+  uint32_t image_handles = 0;
+  for (const auto &instruction : *fixture->block) {
+    if (instruction.GetOpcode() != ValueOpcode::GetImageResource) {
+      continue;
+    }
+    const auto &inline_source = *resource_plan.descriptor_sources.at(
+        fixture->program.info.images[image_handles++].source).inline_descriptor;
+    const auto key = instruction.Arg(inline_source.key_arg).Resolve();
+    const auto *multiply = key.TryInstruction();
+    Check(multiply != nullptr && multiply->GetOpcode() == ValueOpcode::IMul32 &&
+              multiply->Arg(0).ResolveInstruction() != nullptr &&
+              multiply->Arg(0).ResolveInstruction()->GetOpcode() == ValueOpcode::ReadConstBuffer,
+          "full-width inline image lost its live loop-dependent selector");
+    Check(selection_key.IsEmpty() || selection_key == key,
+          "full-width inline images use different live selection keys");
+    selection_key = key;
+  }
+  Check(image_handles == 2u, "full-width inline image handle disappeared during DCE");
+
+  std::array<uint32_t, 8> user_data{0x1000u, 440u << 16u, 2u, 0u,
+                                   0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  DescriptorValue image_a;
+  image_a.dword_count = 8u;
+  image_a.dwords[0] = 0x20u;
+  image_a.dwords[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  image_a.dwords[2] = 3u | (3u << 14u);
+  image_a.dwords[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  image_a.dwords[4] = 1u;
+  image_a.dwords[5] = 2u;
+  image_a.dwords[6] = 4u;
+  image_a.dwords[7] = 0x80u;
+  auto image_b = image_a;
+  // The compact halves are identical: deduplication must examine all eight words.
+  image_b.dwords[4] = 2u;
+  image_b.dwords[5] = 4u;
+  image_b.dwords[6] = 8u;
+  image_b.dwords[7] = 0x100u;
+  for (uint32_t record = 0; record < 2u; record++) {
+    for (uint32_t image = 0; image < 2u; image++) {
+      const auto &descriptor = (record ^ image) == 0u ? image_a : image_b;
+      for (uint32_t dword = 0; dword < 8u; dword++) {
+        memory.words[(record * 440u + image * 32u) / 4u + dword] =
+            descriptor.dwords[dword];
+      }
+    }
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  memory.fail_address = 0x2000u;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "full-width inline images required CPU evaluation of the live selector");
+  memory.fail_address = UINT64_MAX;
+  Check(snapshot.images.size() == 6u && snapshot.samplers.size() == 1u &&
+            specialization.sampler_origins == std::vector<uint32_t>{0u} &&
+            specialization.sampled_pairs.size() == 6u &&
+            std::ranges::all_of(specialization.images, [](const auto &image) {
+              return image.indirect_sampler == UINT32_MAX;
+            }),
+        "full-width image candidates were compacted or cloned the ordinary sampler");
+  for (uint32_t image = 0; image < 2u; image++) {
+    const auto first = InlineCandidateForKey(snapshot, specialization, 0u, image);
+    const auto second = InlineCandidateForKey(snapshot, specialization, 440u, image);
+    Check(first != second &&
+              snapshot.images[first] == (image == 0u ? image_a : image_b) &&
+              snapshot.images[second] == (image == 0u ? image_b : image_a) &&
+              InlineCandidateForKey(snapshot, specialization, UINT32_MAX - 7u, image) == image &&
+              std::ranges::all_of(snapshot.images[image].dwords,
+                                  [](uint32_t word) { return word == 0u; }),
+          "full-width image mapping lost an upper descriptor word or its null fallback");
+  }
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  for (const uint64_t failed_address : {memory.base + 28u, memory.base + 60u,
+                                        memory.base + 440u + 28u,
+                                        memory.base + 440u + 60u}) {
+    memory.fail_address = failed_address;
+    Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+              SameResourceSnapshot(snapshot, prior_snapshot) &&
+              specialization == prior_specialization,
+          "failed final inline descriptor word was skipped or partially committed");
+  }
+
+  // Scalar-buffer bases are rounded down, and a partial final dword reads as
+  // zero without invoking the callback for any of its in-bounds bytes.
+  user_data[0] = static_cast<uint32_t>(memory.base) + 3u;
+  user_data[1] = 0u;
+  memory.fail_address = memory.base + 60u;
+  auto partial_b = image_b;
+  partial_b.dwords[7] = 0u;
+  for (const uint32_t size : {61u, 62u, 63u}) {
+    user_data[2] = size;
+    ResourceSnapshot partial;
+    ResourceSpecialization partial_specialization;
+    Check(MaterializeResources(resource_plan, runtime, partial, partial_specialization),
+          "partial final inline descriptor word escaped scalar-buffer bounds or base alignment");
+    const auto first = InlineCandidateForKey(partial, partial_specialization, 0u, 0u);
+    const auto second = InlineCandidateForKey(partial, partial_specialization, 0u, 1u);
+    Check(partial.images[first] == image_a && partial.images[second] == partial_b,
+          "partial full-width descriptor did not preserve its first seven words");
+  }
+  user_data[2] = 64u;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "newly in-bounds eighth descriptor word did not invoke the failing callback");
+  memory.fail_address = UINT64_MAX;
+  ResourceSnapshot complete_tail;
+  ResourceSpecialization complete_tail_specialization;
+  Check(MaterializeResources(resource_plan, runtime, complete_tail,
+                             complete_tail_specialization) &&
+            complete_tail.images[InlineCandidateForKey(
+                complete_tail, complete_tail_specialization, 0u, 1u)] == image_b,
+        "full-width descriptor did not recover its eighth word at the exact buffer boundary");
+  ApplyResourceSpecialization(fixture->program, prior_specialization);
+  Check(fixture->program.info.images.size() == prior_snapshot.images.size() &&
+            fixture->program.info.samplers.size() == 1u &&
+            fixture->program.info.sampled_pairs == prior_specialization.sampled_pairs &&
+            std::ranges::all_of(fixture->program.info.images, [](const ImageResource &image) {
+              return !image.r128 && image.indirect_sampler == UINT32_MAX;
+            }),
+        "applied full-width image specialization changed width or ordinary sampler bindings");
+}
+
+void TestInlineImageAddressTable() {
+  auto fixture = MakeInlineDescriptorFixture(false, true);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(fixture->program.info.images.size() == 1u &&
+            fixture->program.info.samplers.size() == 1u &&
+            !fixture->program.info.images[0].r128,
+        "nested raw image table was not tracked as a full-width sampled image");
+  const auto &source = fixture->program.descriptor_sources.at(
+      fixture->program.info.images[0].source);
+  Check(source.inline_descriptor.has_value() &&
+            source.inline_descriptor->image_table.has_value(),
+        "nested image table lost its material and address provenance");
+  const auto &inline_plan = *source.inline_descriptor;
+  const auto &table_plan = *inline_plan.image_table;
+  Check(inline_plan.selector_stride == 872u && inline_plan.descriptor_offset == 564u &&
+            table_plan.table_offset == 544u && table_plan.index_shift == 0u &&
+            table_plan.index_mask == 255u &&
+            table_plan.address_source < resource_plan.descriptor_sources.size() &&
+            resource_plan.descriptor_sources[table_plan.address_source].dword_count == 2u,
+        "nested image-table plan changed the selector or uniform raw address");
+  const auto handle = std::ranges::find_if(*fixture->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::GetImageResource;
+  });
+  Check(handle != fixture->block->end() && inline_plan.key_arg < handle->NumArgs(),
+        "nested image-table handle was removed during DCE");
+  const auto *live_key = handle->Arg(inline_plan.key_arg).ResolveInstruction();
+  Check(live_key != nullptr && live_key->GetOpcode() == ValueOpcode::IMul32 &&
+            live_key->Arg(0).ResolveInstruction() != nullptr &&
+            live_key->Arg(0).ResolveInstruction()->GetOpcode() == ValueOpcode::ReadConstBuffer,
+        "nested image table evaluated or discarded the loop-dependent byte-offset key");
+
+  std::array<uint32_t, 10> user_data{0x1000u, 872u << 16u, 2u, 0u,
+                                    0x2000u, 0u, 16u, 0u, 0x2400u, 0u};
+  LinearTestMemory memory;
+  DescriptorValue image_a;
+  image_a.dword_count = 8u;
+  image_a.dwords[0] = 0x20u;
+  image_a.dwords[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  image_a.dwords[2] = 3u | (3u << 14u);
+  image_a.dwords[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  image_a.dwords[4] = 1u;
+  image_a.dwords[7] = 0x80u;
+  auto image_b = image_a;
+  image_b.dwords[0] = 0x40u;
+  const uint64_t table_address = 0x2400u + 544u;
+  for (uint32_t dword = 0; dword < 8u; dword++) {
+    memory.words[(table_address - memory.base) / 4u + dword] = image_a.dwords[dword];
+    memory.words[(table_address + 32u - memory.base) / 4u + dword] = image_b.dwords[dword];
+  }
+  DescriptorValue clamp;
+  clamp.dword_count = 4u;
+  clamp.dwords[0] = 146u;
+  for (uint32_t record = 0; record < 2u; record++) {
+    memory.words[(record * 872u + 136u) / 4u] = clamp.dwords[0];
+    // The high selector bits must not leak into the table index.
+    memory.words[(record * 872u + 564u) / 4u] = record == 0u ? 0x101u : 0x100u;
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  memory.fail_address = 0x2000u;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "nested image table required CPU evaluation of the live loop selector");
+  memory.fail_address = UINT64_MAX;
+  const auto first = InlineCandidateForKey(snapshot, specialization, 0u);
+  const auto second = InlineCandidateForKey(snapshot, specialization, 872u);
+  Check(first != 0u && second != 0u && first != second &&
+            snapshot.images[first] == image_b && snapshot.images[second] == image_a,
+        "nested image table ignored its masked index or raw eight-dword descriptor");
+  for (const auto candidate : {first, second}) {
+    const auto sampler = specialization.images[candidate].indirect_sampler;
+    Check(sampler < snapshot.samplers.size() && snapshot.samplers[sampler] == clamp,
+          "nested image table lost the inline sampler paired with its material record");
+  }
+  const auto fallback_sampler = specialization.images[0].indirect_sampler;
+  Check(InlineCandidateForKey(snapshot, specialization, UINT32_MAX - 7u) == 0u &&
+            snapshot.images[0] == image_a && fallback_sampler < snapshot.samplers.size() &&
+            std::ranges::all_of(snapshot.samplers[fallback_sampler].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "out-of-bounds material selector replaced valid image-table entry zero with null");
+
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  for (const uint64_t failed_address : {table_address + 28u, table_address + 32u + 28u}) {
+    memory.fail_address = failed_address;
+    Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+              SameResourceSnapshot(snapshot, prior_snapshot) &&
+              specialization == prior_specialization,
+          "failed raw image-table read partially updated resources or skipped descriptor tail");
+  }
+  memory.fail_address = memory.base + 564u;
+  user_data[1] = 0u;
+  user_data[2] = 566u;
+  ResourceSnapshot partial;
+  ResourceSpecialization partial_specialization;
+  Check(MaterializeResources(resource_plan, runtime, partial, partial_specialization),
+        "partial material selector read escaped scalar-buffer bounds");
+  const auto partial_candidate = InlineCandidateForKey(partial, partial_specialization, 0u);
+  const auto partial_sampler = partial_specialization.images[partial_candidate].indirect_sampler;
+  Check(partial.images[partial_candidate] == image_a && partial_sampler < partial.samplers.size() &&
+            partial.samplers[partial_sampler] == clamp,
+        "partial material selector did not select table entry zero with its still-valid sampler");
+
+  ApplyResourceSpecialization(fixture->program, prior_specialization);
+  Check(fixture->program.info.images.size() == prior_snapshot.images.size() &&
+            std::ranges::all_of(fixture->program.info.images,
+                                [](const ImageResource &image) { return !image.r128; }),
+        "nested table specialization changed the native descriptor width");
 }
 
 void TestDenseBufferTracking() {
@@ -1474,6 +2218,10 @@ int main() {
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("inline descriptor pairs", TestInlineDescriptorPairs);
+    Run("inline image uniform samplers", TestInlineImageUniformSamplers);
+    Run("inline full-width images", TestInlineFullWidthImages);
+    Run("inline image address table", TestInlineImageAddressTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);

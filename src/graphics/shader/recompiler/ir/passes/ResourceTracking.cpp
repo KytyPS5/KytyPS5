@@ -98,6 +98,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		PlanInlineDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -126,9 +127,19 @@ public:
 				m_program.memory_info[index].planning_only = true;
 			}
 		}
+		for (const auto& plan: m_inline_descriptors) {
+			plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 1; dword < plan.handle->NumArgs(); dword++) {
+				plan.handle->SetArg(dword, dword <= plan.root_count ? plan.roots[dword - 1u] : plan.key);
+			}
+		}
+		for (const auto index: m_inline_planning_memory) {
+			m_program.memory_info[index].planning_only = true;
+		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
-			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+			return std::ranges::find(m_inline_planning_reads, inst) != m_inline_planning_reads.end() ||
+			       std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
@@ -158,6 +169,17 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+	};
+
+	struct InlineDescriptorPlan {
+		Inst*                      handle = nullptr;
+		uint32_t                   source = 0;
+		Value                      key;
+		std::array<Value, 6>        roots {};
+		std::array<uint32_t, 8>     memory {};
+		std::array<const Inst*, 8>  reads {};
+		uint32_t                   root_count = 4;
+		uint32_t                   read_count = 4;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -206,7 +228,8 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image != descriptor.indirect_image) {
+			    current.indirect_image != descriptor.indirect_image ||
+			    current.inline_descriptor != descriptor.inline_descriptor) {
 				continue;
 			}
 			bool same = true;
@@ -430,7 +453,8 @@ private:
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+		return std::ranges::find(m_inline_planning_memory, index) != m_inline_planning_memory.end() ||
+		       std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
 			return std::ranges::find(plan.memory, index) != plan.memory.end();
 		});
@@ -450,6 +474,275 @@ private:
 				IndirectImagePlan plan;
 				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
+				}
+			}
+		}
+	}
+
+	const InlineDescriptorPlan* FindInlineDescriptor(const Inst& handle) const {
+		const auto found = std::ranges::find_if(m_inline_descriptors, [&](const auto& plan) {
+			return plan.handle == &handle;
+		});
+		return found == m_inline_descriptors.end() ? nullptr : &*found;
+	}
+
+	static bool MatchInlineStride(Value key, uint32_t& stride) {
+		const auto* multiply = key.Resolve().TryInstruction();
+		return multiply != nullptr && multiply->GetOpcode() == ValueOpcode::IMul32 &&
+		       multiply->NumArgs() == 2u &&
+		       (ImmediateU32(multiply->Arg(0), stride) || ImmediateU32(multiply->Arg(1), stride)) &&
+		       stride != 0u;
+	}
+
+	bool TryMakeInlineDescriptor(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan,
+	                             bool compact_image = true) {
+		const bool image = handle.GetOpcode() == ValueOpcode::GetImageResource;
+		if ((!image && handle.GetOpcode() != ValueOpcode::GetSamplerResource) ||
+		    handle.NumArgs() != (image ? 8u : 4u)) {
+			return false;
+		}
+		const uint32_t descriptor_dwords = image && !compact_image ? 8u : 4u;
+		if (image && compact_image) {
+			for (uint32_t i = 4u; i < 8u; i++) {
+				uint32_t upper = 0;
+				if (!ImmediateU32(handle.Arg(i), upper) || upper != 0u) {
+					return false;
+				}
+			}
+		}
+		Inst* buffer = nullptr;
+		uint32_t base_offset = 0;
+		for (uint32_t i = 0; i < descriptor_dwords; i++) {
+			const auto* read = handle.Arg(i).Resolve().TryInstruction();
+			uint32_t memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			auto* current_buffer = read->Arg(0).Resolve().TryInstruction();
+			if (current_buffer == nullptr || (buffer != nullptr && buffer != current_buffer)) {
+				return false;
+			}
+			buffer = current_buffer;
+			if (i == 0u) {
+				base_offset = memory->offset;
+				plan.key = read->Arg(1).Resolve();
+			} else if (static_cast<uint64_t>(base_offset) + i * 4u != memory->offset ||
+			           !EquivalentValue(m_program, plan.key, read->Arg(1))) {
+				return false;
+			}
+			plan.memory[i] = memory_index;
+			plan.reads[i] = read;
+		}
+		// Keep the wrapped byte offset on the GPU, including loop-carried selectors.
+		// Only the buffer descriptor itself must be runtime-uniform.
+		uint32_t stride = 0;
+		if (!MatchInlineStride(plan.key, stride)) {
+			return false;
+		}
+		DescriptorSource buffer_source;
+		uint32_t buffer_source_index = 0;
+		if (!MakeRuntimeBufferSource(*buffer, pc, buffer_source_index, buffer_source)) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = image ? 8u : 4u;
+		std::copy_n(buffer_source.dwords.begin(), 4u, source.dwords.begin());
+		for (uint32_t i = 4u; i < source.dword_count; i++) {
+			source.dwords[i] = Value(0u);
+		}
+		source.inline_descriptor = DescriptorSource::InlineDescriptor {
+		    buffer_source_index, stride, base_offset, 0u};
+		source.inline_descriptor->descriptor_dwords = descriptor_dwords;
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		plan.read_count = descriptor_dwords;
+		std::copy_n(buffer_source.dwords.begin(), 4u, plan.roots.begin());
+		return true;
+	}
+
+	bool TryMakeMaterialImageTable(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		Inst* address = nullptr;
+		Value table_index;
+		uint32_t table_offset = 0;
+		for (uint32_t i = 0; i < 8u; i++) {
+			const auto* read = handle.Arg(i).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 || read->NumArgs() != 4u) {
+				return false;
+			}
+			const auto memory_index = read->Flags<MemoryFlags>().index;
+			if (memory_index >= m_program.memory_info.size() || !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[memory_index];
+			uint32_t high_offset = 0;
+			const auto enabled = read->Arg(3).Resolve();
+			if (memory.kind != ResourceKind::ScalarAddress || memory.data_bits != 32u ||
+			    memory.data_dwords != 1u || !ImmediateU32(read->Arg(2), high_offset) || high_offset != 0u ||
+			    !enabled.IsImmediate() || enabled.GetType() != Type::U1 || !enabled.U1()) {
+				return false;
+			}
+			auto* current_address = read->Arg(0).Resolve().TryInstruction();
+			if (current_address == nullptr || current_address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (address != nullptr && address != current_address)) {
+				return false;
+			}
+			address = current_address;
+			if (i == 0u) {
+				table_offset = memory.offset;
+				table_index = read->Arg(1).Resolve();
+			} else if (static_cast<uint64_t>(table_offset) + i * 4u != memory.offset ||
+			           !EquivalentValue(m_program, table_index, read->Arg(1))) {
+				return false;
+			}
+			plan.memory[i] = memory_index;
+			plan.reads[i] = read;
+		}
+		const auto* scale = table_index.TryInstruction();
+		uint32_t table_shift = 0;
+		if (scale == nullptr || scale->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    !ImmediateU32(scale->Arg(1), table_shift) || table_shift != 5u) {
+			return false;
+		}
+		Value packed;
+		uint32_t index_shift = 0;
+		uint32_t index_mask = 0;
+		const auto* extract = scale->Arg(0).Resolve().TryInstruction();
+		if (extract != nullptr && extract->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			if (ImmediateU32(extract->Arg(0), index_mask)) {
+				packed = extract->Arg(1).Resolve();
+			} else if (ImmediateU32(extract->Arg(1), index_mask)) {
+				packed = extract->Arg(0).Resolve();
+			} else {
+				return false;
+			}
+			const auto* shift = packed.TryInstruction();
+			if (shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+				if (!ImmediateU32(shift->Arg(1), index_shift)) {
+					return false;
+				}
+				index_shift &= 31u;
+				packed = shift->Arg(0).Resolve();
+			}
+		} else if (extract != nullptr && extract->GetOpcode() == ValueOpcode::BitFieldUExtract) {
+			uint32_t width = 0;
+			if (!ImmediateU32(extract->Arg(1), index_shift) || !ImmediateU32(extract->Arg(2), width) ||
+			    width == 0u || width > 8u || index_shift > 32u - width) {
+				return false;
+			}
+			index_mask = (1u << width) - 1u;
+			packed = extract->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		if (index_mask == 0u || index_mask > 0xffu) {
+			return false;
+		}
+		const auto* material_read = packed.TryInstruction();
+		uint32_t material_memory = 0;
+		const auto* memory = material_read != nullptr ? ScalarReadMemory(*material_read, material_memory) : nullptr;
+		if (memory == nullptr) {
+			return false;
+		}
+		plan.key = material_read->Arg(1).Resolve();
+		uint32_t stride = 0;
+		auto* buffer = material_read->Arg(0).Resolve().TryInstruction();
+		if (buffer == nullptr || !MatchInlineStride(plan.key, stride)) {
+			return false;
+		}
+		DescriptorSource address_source;
+		MakeSource(*address, 2u, false, false, address_source, pc);
+		uint32_t bad_dword = 0;
+		if (!ValidateSource(address_source, bad_dword)) {
+			return false;
+		}
+		DescriptorSource buffer_source;
+		uint32_t buffer_index = 0;
+		if (!MakeRuntimeBufferSource(*buffer, pc, buffer_index, buffer_source)) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = 8u;
+		std::copy_n(buffer_source.dwords.begin(), 4u, source.dwords.begin());
+		std::copy_n(address_source.dwords.begin(), 2u, source.dwords.begin() + 4u);
+		source.dwords[6] = Value(0u);
+		source.dwords[7] = Value(0u);
+		source.inline_descriptor = DescriptorSource::InlineDescriptor {
+		    buffer_index, stride, memory->offset, 0u,
+		    DescriptorSource::InlineDescriptor::ImageTable {InternSource(address_source), table_offset, index_shift, index_mask}};
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		plan.root_count = 6u;
+		plan.read_count = 8u;
+		std::copy_n(source.dwords.begin(), 6u, plan.roots.begin());
+		return true;
+	}
+
+	void PlanInlineDescriptors() {
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (inst.GetOpcode() != ValueOpcode::ImageSampleRaw || inst.NumArgs() < 2u) {
+					continue;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					continue;
+				}
+				auto* image = inst.Arg(0).Resolve().TryInstruction();
+				auto* sampler = inst.Arg(1).Resolve().TryInstruction();
+				InlineDescriptorPlan image_plan;
+				InlineDescriptorPlan sampler_plan;
+				if (image == nullptr || sampler == nullptr || FindIndirectImage(*image) != nullptr ||
+				    !(TryMakeInlineDescriptor(*image, flags.pc, image_plan,
+				                              m_program.memory_info[flags.index].image_r128) ||
+				      (!m_program.memory_info[flags.index].image_r128 &&
+				       TryMakeMaterialImageTable(*image, flags.pc, image_plan)))) {
+					continue;
+				}
+				const bool inline_sampler = TryMakeInlineDescriptor(*sampler, flags.pc, sampler_plan);
+				if (inline_sampler) {
+					const auto& image_source = *m_sources[image_plan.source].inline_descriptor;
+					const auto& sampler_source = *m_sources[sampler_plan.source].inline_descriptor;
+					if (image_source.buffer_source != sampler_source.buffer_source ||
+					    image_source.selector_stride != sampler_source.selector_stride ||
+					    !EquivalentValue(m_program, image_plan.key, sampler_plan.key)) {
+						Fail(flags.pc, "inline image and sampler require the same material buffer and selector");
+					}
+				} else {
+					if (sampler->GetOpcode() != ValueOpcode::GetSamplerResource) {
+						continue;
+					}
+					DescriptorSource sampler_source;
+					const bool sample_adjust = (m_program.memory_info[flags.index].image_sample_flags &
+					                            Decoder::ImageSampleFlagAdjust) != 0;
+					MakeSource(*sampler, 4u, true, sample_adjust, sampler_source, flags.pc);
+					uint32_t bad_dword = 0;
+					if (!ValidateSource(sampler_source, bad_dword)) {
+						continue;
+					}
+				}
+				if (FindInlineDescriptor(*image) == nullptr) {
+					m_inline_descriptors.push_back(image_plan);
+				}
+				if (inline_sampler && FindInlineDescriptor(*sampler) == nullptr) {
+					m_inline_descriptors.push_back(sampler_plan);
+				}
+			}
+		}
+		std::vector<const Inst*> handles;
+		for (const auto& plan: m_inline_descriptors) {
+			handles.push_back(plan.handle);
+		}
+		for (const auto& plan: m_inline_descriptors) {
+			for (uint32_t i = 0; i < plan.read_count; i++) {
+				// A descriptor word may also be used by ordinary shader arithmetic.
+				// Only remove loads whose complete use set is rewritten by this plan.
+				if (UsesOnly(*plan.reads[i], handles)) {
+					m_inline_planning_reads.push_back(plan.reads[i]);
+					m_inline_planning_memory.push_back(plan.memory[i]);
 				}
 			}
 		}
@@ -684,8 +977,11 @@ private:
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
+		const auto* inline_descriptor = handle != nullptr ? FindInlineDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
+		} else if (inline_descriptor != nullptr) {
+			source = inline_descriptor->source;
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
 		}
@@ -703,8 +999,14 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
+			const auto* inline_sampler = sampler_handle != nullptr ? FindInlineDescriptor(*sampler_handle) : nullptr;
+			if (inline_sampler != nullptr) {
+				sampler_source = inline_sampler->source;
+			} else {
+				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
+				          sampler_source, true, sample_adjust);
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -728,7 +1030,7 @@ private:
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
 				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_image.has_value()) {
+				    image_source->indirect_image.has_value() || image_source->inline_descriptor.has_value()) {
 					continue;
 				}
 				bool alias = true;
@@ -750,6 +1052,9 @@ private:
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
 	std::vector<IndirectImagePlan> m_indirect_images;
+	std::vector<InlineDescriptorPlan> m_inline_descriptors;
+	std::vector<const Inst*>       m_inline_planning_reads;
+	std::vector<uint32_t>          m_inline_planning_memory;
 };
 
 } // namespace

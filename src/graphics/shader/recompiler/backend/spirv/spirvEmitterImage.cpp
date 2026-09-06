@@ -775,7 +775,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
+			const auto candidate_sampler = state.program.info.images[resource].indirect_sampler;
+			const auto sampled = MakeSampledImage(state, resource,
+			    candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
 			if (dref) {
@@ -801,12 +803,15 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto* source = image.source < ctx.program.descriptor_sources.size()
 		                         ? &ctx.program.descriptor_sources[image.source]
 		                         : nullptr;
-		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
-		    source->indirect_image->key_arg >= handle->NumArgs()) {
+		const auto key_arg = source != nullptr && source->inline_descriptor.has_value()
+		                         ? source->inline_descriptor->key_arg
+		                         : source != nullptr && source->indirect_image.has_value()
+		                               ? source->indirect_image->key_arg : UINT32_MAX;
+		if (handle == nullptr || key_arg >= handle->NumArgs()) {
 			ctx.Fail(inst, "has invalid indirect image key provenance");
 			return true;
 		}
-		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
+		const auto key = ctx.Def(handle->Arg(key_arg));
 		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");

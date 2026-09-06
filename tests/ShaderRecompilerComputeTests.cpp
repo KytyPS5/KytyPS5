@@ -971,6 +971,11 @@ struct BdaMapping {
   u32 backing_offset = 0;
 };
 
+struct SampledImageFixture {
+  uint64_t guest_address = 0;
+  std::vector<u32> rgba;
+};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1019,6 +1024,9 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  std::vector<SampledImageFixture> sampled_image_fixtures;
+  bool use_runtime_samplers = false;
+  bool buffer_addresses_are_backing_offsets = false;
 };
 
 struct GraphicsCase {
@@ -1238,6 +1246,8 @@ CompiledShader CompileCase(
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
       .read_memory = ReadTestMemory,
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
+      .read_specialization_memory =
+          test.buffer_addresses_are_backing_offsets ? ReadTestMemory : nullptr,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -1321,6 +1331,14 @@ CompiledShader CompileCase(
     u32 offset = 0;
     if (i < test.storage_buffer_offsets.size()) {
       offset = test.storage_buffer_offsets[i];
+    }
+    if (test.buffer_addresses_are_backing_offsets) {
+      const auto &words = resources.buffers.at(i).dwords;
+      ShaderBufferResource descriptor{};
+      std::copy_n(words.begin(), 4, descriptor.fields);
+      Require(test.name, "shader data", descriptor.Base48() < 256u,
+              "fixture buffer address is not a small backing offset");
+      offset = static_cast<u32>(descriptor.Base48());
     }
     Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
             "storage buffer offset is not representable");
@@ -9771,7 +9789,9 @@ public:
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr,
+                std::span<const Image *const> sampled_images_by_resource = {},
+                std::span<const vk::Sampler> samplers_by_resource = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto Binding = [&](Kind kind) {
@@ -10048,13 +10068,23 @@ public:
       }
     }
     if (sampled != nullptr) {
-      Require(test.name, "dispatch", sampled_image != nullptr,
+      Require(test.name, "dispatch",
+              sampled_image != nullptr || !sampled_images_by_resource.empty(),
               "sampled image descriptor requested but no sampled image was "
               "provided");
       sampled_infos.resize(sampled->resources.size());
-      for (auto &info : sampled_infos) {
-        info.imageView = sampled_image->view;
-        info.imageLayout = sampled_image->layout;
+      for (size_t slot = 0; slot < sampled_infos.size(); ++slot) {
+        const auto resource = sampled->resources[slot];
+        const auto *image = sampled_image;
+        if (!sampled_images_by_resource.empty()) {
+          Require(test.name, "dispatch", resource < sampled_images_by_resource.size(),
+                  "sampled image resource has no fixture binding");
+          image = sampled_images_by_resource[resource];
+        }
+        Require(test.name, "dispatch", image != nullptr,
+                "sampled image resource has a null fixture binding");
+        sampled_infos[slot].imageView = image->view;
+        sampled_infos[slot].imageLayout = image->layout;
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -10094,11 +10124,19 @@ public:
     BindStorage(storage_atomic, storage_image_uint, &storage_atomic_infos);
     const auto *samplers = Binding(Kind::Samplers);
     if (samplers != nullptr) {
-      Require(test.name, "dispatch", sampler != nullptr,
+      Require(test.name, "dispatch",
+              sampler != nullptr || !samplers_by_resource.empty(),
               "sampler descriptor requested but no sampler was provided");
       sampler_infos.resize(samplers->resources.size());
-      for (auto &info : sampler_infos) {
-        info.sampler = sampler;
+      for (size_t slot = 0; slot < sampler_infos.size(); ++slot) {
+        const auto resource = samplers->resources[slot];
+        if (!samplers_by_resource.empty()) {
+          Require(test.name, "dispatch", resource < samplers_by_resource.size(),
+                  "sampler resource has no fixture binding");
+          sampler_infos[slot].sampler = samplers_by_resource[resource];
+        } else {
+          sampler_infos[slot].sampler = sampler;
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -12055,6 +12093,9 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto buffer = vulkan->CreateStorageBuffer(
       test.name, test.initial, dwords, Has(Kind::BdaPagetable));
   VulkanHarness::Image sampled_image;
+  std::vector<VulkanHarness::Image> sampled_image_fixtures;
+  std::vector<const VulkanHarness::Image *> sampled_images_by_resource;
+  std::vector<vk::Sampler> samplers_by_resource;
   VulkanHarness::Image storage_image;
   VulkanHarness::Image storage_image_uint;
   VulkanHarness::Buffer gds_buffer;
@@ -12079,7 +12120,35 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     gds_buffer =
         vulkan->CreateStorageBuffer(test.name, test.gds_initial, gds_dwords);
   }
-  if (needs_sampled_image) {
+  if (needs_sampled_image && !test.sampled_image_fixtures.empty()) {
+    sampled_image_fixtures.reserve(test.sampled_image_fixtures.size());
+    for (const auto &fixture : test.sampled_image_fixtures) {
+      sampled_image_fixtures.push_back(vulkan->CreateImage2D(
+          test.name, test.image_width, test.image_height,
+          test.sampled_image_format, vk::ImageUsageFlagBits::eSampled,
+          fixture.rgba, test.sampled_image_dwords_per_pixel,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    }
+    sampled_images_by_resource.resize(compiled.program.info.images.size());
+    for (size_t resource = 0; resource < compiled.program.info.images.size(); ++resource) {
+      if (compiled.program.info.images[resource].resource_class !=
+          ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+        continue;
+      }
+      ShaderTextureResource descriptor{};
+      std::copy_n(compiled.resources.images.at(resource).dwords.begin(), 8,
+                  descriptor.fields);
+      const auto fixture = std::ranges::find_if(
+          test.sampled_image_fixtures, [&](const auto &candidate) {
+            return candidate.guest_address == descriptor.Base40();
+          });
+      Require(test.name, "sampled image fixture",
+              fixture != test.sampled_image_fixtures.end(),
+              "materialized image address has no fixture image");
+      const auto index = static_cast<size_t>(fixture - test.sampled_image_fixtures.begin());
+      sampled_images_by_resource[resource] = &sampled_image_fixtures[index];
+    }
+  } else if (needs_sampled_image) {
     auto sampled_mips = test.sampled_image_rgba_mips;
     auto sampled_format = test.sampled_image_format;
     auto sampled_dwords_per_pixel = test.sampled_image_dwords_per_pixel;
@@ -12108,7 +12177,22 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, 1,
         vk::ImageLayout::eGeneral);
   }
-  if (needs_sampler) {
+  if (needs_sampler && test.use_runtime_samplers) {
+    for (size_t index = 0; index < compiled.resources.samplers.size(); ++index) {
+      const auto &value = compiled.resources.samplers[index];
+      ShaderSamplerResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4, descriptor.fields);
+      const auto &info = compiled.program.info.samplers.at(index);
+      if (!info.depth_compare) {
+        descriptor.fields[0] &= ~(0x7u << 12u);
+      }
+      if (info.force_point_filtering) {
+        descriptor.SetPointFiltering();
+      }
+      samplers_by_resource.push_back(
+          vulkan->RuntimeRenderer().GetSamplerCache().GetSampler(descriptor));
+    }
+  } else if (needs_sampler) {
     sampler = vulkan->CreateNearestSampler(test.name);
   }
 
@@ -12116,7 +12200,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
                    needs_sampled_image ? &sampled_image : nullptr,
                    needs_storage_image ? &storage_image : nullptr,
                    needs_storage_image ? &storage_image_uint : nullptr,
-                   sampler);
+                   sampler, sampled_images_by_resource, samplers_by_resource);
   auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
   if (!test.expected_gds.empty()) {
     const auto gds_actual =
@@ -12139,6 +12223,9 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     vulkan->Device().destroySampler(sampler, nullptr);
   }
   vulkan->DestroyImage(&sampled_image);
+  for (auto &image : sampled_image_fixtures) {
+    vulkan->DestroyImage(&image);
+  }
   vulkan->DestroyImage(&storage_image);
   vulkan->DestroyImage(&storage_image_uint);
   vulkan->DestroyBuffer(&gds_buffer);
@@ -20891,6 +20978,238 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   return test;
 }
 
+enum class MaterialImageSampleMode {
+  CompactDynamicSampler,
+  CompactStaticSampler,
+  ImageTableDynamicSampler,
+  FullStaticSampler,
+};
+
+TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode) {
+  using O = ShaderOpcode;
+  constexpr u32 material_base = 128u;
+  constexpr u32 index_base = 64u;
+  const bool full_inline = mode == MaterialImageSampleMode::FullStaticSampler;
+  const u32 material_stride = full_inline ? 440u : 872u;
+  constexpr u32 material_count = 4u;
+  constexpr uint64_t image_a_address = 0x100000u;
+  constexpr uint64_t image_b_address = 0x200000u;
+  constexpr u32 raw_table_base = 4096u;
+  constexpr u32 raw_table_offset = 544u;
+  constexpr u32 packed_index_offset = 564u;
+  const bool image_table = mode == MaterialImageSampleMode::ImageTableDynamicSampler;
+  const bool dynamic_sampler = mode == MaterialImageSampleMode::CompactDynamicSampler || image_table;
+  const u32 image_offset = full_inline ? 0u : dynamic_sampler ? 152u : 588u;
+  const u32 iteration_count = image_table ? 5u : material_count;
+
+  TestCase test;
+  test.name = full_inline ? "ImageSampleLzFullDynamicMaterialStaticSampler"
+                         : image_table ? "ImageSampleDynamicMaterialImageTablePairs"
+                         : dynamic_sampler ? "ImageSampleR128DynamicMaterialPairs"
+                                           : "ImageSampleLzR128DynamicMaterialStaticSampler";
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.use_runtime_samplers = true;
+  test.buffer_addresses_are_backing_offsets = true;
+  const u32 backing_size = image_table ? raw_table_base + raw_table_offset + 2u * 32u
+                                      : material_base + material_count * material_stride;
+  test.initial.resize(backing_size / 4u);
+  const std::array keys{2u, 0u, 3u, 1u, 5u};
+  std::copy_n(keys.begin(), iteration_count, test.initial.begin() + index_base / 4u);
+  test.expected = {std::bit_cast<u32>(80.0f), std::bit_cast<u32>(8.0f),
+                   std::bit_cast<u32>(dynamic_sampler ? 20.0f : 80.0f),
+                   std::bit_cast<u32>(dynamic_sampler ? 2.0f : 8.0f)};
+  if (image_table) {
+    // Out-of-bounds material reads yield index zero and a zero (repeat) sampler.
+    test.expected.push_back(std::bit_cast<u32>(2.0f));
+  }
+  if (full_inline) {
+    // The second full descriptor in the same x16 load selects the other image.
+    for (const float value : {8.0f, 80.0f, 8.0f, 80.0f}) {
+      test.expected.push_back(std::bit_cast<u32>(value));
+    }
+  }
+
+  // Keep s[0:3] free: CompileCase uses them for default image metadata.
+  const std::array material_descriptor{material_base, material_stride << 16u,
+                                       material_count, 0u};
+  const std::array index_descriptor{index_base, 4u << 16u, iteration_count, 0u};
+  std::copy(material_descriptor.begin(), material_descriptor.end(),
+            test.user_data.begin() + 4u);
+  std::copy(index_descriptor.begin(), index_descriptor.end(),
+            test.user_data.begin() + 8u);
+  test.user_data[50] = static_cast<u32>(test.expected.size() * sizeof(u32));
+  if (image_table) {
+    test.user_data[24] = raw_table_base;
+  }
+
+  for (u32 record = 0; record < material_count; ++record) {
+    const auto image_address = record < 2u ? image_a_address : image_b_address;
+    const auto clamp_x = record % 2u == 0u ? Prospero::SamplerClampMode::kClampLastTexel
+                                         : Prospero::SamplerClampMode::kWrap;
+    const std::array sampler{
+        static_cast<u32>(clamp_x) |
+            (static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel) << 3u) |
+            (static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel) << 6u),
+        0u, 0u, 0u};
+    const std::array image{
+        static_cast<u32>(image_address >> 8u),
+        (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) |
+            (3u << 30u),
+        3u << 14u,
+        DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u)};
+    const auto record_base = material_base + record * material_stride;
+    if (dynamic_sampler) {
+      std::copy(sampler.begin(), sampler.end(),
+                test.initial.begin() + (record_base + 136u) / 4u);
+    }
+    if (image_table) {
+      const auto table_index = record / 2u;
+      // Only the low eight bits select the texture; upper flags must be discarded.
+      test.initial[(record_base + packed_index_offset) / 4u] = 0xa5c30000u | table_index;
+      const auto table_word = (raw_table_base + raw_table_offset + table_index * 32u) / 4u;
+      std::copy(image.begin(), image.end(), test.initial.begin() + table_word);
+      // Full descriptors retain a nonzero upper word (the usual PerfMod setting).
+      test.initial[table_word + 5u] = 0x00700000u;
+    } else {
+      std::copy(image.begin(), image.end(),
+                test.initial.begin() + (record_base + image_offset) / 4u);
+      if (full_inline) {
+        const auto first_word = record_base / 4u;
+        test.initial[first_word + 5u] = 0x00700000u;
+        std::copy_n(test.initial.begin() + first_word, 8u,
+                    test.initial.begin() + first_word + 8u);
+        test.initial[first_word + 8u] = static_cast<u32>(
+            (record < 2u ? image_b_address : image_a_address) >> 8u);
+      }
+    }
+  }
+
+  auto image_a = MakeRgbaImage(4, 4);
+  auto image_b = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&image_a, 4, 1, 1, std::bit_cast<u32>(2.0f), 0, 0, 0);
+  SetRgbaPixel(&image_a, 4, 3, 1, std::bit_cast<u32>(8.0f), 0, 0, 0);
+  SetRgbaPixel(&image_b, 4, 1, 1, std::bit_cast<u32>(20.0f), 0, 0, 0);
+  SetRgbaPixel(&image_b, 4, 3, 1, std::bit_cast<u32>(80.0f), 0, 0, 0);
+  test.sampled_image_fixtures = {{0u, MakeRgbaImage(4, 4)},
+                                {image_a_address, std::move(image_a)},
+                                {image_b_address, std::move(image_b)}};
+
+  auto &code = test.code;
+  if (dynamic_sampler) {
+    // IMAGE_SAMPLE_D address order is dUV/dX, dUV/dY, then UV.
+    AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.25f));
+    AppendVMovU32(&code, 21, 0);
+    AppendVMovU32(&code, 22, 0);
+    AppendVMovLiteral(&code, 23, std::bit_cast<u32>(0.25f));
+  } else {
+    // A literal s[76:79] sampler remains independent of the material lookup.
+    const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel);
+    AppendSMovLiteral(&code, 76, clamp | (clamp << 3u) | (clamp << 6u));
+    for (u32 sgpr = 77; sgpr < 80; ++sgpr) {
+      code.push_back(EncodeSMovB32(sgpr, InlineU32(0)));
+    }
+  }
+  AppendVMovLiteral(&code, 24, std::bit_cast<u32>(1.3125f));
+  AppendVMovLiteral(&code, 25, std::bit_cast<u32>(0.375f));
+  code.push_back(EncodeSMovB32(32, InlineU32(0)));
+  const auto loop = code.size();
+  code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(2)));
+  code.push_back(EncodeSmem0(0x08, 60, 4));
+  code.push_back(EncodeSmem1(0, 33));
+  code.push_back(EncodeSop2(0x26, 61, 60, 255u));
+  code.push_back(material_stride);
+  if (image_table) {
+    code.push_back(EncodeSmem0(0x0a, 12, 2));
+    code.push_back(EncodeSmem1(136, 61));
+    code.push_back(EncodeSmem0(0x08, 62, 2));
+    code.push_back(EncodeSmem1(packed_index_offset, 61));
+    code.push_back(EncodeSop2(0x0e, 62, 62, 255u));
+    code.push_back(0xffu);
+    code.push_back(EncodeSop2(0x1e, 63, 62, InlineU32(5)));
+    code.push_back(EncodeSmem0(0x03, 16, 12));
+    code.push_back(EncodeSmem1(raw_table_offset, 63));
+  } else if (dynamic_sampler) {
+    // One dynamic x8 read loads sampler s[12:15] and compact image s[16:19].
+    code.push_back(EncodeSmem0(0x0b, 12, 2));
+    code.push_back(EncodeSmem1(136, 61));
+  } else if (full_inline) {
+    // One x16 read supplies two adjacent full image descriptors s[16:31].
+    code.push_back(EncodeSmem0(0x0c, 16, 2));
+    code.push_back(EncodeSmem1(0, 61));
+  } else {
+    code.push_back(EncodeSmem0(0x0a, 16, 2));
+    code.push_back(EncodeSmem1(image_offset, 61));
+  }
+  if (!image_table && !full_inline) {
+    // These adjacent SGPRs must not become compact descriptor dwords 4 through 7.
+    for (u32 sgpr = 20; sgpr < 24; ++sgpr) {
+      AppendSMovLiteral(&code, sgpr, 0xdeadc000u + sgpr);
+    }
+  }
+  code.push_back(EncodeMimg0(dynamic_sampler ? 0x22u : 0x27u,
+                             0x1, 0, false, 1, !image_table && !full_inline));
+  code.push_back(EncodeMimg1(0, dynamic_sampler ? 20u : 24u, 4,
+                             dynamic_sampler ? 3u : 19u));
+  code.push_back(EncodeVop1(0x01, 30, 33));
+  AppendBufferStoreDword(&code, 0, 30);
+  if (full_inline) {
+    code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
+    code.push_back(EncodeMimg1(1, 24, 6, 19));
+    code.push_back(EncodeSop2(0x00, 34, 33, InlineU32(material_count * 4u)));
+    code.push_back(EncodeVop1(0x01, 30, 34));
+    AppendBufferStoreDword(&code, 1, 30);
+  }
+  code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 32, InlineU32(iteration_count)));
+  const auto branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1u))));
+  AppendEnd(&code);
+
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_LSHL_B32,
+                  O::S_BUFFER_LOAD_DWORD, O::S_MUL_I32,
+                  full_inline ? O::S_BUFFER_LOAD_DWORDX16
+                  : dynamic_sampler && !image_table ? O::S_BUFFER_LOAD_DWORDX8
+                                                  : O::S_BUFFER_LOAD_DWORDX4,
+                  O::IMAGE_SAMPLE,
+                  O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::S_ENDPGM};
+  test.decoded_counts = {{"r128=1", image_table || full_inline ? 0u : 1u}};
+  if (image_table) {
+    test.opcodes.push_back(O::S_AND_B32);
+    test.opcodes.push_back(O::S_LOAD_DWORDX8);
+  }
+  test.required_spirv = {"OpLoopMerge", "OpSwitch", "OpImageSampleExplicitLod",
+                         dynamic_sampler ? "Grad" : "Lod"};
+  if (!dynamic_sampler) {
+    test.decoded_counts.push_back({"image_sample_lz ", full_inline ? 2u : 1u});
+    test.forbidden_spirv = {"Grad"};
+  }
+  return test;
+}
+
+TestCase ImageSampleR128DynamicMaterialPairs() {
+  return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::CompactDynamicSampler);
+}
+
+TestCase ImageSampleLzR128DynamicMaterialStaticSampler() {
+  return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::CompactStaticSampler);
+}
+
+TestCase ImageSampleDynamicMaterialImageTablePairs() {
+  return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::ImageTableDynamicSampler);
+}
+
+TestCase ImageSampleLzFullDynamicMaterialStaticSampler() {
+  return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::FullStaticSampler);
+}
+
 void CheckIndirectImageKeySwitch() {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -22347,6 +22666,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
+  AddCase(ImageSampleR128DynamicMaterialPairs);
+  AddCase(ImageSampleLzR128DynamicMaterialStaticSampler);
+  AddCase(ImageSampleDynamicMaterialImageTablePairs);
+  AddCase(ImageSampleLzFullDynamicMaterialStaticSampler);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
@@ -26715,6 +27038,14 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--inline-material-pairs-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleR128DynamicMaterialPairs());
+    RunCase(&vulkan, ImageSampleLzR128DynamicMaterialStaticSampler());
+    RunCase(&vulkan, ImageSampleDynamicMaterialImageTablePairs());
+    RunCase(&vulkan, ImageSampleLzFullDynamicMaterialStaticSampler());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {

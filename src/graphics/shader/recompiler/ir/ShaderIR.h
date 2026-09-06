@@ -133,6 +133,7 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	uint32_t                      indirect_sampler = UINT32_MAX;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -445,6 +446,28 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
+	struct InlineDescriptor {
+		struct ImageTable {
+			uint32_t address_source = 0;
+			uint32_t table_offset   = 0;
+			uint32_t index_shift    = 0;
+			uint32_t index_mask     = 0;
+
+			bool operator==(const ImageTable& other) const = default;
+		};
+
+		uint32_t buffer_source     = 0;
+		uint32_t selector_stride   = 0;
+		uint32_t descriptor_offset = 0;
+		uint32_t key_arg           = 0;
+		std::optional<ImageTable> image_table;
+		// Direct inline descriptors read four compact/sampler words or eight image words.
+		// ImageTable retains its separate packed selector and eight-word table-entry format.
+		uint32_t descriptor_dwords = 4;
+
+		bool operator==(const InlineDescriptor& other) const = default;
+	};
+
 	struct IndirectImage {
 		uint32_t material_source = 0;
 		uint32_t heap_source     = 0;
@@ -458,6 +481,7 @@ struct DescriptorSource {
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectImage> indirect_image;
+	std::optional<InlineDescriptor> inline_descriptor;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };

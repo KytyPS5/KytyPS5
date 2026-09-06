@@ -18,6 +18,14 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
 	return !has_stencil || htile_stencil_disabled || has_htile;
 }
 
+inline constexpr bool htile_fill_clears_depth(uint32_t fill) {
+	return (fill & 0xfu) == 0u;
+}
+
+inline constexpr bool htile_fill_clears_stencil(uint32_t fill) {
+	return ((fill >> 8u) & 0x3u) == 0u;
+}
+
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;
@@ -32,6 +40,7 @@ struct RenderDepthInfo {
 	float                       depth_min_bounds         = 0.0f;
 	float                       depth_max_bounds         = 0.0f;
 	bool                        stencil_clear_enable     = false;
+	bool                        stencil_meta_clear_enable = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;
 	PipelineStencilStaticState  stencil_static_front;

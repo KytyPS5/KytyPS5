@@ -1925,7 +1925,8 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end() && found->second.type != MetaDataInfo::Type::PendingDcc;
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value) {
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
+                                 bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
@@ -1934,6 +1935,9 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
+	}
+	if (fill_known != nullptr) {
+		*fill_known = found->second.fill_known;
 	}
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
@@ -1948,6 +1952,20 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_known = false;
+	return true;
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
+	    found->second.type == MetaDataInfo::Type::Dcc) {
+		return false;
+	}
+	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_value = fill_value;
+	found->second.fill_known = true;
 	return true;
 }
 
@@ -1980,6 +1998,7 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 		found->second.clear_mask = dcc_clear_mask;
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
+		found->second.fill_known = true;
 	}
 }
 

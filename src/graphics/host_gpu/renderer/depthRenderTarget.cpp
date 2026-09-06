@@ -288,7 +288,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
-	r.stencil_clear_value = hw.GetStencilClearValue();
+	r.stencil_clear_value       = hw.GetStencilClearValue();
+	r.stencil_meta_clear_enable = false;
 	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
 		const bool stencil_ops_disabled =
@@ -439,7 +440,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
+	if (stencil_clear_enable || stencil_meta_clear_enable ||
 	    (stencil_test_enable && (face_writes(stencil_static_front, stencil_dynamic_front) ||
 	                             face_writes(stencil_static_back, stencil_dynamic_back)))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;

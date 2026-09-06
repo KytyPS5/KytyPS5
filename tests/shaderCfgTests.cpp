@@ -9609,14 +9609,18 @@ void TestComputeExecutionGdsAppendAdmission() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
   using V = IR::Value;
-  enum class Scenario { Valid, FixedLoop, VaryingM0, Offset, Width, MissingMemory,
+  enum class Scenario { Valid, FixedLoop, VaryingM0, Offset, OffsetHigh, OffsetMax,
+                        OffsetLoop, OffsetUnaligned, OffsetTooLarge, Width, MissingMemory,
                         Consume, LdsAppend, OtherGds, Partitioned, Divergent,
                         CounterBranch, CyclicReadWrite };
   for (const auto scenario : {Scenario::Valid, Scenario::FixedLoop, Scenario::VaryingM0,
-       Scenario::Offset, Scenario::Width, Scenario::MissingMemory, Scenario::Consume,
+       Scenario::Offset, Scenario::OffsetHigh, Scenario::OffsetMax, Scenario::OffsetLoop,
+       Scenario::OffsetUnaligned, Scenario::OffsetTooLarge,
+       Scenario::Width, Scenario::MissingMemory, Scenario::Consume,
        Scenario::LdsAppend, Scenario::OtherGds, Scenario::Partitioned, Scenario::Divergent,
        Scenario::CounterBranch, Scenario::CyclicReadWrite}) {
-    const bool loop = scenario == Scenario::FixedLoop || scenario == Scenario::CounterBranch ||
+    const bool loop = scenario == Scenario::FixedLoop || scenario == Scenario::OffsetLoop ||
+                      scenario == Scenario::CounterBranch ||
                       scenario == Scenario::CyclicReadWrite;
     IR::Program program;
     program.stage = ShaderType::Compute;
@@ -9634,6 +9638,10 @@ void TestComputeExecutionGdsAppendAdmission() {
     IR::MemoryInfo memory{};
     memory.kind = scenario == Scenario::LdsAppend ? IR::ResourceKind::Lds : IR::ResourceKind::Gds;
     if (scenario == Scenario::Offset) memory.offset = 4u;
+    if (scenario == Scenario::OffsetHigh || scenario == Scenario::OffsetLoop) memory.offset = 0x104u;
+    if (scenario == Scenario::OffsetMax) memory.offset = 0xfffcu;
+    if (scenario == Scenario::OffsetUnaligned) memory.offset = 3u;
+    if (scenario == Scenario::OffsetTooLarge) memory.offset = 0x10000u;
     if (scenario == Scenario::Width) memory.data_bits = 64u;
     if (scenario != Scenario::MissingMemory) program.memory_info.push_back(memory);
     IR::Inst* iteration = nullptr;
@@ -9694,7 +9702,12 @@ void TestComputeExecutionGdsAppendAdmission() {
     ComputeWorkgroupLimits limits{{1024u,1024u,64u},1024u};
     limits.native_subgroup_size = 32u;
     const auto plan = PlanComputeExecution(program, input, limits);
-    const bool allowed = scenario == Scenario::Valid || scenario == Scenario::FixedLoop;
+    // LLVM's GDS pointer lowering folds an aligned 16-bit byte displacement
+    // into DS_APPEND. Planning admits its shape; runtime backing bounds still
+    // decide whether a counter address can be accessed.
+    const bool allowed = scenario == Scenario::Valid || scenario == Scenario::FixedLoop ||
+                         scenario == Scenario::Offset || scenario == Scenario::OffsetHigh ||
+                         scenario == Scenario::OffsetMax || scenario == Scenario::OffsetLoop;
     Check(plan.error.empty() == allowed,
           "GDS append admission changed a supported or rejected boundary");
     if (allowed) Check(plan.IsSplitWave64() && plan.wave_partition_factor == 1u,

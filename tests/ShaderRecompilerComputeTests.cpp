@@ -21138,6 +21138,158 @@ TestCase DsAppendWave64ReturnsOneBaseAcrossNativeHalves() {
   return test;
 }
 
+// Synthetic DS_APPEND byte-offset coverage. One guest wave64 uses two native
+// halves. All guest words are assembled from public instruction helpers.
+TestCase DsAppendWave64OffsetsSelectIndependentCounters() {
+  using O = ShaderOpcode;
+  struct Scenario { uint64_t mask; u32 byte_offset; u32 region; };
+  constexpr std::array scenarios{
+      Scenario{0xffffffffffffffffull, 4u, 0u},
+      Scenario{0x8000002280000005ull, 12u, 1u},
+      Scenario{0x8000002100000000ull, 0x104u, 2u},
+      Scenario{0x0000000080000002ull, 4u, 0u},
+      Scenario{0x0000000000000000ull, 12u, 1u},
+      Scenario{0x8000000100000001ull, 0x104u, 2u},
+  };
+  constexpr u32 lanes = 64u, guard = 4u, region_capacity = 128u;
+  constexpr u32 compact_start = guard + scenarios.size() * 2u * lanes;
+  constexpr u32 gds_base = 8u, gds_size = 272u, sentinel = 0xdeadbeefu;
+  TestCase test;
+  test.name = "DsAppendWave64OffsetsSelectIndependentCounters";
+  test.initial.assign(compact_start + 3u * region_capacity + guard, sentinel);
+  test.expected = test.initial;
+  test.gds_initial.resize(70u);
+  for (u32 i = 0; i < test.gds_initial.size(); ++i)
+    test.gds_initial[i] = 0xc0de0000u + i;
+  test.gds_initial[3] = 7u;  // base8 + offset4
+  test.gds_initial[5] = 13u; // base8 + offset12
+  test.gds_initial[67] = 23u; // base8 + offset0x104 (both offset bytes)
+  test.expected_gds = test.gds_initial;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = 8u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 2u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.lds_size_dwords = 0u;
+  test.compute_info.needs_lds_barriers = false;
+  auto& code = test.code;
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(3), 1));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(0), 6)); // stable x+8*y
+  AppendSMovLiteral(&code, 124, (gds_base << 16u) | gds_size);
+  for (u32 step = 0; step < scenarios.size(); ++step) {
+    const auto& scenario = scenarios[step];
+    const u32 counter = (gds_base + scenario.byte_offset) / 4u;
+    const u32 before = test.expected_gds[counter];
+    AppendVMovLiteral(&code, 3, sentinel);
+    AppendVMovLiteral(&code, 4, sentinel);
+    AppendVMovU32(&code, 7, step * 256u);
+    code.push_back(EncodeVop2(0x25, 7, Vgpr(6), 7));
+    AppendSMovLiteral(&code, 126, static_cast<u32>(scenario.mask));
+    AppendSMovLiteral(&code, 127, static_cast<u32>(scenario.mask >> 32u));
+    code.push_back(EncodeDs0(0x3e, scenario.byte_offset, true));
+    code.push_back(EncodeDs1(3, 0, 0));
+    code.push_back(0xbf8c0000u); // S_WAITCNT 0
+    code.push_back(EncodeVop2(0x24, 4, 127u, 3));
+    code.push_back(EncodeVop2(0x23, 4, 126u, 4));
+    AppendStoreVgprAtLaneDwordOffset(
+        &code, 7, 4, compact_start + scenario.region * region_capacity);
+    code.push_back(EncodeSop1(0x04, 126, 193u)); // restore full EXEC
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 6, guard + step * 2u * lanes);
+    AppendStoreVgprAtLaneDwordOffset(&code, 4, 6, guard + (step * 2u + 1u) * lanes);
+    u32 prefix = 0;
+    for (u32 lane = 0; lane < lanes; ++lane) {
+      if ((scenario.mask & (uint64_t{1} << lane)) == 0) continue;
+      const u32 slot = before + prefix++;
+      Require(test.name, "CPU oracle", slot < region_capacity,
+              "offset append reservation exceeds its separate bounded region");
+      test.expected[guard + step * 2u * lanes + lane] = before;
+      test.expected[guard + (step * 2u + 1u) * lanes + lane] = slot;
+      test.expected[compact_start + scenario.region * region_capacity + slot] =
+          step * 256u + lane;
+    }
+    test.expected_gds[counter] = before + prefix;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::DS_APPEND,
+                  O::V_MBCNT_HI_U32_B32, O::V_MBCNT_LO_U32_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_APPEND", scenarios.size()}};
+  return test;
+}
+
+TestCase DsAppendWave64OffsetLoopCompactsSparseReservations() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64u, iterations = 3u, guard = 4u;
+  constexpr u32 compact_start = guard + iterations * 2u * lanes;
+  constexpr u32 capacity = 128u, sentinel = 0xdeadbeefu;
+  constexpr uint64_t mask = 0x8000000280000002ull; // 1,31,33,63; no lane0
+  TestCase test;
+  test.name = "DsAppendWave64OffsetLoopCompactsSparseReservations";
+  test.initial.assign(compact_start + capacity + guard, sentinel);
+  test.expected = test.initial;
+  test.gds_initial.resize(70u);
+  for (u32 i = 0; i < test.gds_initial.size(); ++i)
+    test.gds_initial[i] = 0xa5a50000u + i;
+  test.gds_initial[67] = 7u;
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[67] = 19u; // three reservations of four active lanes
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = 8u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 2u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.lds_size_dwords = 0u;
+  test.compute_info.needs_lds_barriers = false;
+  auto& code = test.code;
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(3), 1));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(0), 6));
+  AppendSMovLiteral(&code, 124, (8u << 16u) | 272u);
+  AppendSMovLiteral(&code, 8, 0u);
+  const size_t loop = code.size();
+  AppendVMovLiteral(&code, 3, sentinel);
+  AppendVMovLiteral(&code, 4, sentinel);
+  code.push_back(EncodeVop1(0x01, 7, 8));
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(8), 7));
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(6), 7)); // iteration*256+lane
+  AppendSMovLiteral(&code, 126, static_cast<u32>(mask));
+  AppendSMovLiteral(&code, 127, static_cast<u32>(mask >> 32u));
+  code.push_back(EncodeDs0(0x3e, 0x104u, true));
+  code.push_back(EncodeDs1(3, 0, 0));
+  code.push_back(0xbf8c0000u);
+  code.push_back(EncodeVop2(0x24, 4, 127u, 3));
+  code.push_back(EncodeVop2(0x23, 4, 126u, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 4, compact_start);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeVop1(0x01, 8, 8));
+  code.push_back(EncodeVop2(0x1a, 8, InlineU32(7), 8));
+  code.push_back(EncodeVop2(0x25, 8, Vgpr(6), 8)); // two planes per iteration
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 8, guard);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 8, guard + lanes);
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 8, InlineU32(iterations)));
+  const auto displacement = static_cast<int32_t>(loop) -
+                            static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(displacement)));
+  AppendEnd(&code);
+  for (u32 iteration = 0; iteration < iterations; ++iteration) {
+    const u32 before = 7u + iteration * 4u;
+    u32 prefix = 0;
+    for (u32 lane = 0; lane < lanes; ++lane) {
+      if ((mask & (uint64_t{1} << lane)) == 0) continue;
+      const u32 slot = before + prefix++;
+      test.expected[guard + iteration * 2u * lanes + lane] = before;
+      test.expected[guard + (iteration * 2u + 1u) * lanes + lane] = slot;
+      test.expected[compact_start + slot] = iteration * 256u + lane;
+    }
+  }
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::DS_APPEND,
+                  O::V_MBCNT_HI_U32_B32, O::V_MBCNT_LO_U32_B32,
+                  O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_APPEND", 1u}, {"S_CBRANCH_SCC1", 1u}};
+  return test;
+}
+
 TestCase MakeBufferDescriptorTableScalarLoop(bool predicated) {
   using O = ShaderOpcode;
   constexpr u32 table_base = 256u;
@@ -28110,6 +28262,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(DsAppendWave64ReturnsOneBaseAcrossNativeHalves);
   AddCase(DsAppendWave64BoundedLoopCompactsThreeReservations);
+  AddCase(DsAppendWave64OffsetsSelectIndependentCounters);
+  AddCase(DsAppendWave64OffsetLoopCompactsSparseReservations);
   AddCase(BufferDescriptorTableScalarLoopDistinctStores);
   AddCase(BufferDescriptorTableScalarLoopPredicatedStores);
   AddCase(BufferDescriptorTableScalarLoopLoadsFeedLaterResults);

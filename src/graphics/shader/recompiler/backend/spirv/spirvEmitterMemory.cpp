@@ -784,7 +784,8 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const bool split_wave64 = state.compute_execution.IsSplitWave64();
-	if (split_wave64 && (!append || mem.kind != IR::ResourceKind::Gds || mem.offset != 0u ||
+	if (split_wave64 && (!append || mem.kind != IR::ResourceKind::Gds ||
+	                     !IsSupportedWave64GdsAppendOffset(mem.offset) ||
 	                     state.compute_execution.wave_partition_factor != 1u)) {
 		ctx.Fail(inst, "requires a single-wave GDS append plan");
 	}

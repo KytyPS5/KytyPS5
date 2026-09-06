@@ -1,6 +1,6 @@
 # Shader capture and batch audit
 
-These tools inspect shader code and compiler failures without executing shaders on a GPU. Run the Windows commands below in PowerShell from the repository root, after following the [Windows build setup](../README.md#build-requirements-windows).
+The corpus tools inspect shader code and compiler failures without executing shaders on a GPU. The compute fixture runner below executes the existing synthetic GPU tests. Run the Windows commands in PowerShell from the repository root, after following the [Windows build setup](../README.md#build-requirements-windows).
 
 ## Build the auditor
 
@@ -79,6 +79,20 @@ The runner exits with code 1 if any manifest fails or times out, and 0 if all pa
 | `resource_tracking` | Compute IR translation and resource-plan extraction completed, using captured dispatch parameters or the explicitly assumed header profile. |
 
 A passing result applies only to the reported coverage. Non-compute stages and compute captures without sufficient metadata stop at control-flow analysis. The audit does not materialize runtime descriptors, emit or validate SPIR-V, execute GPU work, or prove that a game renders correctly. Use targeted compiler tests, GPU regression tests and runtime checks to validate fixes beyond the audit's scope.
+
+## Run compute fixtures and retain every failure
+
+```powershell
+cmake --build _Build/windows --target shader_recompiler_compute_tests
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\run-compute-cases.ps1 `
+  -CasePattern 'Scalar.*Mask|Waterfall' -TimeoutSeconds 30
+```
+
+Omit `-CasePattern` to run every registered compute fixture; the pattern is a case-sensitive regular expression. Pass `-Executable` for a different native test executable. The runner obtains names using `--list-compute-cases`, then invokes each selected name with `--compute-case` in a separate process. Workers run strictly sequentially, create no console windows, and drain both streams asynchronously into their own log files. Do not run another GPU test or emulator concurrently.
+
+The listing and every case have the specified timeout. A failure or timeout is recorded and the next case runs after the previous process has terminated. If termination cannot be confirmed, the batch stops and reports the unrun count. A timeout bounds the worker process; it does not establish that a shader loop is safe for the driver, so potentially hanging regressions still require a bounded fixture or compiler-level test first.
+
+`-OutputDirectory` must be new or empty; by default a unique directory is created under `_Build/compute-tests`. It contains `report.json`, incrementally written `results.jsonl`, listing logs, and numbered per-case directories with `stdout.txt` and `stderr.txt`. Exit code is 1 for any failed/timed-out case, listing error, or empty selection, and 0 when all selected cases pass. Results apply to these fixtures and the current GPU; they do not prove that a game renders correctly.
 
 ## Localize GPU execution faults
 

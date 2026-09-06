@@ -17,19 +17,19 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_WAITCNT: EmitWaitcnt(); return true;
 
 		case O::S_AND_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
+			S_SAVEEXEC(inst, IR::ValueOpcode::BitwiseAnd32, false, false, false);
 			return true;
 		case O::S_ANDN1_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
+			S_SAVEEXEC(inst, IR::ValueOpcode::BitwiseAnd32, false, true, false);
 			return true;
 		case O::S_AND_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
+			S_SAVEEXEC(inst, IR::ValueOpcode::BitwiseAnd32, false, false, true);
 			return true;
 		case O::S_ANDN1_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);
+			S_SAVEEXEC(inst, IR::ValueOpcode::BitwiseAnd32, false, true, true);
 			return true;
 		case O::S_ORN2_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
+			S_SAVEEXEC(inst, IR::ValueOpcode::BitwiseOr32, true, false, true);
 			return true;
 		case O::S_ADD_U32: ADD_U32(inst, false, false); return true;
 		case O::S_ADDC_U32: ADD_U32(inst, false, true); return true;

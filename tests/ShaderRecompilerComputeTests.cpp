@@ -13292,10 +13292,12 @@ TestCase ScalarNotB64UpdatesScc() {
   AppendStoreSgprPair(&code, 14, 7);
   AppendEnd(&code);
 
+  // RDNA2 S_NOT_B64 sets SCC from the complete 64-bit result. LocalSize=1
+  // produces VCC={1,0}, whose complement {fffffffe,ffffffff} is nonzero.
   return {"ScalarNotB64UpdatesScc",
           code,
           {},
-          {0, 1, 0, 0, 1, 0, 0, 0xfffffffeu, 0xffffffffu},
+          {0, 1, 0, 0, 1, 0, 1, 0xfffffffeu, 0xffffffffu},
           {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_NOT_B64, O::S_CSELECT_B32,
            O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
@@ -13429,8 +13431,10 @@ TestCase ScalarSaveExecOps() {
   return {"ScalarSaveExecOps",
           code,
           {},
-          // EXEC and saved EXEC values are invocation-local Booleans.
-          {1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 0},
+          // SAVEEXEC snapshots raw words; B32 operations preserve EXEC_HI.
+          // The final ANDN1_B32 leaves EXEC_LO=2, so SCC remains set.
+          {1, 0, 1, 0, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+           3, 0xffffffffu, 3, 2, 0xffffffffu, 1},
           {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
            O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
            O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
@@ -13457,7 +13461,8 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
   return {"ScalarOrn2SaveexecUsesSourceOrNotExec",
           code,
           {},
-          {1, 0, 1, 0, 1},
+          // SAVEEXEC copies raw EXEC, then computes source | ~old_EXEC.
+          {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
           {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -13773,10 +13778,12 @@ TestCase ScalarSelectB64PreservesMaskProvenance() {
   AppendStoreSgpr(&code, 16, 1);
   AppendEnd(&code);
 
+  // Selecting a saved VCC retains its numeric bits. With LocalSize=1,
+  // NOT{1,0} is nonzero regardless of the saved lane-membership predicate.
   return {"ScalarSelectB64PreservesMaskProvenance",
           code,
           {},
-          {1, 0},
+          {1, 1},
           {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CSELECT_B64, O::S_NOT_B64,
            O::S_CSELECT_B32, O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
@@ -13808,7 +13815,9 @@ TestCase ScalarWqmB64SelectsSccDomain() {
   return {"ScalarWqmB64SelectsSccDomain",
           code,
           {},
-          {1, 0},
+          // NOT of the one valid lane's VCC={1,0} is nonzero as a u64;
+          // expanding its occupied quads still leaves a nonzero scalar result.
+          {1, 1},
           {O::S_MOV_B32, O::S_WQM_B64, O::S_CSELECT_B32, O::V_CMP_EQ_U32,
            O::S_MOV_B64, O::S_NOT_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
@@ -13839,13 +13848,464 @@ TestCase ScalarMaskProvenanceOverlapAndMixedBinary() {
   AppendStoreSgpr(&code, 14, 1);
   AppendEnd(&code);
 
+  // The overlapping copy keeps numeric VCC={1,0}; both NOT and NAND below
+  // produce {fffffffe,ffffffff}, so their scalar SCC values are both one.
   return {"ScalarMaskProvenanceOverlapAndMixedBinary",
           code,
           {},
-          {0, 1},
+          {1, 1},
           {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_NOT_B64, O::S_CSELECT_B32,
            O::S_MOV_B32, O::S_NAND_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase ScalarMaskWaterfallSparseExecAndReactivation() {
+  using O = ShaderOpcode;
+  constexpr u32 lane_count = 32;
+  constexpr u32 sparse_mask = (1u << 5u) | (1u << 9u) | (1u << 17u);
+
+  std::vector<u32> code;
+  // Keep the input keys live in all host lanes before narrowing guest EXEC.
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 2, 3);
+  AppendVMovU32(&code, 10, 0); // Number of times this lane was the bucket leader.
+  AppendVMovU32(&code, 11, 0); // Key observed by the elected leader.
+  AppendVMovU32(&code, 12, 0); // Full-EXEC body visits, including inactive lanes.
+
+  code.push_back(EncodeVopc(0xc2, InlineU32(5), 0));
+  code.push_back(EncodeSop1(0x04, 8, 106)); // s[8:9] = vcc
+  for (u32 lane : {9u, 17u}) {
+    code.push_back(EncodeVopc(0xc2, InlineU32(lane), 0));
+    code.push_back(EncodeSop2(0x11, 8, 8, 106)); // s_or_b64 remaining, vcc
+  }
+  code.push_back(EncodeSop1(0x04, 126, 8)); // exec = sparse remaining mask
+  code.push_back(EncodeSop1(0x04, 14, 126)); // Save numeric EXEC for readback.
+  code.push_back(EncodeSop1(0x14, 16, 8));   // First active lane must be 5.
+  AppendVop3(&code, 0x360, 17, Vgpr(2), 16); // First key must be 2.
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+
+  const size_t loop = code.size();
+  code.push_back(EncodeSop1(0x14, 20, 8)); // s_ff1_i32_b64 lane, remaining
+  AppendVop3(&code, 0x360, 21, Vgpr(2), 20); // v_readlane_b32 key, v2, lane
+  code.push_back(EncodeVopc(0xc2, 21, 2)); // v_cmp_eq_u32 vcc, key, v2
+  code.push_back(EncodeSop1(0x04, 10, 106)); // Save bucket membership.
+  code.push_back(EncodeSop1(0x24, 24, 10)); // Save EXEC; enable bucket lanes.
+  const size_t skip_empty = code.size();
+  code.push_back(0); // s_cbranch_execz skip_body
+
+  // This is a scalar branch: all host lanes must reach the body whenever any
+  // guest lane matches. ORN2_SAVEEXEC then reactivates every guest lane.
+  code.push_back(EncodeSop1(0x28, 106, 126)); // vcc = exec; exec |= ~exec
+  code.push_back(EncodeVop2(0x25, 12, InlineU32(1), 12));
+  code.push_back(EncodeSop1(0x04, 126, 106)); // Restore bucket EXEC.
+
+  // (-mask) & mask elects exactly one lane, including when lane 0 is inactive.
+  // Lanes 5 and 9 share a key, so only lane 5 may record that bucket.
+  code.push_back(EncodeSop2(0x01, 106, InlineU32(0), 106));
+  code.push_back(EncodeSop2(0x05, 107, InlineU32(0), 107));
+  code.push_back(EncodeSop2(0x0f, 126, 106, 126));
+  code.push_back(EncodeVop2(0x25, 10, InlineU32(1), 10));
+  code.push_back(EncodeVop1(0x01, 11, 21));
+
+  const size_t skip_body = code.size();
+  code.push_back(EncodeSop2(0x15, 8, 8, 10)); // Remove processed bucket; set SCC.
+  code.push_back(EncodeSop1(0x04, 126, 24)); // Restore original sparse EXEC.
+  code.push_back(EncodeSop2(0x0a, 23, InlineU32(1), InlineU32(0)));
+  // The bound is independent of mask progress and READLANE results. Broken
+  // mask lowering must yield a finite wrong-result test, not a driver hang.
+  code.push_back(EncodeSop2(0x00, 22, 22, InlineU32(1)));
+  code.push_back(EncodeSopc(0x09, 22, InlineU32(8)));
+  const size_t bounded_exit = code.size();
+  code.push_back(0); // s_cbranch_scc1 exit
+  code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
+  const size_t repeat = code.size();
+  code.push_back(0); // s_cbranch_scc1 loop
+
+  const size_t exit = code.size();
+  const auto patch_branch = [&](size_t at, u32 opcode, size_t target) {
+    const auto offset = static_cast<int32_t>(target) -
+                        static_cast<int32_t>(at) - 1;
+    code[at] = EncodeSopp(opcode, static_cast<u32>(offset));
+  };
+  patch_branch(skip_empty, 0x08, skip_body);
+  patch_branch(bounded_exit, 0x05, exit);
+  patch_branch(repeat, 0x05, loop);
+
+  code.push_back(EncodeSop1(0x04, 126, 193)); // exec = -1
+  AppendStoreSgprAtLaneDwordOffset(&code, 14, 0, lane_count * 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 15, 0, lane_count * 1);
+  AppendStoreSgprAtLaneDwordOffset(&code, 16, 0, lane_count * 2);
+  AppendStoreSgprAtLaneDwordOffset(&code, 17, 0, lane_count * 3);
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, lane_count * 4);
+  AppendStoreSgprAtLaneDwordOffset(&code, 9, 0, lane_count * 5);
+  AppendStoreSgprAtLaneDwordOffset(&code, 22, 0, lane_count * 6);
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 0, lane_count * 7);
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, lane_count * 8);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 0, lane_count * 9);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarMaskWaterfallSparseExecAndReactivation";
+  test.code = std::move(code);
+  test.initial.resize(lane_count);
+  std::iota(test.initial.begin(), test.initial.end(), 100u);
+  test.initial[5] = 2;
+  test.initial[9] = 2;
+  test.initial[17] = 7;
+  test.expected.resize(lane_count * 10, 0);
+  for (u32 lane = 0; lane < lane_count; ++lane) {
+    test.expected[lane] = sparse_mask;
+    test.expected[lane_count * 2 + lane] = 5;
+    test.expected[lane_count * 3 + lane] = 2;
+    test.expected[lane_count * 6 + lane] = 2;
+    test.expected[lane_count * 7 + lane] = 2;
+  }
+  test.expected[lane_count * 8 + 5] = 1;
+  test.expected[lane_count * 8 + 17] = 1;
+  test.expected[lane_count * 9 + 5] = 2;
+  test.expected[lane_count * 9 + 17] = 7;
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::S_MOV_B64, O::S_OR_B64,
+                  O::S_FF1_I32_B64, O::V_READLANE_B32, O::V_CMP_EQ_U32,
+                  O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_EXECZ,
+                  O::S_ORN2_SAVEEXEC_B64, O::S_SUB_U32, O::S_SUBB_U32,
+                  O::S_AND_B64, O::S_ANDN2_B64, O::S_CSELECT_B32,
+                  O::S_ADD_U32, O::S_CMP_GE_U32, O::S_CMP_LG_U32,
+                  O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_FF1_I32_B64", 2}, {"V_READLANE_B32", 2},
+                         {"S_ORN2_SAVEEXEC_B64", 1}, {"S_ANDN2_B64", 1}};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = lane_count;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarSaveexecSccIsWaveUniform() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 32;
+  struct Scenario {
+    u32 opcode;
+    u32 old_exec;
+    u32 source;
+    u32 result;
+    bool write_64;
+  };
+  constexpr std::array scenarios{
+      Scenario{0x24, 0xffffffffu, 0x20u, 0x20u, true}, // AND64, sparse
+      Scenario{0x24, 0xffffffffu, 0u, 0u, true},       // AND64, empty
+      Scenario{0x37, 0xffffffffu, 0xffffffdfu, 0x20u, true}, // ANDN1
+      Scenario{0x28, 0xffffffdfu, 0u, 0x20u, true},         // ORN2
+      Scenario{0x3c, 0xffffffffu, 0x20000u, 0x20000u, false}, // AND32
+      Scenario{0x44, 0xffffffffu, 0xffffffffu, 0u, false},   // ANDN1_32
+  };
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  for (const auto &scenario : scenarios) {
+    AppendSMovLiteral(&code, 126, scenario.old_exec);
+    code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    AppendSMovLiteral(&code, 4, scenario.source);
+    code.push_back(EncodeSMovB32(5, InlineU32(0)));
+    AppendSMovLiteral(&code, 9, 0x12345678u);
+    code.push_back(EncodeSop1(scenario.opcode, 8, 4));
+    code.push_back(EncodeSop2(0x0a, 10, InlineU32(1), InlineU32(0)));
+    code.push_back(EncodeSop1(0x04, 12, 126));
+    code.push_back(EncodeSop1(0x04, 126, 193)); // Restore all lanes for readback.
+    const u32 base = static_cast<u32>(expected.size());
+    AppendStoreSgprAtLaneDwordOffset(&code, 10, 0, base);
+    AppendStoreSgprAtLaneDwordOffset(&code, 12, 0, base + lanes);
+    AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, base + lanes * 2);
+    AppendStoreSgprAtLaneDwordOffset(&code, 9, 0, base + lanes * 3);
+    // SAVEEXEC sets SCC=(new EXEC!=0) for the whole wave; the 32-bit variant
+    // writes only its destination SGPR and must preserve the adjacent word.
+    expected.insert(expected.end(), lanes, scenario.result != 0 ? 1u : 0u);
+    expected.insert(expected.end(), lanes, scenario.result);
+    expected.insert(expected.end(), lanes, scenario.old_exec);
+    expected.insert(expected.end(), lanes, scenario.write_64 ? 0u : 0x12345678u);
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "ScalarSaveexecSccIsWaveUniform";
+  test.code = std::move(code);
+  test.expected = std::move(expected);
+  test.opcodes = {O::S_AND_SAVEEXEC_B64, O::S_ANDN1_SAVEEXEC_B64,
+                  O::S_ORN2_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
+                  O::S_ANDN1_SAVEEXEC_B32, O::S_CSELECT_B32,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarWqmSccIsWaveUniform() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 32;
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  for (u32 selected_lane : {5u, 31u, 64u}) {
+    code.push_back(EncodeSop1(0x04, 126, 193));
+    code.push_back(EncodeVopc(0xc2, InlineU32(selected_lane), 0));
+    code.push_back(EncodeSop1(0x04, 4, 106)); // Preserve mask provenance in s4.
+    const u32 quad = selected_lane < lanes
+                         ? 0xfu << (selected_lane & ~3u)
+                         : 0u;
+    // Exercise the tagged SGPR path, special-register source path and EXEC
+    // destination path independently. No scalar branch can hide an SCC error.
+    for (const auto [destination, source] :
+         {std::pair{8u, 4u}, std::pair{8u, 106u}, std::pair{126u, 4u}}) {
+      code.push_back(EncodeSop1(0x0a, destination, source));
+      code.push_back(EncodeSop2(0x0a, 10, InlineU32(1), InlineU32(0)));
+      if (destination == 126u) {
+        code.push_back(EncodeSop1(0x04, 8, 126));
+      }
+      code.push_back(EncodeSop1(0x04, 126, 193));
+      const u32 base = static_cast<u32>(expected.size());
+      AppendStoreSgprAtLaneDwordOffset(&code, 10, 0, base);
+      AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, base + lanes);
+      AppendStoreSgprAtLaneDwordOffset(&code, 9, 0, base + lanes * 2);
+      // WQM expands each nonempty four-bit group. SCC tests the scalar result,
+      // including invocations that do not belong to the expanded quad.
+      expected.insert(expected.end(), lanes, quad != 0 ? 1u : 0u);
+      expected.insert(expected.end(), lanes, quad);
+      expected.insert(expected.end(), lanes, 0u);
+    }
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "ScalarWqmSccIsWaveUniform";
+  test.code = std::move(code);
+  test.expected = std::move(expected);
+  test.opcodes = {O::V_CMP_EQ_U32, O::S_WQM_B64, O::S_CSELECT_B32,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+void AppendRawScalarPair(std::vector<u32> *code, u32 reg,
+                         const std::array<u32, 2> &words) {
+  AppendSMovLiteral(code, reg, words[0]);
+  AppendSMovLiteral(code, reg + 1u, words[1]);
+}
+
+void AppendRawPairSnapshot(std::vector<u32> *code, u32 dst, u32 src) {
+  // Separate 32-bit reads ensure a broken S_MOV_B64 cannot hide the result of
+  // the instruction being tested. These SALU reads run even with EXEC=0.
+  code->push_back(EncodeSMovB32(dst, src));
+  code->push_back(EncodeSMovB32(dst + 1u, src + 1u));
+}
+
+TestCase MakeScalarRawMaskCase(const char *name, std::vector<u32> code,
+                              std::vector<u32> expected,
+                              std::vector<ShaderOpcode> opcodes) {
+  // Only lane zero performs vector work, after all raw scalar snapshots.
+  // There are no guest loops, cross-lane reads, or subgroup-dependent oracles.
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  for (u32 reg = 0; reg < expected.size(); ++reg) {
+    AppendStoreSgpr(&code, reg, reg);
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = name;
+  test.code = std::move(code);
+  test.expected = std::move(expected);
+  test.opcodes = std::move(opcodes);
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarRawSpecialWordMovesPreserveOtherHalf() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendRawScalarPair(&code, 106, {0x01234567u, 0x89abcdefu});
+  AppendRawScalarPair(&code, 126, {0x76543210u, 0xfedcba98u});
+  code.push_back(EncodeSMovB32(106, 127)); // VCC_LO = EXEC_HI.
+  AppendRawPairSnapshot(&code, 0, 106);
+  code.push_back(EncodeSMovB32(127, 107)); // EXEC_HI = VCC_HI.
+  AppendRawPairSnapshot(&code, 2, 126);
+  code.push_back(EncodeSMovB32(107, 126)); // VCC_HI = EXEC_LO.
+  AppendRawPairSnapshot(&code, 4, 106);
+  code.push_back(EncodeSMovB32(126, 106)); // EXEC_LO = VCC_LO.
+  AppendRawPairSnapshot(&code, 6, 126);
+  return MakeScalarRawMaskCase(
+      "ScalarRawSpecialWordMovesPreserveOtherHalf", std::move(code),
+      {0xfedcba98u, 0x89abcdefu, 0x76543210u, 0x89abcdefu,
+       0xfedcba98u, 0x76543210u, 0xfedcba98u, 0x89abcdefu},
+      {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+}
+
+TestCase ScalarRawMaskPairMovesAndSelectPreserveWords() {
+  using O = ShaderOpcode;
+  constexpr std::array<u32, 2> a = {0x89abcdefu, 0x12345678u};
+  constexpr std::array<u32, 2> b = {0x76543210u, 0xfedcba98u};
+  std::vector<u32> code;
+  AppendRawScalarPair(&code, 20, a);
+  code.push_back(EncodeSop1(0x04, 106, 20)); // VCC = s[20:21].
+  AppendRawPairSnapshot(&code, 0, 106);
+  code.push_back(EncodeSop1(0x04, 2, 106)); // s[2:3] = VCC.
+  AppendRawScalarPair(&code, 126, b);
+  code.push_back(EncodeSop1(0x04, 4, 126)); // s[4:5] = EXEC.
+  code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(0)));
+  code.push_back(EncodeSop2(0x0b, 126, 20, 4)); // SCC=1: EXEC = a.
+  AppendRawPairSnapshot(&code, 6, 126);
+  code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(1)));
+  code.push_back(EncodeSop2(0x0b, 106, 20, 4)); // SCC=0: VCC = b.
+  AppendRawPairSnapshot(&code, 8, 106);
+  code.push_back(EncodeSop2(0x0b, 106, 106, 126)); // Overlap; SCC=0 selects EXEC.
+  AppendRawPairSnapshot(&code, 10, 106);
+  return MakeScalarRawMaskCase(
+      "ScalarRawMaskPairMovesAndSelectPreserveWords", std::move(code),
+      {a[0], a[1], a[0], a[1], b[0], b[1], a[0], a[1], b[0], b[1], a[0], a[1]},
+      {O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32, O::S_CSELECT_B64,
+       O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+}
+
+TestCase ScalarRawWqmPreservesWords() {
+  using O = ShaderOpcode;
+  constexpr std::array<std::array<u32, 2>, 4> masks = {{
+      {0x00000102u, 0x80000004u}, {0u, 0x00010000u},
+      {0x80000000u, 0x00000010u}, {0x00001004u, 0x80000100u}}};
+  const auto whole_quads = [](u32 word) {
+    u32 result = 0;
+    for (u32 quad = 0; quad < 8; ++quad) {
+      if (((word >> (quad * 4u)) & 0xfu) != 0) {
+        result |= 0xfu << (quad * 4u);
+      }
+    }
+    return result;
+  };
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  for (u32 index = 0; index < masks.size(); ++index) {
+    const u32 src = index == 0 || index == 3 ? 106 : 20;
+    const u32 dst = index == 0 ? 0 : index == 2 ? 126 : 106;
+    const u32 snapshot = index * 3u;
+    AppendRawScalarPair(&code, src, masks[index]);
+    code.push_back(EncodeSop1(0x0a, dst, src));
+    if (index != 0) { AppendRawPairSnapshot(&code, snapshot, dst); }
+    code.push_back(EncodeSop2(0x0a, snapshot + 2u, InlineU32(1), InlineU32(0)));
+    const u32 low = whole_quads(masks[index][0]);
+    const u32 high = whole_quads(masks[index][1]);
+    expected.insert(expected.end(), {low, high, (low | high) != 0 ? 1u : 0u});
+  }
+  return MakeScalarRawMaskCase(
+      "ScalarRawWqmPreservesWords", std::move(code), std::move(expected),
+      {O::S_MOV_B32, O::S_WQM_B64, O::S_CSELECT_B32, O::V_MOV_B32,
+       O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+}
+
+TestCase ScalarRawSaveexecPreservesSnapshotsAndWidth() {
+  using O = ShaderOpcode;
+  struct Scenario {
+    u32 opcode;
+    std::array<u32, 2> exec;
+    std::array<u32, 2> source;
+  };
+  constexpr std::array<Scenario, 3> scenarios = {{
+      {0x28, {0x0000000cu, 0x80000000u}, {1u, 1u}},
+      {0x24, {0x80000020u, 0x80000100u}, {0x80000000u, 0x80000000u}},
+      // B32 saves only EXEC_LO; s21 is a neighboring sentinel, not a source.
+      {0x3c, {0x00000020u, 0x80000100u}, {0x80000000u, 0x13579bdfu}}}};
+  std::vector<u32> code;
+  for (u32 index = 0; index < scenarios.size(); ++index) {
+    const auto &scenario = scenarios[index];
+    AppendRawScalarPair(&code, 126, scenario.exec);
+    AppendRawScalarPair(&code, 20, scenario.source);
+    // Destination aliases source: both original operands must be read before
+    // the old EXEC snapshot overwrites s20 (and, for B64, s21).
+    code.push_back(EncodeSop1(scenario.opcode, 20, 20));
+    AppendRawPairSnapshot(&code, index * 5u, 20);
+    AppendRawPairSnapshot(&code, index * 5u + 2u, 126);
+    code.push_back(EncodeSop2(0x0a, index * 5u + 4u, InlineU32(1), InlineU32(0)));
+  }
+  // ORN2: source | ~old_EXEC. AND: source & old_EXEC. The B32 operation
+  // preserves EXEC_HI and s21, and computes SCC from its zero low result.
+  return MakeScalarRawMaskCase(
+      "ScalarRawSaveexecPreservesSnapshotsAndWidth", std::move(code),
+      {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1,
+       0x80000020u, 0x80000100u, 0x80000000u, 0x80000000u, 1,
+       0x00000020u, 0x13579bdfu, 0, 0x80000100u, 0},
+      {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B64,
+       O::S_AND_SAVEEXEC_B32, O::S_CSELECT_B32, O::V_MOV_B32,
+       O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+}
+
+TestCase ScalarFlagOperandsUseNumericMaskBits() {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 32;
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  // Scalar operand encodings: SCC, VCCZ, EXECZ. Each flag supplies the numeric
+  // pair {flag, 0}, so a true flag used as a lane mask selects only lane zero.
+  for (u32 flag : {253u, 251u, 252u}) {
+    for (u32 flag_value : {0u, 1u}) {
+      code.push_back(EncodeSMovB32(126, 193)); // Full EXEC_LO.
+      code.push_back(EncodeSMovB32(127, InlineU32(0)));
+      if (flag == 253u) {
+        code.push_back(EncodeSopc(0x06, InlineU32(0),
+                                  InlineU32(flag_value != 0 ? 0u : 1u)));
+      } else {
+        const u32 source = flag == 251u ? 106u : 126u;
+        code.push_back(EncodeSMovB32(source,
+                                     InlineU32(flag_value != 0 ? 0u : 1u)));
+        code.push_back(EncodeSMovB32(source + 1u, InlineU32(0)));
+      }
+      // EXECZ=true deliberately executes this SALU instruction with EXEC=0.
+      // Capture the flag before restoring EXEC or performing any vector work.
+      code.push_back(EncodeSop2(0x0f, 8, flag, 193)); // s_and_b64 s[8:9], flag, -1
+      code.push_back(EncodeSMovB32(126, 193));
+      code.push_back(EncodeSMovB32(127, InlineU32(0)));
+      AppendVMovU32(&code, 1, 1);
+      AppendVop3(&code, 0x101, 2, InlineU32(0), Vgpr(1), 8);
+
+      const u32 base = static_cast<u32>(expected.size());
+      AppendStoreSgprAtLaneDwordOffset(&code, 8, 0, base);
+      AppendStoreSgprAtLaneDwordOffset(&code, 9, 0, base + lanes);
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, base + lanes * 2);
+      expected.insert(expected.end(), lanes, flag_value);
+      expected.insert(expected.end(), lanes * 2, 0u);
+      expected[base + lanes * 2] = flag_value;
+    }
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "ScalarFlagOperandsUseNumericMaskBits";
+  test.code = std::move(code);
+  test.expected = std::move(expected);
+  // Missing stores must fail even for the false-flag and upper-word rows.
+  test.initial.assign(test.expected.size(), 0xdeadbeefu);
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_AND_B64,
+                  O::V_CNDMASK_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"S_AND_B64", 6}, {"V_CNDMASK_B32", 6}};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase ScalarLiteral() {
@@ -14712,9 +15172,8 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   test.name = "VectorAddcWritesPerLaneCarryOut";
   test.code = code;
   test.initial = {0x0000ffffu, 0u, 0x0000ffffu, 0u};
-  // VCC is represented as the current invocation's carry bit, not a shared
-  // four-lane ballot word.
-  test.expected = {1u, 0u, 1u, 0u};
+  // Lanes 0 and 2 carry out. V_MOV reads the complete VCC_LO mask in every lane.
+  test.expected = {5u, 5u, 5u, 5u};
   test.opcodes = {O::V_MOV_B32,         O::V_LSHLREV_B32, O::V_CMP_T_U32,
                   O::BUFFER_LOAD_DWORD, O::V_ADDC_U32,    O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -14882,8 +15341,8 @@ TestCase VectorVop3BCarryOutWritesSgprMask() {
   TestCase test;
   test.name = "VectorVop3BCarryOutWritesSgprMask";
   test.code = code;
-  // Scalar mask destinations keep the current invocation's bit.
-  test.expected = std::vector<u32>(12, 1u);
+  // All four lanes carry or borrow; each raw SGPR read returns the full mask.
+  test.expected = std::vector<u32>(12, 0xfu);
   test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
                   O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -14915,7 +15374,8 @@ TestCase VectorVop3BCarryOutUsesEncodedSdst() {
   TestCase test;
   test.name = "VectorVop3BCarryOutUsesEncodedSdst";
   test.code = code;
-  test.expected = std::vector<u32>(12, 1u);
+  // Each encoded SDST receives all four carry/borrow bits, read as one DWORD.
+  test.expected = std::vector<u32>(12, 0xfu);
   test.opcodes = {O::V_MOV_B32,    O::V_ADD_I32,          O::V_SUB_I32,
                   O::V_SUBREV_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -14954,7 +15414,8 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
   TestCase test;
   test.name = "VectorVop3BSubCoU32UsesRdna2Opcode310";
   test.code = code;
-  test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 1, 0, 0, 1};
+  // Only lanes 0 and 3 borrow; the raw SDST mask is 0x9 in every lane.
+  test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 9, 9, 9, 9};
   test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32,       O::V_CNDMASK_B32,
                   O::V_SUB_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
@@ -17415,7 +17876,8 @@ TestCase BranchVccnzUsesInvocationMask() {
   TestCase test;
   test.name = "BranchVccnzUsesInvocationMask";
   test.code = code;
-  test.expected = {42, 11, 11, 11, 42, 11, 11, 11};
+  // Lane zero sets VCC in each group; the scalar branch is taken by the wave.
+  test.expected = {42, 42, 42, 42, 42, 42, 42, 42};
   test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,   O::V_ADD_NC_U32,
                   O::V_CMP_EQ_U32,       O::S_CBRANCH_VCCNZ, O::S_BRANCH,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -19307,7 +19769,8 @@ TestCase BranchVccnzUsesCarryProducedInvocationMask() {
   TestCase test;
   test.name = "BranchVccnzUsesCarryProducedInvocationMask";
   test.code = code;
-  test.expected = {11, 42, 42, 42, 42, 42, 42, 42};
+  // Each group has at least one carry bit, so its scalar branch is taken.
+  test.expected = {42, 42, 42, 42, 42, 42, 42, 42};
   test.opcodes = {O::V_MOV_B32,   O::V_LSHLREV_B32,      O::V_ADD_NC_U32,
                   O::V_CMP_F_U32, O::V_ADDC_U32,         O::S_CBRANCH_VCCNZ,
                   O::S_BRANCH,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -22863,6 +23326,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarSelectB64PreservesMaskProvenance);
   AddCase(ScalarWqmB64SelectsSccDomain);
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
+  AddCase(ScalarMaskWaterfallSparseExecAndReactivation);
+  AddCase(ScalarSaveexecSccIsWaveUniform);
+  AddCase(ScalarWqmSccIsWaveUniform);
+  AddCase(ScalarRawSpecialWordMovesPreserveOtherHalf);
+  AddCase(ScalarRawMaskPairMovesAndSelectPreserveWords);
+  AddCase(ScalarRawWqmPreservesWords);
+  AddCase(ScalarRawSaveexecPreservesSnapshotsAndWidth);
+  AddCase(ScalarFlagOperandsUseNumericMaskBits);
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
@@ -27233,6 +27704,25 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--list-compute-cases") == 0) {
+    for (const auto &test : MakeCases()) {
+      std::printf("KYTY_COMPUTE_CASE %s\n", test.name);
+    }
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--compute-case") == 0) {
+    const auto cases = MakeCases();
+    const auto found = std::find_if(cases.begin(), cases.end(), [&](const auto &test) {
+      return std::strcmp(test.name, argv[2]) == 0;
+    });
+    if (found == cases.end()) {
+      std::fprintf(stderr, "unknown compute case: %s\n", argv[2]);
+      return 2;
+    }
+    VulkanHarness vulkan;
+    RunCase(&vulkan, *found);
+    return 0;
+  }
   CheckLeastRecentlyUsedCacheOrdering();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--shader-fatal-only") == 0) {
@@ -27289,6 +27779,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop1SdwaMovByteAndWordDestinationModes());
     RunCase(&vulkan, Vop1SdwaMovSourcesOverlapAndInactiveExec());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mask-waterfall-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarMaskWaterfallSparseExecAndReactivation());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {

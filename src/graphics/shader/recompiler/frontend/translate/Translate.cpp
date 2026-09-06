@@ -116,8 +116,12 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
-	return {ir.Select(value, IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))),
-	        IR::U32(IR::Value(0u))};
+	// Keep the invocation predicate separate from its architectural wave mask.
+	// Scalar consumers (for example FF1 and mask arithmetic) need every lane bit.
+	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {value});
+	return {ir.CompositeExtract(ballot, 0),
+	        current_wave_size == 64u ? ir.CompositeExtract(ballot, 1)
+	                                 : IR::U32(IR::Value(0u))};
 }
 
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
@@ -139,10 +143,10 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::Scc:
 			return ir.Select(ir.GetScc(), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
 		case Decoder::OperandKind::VccZ:
-			return ir.Select(ir.LogicalNot(ir.GetVcc()), IR::U32(IR::Value(1u)),
+			return ir.Select(MaskIsZero(ir.GetVccLo(), ir.GetVccHi()), IR::U32(IR::Value(1u)),
 			                 IR::U32(IR::Value(0u)));
 		case Decoder::OperandKind::ExecZ:
-			return ir.Select(ir.LogicalNot(ir.GetExec()), IR::U32(IR::Value(1u)),
+			return ir.Select(MaskIsZero(ir.GetExecLo(), ir.GetExecHi()), IR::U32(IR::Value(1u)),
 			                 IR::U32(IR::Value(0u)));
 		default: EXIT("invalid decoded operand used as a raw U32 source");
 	}
@@ -157,11 +161,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 106u: return ir.GetVccLo();
 		case 107u: return ir.GetVccHi();
 		case 124u: return ir.GetM0();
-		case 126u:
-		case 127u: {
-			const auto mask = BallotMask(ir.GetExec());
-			return mask[code - 126u];
-		}
+		case 126u: return ir.GetExecLo();
+		case 127u: return ir.GetExecHi();
 		default: return IR::U32(IR::Value(0u));
 	}
 }
@@ -220,8 +221,8 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 			case Decoder::OperandKind::ExecHi: return ir.GetExec();
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: return ir.GetVcc();
-			case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-			case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+			case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 			default: break;
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
@@ -334,20 +335,20 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		}
 		case Decoder::OperandKind::VccLo:
 			ir.SetVccLo(IR::U32(value));
-			ir.SetVcc(ThreadBit(IR::U32(value)));
+			ir.SetVcc(ThreadBit(value, ir.GetVccHi()));
 			break;
 		case Decoder::OperandKind::VccHi:
 			ir.SetVccHi(IR::U32(value));
-			ir.SetVcc(ThreadBit(ir.GetVccLo()));
+			ir.SetVcc(ThreadBit(ir.GetVccLo(), value));
 			break;
 		case Decoder::OperandKind::M0: ir.SetM0(IR::U32(value)); break;
 		case Decoder::OperandKind::ExecLo:
 			ir.SetExecLo(IR::U32(value));
-			ir.SetExec(ThreadBit(IR::U32(value)));
+			ir.SetExec(ThreadBit(value, ir.GetExecHi()));
 			break;
 		case Decoder::OperandKind::ExecHi:
 			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit(ir.GetExecLo()));
+			ir.SetExec(ThreadBit(ir.GetExecLo(), value));
 			break;
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
@@ -596,7 +597,7 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 	if (operand.kind == Decoder::OperandKind::Null) {
 		return;
 	}
-	const auto thread_bit = ThreadBit(value[0]);
+	const auto thread_bit = ThreadBit(value[0], value[1]);
 	switch (operand.kind) {
 		case Decoder::OperandKind::ExecLo:
 			ir.SetExec(thread_bit);
@@ -616,7 +617,26 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 }
 
 IR::U1 Translator::ThreadBit(IR::U32 low) {
-	return ir.INotEqual(low, IR::U32(IR::Value(0u)));
+	return ThreadBit(low, IR::U32(IR::Value(0u)));
+}
+
+IR::U1 Translator::ThreadBit(IR::U32 low, IR::U32 high) {
+	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	const auto bit = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
+	auto word = low;
+	if (current_wave_size == 64u) {
+		const auto upper =
+		    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {lane, IR::Value(32u)}));
+		word = ir.Select(upper, high, low);
+	}
+	const auto selected = ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), IR::U32(IR::Value(1u)));
+	return ir.INotEqual(selected, IR::U32(IR::Value(0u)));
+}
+
+IR::U1 Translator::MaskIsZero(IR::U32 low, IR::U32 high) {
+	// GFX10 wave32 EXECZ/VCCZ ignore the unused upper half.
+	const auto mask = current_wave_size == 64u ? ir.BitwiseOr(low, high) : low;
+	return ir.IEqual(mask, IR::U32(IR::Value(0u)));
 }
 
 IR::U1 Translator::ReadCondition(const Decoder::Operand& operand) {
@@ -636,20 +656,26 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	if (operand.kind == Decoder::OperandKind::LiteralConstant ||
 	    operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
 	    operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		return IR::U1(IR::Value(operand.value != 0u));
+		const auto mask = ReadU32Pair(operand);
+		return ThreadBit(mask[0], mask[1]);
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
-			return ir.GetThreadBitScalarReg(reg);
+			const auto low = ReadU32(operand);
+			const auto high = current_wave_size == 64u ? ReadScalarCode(operand.reg + 1u)
+			                                         : IR::U32(IR::Value(0u));
+			return IR::U1(ir.Emit(IR::ValueOpcode::SelectU1,
+			                     {ir.GetScalarMaskTag(reg), ir.GetThreadBitScalarReg(reg),
+			                      ThreadBit(low, high)}));
 		}
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi: return ir.GetExec();
 		case Decoder::OperandKind::VccLo:
 		case Decoder::OperandKind::VccHi: return ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
-		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+		case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+		case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 		default: return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 }
@@ -672,10 +698,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi:
-		case Decoder::OperandKind::VccZ:
-		case Decoder::OperandKind::ExecZ:
-		case Decoder::OperandKind::Scc: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::VccHi: return IR::U1(IR::Value(true));
+		// SCC/EXECZ/VCCZ are numeric scalar operands {flag, 0}, not replicated
+		// lane masks. Their Boolean form remains useful for carry/branch inputs.
 		default: return IR::U1(IR::Value(false));
 	}
 }
@@ -781,17 +806,25 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
+	// Scalar mask branches are wave-uniform. A later SAVEEXEC can reactivate lanes
+	// inside the region, so inactive guest lanes must not leave the host branch.
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero:
+			condition = MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			break;
+		case CFG::BranchCondition::VccNonZero:
+			condition = ir.LogicalNot(MaskIsZero(ir.GetVccLo(), ir.GetVccHi()));
+			break;
+		case CFG::BranchCondition::ExecZero:
+			condition = MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
+			break;
+		case CFG::BranchCondition::ExecNonZero:
+			condition = ir.LogicalNot(MaskIsZero(ir.GetExecLo(), ir.GetExecHi()));
+			break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				EXIT("block %u reads an invalid goto variable", source.id);
@@ -1046,8 +1079,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 		}
 		entry_ir.SetExec(IR::U1(IR::Value(true)));
-		entry_ir.SetExecLo(IR::U32(IR::Value(1u)));
-		entry_ir.SetExecHi(IR::U32(IR::Value(0u)));
+		const auto initial_exec = entry_ir.Emit(IR::ValueOpcode::Ballot, {IR::Value(true)});
+		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_exec, 0));
+		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_exec, 1)
+		                                          : IR::U32(IR::Value(0u)));
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.compute;
 			const auto  thread_ids =

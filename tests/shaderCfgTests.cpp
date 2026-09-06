@@ -4387,13 +4387,15 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   Check(getpc_wrote_vcc_lo,
         "S_GETPC_B64 did not advance s105 through the VCC alias");
 
-  const Decoder::OperandKind canonical_zero_masks[] = {
-      Decoder::OperandKind::Null,
-      Decoder::OperandKind::PopsExitingWaveId,
-      Decoder::OperandKind::VccZ,
-      Decoder::OperandKind::ExecZ,
+  const std::pair<Decoder::OperandKind, bool> mask_tag_operands[] = {
+      {Decoder::OperandKind::Null, true},
+      {Decoder::OperandKind::PopsExitingWaveId, true},
+      // Scalar flags are numeric {flag, 0}, not replicated lane masks.
+      {Decoder::OperandKind::Scc, false},
+      {Decoder::OperandKind::VccZ, false},
+      {Decoder::OperandKind::ExecZ, false},
   };
-  for (const auto kind : canonical_zero_masks) {
+  for (const auto [kind, expected_mask_tag] : mask_tag_operands) {
     store = {};
     store.family = Decoder::Family::SOP1;
     store.opcode = Decoder::Opcode::S_NOT_B64;
@@ -4411,8 +4413,8 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
         preserved_mask_tag |= valid.IsImmediate() && valid.U1();
       }
     }
-    Check(preserved_mask_tag,
-          "canonical zero/condition operand lost scalar mask validity");
+    Check(preserved_mask_tag == expected_mask_tag,
+          "zero/flag operand has incorrect scalar mask validity");
   }
 }
 
@@ -7883,9 +7885,9 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
         "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
-  Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
-                             "OpGroupNonUniformBallot"),
-        "per-invocation EXEC/SCC branch reconstructed a native subgroup mask");
+  Check(Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
+                            "OpGroupNonUniformBallot"),
+        "EXEC/SCC branch lost the numeric initial wave mask");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -9364,11 +9366,13 @@ void TestTypedEntryStateIsMinimal() {
     IR::Value exec;
     IR::Value exec_lo;
     IR::Value exec_hi;
+    const IR::Inst *initial_ballot = nullptr;
     for (const auto *block : values.blocks) {
       for (const auto &inst : *block) {
         switch (inst.GetOpcode()) {
         case IR::ValueOpcode::Ballot:
           ballots++;
+          initial_ballot = &inst;
           break;
         case IR::ValueOpcode::SetExec:
           set_exec++;
@@ -9398,16 +9402,31 @@ void TestTypedEntryStateIsMinimal() {
         }
       }
     }
+    const auto is_ballot_word = [&](IR::Value value, uint32_t word) {
+      const auto *extract = value.TryInstruction();
+      return extract != nullptr &&
+             extract->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
+             extract->Arg(0).Resolve().TryInstruction() == initial_ballot &&
+             extract->Arg(1).IsImmediate() && extract->Arg(1).U32() == word;
+    };
     Check(set_exec == 1u && set_exec_lo == 1u && set_exec_hi == 1u &&
-              ballots == 0u && exec.IsImmediate() && exec.U1() &&
-              exec_lo.IsImmediate() && exec_lo.U32() == 1u &&
-              exec_hi.IsImmediate() && exec_hi.U32() == 0u,
-          "typed entry is not the local {1,0} invocation mask");
+              ballots == 1u && exec.IsImmediate() && exec.U1() &&
+              initial_ballot->Arg(0).IsImmediate() && initial_ballot->Arg(0).U1() &&
+              is_ballot_word(exec_lo, 0u) &&
+              (wave_size == 64u ? is_ballot_word(exec_hi, 1u)
+                               : exec_hi.IsImmediate() && exec_hi.U32() == 0u),
+          "typed entry lost the active wave ballot or selected incorrect EXEC words");
 
     IR::RewriteToSsa(values.blocks);
     IR::RemoveIdentities(values.blocks);
     IR::EliminateDeadCode(values.blocks);
     IR::ValidateProgram(values, true);
+    for (const auto *block : values.blocks) {
+      Check(std::ranges::none_of(*block, [](const auto &inst) {
+              return inst.GetOpcode() == IR::ValueOpcode::Ballot;
+            }),
+            "unused initial EXEC ballot survived dead-code elimination");
+    }
   };
 
   check(32u);
@@ -10145,8 +10164,8 @@ void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(!Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
-        "vertex EXEC guard depends on the native subgroup lane");
+  Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "vertex EXEC=1 guard lost numeric lane membership");
   Check(Common::ContainsStr(source, "OpBranchConditional"),
         "vertex export lost its per-invocation EXEC guard");
 }
@@ -10172,9 +10191,9 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(
       !Common::ContainsStr(source, "OpGroupNonUniformBallot"),
-      "per-invocation VCC producer still materialized a shared subgroup mask");
-  Check(!Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
-        "per-invocation BFM EXEC prefix still selected native subgroup lanes");
+      "overwritten VCC/EXEC producers retained dead subgroup ballots");
+  Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "BFM EXEC=0xf guard lost numeric lane membership");
   Check(!Common::ContainsStr(source, "%vcc_lo") &&
             !Common::ContainsStr(source, "%vcc_hi"),
         "per-invocation comparison retained VCC register mirrors");
@@ -10190,16 +10209,17 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   const auto wqm_source = DisassembleSpirvBinary(result.spirv);
   Check(Common::ContainsStr(wqm_source, "OpCapability GroupNonUniformBallot") &&
             Common::ContainsStr(wqm_source, "OpGroupNonUniformBallot"),
-        "per-invocation scalar WQM omitted its subgroup ballot capability");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 2u,
-        "wave64 WQM did not compact exactly two ballot words");
+        "scalar WQM omitted the numeric initial EXEC mask");
+  // WqmU64 expands both raw DWORDs in one component-wise U32x2 operation.
+  Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
+        "wave64 WQM did not expand the numeric mask as one U32x2 value");
 
   auto wave32_options = options;
   wave32_options.wave_size = 32u;
   result = RecompileForTest(wqm_shader, wave32_options);
   CheckSpirvBinaryValidates(result.spirv);
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
-        "wave32 WQM retained the unused high ballot-word expansion");
+        "wave32 WQM did not preserve the scalar U32x2 expansion");
 
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
@@ -10234,10 +10254,10 @@ void TestNewShaderRecompilerPerInvocationU64Complement() {
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "OpLogicalNot"),
-        "per-invocation s_not_b64 did not complement the lane predicate");
-  Check(!Common::ContainsStr(source, "OpNot %uint"),
-        "per-invocation s_not_b64 emitted raw complemented mask words");
+  Check(Common::ContainsStr(source, "OpNot %uint"),
+        "s_not_b64 did not complement the numeric wave mask");
+  Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "complemented EXEC lost numeric lane membership");
 }
 
 void TestNewShaderRecompilerExpPixelOutputs() {
@@ -12038,8 +12058,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                    .conditional_branches = 1,
                                    .ballots = 1},
                                   ShaderType::Vertex);
-  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmMask"),
-        "WQM size fixture no longer reaches per-invocation WqmMask IR");
+  Check(count_shared(wqm_result,
+                     ShaderRecompiler::IR::ValueOpcode::WqmU64) == 1u,
+        "WQM size fixture did not retain its numeric scalar expansion");
 
   const uint32_t dispatcher[] = {
       EncodeSopp(0x05, 2),       // entry -> B, fallthrough A

@@ -94,22 +94,6 @@ bool Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 	const auto invocation_result =
 	    unary ? ir.LogicalNot(ReadMask(inst.src0))
 	          : U64MaskBinary(inst, logical_opcode, negate_rhs, negate_result);
-	const auto is_exec_or_vcc = [](const Decoder::Operand& operand) {
-		switch (operand.kind) {
-			case Decoder::OperandKind::ExecLo:
-			case Decoder::OperandKind::ExecHi:
-			case Decoder::OperandKind::VccLo:
-			case Decoder::OperandKind::VccHi: return true;
-			default: return false;
-		}
-	};
-	if (is_exec_or_vcc(inst.dst) || is_exec_or_vcc(inst.src0) ||
-	    (inst.src_count > 1u && is_exec_or_vcc(inst.src1))) {
-		WriteMask64(inst.dst, invocation_result);
-		ir.SetScc(invocation_result);
-		return true;
-	}
-
 	const auto lhs        = ReadU32Pair(inst.src0);
 	auto       mask_valid = ReadMaskValid(inst.src0);
 	if (inst.src_count > 1u) {
@@ -132,13 +116,9 @@ bool Translator::S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode lo
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
 		ir.SetThreadBitScalarReg(dst, invocation_result);
 		ir.SetScalarMaskTag(dst, mask_valid);
-		const auto raw_nonzero =
-		    ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u)));
-		ir.SetScc(IR::U1(
-		    ir.Emit(IR::ValueOpcode::SelectU1, {mask_valid, invocation_result, raw_nonzero})));
-	} else {
-		ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u))));
 	}
+	// SCC describes the complete scalar result, not this invocation's membership.
+	ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), IR::U32(IR::Value(0u))));
 	return true;
 }
 

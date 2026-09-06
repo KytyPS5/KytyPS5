@@ -44,6 +44,8 @@ enum class ResourceKind {
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
+	// Logical pre-specialization buffer table, independent of dense native resources.
+	uint32_t                buffer_table             = UINT32_MAX;
 	uint32_t                sampler                  = 0;
 	uint32_t                offset                   = 0;
 	uint32_t                secondary_offset         = 0;
@@ -414,6 +416,30 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
+struct BoundedSrtRead {
+	uint32_t address_source = 0;
+	uint32_t count_source   = 0;
+	uint32_t offset_scale   = 0;
+	uint32_t offset_bias    = 0;
+	// Kept separate from the wrapping U32 offset; scalar memory sign-extends this field.
+	uint32_t memory_offset = 0;
+	bool operator==(const BoundedSrtRead&) const = default;
+};
+
+struct BoundedSrtLayout {
+	uint32_t count       = 0;
+	uint32_t flat_offset = 0;
+	bool operator==(const BoundedSrtLayout&) const = default;
+};
+
+struct BufferTableLayout {
+	uint32_t count               = 0;
+	uint32_t mapping_flat_offset = 0;
+	// Unique absolute dense buffer IDs. The flat mapping also contains absolute IDs.
+	std::vector<uint32_t> resources;
+	bool operator==(const BufferTableLayout&) const = default;
+};
+
 struct ShaderInfo {
 	// Bound compiler work independently of the host device. Final descriptor layouts
 	// must also fit the Vulkan device limits after resource specialization.
@@ -422,6 +448,8 @@ struct ShaderInfo {
 	static constexpr uint32_t MaxSamplers     = 128;
 	static constexpr uint32_t MaxSampledPairs = 256;
 
+	std::vector<BoundedSrtLayout>     bounded_srt_reads;
+	std::vector<BufferTableLayout>    buffer_tables;
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
@@ -459,6 +487,12 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
+	struct BoundedBuffer {
+		std::array<uint32_t, 4> reads {};
+		uint32_t key_arg = 0;
+		bool operator==(const BoundedBuffer&) const = default;
+	};
+
 	struct InlineDescriptor {
 		struct ImageTable {
 			uint32_t address_source = 0;
@@ -495,6 +529,7 @@ struct DescriptorSource {
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectImage> indirect_image;
 	std::optional<InlineDescriptor> inline_descriptor;
+	std::optional<BoundedBuffer> bounded_buffer;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -541,6 +576,7 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<BoundedSrtRead>          bounded_srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;

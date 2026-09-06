@@ -1785,6 +1785,182 @@ void TestDynamicSrtReadRemainsExplicit() {
         "unified memory-offset layout is inconsistent");
 }
 
+enum class BoundedSrtScenario {
+  Valid, ReversedGuard, WrappedOffset, SparseBlockIds, NonzeroStart, NonunitStep,
+  SignedGuard, UnknownBound, ReadBeforeGuard, WrongSuccessEdge,
+  NonlinearOffset, DynamicPointer, GuardedPointerLoad, MixedDescriptorColumns, VertexStage,
+};
+
+struct BoundedSrtFixture {
+  std::unique_ptr<Fixture> fixture;
+  std::array<Value, 4> descriptor_words;
+  Value threshold;
+  Value index;
+};
+
+BoundedSrtFixture MakeBoundedSrtTrackingFixture(BoundedSrtScenario scenario) {
+  BoundedSrtFixture result;
+  result.fixture = std::make_unique<Fixture>(
+      scenario == BoundedSrtScenario::VertexStage ? ShaderType::Vertex : ShaderType::Compute);
+  auto &fixture = *result.fixture;
+  auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
+  auto *body = fixture.AddBlock();
+  auto *latch = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  const auto Branch = [&](uint32_t from, uint32_t to) {
+    fixture.program.blocks[from]->AddBranch(fixture.program.blocks[to]);
+    auto &term = fixture.program.block_info[from].terminator;
+    term.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    term.true_block = to;
+  };
+  Branch(0, 1);
+  Branch(2, 3);
+  Branch(3, 1);
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  auto &term = fixture.program.block_info[1].terminator;
+  term.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  term.true_block = 4; // LogicalNot(i<N): successful loop body is false edge.
+  term.false_block = 2;
+  auto low = fixture.UserData(0);
+  const auto high = fixture.UserData(1);
+  const auto count = scenario == BoundedSrtScenario::UnknownBound
+                         ? fixture.Emit(ValueOpcode::LaneId)
+                         : fixture.UserData(2);
+  auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  result.index = Value(&phi);
+  const auto next = fixture.Emit(ValueOpcode::IAdd32,
+      {result.index, Value(scenario == BoundedSrtScenario::NonunitStep ? 2u : 1u)}, 0, latch);
+  phi.AddPhiOperand(entry, Value(scenario == BoundedSrtScenario::NonzeroStart ? 1u : 0u));
+  phi.AddPhiOperand(latch, next);
+  const auto compare = fixture.Emit(
+      scenario == BoundedSrtScenario::SignedGuard ? ValueOpcode::SLessThan32
+      : scenario == BoundedSrtScenario::ReversedGuard ? ValueOpcode::UGreaterThan32
+                                                     : ValueOpcode::ULessThan32,
+      scenario == BoundedSrtScenario::ReversedGuard
+          ? std::initializer_list<Value>{count, result.index}
+          : std::initializer_list<Value>{result.index, count}, 0, header);
+  fixture.program.block_info[1].condition =
+      fixture.Emit(ValueOpcode::LogicalNot, {compare}, 0, header);
+  if (scenario == BoundedSrtScenario::WrongSuccessEdge) {
+    // Same CFG shape, but the read is reached on i>=N. A block-dominance-only
+    // check must not mistake this for a bounded read.
+    term.true_block = 2;
+    term.false_block = 4;
+  }
+  fixture.block = body;
+  if (scenario == BoundedSrtScenario::DynamicPointer)
+    low = fixture.Emit(ValueOpcode::IAdd32, {low, result.index});
+  if (scenario == BoundedSrtScenario::GuardedPointerLoad) {
+    const auto pointer_address = fixture.Address(low, high, 0x84);
+    MemoryInfo pointer_memory;
+    pointer_memory.kind = ResourceKind::ScalarAddress;
+    low = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {pointer_address, Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory(pointer_memory, 0x84));
+  }
+  const auto address = fixture.Address(low, high, 0x90);
+  const auto scale = scenario == BoundedSrtScenario::WrappedOffset ? 0x80000000u : 16u;
+  auto offset = fixture.Emit(ValueOpcode::IMul32,
+      {result.index, scenario == BoundedSrtScenario::NonlinearOffset ? result.index : Value(scale)});
+  if (scenario == BoundedSrtScenario::WrappedOffset)
+    offset = fixture.Emit(ValueOpcode::IAdd32, {offset, Value(0xfffffffcu)});
+  auto *read_block = scenario == BoundedSrtScenario::ReadBeforeGuard ? header : body;
+  // For the before-guard negative, create its independent address and affine
+  // offset in the header as well: the fixture remains valid SSA.
+  auto read_address = address;
+  if (read_block == header) {
+    read_address = fixture.Emit(ValueOpcode::GetAddressResource, {low, high},
+                               MemoryFlags{0, 0x90}, header);
+    offset = fixture.Emit(ValueOpcode::IMul32, {result.index, Value(16u)}, 0, header);
+  }
+  for (uint32_t word = 0; word < 4u; ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = (scenario == BoundedSrtScenario::WrappedOffset ? 4u : 16u) + word * 4u;
+    memory.component_count = 4u;
+    memory.component_index = word;
+    if (scenario == BoundedSrtScenario::MixedDescriptorColumns && word == 3u)
+      memory.offset += 4u;
+    result.descriptor_words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {read_address, offset, Value(0u), Value(true)},
+        fixture.AddMemory(memory, 0x100), read_block);
+  }
+  MemoryInfo threshold_memory;
+  threshold_memory.kind = ResourceKind::ScalarAddress;
+  threshold_memory.offset = 80u;
+  const auto threshold_offset = fixture.Emit(ValueOpcode::IMul32, {result.index, Value(8u)});
+  result.threshold = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {address, threshold_offset, Value(0u), Value(true)},
+      fixture.AddMemory(threshold_memory, 0x120));
+  const auto buffer = fixture.Buffer(result.descriptor_words, 0x140);
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  store.idxen = true;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+      {buffer, Value(0u), Value(0u), Value(0u), result.threshold, Value(true)},
+      fixture.AddMemory(store, 0x140));
+  if (scenario == BoundedSrtScenario::SparseBlockIds) {
+    // Real translation prepends an entry whose ID differs from its ordinal.
+    // Branch metadata refers to IDs; phi edges refer to block pointers.
+    constexpr std::array ids{100u, 7u, 42u, 19u, 81u};
+    for (uint32_t i = 0; i < fixture.program.block_info.size(); ++i) {
+      auto &info = fixture.program.block_info[i];
+      info.id = ids[i];
+      if (info.terminator.true_block != UINT32_MAX)
+        info.terminator.true_block = ids[info.terminator.true_block];
+      if (info.terminator.false_block != UINT32_MAX)
+        info.terminator.false_block = ids[info.terminator.false_block];
+    }
+  }
+  return result;
+}
+
+void TestBoundedSrtTrackingProofBoundaries() {
+  for (auto scenario : {BoundedSrtScenario::NonzeroStart, BoundedSrtScenario::NonunitStep,
+                        BoundedSrtScenario::SignedGuard, BoundedSrtScenario::UnknownBound,
+                        BoundedSrtScenario::ReadBeforeGuard, BoundedSrtScenario::WrongSuccessEdge,
+                        BoundedSrtScenario::NonlinearOffset, BoundedSrtScenario::DynamicPointer,
+                        BoundedSrtScenario::GuardedPointerLoad, BoundedSrtScenario::MixedDescriptorColumns,
+                        BoundedSrtScenario::VertexStage}) {
+    auto fixture = MakeBoundedSrtTrackingFixture(scenario);
+    BuildSrtPlan(fixture.fixture->program);
+    CheckFatal([&] { TrackResources(fixture.fixture->program); },
+               "not a valid runtime value", "unproved scalar descriptor loop was accepted");
+    Check(!fixture.fixture->program.resource_tracking_complete &&
+              fixture.fixture->program.info.buffers.empty() &&
+              fixture.fixture->program.descriptor_sources.empty(),
+          "rejected scalar descriptor loop mutated the tracked resource plan");
+  }
+  std::cout << "bounded SRT rejection boundaries passed: 11\n";
+  for (auto scenario : {BoundedSrtScenario::Valid, BoundedSrtScenario::ReversedGuard,
+                        BoundedSrtScenario::WrappedOffset, BoundedSrtScenario::SparseBlockIds}) {
+    auto fixture = MakeBoundedSrtTrackingFixture(scenario);
+    fixture.fixture->PlanAndTrack();
+    const auto &program = fixture.fixture->program;
+    Check(program.resource_tracking_complete && program.info.buffers.size() == 1u &&
+              !program.info.uses_dma,
+          "bounded scalar descriptor loop did not retain one logical buffer table");
+    for (const auto read : fixture.descriptor_words) {
+      const auto *indexed = read.Resolve().TryInstruction();
+      Check(indexed != nullptr &&
+                std::string_view(ValueOpcodeName(indexed->GetOpcode())) == "ReadBoundedSrtU32" &&
+                indexed->Arg(0).Resolve() == fixture.index,
+            "bounded descriptor word discarded its live induction index");
+    }
+    const auto *threshold = fixture.threshold.Resolve().TryInstruction();
+    Check(threshold != nullptr &&
+              std::string_view(ValueOpcodeName(threshold->GetOpcode())) == "ReadBoundedSrtU32" &&
+              threshold->Arg(0).Resolve() == fixture.index,
+          "ordinary scalar threshold was not rewritten to the indexed snapshot");
+    Check(std::ranges::none_of(program.memory_info, [](const MemoryInfo &memory) {
+            return memory.planning_only;
+          }), "bounded raw reads were discarded with a planning_only shortcut");
+  }
+
+}
+
 void TestPhiValidation() {
   Fixture fixture;
   auto *left = fixture.block;
@@ -2380,6 +2556,415 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+// TEST ONLY: ResourceTrackingTests.cpp, after Fixture and before main.
+// Register the four TestBoundedMaterialization* functions below with Run().
+struct BoundedSnapshotReader {
+  std::vector<std::pair<uint64_t, uint32_t>> words;
+  std::vector<uint64_t> reads;
+  uint64_t fail_address = UINT64_MAX;
+  uint32_t ordinary_reads = 0;
+  uint32_t generated_descriptors = 0;
+  bool change_repeated_reads = false;
+
+  static bool Clean(void* userdata, uint64_t address, uint32_t* word) {
+    auto& self = *static_cast<BoundedSnapshotReader*>(userdata);
+    self.reads.push_back(address);
+    if (address == self.fail_address) return false;
+    for (const auto& entry : self.words) {
+      if (entry.first == address) {
+        *word = entry.second;
+        if (self.change_repeated_reads) {
+          for (size_t i = 0; i + 1u < self.reads.size(); ++i)
+            if (self.reads[i] == address) ++*word;
+        }
+        return true;
+      }
+    }
+    if (address >= 0x1000u && address - 0x1000u < uint64_t{self.generated_descriptors} * 16u &&
+        (address & 3u) == 0u) {
+      const auto index = static_cast<uint32_t>((address - 0x1000u) / 16u);
+      const auto component = static_cast<uint32_t>((address - 0x1000u) % 16u / 4u);
+      const std::array<uint32_t, 4> descriptor{0x20000u + index * 256u, 4u << 16u, 4u, 0u};
+      *word = descriptor[component];
+      return true;
+    }
+    return false;
+  }
+  static bool Ordinary(void* userdata, uint64_t, uint32_t*) {
+    ++static_cast<BoundedSnapshotReader*>(userdata)->ordinary_reads;
+    return false;
+  }
+};
+
+uint32_t AddBoundedSnapshotSource(Fixture& fixture, std::initializer_list<Value> words) {
+  DescriptorSource source;
+  source.dword_count = static_cast<uint32_t>(words.size());
+  uint32_t index = 0;
+  for (const auto word : words) source.dwords[index++] = word;
+  fixture.program.descriptor_sources.push_back(source);
+  return static_cast<uint32_t>(fixture.program.descriptor_sources.size() - 1u);
+}
+
+void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_table) {
+  auto& program = fixture.program;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  AddBoundedSnapshotSource(fixture, {fixture.UserData(0u)});
+  AddBoundedSnapshotSource(fixture, {fixture.UserData(1u), fixture.UserData(2u)});
+  for (uint32_t column = 0; column < columns; ++column)
+    program.bounded_srt_reads.push_back({.address_source=1u, .count_source=0u,
+                                         .offset_scale=columns * 4u,
+                                         .offset_bias=buffer_table ? 0u : column * 4u,
+                                         .memory_offset=buffer_table ? column * 4u : 0u});
+  if (buffer_table) {
+    Check(columns == 4u, "test descriptor table must have four columns");
+    const auto source = AddBoundedSnapshotSource(fixture, {Value(0u),Value(0u),Value(0u),Value(0u)});
+    program.descriptor_sources[source].bounded_buffer = DescriptorSource::BoundedBuffer{{0u,1u,2u,3u},0u};
+    program.info.buffers.push_back({.source=source});
+  }
+}
+
+SrtRuntime BoundedSnapshotRuntime(BoundedSnapshotReader& reader, std::span<const uint32_t> data) {
+  return {.user_data=data, .read_memory=BoundedSnapshotReader::Ordinary, .userdata=&reader,
+          .read_specialization_memory=BoundedSnapshotReader::Clean};
+}
+
+void CheckBoundedTransaction(const ResourceSnapshot& snapshot, const ResourceSnapshot& old_snapshot,
+                             const ResourceSpecialization& specialization,
+                             const ResourceSpecialization& old_specialization) {
+  Check(SameResourceSnapshot(snapshot, old_snapshot) &&
+            snapshot.immutable_srt_ranges == old_snapshot.immutable_srt_ranges &&
+            specialization == old_specialization,
+        "failed bounded materialization changed snapshot, footprints or specialization");
+}
+
+// The frontend can place Phi nodes in an empty loop header and the scalar
+// comparison in its unconditional successor. The bound may itself be a shared
+// scalar load with a runtime-uniform byte offset, not an immediate offset.
+void CheckBoundedSrtSplitHeader(bool memory_bound) {
+  Fixture fixture;
+  auto* entry = fixture.block;
+  auto* header = fixture.AddBlock();
+  auto* guard = fixture.AddBlock();
+  auto* body = fixture.AddBlock();
+  auto* latch = fixture.AddBlock();
+  auto* exit = fixture.AddBlock();
+  const auto branch = [&](uint32_t from, uint32_t to) {
+    fixture.program.blocks[from]->AddBranch(fixture.program.blocks[to]);
+    auto& term = fixture.program.block_info[from].terminator;
+    term.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    term.true_block = to;
+  };
+  branch(0u, 1u);
+  branch(1u, 2u);
+  branch(3u, 4u);
+  branch(4u, 1u);
+  guard->AddBranch(exit);
+  guard->AddBranch(body);
+  auto& term = fixture.program.block_info[2].terminator;
+  term.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  term.true_block = 5u;
+  term.false_block = 3u;
+  const auto low = fixture.UserData(0u);
+  const auto high = fixture.UserData(1u);
+  const auto offset_or_count = fixture.UserData(2u);
+  auto& phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  const auto index = Value(&phi);
+  // Match the ordinary unsigned scalar-add lowering, including both low-word
+  // projections; neither carry component participates in the induction value.
+  const auto sum = fixture.Emit(ValueOpcode::IAddCarry32, {index, Value(1u)}, 0, latch);
+  const auto sum_low = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                   {sum, Value(0u)}, 0, latch);
+  const auto carry_sum = fixture.Emit(ValueOpcode::IAddCarry32,
+                                     {sum_low, Value(0u)}, 0, latch);
+  const auto next = fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                {carry_sum, Value(0u)}, 0, latch);
+  phi.AddPhiOperand(entry, Value(0u));
+  phi.AddPhiOperand(latch, next);
+  fixture.block = guard;
+  const auto address = fixture.Address(low, high, 0x20u);
+  const auto count = memory_bound
+      ? fixture.Emit(ValueOpcode::LoadAddressU32,
+          {address, offset_or_count, Value(0u), Value(true)},
+          fixture.AddMemory({.kind=ResourceKind::ScalarAddress}, 0x20u))
+      : offset_or_count;
+  const auto compare = fixture.Emit(ValueOpcode::ULessThan32, {index, count});
+  fixture.program.block_info[2].condition = fixture.Emit(ValueOpcode::LogicalNot, {compare});
+  fixture.block = body;
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(4u)});
+  std::array<Value, 4> words;
+  for (uint32_t word = 0u; word < 4u; ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = 16u + word * 4u;
+    memory.component_count = 4u;
+    memory.component_index = word;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {address, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x40u));
+  }
+  const auto buffer = fixture.Buffer(words, 0x50u);
+  // Count is ordinary shader data too: replacing only its descriptor-source
+  // copy would leave this live consumer reading mutable guest memory.
+  const auto payload = fixture.Emit(ValueOpcode::IAdd32, {count, Value(7u)});
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+      {buffer, Value(0u), Value(0u), Value(0u), payload, Value(true)},
+      fixture.AddMemory({.kind=ResourceKind::Buffer}, 0x50u));
+  constexpr std::array ids{100u, 7u, 42u, 19u, 81u, 9u};
+  for (auto& info : fixture.program.block_info) {
+    info.id = ids[info.id];
+    if (info.terminator.true_block != UINT32_MAX)
+      info.terminator.true_block = ids[info.terminator.true_block];
+    if (info.terminator.false_block != UINT32_MAX)
+      info.terminator.false_block = ids[info.terminator.false_block];
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete && fixture.program.info.buffers.size() == 1u,
+        "unconditional Phi-to-guard chain did not retain its bounded descriptor table");
+  for (const auto word : words) {
+    const auto* read = word.Resolve().TryInstruction();
+    Check(read && read->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 &&
+              read->Arg(0).Resolve() == index,
+          "split-header descriptor lost its live induction index");
+  }
+  if (!memory_bound) return;
+  Check(!fixture.program.info.uses_dma,
+        "shared runtime-uniform loop bound still requires live guest DMA");
+  const auto live_count = payload.ResolveInstruction()->Arg(0).Resolve();
+  const auto* snapshot_read = live_count.TryInstruction();
+  Check(snapshot_read && snapshot_read->GetOpcode() == ValueOpcode::ReadConst &&
+            compare.ResolveInstruction()->Arg(1).Resolve() == live_count,
+        "loop bound and ordinary consumer do not share a real immutable snapshot read");
+  const auto slot = snapshot_read->Arg(1).Resolve().U32();
+  auto plan = ExtractResourcePlan(fixture.program);
+  for (const uint32_t count_value : {2u, 0u}) {
+    BoundedSnapshotReader reader;
+    reader.words.emplace_back(0x1000u, count_value);
+    for (uint32_t row = 0u; row < count_value; ++row) {
+      const std::array descriptor{0x20000u + row * 256u, (row + 1u) * 4u << 16u, 4u, 0u};
+      for (uint32_t word = 0u; word < 4u; ++word)
+        reader.words.emplace_back(0x1010u + row * 16u + word * 4u, descriptor[word]);
+    }
+    reader.change_repeated_reads = true;
+    const std::array<uint32_t, 3> data{0x1000u, 0u, 0u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
+          "split-header bound failed coherent materialization");
+    Check(slot < snapshot.flattened_srt.size() && snapshot.flattened_srt[slot] == count_value &&
+              reader.ordinary_reads == 0u && reader.reads.size() == 1u + count_value * 4u,
+          "loop bound was read twice, used an ordinary reader, or zero trip read a descriptor");
+    const auto expected_ranges = count_value
+        ? std::vector<ResourceReadRange>{{0x1000u, 4u}, {0x1010u, 32u}}
+        : std::vector<ResourceReadRange>{{0x1000u, 4u}};
+    Check(snapshot.immutable_srt_ranges == expected_ranges,
+          "shared loop bound source bytes were omitted from immutable dependencies");
+  }
+}
+
+void TestBoundedSrtSplitHeaderUniformCount() { CheckBoundedSrtSplitHeader(false); }
+void TestBoundedSrtSplitHeaderSharedMemoryCount() { CheckBoundedSrtSplitHeader(true); }
+
+void TestBoundedMaterializationAddressesAndSnapshot() {
+  Fixture fixture;
+  InitializeBoundedSnapshot(fixture, 1u, false);
+  fixture.program.bounded_srt_reads[0].offset_scale = 4u;
+  fixture.program.bounded_srt_reads[0].offset_bias = 0xfffffffdu;
+  fixture.program.bounded_srt_reads[0].memory_offset = 0xfffffffdu; // signed -3, aligns to -4
+  auto plan = ExtractResourcePlan(fixture.program);
+  BoundedSnapshotReader reader;
+  reader.words = {{0x100000ff8ull,0xa1u},{0xffcull,0xb2u},{0x1000ull,0xc3u}};
+  const std::array<uint32_t,3> data{3u,0x1003u,0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader,data), snapshot,specialization),
+        "wrapping bounded address materialization failed");
+  Check(snapshot.flattened_srt == std::vector<uint32_t>{0xa1u,0xb2u,0xc3u} &&
+            reader.reads == std::vector<uint64_t>{0x100000ff8ull,0xffcull,0x1000ull},
+        "bounded address combined signed immediate with wrapping U32 offset incorrectly");
+  Check(snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0xffcu,8u},{0x100000ff8ull,4u}},
+        "bounded snapshot footprints lost exact source bytes or merged a gap");
+  Check(reader.ordinary_reads == 0u, "bounded payload used the ordinary reader");
+  const auto saved_snapshot = snapshot;
+  const auto saved_specialization = specialization;
+  reader.fail_address = 0x1000u;
+  Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader,data), snapshot,specialization),
+        "missing last bounded word did not reject the transaction");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  const std::array<uint32_t,3> underflow{1u,0u,0u};
+  plan.bounded_srt_reads[0].offset_bias=0u;
+  const auto before_overflow_reads=reader.reads.size();
+  Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader,underflow), snapshot,specialization),
+        "negative immediate below address zero was not rejected");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  Check(reader.reads.size()==before_overflow_reads, "underflow reached a memory callback");
+  plan.bounded_srt_reads[0].offset_bias=8u;
+  plan.bounded_srt_reads[0].memory_offset=0u;
+  const std::array<uint32_t,3> overflow{1u,0xfffffffcu,0xffffu};
+  Check(!MaterializeResources(plan,BoundedSnapshotRuntime(reader,overflow),snapshot,specialization) &&
+            reader.reads.size()==before_overflow_reads,
+        "48-bit source overflow reached a memory callback or was accepted");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+
+  Fixture duplicate;
+  InitializeBoundedSnapshot(duplicate,2u,false);
+  for (auto& read : duplicate.program.bounded_srt_reads) { read.offset_scale=4u; read.offset_bias=0u; }
+  const auto count_address=duplicate.Address(Value(0x800u),Value(0u));
+  const auto count_flags=duplicate.AddMemory(
+      {.kind=ResourceKind::ScalarAddress,.planning_only=true},0x20u);
+  const auto count_raw=duplicate.Emit(ValueOpcode::LoadAddressU32,
+      {count_address,Value(0u),Value(0u),Value(true)},count_flags);
+  duplicate.program.srt_reads.push_back({count_raw,0u});
+  const auto srt=duplicate.Emit(ValueOpcode::GetSrtResource);
+  duplicate.program.descriptor_sources[0].dwords[0]=duplicate.Emit(ValueOpcode::ReadConst,{srt,Value(0u)});
+  auto duplicate_plan = ExtractResourcePlan(duplicate.program);
+  reader = {};
+  reader.words = {{0x800u,2u},{0x1000u,0x12u},{0x1004u,0x34u}};
+  reader.change_repeated_reads = true;
+  const std::array<uint32_t,3> twice{2u,0x1000u,0u};
+  Check(MaterializeResources(duplicate_plan,BoundedSnapshotRuntime(reader,twice),snapshot,specialization),
+        "duplicate bounded columns failed");
+  Check(snapshot.flattened_srt == std::vector<uint32_t>{2u,0x12u,0x34u,0x12u,0x34u} &&
+            reader.reads.size() == 3u && reader.ordinary_reads==0u &&
+            snapshot.immutable_srt_ranges==std::vector<ResourceReadRange>{{0x800u,4u},{0x1000u,8u}},
+        "same coherent source word was read twice or observed inconsistent values");
+}
+
+void TestBoundedMaterializationCandidatesAndRemap() {
+  for (const uint32_t count : {3u,0u}) {
+    Fixture fixture;
+    InitializeBoundedSnapshot(fixture,4u,true);
+    const auto ordinary_source = AddBoundedSnapshotSource(fixture,
+        {Value(0x40000u),Value(16u << 16u),Value(4u),Value(0u)});
+    fixture.program.info.buffers.push_back({.source=ordinary_source});
+    auto ordinary = fixture.Buffer({Value(0x40000u),Value(16u << 16u),Value(4u),Value(0u)});
+    ordinary.ResolveInstruction()->SetFlags<uint32_t>(1u);
+    const auto flags = fixture.AddMemory({.kind=ResourceKind::Buffer,.resource=1u},0x40u);
+    fixture.Emit(ValueOpcode::LoadBufferU32,{ordinary,Value(0u),Value(0u),Value(0u),Value(true)},flags);
+    // Two uses share one metadata index: a remap must occur once, not per use.
+    fixture.Emit(ValueOpcode::LoadBufferU32,{ordinary,Value(1u),Value(0u),Value(0u),Value(true)},flags);
+    fixture.program.memory_info.push_back({.kind=ResourceKind::ScalarBuffer,.resource=99u,.planning_only=true});
+    auto plan = ExtractResourcePlan(fixture.program);
+    BoundedSnapshotReader reader;
+    const std::array<uint32_t,4> first{0x20000u,4u << 16u,8u,0u};
+    const std::array<uint32_t,4> second{0x20000u,8u << 16u,8u,1u};
+    for (uint32_t index=0; index<3u; ++index)
+      for (uint32_t word=0; word<4u; ++word)
+        reader.words.emplace_back(0x1000u+index*16u+word*4u, (index==1u ? second : first)[word]);
+    // Zero count provides no address user-data words; unreachable table address is not evaluated.
+    const std::vector<uint32_t> data = count ? std::vector<uint32_t>{count,0x1000u,0u}
+                                            : std::vector<uint32_t>{0u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),snapshot,specialization),
+          "bounded candidates or zero-trip table failed materialization");
+    const uint32_t ordinary_dense = count ? 2u : 0u;
+    Check(snapshot.buffers.size() == ordinary_dense+1u &&
+              specialization.buffer_origins == (count ? std::vector<uint32_t>{0u,0u,1u}
+                                                     : std::vector<uint32_t>{1u}),
+          "bounded full-word dedup or ordinary buffer origins changed");
+    const auto& table = specialization.buffer_tables[0];
+    Check(table.count == count && table.resources == (count ? std::vector<uint32_t>{0u,1u}
+                                                          : std::vector<uint32_t>{}),
+          "bounded table inserted a null candidate or lost a distinct descriptor");
+    if (count) {
+      Check(snapshot.buffers[0].dwords[1]==first[1] && snapshot.buffers[1].dwords[1]==second[1] &&
+                snapshot.buffers[1].dwords[3]==second[3] &&
+                specialization.buffers[0].packed_stride != specialization.buffers[1].packed_stride,
+            "candidate descriptor words or independent strides were lost");
+      Check(std::vector<uint32_t>(snapshot.flattened_srt.begin()+table.mapping_flat_offset,
+                                 snapshot.flattened_srt.end()) == std::vector<uint32_t>{0u,1u,0u},
+            "bounded descriptor indices do not map to their deduplicated candidates");
+      // Keep equal address/stride/length; only descriptor dword3 distinguishes the second candidate.
+      for (auto& word : reader.words) if (word.first==0x1014u) word.second=first[1];
+      ResourceSnapshot full_word_snapshot;
+      ResourceSpecialization full_word_specialization;
+      Check(MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),full_word_snapshot,full_word_specialization) &&
+                full_word_snapshot.buffers.size()==3u &&
+                full_word_specialization.buffers[0].packed_stride==full_word_specialization.buffers[1].packed_stride &&
+                full_word_snapshot.buffers[0].dwords[3]!=full_word_snapshot.buffers[1].dwords[3],
+            "dedup ignored descriptor dword3 when address, stride and length matched");
+    } else {
+      Check(reader.reads.empty() && snapshot.immutable_srt_ranges.empty() && snapshot.flattened_srt.empty(),
+            "zero-count bounded table read memory or retained a placeholder payload");
+    }
+    const auto saved_snapshot=snapshot;
+    const auto saved_specialization=specialization;
+    const auto saved_column=plan.bounded_srt_reads[1];
+    for (const bool change_bias : {true,false}) {
+      if (change_bias) plan.bounded_srt_reads[1].offset_bias=4u;
+      else plan.bounded_srt_reads[1].memory_offset=8u;
+      // Both redirected source words exist for every record. Rejection must come
+      // from incompatible descriptor columns, rather than an incidental read failure.
+      Check(!MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),snapshot,specialization),
+            "bounded descriptor accepted mismatched dynamic bias or immediate column offset");
+      CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+      plan.bounded_srt_reads[1]=saved_column;
+    }
+    ApplyResourceSpecialization(fixture.program,specialization);
+    Check(fixture.program.info.buffers.size()==ordinary_dense+1u &&
+              fixture.program.memory_info[flags.index].resource==ordinary_dense &&
+              ordinary.ResolveInstruction()->Flags<uint32_t>()==ordinary_dense &&
+              fixture.program.memory_info[1].resource==99u,
+          "ordinary buffer after expanded/empty table or stale metadata remapped incorrectly");
+  }
+}
+
+void TestBoundedMaterializationLimitsAreTransactional() {
+  Fixture fixture;
+  InitializeBoundedSnapshot(fixture,2u,false);
+  for (auto& read : fixture.program.bounded_srt_reads) { read.offset_scale=0u; read.offset_bias=0u; }
+  auto plan = ExtractResourcePlan(fixture.program);
+  BoundedSnapshotReader reader;
+  reader.words={{0x1000u,0x1234u}};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const std::array<uint32_t,3> at_limit{32768u,0x1000u,0u};
+  Check(MaterializeResources(plan,BoundedSnapshotRuntime(reader,at_limit),snapshot,specialization) &&
+            snapshot.flattened_srt.size()==65536u && reader.reads.size()==1u,
+        "exact total 65536-probe bounded snapshot failed");
+  const auto saved_snapshot=snapshot;
+  const auto saved_specialization=specialization;
+  const std::array<uint32_t,3> over_limit{32769u,0x1000u,0u};
+  Check(!MaterializeResources(plan,BoundedSnapshotRuntime(reader,over_limit),snapshot,specialization),
+        "total bounded probes exceeded 65536 across columns");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+
+  Fixture dense;
+  InitializeBoundedSnapshot(dense,4u,true);
+  auto dense_plan=ExtractResourcePlan(dense.program);
+  reader={}; reader.generated_descriptors=ShaderInfo::MaxBuffers+1u;
+  const std::array<uint32_t,3> max_candidates{ShaderInfo::MaxBuffers,0x1000u,0u};
+  Check(MaterializeResources(dense_plan,BoundedSnapshotRuntime(reader,max_candidates),snapshot,specialization) &&
+            snapshot.buffers.size()==ShaderInfo::MaxBuffers,
+        "exact dense buffer candidate limit was rejected");
+  const auto dense_saved=snapshot;
+  const auto dense_specialization=specialization;
+  const std::array<uint32_t,3> too_many{ShaderInfo::MaxBuffers+1u,0x1000u,0u};
+  Check(!MaterializeResources(dense_plan,BoundedSnapshotRuntime(reader,too_many),snapshot,specialization),
+        "dense buffer candidate limit plus one was accepted");
+  CheckBoundedTransaction(snapshot,dense_saved,specialization,dense_specialization);
+}
+
+void TestBoundedMaterializationRejectsWritableAliases() {
+  for (const bool overlap : {false,true}) {
+    Fixture fixture;
+    InitializeBoundedSnapshot(fixture,4u,true);
+    const auto writer=AddBoundedSnapshotSource(fixture,
+        {Value(overlap ? 0x100cu : 0x1010u),Value(0u),Value(4u),Value(0u)});
+    fixture.program.info.buffers.push_back({.source=writer,.written=true});
+    auto plan=ExtractResourcePlan(fixture.program);
+    BoundedSnapshotReader reader; reader.generated_descriptors=1u;
+    const std::array<uint32_t,3> data{1u,0x1000u,0u};
+    ResourceSnapshot snapshot; snapshot.user_data={0xfeedu};
+    snapshot.immutable_srt_ranges={{0x800u,4u}};
+    ResourceSpecialization specialization;
+    const auto old_snapshot=snapshot;
+    const auto old_specialization=specialization;
+    const bool accepted=MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),snapshot,specialization);
+    Check(accepted != overlap,"bounded source final-word alias or exact-end disjoint writer misclassified");
+    if (overlap) CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -2405,6 +2990,13 @@ int main() {
     Run("inline image address table", TestInlineImageAddressTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
+    Run("bounded SRT tracking proof", TestBoundedSrtTrackingProofBoundaries);
+    Run("bounded SRT split header", TestBoundedSrtSplitHeaderUniformCount);
+    Run("bounded SRT shared memory count", TestBoundedSrtSplitHeaderSharedMemoryCount);
+    Run("TestBoundedMaterializationAddressesAndSnapshot", TestBoundedMaterializationAddressesAndSnapshot);
+    Run("TestBoundedMaterializationCandidatesAndRemap", TestBoundedMaterializationCandidatesAndRemap);
+    Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
+    Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);
     Run("phi validation", TestPhiValidation);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);

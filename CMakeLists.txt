@@ -609,6 +609,9 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-clear-only)
 		add_test(NAME native_htile_array_subset
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-htile-subset-only)
+		add_test(NAME shader_immutable_srt_binding_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --immutable-srt-binding-admission-only)
+		set_tests_properties(shader_immutable_srt_binding_admission PROPERTIES TIMEOUT 360 RUN_SERIAL TRUE)
 		add_test(NAME sampled_htile_write_admission
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-write-admission-only)
 		add_test(NAME sampled_htile_admission

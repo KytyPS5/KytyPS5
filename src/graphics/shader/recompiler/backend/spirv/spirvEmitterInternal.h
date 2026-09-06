@@ -275,6 +275,7 @@ enum : uint32_t {
 	OpBranch                       = 249,
 	OpBranchConditional            = 250,
 	OpSwitch                       = 251,
+	OpUnreachable                  = 255,
 	OpKill                         = 252,
 	OpReturn                       = 253,
 	OpReturnValue                  = 254,
@@ -464,6 +465,10 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	const IR::Block*                                                   current_block = nullptr;
 	uint32_t                                                           scratch_u32_variable = 0;
+	// A bounded buffer-table switch reuses the ordinary memory emitter with
+	// one candidate descriptor at a time. Other instructions retain their metadata.
+	const IR::Inst*                                                     memory_override_inst = nullptr;
+	const IR::MemoryInfo*                                               memory_override = nullptr;
 };
 
 enum class VertexInputScalarKind { Float, Sint, Uint };

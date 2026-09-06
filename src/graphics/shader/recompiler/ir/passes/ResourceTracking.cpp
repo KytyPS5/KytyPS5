@@ -97,6 +97,7 @@ public:
 		if (!m_program.srt_plan_complete) {
 			Fail(0, "SRT plan is not ready");
 		}
+		PlanBoundedReads();
 		PlanIndirectImages();
 		PlanInlineDescriptors();
 		for (auto* block: m_program.blocks) {
@@ -110,11 +111,14 @@ public:
 		}
 		for (const auto& patch: m_memory_patches) {
 			auto& memory    = m_program.memory_info[patch.index];
+			memory.buffer_table = patch.buffer_table;
 			memory.resource = patch.resource;
 			if (patch.has_sampler) {
 				memory.sampler = patch.sampler;
 			}
 		}
+		ApplyBoundedRootReads();
+		ApplyBoundedReads();
 		for (const auto& plan: m_indirect_images) {
 			plan.handle->SetArg(0, plan.key);
 			for (uint32_t dword = 0; dword < 4u; dword++) {
@@ -160,6 +164,7 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+		uint32_t buffer_table = UINT32_MAX;
 	};
 
 	struct IndirectImagePlan {
@@ -224,12 +229,196 @@ private:
 		return true;
 	}
 
+	struct BoundedReadPlan {
+		Inst* read = nullptr;
+		BoundedSrtReadProof proof;
+		uint32_t read_id = 0;
+	};
+	struct BoundedBufferPlan {
+		Inst* handle = nullptr;
+		Value index;
+		std::array<Value, 3> roots;
+	};
+
+	void PlanBoundedReads() {
+		if (m_program.stage != ShaderType::Compute) return;
+		for (auto* block : m_program.blocks) {
+			for (auto& inst : *block) {
+				if (!inst.HasUses()) continue;
+				const auto proof = ProveBoundedSrtRead(m_program, inst);
+				if (!proof) continue;
+				PlanBoundedRootReads(proof->count);
+				PlanBoundedRootReads(proof->address_low);
+				PlanBoundedRootReads(proof->address_high);
+				DescriptorSource address;
+				address.dword_count = 2u;
+				address.dwords[0] = proof->address_low;
+				address.dwords[1] = proof->address_high;
+				DescriptorSource count;
+				count.dword_count = 1u;
+				count.dwords[0] = proof->count;
+				const BoundedSrtRead read {InternSource(address), InternSource(count),
+				                          proof->offset_scale, proof->offset_bias, proof->memory_offset};
+				auto found = std::ranges::find(m_bounded_srt_reads, read);
+				uint32_t read_id = static_cast<uint32_t>(found - m_bounded_srt_reads.begin());
+				if (found == m_bounded_srt_reads.end()) m_bounded_srt_reads.push_back(read);
+				m_bounded_reads.push_back({&inst, *proof, read_id});
+			}
+		}
+	}
+
+	const BoundedReadPlan* BoundedRead(const Inst* read) const {
+		const auto found = std::ranges::find_if(m_bounded_reads,
+		    [&](const BoundedReadPlan& plan) { return plan.read == read; });
+		return found == m_bounded_reads.end() ? nullptr : &*found;
+	}
+
+	bool MakeBoundedBufferSource(Inst& handle, uint32_t& source) {
+		if (handle.NumArgs() != 4u) return false;
+		std::array<const BoundedReadPlan*, 4> words;
+		for (uint32_t word = 0; word < words.size(); ++word) {
+			words[word] = BoundedRead(handle.Arg(word).Resolve().TryInstruction());
+			if (words[word] == nullptr) return false;
+		}
+		const auto& first = m_bounded_srt_reads[words[0]->read_id];
+		for (uint32_t word = 1; word < words.size(); ++word) {
+			const auto& next = m_bounded_srt_reads[words[word]->read_id];
+			if (words[word]->proof.index != words[0]->proof.index ||
+			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    first.offset_scale != next.offset_scale || first.offset_bias != next.offset_bias ||
+			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
+		}
+		DescriptorSource descriptor;
+		descriptor.dword_count = 4u;
+		descriptor.dwords[0] = words[0]->proof.address_low;
+		descriptor.dwords[1] = words[0]->proof.address_high;
+		descriptor.dwords[2] = words[0]->proof.count;
+		descriptor.dwords[3] = Value(0u);
+		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer {};
+		for (uint32_t word = 0; word < words.size(); ++word)
+			descriptor.bounded_buffer->reads[word] = words[word]->read_id;
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_buffers,
+		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; }))
+			m_bounded_buffers.push_back({&handle, words[0]->proof.index,
+			                            {descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2]}});
+		return true;
+	}
+
+	// Only roots of an already-proved bounded read receive this extension.
+	// Their raw ancestors execute before the unavoidable unsigned guard and
+	// use host-evaluable addresses; arbitrary dynamic shader reads stay live.
+	void PlanBoundedRootReads(Value value) {
+		value = value.Resolve();
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(m_bounded_root_visited, inst) !=
+		                           m_bounded_root_visited.end()) return;
+		m_bounded_root_visited.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < m_program.srt_reads.size())
+				PlanBoundedRootReads(m_program.srt_reads[slot.U32()].value);
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+			PlanBoundedRootReads(inst->Arg(arg));
+		const auto op = inst->GetOpcode();
+		if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) return;
+		const auto flags = inst->Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size())
+			Fail(flags.pc, "bounded snapshot root has invalid memory metadata");
+		const auto& memory = m_program.memory_info[flags.index];
+		if (memory.planning_only) return;
+		if ((op == ValueOpcode::LoadAddressU32 && memory.kind != ResourceKind::ScalarAddress) ||
+		    (op == ValueOpcode::ReadConstBuffer && memory.kind != ResourceKind::ScalarBuffer) ||
+		    inst->Parent() == nullptr || !ValidateRuntimeValue(m_program, value))
+			Fail(flags.pc, "bounded snapshot root is not a valid runtime scalar read");
+		m_bounded_root_reads.push_back(inst);
+	}
+
+	void ApplyBoundedRootReads() {
+		for (auto* read : m_bounded_root_reads) {
+			auto* block = read->Parent();
+			const auto where = std::ranges::find_if(block->Instructions(),
+			    [&](const Inst& inst) { return &inst == read; });
+			const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+			const auto srt = Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
+			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
+			                                                  {srt, Value(slot)}));
+			const auto original = Value(read);
+			const auto uses = read->Uses();
+			for (const auto& use : uses) use.user->SetArg(use.operand, flat);
+			const auto rewrite = [&](Value& value) {
+				if (value.Resolve() == original) value = flat;
+			};
+			for (auto& info : m_program.block_info) {
+				rewrite(info.condition);
+				rewrite(info.indirect_target);
+			}
+			// These retained values are not registered IR Uses. In particular,
+			// the count/address sources must point to ReadConst so extraction
+			// marks the exact flat slot for the coherent specialization reader.
+			for (auto& source : m_sources)
+				for (uint32_t word = 0; word < source.dword_count; ++word)
+					rewrite(source.dwords[word]);
+			for (auto& plan : m_bounded_buffers)
+				for (auto& root : plan.roots) rewrite(root);
+			for (auto& plan : m_indirect_images) {
+				rewrite(plan.key);
+				for (auto& root : plan.roots) rewrite(root);
+			}
+			for (auto& plan : m_inline_descriptors) {
+				rewrite(plan.key);
+				for (auto& root : plan.roots) rewrite(root);
+			}
+			// Keep a real raw template for host evaluation, without invalidating
+			// it as ReplaceUsesWith would. Isolate its planning metadata from any
+			// live access which happens to share the original MemoryInfo index.
+			auto flags = read->Flags<MemoryFlags>();
+			auto memory = m_program.memory_info[flags.index];
+			memory.planning_only = true;
+			flags.index = static_cast<uint32_t>(m_program.memory_info.size());
+			m_program.memory_info.push_back(memory);
+			read->SetFlags(flags);
+			m_program.srt_reads.push_back({original, slot});
+			block->AppendNewInst(ValueOpcode::ReferenceU32, {original});
+		}
+		std::erase_if(m_program.dynamic_reads, [&](Value value) {
+			return std::ranges::find(m_bounded_root_reads, value.Resolve().TryInstruction()) !=
+			       m_bounded_root_reads.end();
+		});
+	}
+
+	void ApplyBoundedReads() {
+		m_program.bounded_srt_reads = m_bounded_srt_reads;
+		for (const auto& plan : m_bounded_reads) {
+			auto* block = plan.read->Parent();
+			auto where = std::ranges::find_if(block->Instructions(),
+			    [&](const Inst& inst) { return &inst == plan.read; });
+			const auto replacement = Value(&*block->PrependNewInst(
+			    where, ValueOpcode::ReadBoundedSrtU32, {plan.proof.index}, plan.read_id));
+			// Real indexed immutable reads replace every consumer, including ordinary
+			// scalar threshold data. The raw memory instruction is no longer emitted;
+			// no planning_only shortcut discards its runtime index or shared readers.
+			plan.read->ReplaceUsesWith(replacement);
+		}
+		for (const auto& plan : m_bounded_buffers) {
+			plan.handle->SetArg(0, plan.index);
+			for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, plan.roots[word - 1u]);
+		}
+		std::erase_if(m_program.dynamic_reads, [](Value value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			return inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32;
+		});
+	}
+
 	uint32_t InternSource(const DescriptorSource& descriptor) {
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
 			    current.indirect_image != descriptor.indirect_image ||
-			    current.inline_descriptor != descriptor.inline_descriptor) {
+			    current.inline_descriptor != descriptor.inline_descriptor ||
+			    current.bounded_buffer != descriptor.bounded_buffer) {
 				continue;
 			}
 			bool same = true;
@@ -754,6 +943,7 @@ private:
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
+		if (expected == ValueOpcode::GetBufferResource && MakeBoundedBufferSource(*handle, source)) return;
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
@@ -900,12 +1090,12 @@ private:
 	}
 
 	void AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
-	                    uint32_t pc) {
+	                    uint32_t pc, uint32_t buffer_table = UINT32_MAX) {
 		for (auto& patch: m_memory_patches) {
 			if (patch.index != index) {
 				continue;
 			}
-			if (patch.resource != resource ||
+			if (patch.resource != resource || patch.buffer_table != buffer_table ||
 			    (has_sampler && patch.has_sampler && patch.sampler != sampler)) {
 				Fail(pc, "memory metadata is reused with incompatible resources");
 			}
@@ -915,10 +1105,12 @@ private:
 			}
 			return;
 		}
-		m_memory_patches.push_back({index, resource, sampler, has_sampler});
+		m_memory_patches.push_back({index, resource, sampler, has_sampler, buffer_table});
 	}
 
 	void Collect(Inst& inst) {
+		if (BoundedRead(&inst) != nullptr ||
+		    std::ranges::find(m_bounded_root_reads, &inst) != m_bounded_root_reads.end()) return;
 		const auto op           = inst.GetOpcode();
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
@@ -950,7 +1142,8 @@ private:
 				                           m_info.buffers.size() + 1u, ShaderInfo::MaxBuffers));
 			}
 			AddHandlePatch(handle, resource, flags.pc);
-			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
+			AddMemoryPatch(flags.index, resource, 0, false, flags.pc,
+			               m_sources[source].bounded_buffer.has_value() ? resource : UINT32_MAX);
 			return;
 		}
 		if (address_info.access != AddressAccess::None) {
@@ -1028,7 +1221,8 @@ private:
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
+			    buffer_source->bounded_buffer.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
@@ -1053,6 +1247,11 @@ private:
 	Program&                       m_program;
 	ShaderInfo                     m_info;
 	std::vector<DescriptorSource>  m_sources;
+	std::vector<BoundedSrtRead> m_bounded_srt_reads;
+	std::vector<BoundedReadPlan> m_bounded_reads;
+	std::vector<const Inst*> m_bounded_root_visited;
+	std::vector<Inst*> m_bounded_root_reads;
+	std::vector<BoundedBufferPlan> m_bounded_buffers;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
 	std::vector<IndirectImagePlan> m_indirect_images;

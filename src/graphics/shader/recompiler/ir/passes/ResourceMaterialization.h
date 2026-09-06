@@ -29,6 +29,10 @@ struct ResourceSpecialization {
 		bool                          operator==(const Image&) const = default;
 	};
 
+	std::vector<BoundedSrtLayout> bounded_srt_reads;
+	std::vector<BufferTableLayout> buffer_tables;
+	// Dense native buffer -> original logical buffer metadata. Empty tables have no slot.
+	std::vector<uint32_t> buffer_origins;
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
 	// Candidate sampler slots clone a base sampler's metadata. Descriptor payloads stay in

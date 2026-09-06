@@ -992,10 +992,263 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	return true;
 }
 
+// Accept only one canonical induction value. Arithmetic stays modulo 2^32;
+// the SMEM instruction's signed immediate is intentionally not folded here.
+struct BoundedOffset {
+	const Inst* index = nullptr;
+	uint32_t scale = 0;
+	uint32_t bias = 0;
+};
+
+bool ParseBoundedOffset(Value value, BoundedOffset& result,
+                        std::unordered_set<const Inst*>& visiting) {
+	value = value.Resolve();
+	if (value.GetType() != Type::U32) return false;
+	if (value.IsImmediate()) {
+		result.bias = value.U32();
+		return true;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || !visiting.insert(inst).second) return false;
+	const auto finish = [&](bool success) { visiting.erase(inst); return success; };
+	if (inst->GetOpcode() == ValueOpcode::Phi) {
+		result.index = inst;
+		result.scale = 1u;
+		return finish(true);
+	}
+	if (inst->NumArgs() != 2u) return finish(false);
+	const Inst* arithmetic = inst;
+	auto op = inst->GetOpcode();
+	if (op == ValueOpcode::CompositeExtractU32x2) {
+		const auto component = inst->Arg(1).Resolve();
+		arithmetic = inst->Arg(0).Resolve().TryInstruction();
+		if (!component.IsImmediate() || component.GetType() != Type::U32 || component.U32() != 0u ||
+		    arithmetic == nullptr || arithmetic->GetOpcode() != ValueOpcode::IAddCarry32 ||
+		    arithmetic->NumArgs() != 2u) return finish(false);
+		// S_ADD_U32 lowers through carry pairs. Its low word has exactly the
+		// same modulo-U32 value as IAdd32; the high/carry word is not affine.
+		op = ValueOpcode::IAdd32;
+	}
+	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::ISub32 &&
+	    op != ValueOpcode::IMul32 && op != ValueOpcode::ShiftLeftLogical32)
+		return finish(false);
+	BoundedOffset left, right;
+	if (!ParseBoundedOffset(arithmetic->Arg(0), left, visiting) ||
+	    !ParseBoundedOffset(arithmetic->Arg(1), right, visiting)) return finish(false);
+	if (left.index != nullptr && right.index != nullptr && left.index != right.index)
+		return finish(false);
+	result.index = left.index != nullptr ? left.index : right.index;
+	switch (op) {
+		case ValueOpcode::IAdd32:
+			result.scale = left.scale + right.scale;
+			result.bias = left.bias + right.bias;
+			break;
+		case ValueOpcode::ISub32:
+			result.scale = left.scale - right.scale;
+			result.bias = left.bias - right.bias;
+			break;
+		case ValueOpcode::IMul32:
+			if (left.index != nullptr && right.index != nullptr) return finish(false);
+			result.scale = left.scale * right.bias + right.scale * left.bias;
+			result.bias = left.bias * right.bias;
+			break;
+		case ValueOpcode::ShiftLeftLogical32:
+			if (right.index != nullptr) return finish(false);
+			result.scale = left.scale << (right.bias & 31u);
+			result.bias = left.bias << (right.bias & 31u);
+			break;
+		default: return finish(false);
+	}
+	return finish(true);
+}
+
+class BoundedLoopProof {
+public:
+	explicit BoundedLoopProof(const Program& program): m_program(program) {}
+
+	std::optional<BoundedSrtReadProof> Run(const Inst& read) {
+		if (m_program.stage != ShaderType::Compute || m_program.dispatcher_fallback || m_program.blocks.empty() ||
+		    m_program.blocks.size() != m_program.block_info.size() ||
+		    read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() != 4u)
+			return {};
+		const auto flags = read.Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size()) return {};
+		const auto& memory = m_program.memory_info[flags.index];
+		if (memory.kind != ResourceKind::ScalarAddress || memory.planning_only ||
+		    memory.data_dwords != 1u || memory.data_bits != 32u ||
+		    !Immediate(read.Arg(2), 0u) || read.Arg(3).Resolve() != Value(true)) return {};
+		const auto* address = read.Arg(0).Resolve().TryInstruction();
+		if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    address->NumArgs() != 2u ||
+		    !ValidateRuntimeValue(m_program, address->Arg(0)) ||
+		    !ValidateRuntimeValue(m_program, address->Arg(1))) return {};
+		BoundedOffset offset;
+		std::unordered_set<const Inst*> visiting;
+		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr)
+			return {};
+		if (!BuildGraph()) return {};
+		const auto* phi = offset.index;
+		const auto* header = phi->Parent();
+		if (header == nullptr || !m_ids.contains(header) || !m_ids.contains(read.Parent()) ||
+		    !Reachable(read.Parent()) || phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u ||
+		    header->ImmPredecessors().size() != 2u) return {};
+		const Block* initial = nullptr;
+		const Block* latch = nullptr;
+		for (size_t incoming = 0; incoming < 2u; ++incoming) {
+			const auto* predecessor = phi->PhiBlock(incoming);
+			if (predecessor == nullptr || !m_ids.contains(predecessor) ||
+			    std::ranges::find(header->ImmPredecessors(), predecessor) ==
+			        header->ImmPredecessors().end()) return {};
+			const auto value = phi->Arg(incoming).Resolve();
+			if (Immediate(value, 0u) && !Dominates(header, predecessor)) {
+				if (initial != nullptr) return {};
+				initial = predecessor;
+			} else {
+				const auto* next = value.TryInstruction();
+				if (latch != nullptr || next == nullptr ||
+				    !Dominates(header, predecessor) || next->Parent() == nullptr ||
+				    !Dominates(next->Parent(), predecessor)) return {};
+				BoundedOffset update;
+				std::unordered_set<const Inst*> update_visiting;
+				if (!ParseBoundedOffset(value, update, update_visiting) || update.index != phi ||
+				    update.scale != 1u || update.bias != 1u) return {};
+				latch = predecessor;
+			}
+		}
+		if (initial == nullptr || latch == nullptr || initial == latch) return {};
+		// SSA construction may put the induction Phi in a separate empty header.
+		// Follow only an unavoidable, single-entry unconditional chain to its
+		// guard: every visit to the Phi must execute the same comparison.
+		const Block* guard = header;
+		std::unordered_set<const Block*> guard_chain;
+		while (m_program.block_info[m_ids.at(guard)].terminator.kind ==
+		       CFG::TerminatorKind::Branch) {
+			if (!guard_chain.insert(guard).second) return {};
+			const auto next_id = m_program.block_info[m_ids.at(guard)].terminator.true_block;
+			const auto* next = m_by_id.at(next_id);
+			if (next->ImmPredecessors().size() != 1u ||
+			    next->ImmPredecessors().front() != guard) return {};
+			guard = next;
+		}
+		const auto& info = m_program.block_info[m_ids.at(guard)];
+		if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) return {};
+		auto condition = info.condition.Resolve();
+		bool invert = false;
+		std::unordered_set<const Inst*> condition_visited;
+		while (const auto* inst = condition.TryInstruction()) {
+			if (!condition_visited.insert(inst).second) return {};
+			if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
+			invert = !invert;
+			condition = inst->Arg(0).Resolve();
+		}
+		const auto* compare = condition.TryInstruction();
+		if (compare == nullptr || compare->NumArgs() != 2u) return {};
+		const auto index = Value(const_cast<Inst*>(phi));
+		Value count;
+		if (compare->GetOpcode() == ValueOpcode::ULessThan32 && compare->Arg(0).Resolve() == index)
+			count = compare->Arg(1).Resolve();
+		else if (compare->GetOpcode() == ValueOpcode::UGreaterThan32 && compare->Arg(1).Resolve() == index)
+			count = compare->Arg(0).Resolve();
+		else return {};
+		if (count.GetType() != Type::U32 || !ValidateRuntimeValue(m_program, count)) return {};
+		// Roots may be loaded in the preheader or in this unavoidable guard
+		// chain. Both execute even when N is zero; success-only pointer loads
+		// remain ineligible for eager snapshot evaluation.
+		if (!RuntimeReadsDominate(count, guard) || !RuntimeReadsDominate(address->Arg(0), guard) ||
+		    !RuntimeReadsDominate(address->Arg(1), guard)) return {};
+		const auto success_id = invert ? info.terminator.false_block : info.terminator.true_block;
+		const auto* success = m_by_id.at(success_id);
+		// Removing the successful i<N edge must make the actual read unreachable.
+		// Block dominance alone is insufficient when the guard's false path merges.
+		if (Reachable(read.Parent(), nullptr, guard, success)) return {};
+		return BoundedSrtReadProof {index, count, address->Arg(0).Resolve(), address->Arg(1).Resolve(),
+		                           offset.scale, offset.bias, memory.offset};
+	}
+
+private:
+	static bool Immediate(Value value, uint32_t expected) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
+	}
+	bool RuntimeReadsDominate(Value root, const Block* header) const {
+		std::vector<Value> work {root};
+		std::unordered_set<const Inst*> visited;
+		while (!work.empty()) {
+			const auto value = work.back().Resolve();
+			work.pop_back();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_program.srt_reads.size()) return false;
+				work.push_back(m_program.srt_reads[slot.U32()].value);
+			}
+			if ((inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			     inst->GetOpcode() == ValueOpcode::ReadConstBuffer) &&
+			    (inst->Parent() == nullptr || !Dominates(inst->Parent(), header))) return false;
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) work.push_back(inst->Arg(arg));
+		}
+		return true;
+	}
+	bool BuildGraph() {
+		for (uint32_t i = 0; i < m_program.blocks.size(); ++i) {
+			if (m_program.blocks[i] == nullptr || !m_ids.emplace(m_program.blocks[i], i).second ||
+			    m_program.block_info[i].id == UINT32_MAX ||
+			    !m_by_id.emplace(m_program.block_info[i].id, m_program.blocks[i]).second) return false;
+		}
+		for (uint32_t i = 0; i < m_program.blocks.size(); ++i) {
+			const auto& term = m_program.block_info[i].terminator;
+			std::vector<const Block*> expected;
+			if (term.kind == CFG::TerminatorKind::Branch || term.kind == CFG::TerminatorKind::ConditionalBranch) {
+				if (!m_by_id.contains(term.true_block)) return false;
+				expected.push_back(m_by_id.at(term.true_block));
+			}
+			if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+				if (!m_by_id.contains(term.false_block) || term.true_block == term.false_block) return false;
+				expected.push_back(m_by_id.at(term.false_block));
+			}
+			if (term.kind != CFG::TerminatorKind::Branch && term.kind != CFG::TerminatorKind::ConditionalBranch &&
+			    term.kind != CFG::TerminatorKind::Return) return false;
+			const auto actual = m_program.blocks[i]->ImmSuccessors();
+			if (actual.size() != expected.size()) return false;
+			for (const auto* successor : actual)
+				if (std::ranges::find(expected, successor) == expected.end()) return false;
+		}
+		return true;
+	}
+	bool Reachable(const Block* target, const Block* exclude = nullptr,
+	               const Block* edge_from = nullptr, const Block* edge_to = nullptr) const {
+		std::vector<const Block*> work {m_program.blocks.front()};
+		std::unordered_set<const Block*> visited;
+		while (!work.empty()) {
+			const auto* block = work.back();
+			work.pop_back();
+			if (block == exclude || !visited.insert(block).second) continue;
+			if (block == target) return true;
+			for (const auto* successor : block->ImmSuccessors())
+				if (block != edge_from || successor != edge_to) work.push_back(successor);
+		}
+		return false;
+	}
+	bool Dominates(const Block* dominator, const Block* block) const {
+		return m_ids.contains(dominator) && m_ids.contains(block) && Reachable(block) &&
+		       (dominator == block || !Reachable(block, dominator));
+	}
+	const Program& m_program;
+	std::unordered_map<const Block*, uint32_t> m_ids;
+	std::unordered_map<uint32_t, const Block*> m_by_id;
+};
+
 } // namespace
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program).Run(value);
+}
+
+std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
+                                                     const Inst& read) {
+	return BoundedLoopProof(program).Run(read);
 }
 
 void BuildSrtPlan(Program& program) {

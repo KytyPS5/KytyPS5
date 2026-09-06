@@ -214,6 +214,7 @@ VALUE_OPCODE(MakeImageAddress, ImageAddress, U32, U32, U32, U32, U32, U32, U32, 
              U32, U32)
 
 VALUE_OPCODE(ReadConst, U32, SrtResource, U32)
+VALUE_OPCODE(ReadBoundedSrtU32, U32, U32)
 VALUE_OPCODE(ReadConstBuffer, U32, BufferResource, U32)
 VALUE_OPCODE(LoadAddressU8, U8, AddressResource, U32, U32, U1)
 VALUE_OPCODE(LoadAddressU16, U16, AddressResource, U32, U32, U1)

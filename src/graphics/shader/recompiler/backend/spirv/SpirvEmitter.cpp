@@ -80,6 +80,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
+	    std::ranges::any_of(program.info.bounded_srt_reads, [](const auto& read) { return read.count != 0; }) ||
+	    std::ranges::any_of(program.info.buffer_tables, [](const auto& table) { return table.count != 0; }) ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
 		     return image.indirect_search_iterations != 0u;
 	     });
@@ -140,7 +142,26 @@ void ValidateNativeProgram(const IR::Program& program) {
 					if (planning_only_handle(inst)) {
 						break;
 					}
-					if (dense >= program.info.buffers.size()) {
+					if (!inst.Uses().empty() && std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+						if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) { return false; }
+						const auto index = use.user->Flags<IR::MemoryFlags>().index;
+						return index < program.memory_info.size() &&
+						       program.memory_info[index].buffer_table != UINT32_MAX;
+					})) {
+						if (dense >= program.info.buffer_tables.size()) {
+							Fail(program, "typed buffer handle has an invalid bounded table");
+						}
+						for (const auto& use: inst.Uses()) {
+							if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) {
+								Fail(program, "bounded buffer handle has an unsupported use");
+							}
+							const auto index = use.user->Flags<IR::MemoryFlags>().index;
+							if (index >= program.memory_info.size() ||
+							    program.memory_info[index].buffer_table != dense) {
+								Fail(program, "bounded buffer handle and memory table disagree");
+							}
+						}
+					} else if (dense >= program.info.buffers.size()) {
 						Fail(program, "typed buffer handle has an invalid dense resource");
 					}
 					break;
@@ -189,10 +210,6 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 	const auto MarkBallot = [&] { requirements.subgroup_ballot = true; };
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
-			    inst.GetType() == IR::Type::U64) {
-				requirements.buffer_int64_atomics = true;
-			}
 			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
 			if (address_access != IR::AddressAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
@@ -214,16 +231,33 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind == IR::ResourceKind::Buffer) {
-					if (memory.resource >= program.info.buffers.size()) {
+				const auto inspect_candidate = [&](uint32_t resource) {
+					if (resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
-					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+					if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
+					    inst.GetType() == IR::Type::U64) {
+						requirements.buffer_int64_atomics = true;
+					}
+					if (memory.kind == IR::ResourceKind::Buffer &&
+					    (program.info.buffers[resource].packed_stride & (1u << 20u)) != 0u) {
 						if (program.stage != ShaderType::Compute) {
 							Fail(program, "buffer ADD_TID is only valid for compute shaders");
 						}
 						requirements.subgroup_local_invocation_id = true;
 					}
+				};
+				if (memory.buffer_table != UINT32_MAX) {
+					if (memory.buffer_table >= program.info.buffer_tables.size()) {
+						Fail(program, "buffer operation has invalid bounded table metadata");
+					}
+					const auto& table = program.info.buffer_tables[memory.buffer_table];
+					if ((table.count == 0) != table.resources.empty()) {
+						Fail(program, "bounded buffer count and candidates disagree");
+					}
+					for (const auto resource: table.resources) { inspect_candidate(resource); }
+				} else if (memory.kind == IR::ResourceKind::Buffer) {
+					inspect_candidate(memory.resource);
 				}
 			}
 			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());

@@ -842,6 +842,91 @@ static bool NormalizeSampledHtileRead(
 	return true;
 }
 
+// Indexed SRT values are frozen before dispatch. Check every source byte
+// against the complete declared write footprint before any cache acquisition,
+// ownership change, upload or binding can begin for any active stage.
+static void ValidateImmutableSrtWriteAliases(
+    std::span<const ShaderStageRuntime* const> stages) {
+	std::vector<GuestRange> reads;
+	for (const auto* stage: stages) {
+		EXIT_IF(stage == nullptr || !*stage);
+		for (const auto& source: stage->resources.immutable_srt_ranges) {
+			const GuestRange range {source.address, source.size};
+			if (!range.Valid()) {
+				EXIT("immutable SRT snapshot has an invalid range: address=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n", range.address, range.size);
+			}
+			reads.push_back(range);
+		}
+	}
+	if (reads.empty()) {
+		return;
+	}
+	// The admitted snapshot proof currently covers compute without additional
+	// DMA accesses. In a combined draw this check precedes either stage's work.
+	for (const auto* stage: stages) {
+		const auto& info = stage->program->info;
+		if (stage->program->stage != ShaderType::Compute || info.uses_dma) {
+			EXIT("immutable SRT snapshot requires compute without DMA accesses: stage=%u dma=%d\n",
+			     static_cast<uint32_t>(stage->program->stage), info.uses_dma);
+		}
+		if (stage->resources.buffers.size() != info.buffers.size() ||
+		    stage->resources.images.size() != info.images.size()) {
+			EXIT("immutable SRT snapshot resource counts disagree\n");
+		}
+	}
+	const auto validate_write = [&](GuestRange written, ShaderType stage,
+	                                const char* kind, uint32_t index) {
+		if (!written.Valid()) {
+			EXIT("immutable SRT writable resource has an invalid range: stage=%u kind=%s index=%u "
+			     "address=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     static_cast<uint32_t>(stage), kind, index, written.address, written.size);
+		}
+		for (const auto source: reads) {
+			if (written.address < source.End() && source.address < written.End()) {
+				EXIT("immutable SRT snapshot overlaps writable resource: stage=%u kind=%s index=%u "
+				     "source=0x%016" PRIx64 "+0x%016" PRIx64 " writer=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+				     static_cast<uint32_t>(stage), kind, index, source.address, source.size,
+				     written.address, written.size);
+			}
+		}
+	};
+	for (const auto* stage: stages) {
+		const auto& info = stage->program->info;
+		for (uint32_t index = 0; index < info.images.size(); ++index) {
+			auto resource = info.images[index];
+			if (!resource.written && !resource.atomic) {
+				continue;
+			}
+			resource.written = true; // An atomic access has the storage write footprint too.
+			const auto normalized = NormalizeTextureDescriptor(resource, stage->resources.images[index]);
+			if (!normalized.descriptor.IsNull()) {
+				// This is the same full padded allocation (all mips/layers/depth)
+				// ResolveTexture will expose, not merely its selected view texels.
+				validate_write(normalized.desc.info.data, stage->program->stage, "image", index);
+			}
+		}
+		for (uint32_t index = 0; index < info.buffers.size(); ++index) {
+			const auto& resource = info.buffers[index];
+			if (!resource.written && !resource.atomic) {
+				continue;
+			}
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(stage->resources.buffers[index]);
+			const uint64_t address = descriptor.Base48();
+			const uint64_t stride = descriptor.Stride();
+			const uint64_t records = descriptor.NumRecords();
+			if (stride != 0 && records > UINT64_MAX / stride) {
+				EXIT("immutable SRT writable buffer footprint overflow\n");
+			}
+			const uint64_t size = stride == 0 ? records : stride * records;
+			// Match NativeStorageBuffer's explicit null/empty descriptor behavior.
+			if (address != 0 && size != 0) {
+				validate_write({address, size}, stage->program->stage, "buffer", index);
+			}
+		}
+	}
+}
+
 static void ValidateSampledHtileWriteAliases(
     std::span<const ShaderStageRuntime* const> stages) {
 	struct ReadDependency { GuestRange data; GuestRange metadata; };
@@ -1114,6 +1199,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const ShaderStageRuntime* stage = &runtime;
+	ValidateImmutableSrtWriteAliases(std::span<const ShaderStageRuntime* const>{&stage, 1u});
 	ValidateComparisonStorageAliases(std::span<const ShaderStageRuntime* const>{&stage, 1u});
 	ValidateSampledHtileWriteAliases(std::span<const ShaderStageRuntime* const>{&stage, 1u});
 	const auto& program  = *runtime.program;
@@ -1263,6 +1349,8 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	// Validate the complete draw before preparing either stage: preparing the
 	// vertex stage first could already replace an image needed by the pixel stage.
 	const std::array<const ShaderStageRuntime*, 2> stages {&vertex, &pixel};
+	ValidateImmutableSrtWriteAliases(std::span<const ShaderStageRuntime* const>{
+	    stages.data(), pixel_active ? 2u : 1u});
 	ValidateComparisonStorageAliases(std::span<const ShaderStageRuntime* const>{
 	    stages.data(), pixel_active ? 2u : 1u});
 	ValidateSampledHtileWriteAliases(std::span<const ShaderStageRuntime* const>{

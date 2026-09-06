@@ -19,6 +19,21 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 };
 
+// A raw scalar read whose index is bounded by a dominating unsigned loop guard.
+// offset_scale/index + offset_bias uses U32 arithmetic BEFORE separate signed
+// memory_offset addition/alignment, matching raw SMEM address evaluation.
+struct BoundedSrtReadProof {
+	Value index;
+	Value count;
+	Value address_low;
+	Value address_high;
+	uint32_t offset_scale = 0;
+	uint32_t offset_bias = 0;
+	uint32_t memory_offset = 0;
+};
+std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
+                                                     const Inst& read);
+
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);

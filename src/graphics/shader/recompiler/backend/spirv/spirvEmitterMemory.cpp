@@ -751,10 +751,13 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto mem    = ctx.Memory(inst);
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
+	const bool split_wave64 = state.compute_execution.IsSplitWave64();
+	if (split_wave64 && (!append || mem.kind != IR::ResourceKind::Gds || mem.offset != 0u ||
+	                     state.compute_execution.wave_partition_factor != 1u)) {
+		ctx.Fail(inst, "requires a single-wave GDS append plan");
+	}
 	const auto exec   = ctx.Arg(inst, 1);
-	const auto ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                           ConstantU32(state, ScopeSubgroup), exec});
+	const auto ballot = EmitWaveBallot(state, exec);
 	const auto low  = state.builder.AllocateId();
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
@@ -762,11 +765,10 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto count =
 	    Binary(state, OpIAdd, TypeU32(state), Unary(state, OpBitCount, TypeU32(state), low),
 	           Unary(state, OpBitCount, TypeU32(state), high));
-	const auto first = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), first,
-	                           ConstantU32(state, ScopeSubgroup), ballot});
-	const auto is_first =
-	    Binary(state, OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), first);
+	const auto first = EmitWaveFindFirst(state, ballot);
+	const auto lane = split_wave64 ? EmitHostLocalInvocationIndex(state)
+	                               : EmitSubgroupLocalInvocationId(state);
+	const auto is_first = Binary(state, OpIEqual, TypeBool(state), lane, first);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
 	const auto m0_bounds =
 	    mem.kind == IR::ResourceKind::Gds
@@ -784,10 +786,19 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 		     ConstantU32(state, MemorySemanticsNone), count});
 		return value;
 	});
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), result,
-	                           ConstantU32(state, ScopeSubgroup), atomic, first});
-	return result;
+	if (split_wave64) {
+		// The atomic guard has merged: all 64 host invocations participate. GDS
+		// lives in StorageBuffer memory, distinct from the wave scratch array.
+		// Order successive counter reservations even when their elected lanes
+		// belong to different native subgroups.
+		state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, ScopeDevice), ConstantU32(state,
+		                           MemorySemanticsAcquireRelease | MemorySemanticsUniformMemory)});
+	}
+	// Empty EXEC elects no lane, performs no atomic and returns zero through
+	// the split helper's guarded scratch read; guest inactive writes still keep
+	// their old VGPR values in the surrounding IR Select.
+	return EmitWaveReadLane(state, atomic, first);
 }
 
 struct PreparedFormattedMemory {
@@ -1062,9 +1073,141 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction({OpFunctionEnd});
 }
 
+namespace {
+
+// The loop proof establishes that each executed access has index < count.
+// Keep an explicit bounds branch before the flat-buffer load as well. Invalid
+// indices have no guest semantics in this admitted class and must not access
+// another snapshot column or silently select a different descriptor.
+uint32_t LoadBoundedFlatWord(EmitterState& state, uint32_t index,
+                            uint32_t count, uint32_t flat_offset) {
+	if (count == 0) {
+		// A proved zero-trip loop cannot execute this instruction. Do not
+		// create a resource or invent a readable table for that unreachable path.
+		return state.builder.Constant(OpUndef, TypeU32(state), {});
+	}
+	if (state.flattened_srt_variable == 0 || flat_offset > UINT32_MAX - (count - 1u)) {
+		EXIT("bounded SRT layout has no valid flattened table\n");
+	}
+	const auto valid = Binary(state, OpULessThan, TypeBool(state), index,
+	                          ConstantU32(state, count));
+	const auto load_label = state.builder.AllocateId();
+	const auto invalid_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction({OpBranchConditional, valid, load_label, invalid_label});
+	EmitLabel(state, invalid_label);
+	state.builder.AddFunction({OpUnreachable});
+	EmitLabel(state, load_label);
+	const auto offset = Binary(state, OpIAdd, TypeU32(state), index,
+	                           ConstantU32(state, flat_offset));
+	const auto pointer = state.builder.AllocateId();
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                           state.flattened_srt_variable, ConstantU32(state, 0), offset});
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+	state.builder.AddFunction({OpBranch, merge_label});
+	EmitLabel(state, merge_label);
+	return value;
+}
+
+bool EmitBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None) {
+		return false;
+	}
+	const auto memory = ctx.Memory(inst);
+	if (memory.buffer_table == UINT32_MAX) {
+		return false;
+	}
+	auto& state = ctx.state;
+	if (memory.buffer_table >= state.program.info.buffer_tables.size()) {
+		ctx.Fail(inst, "bounded buffer table specialization is missing");
+	}
+	const auto& table = state.program.info.buffer_tables[memory.buffer_table];
+	const bool has_result = inst.GetType() != IR::Type::Void;
+	if (table.count == 0) {
+		if (!table.resources.empty()) {
+			ctx.Fail(inst, "empty bounded buffer table retained candidate resources");
+		}
+		if (has_result) {
+			ctx.Define(inst, state.builder.Constant(OpUndef, ctx.TypeId(inst.GetType()), {}));
+		}
+		return true;
+	}
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetBufferResource ||
+	    table.resources.empty()) {
+		ctx.Fail(inst, "bounded buffer table has no index or typed candidates");
+	}
+	const auto selected = LoadBoundedFlatWord(state, ctx.Arg(*handle, 0), table.count,
+	                                         table.mapping_flat_offset);
+	const auto merge_label = state.builder.AllocateId();
+	const auto invalid_label = state.builder.AllocateId();
+	const auto result = has_result ? ctx.Result(inst) : 0u;
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> switch_words{OpSwitch, selected, invalid_label};
+	for (const auto resource: table.resources) {
+		if (resource >= state.program.info.buffers.size() ||
+		    std::count(table.resources.begin(), table.resources.end(), resource) != 1) {
+			ctx.Fail(inst, "bounded buffer table contains an invalid candidate");
+		}
+		labels.push_back(state.builder.AllocateId());
+		switch_words.push_back(resource);
+		switch_words.push_back(labels.back());
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction(switch_words);
+	EmitLabel(state, invalid_label);
+	state.builder.AddFunction({OpUnreachable});
+	std::vector<uint32_t> phi{OpPhi, has_result ? ctx.TypeId(inst.GetType()) : 0u, result};
+	const auto* previous_inst = ctx.memory_override_inst;
+	const auto* previous_memory = ctx.memory_override;
+	for (size_t candidate = 0; candidate < table.resources.size(); ++candidate) {
+		EmitLabel(state, labels[candidate]);
+		auto specialized = memory;
+		specialized.resource = table.resources[candidate];
+		specialized.buffer_table = UINT32_MAX;
+		ctx.memory_override_inst = &inst;
+		ctx.memory_override = &specialized;
+		// Each switch arm needs its own SSA result. The original instruction's
+		// reserved ID is defined once by the merge Phi, preserving forward uses.
+		ctx.definitions.erase(&inst);
+		if (!EmitValueMemory(ctx, inst)) {
+			ctx.Fail(inst, "bounded buffer candidate has no ordinary memory emitter");
+		}
+		if (has_result) {
+			phi.push_back(ctx.definitions.at(&inst));
+			phi.push_back(state.current_label);
+		}
+		state.builder.AddFunction({OpBranch, merge_label});
+	}
+	ctx.memory_override_inst = previous_inst;
+	ctx.memory_override = previous_memory;
+	ctx.definitions.erase(&inst);
+	EmitLabel(state, merge_label);
+	if (has_result) {
+		state.builder.AddFunction(phi);
+		ctx.definitions.emplace(&inst, result);
+	}
+	return true;
+}
+
+} // namespace
+
+
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state             = ctx.state;
 	const auto op                = inst.GetOpcode();
+	if (op == IR::ValueOpcode::ReadBoundedSrtU32) {
+		const auto id = inst.Flags<uint32_t>();
+		if (id >= state.program.info.bounded_srt_reads.size()) {
+			ctx.Fail(inst, "bounded SRT read specialization is missing");
+		}
+		const auto& layout = state.program.info.bounded_srt_reads[id];
+		ctx.Define(inst, LoadBoundedFlatWord(state, ctx.Arg(inst, 0), layout.count, layout.flat_offset));
+		return true;
+	}
+	if (EmitBoundedBufferMemory(ctx, inst)) { return true; }
 	const auto buffer_components = IR::BufferComponentCount(op);
 	if (buffer_components > 1u) {
 		const auto access = IR::BufferAccessOf(op);

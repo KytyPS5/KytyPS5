@@ -9170,6 +9170,114 @@ void TestUnusedNativeF64EmissionHasCompleteRequirements() {
   std::puts("KYTY_UNUSED_F64_EMISSION_PASS");
 }
 
+// TEST ONLY: insert after AddExecutionPlanBlock in shaderCfgTests.cpp.
+// Call TestComputeExecutionGdsAppendAdmission from default main and a focused selector.
+void TestComputeExecutionGdsAppendAdmission() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  using V = IR::Value;
+  enum class Scenario { Valid, FixedLoop, VaryingM0, Offset, Width, MissingMemory,
+                        Consume, LdsAppend, OtherGds, Partitioned, Divergent,
+                        CounterBranch, CyclicReadWrite };
+  for (const auto scenario : {Scenario::Valid, Scenario::FixedLoop, Scenario::VaryingM0,
+       Scenario::Offset, Scenario::Width, Scenario::MissingMemory, Scenario::Consume,
+       Scenario::LdsAppend, Scenario::OtherGds, Scenario::Partitioned, Scenario::Divergent,
+       Scenario::CounterBranch, Scenario::CyclicReadWrite}) {
+    const bool loop = scenario == Scenario::FixedLoop || scenario == Scenario::CounterBranch ||
+                      scenario == Scenario::CyclicReadWrite;
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64u;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* exit = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1u;
+    body->AddBranch(exit);
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[1].terminator.true_block = 2u;
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    IR::MemoryInfo memory{};
+    memory.kind = scenario == Scenario::LdsAppend ? IR::ResourceKind::Lds : IR::ResourceKind::Gds;
+    if (scenario == Scenario::Offset) memory.offset = 4u;
+    if (scenario == Scenario::Width) memory.data_bits = 64u;
+    if (scenario != Scenario::MissingMemory) program.memory_info.push_back(memory);
+    IR::Inst* iteration = nullptr;
+    if (loop) {
+      iteration = &body->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+      iteration->AddPhiOperand(entry, V(0u));
+      body->AddBranch(body);
+      program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[1].terminator.true_block = 1u;
+      program.block_info[1].terminator.false_block = 2u;
+      program.block_info[1].terminator.loop_header = true;
+    }
+    const auto m0 = scenario == Scenario::VaryingM0 ? V(&lane) : V(0x00040004u);
+    auto& append = body->AppendNewInst(
+        scenario == Scenario::Consume ? O::DataConsume : O::DataAppend,
+        {m0, V(true), V(0xffffffffu), V(0xffffffffu)});
+    append.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x40u});
+    body->AppendNewInst(O::ReferenceU32, {V(&append)});
+    if (loop) {
+      auto& next = body->AppendNewInst(O::IAdd32, {V(iteration), V(1u)});
+      iteration->AddPhiOperand(body, V(&next));
+      auto& bounded = body->AppendNewInst(O::ULessThan32, {V(&next), V(3u)});
+      program.block_info[1].condition = V(&bounded);
+    }
+    if (scenario == Scenario::CounterBranch) {
+      auto& pred = body->AppendNewInst(O::INotEqual32, {V(&append), V(0u)});
+      auto& ballot = body->AppendNewInst(O::Ballot, {V(&pred)});
+      auto& low = body->AppendNewInst(O::CompositeExtractU32x4, {V(&ballot), V(0u)});
+      auto& condition = body->AppendNewInst(O::INotEqual32, {V(&low), V(0u)});
+      program.block_info[1].condition = V(&condition); // uniform, still polling GDS
+    }
+    if (scenario == Scenario::Divergent) {
+      auto& condition = entry->AppendNewInst(O::INotEqual32, {V(&lane), V(0u)});
+      entry->AddBranch(exit);
+      program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[0].terminator.false_block = 2u;
+      program.block_info[0].condition = V(&condition);
+    }
+    if (scenario == Scenario::OtherGds) {
+      auto& read = body->AppendNewInst(O::LoadSharedU32, {V(0u), V(true)});
+      read.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x50u});
+      body->AppendNewInst(O::ReferenceU32, {V(&read)});
+    }
+    if (scenario == Scenario::CyclicReadWrite) {
+      auto& source = entry->AppendNewInst(O::GetBufferResource, {V(0u),V(0u),V(256u),V(0u)});
+      IR::MemoryInfo scalar{}; scalar.kind = IR::ResourceKind::ScalarBuffer;
+      program.memory_info.push_back(scalar);
+      auto& read = body->AppendNewInst(O::ReadConstBuffer, {V(&source), V(0u)});
+      read.SetFlags(IR::MemoryFlags{.index=1u,.pc=0x50u});
+      body->AppendNewInst(O::ReferenceU32, {V(&read)});
+    }
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = scenario == Scenario::Partitioned ? 128u : 64u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.lds_size_dwords = scenario == Scenario::LdsAppend ? 4u : 0u;
+    compute.wave_size = 64u;
+    ShaderStageInputInfo input{}; input.compute = &compute;
+    ComputeWorkgroupLimits limits{{1024u,1024u,64u},1024u};
+    limits.native_subgroup_size = 32u;
+    const auto plan = PlanComputeExecution(program, input, limits);
+    const bool allowed = scenario == Scenario::Valid || scenario == Scenario::FixedLoop;
+    Check(plan.error.empty() == allowed,
+          "GDS append admission changed a supported or rejected boundary");
+    if (allowed) Check(plan.IsSplitWave64() && plan.wave_partition_factor == 1u,
+                       "GDS append lost its one-complete-wave execution plan");
+    if (scenario == Scenario::VaryingM0)
+      Check(plan.error.find("wave-uniform M0") != std::string::npos,
+            "varying M0 was not rejected by the counter-address proof");
+    if (scenario == Scenario::CounterBranch)
+      Check(plan.error.find("counter cannot control a branch") != std::string::npos,
+            "uniform ballot hid a cyclic counter progress dependency");
+    if (scenario == Scenario::CyclicReadWrite)
+      Check(plan.error.find("cyclic reads and writes") != std::string::npos,
+            "GDS append did not preserve the cyclic communication guard");
+  }
+}
+
 void TestComputeExecutionPlanningBoundaries() {
   using namespace ShaderRecompiler;
   IR::Program program;
@@ -13740,6 +13848,11 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--gds-append-admission-only") == 0) {
+    Libs::Graphics::TestComputeExecutionGdsAppendAdmission();
+    std::puts("KYTY_GDS_APPEND_ADMISSION_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--unused-f64-emission-only") == 0) {
     Libs::Graphics::TestUnusedNativeF64EmissionHasCompleteRequirements();
     return 0;
@@ -13856,6 +13969,7 @@ int main(int argc, char* argv[]) {
   TestF64CertificateReciprocalNonzeroProof();
   TestF64CertificatePhiPredecessorProvenance();
   TestUnusedNativeF64EmissionHasCompleteRequirements();
+  TestComputeExecutionGdsAppendAdmission();
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();

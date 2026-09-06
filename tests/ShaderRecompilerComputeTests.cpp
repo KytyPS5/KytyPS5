@@ -1628,6 +1628,25 @@ constexpr std::array SampledHtileWriteScenarios {
     SampledHtileWriteScenario{"vs-read-ps-buffer-shared-native", true, false, false, true, true, true},
 };
 
+// Place before VulkanHarness. Synthetic ranges, independent of any game capture.
+struct ImmutableSrtScenario {
+  const char* mode;
+  const char* diagnostic;
+  bool allowed = false;
+};
+constexpr std::array ImmutableSrtScenarios {
+    ImmutableSrtScenario{"buffer-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"buffer-atomic-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"image-padding-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"range-overflow", "immutable SRT snapshot has an invalid range"},
+    ImmutableSrtScenario{"range-48bit", "immutable SRT snapshot has an invalid range"},
+    ImmutableSrtScenario{"range-zero", "immutable SRT snapshot has an invalid range"},
+    ImmutableSrtScenario{"dma-access", "immutable SRT snapshot requires compute without DMA accesses"},
+    ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute without DMA accesses"},
+    ImmutableSrtScenario{"buffer-disjoint", "", true},
+    ImmutableSrtScenario{"image-padding-disjoint", "", true},
+};
+
 class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
@@ -9195,6 +9214,180 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
           "sampled HTile direct allocation release failed");
   std::printf("[gpu]     %-32s ok\n", name);
 }
+
+  // Place inside VulkanHarness. Reaches actual renderer admission before any
+  // binding mutation, without dispatching potentially conflicting resources.
+  void CheckImmutableSrtBindingCase(const char* mode) {
+    using namespace ShaderRecompiler::IR;
+    constexpr const char* name = "ImmutableSrtBindingAdmission";
+    const auto found = std::ranges::find_if(ImmutableSrtScenarios,
+        [&](const auto& scenario) { return std::strcmp(mode, scenario.mode) == 0; });
+    Require(name, "scenario", found != ImmutableSrtScenarios.end(),
+            "unknown immutable SRT admission scenario");
+    const auto scenario = *found;
+    const std::string_view selected(mode);
+    const bool image_writer = selected.starts_with("image-padding-");
+    const bool buffer_writer = selected.starts_with("buffer-");
+    const bool graphics = selected == "vertex-snapshot";
+    constexpr uintptr_t base = 0x0000000205200000ull;
+    constexpr uint64_t allocation_size = 0x20000u;
+    constexpr uint64_t allocation_alignment = 0x10000u;
+    constexpr uint32_t width = 17u, height = 9u;
+    constexpr auto format = Prospero::BufferFormat::k32UInt;
+    constexpr auto tile = Prospero::TileMode::kStandard4KB;
+    TileSizeAlign image_layout{};
+    TileGetTextureSize(format,width,height,1u,tile,&image_layout,nullptr,nullptr);
+    Require(name,"padded image footprint",
+            image_layout.size > uint64_t{width}*height*sizeof(uint32_t)+sizeof(uint32_t) &&
+                image_layout.size+sizeof(uint32_t) <= allocation_size,
+            "image padding test does not reach bytes beyond its visible texels");
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name,"direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(0,
+                Libs::LibKernel::Memory::KernelGetDirectMemorySize(),allocation_size,
+                allocation_alignment,0,&direct_offset)==0,
+            "immutable SRT fixture direct allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name,"direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped,allocation_size,
+                0x3,0x10,direct_offset,allocation_alignment)==0 &&
+                mapped==reinterpret_cast<void*>(base),
+            "immutable SRT fixture direct mapping failed");
+    std::memset(mapped,0,allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto& scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers,user_config,shaders);
+      context.InitializeGpu(nullptr);
+      auto& resources = context.GetGpuResources();
+      resources.MapMemory(base,allocation_size);
+      auto& executor = context.GetRenderExecutor();
+
+      Program program{};
+      program.stage = graphics ? ShaderType::Vertex : ShaderType::Compute;
+      program.resource_tracking_complete = true;
+      program.shader_info_complete = true;
+      program.info.uses_dma = selected == "dma-access";
+      program.info.bounded_srt_reads.push_back({1u,0u});
+      ShaderStageRuntime runtime{};
+      runtime.resources.flattened_srt = {0x13579bdfu};
+      constexpr uint32_t buffer_size = 256u;
+      const uint64_t writer_size = image_writer ? image_layout.size : buffer_size;
+      ResourceReadRange source{base+writer_size-(scenario.allowed ? 0u : 4u),4u};
+      if (!image_writer && !buffer_writer) source={base+0x10000u,4u};
+      if (selected == "range-overflow") source={UINT64_MAX-3u,8u};
+      if (selected == "range-48bit") source={uint64_t{1}<<48u,4u};
+      if (selected == "range-zero") source={0u,4u};
+      runtime.resources.immutable_srt_ranges.push_back(source);
+      if (source.size==sizeof(uint32_t) && source.address>=base &&
+          source.address-base<=allocation_size-sizeof(uint32_t)) {
+        const uint32_t snapshotted_word=runtime.resources.flattened_srt[0];
+        std::memcpy(reinterpret_cast<void*>(source.address),&snapshotted_word,sizeof(snapshotted_word));
+      }
+      if (buffer_writer) {
+        BufferResource info{};
+        info.written = selected != "buffer-atomic-overlap";
+        info.atomic = selected == "buffer-atomic-overlap";
+        program.info.buffers.push_back(info);
+        ShaderBufferResource buffer{};
+        buffer.UpdateAddress48(base);
+        buffer.fields[1] |= 4u<<16u;
+        buffer.fields[2] = buffer_size/4u;
+        buffer.fields[3] = DstSel(4,5,6,7);
+        DescriptorValue value{};
+        value.dword_count=4u;
+        std::copy(std::begin(buffer.fields),std::end(buffer.fields),value.dwords.begin());
+        runtime.resources.buffers.push_back(value);
+      }
+      if (image_writer) {
+        ImageResource info{};
+        info.resource_class = ImageResourceClass::Storage;
+        info.numeric_class = Prospero::TextureNumericClass::Uint;
+        info.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        info.written = true;
+        program.info.images.push_back(info);
+        ShaderTextureResource image{};
+        image.fields[0]=static_cast<uint32_t>(base>>8u);
+        image.fields[1]=static_cast<uint32_t>(base>>40u) |
+            (static_cast<uint32_t>(format)<<20u) | (((width-1u)&3u)<<30u);
+        image.fields[2]=((width-1u)>>2u) | ((height-1u)<<14u);
+        image.fields[3]=DstSel(4,5,6,7) | (static_cast<uint32_t>(tile)<<20u) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D)<<28u);
+        image.fields[5]=0x00700000u;
+        DescriptorValue value{};
+        value.dword_count=8u;
+        std::copy(std::begin(image.fields),std::end(image.fields),value.dwords.begin());
+        runtime.resources.images.push_back(value);
+      }
+      AllocateBindings(program);
+      CompiledShaderInfo info{};
+      info.stage=program.stage;
+      info.info=std::move(program.info);
+      info.bindings=std::move(program.bindings);
+      runtime.program=&info;
+      Program pixel_program{};
+      pixel_program.stage=ShaderType::Pixel;
+      pixel_program.resource_tracking_complete=true;
+      pixel_program.shader_info_complete=true;
+      AllocateBindings(pixel_program);
+      CompiledShaderInfo pixel_info{};
+      pixel_info.stage=ShaderType::Pixel;
+      pixel_info.info=std::move(pixel_program.info);
+      pixel_info.bindings=std::move(pixel_program.bindings);
+      ShaderStageRuntime pixel_runtime{.program=&pixel_info};
+      std::printf("KYTY_IMMUTABLE_SRT_READY %s\n",mode);
+      std::fflush(stdout);
+      if (graphics) {
+        (void)RenderExecutorTestAccess::PrepareGraphicsBindings(executor,runtime,pixel_runtime,true);
+      } else {
+        auto prepared=executor.PrepareBindings(runtime);
+        if (scenario.allowed) {
+          executor.FindBuffers(prepared);
+          executor.RebindBuffers(prepared);
+          executor.RebindImages(prepared);
+          Require(name,mode,prepared.resources.buffers.size()==info.info.buffers.size() &&
+                      prepared.resources.images.size()==info.info.images.size(),
+                  "disjoint immutable snapshot suppressed a declared writable resource");
+          if (buffer_writer) {
+            Require(name,mode,prepared.resources.buffers[0].buffer!=nullptr &&
+                        prepared.resources.buffers[0].range==buffer_size &&
+                        prepared.buffer_sources[0].first.Base48()==base,
+                    "disjoint buffer writer was omitted or rebound to a different extent");
+          }
+          if (image_writer) {
+            const auto& binding=prepared.resources.images[0];
+            const auto& image=context.GetTextureCache().GetImage(binding.image_id);
+            Require(name,mode,binding.image_view!=nullptr && image.info.data.address==base &&
+                        image.info.data.size==image_layout.size,
+                    "disjoint storage image lost its full padded allocation");
+          }
+        }
+      }
+      if (!scenario.allowed) {
+        std::printf("KYTY_IMMUTABLE_SRT_RETURNED %s\n",mode);
+        std::fflush(nullptr);
+        std::_Exit(0); // RED is successful old admission; never submit a conflicting operation.
+      }
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base,allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name,"unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base,allocation_size)==0,
+            "immutable SRT fixture unmap failed");
+    Require(name,"release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,allocation_size)==0,
+            "immutable SRT fixture direct release failed");
+    std::printf("KYTY_IMMUTABLE_SRT_RETURNED %s\n",mode);
+  }
 
   void CheckSampledHtileWriteCase(const char* mode) {
     using namespace ShaderRecompiler::IR;
@@ -20450,6 +20643,366 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   return test;
 }
 
+// Synthetic descriptor-table regression. Guest code is assembled from public
+// instruction helpers; no captured shader words or game-specific constants.
+// TEST ONLY: insert before ComputeCases() in ShaderRecompilerComputeTests.cpp.
+// Register AddCase(DsAppendWave64ReturnsOneBaseAcrossNativeHalves).
+// Run via existing --compute-case DsAppendWave64ReturnsOneBaseAcrossNativeHalves.
+// RDNA2 ISA 12.13 p197: one atomic popcount(EXEC) increment, same pre-op value
+// broadcast to every active lane. MBCNT supplies the separate per-lane prefix.
+// TEST ONLY. AddCase(DsAppendWave64BoundedLoopCompactsThreeReservations).
+TestCase DsAppendWave64BoundedLoopCompactsThreeReservations() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsAppendWave64BoundedLoopCompactsThreeReservations";
+  test.initial.assign(258u, 0xdeadbeefu);
+  test.expected = test.initial;
+  test.gds_initial = {0x13579bdfu, 10u, 0x2468ace0u};
+  test.expected_gds = {0x13579bdfu, 202u, 0x2468ace0u};
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 8u;
+  test.compute_info.threads_num[1] = 8u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 2;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.lds_size_dwords = 0u;
+  test.compute_info.needs_lds_barriers = false;
+  auto& code = test.code;
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(3), 1));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(0), 6)); // lane=x+8*y
+  AppendSMovLiteral(&code, 124, 0x00040004u); // GDS counter bytebase4,size4
+  AppendSMovLiteral(&code, 8, 0u); // uniform iteration counter
+  const size_t loop = code.size();
+  code.push_back(EncodeDs0(0x3e, 0u, true));
+  code.push_back(EncodeDs1(3, 0, 0));
+  code.push_back(0xbf8c0000u);
+  code.push_back(EncodeVop2(0x24, 4, 127u, 3));
+  code.push_back(EncodeVop2(0x23, 4, 126u, 4));
+  code.push_back(EncodeVop1(0x01, 7, 8));
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(8), 7));
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(6), 7)); // iteration*256+lane
+  AppendStoreVgprAtLaneDwordOffset(&code, 7, 4, 0u);
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 8, InlineU32(3)));
+  const auto displacement = static_cast<int32_t>(loop) -
+                            static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(displacement))); // SCC1:repeat
+  AppendEnd(&code);
+  for (u32 iteration = 0; iteration < 3u; ++iteration)
+    for (u32 lane = 0; lane < 64u; ++lane)
+      test.expected[10u + iteration * 64u + lane] = iteration * 256u + lane;
+  test.opcodes = {O::S_MOV_B32, O::DS_APPEND, O::V_MBCNT_HI_U32_B32,
+                  O::V_MBCNT_LO_U32_B32, O::S_ADD_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_APPEND", 1u}, {"S_CBRANCH_SCC1", 1u}};
+  return test;
+}
+
+TestCase DsAppendWave64ReturnsOneBaseAcrossNativeHalves() {
+  using O = ShaderOpcode;
+  struct Scenario { uint64_t mask; u32 counter_index; bool compact; };
+  constexpr std::array scenarios{
+      Scenario{0xffffffffffffffffull, 1u, true}, // both complete native halves
+      Scenario{0x8000002280000005ull, 1u, true}, // lanes0,2,31,33,37,63
+      Scenario{0x8000002100000000ull, 1u, true}, // upper half only:32,37,63
+      Scenario{0x0000000080000002ull, 1u, true}, // lower half only:1,31
+      Scenario{0x0000000000000000ull, 1u, true}, // no counter or VGPR writes
+      Scenario{0x8000000100000001ull, 3u, false}, // uint32 counter wrap
+  };
+  constexpr u32 lanes = 64u;
+  constexpr u32 sentinel = 0xdeadbeefu;
+  constexpr u32 compact_start = static_cast<u32>(scenarios.size()) * 2u * lanes;
+  constexpr u32 compact_capacity = 256u;
+  TestCase test;
+  test.name = "DsAppendWave64ReturnsOneBaseAcrossNativeHalves";
+  test.initial.assign(compact_start + compact_capacity + 2u, sentinel);
+  test.expected = test.initial;
+  test.gds_initial = {0x13579bdfu, 100u, 0x2468ace0u, 0xfffffffeu, 0xa5a55a5au};
+  test.expected_gds = test.gds_initial;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 8u;
+  test.compute_info.threads_num[1] = 8u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 2;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.lds_size_dwords = 0u;
+  test.compute_info.needs_lds_barriers = false;
+  auto& code = test.code;
+  // Flatten guest x/y before changing EXEC; v6 is stable across every scenario.
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(3), 1));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(0), 6));
+  for (u32 step = 0; step < scenarios.size(); ++step) {
+    const auto& scenario = scenarios[step];
+    const u32 before = test.expected_gds[scenario.counter_index];
+    AppendVMovLiteral(&code, 3, sentinel); // common DS_APPEND result
+    AppendVMovLiteral(&code, 4, sentinel); // common base plus MBCNT prefix
+    AppendVMovU32(&code, 7, step * 1000u);
+    code.push_back(EncodeVop2(0x25, 7, Vgpr(6), 7));
+    // GDS M0 is {base_bytes[15:0], size_bytes[15:0]}; the instruction offset
+    // is zero as required by RDNA2. Each selected counter occupies one DWORD.
+    AppendSMovLiteral(&code, 124, (scenario.counter_index * 4u << 16u) | 4u);
+    AppendSMovLiteral(&code, 126, static_cast<u32>(scenario.mask));
+    AppendSMovLiteral(&code, 127, static_cast<u32>(scenario.mask >> 32u));
+    code.push_back(EncodeDs0(0x3e, 0, true));
+    code.push_back(EncodeDs1(3, 0, 0));
+    code.push_back(0xbf8c0000u); // S_WAITCNT 0 before consuming the DS result
+    // Use the same HI-then-LO prefix order as an ordinary append compaction.
+    code.push_back(EncodeVop2(0x24, 4, 127u, 3)); // MBCNT_HI EXEC_HI,base
+    code.push_back(EncodeVop2(0x23, 4, 126u, 4)); // MBCNT_LO EXEC_LO,partial
+    if (scenario.compact) {
+      AppendStoreVgprAtLaneDwordOffset(&code, 7, 4, compact_start);
+    }
+    code.push_back(EncodeSop1(0x04, 126, 193u)); // EXEC=-1 before full readback
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 6, step * 2u * lanes);
+    AppendStoreVgprAtLaneDwordOffset(&code, 4, 6, (step * 2u + 1u) * lanes);
+
+    u32 prefix = 0u;
+    for (u32 lane = 0; lane < lanes; ++lane) {
+      if ((scenario.mask & (uint64_t{1} << lane)) == 0) continue;
+      const u32 slot = before + prefix; // defined uint32 wrap for the last case
+      test.expected[step * 2u * lanes + lane] = before;
+      test.expected[(step * 2u + 1u) * lanes + lane] = slot;
+      if (scenario.compact) {
+        Require(test.name, "CPU oracle", slot < compact_capacity,
+                "append compaction oracle exceeds its bounded output region");
+        test.expected[compact_start + slot] = step * 1000u + lane;
+      }
+      ++prefix;
+    }
+    test.expected_gds[scenario.counter_index] = before + prefix;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::DS_APPEND, O::V_MBCNT_HI_U32_B32,
+                  O::V_MBCNT_LO_U32_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_APPEND", scenarios.size()}};
+  return test;
+}
+
+TestCase MakeBufferDescriptorTableScalarLoop(bool predicated) {
+  using O = ShaderOpcode;
+  constexpr u32 table_base = 256u;
+  constexpr u32 descriptor_offset = 16u;
+  constexpr u32 descriptor_stride = 16u;
+  constexpr u32 backing_dwords = 128u;
+  constexpr u32 lanes = 4u;
+  constexpr std::array buffer_bases{64u, 128u, 192u};
+  constexpr std::array buffer_strides{4u, 8u, 4u};
+  const u32 iterations = predicated ? 3u : 2u;
+
+  TestCase test;
+  test.name = predicated ? "BufferDescriptorTableScalarLoopPredicatedStores"
+                         : "BufferDescriptorTableScalarLoopDistinctStores";
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.lds_size_dwords = 0;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.bda_mappings = {{0, 0}};
+  test.user_data[8] = table_base; // Raw S_LOAD base s[8:9].
+  test.user_data[50] = lanes * sizeof(u32); // Marker writes only the first four words.
+  test.initial.resize(backing_dwords);
+  for (u32 word = 0; word < backing_dwords; ++word) {
+    test.initial[word] = 0xdead0000u | word;
+  }
+  test.initial[table_base / sizeof(u32)] = iterations;
+  for (u32 record = 0; record < buffer_bases.size(); ++record) {
+    // Distinct guest buffers with four indexed DWORD records. Their addresses
+    // are small nonzero packed backing offsets, as required by this harness.
+    const std::array descriptor{buffer_bases[record],
+                                buffer_strides[record] << 16u, lanes, 0u};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() +
+                  (table_base + descriptor_offset + record * descriptor_stride) /
+                      sizeof(u32));
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; ++lane) {
+    test.expected[lane] = iterations; // Final scalar counter under restored EXEC.
+    for (u32 record = 0; record < 2u; ++record) {
+      if (!predicated || (lane & 1u) == record) {
+        test.expected[(buffer_bases[record] + buffer_strides[record] * lane) /
+                      sizeof(u32)] =
+            0x100u + record * 16u + lane;
+      }
+    }
+  }
+  // Different A/B strides prove selection of the complete descriptor, rather
+  // than merely changing its base address. B interleaves untouched guard words.
+  // Every other DWORD, including buffer C, inactive records, raw descriptor
+  // words, table header, inter-buffer padding and the final tail, stays exact.
+
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // S_MOV_B64 EXEC, -1.
+  AppendVMovLiteral(&code, 2, 0x100u);
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(0), 2)); // lane-specific store payload.
+  if (predicated) {
+    code.push_back(EncodeVop2(0x1b, 1, InlineU32(1), 0)); // lane parity.
+  }
+  code.push_back(EncodeSMovB32(32, InlineU32(0)));
+  const size_t loop = code.size();
+  code.push_back(EncodeSmem0(0x00, 40, 4)); // Loop bound from raw table header.
+  code.push_back(EncodeSmem1(0));
+  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT.
+  code.push_back(EncodeSopc(0x0a, 32, 40)); // counter < runtime bound.
+  const size_t exit_branch = code.size();
+  code.push_back(0);
+
+  code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(4)));
+  code.push_back(EncodeVop2(0x25, 3, 33, 2)); // 0x100 + 16*counter + lane.
+  size_t skip_empty = 0;
+  if (predicated) {
+    // Iterations 0 and 1 activate different lanes. Iteration 2 has no active
+    // lanes and must skip both the raw descriptor read and its store.
+    code.push_back(EncodeVopc(0xd2, 32, 1)); // V_CMPX_EQ_U32 EXEC, counter, parity.
+    skip_empty = code.size();
+    code.push_back(0);
+  }
+  // The descriptor load is genuinely loop-variant: its address depends on
+  // the induction Phi, not on a value that is constant during specialization.
+  code.push_back(EncodeSmem0(0x02, 16, 4));
+  code.push_back(EncodeSmem1(descriptor_offset, 33));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeMubuf0(0x1c, 0, true, false, true));
+  code.push_back(EncodeMubuf1(3, 4, 0)); // BUFFER_STORE_DWORD v3, v0, s[16:19].
+  const size_t restore = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1)));
+  const size_t backedge = code.size();
+  code.push_back(0);
+  const size_t exit = code.size();
+  AppendStoreSgprAtLaneDwordOffset(&code, 32, 0, 0);
+  AppendEnd(&code);
+  const auto branch = [&](size_t at, u32 opcode, size_t target) {
+    code[at] = EncodeSopp(opcode, static_cast<u32>(
+        static_cast<int64_t>(target) - static_cast<int64_t>(at) - 1));
+  };
+  branch(exit_branch, 0x04, exit); // S_CBRANCH_SCC0.
+  branch(backedge, 0x02, loop); // S_BRANCH.
+  if (predicated) branch(skip_empty, 0x08, restore); // S_CBRANCH_EXECZ.
+
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_LOAD_DWORD,
+                  O::S_LOAD_DWORDX4, O::S_WAITCNT, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC0, O::S_BRANCH, O::S_LSHL_B32,
+                  O::S_ADD_U32, O::V_MOV_B32, O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (predicated) {
+    test.opcodes.insert(test.opcodes.end(),
+                        {O::V_AND_B32, O::V_CMPX_EQ_U32, O::S_CBRANCH_EXECZ});
+  }
+  // Constrain the semantic loop, without prescribing BDA versus descriptor
+  // enumeration as the eventual implementation of dynamic buffer selection.
+  test.required_spirv = {"OpLoopMerge"};
+  return test;
+}
+
+TestCase BufferDescriptorTableScalarLoopDistinctStores() {
+  return MakeBufferDescriptorTableScalarLoop(false);
+}
+
+TestCase BufferDescriptorTableScalarLoopPredicatedStores() {
+  return MakeBufferDescriptorTableScalarLoop(true);
+}
+
+TestCase BufferDescriptorTableScalarLoopLoadsFeedLaterResults() {
+  using O = ShaderOpcode;
+  auto test = MakeBufferDescriptorTableScalarLoop(false);
+  test.name = "BufferDescriptorTableScalarLoopLoadsFeedLaterResults";
+  // Retain the original A/B descriptors (different base AND stride4/8), while
+  // making their payloads inputs. No descriptor table or payload is writable.
+  for (u32 lane = 0; lane < 4u; ++lane) {
+    test.initial[16u + lane] = 0x1100u + 3u * lane;
+    test.initial[32u + 2u * lane] = 0x2200u + 5u * lane;
+  }
+  test.expected = test.initial;
+  test.user_data[50] = 16u * sizeof(u32); // Only output words0..15 are writable.
+  for (u32 lane = 0; lane < 4u; ++lane) {
+    const u32 a = 0x1100u + 3u * lane;
+    const u32 b = 0x2200u + 5u * lane;
+    test.expected[lane] = a + b;
+    test.expected[4u + lane] = b;
+    test.expected[8u + lane] = a;
+    test.expected[12u + lane] = b;
+  }
+  auto &code = test.code;
+  code.clear();
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // Full EXEC.
+  AppendVMovU32(&code, 3, 0); // Last loaded value (defined even on zero-trip path).
+  AppendVMovU32(&code, 4, 0); // Loop-carried accumulator.
+  code.push_back(EncodeSMovB32(32, InlineU32(0)));
+  const size_t loop = code.size();
+  code.push_back(EncodeSmem0(0x00, 40, 4)); // S_LOAD bound from table header.
+  code.push_back(EncodeSmem1(0));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeSopc(0x0a, 32, 40));
+  const size_t exit_branch = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(4)));
+  code.push_back(EncodeSmem0(0x02, 16, 4));
+  code.push_back(EncodeSmem1(16, 33)); // Four words at table+16+index*16.
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeMubuf0(0x0c, 0, true, false));
+  code.push_back(EncodeMubuf1(3, 4, 0)); // Dynamic BUFFER_LOAD v3, lane, s[16:19].
+  code.push_back(EncodeSopp(0x0c, 0));
+  // Both immediate consumers and post-loop consumers must receive the chosen
+  // candidate's value after any lowering-generated branch merges.
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(3), 4));
+  code.push_back(EncodeSop2(0x1e, 34, 32, InlineU32(2)));
+  code.push_back(EncodeVop2(0x25, 5, 34, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 5, 8u);
+  code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1)));
+  const size_t backedge = code.size();
+  code.push_back(0);
+  const size_t exit = code.size();
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 4u);
+  AppendEnd(&code);
+  const auto branch = [&](size_t at, u32 opcode, size_t target) {
+    code[at] = EncodeSopp(opcode, static_cast<u32>(
+        static_cast<int64_t>(target) - static_cast<int64_t>(at) - 1));
+  };
+  branch(exit_branch, 0x04, exit);
+  branch(backedge, 0x02, loop);
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_LOAD_DWORD,
+                  O::S_LOAD_DWORDX4, O::S_WAITCNT, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC0, O::S_BRANCH, O::S_LSHL_B32,
+                  O::S_ADD_U32, O::V_MOV_B32, O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferDescriptorTableZeroTripSkipsUnreadableTable() {
+  auto test = MakeBufferDescriptorTableScalarLoop(false);
+  test.name = "BufferDescriptorTableZeroTripSkipsUnreadableTable";
+  // Only the header at byte256 exists. The first descriptor would start at
+  // byte272, outside both the backing and ReadTestMemory's readable range.
+  // A zero-trip loop must not invent a candidate or read even descriptor[0].
+  test.initial.resize(65u);
+  test.initial[64u] = 0u;
+  test.expected = test.initial;
+  test.user_data[50] = 8u * sizeof(u32);
+  for (u32 lane = 0; lane < 4u; ++lane) {
+    test.expected[lane] = 0u; // Original post-loop counter markers still execute.
+    test.expected[4u + lane] = 0x60000000u + lane;
+  }
+  // Append independent post-loop work before the final S_ENDPGM, leaving the
+  // original loop and its descriptor-dependent store untouched.
+  Require(test.name, "synthetic shader", !test.code.empty() &&
+              test.code.back() == EncodeSopp(0x01), "missing final S_ENDPGM");
+  test.code.pop_back();
+  AppendVMovLiteral(&test.code, 2, 0x60000000u);
+  test.code.push_back(EncodeVop2(0x25, 2, Vgpr(0), 2));
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 2, 0, 4u);
+  AppendEnd(&test.code);
+  // All remaining bytes, including A/B/C poison and the zero header, are exact.
+  return test;
+}
+
 TestCase Buffers65FromSrtUsePackedOffsetsAndStorageFallback() {
   using O = ShaderOpcode;
   constexpr u32 input_count = 64u;
@@ -26513,6 +27066,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
+  AddCase(DsAppendWave64ReturnsOneBaseAcrossNativeHalves);
+  AddCase(DsAppendWave64BoundedLoopCompactsThreeReservations);
+  AddCase(BufferDescriptorTableScalarLoopDistinctStores);
+  AddCase(BufferDescriptorTableScalarLoopPredicatedStores);
+  AddCase(BufferDescriptorTableScalarLoopLoadsFeedLaterResults);
+  AddCase(BufferDescriptorTableZeroTripSkipsUnreadableTable);
   AddCase(Buffers65FromSrtUsePackedOffsetsAndStorageFallback);
   AddCase(BufferD16LoadsPreserveHalvesAndSnapshotAddress);
   AddCase(BufferD16StoresSelectHighBytesAndRespectBounds);
@@ -31313,6 +31872,22 @@ void CheckSampledHtileAdmission() {
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Place after CheckRendererFailureCases, outside VulkanHarness.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckImmutableSrtBindingAdmission() {
+  constexpr const char* name="ImmutableSrtBindingAdmission";
+  std::vector<RendererFailureCase> cases;
+  for (const auto& scenario:ImmutableSrtScenarios)
+    if (!scenario.allowed) cases.push_back({scenario.mode,scenario.diagnostic});
+  CheckRendererFailureCases(name,"--immutable-srt-binding",
+      "KYTY_IMMUTABLE_SRT_READY ","KYTY_IMMUTABLE_SRT_RETURNED ",cases);
+  VulkanHarness vulkan;
+  for (const auto& scenario:ImmutableSrtScenarios)
+    if (scenario.allowed) vulkan.CheckImmutableSrtBindingCase(scenario.mode);
+  std::printf("[host]    %-32s ok (%zu rejected, 2 allowed)\n",name,cases.size());
+}
+#endif
+
 void CheckSampledHtileWriteAdmission() {
   constexpr const char* name = "SampledHtileWriteAdmission";
   std::vector<RendererFailureCase> rejected;
@@ -31448,6 +32023,21 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+// Insert before main's unknown-selector check.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc==3 && std::strcmp(argv[1],"--immutable-srt-binding")==0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImmutableSrtBindingCase(argv[2]);
+    return 0;
+  }
+  if (argc==2 && std::strcmp(argv[1],"--immutable-srt-binding-admission-only")==0) {
+    CheckImmutableSrtBindingAdmission();
+    return 0;
+  }
+#endif
+// Suggested CTest: shader_immutable_srt_binding_admission, selector above,
+// timeout 360 seconds. All child workers remain sequential and bounded.
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 3 && std::strcmp(argv[1], "--sampled-htile-alias") == 0) {
     VulkanHarness vulkan;
@@ -31487,6 +32077,18 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--f64-admission-positive-only") == 0) {
     CheckF64AdmissionPositive();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-descriptor-neighbors-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferDescriptorTableScalarLoopLoadsFeedLaterResults());
+    RunCase(&vulkan, BufferDescriptorTableZeroTripSkipsUnreadableTable());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-descriptor-loop-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferDescriptorTableScalarLoopDistinctStores());
+    RunCase(&vulkan, BufferDescriptorTableScalarLoopPredicatedStores());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--f64-arithmetic-only") == 0) {

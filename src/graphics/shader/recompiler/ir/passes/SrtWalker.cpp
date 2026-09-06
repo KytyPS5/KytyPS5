@@ -578,6 +578,9 @@ private:
 		uint32_t word = 0;
 		if (m_runtime.read_memory != nullptr) {
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
+				const auto message = Diagnostic(m_program, flags.pc,
+				    fmt::format("cannot read descriptor memory at guest address 0x{:016x}", address));
+				std::fprintf(stderr, "%s\n", message.c_str());
 				return false;
 			}
 		} else {
@@ -961,6 +964,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		value.dword_count = source->dword_count;
 		for (uint32_t index = 0; index < source->dword_count; index++) {
 			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+				const auto message = Diagnostic(program, 0u,
+				    fmt::format("descriptor source {} dword {} evaluation failed", source_index, index));
+				std::fprintf(stderr, "%s\n", message.c_str());
 				return false;
 			}
 		}

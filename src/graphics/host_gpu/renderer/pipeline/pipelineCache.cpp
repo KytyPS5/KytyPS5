@@ -275,6 +275,8 @@ struct PipelineCache::ProgramCache {
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
+		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
+		                     options.shader_hash);
 		if (options.dump_ir) {
 			if (!options.early_dump) {
 				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());

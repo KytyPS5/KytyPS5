@@ -275,9 +275,9 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		if (partitions_guest_workgroup || index >= program.memory_info.size())
 			return "wave64 GDS append requires one complete guest wave and valid metadata";
 		const auto& memory = program.memory_info[index];
-		if (memory.kind != IR::ResourceKind::Gds || memory.offset != 0u ||
+		if (memory.kind != IR::ResourceKind::Gds || !IsSupportedWave64GdsAppendOffset(memory.offset) ||
 		    memory.data_bits != 32u || memory.data_dwords != 1u)
-			return "wave64 GDS append requires a zero-offset DWORD counter";
+			return "wave64 GDS append requires a DWORD counter with an aligned 16-bit byte offset";
 		append_memory.insert(index);
 		appends.push_back(&inst);
 	}

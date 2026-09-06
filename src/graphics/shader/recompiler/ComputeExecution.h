@@ -22,6 +22,13 @@ struct ComputeExecutionPlan {
 	[[nodiscard]] bool IsCooperativeWave64() const { return cooperative_wave64; }
 };
 
+// LLVM's GDS pointer lowering folds a byte displacement into DS_APPEND's
+// 16-bit immediate. Keep the split-wave extension to whole DWORD counters;
+// the runtime M0 and backing bounds remain separate from this shape check.
+[[nodiscard]] constexpr bool IsSupportedWave64GdsAppendOffset(uint32_t offset) {
+	return offset <= 0xfffcu && (offset & 3u) == 0u;
+}
+
 // Pure, deterministic and shared by emission and the runtime pipeline cache.
 // A nonempty error forbids emission/dispatch; offline width zero remains native.
 [[nodiscard]] ComputeExecutionPlan PlanComputeExecution(

@@ -617,6 +617,7 @@ struct SystemOverlay::Impl {
 		io.IniFilename = nullptr;
 		io.LogFilename = nullptr;
 		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
 		ImGui::StyleColorsDark();

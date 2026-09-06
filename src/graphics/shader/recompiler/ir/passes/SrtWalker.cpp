@@ -996,7 +996,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	return true;
 }
 
-// Accept one canonical induction value or exact WorkgroupId axis. Arithmetic stays modulo 2^32;
+// Accept one induction value, finite selector or exact WorkgroupId axis. Arithmetic stays modulo 2^32;
 // the SMEM instruction's signed immediate is intentionally not folded here.
 struct BoundedOffset {
 	const Inst* index = nullptr;
@@ -1026,7 +1026,9 @@ bool ParseBoundedOffset(Value value, BoundedOffset& result,
 		result.scale = 1u;
 		return finish(true);
 	}
-	if (inst->GetOpcode() == ValueOpcode::Phi) {
+	if (inst->GetOpcode() == ValueOpcode::Phi ||
+	    inst->GetOpcode() == ValueOpcode::SelectU32 ||
+	    inst->GetOpcode() == ValueOpcode::ReadFirstLane) {
 		result.index = inst;
 		result.scale = 1u;
 		return finish(true);
@@ -1077,9 +1079,9 @@ bool ParseBoundedOffset(Value value, BoundedOffset& result,
 	return finish(true);
 }
 
-class BoundedLoopProof {
+class BoundedReadProof {
 public:
-	explicit BoundedLoopProof(const Program& program): m_program(program) {}
+	explicit BoundedReadProof(const Program& program): m_program(program) {}
 
 	std::optional<BoundedSrtReadProof> Run(const Inst& read) {
 		if (m_program.stage != ShaderType::Compute || m_program.dispatcher_fallback || m_program.blocks.empty() ||
@@ -1102,7 +1104,14 @@ public:
 		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr)
 			return {};
 		if (!BuildGraph()) return {};
-		if (offset.index->GetOpcode() == ValueOpcode::GetBuiltin) {
+		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
+		const auto maximum = workgroup ? std::optional<uint32_t>{} :
+		                                FiniteMaximum(Value(const_cast<Inst*>(offset.index)));
+		if (workgroup || maximum.has_value()) {
+			// The dense enclosure includes every possible GPU value. Keep the key
+			// live; only its constant bound is evaluated on the host. Existing
+			// materialization budgets and coherent-read checks apply to every entry.
+			if (maximum == UINT32_MAX) return {}; // max+1 must not wrap to an empty table.
 			if (!Dominates(offset.index->Parent(), read.Parent()) ||
 			    (offset.index->Parent() == read.Parent() && !Precedes(*offset.index, read))) return {};
 			// Only memory roots in the guaranteed entry prefix may be evaluated
@@ -1119,12 +1128,14 @@ public:
 			}
 			if (!RuntimeReadsDominate(address->Arg(0), prefix, &read) ||
 			    !RuntimeReadsDominate(address->Arg(1), prefix, &read)) return {};
-			return BoundedSrtReadProof {Value(const_cast<Inst*>(offset.index)), Value {},
+			return BoundedSrtReadProof {Value(const_cast<Inst*>(offset.index)),
+			                           workgroup ? Value {} : Value(*maximum + 1u),
 			                           address->Arg(0).Resolve(), address->Arg(1).Resolve(),
 			                           offset.scale, offset.bias, memory.offset,
-			                           offset.index->Arg(1).Resolve().U32()};
+			                           workgroup ? offset.index->Arg(1).Resolve().U32() : UINT32_MAX};
 		}
 		const auto* phi = offset.index;
+		if (phi->GetOpcode() != ValueOpcode::Phi) return {};
 		const auto* header = phi->Parent();
 		if (header == nullptr || !m_ids.contains(header) || !m_ids.contains(read.Parent()) ||
 		    !Reachable(read.Parent()) || phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u ||
@@ -1203,6 +1214,256 @@ public:
 	}
 
 private:
+	std::optional<uint32_t> FiniteMaximum(Value value) {
+		value = value.Resolve();
+		if (value.GetType() != Type::U32) return {};
+		if (value.IsImmediate()) return value.U32();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !m_ids.contains(inst->Parent())) return {};
+		if (const auto found = m_finite_values.find(inst); found != m_finite_values.end())
+			return found->second;
+		if (!m_finite_visiting.insert(inst).second) return {};
+		const auto finish = [&](std::optional<uint32_t> result) {
+			m_finite_visiting.erase(inst);
+			m_finite_values.emplace(inst, result);
+			return result;
+		};
+		if (inst->GetOpcode() == ValueOpcode::ReadFirstLane && inst->NumArgs() == 2u &&
+		    inst->Arg(1).GetType() == Type::U1) {
+			// Every source lane must be bounded, including lane0 for empty EXEC.
+			// Matching a predicated write's mask alone does not justify erasing
+			// its inactive old value; no GPU predicate is evaluated by this proof.
+			if (const auto strict = FiniteMaximum(inst->Arg(0)); strict.has_value())
+				return finish(strict);
+			const auto active = inst->Arg(1).Resolve();
+			if (!ProveActiveMaskNonempty(*inst, active)) return finish({});
+			std::unordered_set<const Inst*> active_visiting;
+			return finish(FiniteMaximumActive(inst->Arg(0), active, active_visiting));
+		}
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+			const auto condition = inst->Arg(0).Resolve();
+			if (condition.GetType() != Type::U1) return finish({});
+			if (condition.IsImmediate())
+				return finish(FiniteMaximum(inst->Arg(condition.U1() ? 1u : 2u)));
+			const auto yes = FiniteMaximum(inst->Arg(1));
+			const auto no = FiniteMaximum(inst->Arg(2));
+			return finish(yes && no ? std::optional(std::max(*yes, *no)) : std::nullopt);
+		}
+		if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0u &&
+		    inst->NumArgs() == inst->NumPhiBlocks() &&
+		    inst->NumArgs() == inst->Parent()->ImmPredecessors().size()) {
+			std::unordered_set<const Block*> incoming;
+			uint32_t maximum = 0u;
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+				const auto* predecessor = inst->PhiBlock(arg);
+				if (!m_ids.contains(predecessor) || !incoming.insert(predecessor).second ||
+				    std::ranges::find(inst->Parent()->ImmPredecessors(), predecessor) ==
+				        inst->Parent()->ImmPredecessors().end()) return finish({});
+				const auto bound = FiniteMaximum(inst->Arg(arg));
+				if (!bound) return finish({});
+				maximum = std::max(maximum, *bound);
+			}
+			return finish(maximum);
+		}
+		return finish({});
+	}
+
+	std::optional<uint32_t> FiniteMaximumActive(
+	    Value value, Value active, std::unordered_set<const Inst*>& visiting) {
+		value = value.Resolve();
+		active = active.Resolve();
+		if (value.GetType() != Type::U32) return {};
+		if (value.IsImmediate()) return value.U32();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !m_ids.contains(inst->Parent()) || !visiting.insert(inst).second)
+			return {};
+		const auto finish = [&](std::optional<uint32_t> result) {
+			visiting.erase(inst);
+			return result;
+		};
+		if (inst->GetOpcode() == ValueOpcode::ReadFirstLane) {
+			// A nested lane selection has its own mask and proof context.
+			return finish(FiniteMaximum(value));
+		}
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+			const auto condition = inst->Arg(0).Resolve();
+			if (condition.GetType() != Type::U1) return finish({});
+			if (condition.IsImmediate())
+				return finish(FiniteMaximumActive(
+				    inst->Arg(condition.U1() ? 1u : 2u), active, visiting));
+			if (condition == active)
+				return finish(FiniteMaximumActive(inst->Arg(1), active, visiting));
+			const auto yes = FiniteMaximumActive(inst->Arg(1), active, visiting);
+			const auto no = FiniteMaximumActive(inst->Arg(2), active, visiting);
+			return finish(yes && no ? std::optional(std::max(*yes, *no)) : std::nullopt);
+		}
+		if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0u &&
+		    inst->NumArgs() == inst->NumPhiBlocks() &&
+		    inst->NumArgs() == inst->Parent()->ImmPredecessors().size()) {
+			std::unordered_set<const Block*> incoming;
+			uint32_t maximum = 0u;
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+				const auto* predecessor = inst->PhiBlock(arg);
+				if (!m_ids.contains(predecessor) || !incoming.insert(predecessor).second ||
+				    std::ranges::find(inst->Parent()->ImmPredecessors(), predecessor) ==
+				        inst->Parent()->ImmPredecessors().end()) return finish({});
+				const auto bound = FiniteMaximumActive(inst->Arg(arg), active, visiting);
+				if (!bound) return finish({});
+				maximum = std::max(maximum, *bound);
+			}
+			return finish(maximum);
+		}
+		return finish({});
+	}
+
+	struct MaskWordProof {
+		bool uniform = false;
+		bool subset = false;
+	};
+
+	MaskWordProof ProveMaskWord(Value value, uint32_t component,
+	                            std::unordered_set<const Inst*>& visiting) const {
+		value = value.Resolve();
+		if (value.GetType() != Type::U32) return {};
+		if (value.IsImmediate()) return {true, value.U32() == 0u};
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !visiting.insert(inst).second) return {};
+		const auto finish = [&](MaskWordProof result) {
+			visiting.erase(inst);
+			return result;
+		};
+		if (inst->GetOpcode() == ValueOpcode::CompositeExtractU32x4 && inst->NumArgs() == 2u) {
+			const auto index = inst->Arg(1).Resolve();
+			const auto* ballot = inst->Arg(0).Resolve().TryInstruction();
+			const bool entry_ballot = index.IsImmediate() && index.GetType() == Type::U32 &&
+			                          ballot != nullptr && ballot->GetOpcode() == ValueOpcode::Ballot &&
+			                          ballot->NumArgs() == 1u && ballot->Arg(0).Resolve() == Value(true) &&
+			                          ballot->Parent() == m_program.blocks.front();
+			return finish({entry_ballot, entry_ballot && index.U32() == component});
+		}
+		if ((inst->GetOpcode() == ValueOpcode::BitwiseAnd32 ||
+		     inst->GetOpcode() == ValueOpcode::BitwiseOr32) && inst->NumArgs() == 2u) {
+			const auto left = ProveMaskWord(inst->Arg(0), component, visiting);
+			const auto right = ProveMaskWord(inst->Arg(1), component, visiting);
+			if (!left.uniform || !right.uniform) return finish({});
+			const bool subset = inst->GetOpcode() == ValueOpcode::BitwiseAnd32
+			                        ? left.subset || right.subset
+			                        : left.subset && right.subset;
+			return finish({true, subset});
+		}
+		return finish({});
+	}
+
+	bool ParseThreadBit(Value active, Value& low, Value& high) const {
+		active = active.Resolve();
+		const auto* nonzero = active.TryInstruction();
+		if (nonzero == nullptr || nonzero->GetOpcode() != ValueOpcode::INotEqual32 ||
+		    nonzero->NumArgs() != 2u) return false;
+		Value selected;
+		if (Immediate(nonzero->Arg(0), 0u)) selected = nonzero->Arg(1).Resolve();
+		else if (Immediate(nonzero->Arg(1), 0u)) selected = nonzero->Arg(0).Resolve();
+		else return false;
+		const auto* one = selected.TryInstruction();
+		if (one == nullptr || one->GetOpcode() != ValueOpcode::BitwiseAnd32 || one->NumArgs() != 2u)
+			return false;
+		Value shifted;
+		if (Immediate(one->Arg(0), 1u)) shifted = one->Arg(1).Resolve();
+		else if (Immediate(one->Arg(1), 1u)) shifted = one->Arg(0).Resolve();
+		else return false;
+		const auto* shift = shifted.TryInstruction();
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
+		    shift->NumArgs() != 2u) return false;
+		const auto* bit = shift->Arg(1).Resolve().TryInstruction();
+		if (bit == nullptr || bit->GetOpcode() != ValueOpcode::BitwiseAnd32 || bit->NumArgs() != 2u)
+			return false;
+		Value lane;
+		if (Immediate(bit->Arg(0), 31u)) lane = bit->Arg(1).Resolve();
+		else if (Immediate(bit->Arg(1), 31u)) lane = bit->Arg(0).Resolve();
+		else return false;
+		const auto* lane_inst = lane.TryInstruction();
+		const auto* choose = shift->Arg(0).Resolve().TryInstruction();
+		if (lane_inst == nullptr || lane_inst->GetOpcode() != ValueOpcode::LaneId ||
+		    choose == nullptr || choose->GetOpcode() != ValueOpcode::SelectU32 ||
+		    choose->NumArgs() != 3u) return false;
+		const auto* upper = choose->Arg(0).Resolve().TryInstruction();
+		if (upper == nullptr || upper->GetOpcode() != ValueOpcode::UGreaterThanEqual32 ||
+		    upper->NumArgs() != 2u || upper->Arg(0).Resolve() != lane ||
+		    !Immediate(upper->Arg(1), 32u)) return false;
+		high = choose->Arg(1).Resolve();
+		low = choose->Arg(2).Resolve();
+		return true;
+	}
+
+	bool IsZeroMaskGuard(Value condition, Value low, Value high) const {
+		condition = condition.Resolve();
+		const auto* equal = condition.TryInstruction();
+		if (equal == nullptr || equal->GetOpcode() != ValueOpcode::IEqual32 ||
+		    equal->NumArgs() != 2u) return false;
+		Value combined;
+		if (Immediate(equal->Arg(0), 0u)) combined = equal->Arg(1).Resolve();
+		else if (Immediate(equal->Arg(1), 0u)) combined = equal->Arg(0).Resolve();
+		else return false;
+		const auto* bit_or = combined.TryInstruction();
+		if (bit_or == nullptr || bit_or->GetOpcode() != ValueOpcode::BitwiseOr32 ||
+		    bit_or->NumArgs() != 2u) return false;
+		const auto left = bit_or->Arg(0).Resolve();
+		const auto right = bit_or->Arg(1).Resolve();
+		return (left == low.Resolve() && right == high.Resolve()) ||
+		       (left == high.Resolve() && right == low.Resolve());
+	}
+
+	bool GraphHasCycle(const Block* block, std::unordered_set<const Block*>& active,
+	                   std::unordered_set<const Block*>& complete) const {
+		if (complete.contains(block)) return false;
+		if (!active.insert(block).second) return true;
+		for (const auto* successor : block->ImmSuccessors())
+			if (GraphHasCycle(successor, active, complete)) return true;
+		active.erase(block);
+		complete.insert(block);
+		return false;
+	}
+
+	bool PostDominates(const Block* required, const Block* start) const {
+		if (required == start) return true;
+		std::vector<const Block*> work {start};
+		std::unordered_set<const Block*> visited;
+		while (!work.empty()) {
+			const auto* block = work.back();
+			work.pop_back();
+			if (block == required || !visited.insert(block).second) continue;
+			const auto& term = m_program.block_info[m_ids.at(block)].terminator;
+			if (term.kind == CFG::TerminatorKind::Return) return false;
+			for (const auto* successor : block->ImmSuccessors()) work.push_back(successor);
+		}
+		return true;
+	}
+
+	bool ProveActiveMaskNonempty(const Inst& read_first_lane, Value active) const {
+		if (read_first_lane.Parent() == nullptr || !m_ids.contains(read_first_lane.Parent())) return false;
+		std::unordered_set<const Block*> graph_active;
+		std::unordered_set<const Block*> graph_complete;
+		if (GraphHasCycle(m_program.blocks.front(), graph_active, graph_complete)) return false;
+		Value low, high;
+		if (!ParseThreadBit(active, low, high)) return false;
+		std::unordered_set<const Inst*> low_visiting;
+		std::unordered_set<const Inst*> high_visiting;
+		const auto low_proof = ProveMaskWord(low, 0u, low_visiting);
+		const auto high_proof = ProveMaskWord(high, 1u, high_visiting);
+		if (!low_proof.uniform || !low_proof.subset || !high_proof.uniform || !high_proof.subset)
+			return false;
+		for (const auto* guard : m_program.blocks) {
+			const auto& info = m_program.block_info[m_ids.at(guard)];
+			if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    !IsZeroMaskGuard(info.condition, low, high)) continue;
+			const auto* nonempty = m_by_id.at(info.terminator.false_block);
+			if (!PostDominates(guard, m_program.blocks.front()) ||
+			    !Dominates(nonempty, read_first_lane.Parent()) ||
+			    !PostDominates(read_first_lane.Parent(), nonempty)) continue;
+			return true;
+		}
+		return false;
+	}
+
 	static bool Immediate(Value value, uint32_t expected) {
 		value = value.Resolve();
 		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
@@ -1286,6 +1547,8 @@ private:
 	const Program& m_program;
 	std::unordered_map<const Block*, uint32_t> m_ids;
 	std::unordered_map<uint32_t, const Block*> m_by_id;
+	std::unordered_map<const Inst*, std::optional<uint32_t>> m_finite_values;
+	std::unordered_set<const Inst*> m_finite_visiting;
 };
 
 } // namespace
@@ -1296,7 +1559,7 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value) {
 
 std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
                                                      const Inst& read) {
-	return BoundedLoopProof(program).Run(read);
+	return BoundedReadProof(program).Run(read);
 }
 
 void BuildSrtPlan(Program& program) {

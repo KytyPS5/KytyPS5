@@ -3061,6 +3061,435 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   }
 }
 
+enum class FiniteSelectorScenario {
+  Select, Phi, CarryOffset, UnknownArm, UndefArm, CyclicPhi,
+  ConditionalRoot, MixedColumns, MixedIndex, VertexStage, EmptyExecUndef,
+};
+
+struct FiniteSelectorFixture {
+  std::unique_ptr<Fixture> fixture;
+  std::array<Value, 4> words;
+  Value index;
+  Value payload;
+};
+
+FiniteSelectorFixture MakeFiniteSelectorFixture(FiniteSelectorScenario scenario) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  FiniteSelectorFixture result;
+  result.fixture = std::make_unique<Fixture>(
+      scenario == FiniteSelectorScenario::VertexStage ? ShaderType::Vertex : ShaderType::Compute);
+  auto& f = *result.fixture;
+  const auto base_low = f.UserData(0u);
+  const auto base_high = f.UserData(1u);
+  const auto unknown = f.UserData(2u);
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto p0 = f.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  const auto p1 = f.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+  const auto p2 = f.Emit(ValueOpcode::IEqual32, {lane, Value(2u)});
+  const auto p3 = f.Emit(ValueOpcode::IEqual32, {lane, Value(3u)});
+  const auto ballot = f.Emit(ValueOpcode::Ballot, {p0});
+  const auto ballot_low = f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+  const auto branch_condition = f.Emit(ValueOpcode::INotEqual32, {ballot_low, Value(0u)});
+  const auto branch = [&](uint32_t from, uint32_t to) {
+    f.program.blocks[from]->AddBranch(f.program.blocks[to]);
+    auto& term = f.program.block_info[from].terminator;
+    term.kind = CFG::TerminatorKind::Branch;
+    term.true_block = to;
+  };
+  const auto conditional = [&](uint32_t from, uint32_t yes, uint32_t no, Value condition) {
+    f.program.blocks[from]->AddBranch(f.program.blocks[yes]);
+    f.program.blocks[from]->AddBranch(f.program.blocks[no]);
+    auto& info = f.program.block_info[from];
+    info.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    info.terminator.true_block = yes;
+    info.terminator.false_block = no;
+    info.condition = condition;
+    f.Emit(ValueOpcode::Reference, {condition}, 0, f.program.blocks[from]);
+  };
+  Value selector;
+  Value low = base_low;
+  Value high = base_high;
+  Value active(true);
+  if (scenario == FiniteSelectorScenario::Phi || scenario == FiniteSelectorScenario::CyclicPhi) {
+    auto* left = f.AddBlock();
+    auto* right = f.AddBlock();
+    auto* merge = f.AddBlock();
+    conditional(0u, 1u, 2u, branch_condition);
+    branch(1u, 3u);
+    branch(2u, 3u);
+    const auto pair = f.Emit(ValueOpcode::SelectU32, {p0, Value(0u), Value(1u)}, 0, left);
+    const auto left_value = f.Emit(ValueOpcode::SelectU32, {p1, Value(2u), pair}, 0, left);
+    const auto right_value = f.Emit(ValueOpcode::SelectU32, {p2, Value(3u), Value(4u)}, 0, right);
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(left, left_value);
+    phi.AddPhiOperand(right, right_value);
+    selector = Value(&phi);
+    f.block = merge;
+    if (scenario == FiniteSelectorScenario::CyclicPhi) {
+      f.AddBlock();
+      const auto next = f.Emit(ValueOpcode::IAdd32, {selector, Value(1u)});
+      phi.AddPhiOperand(merge, next);
+      const auto again = f.Emit(ValueOpcode::ULessThan32, {next, Value(100u)});
+      conditional(3u, 3u, 4u, again);
+      f.program.block_info[3].terminator.loop_header = true;
+      f.program.block_info[4].terminator.kind = CFG::TerminatorKind::Return;
+    } else {
+      f.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+    }
+  } else {
+    Value last(4u);
+    if (scenario == FiniteSelectorScenario::UnknownArm) last = unknown;
+    if (scenario == FiniteSelectorScenario::UndefArm) last = f.Emit(ValueOpcode::UndefU32);
+    selector = f.Emit(ValueOpcode::SelectU32, {p3, Value(3u), last});
+    selector = f.Emit(ValueOpcode::SelectU32, {p2, Value(2u), selector});
+    selector = f.Emit(ValueOpcode::SelectU32, {p1, Value(1u), selector});
+    selector = f.Emit(ValueOpcode::SelectU32, {p0, Value(0u), selector});
+    f.program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+    if (scenario == FiniteSelectorScenario::ConditionalRoot) {
+      auto* roots = f.AddBlock();
+      auto* body = f.AddBlock();
+      f.AddBlock();
+      conditional(0u, 1u, 3u, branch_condition);
+      branch(1u, 2u);
+      branch(2u, 3u);
+      f.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+      f.block = roots;
+      low = f.Emit(ValueOpcode::LoadAddressU32,
+          {f.Address(base_low, base_high), unknown, Value(0u), Value(true)},
+          f.AddMemory({.kind=ResourceKind::ScalarAddress}, 0x10u));
+      high = Value(0u);
+      f.block = body;
+    }
+    if (scenario == FiniteSelectorScenario::EmptyExecUndef) {
+      active = f.Emit(ValueOpcode::IEqual32, {unknown, Value(0u)});
+      selector = f.Emit(ValueOpcode::SelectU32,
+          {active, Value(1u), f.Emit(ValueOpcode::UndefU32)});
+    }
+  }
+  result.index = f.Emit(ValueOpcode::ReadFirstLane, {selector, active});
+  const auto shifted = f.Emit(ValueOpcode::ShiftLeftLogical32, {result.index, Value(4u)});
+  Value offset;
+  if (scenario == FiniteSelectorScenario::CarryOffset) {
+    const auto sum = f.Emit(ValueOpcode::IAddCarry32, {shifted, Value(32u)});
+    offset = f.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(0u)});
+  } else {
+    offset = f.Emit(ValueOpcode::IAdd32, {shifted, Value(32u)});
+  }
+  const auto address = f.Address(low, high, 0x30u);
+  for (uint32_t word = 0; word < 4u; ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * 4u;
+    memory.component_count = 4u;
+    memory.component_index = word;
+    if (scenario == FiniteSelectorScenario::MixedColumns && word == 3u) memory.offset += 4u;
+    auto word_offset = offset;
+    if (scenario == FiniteSelectorScenario::MixedIndex && word == 3u) {
+      const auto other_values = f.Emit(ValueOpcode::SelectU32, {p3, Value(0u), Value(4u)});
+      const auto other_index = f.Emit(ValueOpcode::ReadFirstLane, {other_values, Value(true)});
+      const auto other_shift = f.Emit(ValueOpcode::ShiftLeftLogical32, {other_index, Value(4u)});
+      word_offset = f.Emit(ValueOpcode::IAdd32, {other_shift, Value(32u)});
+    }
+    result.words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+        {address, word_offset, Value(0u), Value(true)}, f.AddMemory(memory, 0x40u));
+  }
+  const auto handle = f.Buffer(result.words, 0x50u);
+  // Ordinary consumers of every word must observe the descriptor snapshot.
+  result.payload = f.Emit(ValueOpcode::IAdd32, {result.words[0], result.words[1]});
+  result.payload = f.Emit(ValueOpcode::IAdd32, {result.payload, result.words[2]});
+  result.payload = f.Emit(ValueOpcode::IAdd32, {result.payload, result.words[3]});
+  f.Emit(ValueOpcode::StoreBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), result.payload, Value(true)},
+      f.AddMemory({.kind=ResourceKind::Buffer, .idxen=true}, 0x50u));
+  // Metadata branch targets are block IDs, not vector indices.
+  for (auto& info : f.program.block_info) {
+    info.id = 100u + info.id * 7u;
+    if (info.terminator.true_block != UINT32_MAX)
+      info.terminator.true_block = 100u + info.terminator.true_block * 7u;
+    if (info.terminator.false_block != UINT32_MAX)
+      info.terminator.false_block = 100u + info.terminator.false_block * 7u;
+  }
+  return result;
+}
+
+void TestFiniteSelectorSrtProof() {
+  // RDNA2 READFIRSTLANE selects lane0 when EXEC is empty. A matching mask
+  // Select cannot erase an undefined old value without a nonempty proof.
+  auto empty = MakeFiniteSelectorFixture(FiniteSelectorScenario::EmptyExecUndef);
+  Check(!ProveBoundedSrtRead(empty.fixture->program, *empty.words[0].ResolveInstruction()),
+        "finite selector pruned an undefined lane0 value under possibly empty EXEC");
+  for (auto scenario : {FiniteSelectorScenario::UnknownArm, FiniteSelectorScenario::UndefArm,
+                        FiniteSelectorScenario::CyclicPhi, FiniteSelectorScenario::ConditionalRoot,
+                        FiniteSelectorScenario::MixedColumns, FiniteSelectorScenario::MixedIndex,
+                        FiniteSelectorScenario::VertexStage}) {
+    auto test = MakeFiniteSelectorFixture(scenario);
+    auto& program = test.fixture->program;
+    if (scenario != FiniteSelectorScenario::MixedColumns && scenario != FiniteSelectorScenario::MixedIndex)
+      Check(!ProveBoundedSrtRead(program, *test.words[0].ResolveInstruction()),
+            "finite selector admitted unknown, undefined, cyclic or conditional-root provenance");
+    BuildSrtPlan(program);
+    CheckFatal([&] { TrackResources(program); }, "not a valid runtime value",
+               "unproved or uncorrelated finite descriptor selection was accepted");
+    Check(!program.resource_tracking_complete && program.info.buffers.empty() &&
+              program.descriptor_sources.empty(),
+          "rejected finite descriptor changed the committed resource plan");
+  }
+  std::cout << "finite selector rejection boundaries passed: 8\n";
+  for (auto scenario : {FiniteSelectorScenario::Select, FiniteSelectorScenario::Phi,
+                        FiniteSelectorScenario::CarryOffset}) {
+    auto test = MakeFiniteSelectorFixture(scenario);
+    auto& program = test.fixture->program;
+    const auto proof = ProveBoundedSrtRead(program, *test.words[0].ResolveInstruction());
+    Check(proof && proof->workgroup_axis == UINT32_MAX &&
+              proof->index.Resolve() == test.index.Resolve() &&
+              proof->count.Resolve().IsImmediate() && proof->count.Resolve().U32() == 5u &&
+              proof->offset_scale == 16u && proof->offset_bias == 32u && proof->memory_offset == 0u,
+          "finite ReadFirstLane selector has no exact five-candidate affine proof");
+    test.fixture->PlanAndTrack();
+    for (auto& word : test.words) {
+      word = word.Resolve();
+      const auto* read = word.TryInstruction();
+      Check(read && read->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 &&
+                read->Arg(0).Resolve() == test.index.Resolve(),
+            "finite descriptor word lost its actual GPU-selected table key");
+    }
+    EliminateDeadCode(program.blocks);
+    ValidateProgram(program, true);
+    Check(program.resource_tracking_complete && program.info.buffers.size() == 1u &&
+              program.bounded_srt_reads.size() == 4u && !program.info.uses_dma,
+          "finite selector did not retain one correlated table without live descriptor DMA");
+    for (const auto word : test.words)
+      Check(word.ResolveInstruction()->HasUses(),
+            "finite descriptor snapshot lost an ordinary shader consumer during DCE");
+  }
+  std::cout << "finite selector proof positives passed: 3\n";
+}
+
+void TestFiniteSelectorSrtMaterialization() {
+  auto test = MakeFiniteSelectorFixture(FiniteSelectorScenario::Phi);
+  test.fixture->PlanAndTrack();
+  EliminateDeadCode(test.fixture->program.blocks);
+  ValidateProgram(test.fixture->program, true);
+  auto plan = ExtractResourcePlan(test.fixture->program);
+  Check(plan.requires_specialization_memory, "finite descriptor table lost coherent-reader admission");
+  const std::array<uint32_t, 3> data{0x1000u, 0u, 123u};
+  BoundedSnapshotReader reader;
+  std::array<std::array<uint32_t, 4>, 5> descriptors;
+  for (uint32_t row = 0; row < 5u; ++row) {
+    descriptors[row] = {0x20000u + row * 256u, ((row + 1u) * 4u) << 16u, 4u, 0u};
+    for (uint32_t word = 0; word < 4u; ++word)
+      reader.words.emplace_back(0x1020u + row * 16u + word * 4u, descriptors[row][word]);
+  }
+  reader.change_repeated_reads = true;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
+        "finite GPU selector required host evaluation or failed coherent table materialization");
+  Check(snapshot.buffers.size() == 5u && specialization.buffer_tables.size() == 1u &&
+            specialization.buffer_tables[0].count == 5u && reader.ordinary_reads == 0u &&
+            reader.reads.size() == 20u &&
+            snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1020u, 80u}},
+        "finite table lost a candidate, read a word twice or omitted immutable descriptor bytes");
+  const auto& table = specialization.buffer_tables[0];
+  for (uint32_t row = 0; row < 5u; ++row) {
+    const auto dense = snapshot.flattened_srt[table.mapping_flat_offset + row];
+    Check(dense < snapshot.buffers.size() && snapshot.buffers[dense].dword_count == 4u &&
+              std::equal(descriptors[row].begin(), descriptors[row].end(), snapshot.buffers[dense].dwords.begin()),
+          "finite table mapping combined words from different descriptors or lost a stride");
+  }
+  const auto saved_snapshot = snapshot;
+  const auto saved_specialization = specialization;
+  reader.reads.clear(); reader.fail_address = 0x1048u;
+  Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
+        "finite table accepted an unreadable candidate word");
+  CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+  reader.reads.clear(); reader.fail_address = UINT64_MAX;
+  // Last candidate can write the final DWORD of the descriptor snapshot.
+  for (auto& [address, value] : reader.words) {
+    if (address == 0x1060u) value = 0x106cu;
+    if (address == 0x1064u) value = 0u;
+    if (address == 0x1068u) value = 4u;
+  }
+  Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
+        "finite descriptor candidate could write its immutable source footprint");
+  CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+  std::cout << "finite selector materialization, transaction and alias checks passed\n";
+}
+
+enum class ActiveFiniteScenario {
+  ValidLow, ValidHigh, ValidOr, MissingGuard, WrongEdge, BypassGuard,
+  DifferentMask, ConstantBits, WrongBallotHalf, VaryingWord,
+  EarlyExit, CyclicControl,
+};
+
+FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scenario) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  FiniteSelectorFixture result;
+  result.fixture = std::make_unique<Fixture>(ShaderType::Compute);
+  auto& f = *result.fixture;
+  auto* entry = f.block;
+  auto* guard = f.AddBlock();
+  auto* body = f.AddBlock();
+  auto* exit = f.AddBlock();
+  auto* after_guard = body;
+  if (scenario == ActiveFiniteScenario::EarlyExit) {
+    after_guard = f.AddBlock();
+  }
+  const auto branch = [&](uint32_t from, uint32_t to) {
+    f.program.blocks[from]->AddBranch(f.program.blocks[to]);
+    auto& info = f.program.block_info[from];
+    info.terminator.kind = CFG::TerminatorKind::Branch;
+    info.terminator.true_block = to;
+  };
+  const auto conditional = [&](uint32_t from, uint32_t yes, uint32_t no, Value condition) {
+    f.program.blocks[from]->AddBranch(f.program.blocks[yes]);
+    f.program.blocks[from]->AddBranch(f.program.blocks[no]);
+    auto& info = f.program.block_info[from];
+    info.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    info.terminator.true_block = yes;
+    info.terminator.false_block = no;
+    info.condition = condition;
+    f.Emit(ValueOpcode::Reference, {condition}, 0, f.program.blocks[from]);
+  };
+
+  const auto ballot = f.Emit(ValueOpcode::Ballot, {Value(true)}, 0, entry);
+  const auto ballot_low =
+      f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)}, 0, entry);
+  const auto ballot_high =
+      f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)}, 0, entry);
+  const auto lane = f.Emit(ValueOpcode::LaneId, {}, 0, entry);
+  Value low;
+  Value high(0u);
+  if (scenario == ActiveFiniteScenario::ValidHigh) {
+    high = f.Emit(ValueOpcode::BitwiseAnd32, {ballot_high, Value(0x20u)}, 0, entry);
+    low = Value(0u);
+  } else if (scenario == ActiveFiniteScenario::ValidOr) {
+    const auto first = f.Emit(ValueOpcode::BitwiseAnd32, {ballot_low, Value(1u)}, 0, entry);
+    const auto third = f.Emit(ValueOpcode::BitwiseAnd32, {ballot_low, Value(4u)}, 0, entry);
+    low = f.Emit(ValueOpcode::BitwiseOr32, {first, third}, 0, entry);
+  } else if (scenario == ActiveFiniteScenario::ConstantBits) {
+    low = Value(1u);
+  } else if (scenario == ActiveFiniteScenario::WrongBallotHalf) {
+    low = ballot_high;
+  } else if (scenario == ActiveFiniteScenario::VaryingWord) {
+    const auto varying =
+        f.Emit(ValueOpcode::ShiftLeftLogical32, {Value(1u), lane}, 0, entry);
+    low = f.Emit(ValueOpcode::BitwiseAnd32, {ballot_low, varying}, 0, entry);
+  } else {
+    const auto sparse =
+        f.Emit(ValueOpcode::BitwiseAnd32, {ballot_low, Value(0x01010101u)}, 0, entry);
+    const auto first_byte =
+        f.Emit(ValueOpcode::BitwiseAnd32, {ballot_low, Value(0xffu)}, 0, entry);
+    low = f.Emit(ValueOpcode::BitwiseAnd32, {sparse, first_byte}, 0, entry);
+    const auto upper_sparse =
+        f.Emit(ValueOpcode::BitwiseAnd32, {ballot_high, Value(0x01010101u)}, 0, entry);
+    high = f.Emit(ValueOpcode::BitwiseAnd32, {upper_sparse, Value(0u)}, 0, entry);
+  }
+  const auto bit = f.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(31u)}, 0, entry);
+  const auto upper =
+      f.Emit(ValueOpcode::UGreaterThanEqual32, {lane, Value(32u)}, 0, entry);
+  const auto word = f.Emit(ValueOpcode::SelectU32, {upper, high, low}, 0, entry);
+  const auto shifted = f.Emit(ValueOpcode::ShiftRightLogical32, {word, bit}, 0, entry);
+  const auto selected =
+      f.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}, 0, entry);
+  const auto active = f.Emit(ValueOpcode::INotEqual32, {selected, Value(0u)}, 0, entry);
+  const auto combined = f.Emit(ValueOpcode::BitwiseOr32, {low, high}, 0, entry);
+  const auto empty = f.Emit(ValueOpcode::IEqual32, {combined, Value(0u)}, 0, guard);
+  const auto branch_choice =
+      f.Emit(ValueOpcode::INotEqual32, {f.UserData(3u), Value(0u)}, 0, entry);
+
+  const auto guard_id = 1u;
+  const auto body_id = 2u;
+  const auto exit_id = 3u;
+  const auto after_id = scenario == ActiveFiniteScenario::EarlyExit ? 4u : body_id;
+  if (scenario == ActiveFiniteScenario::MissingGuard) {
+    branch(0u, body_id);
+    f.program.block_info[guard_id].terminator.kind = CFG::TerminatorKind::Return;
+  } else if (scenario == ActiveFiniteScenario::BypassGuard) {
+    conditional(0u, guard_id, body_id, branch_choice);
+    conditional(guard_id, exit_id, body_id, empty);
+  } else {
+    branch(0u, guard_id);
+    conditional(guard_id,
+                scenario == ActiveFiniteScenario::WrongEdge ? body_id : exit_id,
+                scenario == ActiveFiniteScenario::WrongEdge ? exit_id : after_id,
+                empty);
+  }
+  if (scenario == ActiveFiniteScenario::EarlyExit) {
+    conditional(after_id, body_id, exit_id, branch_choice);
+  }
+
+  f.block = body;
+  const auto p0 = f.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  const auto p1 = f.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+  const auto p2 = f.Emit(ValueOpcode::IEqual32, {lane, Value(2u)});
+  const auto p3 = f.Emit(ValueOpcode::IEqual32, {lane, Value(3u)});
+  auto finite = f.Emit(ValueOpcode::SelectU32, {p3, Value(3u), Value(4u)});
+  finite = f.Emit(ValueOpcode::SelectU32, {p2, Value(2u), finite});
+  finite = f.Emit(ValueOpcode::SelectU32, {p1, Value(1u), finite});
+  finite = f.Emit(ValueOpcode::SelectU32, {p0, Value(0u), finite});
+  const auto old_value = f.UserData(2u);
+  const auto source_mask = scenario == ActiveFiniteScenario::DifferentMask
+                               ? f.Emit(ValueOpcode::LogicalNot, {active})
+                               : active;
+  const auto source = f.Emit(ValueOpcode::SelectU32, {source_mask, finite, old_value});
+  result.index = f.Emit(ValueOpcode::ReadFirstLane, {source, active});
+  const auto offset_shift =
+      f.Emit(ValueOpcode::ShiftLeftLogical32, {result.index, Value(4u)});
+  const auto offset = f.Emit(ValueOpcode::IAdd32, {offset_shift, Value(32u)});
+  const auto address = f.Address(f.UserData(0u), f.UserData(1u), 0x30u);
+  for (uint32_t component = 0; component < 4u; ++component) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = component * sizeof(uint32_t);
+    memory.component_count = 4u;
+    memory.component_index = component;
+    result.words[component] = f.Emit(ValueOpcode::LoadAddressU32,
+        {address, offset, Value(0u), Value(true)}, f.AddMemory(memory, 0x40u));
+  }
+  const auto handle = f.Buffer(result.words, 0x50u);
+  f.Emit(ValueOpcode::StoreBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(0x12345678u), Value(true)},
+      f.AddMemory({.kind=ResourceKind::Buffer, .idxen=true}, 0x50u));
+  if (scenario == ActiveFiniteScenario::CyclicControl) {
+    conditional(body_id, body_id, exit_id, branch_choice);
+  } else {
+    branch(body_id, exit_id);
+  }
+  f.program.block_info[exit_id].terminator.kind = CFG::TerminatorKind::Return;
+  return result;
+}
+
+void TestFiniteSelectorActiveMaskProof() {
+  for (auto scenario : {ActiveFiniteScenario::MissingGuard, ActiveFiniteScenario::WrongEdge,
+                        ActiveFiniteScenario::BypassGuard, ActiveFiniteScenario::DifferentMask,
+                        ActiveFiniteScenario::ConstantBits, ActiveFiniteScenario::WrongBallotHalf,
+                        ActiveFiniteScenario::VaryingWord, ActiveFiniteScenario::EarlyExit,
+                        ActiveFiniteScenario::CyclicControl}) {
+    auto test = MakeActiveFiniteSelectorFixture(scenario);
+    Check(!ProveBoundedSrtRead(test.fixture->program, *test.words[0].ResolveInstruction()),
+          "finite selector accepted an unsafe active-mask projection");
+  }
+  std::cout << "finite selector active-mask rejection boundaries passed: 9\n";
+  for (auto scenario : {ActiveFiniteScenario::ValidLow, ActiveFiniteScenario::ValidHigh,
+                        ActiveFiniteScenario::ValidOr}) {
+    auto test = MakeActiveFiniteSelectorFixture(scenario);
+    const auto proof =
+        ProveBoundedSrtRead(test.fixture->program, *test.words[0].ResolveInstruction());
+    Check(proof && proof->index.Resolve() == test.index.Resolve() &&
+              proof->count.Resolve().IsImmediate() && proof->count.Resolve().U32() == 5u &&
+              proof->offset_scale == 16u && proof->offset_bias == 32u,
+          "finite selector did not use its guarded nonempty active-lane values");
+    test.fixture->PlanAndTrack();
+    Check(test.fixture->program.resource_tracking_complete &&
+              test.fixture->program.info.buffers.size() == 1u &&
+              test.fixture->program.bounded_srt_reads.size() == 4u,
+          "guarded finite selector did not produce one correlated descriptor table");
+  }
+  std::cout << "finite selector active-mask positives passed: 3\n";
+}
+
+
 // Synthetic CPU regressions: append after the existing bounded snapshot helpers.
 Value WorkgroupSrtIndex(Fixture& fixture, uint32_t axis) {
   return fixture.Emit(ValueOpcode::GetBuiltin,
@@ -3471,6 +3900,21 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--finite-selector-srt-proof-only") == 0) {
+      TestFiniteSelectorSrtProof();
+      std::cout << "KYTY_FINITE_SELECTOR_SRT_PROOF_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--finite-selector-srt-materialization-only") == 0) {
+      TestFiniteSelectorSrtMaterialization();
+      std::cout << "KYTY_FINITE_SELECTOR_SRT_MATERIALIZATION_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--finite-selector-active-proof-only") == 0) {
+      TestFiniteSelectorActiveMaskProof();
+      std::cout << "KYTY_FINITE_SELECTOR_ACTIVE_PROOF_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--workgroup-srt-proof-only") == 0) {
       TestWorkgroupSrtTrackingProof();
       TestWorkgroupSrtRootExecutionProof();
@@ -3520,6 +3964,9 @@ int main(int argc, char** argv) {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("raw fallback readability", TestSrtRawFallbackReadability);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
+    Run("finite selector SRT proof", TestFiniteSelectorSrtProof);
+    Run("finite selector SRT materialization", TestFiniteSelectorSrtMaterialization);
+    Run("finite selector active-mask proof", TestFiniteSelectorActiveMaskProof);
     Run("workgroup SRT proof", TestWorkgroupSrtTrackingProof);
     Run("workgroup SRT root execution", TestWorkgroupSrtRootExecutionProof);
     Run("workgroup SRT materialization", TestWorkgroupSrtMaterializationAndSpecialization);

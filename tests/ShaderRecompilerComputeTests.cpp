@@ -21290,6 +21290,119 @@ TestCase DsAppendWave64OffsetLoopCompactsSparseReservations() {
   return test;
 }
 
+// GPU-derived selectors remain runtime values even though their possible
+// values form the finite set {0,1,2,3,4}. No captured shader bytes are used.
+TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64u, scenarios = 5u, guard = 4u;
+  constexpr u32 record_stride = 64u;
+  constexpr u32 input_base = 24u, marker_base = 28u;
+  constexpr u32 marker_dword_offset = 6000u, table_base = 28000u;
+  constexpr u32 marker_words = guard + scenarios * 2u * lanes + guard;
+  constexpr std::array buffer_bases{4u, 8u, 12u, 16u, 20u};
+  constexpr uint64_t upper_mask = 0x8000002000000000ull; // lanes37,63
+  const uint64_t mask = sparse_upper ? upper_mask : 0xffffffffffffffffull;
+  const u32 first_lane = sparse_upper ? 37u : 0u;
+  TestCase test;
+  test.name = sparse_upper ? "FiniteSelectorDescriptorStoresUseFirstActiveUpperLane"
+                           : "FiniteSelectorDescriptorStoresUseGpuChoices";
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.lds_size_dwords = 0u;
+  test.compute_info.needs_lds_barriers = false;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.bda_mappings = {{0, 0}};
+  test.user_data[0] = input_base;
+  test.user_data[1] = record_stride << 16u;
+  test.user_data[2] = scenarios * lanes;
+  test.user_data[8] = table_base; // raw descriptor-table pointer s[8:9]
+  test.user_data[48] = marker_base;
+  test.user_data[50] = (marker_dword_offset + marker_words) * sizeof(u32);
+  test.initial.resize((table_base + 128u) / sizeof(u32));
+  for (u32 word = 0; word < test.initial.size(); ++word)
+    test.initial[word] = 0xdead0000u | word;
+  for (u32 candidate = 0; candidate < scenarios; ++candidate) {
+    const std::array descriptor{buffer_bases[candidate], record_stride << 16u,
+                                scenarios * lanes, 0u};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + (table_base + 32u + 16u * candidate) / 4u);
+  }
+  for (u32 step = 0; step < scenarios; ++step) {
+    for (u32 lane = 0; lane < lanes; ++lane) {
+      u32 input = (step + lane + 2u) % scenarios;
+      if (lane == 13u) input = 0xffffffffu; // maps to default0, not input itself
+      if (lane == first_lane) input = step;
+      test.initial[(input_base + record_stride * (step * lanes + lane)) / 4u] = input;
+    }
+  }
+  test.expected = test.initial;
+  auto& code = test.code;
+  code.push_back(EncodeVop1(0x01, 6, Vgpr(0))); // stable logical lane
+  for (u32 step = 0; step < scenarios; ++step) {
+    AppendVMovU32(&code, 4, 0u); // inactive selector lanes must retain zero
+    AppendVMovU32(&code, 7, step * lanes);
+    code.push_back(EncodeVop2(0x25, 7, Vgpr(6), 7));
+    AppendVMovLiteral(&code, 12, 0x60000000u + step * 256u);
+    code.push_back(EncodeVop2(0x25, 12, Vgpr(6), 12));
+    AppendSMovLiteral(&code, 126, static_cast<u32>(mask));
+    AppendSMovLiteral(&code, 127, static_cast<u32>(mask >> 32u));
+    code.push_back(EncodeMubuf0(0x0c, 0, true, false));
+    code.push_back(EncodeMubuf1(10, 0, 7)); // input v10, indexv7, s[0:3]
+    code.push_back(EncodeSopp(0x0c, 0));
+    for (u32 candidate = 1; candidate < scenarios; ++candidate) {
+      code.push_back(EncodeVopc(0xc2, InlineU32(candidate), 10));
+      AppendVop3(&code, 0x101, 4, Vgpr(4), InlineU32(candidate), 106u);
+    }
+    code.push_back(EncodeVop1(0x02, 32, Vgpr(4)));
+    code.push_back(EncodeSop2(0x31, 33, 32, InlineU32(32)));
+    code.push_back(EncodeSmem0(0x02, 16, 4));
+    code.push_back(EncodeSmem1(0, 33)); // table + 32 + 16*GPU selector
+    code.push_back(EncodeSopp(0x0c, 0));
+    code.push_back(EncodeMubuf0(0x1c, 0, true, false, true));
+    code.push_back(EncodeMubuf1(12, 4, 7)); // selected s[16:19], unique recordv7
+    code.push_back(EncodeSop1(0x04, 126, 193u)); // full EXEC before observations
+    AppendStoreVgprAtLaneDwordOffset(&code, 4, 6,
+        marker_dword_offset + guard + step * 2u * lanes);
+    AppendStoreSgprAtLaneDwordOffset(&code, 32, 6,
+        marker_dword_offset + guard + (step * 2u + 1u) * lanes);
+    for (u32 lane = 0; lane < lanes; ++lane) {
+      const bool active = (mask & (uint64_t{1} << lane)) != 0;
+      const u32 input =
+          test.initial[(input_base + record_stride * (step * lanes + lane)) / 4u];
+      const u32 selector = active && input < scenarios ? input : 0u;
+      test.expected[marker_base / 4u + marker_dword_offset + guard +
+                    step * 2u * lanes + lane] = selector;
+      test.expected[marker_base / 4u + marker_dword_offset + guard +
+                    (step * 2u + 1u) * lanes + lane] = step;
+      if (active) {
+        test.expected[(buffer_bases[step] +
+                       record_stride * (step * lanes + lane)) / 4u] =
+            0x60000000u + step * 256u + lane;
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_CMP_EQ_U32, O::V_CNDMASK_B32,
+                  O::V_READFIRSTLANE_B32, O::S_LSHL4_ADD_U32,
+                  O::S_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
+                  O::S_MOV_B32, O::S_MOV_B64, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READFIRSTLANE_B32", scenarios},
+                         {"S_LOAD_DWORDX4", scenarios}};
+  return test;
+}
+
+TestCase FiniteSelectorDescriptorStoresUseGpuChoices() {
+  return MakeFiniteSelectorDescriptorStores(false);
+}
+
+TestCase FiniteSelectorDescriptorStoresUseFirstActiveUpperLane() {
+  return MakeFiniteSelectorDescriptorStores(true);
+}
+
 TestCase MakeBufferDescriptorTableScalarLoop(bool predicated) {
   using O = ShaderOpcode;
   constexpr u32 table_base = 256u;
@@ -28268,6 +28381,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferDescriptorTableScalarLoopPredicatedStores);
   AddCase(BufferDescriptorTableScalarLoopLoadsFeedLaterResults);
   AddCase(BufferDescriptorTableZeroTripSkipsUnreadableTable);
+  AddCase(FiniteSelectorDescriptorStoresUseGpuChoices);
+  AddCase(FiniteSelectorDescriptorStoresUseFirstActiveUpperLane);
   AddCase(Buffers65FromSrtUsePackedOffsetsAndStorageFallback);
   AddCase(BufferD16LoadsPreserveHalvesAndSnapshotAddress);
   AddCase(BufferD16StoresSelectHighBytesAndRespectBounds);

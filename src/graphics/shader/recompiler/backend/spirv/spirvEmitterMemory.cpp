@@ -709,17 +709,13 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                             const PreparedFormattedMemory& plan, uint32_t component,
                             uint32_t data) {
 	if (component >= plan.info.component_count) return;
-	const auto bits = plan.info.component_bits[component];
-	if (plan.info.type == Format::ComponentType::Snorm && bits == 16u) {
-		const auto value = EmitBitCastF32U32(ctx.state, data);
-		data = EmitPackSnorm2x16(
-		    ctx.state, EmitCompositeConstructF32x2(ctx.state, value, ConstantF32Value(ctx.state, 0.0f)));
-	}
+	const auto bits   = plan.info.component_bits[component];
+	const auto packed = PackFormatComponent(ctx.state, plan.info, component, data);
 	if (bits == 8u || bits == 16u) {
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
-		                     plan.indices[component], bits, data);
+		                     plan.indices[component], bits, packed);
 	} else {
-		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
+		StoreWordInBounds(ctx, plan.resource, plan.indices[component], packed);
 	}
 }
 
@@ -857,11 +853,26 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                         FormattedAccess::Store);
 			EmitIfCondition(state, plan.in_bounds, [&]() {
-				for (uint32_t component = 0; component < components; component++) {
+				const auto count = std::min(components, plan.info.component_count);
+				uint32_t   word  = 0;
+				for (uint32_t component = 0; component < count; component++) {
 					const auto data = state.builder.AllocateId();
 					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
 					                          composite, component);
-					StoreFormattedInBounds(ctx, mem, plan, component, data);
+					if (!plan.info.packed_bitfield) {
+						StoreFormattedInBounds(ctx, mem, plan, component, data);
+						continue;
+					}
+					const auto packed  = PackFormatComponent(state, plan.info, component, data);
+					const auto shifted = Binary(
+					    state, spv::OpShiftLeftLogical, TypeU32(state), packed,
+					    ConstantU32(state, plan.info.component_bit_offset[component]));
+					word = component == 0u
+					           ? shifted
+					           : Binary(state, spv::OpBitwiseOr, TypeU32(state), word, shifted);
+				}
+				if (plan.info.packed_bitfield) {
+					StoreWordInBounds(ctx, plan.resource, plan.indices[0], word);
 				}
 			});
 			return;

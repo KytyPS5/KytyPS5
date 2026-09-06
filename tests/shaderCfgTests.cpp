@@ -4705,13 +4705,15 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   Check(getpc_wrote_vcc_lo,
         "S_GETPC_B64 did not advance s105 through the VCC alias");
 
-  const Decoder::OperandKind canonical_zero_masks[] = {
-      Decoder::OperandKind::Null,
-      Decoder::OperandKind::PopsExitingWaveId,
-      Decoder::OperandKind::VccZ,
-      Decoder::OperandKind::ExecZ,
+  const std::pair<Decoder::OperandKind, bool> mask_tag_operands[] = {
+      {Decoder::OperandKind::Null, true},
+      {Decoder::OperandKind::PopsExitingWaveId, true},
+      // Scalar flags are numeric {flag, 0}, not replicated lane masks.
+      {Decoder::OperandKind::Scc, false},
+      {Decoder::OperandKind::VccZ, false},
+      {Decoder::OperandKind::ExecZ, false},
   };
-  for (const auto kind : canonical_zero_masks) {
+  for (const auto [kind, expected_mask_tag] : mask_tag_operands) {
     store = {};
     store.family = Decoder::Family::SOP1;
     store.opcode = Decoder::Opcode::S_NOT_B64;
@@ -4729,8 +4731,8 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
         preserved_mask_tag |= valid.IsImmediate() && valid.U1();
       }
     }
-    Check(preserved_mask_tag,
-          "canonical zero/condition operand lost scalar mask validity");
+    Check(preserved_mask_tag == expected_mask_tag,
+          "zero/flag operand has incorrect scalar mask validity");
   }
 }
 
@@ -10847,6 +10849,7 @@ void TestTypedEntryStateIsMinimal() {
     IR::Value exec;
     IR::Value exec_lo;
     IR::Value exec_hi;
+    const IR::Inst *initial_ballot = nullptr;
     for (const auto *block : values.blocks) {
       for (const auto &inst : *block) {
         switch (inst.GetOpcode()) {
@@ -10900,6 +10903,12 @@ void TestTypedEntryStateIsMinimal() {
     IR::RemoveIdentities(values.blocks);
     IR::EliminateDeadCode(values.blocks);
     IR::ValidateProgram(values, true);
+    for (const auto *block : values.blocks) {
+      Check(std::ranges::none_of(*block, [](const auto &inst) {
+              return inst.GetOpcode() == IR::ValueOpcode::Ballot;
+            }),
+            "unused initial EXEC ballot survived dead-code elimination");
+    }
   };
 
   check(32u);
@@ -11700,7 +11709,7 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   result = RecompileForTest(wqm_shader, wave32_options);
   CheckSpirvBinaryValidates(result.spirv);
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
-        "wave32 WQM retained the unused high ballot-word expansion");
+        "wave32 WQM did not preserve the scalar U32x2 expansion");
 
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0

@@ -169,11 +169,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 106u: return ir.GetVccLo();
 		case 107u: return ir.GetVccHi();
 		case 124u: return ir.GetM0();
-		case 126u:
-		case 127u: {
-			const auto mask = BallotMask(ir.GetExec());
-			return mask[code - 126u];
-		}
+		case 126u: return ir.GetExecLo();
+		case 127u: return ir.GetExecHi();
 		default: return IR::U32(IR::Value(0u));
 	}
 }
@@ -226,8 +223,8 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 			case Decoder::OperandKind::ExecHi: return ir.GetExec();
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: return ir.GetVcc();
-			case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-			case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+			case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 			default: break;
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
@@ -637,8 +634,8 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
 			           : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
-		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+		case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+		case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 		default: return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 }
@@ -661,10 +658,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi:
-		case Decoder::OperandKind::VccZ:
-		case Decoder::OperandKind::ExecZ:
-		case Decoder::OperandKind::Scc: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::VccHi: return IR::U1(IR::Value(true));
+		// SCC/EXECZ/VCCZ are numeric scalar operands {flag, 0}, not replicated
+		// lane masks. Their Boolean form remains useful for carry/branch inputs.
 		default: return IR::U1(IR::Value(false));
 	}
 }
@@ -752,8 +748,8 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
+	// Scalar mask branches are wave-uniform. A later SAVEEXEC can reactivate lanes
+	// inside the region, so inactive guest lanes must not leave the host branch.
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;

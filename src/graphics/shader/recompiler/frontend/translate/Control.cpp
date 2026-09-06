@@ -4,16 +4,6 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
-bool IsExecOrVcc(const Decoder::Operand& operand) {
-	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi:
-		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: return true;
-		default: return false;
-	}
-}
-
 Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 	Decoder::Operand operand;
 	operand.kind = kind;

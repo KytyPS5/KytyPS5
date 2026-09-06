@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -27637,6 +27638,46 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
           invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
               processor.GetCtx().GetRenderTargetMask() == 0x0badc0de,
           "CLEAR_STATE discarded the pushed Cx state");
+
+  // AGC CLEAR_STATE restores the viewport, scissor, and guard-band register defaults.
+  processor.GetCtx().SetScreenScissor(1, 2, 3, 4);
+  processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
+  Pm4Execution scissor_reset;
+  Require("Pm4ContextState", "scissor reset packet",
+          processor.Process(scissor_reset, clear_state_packet) == Pm4ProcessResult::Complete,
+          "CLEAR_STATE could not reset the rasterization state");
+  const auto &viewport = processor.GetCtx().GetScreenViewport();
+  const auto defaults = calc_final_scissor(viewport, {}, {20000, 20000}, 0);
+  Require("Pm4ContextState", "Rasterization defaults",
+          defaults.left == 0 && defaults.top == 0 && defaults.right == 16384 &&
+              defaults.bottom == 16384 && viewport.guard_band_horz_clip == 1.0f &&
+              viewport.guard_band_vert_clip == 1.0f &&
+              viewport.guard_band_horz_discard == 1.0f &&
+              viewport.guard_band_vert_discard == 1.0f &&
+              std::ranges::all_of(viewport.viewports, [](const auto &slot) {
+                return slot.xscale == 1.0f && slot.yscale == 1.0f && slot.zscale == 1.0f &&
+                       slot.viewport_scissor_right == 16384 &&
+                       slot.viewport_scissor_bottom == 16384 &&
+                       !slot.viewport_scissor_window_offset_enable;
+              }),
+          "CLEAR_STATE did not restore scissor and guard-band defaults");
+  const std::array scissor_registers{
+      std::pair{Pm4::PA_SC_SCREEN_SCISSOR_TL, Pm4::PA_SC_SCREEN_SCISSOR_BR},
+      std::pair{Pm4::PA_SC_WINDOW_SCISSOR_TL, Pm4::PA_SC_WINDOW_SCISSOR_BR},
+      std::pair{Pm4::PA_SC_GENERIC_SCISSOR_TL, Pm4::PA_SC_GENERIC_SCISSOR_BR},
+      std::pair{Pm4::PA_SC_VPORT_SCISSOR_0_TL, Pm4::PA_SC_VPORT_SCISSOR_0_BR}};
+  for (const auto &[tl, br] : scissor_registers) {
+    processor.GetCtx().Reset();
+    g_hw_ctx_indirect_func[tl](processor, tl, 0);
+    g_hw_ctx_indirect_func[br](processor, br, 0);
+    HW::ScanModeControl scan{};
+    scan.vport_scissor_enable = tl == Pm4::PA_SC_VPORT_SCISSOR_0_TL;
+    const auto empty = calc_final_scissor(processor.GetCtx().GetScreenViewport(),
+                                         scan, {3840, 2160}, 0);
+    Require("Pm4ContextState", "explicit empty scissor",
+            empty.right == empty.left && empty.bottom == empty.top,
+            "an explicitly empty scissor was expanded or ignored");
+  }
 
   processor.GetCtx().SetRenderTargetMask(0xabcdef01);
   Require("Pm4ContextState", "push before processor reset",

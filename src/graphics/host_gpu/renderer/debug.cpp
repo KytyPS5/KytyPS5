@@ -17,8 +17,6 @@
 
 namespace Libs::Graphics {
 
-static std::atomic<uint32_t> g_scissor_default_log_count = 0;
-
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
 }
@@ -868,10 +866,6 @@ static bool ScissorRectValid(const ScissorRect& r) {
 	return r.right > r.left && r.bottom > r.top;
 }
 
-static bool ScissorRectSet(const ScissorRect& r) {
-	return r.left != 0 || r.top != 0 || r.right != 0 || r.bottom != 0;
-}
-
 static ScissorRect ScissorRectOffset(ScissorRect r, int x, int y) {
 	r.left += x;
 	r.right += x;
@@ -931,48 +925,24 @@ static bool ScissorClipRuleToIntersectionMask(uint16_t rule, uint8_t* mask) {
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
                                vk::Extent2D extent, uint32_t viewport_index) {
 	EXIT_IF(viewport_index >= std::size(vp.viewports));
-	ScissorRect screen {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
-	                    vp.screen_scissor_bottom};
-	ScissorRect final = screen;
-
-	if (!ScissorRectSet(screen)) {
-		final = {0, 0, static_cast<int>(extent.width), static_cast<int>(extent.height)};
-
-		auto log_id = g_scissor_default_log_count.fetch_add(1);
-		if (log_id < 32) {
-			LOGF("temporary: default unset screen scissor to framebuffer extent %ux%u\n",
-			     extent.width, extent.height);
+	ScissorRect final {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
+	                   vp.screen_scissor_bottom};
+	const auto intersect = [&](ScissorRect rect, bool window_offset) {
+		if (window_offset) {
+			rect = ScissorRectOffset(rect, vp.window_offset_x, vp.window_offset_y);
 		}
-	}
-
-	ScissorRect window {vp.window_scissor_left, vp.window_scissor_top, vp.window_scissor_right,
-	                    vp.window_scissor_bottom};
-	if (ScissorRectSet(window)) {
-		if (vp.window_scissor_window_offset_enable) {
-			window = ScissorRectOffset(window, vp.window_offset_x, vp.window_offset_y);
-		}
-		final = ScissorRectIntersect(final, window);
-	}
-
-	ScissorRect generic {vp.generic_scissor_left, vp.generic_scissor_top, vp.generic_scissor_right,
-	                     vp.generic_scissor_bottom};
-	if (ScissorRectSet(generic)) {
-		if (vp.generic_scissor_window_offset_enable) {
-			generic = ScissorRectOffset(generic, vp.window_offset_x, vp.window_offset_y);
-		}
-		final = ScissorRectIntersect(final, generic);
-	}
+		final = ScissorRectIntersect(final, rect);
+	};
+	intersect({vp.window_scissor_left, vp.window_scissor_top, vp.window_scissor_right,
+	           vp.window_scissor_bottom}, vp.window_scissor_window_offset_enable);
+	intersect({vp.generic_scissor_left, vp.generic_scissor_top, vp.generic_scissor_right,
+	           vp.generic_scissor_bottom}, vp.generic_scissor_window_offset_enable);
 
 	const auto& viewport = vp.viewports[viewport_index];
-	ScissorRect viewport_scissor {viewport.viewport_scissor_left, viewport.viewport_scissor_top,
-	                              viewport.viewport_scissor_right,
-	                              viewport.viewport_scissor_bottom};
-	if (smc.vport_scissor_enable && ScissorRectSet(viewport_scissor)) {
-		if (viewport.viewport_scissor_window_offset_enable) {
-			viewport_scissor =
-			    ScissorRectOffset(viewport_scissor, vp.window_offset_x, vp.window_offset_y);
-		}
-		final = ScissorRectIntersect(final, viewport_scissor);
+	if (smc.vport_scissor_enable) {
+		intersect({viewport.viewport_scissor_left, viewport.viewport_scissor_top,
+		           viewport.viewport_scissor_right, viewport.viewport_scissor_bottom},
+		          viewport.viewport_scissor_window_offset_enable);
 	}
 
 	if (vp.clip_rect_rule == 0) {
@@ -985,12 +955,8 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 					continue;
 				}
 
-				ScissorRect clip {vp.clip_rect_left[i], vp.clip_rect_top[i], vp.clip_rect_right[i],
-				                  vp.clip_rect_bottom[i]};
-				if (vp.clip_rect_window_offset_enable[i]) {
-					clip = ScissorRectOffset(clip, vp.window_offset_x, vp.window_offset_y);
-				}
-				final = ScissorRectIntersect(final, clip);
+				intersect({vp.clip_rect_left[i], vp.clip_rect_top[i], vp.clip_rect_right[i],
+				           vp.clip_rect_bottom[i]}, vp.clip_rect_window_offset_enable[i]);
 			}
 		} else {
 			static std::atomic<uint32_t> log_count {0};

@@ -70,7 +70,9 @@ bool IsGuestAtomic(O op) {
 bool IsSupportedSplitOperation(O op) {
 	if (IsPureUniformOperation(op) || IR::BufferAccessOf(op) != IR::BufferAccess::None ||
 	    IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None ||
-	    IR::ImageOpcodeInfoOf(op).access != IR::ImageAccess::None) return true;
+	    IR::ImageOpcodeInfoOf(op).access != IR::ImageAccess::None ||
+	    IR::SharedAccessOf(op) == IR::SharedAccess::Read ||
+	    IR::SharedAccessOf(op) == IR::SharedAccess::Write) return true;
 	switch (op) {
 		case O::Void: case O::Reference: case O::ReferenceU32:
 		case O::GetUserData: case O::GetShaderBase: case O::GetBuiltin:
@@ -79,9 +81,19 @@ bool IsSupportedSplitOperation(O op) {
 		case O::WqmMask: case O::DppMoveU32: case O::DppUpdateU32:
 		case O::Dpp8MoveU32: case O::Dpp8UpdateU32: case O::Permlane16U32:
 		case O::SwizzleU32: case O::BpermuteU32:
-		case O::ControlNop: case O::Waitcnt: return true;
+		case O::ControlNop: case O::Waitcnt: case O::Barrier: return true;
 		default: return false;
 	}
+}
+
+bool HasGuestLdsAccess(const IR::Program& program) {
+	for (const auto* block : program.blocks) for (const auto& inst : *block) {
+		if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) continue;
+		const auto index = inst.Flags<IR::MemoryFlags>().index;
+		if (index < program.memory_info.size() && program.memory_info[index].kind == IR::ResourceKind::Lds)
+			return true;
+	}
+	return false;
 }
 
 bool HasWaveOperations(const IR::Program& program) {
@@ -139,7 +151,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 	if (program.blocks.size() != program.block_info.size())
 		return "wave64 splitting requires complete branch metadata";
 	for (const auto& memory : program.memory_info) {
-		if (memory.kind == IR::ResourceKind::Lds || memory.kind == IR::ResourceKind::Gds ||
+		if ((memory.kind == IR::ResourceKind::Lds && partitions_guest_workgroup) || memory.kind == IR::ResourceKind::Gds ||
 		    memory.kind == IR::ResourceKind::Scratch)
 			return "wave64 splitting does not support guest shared or scratch memory";
 	}
@@ -170,10 +182,16 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
 				planning_only = index < program.memory_info.size() && program.memory_info[index].planning_only;
 			}
-			if (op == O::Barrier || IR::SharedAccessOf(op) != IR::SharedAccess::None ||
+			if ((op == O::Barrier && partitions_guest_workgroup) ||
 			    op == O::DataAppend || op == O::DataConsume ||
 			    op == O::Sendmsg || op == O::TtraceData || op == O::InstPrefetch || op == O::SetAttribute)
 				return "wave64 splitting does not support guest workgroup or DS operations";
+			if (IR::SharedAccessOf(op) != IR::SharedAccess::None) {
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (partitions_guest_workgroup || index >= program.memory_info.size() ||
+				    program.memory_info[index].kind != IR::ResourceKind::Lds)
+					return "wave64 LDS access requires one complete guest wave and valid LDS metadata";
+			}
 			if (cyclic.contains(block)) {
 				if (!planning_only && IsGuestRead(op)) cyclic_reads.push_back(&inst);
 				has_cyclic_write |= IsGuestWrite(op) || IsGuestAtomic(op);
@@ -307,8 +325,19 @@ ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
 		return plan;
 	}
 	if (count % 64 != 0) { plan.error = "wave64 splitting requires complete guest waves"; return plan; }
-	// Storage reservations alone do not couple guest waves. The convergence
-	// proof below rejects actual LDS/GDS/scratch accesses and all barriers.
+	// Only a complete guest wave that remains one host workgroup may keep LDS.
+	// Reservations without live accesses do not allocate the lazy guest array.
+	const bool uses_lds = HasGuestLdsAccess(program);
+	if (uses_lds && cs->lds_size_dwords == 0) {
+		plan.error = "wave64 LDS access requires a nonzero guest LDS allocation";
+		return plan;
+	}
+	const uint64_t shared_bytes = 64ull * sizeof(uint32_t) +
+	                              (uses_lds ? uint64_t{cs->lds_size_dwords} * sizeof(uint32_t) : 0);
+	if (shared_bytes > limits.max_shared_memory_bytes) {
+		plan.error = "wave64 guest LDS and collective scratch exceed device shared memory limit";
+		return plan;
+	}
 	if (derivatives) {
 		plan.error = "wave64 splitting does not support compute derivatives";
 		return plan;

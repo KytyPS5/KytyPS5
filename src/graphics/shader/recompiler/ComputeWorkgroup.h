@@ -16,6 +16,7 @@ struct ComputeWorkgroupLimits {
 	// Zero preserves offline compilation without assuming a native subgroup width.
 	uint32_t                native_subgroup_size = 0;
 	bool                    can_require_subgroup_size_64 = false;
+	uint32_t                max_shared_memory_bytes = UINT32_MAX;
 };
 
 struct ComputeWorkgroupLayout {

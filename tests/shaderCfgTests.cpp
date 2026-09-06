@@ -9151,6 +9151,7 @@ void TestFusedShaderHandoffPreservesRegisters() {
 }
 
 void TestMeshExportStorage() {
+  using ShaderRecompiler::IR::PushData;
   const uint32_t front[] = {
       EncodeSMovB32(12, 255), 0x1003u,
       EncodeSop1(0x20, 0, 6), // merged-stage handoff
@@ -9158,6 +9159,8 @@ void TestMeshExportStorage() {
   const uint32_t back[] = {
       EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
       EncodeVop1(0x01, 0, 128),
+      EncodeVop1(0x01, 9, 13), // retain user s13
+      EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 5), // store using s[8:11] and vertex ID
       EncodeDs0(0x0d), EncodeDs1(0, 0, 0), // retain guest LDS
       EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
       EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
@@ -9177,14 +9180,48 @@ void TestMeshExportStorage() {
   mesh.vertices_per_group = 64;
   mesh.max_vertices = 192;
   mesh.max_primitives = 176;
+  std::array<uint32_t, 14> user_data{};
+  user_data[8] = 0x10000008u;
+  user_data[9] = 4u << 16u;
+  user_data[10] = 64u;
+  user_data[11] = 0x00027000u;
+  user_data[13] = 0x3f800000u;
   ShaderRecompiler::CompileOptions options{};
   options.stage = ShaderType::Mesh;
   options.input_info.vertex = &input;
   options.back_code = back;
-  for (const uint32_t subgroup_size : {32u, 64u}) {
+  options.user_data = user_data;
+  for (const auto [subgroup_size, push_data_start] :
+       {std::pair{32u, PushData::MeshDrawDwordCount},
+        std::pair{64u, PushData::MeshDrawDwordCount},
+        std::pair{32u, PushData::DwordCount},
+        std::pair{64u, PushData::DwordCount}}) {
     mesh.host_subgroup_size = subgroup_size;
-    const auto result = RecompileForTest(front, options);
+    const auto result =
+        RecompileForTest(front, options, nullptr, nullptr, push_data_start);
     CheckSpirvBinaryValidates(result.spirv);
+    const auto &layout = result.program.bindings;
+    Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
+              layout.memory_offset_count == 1,
+          "mesh shader did not retain its user-data placement and buffer offset");
+    const auto reg = std::ranges::find(layout.user_data_registers, 13u);
+    Check(reg != layout.user_data_registers.end(), "mesh shader lost user s13");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    for (const auto dword :
+         {static_cast<uint32_t>(reg - layout.user_data_registers.begin()),
+          layout.memory_offset_dword}) {
+      const auto operand =
+          std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
+          " %uint_0 %uint_" +
+          std::to_string(dword + (layout.UsesPushData() ? push_data_start : 0u));
+      Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
+            "mesh user SGPR or buffer offset loaded from the wrong storage");
+    }
+    Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                         "vsharp %uint_0 %uint_0") &&
+              !SpirvSourceHasInstructionUsing(source, "OpAccessChain",
+                                              "vsharp %uint_0 %uint_4294967295"),
+          "mesh draw prefix was lost or spilled shader data wrapped into push constants");
     const auto &binary = result.spirv;
     std::vector<uint32_t> sizes(binary[3]), constants(binary[3]);
     uint32_t shared_bytes = 0, private_bytes = 0;

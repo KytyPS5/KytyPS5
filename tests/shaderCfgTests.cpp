@@ -9711,6 +9711,56 @@ void TestComputeExecutionGdsAppendAdmission() {
   }
 }
 
+void TestComputeGuestWorkgroups() {
+  using ShaderRecompiler::ComputeGuestWorkgroups;
+  struct Case {
+    const char* name;
+    std::array<uint32_t, 3> dimensions;
+    std::array<uint32_t, 3> local;
+    bool thread_dimensions;
+    std::array<uint32_t, 3> expected;
+  };
+  // Expected counts describe coverage of the invocation range in each axis;
+  // local size zero retains the runtime convention of one invocation.
+  const Case cases[] = {
+      {"group dimensions unchanged", {UINT32_MAX, 0u, 17u},
+       {UINT32_MAX, 0u, 3u}, false, {UINT32_MAX, 0u, 17u}},
+      {"zero X", {0u, 9u, 17u}, {2u, 4u, 8u}, true, {0u, 3u, 3u}},
+      {"zero Y", {9u, 0u, 17u}, {4u, 2u, 8u}, true, {3u, 0u, 3u}},
+      {"zero Z", {9u, 17u, 0u}, {4u, 8u, 2u}, true, {3u, 3u, 0u}},
+      {"all zero", {0u, 0u, 0u}, {0u, UINT32_MAX, 2u}, true, {0u, 0u, 0u}},
+      {"zero locals normalize to one", {17u, 33u, 65u}, {0u, 0u, 0u},
+       true, {17u, 33u, 65u}},
+      {"all axes ceil", {17u, 33u, 65u}, {16u, 32u, 64u}, true, {2u, 2u, 2u}},
+      {"all axes exact", {32u, 96u, 256u}, {16u, 32u, 64u}, true, {2u, 3u, 4u}},
+      {"max count at unit locals", {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+       {1u, 0u, 1u}, true, {UINT32_MAX, UINT32_MAX, UINT32_MAX}},
+      {"max X ceil does not wrap", {UINT32_MAX, 9u, 17u}, {2u, 4u, 8u},
+       true, {2147483648u, 3u, 3u}},
+      {"max Y ceil does not wrap", {9u, UINT32_MAX, 17u}, {4u, 2u, 8u},
+       true, {3u, 2147483648u, 3u}},
+      {"max Z ceil does not wrap", {9u, 17u, UINT32_MAX}, {4u, 8u, 2u},
+       true, {3u, 3u, 2147483648u}},
+      {"largest local covers two", {2u, 2u, 2u},
+       {UINT32_MAX, UINT32_MAX, UINT32_MAX}, true, {1u, 1u, 1u}},
+      {"largest count and local", {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+       {UINT32_MAX, UINT32_MAX, UINT32_MAX}, true, {1u, 1u, 1u}},
+  };
+  for (const auto& test : cases) {
+    const auto actual = ComputeGuestWorkgroups(test.dimensions, test.local,
+                                               test.thread_dimensions);
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+      if (actual[axis] != test.expected[axis]) {
+        std::fprintf(stderr,
+                     "ComputeGuestWorkgroups: %s axis=%u required=%u actual=%u\n",
+                     test.name, axis, test.expected[axis], actual[axis]);
+      }
+      Check(actual[axis] == test.expected[axis],
+            "guest workgroup count must cover all requested threads without overflow");
+    }
+  }
+}
+
 void TestComputeExecutionPlanningBoundaries() {
   using namespace ShaderRecompiler;
   IR::Program program;
@@ -14292,6 +14342,11 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--compute-guest-workgroups-only") == 0) {
+    Libs::Graphics::TestComputeGuestWorkgroups();
+    std::puts("KYTY_COMPUTE_GUEST_WORKGROUPS_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-acyclic-bda-only") == 0) {
     Libs::Graphics::TestCooperativeWave64BufferCycleVisibility(true);
     std::puts("KYTY_COOPERATIVE_ACYCLIC_BDA_PASS");
@@ -14431,6 +14486,7 @@ int main(int argc, char* argv[]) {
   TestF64CertificatePhiPredecessorProvenance();
   TestUnusedNativeF64EmissionHasCompleteRequirements();
   TestComputeExecutionGdsAppendAdmission();
+  TestComputeGuestWorkgroups();
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();

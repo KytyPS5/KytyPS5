@@ -1266,6 +1266,7 @@ CompiledShader CompileCase(
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory =
           test.buffer_addresses_are_backing_offsets ? ReadTestMemory : nullptr,
+      .compute_workgroups = std::array{test.dispatch_x, test.dispatch_y, test.dispatch_z},
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -4180,6 +4181,48 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+    // Snapshot-dependent stores must execute their shader. The accelerated path
+    // runs before immutable-source alias validation and cannot infer the stored
+    // value from the write-only buffer metadata alone.
+    struct SnapshotCase {
+      const char *label;
+      bool bounded;
+      bool immutable;
+      bool overlaps_output;
+    };
+    constexpr std::array<SnapshotCase, 4> snapshot_cases{{
+        {"bounded read", true, false, false},
+        {"disjoint immutable read", false, true, false},
+        {"overlapping immutable read", false, true, true},
+        {"bounded immutable read", true, true, false},
+    }};
+    for (size_t i = 0; i < snapshot_cases.size(); ++i) {
+      const auto &scenario = snapshot_cases[i];
+      const uint64_t address = write_only_meta + (i + 1u) * 0x100u;
+      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, address);
+      ShaderRecompiler::IR::CompiledShaderInfo snapshot_program{};
+      auto snapshot_input = MakeInput(address, false, true, snapshot_program);
+      if (scenario.bounded) {
+        snapshot_program.info.bounded_srt_reads.push_back({1u, 0u});
+        snapshot_input.stage.resources.flattened_srt.push_back(0x13579bdfu);
+      }
+      if (scenario.immutable) {
+        snapshot_input.stage.resources.immutable_srt_ranges.push_back(
+            {scenario.overlaps_output ? address : address + 0x100000u,
+             sizeof(uint32_t)});
+      }
+      Require(name, "snapshot fixture starts uncleared",
+              !snapshot_program.info.uses_dma &&
+                  !texture_cache.IsMetaCleared(address, 0),
+              "snapshot fixture does not represent lowered scalar reads");
+      const bool consumed =
+          RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+              executor, snapshot_input, command);
+      Require(name, scenario.label,
+              !consumed && !texture_cache.IsMetaCleared(address, 0),
+              "snapshot-dependent dispatch was consumed or mutated metadata "
+              "before shader execution and immutable-source validation");
+    }
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -24125,6 +24168,137 @@ TestCase Wave64CooperativeBufferProducerConsumer() {
 }
 
 
+// Two workgroup-dependent scalar coefficient blocks remain guest runtime reads.
+// Public synthetic values, no captured instruction stream or guest addresses.
+TestCase Wave64CooperativeBdaCoefficientsByWorkgroup() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 128;
+  constexpr u32 group_count = 6;
+  constexpr u32 total = local_count * group_count;
+  constexpr u32 planes = 20;
+  constexpr u32 mailbox = 15424; // DWORDs; past 4 + planes*total outputs.
+  constexpr u32 x_coefficients = 16384;
+  constexpr u32 y_coefficients = 16448;
+  // Identity mapping also matches ReadTestMemory if proven coefficient reads
+  // later use an immutable snapshot instead of physical loads.
+  constexpr uint64_t guest_base = 0;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64CooperativeBdaCoefficientsByWorkgroup", local_count, local_count, planes);
+  test.dispatch_x = 2;
+  test.dispatch_y = 3;
+  test.compute_info.group_id[1] = true; // s16=WorkgroupID.x, s17=WorkgroupID.y.
+  test.initial.resize(16516);
+  for (u32 word = 0; word < test.initial.size(); ++word)
+    test.initial[word] = 0xac000000u | word;
+  for (u32 x = 0; x < 2; ++x)
+    for (u32 k = 0; k < 8; ++k)
+      test.initial[x_coefficients + x * 8u + k] = 0x1000u + x * 0x100u + k * 3u;
+  for (u32 y = 0; y < 3; ++y)
+    for (u32 k = 0; k < 8; ++k)
+      test.initial[y_coefficients + y * 8u + k] = 0x2000u + y * 0x100u + k * 5u;
+  for (u32 group = 0; group < group_count; ++group)
+    for (u32 lane = 0; lane < local_count; ++lane)
+      test.initial[mailbox + group * local_count + lane] = 0x4000u + group * 0x400u + lane;
+  test.expected = test.initial;
+  test.has_user_data = true;
+  test.buffer_addresses_are_backing_offsets = true; // Enable the clean snapshot callback.
+  test.user_data[0] = static_cast<u32>(guest_base);
+  test.user_data[1] = static_cast<u32>(guest_base >> 32u);
+  // The writable descriptor ends before the read-only coefficient allocation.
+  // Do not manufacture an overlapping immutable snapshot dependency.
+  test.user_data[50] = (mailbox + total) * sizeof(u32);
+  test.bda_mappings = {{guest_base, 0}};
+  test.required_spirv = {"OpControlBarrier", " Coherent"};
+
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  code.push_back(EncodeSop2(0x1e, 18, 17, InlineU32(1))); // group=2*y+x.
+  code.push_back(EncodeSop2(0x00, 18, 18, 16));
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(4), 1));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(0), 6)); // local=x+16*y.
+  code.push_back(EncodeVop1(0x01, 4, 18));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(7), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(6), 4)); // full 2x3 output index.
+  code.push_back(EncodeVop1(0x01, 5, 18));
+  code.push_back(EncodeVop2(0x1a, 5, InlineU32(16), 5));
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(6), 5));
+  AppendVMovLiteral(&code, 15, 0x1000u);
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(15), 5));
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));
+  AppendMultiWaveLdsStore(&code, 5, 7);
+  AppendMultiWaveGuestBarrier(&code);
+  code.push_back(EncodeVop2(0x25, 13, InlineU32(64), 6));
+  AppendVMovLiteral(&code, 15, local_count - 1u);
+  code.push_back(EncodeVop2(0x1b, 13, Vgpr(15), 13));
+  code.push_back(EncodeVop2(0x1a, 13, InlineU32(2), 13));
+  AppendMultiWaveLdsRead(&code, 14, 13); // Other guest wave, retained across loop.
+
+  code.push_back(EncodeSop2(0x1e, 19, 16, InlineU32(5)));
+  code.push_back(EncodeSop2(0x1e, 20, 17, InlineU32(5)));
+  code.push_back(EncodeSmem0(0x03, 24, 0)); // s[24:31], pointer s[0:1].
+  code.push_back(EncodeSmem1(x_coefficients * sizeof(u32), 19));
+  code.push_back(EncodeSmem0(0x03, 32, 0)); // s[32:39], independent WG y offset.
+  code.push_back(EncodeSmem1(y_coefficients * sizeof(u32), 20));
+  code.push_back(EncodeSopp(0x0c, 0));
+  for (u32 k = 0; k < 16; ++k)
+    AppendStoreSgprAtLaneDwordOffset(&code, 24 + k, 4, 4u + total * k);
+
+  code.push_back(EncodeVop2(0x1a, 9, InlineU32(2), 4));
+  AppendVMovLiteral(&code, 15, mailbox * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 9, Vgpr(15), 9));
+  code.push_back(EncodeVop1(0x01, 11, 24));
+  code.push_back(EncodeVop1(0x01, 12, 39));
+  code.push_back(EncodeSMovB32(40, InlineU32(0)));
+  const size_t loop = code.size();
+  code.push_back(EncodeMubuf0(0x0c, 0, false, true, true));
+  code.push_back(EncodeMubuf1(10, 12, 9));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(11), 10));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(12), 10));
+  code.push_back(EncodeMubuf0(0x1c, 0, false, true, true));
+  code.push_back(EncodeMubuf1(10, 12, 9));
+  code.push_back(EncodeSopk(0x17, 125, 0)); // VSCNT completes each iteration store.
+  code.push_back(EncodeSop2(0x00, 40, 40, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 40, InlineU32(4)));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  AppendVop3(&code, 0x360, 41, Vgpr(10), InlineU32(63));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 4u + total * 16u);
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 4, 4u + total * 17u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 41, 4, 4u + total * 18u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 40, 4, 4u + total * 19u);
+  AppendEnd(&code);
+
+  for (u32 y = 0; y < 3; ++y) {
+    for (u32 x = 0; x < 2; ++x) {
+      const u32 group = y * 2u + x;
+      const u32 increment = (0x1000u + x * 0x100u) + (0x2000u + y * 0x100u + 35u);
+      for (u32 lane = 0; lane < local_count; ++lane) {
+        const u32 index = group * local_count + lane;
+        for (u32 k = 0; k < 8; ++k) {
+          test.expected[4u + total * k + index] = 0x1000u + x * 0x100u + k * 3u;
+          test.expected[4u + total * (8u + k) + index] = 0x2000u + y * 0x100u + k * 5u;
+        }
+        const u32 value = 0x4000u + group * 0x400u + lane + 4u * increment;
+        test.expected[mailbox + index] = value;
+        test.expected[4u + total * 16u + index] = value;
+        test.expected[4u + total * 17u + index] = 0x1000u + (group << 16u) + ((lane + 64u) & 127u);
+        test.expected[4u + total * 18u + index] =
+            0x4000u + group * 0x400u + (lane / 64u) * 64u + 63u + 4u * increment;
+        test.expected[4u + total * 19u + index] = 4u;
+      }
+    }
+  }
+  test.opcodes = {O::S_LOAD_DWORDX8, O::S_LSHL_B32, O::S_ADD_U32,
+                  O::DS_WRITE_B32, O::DS_READ_B32, O::S_BARRIER,
+                  O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::V_READLANE_B32,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"S_LOAD_DWORDX8", 2}};
+  return test;
+}
+
 TestCase MakeWave64SingleGroupLdsTileCase(bool explicit_barrier) {
   using O = ShaderOpcode;
   constexpr u32 count = 128;
@@ -27875,6 +28049,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64MultiWaveLdsWaveZeroContinuesAfterPeersExit);
   AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
   AddCase(Wave64CooperativeBufferProducerConsumer);
+  AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
   AddCase(Wave64SingleGroupLdsExplicitBarrier);
   AddCase(Wave64SingleGroupLdsUniformBranchOrdering);
@@ -28060,6 +28235,50 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeImageClear(compute, 32, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "partial buffer coverage was classified as a complete clear");
+  // A lowered scalar read no longer sets uses_dma. Neither an indexed read
+  // nor its frozen source bytes prove that the shader stores user_data[4].
+  // Keep the direct constant clear above eligible, but execute these shaders.
+  compute.dispatch_threads_num[0] = 64;
+  struct SnapshotCase {
+    const char *label;
+    bool bounded;
+    bool immutable;
+    bool overlaps_output;
+  };
+  constexpr std::array<SnapshotCase, 4> snapshot_cases{{
+      {"bounded read", true, false, false},
+      {"disjoint immutable read", false, true, false},
+      {"overlapping immutable read", false, true, true},
+      {"bounded immutable read", true, true, false},
+  }};
+  for (const auto &scenario : snapshot_cases) {
+    auto snapshot_program = program;
+    compute.stage.program = &snapshot_program;
+    compute.stage.resources = positive.resources;
+    if (scenario.bounded) {
+      snapshot_program.info.bounded_srt_reads.push_back({1u, 0u});
+      compute.stage.resources.flattened_srt.push_back(0x13579bdfu);
+    }
+    if (scenario.immutable) {
+      compute.stage.resources.immutable_srt_ranges.push_back(
+          {scenario.overlaps_output ? 0x10000u : 0x20000u,
+           sizeof(uint32_t)});
+    }
+    Require("ComputeImageClearSnapshots", "lowered scalar fixture",
+            !snapshot_program.info.uses_dma,
+            "the snapshot fixture still relies on the old DMA rejection");
+    descriptor.fields[0] = 0x12345678u;
+    packed_clear = 0x87654321u;
+    size = 0x123456789abcdef0ull;
+    Require("ComputeImageClearSnapshots", scenario.label,
+            !ResolveComputeImageClear(compute, 64, 1, 1, 0x61u, descriptor,
+                                      packed_clear, size) &&
+                descriptor.fields[0] == 0x12345678u &&
+                packed_clear == 0x87654321u &&
+                size == 0x123456789abcdef0ull,
+            "snapshot-dependent writes were classified as a constant clear");
+  }
+  compute.stage.program = &program;
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
@@ -32830,6 +33049,11 @@ int main(int argc, char **argv) {
     CheckF64AdmissionPositive();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-bda-coefficients-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64CooperativeBdaCoefficientsByWorkgroup());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-cooperative-ssbo-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64CooperativeBufferProducerConsumer());
@@ -33119,6 +33343,16 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-image-clear-only") == 0) {
+    CheckPs5GameExampleImageClearRuntimeShape();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-clear-snapshots-only") == 0) {
+    CheckPs5GameExampleImageClearRuntimeShape();
+    VulkanHarness vulkan;
+    vulkan.CheckComputeMetaClearClassification();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {

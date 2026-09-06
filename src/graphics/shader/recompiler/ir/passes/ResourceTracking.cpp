@@ -247,18 +247,24 @@ private:
 				if (!inst.HasUses()) continue;
 				const auto proof = ProveBoundedSrtRead(m_program, inst);
 				if (!proof) continue;
-				PlanBoundedRootReads(proof->count);
+				if (proof->workgroup_axis == UINT32_MAX) PlanBoundedRootReads(proof->count);
 				PlanBoundedRootReads(proof->address_low);
 				PlanBoundedRootReads(proof->address_high);
 				DescriptorSource address;
 				address.dword_count = 2u;
 				address.dwords[0] = proof->address_low;
 				address.dwords[1] = proof->address_high;
-				DescriptorSource count;
-				count.dword_count = 1u;
-				count.dwords[0] = proof->count;
-				const BoundedSrtRead read {InternSource(address), InternSource(count),
-				                          proof->offset_scale, proof->offset_bias, proof->memory_offset};
+				const auto address_source = InternSource(address);
+				uint32_t count_source = UINT32_MAX;
+				if (proof->workgroup_axis == UINT32_MAX) {
+					DescriptorSource count;
+					count.dword_count = 1u;
+					count.dwords[0] = proof->count;
+					count_source = InternSource(count);
+				}
+				const BoundedSrtRead read {address_source, count_source,
+				                          proof->offset_scale, proof->offset_bias, proof->memory_offset,
+				                          proof->workgroup_axis};
 				auto found = std::ranges::find(m_bounded_srt_reads, read);
 				uint32_t read_id = static_cast<uint32_t>(found - m_bounded_srt_reads.begin());
 				if (found == m_bounded_srt_reads.end()) m_bounded_srt_reads.push_back(read);
@@ -281,10 +287,13 @@ private:
 			if (words[word] == nullptr) return false;
 		}
 		const auto& first = m_bounded_srt_reads[words[0]->read_id];
+		// Workgroup snapshots currently cover scalar payloads, not descriptor candidates.
+		if (first.workgroup_axis != UINT32_MAX) return false;
 		for (uint32_t word = 1; word < words.size(); ++word) {
 			const auto& next = m_bounded_srt_reads[words[word]->read_id];
 			if (words[word]->proof.index != words[0]->proof.index ||
 			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    next.workgroup_axis != UINT32_MAX ||
 			    first.offset_scale != next.offset_scale || first.offset_bias != next.offset_bias ||
 			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
 		}
@@ -410,6 +419,33 @@ private:
 			const auto* inst = value.Resolve().TryInstruction();
 			return inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32;
 		});
+		// Descriptor sources are non-owning Values. Pure coefficient reads no
+		// longer have a resource handle retaining their address/count operands.
+		// Keep the final roots alive through DCE and plan extraction, including
+		// ReadConst roots introduced by ApplyBoundedRootReads above.
+		std::vector<uint8_t> retained_sources(m_sources.size());
+		std::vector<Inst*> retained_roots;
+		const auto retain = [&](uint32_t source) {
+			if (source >= m_sources.size()) Fail(0, "bounded snapshot source is missing");
+			if (retained_sources[source] != 0u) return;
+			retained_sources[source] = 1u;
+			auto& descriptor = m_sources[source];
+			for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+				auto& value = descriptor.dwords[word];
+				value = value.Resolve();
+				auto* inst = value.TryInstruction();
+				if (inst == nullptr) continue;
+				if (value.GetType() != Type::U32 || inst->Parent() == nullptr)
+					Fail(0, "bounded snapshot root is not a defined U32 value");
+				if (std::ranges::find(retained_roots, inst) != retained_roots.end()) continue;
+				retained_roots.push_back(inst);
+				inst->Parent()->AppendNewInst(ValueOpcode::ReferenceU32, {value});
+			}
+		};
+		for (const auto& read : m_bounded_srt_reads) {
+			retain(read.address_source);
+			if (read.workgroup_axis == UINT32_MAX) retain(read.count_source);
+		}
 	}
 
 	uint32_t InternSource(const DescriptorSource& descriptor) {

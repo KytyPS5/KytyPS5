@@ -3061,6 +3061,295 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   }
 }
 
+// Synthetic CPU regressions: append after the existing bounded snapshot helpers.
+Value WorkgroupSrtIndex(Fixture& fixture, uint32_t axis) {
+  return fixture.Emit(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(axis)});
+}
+
+Value WorkgroupSrtRawRead(Fixture& fixture, Value offset, uint32_t immediate = 0u) {
+  fixture.program.block_info[0].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  const auto address = fixture.Address(fixture.UserData(0u), fixture.UserData(1u));
+  MemoryInfo memory; memory.kind = ResourceKind::ScalarAddress; memory.offset = immediate;
+  const auto read = fixture.Emit(ValueOpcode::LoadAddressU32,
+      {address, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x40u));
+  fixture.Emit(ValueOpcode::ReferenceU32, {read});
+  return read;
+}
+
+void TestWorkgroupSrtTrackingProof() {
+  // Keep unsupported index provenance live; it must not become a fake snapshot.
+  for (uint32_t scenario = 0; scenario < 5u; ++scenario) {
+    Fixture fixture;
+    Value index;
+    if (scenario < 2u) {
+      index = fixture.Emit(ValueOpcode::GetBuiltin,
+          {Value(static_cast<uint32_t>(scenario == 0u ? StageInputKind::LocalInvocationId
+                                                      : StageInputKind::GlobalInvocationId)), Value(0u)});
+    } else if (scenario == 2u) {
+      index = fixture.UserData(2u); // A uniform value is not a dispatch bound.
+    } else {
+      const auto x = WorkgroupSrtIndex(fixture, 0u);
+      index = fixture.Emit(scenario == 3u ? ValueOpcode::IAdd32 : ValueOpcode::IMul32,
+          {x, scenario == 3u ? WorkgroupSrtIndex(fixture, 1u) : x});
+    }
+    const auto read = WorkgroupSrtRawRead(fixture, index);
+    Check(!ProveBoundedSrtRead(fixture.program, *read.ResolveInstruction()),
+          "workgroup SRT proof accepted local/global/unbounded/multiple-axis/nonlinear index");
+  }
+  for (uint32_t axis = 0; axis < 3u; ++axis) {
+    Fixture fixture;
+    const auto index = WorkgroupSrtIndex(fixture, axis);
+    const auto scaled = fixture.Emit(axis == 0u ? ValueOpcode::ShiftLeftLogical32 : ValueOpcode::IMul32,
+        {index, Value(axis == 0u ? 4u : 12u)});
+    // Include the carry-pair lowering of S_ADD_U32, not only plain IAdd.
+    const auto carry = fixture.Emit(ValueOpcode::IAddCarry32, {scaled, Value(7u)});
+    const auto offset = fixture.Emit(ValueOpcode::CompositeExtractU32x2, {carry, Value(0u)});
+    const auto read = WorkgroupSrtRawRead(fixture, offset, 68u);
+    const auto payload = fixture.Emit(ValueOpcode::IAdd32, {read, Value(9u)});
+    fixture.Emit(ValueOpcode::ReferenceU32, {payload});
+    const auto proof = ProveBoundedSrtRead(fixture.program, *read.ResolveInstruction());
+    Check(proof && proof->workgroup_axis == axis && proof->index.Resolve() == index &&
+              proof->offset_scale == (axis == 0u ? 16u : 12u) && proof->offset_bias == 7u &&
+              proof->memory_offset == 68u,
+          "affine WorkgroupId scalar read has no exact dispatch-axis proof");
+    fixture.PlanAndTrack();
+    const auto live_read = read.Resolve();
+    EliminateDeadCode(fixture.program.blocks);
+    ValidateProgram(fixture.program, true);
+    const auto* indexed = live_read.TryInstruction();
+    Check(indexed && indexed->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 &&
+              indexed->Arg(0).Resolve() == index &&
+              payload.ResolveInstruction()->Arg(0).Resolve().TryInstruction() == indexed &&
+              !fixture.program.info.uses_dma && fixture.program.bounded_srt_reads.size() == 1u,
+          "workgroup SRT tracking dropped a live key/user or retained raw DMA");
+    const auto& column = fixture.program.bounded_srt_reads[0];
+    Check(column.workgroup_axis == axis && column.count_source == UINT32_MAX,
+          "workgroup SRT column used an invented scalar count source");
+    auto plan = ExtractResourcePlan(fixture.program);
+    Check(plan.bounded_srt_reads == fixture.program.bounded_srt_reads &&
+              plan.requires_specialization_memory,
+          "extraction lost the dispatch-dependent column or clean-reader requirement");
+    BoundedSnapshotReader reader;
+    reader.words = {{0x1048u, 0x11u}, {axis == 0u ? 0x1058u : 0x1054u, 0x22u}};
+    const std::array<uint32_t, 2> data{0x1000u, 0u};
+    auto runtime = BoundedSnapshotRuntime(reader, data);
+    std::array<uint32_t, 3> groups{1u, 1u, 1u}; groups[axis] = 2u;
+    runtime.compute_workgroups = groups;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{0x11u, 0x22u} &&
+              reader.ordinary_reads == 0u,
+          "DCE or extraction lost the pure coefficient address roots");
+  }
+}
+
+void TestWorkgroupSrtRootExecutionProof() {
+  for (const bool conditional : {false, true}) {
+    Fixture fixture;
+    const auto low = fixture.UserData(0u);
+    const auto high = fixture.UserData(1u);
+    const auto root_offset = fixture.UserData(2u);
+    const auto index = WorkgroupSrtIndex(fixture, 0u);
+    auto* roots = fixture.AddBlock();
+    auto* body = fixture.AddBlock();
+    auto* exit = fixture.AddBlock();
+    const auto branch = [&](uint32_t from, uint32_t to) {
+      fixture.program.blocks[from]->AddBranch(fixture.program.blocks[to]);
+      auto& term = fixture.program.block_info[from].terminator;
+      term.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+      term.true_block = to;
+    };
+    branch(0u, 1u); branch(1u, 2u); branch(2u, 3u);
+    fixture.program.block_info[3].terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+    if (conditional) {
+      fixture.program.blocks[0]->AddBranch(exit);
+      auto& info = fixture.program.block_info[0];
+      info.terminator.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+      info.terminator.false_block = 3u;
+      info.condition = fixture.Emit(ValueOpcode::INotEqual32, {root_offset, Value(0u)});
+    }
+    fixture.block = roots;
+    const auto pointer = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {fixture.Address(low, high), root_offset, Value(0u), Value(true)},
+        fixture.AddMemory({.kind=ResourceKind::ScalarAddress}, 0x20u));
+    const auto shared = fixture.Emit(ValueOpcode::IAdd32, {pointer, Value(1u)});
+    fixture.Emit(ValueOpcode::ReferenceU32, {shared});
+    fixture.block = body;
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(2u)});
+    const auto read = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {fixture.Address(pointer, Value(0u)), offset, Value(0u), Value(true)},
+        fixture.AddMemory({.kind=ResourceKind::ScalarAddress}, 0x40u));
+    fixture.Emit(ValueOpcode::ReferenceU32, {read});
+    Check(ProveBoundedSrtRead(fixture.program, *read.ResolveInstruction()).has_value() != conditional,
+          "workgroup snapshot confused guaranteed split-prefix and conditional-only pointer roots");
+    if (conditional) continue;
+    fixture.PlanAndTrack();
+    const auto live = read.Resolve();
+    EliminateDeadCode(fixture.program.blocks);
+    ValidateProgram(fixture.program, true);
+    Check(live.ResolveInstruction()->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 &&
+              shared.ResolveInstruction()->Arg(0).ResolveInstruction()->GetOpcode() == ValueOpcode::ReadConst &&
+              !fixture.program.info.uses_dma,
+          "unconditional pointer root and its ordinary consumer did not share the clean snapshot");
+    const auto slot = shared.ResolveInstruction()->Arg(0).ResolveInstruction()->Arg(1).U32();
+    auto plan = ExtractResourcePlan(fixture.program);
+    Check(slot < plan.clean_flat_slots.size() && plan.clean_flat_slots[slot] != 0u,
+          "workgroup address-root snapshot lost its clean-read association");
+  }
+  Fixture invalid_axis;
+  const auto read = WorkgroupSrtRawRead(invalid_axis, WorkgroupSrtIndex(invalid_axis, 3u));
+  Check(!ProveBoundedSrtRead(invalid_axis.program, *read.ResolveInstruction()),
+        "workgroup snapshot accepted a malformed axis");
+}
+
+void InitializeWorkgroupSnapshot(Fixture& fixture, std::initializer_list<uint32_t> axes) {
+  fixture.program.srt_plan_complete = fixture.program.resource_tracking_complete = true;
+  const auto source = AddBoundedSnapshotSource(fixture, {fixture.UserData(0u), fixture.UserData(1u)});
+  for (const auto axis : axes) {
+    BoundedSrtRead read{.address_source=source, .count_source=UINT32_MAX,
+                       .offset_scale=4u, .offset_bias=0u, .memory_offset=0u};
+    read.workgroup_axis = axis;
+    fixture.program.bounded_srt_reads.push_back(read);
+  }
+}
+
+SrtRuntime WorkgroupSnapshotRuntime(BoundedSnapshotReader& reader, std::span<const uint32_t> data,
+                                    std::array<uint32_t,3> groups) {
+  auto runtime = BoundedSnapshotRuntime(reader, data);
+  runtime.compute_workgroups = groups;
+  return runtime;
+}
+
+void TestWorkgroupSrtMaterializationAndSpecialization() {
+  Fixture fixture;
+  InitializeWorkgroupSnapshot(fixture, {0u,1u,2u});
+  auto plan = ExtractResourcePlan(fixture.program);
+  BoundedSnapshotReader reader;
+  reader.words = {{0x1000u,0x11u},{0x1004u,0x22u},{0x1008u,0x33u}};
+  reader.change_repeated_reads = true;
+  const std::array<uint32_t,2> data{0x1003u,0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization),
+        "known guest dispatch bounds did not materialize workgroup coefficients");
+  Check(snapshot.flattened_srt == std::vector<uint32_t>{0x11u,0x22u,0x33u,0x11u,0x22u,0x11u} &&
+            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{3u,0u},{2u,3u},{1u,5u}} &&
+            reader.reads == std::vector<uint64_t>{0x1000u,0x1004u,0x1008u} && reader.ordinary_reads == 0u &&
+            snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000u,12u}},
+        "axis cardinality, source alignment, cross-column memoization or footprints changed");
+  const auto saved_snapshot = snapshot;
+  const auto saved_specialization = specialization;
+  reader.fail_address = 0x1008u;
+  Check(!MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization),
+        "missing final coefficient did not abort materialization");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  reader.fail_address = UINT64_MAX;
+  const auto before = reader.reads.size();
+  Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader,data), snapshot,specialization) &&
+            reader.reads.size() == before,
+        "unknown dispatch bound was invented or read payload before rejection");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  auto invalid = ExtractResourcePlan(fixture.program);
+  invalid.bounded_srt_reads[0].workgroup_axis = 3u;
+  Check(!MaterializeResources(invalid, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization),
+        "invalid workgroup axis was accepted");
+  CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  reader.reads.clear();
+  Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{1u,1u,1u}), snapshot,specialization) &&
+            specialization != saved_specialization &&
+            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{1u,0u},{1u,1u},{1u,2u}},
+        "dispatch count change reused a stale permutation layout");
+  const auto same_layout = specialization;
+  reader.reads.clear(); reader.words[0].second = 0x99u;
+  Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{1u,1u,1u}), snapshot,specialization) &&
+            specialization == same_layout && snapshot.flattened_srt == std::vector<uint32_t>(3u,0x99u),
+        "coefficient payload was cached across dispatches or unnecessarily changed the shader key");
+  ApplyResourceSpecialization(fixture.program,specialization);
+  Check(fixture.program.info.bounded_srt_reads == specialization.bounded_srt_reads,
+        "ApplyResourceSpecialization lost dispatch-dependent limits/offsets");
+}
+
+void TestWorkgroupSrtZeroDispatchAndProbeLimit() {
+  Fixture fixture;
+  InitializeWorkgroupSnapshot(fixture,{0u,1u});
+  for (auto& read : fixture.program.bounded_srt_reads) read.offset_scale = 0u;
+  auto plan = ExtractResourcePlan(fixture.program);
+  BoundedSnapshotReader reader;
+  reader.words = {{0x1000u,0x77u}};
+  const std::array<uint32_t,2> data{0x1000u,0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // Any empty axis means no invocation can execute any column, even X reads.
+  for (uint32_t axis = 0u; axis < 3u; ++axis) {
+    std::array<uint32_t,3> groups{3u,2u,5u}; groups[axis] = 0u;
+    Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,{},groups),snapshot,specialization) &&
+              snapshot.flattened_srt.empty() && snapshot.immutable_srt_ranges.empty() &&
+              specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{0u,0u},{0u,0u}} &&
+              reader.reads.empty(),
+          "zero dispatch attempted to evaluate a table address or used another nonzero axis count");
+  }
+  Check(MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{32768u,32768u,1u}),snapshot,specialization) &&
+            snapshot.flattened_srt.size() == 65536u && reader.reads.size() == 1u,
+        "exact combined workgroup snapshot probe budget was rejected");
+  const auto old_snapshot = snapshot;
+  const auto old_specialization = specialization;
+  Check(!MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{32769u,32768u,1u}),snapshot,specialization),
+        "workgroup columns exceeded the combined 65536-probe budget");
+  CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
+}
+
+void TestWorkgroupSrtWrappedOffsetsAndWriteAliases() {
+  Fixture fixture;
+  InitializeWorkgroupSnapshot(fixture,{0u});
+  auto& column = fixture.program.bounded_srt_reads[0];
+  column.offset_bias = 0xfffffffdu;
+  column.memory_offset = 0xfffffffdu;
+  auto plan = ExtractResourcePlan(fixture.program);
+  BoundedSnapshotReader reader;
+  reader.words = {{0x100000ff8ull,0xa1u},{0xffcull,0xb2u},{0x1000ull,0xc3u}};
+  const std::array<uint32_t,2> data{0x1003u,0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{3u,1u,1u}),snapshot,specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0xa1u,0xb2u,0xc3u} &&
+            reader.reads == std::vector<uint64_t>{0x100000ff8ull,0xffcull,0x1000ull} &&
+            snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0xffcu,8u},{0x100000ff8ull,4u}},
+        "workgroup affine U32 wrap was combined with signed SMEM immediate or lost exact ranges");
+  const auto old_snapshot = snapshot;
+  const auto old_specialization = specialization;
+  plan.bounded_srt_reads[0].offset_bias = 0u;
+  const auto before = reader.reads.size();
+  const std::array<uint32_t,2> underflow{0u,0u};
+  Check(!MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,underflow,{1u,1u,1u}),snapshot,specialization) &&
+            reader.reads.size() == before, "negative SMEM immediate underflow reached the reader");
+  CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
+  plan.bounded_srt_reads[0].offset_bias = 8u;
+  plan.bounded_srt_reads[0].memory_offset = 0u;
+  const std::array<uint32_t,2> overflow{0xfffffffcu,0xffffu};
+  Check(!MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,overflow,{1u,1u,1u}),snapshot,specialization) &&
+            reader.reads.size() == before, "48-bit workgroup address overflow reached the reader");
+  CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
+  for (const bool overlap : {false,true}) {
+    Fixture alias;
+    InitializeWorkgroupSnapshot(alias,{0u});
+    const auto writer = AddBoundedSnapshotSource(alias,
+        {Value(overlap ? 0x1007u : 0x1008u),Value(0u),Value(1u),Value(0u)});
+    alias.program.info.buffers.push_back({.source=writer,.written=true});
+    auto alias_plan = ExtractResourcePlan(alias.program);
+    reader = {}; reader.words = {{0x1000u,0x11u},{0x1004u,0x22u}};
+    const std::array<uint32_t,2> alias_data{0x1000u,0u};
+    snapshot = old_snapshot; specialization = old_specialization;
+    const bool accepted = MaterializeResources(alias_plan,
+        WorkgroupSnapshotRuntime(reader,alias_data,{2u,1u,1u}),snapshot,specialization);
+    Check(accepted != overlap, "last coefficient byte alias or exact-end writer was misclassified");
+    if (overlap) CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
+  }
+}
+
 // Run each unsafe-baseline probe in its own bounded external child process.
 // The test never substitutes a callback for the production raw fallback.
 class RawFallbackTestPage {
@@ -3182,6 +3471,19 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--workgroup-srt-proof-only") == 0) {
+      TestWorkgroupSrtTrackingProof();
+      TestWorkgroupSrtRootExecutionProof();
+      std::cout << "KYTY_WORKGROUP_SRT_PROOF_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--workgroup-srt-materialization-only") == 0) {
+      TestWorkgroupSrtMaterializationAndSpecialization();
+      TestWorkgroupSrtZeroDispatchAndProbeLimit();
+      TestWorkgroupSrtWrappedOffsetsAndWriteAliases();
+      std::cout << "KYTY_WORKGROUP_SRT_MATERIALIZATION_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--descriptor-format-provenance-only") == 0) {
       TestDescriptorFormattedBufferProvenance();
       std::cout << "KYTY_DESCRIPTOR_FORMAT_PROVENANCE_PASS\n";
@@ -3218,6 +3520,11 @@ int main(int argc, char** argv) {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("raw fallback readability", TestSrtRawFallbackReadability);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
+    Run("workgroup SRT proof", TestWorkgroupSrtTrackingProof);
+    Run("workgroup SRT root execution", TestWorkgroupSrtRootExecutionProof);
+    Run("workgroup SRT materialization", TestWorkgroupSrtMaterializationAndSpecialization);
+    Run("workgroup SRT zero dispatch and limits", TestWorkgroupSrtZeroDispatchAndProbeLimit);
+    Run("workgroup SRT offsets and aliases", TestWorkgroupSrtWrappedOffsetsAndWriteAliases);
     Run("bounded SRT tracking proof", TestBoundedSrtTrackingProofBoundaries);
     Run("bounded SRT split header", TestBoundedSrtSplitHeaderUniformCount);
     Run("bounded SRT shared memory count", TestBoundedSrtSplitHeaderSharedMemoryCount);

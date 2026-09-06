@@ -28,6 +28,7 @@
 #include <exception>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <nlohmann/json.hpp>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -90,7 +91,8 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 
 void CaptureDispatchedShader(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
-                             std::span<const uint32_t> static_state) {
+                             std::span<const uint32_t> static_state,
+                             std::optional<std::array<uint32_t, 3>> guest_workgroups) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
@@ -153,6 +155,9 @@ void CaptureDispatchedShader(const ShaderParams& params,
 			    {"max_size", options.compute_workgroup_limits.max_size},
 			    {"max_invocations", options.compute_workgroup_limits.max_invocations},
 			};
+			if (guest_workgroups.has_value()) {
+				metadata["compute"]["guest_workgroups"] = *guest_workgroups;
+			}
 		}
 		const auto json = metadata.dump(2) + '\n';
 		const auto write = [&](const std::filesystem::path& path, const void* data, size_t size) {
@@ -376,7 +381,8 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor,
+	                  std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt) {
 		constexpr ShaderType stage = [] {
 			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 				return ShaderType::Vertex;
@@ -401,6 +407,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderBacking,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .compute_workgroups         = guest_workgroups,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -457,7 +464,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size      = input_info.wave_size;
 			options.compute_workgroup_limits = compute_workgroup_limits;
 		}
-		CaptureDispatchedShader(params, options, lookup_key.static_state);
+		CaptureDispatchedShader(params, options, lookup_key.static_state, guest_workgroups);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
@@ -712,12 +719,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               const std::array<uint32_t, 3>& guest_workgroups) {
 	input_info.needs_lds_barriers = !m_graphics.compute_wave64_supported;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	return m_program_cache->Get(params, input_info, push_data_cursor, guest_workgroups);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

@@ -425,6 +425,9 @@ struct BoundedSrtRead {
 	uint32_t offset_bias    = 0;
 	// Kept separate from the wrapping U32 offset; scalar memory sign-extends this field.
 	uint32_t memory_offset = 0;
+	// UINT32_MAX selects count_source; otherwise count_source must be UINT32_MAX
+	// and the axis is bounded by the current guest dispatch supplied at materialization.
+	uint32_t workgroup_axis = UINT32_MAX;
 	bool operator==(const BoundedSrtRead&) const = default;
 };
 

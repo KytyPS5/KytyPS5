@@ -3,6 +3,8 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
+#include <optional>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -17,9 +19,12 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Actual guest dispatch counts before host wave partitioning. Absent for graphics
+	// and offline callers that cannot prove a dispatch-dependent snapshot's bound.
+	std::optional<std::array<uint32_t, 3>> compute_workgroups;
 };
 
-// A raw scalar read whose index is bounded by a dominating unsigned loop guard.
+// A raw scalar read bounded by an unsigned loop guard or one actual dispatch axis.
 // offset_scale/index + offset_bias uses U32 arithmetic BEFORE separate signed
 // memory_offset addition/alignment, matching raw SMEM address evaluation.
 struct BoundedSrtReadProof {
@@ -30,6 +35,7 @@ struct BoundedSrtReadProof {
 	uint32_t offset_scale = 0;
 	uint32_t offset_bias = 0;
 	uint32_t memory_offset = 0;
+	uint32_t workgroup_axis = UINT32_MAX;
 };
 std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
                                                      const Inst& read);

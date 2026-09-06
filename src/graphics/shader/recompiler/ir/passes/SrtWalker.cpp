@@ -996,7 +996,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	return true;
 }
 
-// Accept only one canonical induction value. Arithmetic stays modulo 2^32;
+// Accept one canonical induction value or exact WorkgroupId axis. Arithmetic stays modulo 2^32;
 // the SMEM instruction's signed immediate is intentionally not folded here.
 struct BoundedOffset {
 	const Inst* index = nullptr;
@@ -1015,6 +1015,17 @@ bool ParseBoundedOffset(Value value, BoundedOffset& result,
 	const auto* inst = value.TryInstruction();
 	if (inst == nullptr || !visiting.insert(inst).second) return false;
 	const auto finish = [&](bool success) { visiting.erase(inst); return success; };
+	if (inst->GetOpcode() == ValueOpcode::GetBuiltin) {
+		const auto kind = inst->NumArgs() == 2u ? inst->Arg(0).Resolve() : Value {};
+		const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+		if (!kind.IsImmediate() || kind.GetType() != Type::U32 ||
+		    kind.U32() != static_cast<uint32_t>(StageInputKind::WorkgroupId) ||
+		    !axis.IsImmediate() || axis.GetType() != Type::U32 || axis.U32() >= 3u)
+			return finish(false);
+		result.index = inst;
+		result.scale = 1u;
+		return finish(true);
+	}
 	if (inst->GetOpcode() == ValueOpcode::Phi) {
 		result.index = inst;
 		result.scale = 1u;
@@ -1091,6 +1102,28 @@ public:
 		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr)
 			return {};
 		if (!BuildGraph()) return {};
+		if (offset.index->GetOpcode() == ValueOpcode::GetBuiltin) {
+			if (!Dominates(offset.index->Parent(), read.Parent()) ||
+			    (offset.index->Parent() == read.Parent() && !Precedes(*offset.index, read))) return {};
+			// Only memory roots in the guaranteed entry prefix may be evaluated
+			// eagerly. A dispatch bound does not make a conditional pointer load
+			// unconditional, even when the coefficient itself is read later.
+			const Block* prefix = m_program.blocks.front();
+			std::unordered_set<const Block*> visited;
+			while (m_program.block_info[m_ids.at(prefix)].terminator.kind == CFG::TerminatorKind::Branch) {
+				if (!visited.insert(prefix).second) return {};
+				const auto target = m_program.block_info[m_ids.at(prefix)].terminator.true_block;
+				const auto* next = m_by_id.at(target);
+				if (next->ImmPredecessors().size() != 1u || next->ImmPredecessors().front() != prefix) break;
+				prefix = next;
+			}
+			if (!RuntimeReadsDominate(address->Arg(0), prefix, &read) ||
+			    !RuntimeReadsDominate(address->Arg(1), prefix, &read)) return {};
+			return BoundedSrtReadProof {Value(const_cast<Inst*>(offset.index)), Value {},
+			                           address->Arg(0).Resolve(), address->Arg(1).Resolve(),
+			                           offset.scale, offset.bias, memory.offset,
+			                           offset.index->Arg(1).Resolve().U32()};
+		}
 		const auto* phi = offset.index;
 		const auto* header = phi->Parent();
 		if (header == nullptr || !m_ids.contains(header) || !m_ids.contains(read.Parent()) ||
@@ -1174,7 +1207,15 @@ private:
 		value = value.Resolve();
 		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
 	}
-	bool RuntimeReadsDominate(Value root, const Block* header) const {
+	static bool Precedes(const Inst& definition, const Inst& use) {
+		if (definition.Parent() == nullptr || definition.Parent() != use.Parent()) return false;
+		for (const auto& inst : *use.Parent()) {
+			if (&inst == &use) return false;
+			if (&inst == &definition) return true;
+		}
+		return false;
+	}
+	bool RuntimeReadsDominate(Value root, const Block* header, const Inst* before = nullptr) const {
 		std::vector<Value> work {root};
 		std::unordered_set<const Inst*> visited;
 		while (!work.empty()) {
@@ -1188,9 +1229,12 @@ private:
 				    slot.U32() >= m_program.srt_reads.size()) return false;
 				work.push_back(m_program.srt_reads[slot.U32()].value);
 			}
-			if ((inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-			     inst->GetOpcode() == ValueOpcode::ReadConstBuffer) &&
-			    (inst->Parent() == nullptr || !Dominates(inst->Parent(), header))) return false;
+			if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			    inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				if (inst->Parent() == nullptr || !Dominates(inst->Parent(), header)) return false;
+				if (before != nullptr && (!Dominates(inst->Parent(), before->Parent()) ||
+				    (inst->Parent() == before->Parent() && !Precedes(*inst, *before)))) return false;
+			}
 			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) work.push_back(inst->Arg(arg));
 		}
 		return true;

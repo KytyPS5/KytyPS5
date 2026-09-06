@@ -28,6 +28,20 @@ struct ComputeExecutionPlan {
     const IR::Program& program, ShaderStageInputInfo input_info,
     const ComputeWorkgroupLimits& limits);
 
+// Normalize the dispatch dimensions before applying any host wave partition.
+[[nodiscard]] inline std::array<uint32_t, 3> ComputeGuestWorkgroups(
+    std::array<uint32_t, 3> raw_dimensions,
+    const std::array<uint32_t, 3>& local_sizes, bool use_thread_dimensions) {
+	if (!use_thread_dimensions) return raw_dimensions;
+	for (uint32_t axis = 0; axis < 3; ++axis) {
+		const uint32_t group_size = std::max(local_sizes[axis], 1u);
+		// Quotient + remainder avoids overflow near UINT32_MAX.
+		raw_dimensions[axis] = raw_dimensions[axis] / group_size +
+		                       (raw_dimensions[axis] % group_size != 0u ? 1u : 0u);
+	}
+	return raw_dimensions;
+}
+
 // All axes are checked even though splitting expands X only. Zero work is valid.
 [[nodiscard]] inline std::optional<std::array<uint32_t, 3>> PlanComputeDispatchGroups(
     std::array<uint32_t, 3> guest_groups, uint32_t wave_partition_factor,

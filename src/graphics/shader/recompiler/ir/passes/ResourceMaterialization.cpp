@@ -532,17 +532,34 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	uint64_t probes = 0;
 	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
 		const auto& read = program.bounded_srt_reads[id];
-		const auto* count_source = Source(program, read.count_source);
 		const auto* address_source = Source(program, read.address_source);
-		if (count_source == nullptr || count_source->dword_count != 1u ||
-		    address_source == nullptr || address_source->dword_count != 2u) {
-			return SpecializationFail("bounded SRT read has invalid count/address source widths");
+		if (address_source == nullptr || address_source->dword_count != 2u) {
+			return SpecializationFail("bounded SRT read has invalid address source width");
 		}
-		DescriptorValue count;
-		if (!EvaluateDescriptorSource(program, read.count_source, clean_runtime, count)) {
-			return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its count", id));
+		uint32_t size = 0;
+		if (read.workgroup_axis != UINT32_MAX) {
+			if (read.workgroup_axis >= 3u || read.count_source != UINT32_MAX ||
+			    !runtime.compute_workgroups.has_value()) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} requires actual guest workgroup counts and a valid axis", id));
+			}
+			const auto& groups = *runtime.compute_workgroups;
+			// A zero in any axis creates no invocations, hence no coefficient reads.
+			// These are guest counts, before host wave partitioning, not local sizes.
+			if (std::ranges::all_of(groups, [](uint32_t count) { return count != 0u; })) {
+				size = groups[read.workgroup_axis];
+			}
+		} else {
+			const auto* count_source = Source(program, read.count_source);
+			if (count_source == nullptr || count_source->dword_count != 1u) {
+				return SpecializationFail("bounded SRT read has invalid count source width");
+			}
+			DescriptorValue count;
+			if (!EvaluateDescriptorSource(program, read.count_source, clean_runtime, count)) {
+				return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its count", id));
+			}
+			size = count.dwords[0];
 		}
-		const uint32_t size = count.dwords[0];
 		probes += size;
 		if (probes > MaxIndirectImageProbes ||
 		    snapshot.resources.flattened_srt.size() > UINT32_MAX - uint64_t{size}) {
@@ -1298,7 +1315,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
 	for (const auto& read: plan.bounded_srt_reads) {
 		plan.requires_specialization_memory = true;
-		MarkCleanFlatSlots(plan, Source(plan, read.count_source), plan.clean_flat_slots);
+		if (read.workgroup_axis == UINT32_MAX) {
+			MarkCleanFlatSlots(plan, Source(plan, read.count_source), plan.clean_flat_slots);
+		}
 		MarkCleanFlatSlots(plan, Source(plan, read.address_source), plan.clean_flat_slots);
 	}
 	for (const auto& image: plan.info.images) {

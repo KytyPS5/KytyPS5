@@ -48,6 +48,11 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
+	// Snapshot-dependent stores require shader execution and the immutable-source
+	// alias preflight. Buffer write metadata alone does not prove a constant fill.
+	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty()) {
+		return false;
+	}
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -83,6 +88,9 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
                               uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
+	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty()) {
+		return false;
+	}
 	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
 	    !resources.images.empty() || !resources.samplers.empty()) {
@@ -233,8 +241,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	// Snapshot bounds and the eventual dispatch must use the same guest grid.
+	// Compute it before materialization, without putting counts in the static shader key.
+	const auto guest_groups = ShaderRecompiler::ComputeGuestWorkgroups(
+	    {thread_group_x, thread_group_y, thread_group_z},
+	    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+	     cs_regs.cs_regs.num_thread_z}, use_thread_dimensions);
 	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info, guest_groups);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -314,18 +328,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (use_thread_dimensions) {
-		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
-			return (threads == 0
-			            ? 0u
-			            : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
-		};
-
 		const uint32_t old_x = thread_group_x;
 		const uint32_t old_y = thread_group_y;
 		const uint32_t old_z = thread_group_z;
-		thread_group_x       = groups_from_threads(thread_group_x, cs_regs.cs_regs.num_thread_x);
-		thread_group_y       = groups_from_threads(thread_group_y, cs_regs.cs_regs.num_thread_y);
-		thread_group_z       = groups_from_threads(thread_group_z, cs_regs.cs_regs.num_thread_z);
+		thread_group_x = guest_groups[0];
+		thread_group_y = guest_groups[1];
+		thread_group_z = guest_groups[2];
 
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {

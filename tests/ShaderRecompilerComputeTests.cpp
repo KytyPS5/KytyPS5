@@ -5395,6 +5395,16 @@ public:
           "or stole its stencil association");
 
       constexpr uint64_t second_stencil_offset = 0x90000;
+      auto stencil_storage_desc = MakeLinearDesc(
+          base + second_stencil_offset, ms_stencil_size, vk::Format::eR8Uint,
+          Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
+          {256, 256, 1}, 256, 1, 1);
+      stencil_storage_desc.type = BindingType::Storage;
+      stencil_storage_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto stencil_storage_image =
+          texture_cache.FindImage(stencil_storage_desc);
+      (void)texture_cache.FindTexture(stencil_storage_image,
+                                      stencil_storage_desc);
       auto switched_ms_depth = ms_depth_desc;
       switched_ms_depth.info.stencil = {base + second_stencil_offset,
                                         ms_stencil_size};
@@ -5414,10 +5424,21 @@ public:
                   texture_cache.GetImage(first_stencil_association).depth_id ==
                       ms_depth_image &&
                   second_stencil_association &&
+                  second_stencil_association == stencil_storage_image &&
+                  texture_cache.GetImage(second_stencil_association).IsTracked() &&
                   texture_cache.GetImage(second_stencil_association).depth_id ==
                       ms_depth_image,
               "changing stencil address recreated depth or discarded an "
               "existing lightweight association");
+      Require(name, "CPU write to tracked stencil association",
+              resources.HandleFault(PageFaultAccess::Write,
+                                    base + second_stencil_offset) &&
+                  !texture_cache.GetImage(second_stencil_association).IsTracked() &&
+                  texture_cache.GetImage(second_stencil_association).IsCpuDirty() &&
+                  texture_cache.GetImage(second_stencil_association).depth_id ==
+                      ms_depth_image,
+              "CPU invalidation left a reused stencil image write-protected");
+      memory[second_stencil_offset] = 0x5a;
 
       constexpr uint64_t added_stencil_depth_offset = 0x60000;
       constexpr uint64_t added_stencil_offset = 0x70000;

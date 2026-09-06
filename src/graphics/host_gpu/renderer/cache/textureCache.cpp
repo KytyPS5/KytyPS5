@@ -1859,7 +1859,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr || owner->depth_id) {
+		if (owner == nullptr) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {

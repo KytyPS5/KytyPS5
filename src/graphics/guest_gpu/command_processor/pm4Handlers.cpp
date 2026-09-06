@@ -1442,6 +1442,14 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(addr, sizeof(uint32_t))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("CondExec: failed to synchronise the predicate at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     addr);
+		}
+	}
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}

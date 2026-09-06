@@ -343,7 +343,7 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::printf("Num compiled %u shaders\n", ++num_compiled);
+		std::printf("Num compiled %" PRIu64 " shaders\n", next_shader_id);
 		return permutation.handle;
 	}
 
@@ -362,7 +362,6 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
-	uint32_t                                                    num_compiled   = 0;
 	uint64_t                                                    next_shader_id = 0;
 };
 
@@ -602,7 +601,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
+PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -619,47 +618,42 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	Common::LockGuard lock(m_mutex);
 	auto&             ctx = command.GetRegisters();
 
-	uint32_t color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t i = 0; i < color_count; i++) {
-		color_mask[i] =
-		    (colors[i].image_id ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
-		                              ctx.GetRenderTargetMask(), colors[i].target_slot))
-		                        : 0);
-	}
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	PipelineStaticParameters static_params {};
-
-	static_params.color_count = color_count;
-	PipelineRenderingState rendering {};
+	PipelineRenderingState   rendering {};
 	rendering.color_count       = color_count;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
-		EXIT_IF(!colors[i].image_id || colors[i].format == vk::Format::eUndefined);
-		rendering.color_formats[i] = colors[i].format;
+		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
+		static_params.color_mask[i] = colors[i].export_mapping.ApplyMask(
+		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		rendering.color_formats[i] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
-			attachment_samples = colors[i].samples;
-		} else if (attachment_samples != colors[i].samples) {
+			attachment_samples = colors[i].desc.info.samples;
+		} else if (attachment_samples != colors[i].desc.info.samples) {
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].samples);
+			     attachment_samples, colors[i].desc.info.samples);
 		}
 	}
 	const bool with_depth =
-	    depth.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
 	if (with_depth) {
-		const auto aspects = ImageViewOps::DepthAspectMask(depth.format);
-		rendering.depth_format =
-		    aspects & vk::ImageAspectFlagBits::eDepth ? depth.format : vk::Format::eUndefined;
-		rendering.stencil_format =
-		    aspects & vk::ImageAspectFlagBits::eStencil ? depth.format : vk::Format::eUndefined;
+		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
+		                               ? depth.desc.view_info.format
+		                               : vk::Format::eUndefined;
+		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
+		                               ? depth.desc.view_info.format
+		                               : vk::Format::eUndefined;
 		if (attachment_samples == 0) {
-			attachment_samples = depth.samples;
-		} else if (attachment_samples != depth.samples) {
+			attachment_samples = depth.desc.info.samples;
+		} else if (attachment_samples != depth.desc.info.samples) {
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.samples);
+			     depth.desc.info.samples);
 		}
 	}
 	if (color_count == 0 && !with_depth) {
@@ -689,16 +683,12 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.with_depth              = with_depth;
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	static_params.stencil_test_enable      = depth.stencil_test_enable;
 	static_params.stencil_front            = depth.stencil_static_front;
 	static_params.stencil_back             = depth.stencil_static_back;
-	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
-		static_params.color_mask[i] = color_mask[i];
-	}
 	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList;
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
@@ -763,13 +753,11 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
-	auto cached         = std::make_unique<GraphicsPipeline>();
-	cached->ps_shader_id = ps_id;
-	cached->vs_shader_id = vs_id;
+	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
-	                       vertex_program.module, ps_input_info, pixel_program.module,
-	                       static_params, m_driver_cache);
+	                       vertex_program, ps_input_info, pixel_program, static_params,
+	                       m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -781,19 +769,17 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	return *iter->second;
 }
 
-PipelineCache::ComputePipeline&
-PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
-                                     const ShaderProgram&    compute_program) {
+PipelineCache::Pipeline&
+PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);
 
 	Common::LockGuard lock(m_mutex);
 
-	ComputePipelineKey key {};
-	key.cs_shader_id = compute_program.id;
-
-	if (auto iter = m_compute_pipelines.find(key); iter != m_compute_pipelines.end()) {
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
 		return *iter->second;
 	}
 
@@ -801,14 +787,13 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
-	auto cached         = std::make_unique<ComputePipeline>();
-	cached->cs_shader_id = compute_program.id;
+	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_compute_pipelines.emplace(std::move(key), std::move(cached));
+	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
 	return *iter->second;

@@ -402,7 +402,6 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 	EXIT_NOT_IMPLEMENTED(!z.z_info.HasValidTextureCompatibility());
 	EXIT_NOT_IMPLEMENTED(!z.stencil_info.HasValidTextureCompatibility());
 	if (z.z_info.format == Prospero::DepthFormat::kInvalid) {
-		EXIT_NOT_IMPLEMENTED(z.z_info.format != Prospero::DepthFormat::kInvalid);
 		EXIT_NOT_IMPLEMENTED(z.z_info.num_samples != 0);
 		EXIT_NOT_IMPLEMENTED(z.z_info.htile_acceleration != false);
 		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
@@ -424,14 +423,11 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
 	}
 
-	if (z.stencil_info.format == Prospero::StencilFormat::kInvalid) {
-		EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
-		EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
-	} else {
+	if (z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
 		EXIT_NOT_IMPLEMENTED(z.stencil_info.format != Prospero::StencilFormat::k8UInt);
-		EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
-		EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
 	}
+	EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
+	EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
 
 	if (z.z_info.format != Prospero::DepthFormat::kInvalid ||
 	    z.stencil_info.format != Prospero::StencilFormat::kInvalid) {

@@ -67,11 +67,12 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	return barrier;
 }
 
-std::vector<ShaderBufferWriteRange>
-CollectShaderBufferWrites(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                          const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
+	EXIT_IF(!runtime);
+	const auto& program   = *runtime.program;
+	const auto& resources = runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
-	std::vector<ShaderBufferWriteRange> writes;
+	bool has_writes = false;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;
@@ -80,23 +81,11 @@ CollectShaderBufferWrites(const ShaderRecompiler::IR::CompiledShaderInfo& progra
 		EXIT_IF(value.dword_count < 4);
 		ShaderBufferResource descriptor;
 		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
-		const auto address = descriptor.Base48();
-		const auto records = static_cast<uint64_t>(descriptor.NumRecords());
-		const auto stride  = static_cast<uint64_t>(descriptor.Stride());
-		if (stride != 0 && records > UINT64_MAX / stride) {
-			EXIT("shader resource barrier buffer footprint overflow\n");
-		}
-		const auto size = stride == 0 ? records : stride * records;
-		if (address != 0 && size != 0) {
-			writes.push_back({address, size});
-		}
+		// A zero stride means byte addressing. For either addressing mode a nonzero record
+		// count is exactly the condition for a nonempty descriptor range.
+		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
-	return writes;
-}
-
-bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
-	EXIT_IF(!runtime);
-	return !CollectShaderBufferWrites(*runtime.program, runtime.resources).empty();
+	return has_writes;
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

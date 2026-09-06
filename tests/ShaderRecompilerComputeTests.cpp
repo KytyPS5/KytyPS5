@@ -1725,6 +1725,28 @@ public:
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
 
+    auto *command = &scheduler.Current();
+    const auto original_handle = command->Handle();
+    HW::Context next_registers{};
+    HW::UserConfig next_user_config{};
+    HW::Shader next_shaders{};
+    scheduler.Begin(next_registers, next_user_config, next_shaders);
+    Require("SchedulerTimeline", "guest context rebind",
+            &scheduler.Current() == command &&
+                command->Handle() == original_handle &&
+                &command->GetRegisters() == &next_registers &&
+                &command->GetUserConfig() == &next_user_config &&
+                &command->GetShaders() == &next_shaders,
+            "rebinding guest state replaced the active command recording");
+    scheduler.FlushAndWait();
+    Require("SchedulerTimeline", "guest context after recording restart",
+            scheduler.Active() && &scheduler.Current() == command &&
+                &command->GetRegisters() == &next_registers &&
+                &command->GetUserConfig() == &next_user_config &&
+                &command->GetShaders() == &next_shaders,
+            "restarting command recording lost the current guest context");
+    scheduler.Begin(registers, user_config, shaders);
+
     const auto first_tick = scheduler.CurrentTick();
     uint32_t completed = 0;
     scheduler.DeferOperation([owned = std::make_unique<uint32_t>(1),
@@ -7585,7 +7607,7 @@ public:
       scheduler.Current().EndRendering();
       Require(name, "captured 1D target",
               color.image_id && attachment != nullptr &&
-                  color.image_view != nullptr &&
+                  rendering.color_attachments[0].image_view != nullptr &&
                   color.desc.info.type == Prospero::ImageType::kColor1D &&
                   color.desc.info.extent == vk::Extent3D{width, height, 1} &&
                   color.desc.info.resources == ImageSubresources{1, 1} &&
@@ -7716,7 +7738,7 @@ public:
       Require(
           name, "3D slice transition",
           sliced_color.image_id == color.image_id &&
-              sliced_color.image_view != nullptr &&
+              sliced_rendering.color_attachments[0].image_view != nullptr &&
               sliced_color.desc.view_info.base_layer == 7 &&
               sliced_rendering.num_color_attachments == 1 &&
               sliced_rendering.num_layers == 1 &&
@@ -8170,7 +8192,8 @@ public:
       const auto &image = texture_cache.GetImage(color.image_id);
       Require(name, "captured target",
               color.image_id && attachment != nullptr &&
-                  color.base_array_layer == 5 &&
+                  color.guest_array_layer == 5 &&
+                  color.desc.view_info.base_layer == 5 &&
                   color.desc.info.data.address == target_address &&
                   color.desc.info.data.size == target_size &&
                   color.desc.info.tile_mode == tile_case.tile &&
@@ -8374,6 +8397,46 @@ public:
             ShaderRecompiler::IR::AllocateBindings(program);
           };
 
+      {
+        ShaderRecompiler::IR::Program buffer_ir{};
+        buffer_ir.stage = ShaderType::Compute;
+        buffer_ir.resource_tracking_complete = true;
+        buffer_ir.info.buffers.resize(1);
+        buffer_ir.info.buffers[0].read = true;
+        allocate_bindings(buffer_ir);
+        ShaderRecompiler::IR::CompiledShaderInfo buffer_program{};
+        buffer_program.stage = buffer_ir.stage;
+        buffer_program.info = std::move(buffer_ir.info);
+        buffer_program.bindings = std::move(buffer_ir.bindings);
+
+        constexpr uint64_t buffer_address = base + allocation_size - 0x5000;
+        ShaderBufferResource buffer_descriptor{};
+        buffer_descriptor.UpdateAddress48(buffer_address);
+        buffer_descriptor.fields[2] = 0x8000;
+        ShaderStageRuntime buffer_runtime{.program = &buffer_program};
+        auto &value = buffer_runtime.resources.buffers.emplace_back();
+        std::memcpy(value.dwords.data(), buffer_descriptor.fields,
+                    sizeof(buffer_descriptor.fields));
+        value.dword_count = 4;
+        auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
+        executor.FindBuffers(buffer_bindings);
+        const auto original_id = buffer_bindings.buffer_sources[0].id;
+
+        auto &buffer_cache = resources.GetBufferCache();
+        const auto merged_id =
+            buffer_cache.FindBuffer(base + allocation_size - 0x10000, 0x10000);
+        Require(name, "buffer discovery invalidation", merged_id != original_id,
+                "overlapping buffer discovery did not replace its smaller owner");
+        executor.RebindBuffers(buffer_bindings);
+        const auto &binding = buffer_bindings.buffers[0];
+        const auto &owner = buffer_cache.GetBuffer(merged_id);
+        Require(name, "clamped buffer rebind",
+                binding.buffer == owner.Handle() &&
+                    binding.offset == owner.Offset(buffer_address) &&
+                    binding.range == 0x5000,
+                "descriptor rebind lost its clamped guest range or retained a stale host owner");
+      }
+
       constexpr auto stencil_format = Prospero::BufferFormat::k8UInt;
       constexpr auto linear = Prospero::TileMode::kLinear;
       TileSizeAlign stencil_layout{};
@@ -8425,13 +8488,13 @@ public:
       auto null_bindings = executor.PrepareBindings(null_runtime);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
-              null_bindings.resources.images.size() == 3,
+              null_bindings.images.size() == 3,
               "null descriptor preparation lost an image binding");
-      const auto null_image_id = null_bindings.resources.images[0].image_id;
+      const auto null_image_id = null_bindings.images[0].image_id;
       const auto &null_image = texture_cache.GetImage(null_image_id);
       Require(name, "one null image per format",
-              null_bindings.resources.images[1].image_id == null_image_id &&
-                  null_bindings.resources.images[2].image_id == null_image_id &&
+              null_bindings.images[1].image_id == null_image_id &&
+                  null_bindings.images[2].image_id == null_image_id &&
                   TextureCacheTestAccess::NullImageCount(texture_cache) == 1,
               "null view dimension or usage created another image allocation");
       Require(name, "null descriptors share final cache acquisition",
@@ -8447,7 +8510,7 @@ public:
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), null_bindings));
       Require(name, "null descriptor general layouts",
-              std::ranges::all_of(null_bindings.resources.images,
+              std::ranges::all_of(null_bindings.images,
                                   [](const auto &binding) {
                                     const auto info = MakeImageInfo(binding);
                                     return binding.layout ==
@@ -8578,19 +8641,19 @@ public:
                                 overwide_mipped_storage_descriptor};
       mipped_prepared.program = &mipped_program;
       mipped_prepared.snapshot = &mipped_snapshot;
-      mipped_prepared.resources.images.push_back(
+      mipped_prepared.images.push_back(
           std::move(plain_mipped_storage_binding));
-      mipped_prepared.resources.images.push_back(
+      mipped_prepared.images.push_back(
           std::move(mipped_storage_binding));
-      mipped_prepared.resources.images.push_back(
+      mipped_prepared.images.push_back(
           std::move(overwide_mipped_storage_binding));
-      mipped_prepared.resources.images.push_back(
+      mipped_prepared.images.push_back(
           std::move(sampled_overwide_resolved));
       executor.RebindImages(mipped_prepared);
-      auto &plain_mipped_binding = mipped_prepared.resources.images[0];
-      auto &mipped_binding = mipped_prepared.resources.images[1];
-      auto &overwide_mipped_binding = mipped_prepared.resources.images[2];
-      auto &sampled_overwide_binding = mipped_prepared.resources.images[3];
+      auto &plain_mipped_binding = mipped_prepared.images[0];
+      auto &mipped_binding = mipped_prepared.images[1];
+      auto &overwide_mipped_binding = mipped_prepared.images[2];
+      auto &sampled_overwide_binding = mipped_prepared.images[3];
       plain_mipped_binding.layout = vk::ImageLayout::eGeneral;
       mipped_binding.layout = vk::ImageLayout::eGeneral;
       overwide_mipped_binding.layout = vk::ImageLayout::eGeneral;
@@ -8774,9 +8837,9 @@ public:
       ShaderStageRuntime storage_runtime{&storage_info,
                                          std::move(storage_snapshot)};
       auto storage_discovery = executor.PrepareBindings(storage_runtime);
-      const auto storage_id = storage_discovery.resources.images[0].image_id;
+      const auto storage_id = storage_discovery.images[0].image_id;
       Require(name, "storage prefetch purity",
-              storage_discovery.resources.images[0].image_view == nullptr &&
+              storage_discovery.images[0].image_view == nullptr &&
                   texture_cache.GetImage(storage_id).binding.is_bound &&
                   !texture_cache.GetImage(storage_id).usage.storage &&
                   !TextureCacheTestAccess::PendingDownload(texture_cache,
@@ -8828,10 +8891,10 @@ public:
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
       const auto ordered_sampled_id =
-          ordered_bindings.pixel->resources.images[0].image_id;
+          ordered_bindings.pixel->images[0].image_id;
       Require(
           name, "VS-before-PS retained-owner order",
-          ordered_bindings.vertex.resources.images[0].image_id == storage_id &&
+          ordered_bindings.vertex.images[0].image_id == storage_id &&
               ordered_sampled_id != storage_id &&
               RenderExecutorTestAccess::BoundImagesInOrder(executor, storage_id,
                                                            ordered_sampled_id),
@@ -8843,9 +8906,9 @@ public:
           RenderExecutorTestAccess::PrepareGraphicsBindings(
               executor, storage_runtime, sampled_runtime, true);
       const auto &storage_binding =
-          graphics_bindings.vertex.resources.images[0];
+          graphics_bindings.vertex.images[0];
       const auto &sampled_binding =
-          graphics_bindings.pixel->resources.images[0];
+          graphics_bindings.pixel->images[0];
       Require(name, "storage final acquisition",
               storage_binding.image_view != nullptr &&
                   texture_cache.GetImage(storage_id).usage.storage &&
@@ -8909,13 +8972,13 @@ public:
           *writable_alias_bindings.pixel));
       Require(
           name, "forced-general descriptor capture",
-          writable_alias_bindings.vertex.resources.images[0].layout ==
+          writable_alias_bindings.vertex.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              writable_alias_bindings.pixel->resources.images[0].layout ==
+              writable_alias_bindings.pixel->images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              MakeImageInfo(writable_alias_bindings.vertex.resources.images[0])
+              MakeImageInfo(writable_alias_bindings.vertex.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
-              MakeImageInfo(writable_alias_bindings.pixel->resources.images[0])
+              MakeImageInfo(writable_alias_bindings.pixel->images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
               texture_cache.GetImage(storage_id).backing.state.layout ==
                   vk::ImageLayout::eGeneral &&
@@ -8975,10 +9038,10 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot split_snapshot{};
       split_bindings.program = &split_program;
       split_bindings.snapshot = &split_snapshot;
-      split_bindings.resources.images.push_back(
+      split_bindings.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
            split_storage_desc});
-      split_bindings.resources.images.push_back(
+      split_bindings.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_sampled_desc),
            split_sampled_desc});
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
@@ -8986,13 +9049,13 @@ public:
       const auto &split_image = texture_cache.GetImage(split_id);
       Require(
           name, "per-binding subresource layouts",
-          split_bindings.resources.images[0].layout ==
+          split_bindings.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              split_bindings.resources.images[1].layout ==
+              split_bindings.images[1].layout ==
                   vk::ImageLayout::eShaderReadOnlyOptimal &&
-              MakeImageInfo(split_bindings.resources.images[0]).imageLayout ==
+              MakeImageInfo(split_bindings.images[0]).imageLayout ==
                   vk::ImageLayout::eGeneral &&
-              MakeImageInfo(split_bindings.resources.images[1]).imageLayout ==
+              MakeImageInfo(split_bindings.images[1]).imageLayout ==
                   vk::ImageLayout::eShaderReadOnlyOptimal &&
               split_image.backing.subresource_states.size() == 2 &&
               split_image.backing.subresource_states[0].layout ==
@@ -9066,7 +9129,7 @@ public:
           executor, 1, scheduler.Current(), non_texture_compatible_depth);
       Require(
           name, "depth texture compatibility identity",
-          phased_depth.image_id && phased_depth.htile &&
+          phased_depth.image_id && (phased_depth.desc.info.metadata.kind == ImageMetadataKind::Htile) &&
               non_texture_compatible_depth.image_id == phased_depth.image_id &&
               non_texture_compatible_depth.desc.info.data ==
                   phased_depth.desc.info.data &&
@@ -9077,7 +9140,7 @@ public:
               phased_depth.desc.info.metadata.stencil_compressed &&
               !phased_depth.depth_clear_enable &&
               !phased_depth.depth_meta_clear_enable &&
-              !texture_cache.IsMeta(phased_depth.htile_buffer_vaddr) &&
+              !texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
               !texture_cache.GetImage(phased_depth.image_id).IsGpuModified() &&
               !texture_cache.GetImage(phased_depth.image_id).usage.depth_target,
           "valid PS5 texture-compatibility policy changed logical depth image "
@@ -9113,8 +9176,8 @@ public:
       Require(
           name, "read-only depth/stencil target without write addresses",
           read_only_depth.image_id == phased_depth.image_id &&
-              read_only_depth.depth_buffer_vaddr == phased_depth_address &&
-              read_only_depth.stencil_buffer_vaddr == phased_stencil_address &&
+              read_only_depth.desc.info.data.address == phased_depth_address &&
+              read_only_depth.desc.info.stencil.address == phased_stencil_address &&
               !read_only_depth.depth_write_enable &&
               !read_only_depth.stencil_clear_enable &&
               read_only_depth.stencil_test_enable &&
@@ -9152,16 +9215,14 @@ public:
           executor, scheduler.Current(), &no_color, 0, phased_depth);
       Require(
           name, "HTile final acquisition",
-          phased_depth.image_view != nullptr &&
+          phased_rendering.depth_stencil_attachment.image_view != nullptr &&
               phased_rendering.num_color_attachments == 0 &&
-              phased_rendering.depth_stencil_attachment.image_view ==
-                  phased_depth.image_view &&
               phased_rendering.depth_stencil_attachment.has_depth &&
               phased_depth.depth_meta_clear_enable &&
               phased_depth.depth_load_clear_enable &&
-              texture_cache.IsMeta(phased_depth.htile_buffer_vaddr) &&
+              texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
               !texture_cache.IsMetaCleared(
-                  phased_depth.htile_buffer_vaddr,
+                  phased_depth.desc.info.metadata.range.address,
                   phased_depth.desc.view_info.base_layer) &&
               texture_cache.GetImage(phased_depth.image_id).IsGpuModified() &&
               texture_cache.GetImage(phased_depth.image_id).usage.depth_target,
@@ -9198,22 +9259,18 @@ public:
           executor, 1, scheduler.Current(), depth_only);
       Require(
           name, "depth-only target with stale stencil state",
-          depth_only.image_id && depth_only.format == vk::Format::eD32Sfloat &&
-              depth_only.htile &&
+          depth_only.image_id && depth_only.desc.view_info.format == vk::Format::eD32Sfloat &&
+              (depth_only.desc.info.metadata.kind == ImageMetadataKind::Htile) &&
               depth_only.depth_test_enable && depth_only.depth_write_enable &&
               depth_only.depth_clear_enable &&
               !depth_only.stencil_test_enable &&
               !depth_only.stencil_clear_enable &&
-              depth_only.stencil_buffer_vaddr == 0 &&
-              depth_only.stencil_buffer_size == 0 &&
               depth_only.desc.info.stencil.Empty() &&
-              depth_only.htile_buffer_vaddr == depth_only_htile_address &&
               depth_only.desc.info.metadata.range.address ==
                   depth_only_htile_address &&
-              depth_only.depth_buffer_size != 0 &&
-              depth_only_address + depth_only.depth_buffer_size <=
+              depth_only.desc.info.data.size != 0 &&
+              depth_only_address + depth_only.desc.info.data.size <=
                   base + allocation_size &&
-              depth_only.vaddr_num == 1 &&
               depth_only.AttachmentWriteAspects() ==
                   vk::ImageAspectFlagBits::eDepth,
           "inactive stencil state changed a depth-only HTile attachment");
@@ -9308,7 +9365,7 @@ public:
       for (uint32_t pass = 0; pass < 2; ++pass) {
         Require(name, "bounds prior depth contents",
                 texture_cache.ClearImageFromBuffer(scheduler.Current(),
-                    depth_only.depth_buffer_vaddr, depth_only.depth_buffer_size,
+                    depth_only.desc.info.data.address, depth_only.desc.info.data.size,
                     std::bit_cast<uint32_t>(0.625f)),
                 "failed to seed depth before the deferred HTile clear");
         if (pass == 0) {
@@ -9325,8 +9382,8 @@ public:
             executor, scheduler.Current(), &no_color, 0, bounds_depth);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), bounds_bindings.vertex, *bounds_bindings.pixel));
-        const auto &vertex_depth = bounds_bindings.vertex.resources.images[0];
-        const auto &pixel_depth = bounds_bindings.pixel->resources.images[0];
+        const auto &vertex_depth = bounds_bindings.vertex.images[0];
+        const auto &pixel_depth = bounds_bindings.pixel->images[0];
         constexpr auto readonly_layout = vk::ImageLayout::eDepthReadOnlyOptimal;
         Require(name, "deferred clear with sampled read-only depth bounds",
                 bounds_depth.image_id == depth_only.image_id &&
@@ -9422,8 +9479,8 @@ public:
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
         const auto &shared_image = texture_cache.GetImage(shared_depth.image_id);
-        const auto &vertex_image = shared_bindings.vertex.resources.images[0];
-        const auto &pixel_image = shared_bindings.pixel->resources.images[0];
+        const auto &vertex_image = shared_bindings.vertex.images[0];
+        const auto &pixel_image = shared_bindings.pixel->images[0];
         Require(name, "sampled depth and stencil attachment layout",
                 shared_depth.image_id == phased_depth.image_id &&
                     vertex_image.image_id == shared_depth.image_id &&
@@ -9534,7 +9591,7 @@ public:
 
       auto array_binding = executor.PrepareBindings(array_runtime);
       executor.RebindImages(array_binding);
-      const auto expanded_array_id = array_binding.resources.images[0].image_id;
+      const auto expanded_array_id = array_binding.images[0].image_id;
       const auto &expanded_array = texture_cache.GetImage(expanded_array_id);
       Require(
           name, "2D target to array backing expansion",
@@ -9543,36 +9600,30 @@ public:
               expanded_array_id != array_target_id &&
               !TextureCacheTestAccess::Contains(texture_cache,
                                                 array_target_id) &&
-              array_binding.resources.images[0].image_view != nullptr &&
-              array_binding.resources.images[0].desc.info.type ==
+              array_binding.images[0].image_view != nullptr &&
+              array_binding.images[0].desc.info.type ==
                   Prospero::ImageType::kColor2D &&
-              array_binding.resources.images[0].desc.info.resources ==
+              array_binding.images[0].desc.info.resources ==
                   ImageSubresources{1, 2} &&
-              array_binding.resources.images[0].desc.view_info.type ==
+              array_binding.images[0].desc.view_info.type ==
                   vk::ImageViewType::e2DArray &&
-              array_binding.resources.images[0].desc.view_info.layer_count ==
+              array_binding.images[0].desc.view_info.layer_count ==
                   2 &&
               expanded_array.backing.layers == 2 &&
               expanded_array.IsGpuModified() && expanded_array.usage.texture,
           "raw array view did not expand and reuse the Color2D backing");
 
       RenderColorInfo rebound_array_target{};
-      rebound_array_target.type = RenderColorType::RenderTexture;
       rebound_array_target.desc = array_target;
       rebound_array_target.image_id = array_target_id;
-      rebound_array_target.format = array_target.view_info.format;
-      rebound_array_target.extent = {128, 128};
-      rebound_array_target.samples = 1;
       RenderDepthInfo no_array_depth{};
       auto array_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &rebound_array_target, 1,
           no_array_depth);
       Require(name, "expanded array target rebind",
               rebound_array_target.image_id == expanded_array_id &&
-                  rebound_array_target.image_view != nullptr &&
+                  array_rendering.color_attachments[0].image_view != nullptr &&
                   array_rendering.num_color_attachments == 1 &&
-                  array_rendering.color_attachments[0].image_view ==
-                      rebound_array_target.image_view &&
                   array_rendering.width == 128 &&
                   array_rendering.height == 128 &&
                   array_rendering.num_layers == 1 &&
@@ -9608,7 +9659,7 @@ public:
           executor.PrepareBindings(colliding_msaa_runtime);
       executor.RebindImages(colliding_msaa_binding);
       const auto &resolved_colliding_msaa =
-          colliding_msaa_binding.resources.images[0];
+          colliding_msaa_binding.images[0];
       Require(
           name, "equal-footprint sample-count identity",
           resolved_colliding_msaa.image_id != expanded_array_id &&
@@ -9665,7 +9716,7 @@ public:
       ShaderStageRuntime msaa_runtime{&msaa_program, std::move(msaa_snapshot)};
       auto msaa_binding = executor.PrepareBindings(msaa_runtime);
       executor.RebindImages(msaa_binding);
-      const auto &resolved_msaa = msaa_binding.resources.images[0];
+      const auto &resolved_msaa = msaa_binding.images[0];
       Require(
           name, "MSAA descriptor backing reuse",
           msaa_target_view != nullptr &&
@@ -9705,7 +9756,7 @@ public:
                                             std::move(msaa_array_snapshot)};
       auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
       executor.RebindImages(msaa_array_binding);
-      const auto &resolved_msaa_array = msaa_array_binding.resources.images[0];
+      const auto &resolved_msaa_array = msaa_array_binding.images[0];
       Require(name, "MSAA array backing expansion",
               resolved_msaa_array.image_id != msaa_target_id &&
                   resolved_msaa_array.image_view != nullptr &&
@@ -9760,19 +9811,19 @@ public:
               "depth prefetch performed final target acquisition");
 
       auto target_parent =
-          make_target_desc(base, target_mip_size * 2, {2, 2, 1});
+          make_target_desc(base, target_mip_size * 2, {4, 4, 1});
       target_parent.type = BindingType::RenderTarget;
       target_parent.info.resources.levels = 2;
-      target_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2};
-      target_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1,
-                                          1};
+      target_parent.info.mip_layout[0] = {0, target_mip_size, 4, 4};
+      target_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 2,
+                                          2};
       target_parent.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       auto target_base_subresource =
-          make_target_desc(base, target_mip_size, {2, 2, 1});
+          make_target_desc(base, target_mip_size, {4, 4, 1});
       const auto target_base_subresource_id =
           texture_cache.FindImage(target_base_subresource);
       auto target_subresource =
-          make_target_desc(base + target_mip_size, target_mip_size, {1, 1, 1});
+          make_target_desc(base + target_mip_size, target_mip_size, {2, 2, 1});
       const auto target_subresource_id =
           texture_cache.FindImage(target_subresource);
       const auto *target_subresource_owner =
@@ -9809,18 +9860,10 @@ public:
               "target overlap did not transfer target state to the merged "
               "owner");
       RenderColorInfo rebound_color{};
-      rebound_color.type = RenderColorType::RenderTexture;
       rebound_color.desc = target_subresource;
       rebound_color.image_id = target_subresource_id;
-      rebound_color.format = target_subresource.view_info.format;
-      rebound_color.extent = {1, 1};
-      rebound_color.samples = 1;
       RenderDepthInfo rebound_depth{};
       rebound_depth.desc = depth;
-      rebound_depth.format = depth.info.pixel_format;
-      rebound_depth.width = 1;
-      rebound_depth.height = 1;
-      rebound_depth.samples = 1;
       rebound_depth.image_id = depth_id;
       scheduler.Finish();
       Require(name, "deferred target slot erasure",
@@ -9829,18 +9872,20 @@ public:
               "the displaced target slot was not erased after GPU completion");
       auto rebound_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &rebound_color, 1, rebound_depth);
+      Require(name, "guest target extent after host mip remap",
+              rebound_color.desc.view_info.base_level == 1 &&
+                  rebound_color.guest_mip_level == 0 &&
+                  rebound_color.Extent() == vk::Extent2D{2, 2},
+              "remapping a guest target into its parent mip shrank the guest "
+              "render area twice");
       const auto stencil_proxy_id = texture_cache.FindImageFromRange(
           stencil_address, stencil_layout.size, false);
       Require(
           name, "production target rebind",
           rebound_color.image_id == target_parent_id &&
-              rebound_color.image_view != nullptr &&
-              rebound_depth.image_view != nullptr &&
+              rebound_rendering.color_attachments[0].image_view != nullptr &&
+              rebound_rendering.depth_stencil_attachment.image_view != nullptr &&
               rebound_rendering.num_color_attachments == 1 &&
-              rebound_rendering.color_attachments[0].image_view ==
-                  rebound_color.image_view &&
-              rebound_rendering.depth_stencil_attachment.image_view ==
-                  rebound_depth.image_view &&
               rebound_rendering.width == 1 && rebound_rendering.height == 1 &&
               texture_cache.GetImage(target_parent_id).binding.is_target &&
               texture_cache.GetImage(target_parent_id).usage.render_target &&
@@ -9878,29 +9923,17 @@ public:
       const auto ordered_depth_id = texture_cache.FindImage(ordered_depth_desc);
       RenderExecutorTestAccess::BindRenderTarget(executor, ordered_depth_id);
       RenderColorInfo ordered_color{};
-      ordered_color.type = RenderColorType::RenderTexture;
       ordered_color.desc = ordered_color_desc;
       ordered_color.image_id = stale_ordered_color;
-      ordered_color.format = ordered_color_desc.view_info.format;
-      ordered_color.extent = {1, 1};
-      ordered_color.samples = 1;
       RenderDepthInfo ordered_depth{};
       ordered_depth.desc = ordered_depth_desc;
-      ordered_depth.format = ordered_depth_desc.info.pixel_format;
-      ordered_depth.width = 1;
-      ordered_depth.height = 1;
-      ordered_depth.samples = 1;
       ordered_depth.image_id = ordered_depth_id;
       auto ordered_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &ordered_color, 1, ordered_depth);
       Require(name, "color-before-depth acquisition order",
               ordered_color.image_id != stale_ordered_color &&
-                  ordered_color.image_view != nullptr &&
-                  ordered_depth.image_view != nullptr &&
-                  ordered_rendering.color_attachments[0].image_view ==
-                      ordered_color.image_view &&
-                  ordered_rendering.depth_stencil_attachment.image_view ==
-                      ordered_depth.image_view &&
+                  ordered_rendering.color_attachments[0].image_view != nullptr &&
+                  ordered_rendering.depth_stencil_attachment.image_view != nullptr &&
                   texture_cache.GetImage(ordered_color.image_id).depth_id ==
                       ordered_depth.image_id,
               "depth acquisition ran before the stale color target was "
@@ -9937,11 +9970,11 @@ public:
       ShaderStageRuntime runtime{&program, std::move(snapshot)};
 
       auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
-      const auto sampled_stencil_id = prepared.resources.images[0].image_id;
+      const auto sampled_stencil_id = prepared.images[0].image_id;
       Require(name, "first stencil discovery",
-              prepared.resources.images.size() == 1 &&
+              prepared.images.size() == 1 &&
                   sampled_stencil_id != depth_id &&
-                  prepared.resources.images[0].image_view == nullptr &&
+                  prepared.images[0].image_view == nullptr &&
                   texture_cache.GetImage(sampled_stencil_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_target,
@@ -9950,14 +9983,13 @@ public:
 
       context.GetRenderExecutor().RebindImages(prepared);
       Require(name, "first stencil acquisition",
-              prepared.resources.images[0].image_id == sampled_stencil_id &&
-                  prepared.resources.images[0].image_view != nullptr &&
+              prepared.images[0].image_id == sampled_stencil_id &&
+                  prepared.images[0].image_view != nullptr &&
                   texture_cache.GetImage(sampled_stencil_id).usage.texture,
               "the first sampled-stencil image was not finally acquired");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       RenderDepthInfo reassociated_depth = rebound_depth;
-      reassociated_depth.image_view = nullptr;
       RenderColorInfo no_reassociated_color{};
       (void)RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &no_reassociated_color, 0,
@@ -9971,17 +10003,17 @@ public:
 
       auto redirected = context.GetRenderExecutor().PrepareBindings(runtime);
       Require(name, "redirected owner discovery",
-              redirected.resources.images.size() == 1 &&
-                  redirected.resources.images[0].image_id == depth_id &&
-                  redirected.resources.images[0].image_view == nullptr &&
+              redirected.images.size() == 1 &&
+                  redirected.images[0].image_id == depth_id &&
+                  redirected.images[0].image_view == nullptr &&
                   texture_cache.GetImage(depth_id).binding.is_bound &&
                   !texture_cache.GetImage(sampled_stencil_id).binding.is_bound,
               "the established stencil association did not redirect the next "
               "discovery to the depth owner");
       context.GetRenderExecutor().RebindImages(redirected);
       Require(name, "second-pass stencil acquisition",
-              redirected.resources.images[0].image_id == depth_id &&
-                  redirected.resources.images[0].image_view != nullptr &&
+              redirected.images[0].image_id == depth_id &&
+                  redirected.images[0].image_view != nullptr &&
                   texture_cache.GetImage(depth_id).usage.texture,
               "RebindImages did not acquire the associated depth owner");
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -25704,7 +25736,7 @@ void CheckStencilAttachmentAccess() {
 
 void CheckDepthAttachmentWrites() {
   RenderDepthInfo target{};
-  target.format = vk::Format::eD32SfloatS8Uint;
+  target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
   target.depth_write_enable = true;
   Require("DepthAttachmentWrites", "disabled depth test",
           !target.AttachmentWriteAspects(),
@@ -25756,7 +25788,7 @@ void CheckDepthAttachmentWrites() {
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
           "stencil attachment clear did not claim stencil");
 
-  target.format = vk::Format::eD32Sfloat;
+  target.desc.view_info.format = vk::Format::eD32Sfloat;
   Require("DepthAttachmentWrites", "missing stencil aspect",
           !target.AttachmentWriteAspects(),
           "depth-only format claimed a stencil write");
@@ -25804,7 +25836,7 @@ void CheckDynamicRenderingState() {
           "depth/stencil formats did not participate in pipeline identity");
 
   RenderDepthInfo attachment{};
-  attachment.format = vk::Format::eD32SfloatS8Uint;
+  attachment.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
   Require("DynamicRenderingState", "read-only depth/stencil layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,

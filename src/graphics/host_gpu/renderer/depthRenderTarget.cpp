@@ -203,8 +203,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 		DepthFatal("unsupported depth/stencil format pair");
 	}
 	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
-	r.format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
-	if (r.format == vk::Format::eUndefined) {
+	const auto format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
+	if (format == vk::Format::eUndefined) {
 		DepthFatal("no host depth/stencil format supports required usage for %s",
 		           VulkanToString(ideal_format).c_str());
 	}
@@ -234,16 +234,6 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	    (has_htile && !GuestRange {z.htile_data_base_addr, htile_backing_size}.Valid())) {
 		DepthFatal("layered depth backing range is invalid");
 	}
-	r.htile                   = has_htile;
-	r.width                   = width;
-	r.height                  = height;
-	r.samples                 = samples;
-	r.depth_buffer_size       = depth_backing_size;
-	r.depth_buffer_vaddr      = z.z_read_base_addr;
-	r.stencil_buffer_size     = has_stencil ? stencil_backing_size : 0;
-	r.stencil_buffer_vaddr    = has_stencil ? z.stencil_read_base_addr : 0;
-	r.htile_buffer_size       = has_htile ? htile_backing_size : 0;
-	r.htile_buffer_vaddr      = has_htile ? z.htile_data_base_addr : 0;
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_meta_clear_enable = false;
 	r.depth_load_clear_enable = r.depth_clear_enable;
@@ -294,18 +284,12 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 			r.stencil_dynamic_back = r.stencil_dynamic_front;
 		}
 	}
-	r.vaddr_num = has_stencil ? 2 : 1;
-	r.vaddr[0]  = r.depth_buffer_vaddr;
-	r.size[0]   = r.depth_buffer_size;
-	if (has_stencil) {
-		r.vaddr[1] = r.stencil_buffer_vaddr;
-		r.size[1]  = r.stencil_buffer_size;
-	}
 	TextureCache::ImageDesc desc {};
 	desc.type                 = TextureCache::BindingType::DepthTarget;
-	desc.info.data            = {r.depth_buffer_vaddr, r.depth_buffer_size};
-	desc.info.stencil         = {r.stencil_buffer_vaddr, r.stencil_buffer_size};
-	desc.info.pixel_format    = r.format;
+	desc.info.data            = {z.z_read_base_addr, depth_backing_size};
+	desc.info.stencil =
+	    has_stencil ? GuestRange {z.stencil_read_base_addr, stencil_backing_size} : GuestRange {};
+	desc.info.pixel_format    = format;
 	desc.info.guest_format    = guest_format;
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {width, height, 1};
@@ -314,15 +298,16 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	desc.info.bytes_per_block = bytes;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = Prospero::TileMode::kDepth;
-	desc.info.mip_layout[0]   = {0, r.depth_buffer_size, pitch, height};
-	desc.info.metadata.range  = {r.htile_buffer_vaddr, r.htile_buffer_size};
+	desc.info.mip_layout[0]   = {0, depth_backing_size, pitch, height};
+	desc.info.metadata.range =
+	    has_htile ? GuestRange {z.htile_data_base_addr, htile_backing_size} : GuestRange {};
 	desc.info.metadata.kind   = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;
 	desc.info.metadata.stencil_compressed =
 	    has_stencil && has_htile && !z.stencil_info.htile_stencil_disabled;
-	desc.view_info.format = r.format;
+	desc.view_info.format = format;
 	desc.view_info.type =
 	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
-	desc.view_info.aspect      = ImageViewOps::DepthAspectMask(r.format);
+	desc.view_info.aspect      = ImageViewOps::DepthAspectMask(format);
 	desc.view_info.base_level  = 0;
 	desc.view_info.level_count = 1;
 	desc.view_info.base_layer  = view.base_layer;
@@ -331,11 +316,11 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	r.desc                     = std::move(desc);
 	auto& cache                = m_context.GetTextureCache();
 	r.image_id                 = cache.FindImage(r.desc);
-	r.image_view               = nullptr;
 	BindRenderTarget(r.image_id);
 }
 
 vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
+	const auto format = desc.view_info.format;
 	if (format == vk::Format::eUndefined) {
 		return {};
 	}

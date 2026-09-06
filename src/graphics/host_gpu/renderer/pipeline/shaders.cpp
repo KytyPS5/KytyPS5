@@ -419,13 +419,15 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(
-    GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
+    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
-    const ShaderVertexInputInfo& vs_input_info, vk::ShaderModule vertex_module,
-    const ShaderPixelInputInfo* ps_input_info, vk::ShaderModule pixel_module,
+    const ShaderVertexInputInfo& vs_input_info, const ShaderProgram& vertex_program,
+    const ShaderPixelInputInfo* ps_input_info, const ShaderProgram& pixel_program,
     const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache) {
 	const bool ps_active = ps_input_info != nullptr;
-	EXIT_IF(vertex_module == nullptr || (ps_active && pixel_module == nullptr));
+	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
+	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
+	                        rendering.stencil_format != vk::Format::eUndefined;
 	EXIT_IF(!vs_input_info.stage);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
@@ -468,12 +470,12 @@ void CreatePipelineInternal(
 
 	vk::PipelineShaderStageCreateInfo vert_shader_stage_info {};
 	vert_shader_stage_info.stage  = vertex_stage;
-	vert_shader_stage_info.module = vertex_module;
+	vert_shader_stage_info.module = vertex_program.module;
 	vert_shader_stage_info.pName  = "main";
 
 	vk::PipelineShaderStageCreateInfo frag_shader_stage_info {};
 	frag_shader_stage_info.stage  = vk::ShaderStageFlagBits::eFragment;
-	frag_shader_stage_info.module = pixel_module;
+	frag_shader_stage_info.module = pixel_program.module;
 	frag_shader_stage_info.pName  = "main";
 
 	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
@@ -605,7 +607,7 @@ void CreatePipelineInternal(
 	multisampling.minSampleShading     = 1.0f;
 
 	vk::PipelineColorBlendAttachmentState color_blend_attachment[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t i = 0; i < static_params.color_count; i++) {
+	for (uint32_t i = 0; i < rendering.color_count; i++) {
 		EXIT_NOT_IMPLEMENTED((static_params.color_mask[i] & ~0x0fu) != 0);
 		color_blend_attachment[i].colorWriteMask =
 		    vk::ColorComponentFlags {static_params.color_mask[i]};
@@ -629,12 +631,12 @@ void CreatePipelineInternal(
 	}
 
 	vk::Bool32 color_write_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t i = 0; i < static_params.color_count; i++) {
+	for (uint32_t i = 0; i < rendering.color_count; i++) {
 		color_write_enable[i] = VK_TRUE;
 	}
 
 	vk::PipelineColorWriteCreateInfoEXT color_write {};
-	color_write.attachmentCount    = static_params.color_count;
+	color_write.attachmentCount    = rendering.color_count;
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
@@ -644,7 +646,7 @@ void CreatePipelineInternal(
 	color_blending.pNext = &color_write;
 #endif
 	color_blending.logicOp         = vk::LogicOp::eCopy;
-	color_blending.attachmentCount = static_params.color_count;
+	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
@@ -670,7 +672,7 @@ void CreatePipelineInternal(
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
 		     " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     pipeline.vs_shader_id, pipeline.ps_shader_id, 1u);
+		     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
 	}
 	result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                              &pipeline.pipeline_layout);
@@ -722,7 +724,7 @@ void CreatePipelineInternal(
 	auto dynamic_states_count =
 	    static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
 #if !defined(__APPLE__)
-	if (static_params.color_count == 0) {
+	if (rendering.color_count == 0) {
 		dynamic_states_count--;
 	}
 #endif
@@ -748,8 +750,7 @@ void CreatePipelineInternal(
 	pipeline_info.pViewportState          = &viewport_state;
 	pipeline_info.pRasterizationState     = &rasterizer;
 	pipeline_info.pMultisampleState       = &multisampling;
-	pipeline_info.pDepthStencilState      =
-	    (static_params.with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pDepthStencilState      = (with_depth ? &depth_stencil_info : nullptr);
 	pipeline_info.pColorBlendState        = &color_blending;
 	pipeline_info.pDynamicState           = &dynamic_state;
 	pipeline_info.layout                  = pipeline.pipeline_layout;
@@ -761,10 +762,10 @@ void CreatePipelineInternal(
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
-		     pipeline.vs_shader_id, pipeline.ps_shader_id,
+		     vertex_program.id, ps_active ? pixel_program.id : 0,
 		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
-		     (static_params.with_depth ? "true" : "false"),
-		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count);
+		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
+		     dynamic_states_count);
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
@@ -785,9 +786,9 @@ void CreatePipelineInternal(
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-	vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};

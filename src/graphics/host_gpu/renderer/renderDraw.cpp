@@ -109,12 +109,8 @@ static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::Po
 	return std::ldexp(guest_factor, host_depth_bits + offset.neg_num_db_bits);
 }
 
-static const char* RenderColorTypeName(RenderColorType type) {
-	switch (type) {
-		case RenderColorType::NoColorOutput: return "NoColorOutput";
-		case RenderColorType::RenderTexture: return "RenderTexture";
-		default: return "Unknown";
-	}
+static const char* RenderColorTypeName(const RenderColorInfo& color) {
+	return color.image_id ? "RenderTexture" : "NoColorOutput";
 }
 
 static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color,
@@ -135,10 +131,12 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 	    "DrawFramebufferSkip[%u]: %s color=%s color_addr=0x%010" PRIx64 " color_size=0x%016" PRIx64
 	    " color_image=%s depth_format=%s depth_image=%s depth_vaddr_num=%d target_mask=0x%08" PRIx32
 	    " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
-	    log_id, draw_name, RenderColorTypeName(color.type), color.base_addr, color.buffer_size,
-	    color.image_id ? "yes" : "no", VulkanToString(depth.format).c_str(),
-	    depth.image_id ? "yes" : "no", depth.vaddr_num, ctx.GetRenderTargetMask(),
-	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
+	    log_id, draw_name, RenderColorTypeName(color), color.desc.info.data.address,
+	    color.desc.info.data.size, color.image_id ? "yes" : "no",
+	    VulkanToString(depth.desc.view_info.format).c_str(), depth.image_id ? "yes" : "no",
+	    static_cast<int>(!depth.desc.info.data.Empty()) +
+	        static_cast<int>(depth.desc.info.HasStencil()),
+	    ctx.GetRenderTargetMask(), static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
 }
 
 static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
@@ -191,7 +189,7 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
                                uint32_t flags) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
-	if (color.type == RenderColorType::NoColorOutput) {
+	if (!color.image_id) {
 		return;
 	}
 
@@ -211,8 +209,8 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 	    });
 
-	vk::Extent2D extent = color.image_id ? color.extent : vk::Extent2D {};
-	auto         sc     = calc_final_scissor(vp, ctx.GetScanModeControl(), extent);
+	const auto extent = color.Extent();
+	const auto sc     = calc_final_scissor(vp, ctx.GetScanModeControl(), extent);
 
 	LOGF(
 	    "DrawTargetState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64
@@ -221,13 +219,12 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
 	    "scissor=(%d,%d)-(%d,%d)\n",
-	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name,
-	    RenderColorTypeName(color.type), color.base_addr, extent.width, extent.height,
+	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
+	    color.desc.info.data.address, extent.width, extent.height,
 	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
-	    color.color_clear_enable ? "true" : "false", color.color_clear_value.float32[0],
-	    color.color_clear_value.float32[1], color.color_clear_value.float32[2],
-	    color.color_clear_value.float32[3], cc.mode, cc.op, bc.enable ? "true" : "false",
-	    bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
+	    "false", color.color_clear_value.float32[0], color.color_clear_value.float32[1],
+	    color.color_clear_value.float32[2], color.color_clear_value.float32[3], cc.mode, cc.op,
+	    bc.enable ? "true" : "false", bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
 	    static_cast<int>(ps_resources.images.size()), static_cast<int>(sampled_images),
 	    static_cast<int>(ps_resources.images.size() - sampled_images),
 	    ps_input_info.ps_pixel_kill_enable ? "true" : "false", ps_input_info.target_output_mode[0],
@@ -251,9 +248,10 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	LOGF("DrawInputState[%u]: frame=%d target=%s addr=0x%010" PRIx64
 	     " index_type=%u index_count=%u index_addr=0x%016" PRIx64
 	     " vs_resources=%d vs_buffers=%d\n",
-	     log_id, buffer.GetContext().GetGpu().GetFrameNum(), RenderColorTypeName(color.type),
-	     color.base_addr, index_type_and_size, index_count, reinterpret_cast<uint64_t>(index_addr),
-	     vs_input_info.resources_num, vs_input_info.buffers_num);
+	     log_id, buffer.GetContext().GetGpu().GetFrameNum(), RenderColorTypeName(color),
+	     color.desc.info.data.address, index_type_and_size, index_count,
+	     reinterpret_cast<uint64_t>(index_addr), vs_input_info.resources_num,
+	     vs_input_info.buffers_num);
 
 	for (int bi = 0; bi < vs_input_info.buffers_num; bi++) {
 		const auto& b = vs_input_info.buffers[bi];
@@ -328,9 +326,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const auto&  vp = ctx.GetScreenViewport();
 	vk::Extent2D framebuffer_extent {};
 	if (color_count > 0 && colors[0].image_id) {
-		framebuffer_extent = colors[0].extent;
+		framebuffer_extent = colors[0].Extent();
 	} else if (depth.image_id) {
-		framebuffer_extent = {depth.width, depth.height};
+		framebuffer_extent = {depth.desc.info.extent.width, depth.desc.info.extent.height};
 	} else {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
@@ -392,8 +390,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
 		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
-		const float constant_factor =
-		    ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset, depth.format);
+		const float constant_factor = ConvertPolygonOffsetConstantFactor(
+		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
@@ -449,7 +447,6 @@ struct DrawRenderState {
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	uint32_t              color_count                              = 0;
 	bool                  ps_active                                = true;
-	RenderState           rendering;
 	ShaderVertexInputInfo vs_input_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
@@ -549,23 +546,23 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			target.image_id = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
 		}
-		target.image_view = cache.FindRenderTarget(target.image_id, target.desc);
-		auto& image       = cache.GetImage(target.image_id);
+		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
+		auto&      image      = cache.GetImage(target.image_id);
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     target.target_slot, image.info.data.address, image.info.data.size,
 		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, target.image_view,
+		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
 		                     "Kyty.MRT{}.View[guest=0x{:016x} mip={} layer={}+{}]",
 		                     target.target_slot, image.info.data.address,
 		                     target.desc.view_info.base_level, target.desc.view_info.base_layer,
 		                     target.desc.view_info.layer_count);
-		EXIT_IF(image.backing.samples != target.samples || target.image_view == nullptr);
+		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		if (attachment_samples == 0) {
-			attachment_samples = target.samples;
-		} else if (attachment_samples != target.samples) {
+			attachment_samples = target.desc.info.samples;
+		} else if (attachment_samples != target.desc.info.samples) {
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, target.samples);
+			     attachment_samples, target.desc.info.samples);
 		}
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
@@ -577,11 +574,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width             = std::min(state.width, target.extent.width);
-		state.height            = std::min(state.height, target.extent.height);
+		const auto extent       = target.Extent();
+		state.width             = std::min(state.width, extent.width);
+		state.height            = std::min(state.height, extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		auto& attachment        = state.color_attachments[i];
-		attachment.image_view   = target.image_view;
+		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
 		attachment.clear_value  = target.color_clear_value.uint32;
 		vk::ClearColorValue metadata_clear_value {};
@@ -590,23 +588,25 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (metadata_clear) {
 			attachment.clear_value = metadata_clear_value.uint32;
 		}
-		attachment.is_clear = target.color_clear_enable || metadata_clear;
+		attachment.is_clear = metadata_clear;
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
-		depth.image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
-		if (depth.htile && depth.depth_clear_enable && !cache.ClearMeta(depth.htile_buffer_vaddr)) {
+		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		const auto& metadata   = depth.desc.info.metadata;
+		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
+		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
 		depth.depth_meta_clear_enable =
-		    depth.htile &&
-		    cache.IsMetaCleared(depth.htile_buffer_vaddr, depth.desc.view_info.base_layer);
+		    metadata.kind == ImageMetadataKind::Htile &&
+		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
 		if (depth.depth_meta_clear_enable &&
-		    !cache.TouchMeta(depth.htile_buffer_vaddr, depth.desc.view_info.base_layer, false)) {
+		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
@@ -614,16 +614,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     image.info.data.address, image.info.data.size,
 		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, depth.image_view,
+		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
 		                     "Kyty.DepthTarget.View[guest=0x{:016x} layer={}+{}]",
 		                     image.info.data.address, depth.desc.view_info.base_layer,
 		                     depth.desc.view_info.layer_count);
-		EXIT_IF(depth.image_view == nullptr || image.backing.samples != depth.samples);
+		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
 		if (attachment_samples == 0) {
-			attachment_samples = depth.samples;
-		} else if (attachment_samples != depth.samples) {
+			attachment_samples = depth.desc.info.samples;
+		} else if (attachment_samples != depth.desc.info.samples) {
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.samples);
+			     depth.desc.info.samples);
 		}
 		const auto layout = depth_attachment_layout(depth);
 		// The attachment store writes even when guest depth/stencil tests do not.
@@ -636,12 +636,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.width);
-		state.height              = std::min(state.height, depth.height);
+		state.width               = std::min(state.width, depth.desc.info.extent.width);
+		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
-		const auto aspects        = ImageViewOps::DepthAspectMask(depth.format);
+		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
-		attachment.image_view     = depth.image_view;
+		attachment.image_view     = image_view;
 		attachment.image_layout   = layout;
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
@@ -705,7 +705,6 @@ struct DrawEmitInfo {
 };
 
 struct DrawIndexBufferSource {
-	bool          enabled   = false;
 	uint64_t      address   = 0;
 	const void*   host_data = nullptr;
 	uint64_t      size      = 0;
@@ -715,7 +714,6 @@ struct DrawIndexBufferSource {
 
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
-	uint64_t       size   = 0;
 	vk::DeviceSize offset = 0;
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
@@ -849,8 +847,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 
 static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
                               uint32_t phase) {
-	EXIT_IF(draw.name == nullptr);
-
 	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count, 0,
 	                    draw.instance_count, draw.first_instance);
 }
@@ -935,7 +931,6 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
                                             const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
                                             bool log_setup_phases, DrawRenderState& state) {
-	EXIT_IF(draw.name == nullptr);
 	auto& ctx = buffer.GetRegisters();
 
 	if (ResolveColorTargets(submit_id, buffer, render_target_slice_offset)) {
@@ -960,9 +955,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
 
 	state.ps_active       = DrawHasActivePixelShader(buffer);
-	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
-	                         static_cast<bool>(state.depth_info.image_id));
-	if (state.color_count == 0 && !with_depth && !state.ps_active) {
+	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.name, state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
 		return false;
@@ -973,7 +966,6 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
-	EXIT_IF(draw.name == nullptr);
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1000,11 +992,9 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
 	PreparedIndexBuffer prepared;
-	if (!source.enabled) {
+	if (source.size == 0) {
 		return prepared;
 	}
-	EXIT_IF(source.size == 0);
-	prepared.size = source.size;
 	prepared.type = source.type;
 	if (source.host_data != nullptr) {
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
@@ -1040,10 +1030,9 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 }
 
 static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
-	if (prepared.size == 0) {
+	if (prepared.buffer == nullptr) {
 		return;
 	}
-	EXIT_IF(prepared.buffer == nullptr);
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
@@ -1051,8 +1040,6 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
                                  const DrawRenderState& state, bool always_log,
                                  bool force_legacy_rect_log, uint32_t index_type_and_size,
                                  const void* index_addr) {
-	EXIT_IF(draw.name == nullptr);
-
 	if (!graphics_debug_dump_enabled()) {
 		return;
 	}
@@ -1067,14 +1054,11 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	}
 	LogDrawInputState(buffer, state.color_info[0], state.vs_input_info, index_type_and_size,
 	                  draw.index_count, index_addr);
-	// LogDrawTextureState(draw.name, state.color_info[0], state.ps_input_info);
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
                                const DrawEmitInfo& emit) {
-	EXIT_IF(draw.name == nullptr);
-
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1121,7 +1105,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug) {
-	EXIT_IF(draw.name == nullptr);
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
@@ -1163,7 +1146,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	state.rendering =
+	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
 
 	if (log_pipeline_phase) {
@@ -1222,7 +1205,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	m_context.GetCommandScheduler().BeginRendering(state.rendering);
+	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
@@ -1345,7 +1328,6 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	DrawIndexBufferSource index_source {};
-	index_source.enabled = true;
 	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
 	index_source.host_data =
 	    expanded_indices.empty() ? nullptr : static_cast<const void*>(expanded_indices.data());
@@ -1496,12 +1478,12 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	RenderColorInfo dst {};
 	ResolveRenderColorTarget(submit_id, buffer, src, render_target_slice_offset, 0, true, true);
 	ResolveRenderColorTarget(submit_id, buffer, dst, render_target_slice_offset, 1, true, true);
-	if (!src.image_id || !dst.image_id || src.type == RenderColorType::NoColorOutput ||
-	    dst.type == RenderColorType::NoColorOutput) {
+	if (!src.image_id || !dst.image_id) {
 		return false;
 	}
-	if (src.base_addr == dst.base_addr && src.base_mip_level == dst.base_mip_level &&
-	    src.base_array_layer == dst.base_array_layer) {
+	if (src.desc.info.data.address == dst.desc.info.data.address &&
+	    src.guest_mip_level == dst.guest_mip_level &&
+	    src.guest_array_layer == dst.guest_array_layer) {
 		return true;
 	}
 
@@ -1509,8 +1491,8 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
-	destination.Resolve(source, {src.base_mip_level, 1, src.base_array_layer, 1},
-	                    {dst.base_mip_level, 1, dst.base_array_layer, 1});
+	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
+	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;
 }
 

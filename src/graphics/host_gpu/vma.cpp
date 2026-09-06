@@ -165,7 +165,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	VmaAllocationInfo allocation_result {};
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto       result       = static_cast<vk::Result>(
+	const auto        result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &memory.allocation, &allocation_result));
 	image.image = native_image;
@@ -175,7 +175,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	}
 
 	device.getImageMemoryRequirements(image.image, &memory.requirements);
-	memory.type      = allocation_result.memoryType;
+	memory.type = allocation_result.memoryType;
 	VulkanTrackAllocation(memory);
 	return true;
 }

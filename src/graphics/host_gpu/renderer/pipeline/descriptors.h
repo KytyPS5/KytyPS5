@@ -20,12 +20,6 @@ namespace ShaderRecompiler::IR {
 struct ResourceSnapshot;
 }
 
-struct BufferView {
-	vk::Buffer     buffer = nullptr;
-	vk::DeviceSize offset = 0;
-	vk::DeviceSize range  = VK_WHOLE_SIZE;
-};
-
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
@@ -34,21 +28,25 @@ struct TextureBinding {
 	std::vector<vk::ImageView> mip_views;
 };
 
-struct NativeDescriptors {
-	std::vector<BufferView>     buffers;
-	std::vector<TextureBinding> images;
-	std::vector<vk::Sampler>    samplers;
-	BufferView                  gds;
-	BufferView                  flattened_srt;
-	BufferView                  shader_data;
-};
-
 struct PreparedBindings {
+	struct BufferSource {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		BufferId id;
+	};
+
 	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
-	NativeDescriptors                             resources;
-	std::vector<std::pair<ShaderBufferResource, BufferId>> buffer_sources;
-	std::vector<uint32_t>                         shader_data;
+	// Keep the resolved guest range through cache preparation; only the host buffer ID may
+	// become stale and need resolving again when bindings are rebound.
+	std::vector<BufferSource>             buffer_sources;
+	std::vector<vk::DescriptorBufferInfo> buffers;
+	std::vector<TextureBinding>           images;
+	std::vector<vk::Sampler>              samplers;
+	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
+	vk::DescriptorBufferInfo              flattened_srt;
+	vk::DescriptorBufferInfo              shader_data_buffer;
+	std::vector<uint32_t>                 shader_data;
 };
 
 [[nodiscard]] vk::DescriptorType

@@ -1136,11 +1136,22 @@ void TestNativeShaderResourceDependencies() {
       .info = program.info,
       .bindings = program.bindings,
   };
-  const auto writes = CollectShaderBufferWrites(compiled, resources);
-  Check(writes ==
-            std::vector<ShaderBufferWriteRange>({{0x1000, 48}, {0x2000, 64}}),
-        "graphics/compute write collector lost or invented a storage-buffer "
-        "range");
+  ShaderStageRuntime runtime{.program = &compiled, .resources = resources};
+  Check(HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate lost nonempty written buffers");
+  set_buffer(0, 0, 16, 3);
+  set_buffer(2, 0x2000, 0, 0);
+  runtime.resources = resources;
+  Check(!HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate included null, empty, or read-only buffers");
+  set_buffer(2, 0x2000, 0, 64);
+  runtime.resources = resources;
+  Check(HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate lost a byte-addressed buffer");
+  set_buffer(2, 0x2000, 0x3FFF, UINT32_MAX);
+  runtime.resources = resources;
+  Check(HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate lost a maximum-size strided buffer");
 
   VulkanBuffer buffer;
   buffer.buffer = reinterpret_cast<vk::Buffer::CType>(uintptr_t{1});

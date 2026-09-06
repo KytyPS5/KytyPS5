@@ -148,14 +148,10 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
-	m_registers   = &registers;
-	m_user_config = &user_config;
-	m_shaders     = &shaders;
+	m_command.Bind(registers, user_config, shaders);
 
 	if (m_command.IsInvalid()) {
 		BeginNext();
-	} else {
-		BindCurrent();
 	}
 }
 
@@ -346,11 +342,6 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
-void CommandScheduler::BindCurrent() {
-	EXIT_IF(m_registers == nullptr || m_user_config == nullptr || m_shaders == nullptr);
-	m_command.Bind(*m_registers, *m_user_config, *m_shaders);
-}
-
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
@@ -407,8 +398,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::BeginNext() {
-	EXIT_IF(!m_command.IsInvalid());
-	BindCurrent();
+	CheckActive();
 	BeginCommand();
 }
 

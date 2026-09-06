@@ -75,8 +75,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		mask = 0x0f;
 	}
 
-	r.target_slot    = rt_slot;
-	r.export_mapping = {};
+	r             = {};
+	r.target_slot = rt_slot;
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
@@ -91,23 +91,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 			}
 		}
 
-		// No color output
-		r.type                           = RenderColorType::NoColorOutput;
-		r.desc                           = {};
-		r.base_addr                      = 0;
-		r.image_id                       = {};
-		r.image_view                     = nullptr;
-		r.format                         = vk::Format::eUndefined;
-		r.extent                         = {};
-		r.base_mip_level                 = 0;
-		r.base_array_layer               = 0;
-		r.buffer_size                    = 0;
-		r.samples                        = 1;
-		r.export_mapping                 = {};
-		r.color_clear_enable             = false;
-		r.metadata_clear_supported       = false;
-		r.metadata_fixed_clear_supported = false;
-		r.color_clear_value              = {};
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
@@ -158,7 +141,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
 			     render_target_slice_offset);
 	}
-	r.base_array_layer = view.base_layer;
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic_uint log_count = 0;
 		const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
@@ -179,9 +161,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	// Nonlinear clear values are still stored as normalized components.
 	// Fast color clears are metadata driven and must be handled explicitly when
 	// that metadata path is implemented; render-pass load must preserve contents.
-	r.color_clear_enable = false;
-	r.color_clear_value  = {};
-
 	uint32_t   width  = 0;
 	uint32_t   height = 0;
 	uint32_t   pitch  = 0;
@@ -246,9 +225,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
 	if (tile) {
-		if (volume) {
-			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
-		} else if (texture_tile) {
+		if (volume || texture_tile) {
 			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 		} else {
 			pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
@@ -397,17 +374,10 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.desc                     = std::move(desc);
+	r.guest_mip_level          = rt.view.current_mip_level;
+	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
-	r.type                     = RenderColorType::RenderTexture;
-	r.base_addr                = rt.base.addr;
-	r.image_view               = nullptr;
-	r.format                   = r.desc.view_info.format;
-	r.extent                   = view_extent;
-	r.base_mip_level           = rt.view.current_mip_level;
-	r.buffer_size              = backing_size;
-	r.samples                  = samples;
 	r.export_mapping           = target_format.export_mapping;
-	r.color_clear_enable       = false;
 	ResolveDccClearInfo(r, target_format.format, has_dcc, rt.clear_word0.word0);
 	BindRenderTarget(r.image_id);
 }

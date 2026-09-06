@@ -287,6 +287,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
 				}
+				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicIAdd64 ||
+				    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+					if (program.stage != ShaderType::Compute || kind != IR::ResourceKind::Lds) {
+						Fail(program, "64-bit shared atomics require compute LDS storage");
+					}
+					requirements.shared_int64_atomics = true;
+				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
 					requirements.subgroup_ballot              = true;

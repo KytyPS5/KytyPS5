@@ -584,6 +584,11 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	return observed;
 }
 
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	return AtomicUpdateTyped(state, pointer, kind, TypeU32(state), std::forward<Fn>(desired));
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_INTERNAL_H_ */

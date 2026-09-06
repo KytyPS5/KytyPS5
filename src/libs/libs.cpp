@@ -77,6 +77,10 @@ LIB_DEFINE(InitVideoOutVrrStatus_1);
 } // namespace VrrStatus
 } // namespace LibGen5
 
+namespace LibVideoOutVrrStatus {
+LIB_DEFINE(InitVideoOutVrrStatus_1);
+} // namespace LibVideoOutVrrStatus
+
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAudio_1);
 LIB_DEFINE(InitConvertKeycode_1);

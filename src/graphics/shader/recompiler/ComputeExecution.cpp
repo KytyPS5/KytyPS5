@@ -161,21 +161,22 @@ bool HasGuestBarrier(const IR::Program& program) {
 	return false;
 }
 
-bool IsCooperativeLdsIntegerAtomic(O op) {
+bool IsSupportedLdsIntegerAtomic(O op) {
 	switch (op) {
 		case O::SharedAtomicSwap32: case O::SharedAtomicIAdd32: case O::SharedAtomicISub32:
 		case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
 		case O::SharedAtomicSMax32: case O::SharedAtomicUMax32:
 		case O::SharedAtomicAnd32: case O::SharedAtomicOr32: case O::SharedAtomicXor32:
+		case O::SharedAtomicIAdd64: case O::SharedAtomicOr64:
 			return true;
 		default: return false;
 	}
 }
 
-// The first cooperative mode accepts an ordered, acyclic sequence of guest
-// workgroup barriers. AMD permits additional programs, including early wave
-// termination; reject those unproved barrier layouts rather than reinterpret
-// them. The scheduler keeps finished host invocations alive until the group ends.
+// Cooperative mode accepts one ordered, acyclic chain of guest workgroup
+// barriers. RDNA2 permits waves to terminate before or between barriers; those
+// paths need not pass every phase. The scheduler keeps their host invocations
+// alive until the group ends while each barrier waits only for surviving waves.
 std::string ProveCooperativeBarrierOrder(const IR::Program& program) {
 	const auto count = program.blocks.size();
 	if (count == 0 || count != program.block_info.size())
@@ -250,18 +251,17 @@ std::string ProveCooperativeBarrierOrder(const IR::Program& program) {
 	for (const auto barrier : barrier_blocks) {
 		if (cyclic.contains(program.blocks[barrier]))
 			return "cooperative wave64 does not support cyclic guest barriers";
-		const auto bypass = reachable_without(barrier);
-		if (std::ranges::any_of(exits, [&](size_t exit) { return bypass[exit]; }))
-			return "cooperative wave64 requires ordered guest barriers before every exit";
 	}
-	// Dominators of the same reachable exit form a chain. Several sites in
-	// one acyclic block have the explicit instruction order within that block.
+	// A guest barrier rendezvous is identified by its dynamic occurrence, not
+	// by one static instruction address. Different waves may therefore wait at
+	// incomparable acyclic barrier sites before continuing from their own site.
 	return {};
 }
 
 std::string ProveSplitWaveConvergence(const IR::Program& program, bool partitions_guest_workgroup,
-                                     bool cooperative = false) {
-	if (program.dispatcher_fallback) return "wave64 splitting requires structured control flow";
+                                     bool cooperative,
+                                     bool* synchronize_split_wave_memory) {
+	if (synchronize_split_wave_memory != nullptr) *synchronize_split_wave_memory = false;
 	if (program.blocks.size() != program.block_info.size())
 		return "wave64 splitting requires complete branch metadata";
 	// GDS support is restricted to one logical wave reserving an append range.
@@ -289,10 +289,31 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			return "wave64 splitting does not support guest shared or scratch memory";
 	}
 	const auto cyclic = CyclicBlocks(program);
+	const auto can_reach_cycle = [&](const IR::Block* origin) {
+		std::vector<const IR::Block*> pending{origin};
+		std::unordered_set<const IR::Block*> visited{origin};
+		for (size_t cursor = 0; cursor < pending.size(); ++cursor) {
+			if (cyclic.contains(pending[cursor])) return true;
+			for (const auto* successor : pending[cursor]->ImmSuccessors()) {
+				if (visited.insert(successor).second) pending.push_back(successor);
+			}
+		}
+		return false;
+	};
+	bool image_write_reaches_cycle = false;
+	for (const auto* block : program.blocks) for (const auto& inst : *block) {
+		if (IR::ImageOpcodeInfoOf(inst.GetOpcode()).access == IR::ImageAccess::Write &&
+		    can_reach_cycle(block)) {
+			image_write_reaches_cycle = true;
+			break;
+		}
+	}
 	std::vector<const IR::Inst*> cyclic_reads;
+	std::vector<const IR::Inst*> cyclic_writes;
 	std::vector<const IR::Inst*> cyclic_appends;
-	bool has_cyclic_write = false;
 	bool unproved_cooperative_publication = false;
+	O unproved_cooperative_operation = O::Void;
+	bool unproved_cooperative_operation_is_cyclic = false;
 	std::unordered_set<const IR::Inst*> instructions;
 	std::function<void(IR::Value)> collect = [&](IR::Value value) {
 		const auto* inst = value.TryInstruction();
@@ -303,15 +324,17 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		for (const auto& inst : *block) {
 			collect(IR::Value(const_cast<IR::Inst*>(&inst)));
 			const auto op = inst.GetOpcode();
-			if (!IsSupportedSplitOperation(op) && !(cooperative && IsCooperativeLdsIntegerAtomic(op)))
+			if (!IsSupportedSplitOperation(op) && !IsSupportedLdsIntegerAtomic(op))
 				return "wave64 splitting does not support operation " + std::string(IR::ValueOpcodeName(op));
-			if (cooperative && IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) {
+			if (IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) {
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				const auto expected_dwords =
+				    op == O::SharedAtomicIAdd64 || op == O::SharedAtomicOr64 ? 2u : 1u;
 				if (index >= program.memory_info.size() ||
 				    program.memory_info[index].kind != IR::ResourceKind::Lds ||
 				    program.memory_info[index].data_bits != 32u ||
-				    program.memory_info[index].data_dwords != 1u)
-					return "cooperative wave64 requires DWORD LDS integer atomic metadata";
+				    program.memory_info[index].data_dwords != expected_dwords)
+					return "wave64 splitting requires matching LDS integer atomic metadata";
 			}
 			if (op == O::DppMoveU32) {
 				const auto flags = inst.Flags<IR::DppMoveFlags>();
@@ -331,13 +354,29 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				// The cooperative scheduler publishes SSBO writes between quanta.
 				// An image payload may be outside the polling SCC, so checking only
 				// cyclic image writes would miss publication through a buffer flag.
-				unproved_cooperative_publication |= image_access == IR::ImageAccess::Write ||
+				// A terminal image output cannot feed any scheduler cycle and needs no
+				// cross-quantum publication. Writes that can reach a loop retain the
+				// conservative image-memory boundary.
+				const bool unsupported_publication =
+				    (image_access == IR::ImageAccess::Write && can_reach_cycle(block)) ||
 				    image_access == IR::ImageAccess::Atomic || buffer_access == IR::BufferAccess::Atomic ||
 				    IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None;
-				// Physical pointers do not inherit the SSBO's Coherent decoration,
-				// and scalar reads retain their own guest cache protocol.
-				unproved_cooperative_publication |= cyclic.contains(block) && IsGuestRead(op) &&
-				    (buffer_access != IR::BufferAccess::Read || op == O::ReadConstBuffer);
+				// Physical pointers do not inherit the SSBO's Coherent decoration.
+				// Scalar reads are emitted through the cooperative wave broadcast and
+				// the scheduler's AcquireRelease UniformMemory rendezvous. Read-only
+				// image payloads also need no publication when every image write is
+				// terminal with respect to all scheduler cycles.
+				const bool read_only_image = image_access == IR::ImageAccess::Read &&
+				                             !image_write_reaches_cycle;
+				const bool unsupported_cyclic_read = cyclic.contains(block) && IsGuestRead(op) &&
+				    buffer_access != IR::BufferAccess::Read && op != O::ReadConstBuffer &&
+				    !read_only_image;
+				if (unsupported_publication ||
+				    (unsupported_cyclic_read && !unproved_cooperative_publication)) {
+					unproved_cooperative_operation = op;
+					unproved_cooperative_operation_is_cyclic = cyclic.contains(block);
+				}
+				unproved_cooperative_publication |= unsupported_publication || unsupported_cyclic_read;
 			}
 			if ((op == O::Barrier && partitions_guest_workgroup) ||
 			    op == O::DataConsume ||
@@ -352,11 +391,14 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			}
 			if (cyclic.contains(block)) {
 				if (!planning_only && IsGuestRead(op)) cyclic_reads.push_back(&inst);
+				if (!planning_only && (IsGuestWrite(op) || IsGuestAtomic(op)))
+					cyclic_writes.push_back(&inst);
 				if (op == O::DataAppend) cyclic_appends.push_back(&inst);
-				has_cyclic_write |= IsGuestWrite(op) || IsGuestAtomic(op) || op == O::DataAppend;
 			}
-			if ((IsGuestAtomic(op) || (cooperative && IR::SharedAccessOf(op) == IR::SharedAccess::Atomic)) &&
-			    inst.HasUses())
+			const bool cooperative_image_atomic_return =
+			    cooperative && IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic;
+			if (!cooperative_image_atomic_return &&
+			    (IsGuestAtomic(op) || IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) && inst.HasUses())
 				return "wave64 splitting does not support live atomic return values";
 		}
 	}
@@ -391,12 +433,19 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		// image, raw-address, scalar-cache and atomic communication unsupported
 		// until their distinct visibility protocols have executable regressions.
 		if (cooperative && unproved_cooperative_publication)
-			return "cooperative wave64 cyclic communication requires ordinary buffer reads and writes";
-		// Without an alias/progress proof, a write in any loop may communicate
-		// with a read in another loop or guest wave. Write-only shaders keep
-		// their existing path; post-loop output stores remain permitted.
-		if (has_cyclic_write && !cooperative)
-			return "wave64 splitting cannot prove cyclic reads and writes independent of other waves";
+			return "cooperative wave64 cyclic communication requires ordinary buffer reads and writes; found " +
+			       std::string(IR::ValueOpcodeName(unproved_cooperative_operation)) +
+			       (unproved_cooperative_operation_is_cyclic ? " in cycle" : " outside cycle");
+		if ((!cyclic_writes.empty() || !cyclic_appends.empty()) && !cooperative) {
+			if (partitions_guest_workgroup || !cyclic_appends.empty())
+				return "wave64 splitting cannot prove cyclic reads and writes independent of other waves";
+			// The complete guest wave remains one host workgroup. Rendezvous after
+			// every external memory instruction preserves guest instruction order
+			// across the two native subgroup32 halves, including cyclic feedback
+			// through aliased buffers, physical addresses, or storage images.
+			if (synchronize_split_wave_memory != nullptr)
+				*synchronize_split_wave_memory = true;
+		}
 
 		// A single complete guest wave remains one host workgroup. Only actual
 		// partitioning can introduce new inter-wave progress dependencies here.
@@ -406,6 +455,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			// ReadLane can make a polling value uniform without making it safe.
 			// The monotone worklist follows every SSA use, including phi backedges,
 			// source/selector operands and EXEC predicates; cycles never clear taint.
+			const auto cyclic_read_roots = cyclic_reads;
 			std::unordered_set<const IR::Inst*> memory_dependent(cyclic_reads.begin(), cyclic_reads.end());
 			for (size_t cursor = 0; cursor < cyclic_reads.size(); ++cursor) {
 				for (const auto& use : cyclic_reads[cursor]->Uses()) {
@@ -416,11 +466,25 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			// Check every conditional, including those outside SCCs: an acyclic
 			// branch can otherwise hide memory dependence in the edge selection of
 			// constant phis feeding a later loop. Indirect targets were rejected above.
+			const std::unordered_set<const IR::Inst*> cyclic_read_set(cyclic_read_roots.begin(),
+			                                                        cyclic_read_roots.end());
 			for (const auto& block : program.block_info) {
 				if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
-				    memory_dependent.contains(block.condition.TryInstruction()))
+				    memory_dependent.contains(block.condition.TryInstruction())) {
+					const IR::Inst* progress_read = nullptr;
+					std::unordered_set<const IR::Inst*> visited;
+					std::function<void(IR::Value)> find_progress_read = [&](IR::Value value) {
+						const auto* inst = value.TryInstruction();
+						if (inst == nullptr || !visited.insert(inst).second || progress_read != nullptr) return;
+						if (cyclic_read_set.contains(inst)) { progress_read = inst; return; }
+						for (size_t arg = 0; arg < inst->NumArgs(); ++arg) find_progress_read(inst->Arg(arg));
+					};
+					find_progress_read(block.condition);
 					return "wave64 splitting cannot prove loop memory independent of branch at pc " +
-					       std::to_string(block.start_pc);
+					       std::to_string(block.start_pc) +
+					       (progress_read == nullptr ? std::string{} :
+					        "; progress read " + std::string(IR::ValueOpcodeName(progress_read->GetOpcode())));
+				}
 			}
 		}
 	}
@@ -440,7 +504,11 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			if (varying.contains(inst)) continue;
 			const auto op = inst->GetOpcode();
 			bool is_uniform = false;
-			if (op == O::LaneId || op == O::DppMoveU32 || op == O::Dpp8MoveU32 ||
+			if (op == O::ReadConstBuffer) {
+				// The SPIR-V backend executes one scalar-buffer value per guest wave
+				// and broadcasts lane zero across split native32 halves.
+				is_uniform = true;
+			} else if (op == O::LaneId || op == O::DppMoveU32 || op == O::Dpp8MoveU32 ||
 			    op == O::Permlane16U32 || op == O::WriteLane || op == O::WqmMask ||
 			    op == O::UndefU1 || op == O::UndefU8 || op == O::UndefU16 ||
 			    op == O::UndefU32 || op == O::UndefU64 || IsGuestRead(op) || IsGuestAtomic(op)) {
@@ -467,6 +535,10 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch && !uniform(block.condition))
 			return "wave64 splitting cannot prove wave-uniform branch at pc " + std::to_string(block.start_pc);
 	}
+	// Dispatcher lowering selects the next static block ID from these same
+	// proved-uniform branch conditions. With indirect and unsupported targets
+	// rejected above, all 64 host invocations therefore execute the same switch
+	// case sequence and reach split-wave rendezvous together.
 	return {};
 }
 } // namespace
@@ -515,41 +587,63 @@ ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
 	if (count % 64 != 0) { plan.error = "wave64 splitting requires complete guest waves"; return plan; }
 	// Multi-wave shared storage and guest barriers require a cooperative host
 	// group. Independent waves retain the smaller partitioned execution path.
-	// Reservations without live accesses do not allocate the lazy guest array.
+	// If that path cannot prove cross-wave progress, a later bounded fallback
+	// may keep the complete guest workgroup together. Reservations without live
+	// accesses do not allocate the lazy guest array.
 	const bool uses_lds = HasGuestLdsAccess(program);
-	const bool cooperative = count > 64u && (uses_lds || HasGuestBarrier(program));
+	const bool requires_cooperative = count > 64u && (uses_lds || HasGuestBarrier(program));
 	if (uses_lds && cs->lds_size_dwords == 0) {
 		plan.error = "wave64 LDS access requires a nonzero guest LDS allocation";
-		return plan;
-	}
-	const uint64_t collective_dwords = cooperative ? uint64_t{count} : 64ull;
-	const uint64_t shared_bytes = collective_dwords * sizeof(uint32_t) +
-	                              (uses_lds ? uint64_t{cs->lds_size_dwords} * sizeof(uint32_t) : 0);
-	if (shared_bytes > limits.max_shared_memory_bytes) {
-		plan.error = "wave64 guest LDS and collective scratch exceed device shared memory limit";
 		return plan;
 	}
 	if (derivatives) {
 		plan.error = "wave64 splitting does not support compute derivatives";
 		return plan;
 	}
-	const auto host_shape = cooperative ? plan.layout.guest_size : std::array<uint32_t,3>{64,1,1};
-	const auto host_layout = PlanComputeWorkgroup(host_shape, limits);
-	if (!host_layout) {
-		plan.error = cooperative ? "device cannot fit a complete cooperative guest workgroup" :
-		                           "device cannot fit a complete wave64 workgroup";
-		return plan;
-	}
-	if (cooperative) {
-		plan.error = ProveCooperativeBarrierOrder(program);
-		if (!plan.error.empty()) return plan;
-	}
-	plan.error = ProveSplitWaveConvergence(program, count > 64 && !cooperative, cooperative);
-	if (!plan.error.empty()) return plan;
-	plan.layout.host_size = host_layout->host_size;
-	plan.wave_partition_factor = cooperative ? 1u : count / 64;
-	plan.split_wave64 = true;
-	plan.cooperative_wave64 = cooperative;
-	return plan;
+
+	const auto try_mode = [&](bool cooperative) {
+		auto candidate = plan;
+		const uint64_t collective_dwords = cooperative ? uint64_t{count} : 64ull;
+		const uint64_t shared_bytes = collective_dwords * sizeof(uint32_t) +
+		                              (uses_lds ? uint64_t{cs->lds_size_dwords} * sizeof(uint32_t) : 0);
+		if (shared_bytes > limits.max_shared_memory_bytes) {
+			candidate.error = "wave64 guest LDS and collective scratch exceed device shared memory limit";
+			return candidate;
+		}
+		const auto host_shape = cooperative ? candidate.layout.guest_size :
+		                                      std::array<uint32_t,3>{64,1,1};
+		const auto host_layout = PlanComputeWorkgroup(host_shape, limits);
+		if (!host_layout) {
+			candidate.error = cooperative ? "device cannot fit a complete cooperative guest workgroup" :
+			                                "device cannot fit a complete wave64 workgroup";
+			return candidate;
+		}
+		if (cooperative) {
+			candidate.error = ProveCooperativeBarrierOrder(program);
+			if (!candidate.error.empty()) return candidate;
+		}
+		candidate.error = ProveSplitWaveConvergence(program, count > 64 && !cooperative, cooperative,
+		                                                &candidate.synchronize_split_wave_memory);
+		if (!candidate.error.empty()) return candidate;
+		candidate.layout.host_size = host_layout->host_size;
+		candidate.wave_partition_factor = cooperative ? 1u : count / 64;
+		candidate.split_wave64 = true;
+		candidate.cooperative_wave64 = cooperative;
+		return candidate;
+	};
+
+	auto preferred = try_mode(requires_cooperative);
+	if (preferred.error.empty() || requires_cooperative || count <= 64u) return preferred;
+
+	// The independent proof deliberately rejects loops whose ordinary SSBO
+	// feedback may require another guest wave to make progress. Retry with the
+	// already validated cooperative scheduler, which publishes those writes at
+	// every scheduling quantum. All unsupported image, atomic, raw-address,
+	// scalar-cache and divergent-control cases remain rejected by the same
+	// convergence proof, and the complete host workgroup must fit the device.
+	auto promoted = try_mode(true);
+	if (promoted.error.empty()) return promoted;
+	preferred.error += "; cooperative fallback rejected: " + promoted.error;
+	return preferred;
 }
 } // namespace Libs::Graphics::ShaderRecompiler

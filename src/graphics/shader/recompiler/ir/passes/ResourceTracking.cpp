@@ -1500,6 +1500,7 @@ private:
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
+			m_info.writes_dma |= address_info.access == AddressAccess::Write;
 			return;
 		}
 

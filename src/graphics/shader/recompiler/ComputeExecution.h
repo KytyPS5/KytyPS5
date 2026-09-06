@@ -15,11 +15,17 @@ struct ComputeExecutionPlan {
 	uint32_t wave_partition_factor = 1;
 	bool split_wave64 = false;
 	bool cooperative_wave64 = false;
+	// A cyclic external-memory writer in one complete guest wave is safe only
+	// when both native32 halves rendezvous between guest memory instructions.
+	bool synchronize_split_wave_memory = false;
 	std::string error;
 
 	// Both modes split a logical wave across native32 halves and use software collectives.
 	[[nodiscard]] bool IsSplitWave64() const { return split_wave64; }
 	[[nodiscard]] bool IsCooperativeWave64() const { return cooperative_wave64; }
+	[[nodiscard]] bool SynchronizesSplitWaveMemory() const {
+		return synchronize_split_wave_memory;
+	}
 };
 
 // LLVM's GDS pointer lowering folds a byte displacement into DS_APPEND's

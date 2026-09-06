@@ -90,6 +90,25 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 	for (size_t index = 0; index < segment.instructions.size();) {
 		const auto& inst = *segment.instructions[index];
 		if (inst.GetOpcode() == O::Phi) { ++index; continue; }
+		if (inst.GetOpcode() == O::ReadConstBuffer && !ctx.Memory(inst).planning_only) {
+			// Only the selected guest wave may touch its descriptor, but every
+			// physical invocation must join the cross-subgroup rendezvous. Publish
+			// the raw host loads first, broadcast this wave's lane zero, then commit
+			// the architectural scalar result for the selected wave.
+			Guard(ctx.state, active, [&] {
+				EmitDirectValueInstruction(ctx, inst);
+				StoreResult(ctx, function, inst);
+			});
+			ctx.cooperative_collective_active = active;
+			const auto source = ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+			const auto value = EmitWaveReadLane(ctx.state, source, ConstantU32(ctx.state, 0));
+			ctx.cooperative_collective_active = 0;
+			Guard(ctx.state, active, [&] {
+				ctx.state.builder.AddFunction({OpStore, function.spills.at(&inst), value});
+			});
+			++index;
+			continue;
+		}
 		if (IsCollective(inst.GetOpcode())) {
 			ctx.cooperative_collective_active = active;
 			EmitDirectValueInstruction(ctx, inst);
@@ -192,6 +211,7 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 	}
 	if (segments.empty() || segments.size() >= Waiting) ctx.Fail("invalid cooperative segment count");
 	const auto header = state.builder.AllocateId();
+	const auto schedule = state.builder.AllocateId();
 	const auto dispatch = state.builder.AllocateId();
 	const auto invalid = state.builder.AllocateId();
 	const auto after_switch = state.builder.AllocateId();
@@ -205,53 +225,82 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 	state.builder.AddFunction({OpStore, function.cursor_variable, zero});
 	state.builder.AddFunction({OpBranch, header});
 	EmitLabel(state, header);
+	state.builder.AddFunction({OpLoopMerge, exit, continuation, LoopControlNone});
+	state.builder.AddFunction({OpBranch, schedule});
+	EmitLabel(state, schedule);
 	const auto own_pc = LoadPc(state, function.pc_variable);
-	const auto cursor = LoadPc(state, function.cursor_variable);
-	state.builder.AddFunction({OpStore, ScratchPointer(state, EmitHostLocalInvocationIndex(state)), own_pc});
+	const auto local_index = EmitHostLocalInvocationIndex(state);
+	state.builder.AddFunction({OpStore, ScratchPointer(state, local_index), own_pc});
 	// Every physical invocation, including finished guest waves, publishes its
-	// previous quantum before any wave starts the next one. UniformMemory and
-	// coherent SSBO declarations jointly provide peer-buffer visibility; the
-	// scratch-only rendezvous below does not need the extra storage class.
+	// previous quantum before selecting the next one. UniformMemory and coherent
+	// SSBO declarations jointly provide peer-buffer visibility.
 	Rendezvous(state, MemorySemanticsWorkgroupMemory | MemorySemanticsUniformMemory);
+	const auto cursor = LoadPc(state, function.cursor_variable);
+	const bool power_of_two_wave_count = (wave_count & (wave_count - 1u)) == 0u;
 	std::vector<uint32_t> pcs;
 	for (uint32_t wave = 0; wave < wave_count; ++wave)
 		pcs.push_back(LoadPc(state, ScratchPointer(state, ConstantU32(state, wave * 64u))));
-	// All invocations read the same wave PCs before any wave helper can reuse
-	// scratch. Finished guest waves remain physical participants until all end.
+	// All invocations finish reading the scheduler state before a selected wave
+	// may reuse the same array for a software collective.
 	Rendezvous(state);
-	uint32_t same = ConstantBool(state, true);
-	for (uint32_t wave = 1; wave < wave_count; ++wave)
-		same = Binary(state, OpLogicalAnd, TypeBool(state), same,
-		              Binary(state, OpIEqual, TypeBool(state), pcs[0], pcs[wave]));
-	const auto all_done = Binary(state, OpLogicalAnd, TypeBool(state), same,
-	                            Binary(state, OpIEqual, TypeBool(state), pcs[0], finished));
-	const auto waiting = Binary(state, OpUGreaterThanEqual, TypeBool(state), pcs[0], ConstantU32(state, Waiting));
-	const auto release = Binary(state, OpLogicalAnd, TypeBool(state), same,
-	    Binary(state, OpLogicalAnd, TypeBool(state), waiting,
-	           Binary(state, OpINotEqual, TypeBool(state), pcs[0], finished)));
+	uint32_t all_done = ConstantBool(state, true);
+	uint32_t has_waiter = ConstantBool(state, false);
+	uint32_t all_satisfied = ConstantBool(state, true);
+	for (uint32_t wave = 0; wave < wave_count; ++wave) {
+		const auto is_finished = Binary(state, OpIEqual, TypeBool(state), pcs[wave], finished);
+		const auto is_waiting = Binary(state, OpLogicalAnd, TypeBool(state),
+		    Binary(state, OpUGreaterThanEqual, TypeBool(state), pcs[wave],
+		           ConstantU32(state, Waiting)),
+		    Binary(state, OpINotEqual, TypeBool(state), pcs[wave], finished));
+		all_done = Binary(state, OpLogicalAnd, TypeBool(state), all_done, is_finished);
+		has_waiter = Binary(state, OpLogicalOr, TypeBool(state), has_waiter, is_waiting);
+		const auto satisfied = Binary(state, OpLogicalOr, TypeBool(state), is_finished, is_waiting);
+		all_satisfied = Binary(state, OpLogicalAnd, TypeBool(state), all_satisfied, satisfied);
+	}
+	const auto release = Binary(state, OpLogicalAnd, TypeBool(state), has_waiter, all_satisfied);
+	std::vector<uint32_t> effective_pcs;
+	effective_pcs.reserve(wave_count);
+	for (uint32_t wave = 0; wave < wave_count; ++wave) {
+		const auto is_finished = Binary(state, OpIEqual, TypeBool(state), pcs[wave], finished);
+		const auto successor = Binary(state, OpBitwiseAnd, TypeU32(state), pcs[wave],
+		                              ConstantU32(state, ~Waiting));
+		effective_pcs.push_back(
+		    Select(state, release, Select(state, is_finished, finished, successor), pcs[wave]));
+	}
 	uint32_t selected_pc = finished;
 	uint32_t selected_wave = zero;
 	uint32_t best_distance = ConstantU32(state, wave_count);
 	for (uint32_t wave = 0; wave < wave_count; ++wave) {
-		const auto distance = Binary(state, OpUMod, TypeU32(state),
-		    Binary(state, OpISub, TypeU32(state), ConstantU32(state, wave + wave_count), cursor),
-		    ConstantU32(state, wave_count));
+		const auto wave_id = ConstantU32(state, wave);
+		const auto unwrapped_distance = Binary(state, OpISub, TypeU32(state),
+		    ConstantU32(state, wave + wave_count), cursor);
+		const auto distance = power_of_two_wave_count
+		    ? Binary(state, OpBitwiseAnd, TypeU32(state), unwrapped_distance,
+		          ConstantU32(state, wave_count - 1u))
+		    : Binary(state, OpUMod, TypeU32(state), unwrapped_distance,
+		          ConstantU32(state, wave_count));
 		const auto choose = Binary(state, OpLogicalAnd, TypeBool(state),
-		    Binary(state, OpULessThan, TypeBool(state), pcs[wave], ConstantU32(state, Waiting)),
+		    Binary(state, OpULessThan, TypeBool(state), effective_pcs[wave],
+		           ConstantU32(state, Waiting)),
 		    Binary(state, OpULessThan, TypeBool(state), distance, best_distance));
-		selected_pc = Select(state, choose, pcs[wave], selected_pc);
-		selected_wave = Select(state, choose, ConstantU32(state, wave), selected_wave);
+		selected_pc = Select(state, choose, effective_pcs[wave], selected_pc);
+		selected_wave = Select(state, choose, wave_id, selected_wave);
 		best_distance = Select(state, choose, distance, best_distance);
 	}
-	const auto released_pc = Binary(state, OpBitwiseAnd, TypeU32(state), pcs[0], ConstantU32(state, ~Waiting));
-	selected_pc = Select(state, release, released_pc, selected_pc);
-	const auto current_pc = Select(state, release, released_pc, own_pc);
-	state.builder.AddFunction({OpStore, function.pc_variable, current_pc});
-	const auto next_cursor = Binary(state, OpUMod, TypeU32(state),
-	    Binary(state, OpIAdd, TypeU32(state), selected_wave, ConstantU32(state, 1)),
-	    ConstantU32(state, wave_count));
+	const auto advanced_cursor = Binary(state, OpIAdd, TypeU32(state), selected_wave,
+	                                    ConstantU32(state, 1));
+	const auto next_cursor = power_of_two_wave_count
+	    ? Binary(state, OpBitwiseAnd, TypeU32(state), advanced_cursor,
+	          ConstantU32(state, wave_count - 1u))
+	    : Binary(state, OpUMod, TypeU32(state), advanced_cursor,
+	          ConstantU32(state, wave_count));
 	state.builder.AddFunction({OpStore, function.cursor_variable, next_cursor});
-	state.builder.AddFunction({OpLoopMerge, exit, continuation, LoopControlNone});
+	const auto own_finished = Binary(state, OpIEqual, TypeBool(state), own_pc, finished);
+	const auto own_successor = Binary(state, OpBitwiseAnd, TypeU32(state), own_pc,
+	                                 ConstantU32(state, ~Waiting));
+	const auto released_own_pc = Select(state, own_finished, finished, own_successor);
+	const auto current_pc = Select(state, release, released_own_pc, own_pc);
+	state.builder.AddFunction({OpStore, function.pc_variable, current_pc});
 	state.builder.AddFunction({OpBranchConditional, all_done, exit, dispatch});
 	EmitLabel(state, dispatch);
 	const auto active = Binary(state, OpIEqual, TypeBool(state), current_pc, selected_pc);
@@ -263,8 +312,6 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 	}
 	state.builder.AddFunction(switches);
 	EmitLabel(state, invalid);
-	// The planner proves all barrier sites form an acyclic dominating chain;
-	// non-finished waves therefore cannot get stuck at different barriers.
 	// An invalid PC is not permission to report successful guest completion.
 	state.builder.AddFunction({OpUnreachable});
 	for (const auto& segment : segments) {

@@ -311,6 +311,15 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
+	if (UsesPackedLds64(ctx.state, resource)) {
+		const auto packed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpAtomicLoad, TypeScalarU64(ctx.state), packed,
+		     PackedLds64Pointer(ctx.state, resource.object_pointer, index),
+		     ConstantU32(ctx.state, ScopeWorkgroup),
+		     ConstantU32(ctx.state, MemorySemanticsNone)});
+		return ExtractPackedLdsWord(ctx.state, packed, index);
+	}
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
@@ -476,6 +485,11 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		                     Unary(ctx.state, spv::OpNot, TypeU32(ctx.state), mask)),
 		              value);
 	};
+	if (UsesPackedLds64(ctx.state, resource)) {
+		AtomicUpdatePackedLdsWord(ctx.state, resource.object_pointer, index, merge);
+		return;
+	}
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (mem.kind == IR::ResourceKind::Scratch ||
 	    (mem.kind == IR::ResourceKind::Lds && !LdsHasCompetingInvocations(ctx.state))) {
 		// Private storage has no other writer that could be lost by this RMW.

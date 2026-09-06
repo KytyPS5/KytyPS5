@@ -1337,12 +1337,21 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 			uint32_t thread_group_z;
 		};
 
-		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(
-		    buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-		uint32_t mode = buffer[2];
+		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
+		uint32_t   mode      = buffer[2];
 
-		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+		EXIT_NOT_IMPLEMENTED(args_addr == 0);
+		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
+			static std::atomic<uint32_t> sync_fallback_logs {0};
+			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+				     " (image-owned range, reading guest memory)\n",
+				     args_addr);
+			}
+		}
+		DispatchIndirectArgs args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 
 		return 3;
 	}
@@ -1455,6 +1464,14 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(addr, sizeof(uint32_t))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("CondExec: failed to synchronise the predicate at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     addr);
+		}
+	}
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}

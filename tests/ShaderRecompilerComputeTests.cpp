@@ -14005,6 +14005,120 @@ TestCase VectorFfbhI32NativeAndVop3OnGpu() {
   return test;
 }
 
+TestCase Vop1SdwaMovByteAndWordDestinationModes() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 2, 30);
+  // RDNA2 SDWA DST_U: zero padding, sign-extend upper/zero lower, preserve.
+  // Read the source from memory so the GPU executes the partial-write operations.
+  for (u32 unused = 0; unused < 3; unused++) {
+    for (u32 selector = 0; selector < 6; selector++) {
+      AppendVMovLiteral(&code, 10, 0x12345678u);
+      code.push_back(EncodeVop1(0x01, 10, 249));
+      code.push_back(EncodeVop1Sdwa(2, selector, unused, 6));
+      AppendStoreVgpr(&code, 10, unused * 6u + selector);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaMovByteAndWordDestinationModes";
+  test.code = std::move(code);
+  test.initial = {0xa1b280f3u};
+  test.expected = {
+      0x000000f3u, 0x0000f300u, 0x00f30000u, 0xf3000000u, 0x000080f3u, 0x80f30000u,
+      0xfffffff3u, 0xfffff300u, 0xfff30000u, 0xf3000000u, 0xffff80f3u, 0x80f30000u,
+      0x123456f3u, 0x1234f378u, 0x12f35678u, 0xf3345678u, 0x123480f3u, 0x80f35678u,
+  };
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  for (u32 selector = 0; selector < 6; selector++) {
+    test.decoded_counts.emplace_back(
+        "V_MOV_B32 v10.sdwa(sel=" + std::to_string(selector) + ",sext=0), v2", 3u);
+  }
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  return test;
+}
+
+TestCase Vop1SdwaMovSourcesOverlapAndInactiveExec() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 2, 30);
+  struct Selection {
+    u32 destination;
+    u32 source;
+    u32 sign_extend;
+  };
+  constexpr Selection selections[] = {
+      {4, 2, 0}, {4, 2, 1}, {5, 3, 1}, {1, 5, 0},
+      {3, 0, 0}, {2, 1, 0}, {5, 4, 0}, {6, 3, 1},
+  };
+  for (u32 i = 0; i < std::size(selections); i++) {
+    const auto selection = selections[i];
+    AppendVMovLiteral(&code, 10, 0x12345678u);
+    code.push_back(EncodeVop1(0x01, 10, 249));
+    code.push_back(EncodeVop1Sdwa(2, selection.destination, 2, selection.source,
+                                  selection.sign_extend));
+    AppendStoreVgpr(&code, 10, i);
+  }
+
+  // The selected source byte must be captured before updating the same VGPR.
+  code.push_back(EncodeVop1(0x01, 2, 249));
+  code.push_back(EncodeVop1Sdwa(2, 1, 2, 3));
+  AppendStoreVgpr(&code, 2, 8);
+
+  AppendSMovLiteral(&code, 8, 0xdeadbeefu);
+  code.push_back(EncodeVop1(0x01, 11, 249));
+  code.push_back(EncodeVop1Sdwa(8, 2, 0, 1, 0, 0, 0, 1));
+  AppendStoreVgpr(&code, 11, 9);
+
+  // Synthetic inline-constant variant: 7e0602f9 00861081.
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  code.push_back(EncodeVop1(0x01, 3, 249));
+  code.push_back(EncodeVop1Sdwa(InlineU32(1), 0, 2, 6, 0, 0, 0, 1));
+  AppendStoreVgpr(&code, 3, 10);
+
+  // Scalar inline -1 is sign-filled above BYTE_2 and zero-filled below it.
+  code.push_back(EncodeVop1(0x01, 12, 249));
+  code.push_back(EncodeVop1Sdwa(193, 2, 1, 6, 0, 0, 0, 1));
+  AppendStoreVgpr(&code, 12, 11);
+
+  // EXEC gates every DST_U mode, including a self-overlapping source.
+  for (u32 unused = 0; unused < 3; unused++) {
+    AppendVMovLiteral(&code, 10, 0x89abcdefu);
+    code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    code.push_back(EncodeVop1(0x01, 10, 249));
+    code.push_back(EncodeVop1Sdwa(10, 0, unused, 2, 1));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    AppendStoreVgpr(&code, 10, 12 + unused);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaMovSourcesOverlapAndInactiveExec";
+  test.code = std::move(code);
+  test.initial = {0xa1b280f3u};
+  test.expected = {0x123400b2u, 0x1234ffb2u, 0xffa15678u, 0x1234b278u,
+                   0xf3345678u, 0x12805678u, 0x80f35678u, 0xffffffa1u,
+                   0xa1b2a1f3u, 0x00be0000u, 0x12345601u, 0xffff0000u,
+                   0x89abcdefu, 0x89abcdefu, 0x89abcdefu};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {
+      {"V_MOV_B32 v3.sdwa(sel=0,sext=0), 1", 1},
+      {"V_MOV_B32 v10.sdwa(sel=4,sext=0), v2.sdwa(sel=2,sext=1)", 1},
+      {"V_MOV_B32 v11.sdwa(sel=2,sext=0), s8.sdwa(sel=1,sext=0)", 1},
+      {"V_MOV_B32 v2.sdwa(sel=1,sext=0), v2.sdwa(sel=3,sext=0)", 1},
+  };
+  test.required_spirv = {"OpBitFieldUExtract", "OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase Vop1SdwaFfblCapturedHighWordSource() {
   using O = ShaderOpcode;
 
@@ -22754,6 +22868,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
+  AddCase(Vop1SdwaMovByteAndWordDestinationModes);
+  AddCase(Vop1SdwaMovSourcesOverlapAndInactiveExec);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
@@ -27167,6 +27283,12 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferD16LoadsPreserveHalvesAndSnapshotAddress());
     RunCase(&vulkan, BufferD16StoresSelectHighBytesAndRespectBounds());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaMovByteAndWordDestinationModes());
+    RunCase(&vulkan, Vop1SdwaMovSourcesOverlapAndInactiveExec());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {

@@ -1497,6 +1497,65 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           std::move(resources), std::move(packed_user_data)};
 }
 
+// Teste les deux chemins du flag --stub-bvh (MIMG 0xe6, IMAGE_BVH_INTERSECT_RAY).
+void CheckBvhStub() {
+  constexpr const char *name = "BvhStub";
+
+  // MIMG 0xe6 extrait du log d'Astro Bot (#281).
+  std::vector<u32> code = {0xf1989f07u, 0x00040505u, 0x4442413du,
+                           0x4543403eu, 0x00004746u};
+  // Consomme VGPR 5 (composante 0 du résultat du MIMG) vers le buffer :
+  // sinon le DCE supprime le stub ImageBvhIntersectRay (résultat mort dans ce
+  // shader minimal). Dans le vrai shader d'Astro Bot le résultat est lu.
+  AppendStoreVgpr(&code, 5, 0);
+  AppendEnd(&code);
+
+  // La config est partagée sur tout le processus : capturer et restaurer.
+  const bool original = Config::BvhStubEnabled();
+  auto set_stub = [&](bool enabled) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::OutputDirection::Silent;
+    options.bvh_stub_enabled = enabled;
+    Config::Load(options);
+  };
+
+  // Cas 1 (stub OFF) : le décodeur doit refuser avec un motif explicite.
+  // Pas de TranslateProgram ici : une instruction UNSUPPORTED déclenche EXIT.
+  set_stub(false);
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+  const auto bvh = std::ranges::find_if(
+      decoded.instructions.begin(), decoded.instructions.end(),
+      [](const auto &inst) {
+        return inst.family == ShaderRecompiler::Decoder::Family::MIMG;
+      });
+  Require(name, "MIMG instruction", bvh != decoded.instructions.end(),
+          "BVH shader did not decode a MIMG instruction");
+  Require(name, "unsupported opcode",
+          bvh->opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
+          "BVH opcode must decode as UNSUPPORTED when the stub is off");
+  Require(name, "unsupported reason",
+          std::string(bvh->unsupported_reason).find("--stub-bvh") !=
+              std::string::npos,
+          "unsupported reason must mention the --stub-bvh flag");
+
+  // Cas 2 (stub ON) : pipeline complet, l'IR doit contenir le stub.
+  set_stub(true);
+  TestCase test;
+  test.name = name;
+  test.code = code;
+  test.initial = {0};  // buffer cible du store (1 dword)
+  test.opcodes = {ShaderOpcode::IMAGE_BVH_INTERSECT_RAY};
+  test.ir_counts = {{"ImageBvhIntersectRay", 1}};
+  const auto compiled = CompileCase(test);
+  Require(name, "stub SPIR-V", !compiled.spirv.empty(),
+          "stub compilation returned empty SPIR-V");
+
+  // Restauration obligatoire : le test tourne dans le processus partagé.
+  set_stub(original);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
                                                     u32 num_records,
                                                     bool add_tid = false,
@@ -28433,6 +28492,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckRectListShaders();
+  CheckBvhStub();
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();

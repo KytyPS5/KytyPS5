@@ -14140,6 +14140,71 @@ TestCase Wave64ImageReadLoopAccumulatesWithoutFeedback() {
   return test;
 }
 
+// Each guest workgroup is exactly one wave64. Loaded data controls the loop,
+// with an independent eight-iteration cap; two groups take four/eight passes.
+TestCase Wave64SingleWaveImageFeedbackWithBound() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Wave64SingleWaveImageFeedbackWithBound";
+  test.initial.assign(256, 0xdeadbeefu);
+  test.expected.resize(256);
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.workgroup_register = 16;
+  test.compute_info.group_id[0] = true;
+  test.has_compute_info = true;
+  test.dispatch_x = 2;
+  test.sampled_image_rgba.resize(16);
+  std::iota(test.sampled_image_rgba.begin(), test.sampled_image_rgba.end(), 1u);
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  auto& code = test.code;
+  code.push_back(EncodeVop1(0x01, 4, 16));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(6), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(0), 4));
+  code.push_back(EncodeVop2(0x1b, 20, InlineU32(3), 0));
+  code.push_back(EncodeVop1(0x01, 21, 16));
+  AppendVMovU32(&code, 10, 0);
+  code.push_back(EncodeSMovB32(8, InlineU32(0)));
+  const size_t loop = code.size();
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(11, 20));
+  AppendVop3(&code, 0x360, 9, Vgpr(11), InlineU32(63));
+  code.push_back(EncodeVop2(0x25, 10, Vgpr(11), 10));
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1)));
+  code.push_back(EncodeSopc(0x09, 8, InlineU32(8)));
+  const size_t capped_exit = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSopc(0x0a, 8, 9));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  code[capped_exit] = EncodeSopp(0x05, static_cast<u32>(code.size() - capped_exit - 1));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 4, 0);
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 4, 128);
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2; ++group) {
+    const u32 passes = (group + 1) * 4;
+    for (u32 lane = 0; lane < 64; ++lane) {
+      const u32 index = group * 64 + lane;
+      test.expected[index] = (group * 4 + lane % 4 + 1) * passes;
+      test.expected[128 + index] = passes;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_AND_B32,
+                  O::V_ADD_NC_U32, O::S_MOV_B32, O::IMAGE_LOAD,
+                  O::V_READLANE_B32, O::S_ADD_U32, O::S_CMP_GE_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"IMAGE_LOAD", 1}, {"V_READLANE_B32", 1}};
+  return test;
+}
+
 TestCase Wave64MultidimensionalGuestGeometry() {
   using O = ShaderOpcode;
   constexpr u32 invocation_count = 8u * 4u * 4u * 2u * 2u * 2u;
@@ -23772,6 +23837,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64SparseWaterfallIndependentWaves);
   AddCase(Wave64MultidimensionalGuestGeometry);
   AddCase(Wave64ImageReadLoopAccumulatesWithoutFeedback);
+  AddCase(Wave64SingleWaveImageFeedbackWithBound);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);
   AddCase(ScalarSaveexecSccIsWaveUniform);
   AddCase(ScalarWqmSccIsWaveUniform);

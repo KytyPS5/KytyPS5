@@ -8911,6 +8911,7 @@ void TestComputeExecutionLoopReadFeedback() {
     CyclicImageWrite, CyclicBufferWrite, CyclicAtomic, OtherCycleWrite
   };
   const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const uint32_t invocations : {64u,128u}) {
   for (const auto scenario : {
       Scenario::ImageOutput, Scenario::BufferOutput, Scenario::AddressOutput,
       Scenario::PollDirect, Scenario::PollBallot, Scenario::PollReadLane,
@@ -9074,21 +9075,33 @@ void TestComputeExecutionLoopReadFeedback() {
     }
     IR::ValidateProgram(program,true);
     ShaderComputeInputInfo compute{};
-    compute.threads_num[0] = 128;
+    compute.threads_num[0] = invocations;
     compute.threads_num[1] = compute.threads_num[2] = 1;
     compute.wave_size = 64;
     ShaderStageInputInfo input{};
     input.compute = &compute;
     const auto plan = PlanComputeExecution(program,input,limits);
+    // A single full guest wave remains one host workgroup. Its memory-driven
+    // uniform branches do not introduce progress dependence between partitions.
+    // Direct varying branches and cyclic communication stay unsupported at both sizes.
+    const bool single_wave_feedback = invocations == 64 &&
+        (scenario == Scenario::PollBallot || scenario == Scenario::PollReadLane ||
+         scenario == Scenario::PollReadFirst || scenario == Scenario::PollPhi ||
+         scenario == Scenario::PostLoopBranch);
     const bool accepted = scenario == Scenario::ImageOutput ||
-                          scenario == Scenario::BufferOutput || scenario == Scenario::AddressOutput;
+                          scenario == Scenario::BufferOutput || scenario == Scenario::AddressOutput ||
+                          single_wave_feedback;
+    if (plan.error.empty() != accepted)
+      std::fprintf(stderr, "loop feedback scenario=%u invocations=%u: %s\n",
+                   static_cast<unsigned>(scenario), invocations, plan.error.c_str());
     if (accepted) {
-      Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 2,
-            "independent counter-loop reads with live output must permit complete-wave splitting");
+      Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == invocations / 64,
+            "supported loop reads must preserve complete-wave dispatch geometry");
     } else {
       Check(!plan.error.empty() && !plan.IsSplitWave64(),
             "split-wave proof accepted mutable loop feedback or cyclic memory communication");
     }
+  }
   }
 }
 

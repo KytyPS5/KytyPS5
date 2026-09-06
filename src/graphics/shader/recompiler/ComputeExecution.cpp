@@ -134,7 +134,7 @@ std::unordered_set<const IR::Block*> CyclicBlocks(const IR::Program& program) {
 	return cyclic;
 }
 
-std::string ProveSplitWaveConvergence(const IR::Program& program) {
+std::string ProveSplitWaveConvergence(const IR::Program& program, bool partitions_guest_workgroup) {
 	if (program.dispatcher_fallback) return "wave64 splitting requires structured control flow";
 	if (program.blocks.size() != program.block_info.size())
 		return "wave64 splitting requires complete branch metadata";
@@ -196,25 +196,30 @@ std::string ProveSplitWaveConvergence(const IR::Program& program) {
 		if (has_cyclic_write)
 			return "wave64 splitting cannot prove cyclic reads and writes independent of other waves";
 
-		// Memory dependence is separate from lane uniformity. Ballot and
-		// ReadLane can make a polling value uniform without making it safe.
-		// The monotone worklist follows every SSA use, including phi backedges,
-		// source/selector operands and EXEC predicates; cycles never clear taint.
-		std::unordered_set<const IR::Inst*> memory_dependent(cyclic_reads.begin(), cyclic_reads.end());
-		for (size_t cursor = 0; cursor < cyclic_reads.size(); ++cursor) {
-			for (const auto& use : cyclic_reads[cursor]->Uses()) {
-				if (instructions.contains(use.user) && memory_dependent.insert(use.user).second)
-					cyclic_reads.push_back(use.user);
+		// A single complete guest wave remains one host workgroup. Only actual
+		// partitioning can introduce new inter-wave progress dependencies here.
+		// Convergence and the cyclic communication guard still apply to both modes.
+		if (partitions_guest_workgroup) {
+			// Memory dependence is separate from lane uniformity. Ballot and
+			// ReadLane can make a polling value uniform without making it safe.
+			// The monotone worklist follows every SSA use, including phi backedges,
+			// source/selector operands and EXEC predicates; cycles never clear taint.
+			std::unordered_set<const IR::Inst*> memory_dependent(cyclic_reads.begin(), cyclic_reads.end());
+			for (size_t cursor = 0; cursor < cyclic_reads.size(); ++cursor) {
+				for (const auto& use : cyclic_reads[cursor]->Uses()) {
+					if (instructions.contains(use.user) && memory_dependent.insert(use.user).second)
+						cyclic_reads.push_back(use.user);
+				}
 			}
-		}
-		// Check every conditional, including those outside SCCs: an acyclic
-		// branch can otherwise hide memory dependence in the edge selection of
-		// constant phis feeding a later loop. Indirect targets were rejected above.
-		for (const auto& block : program.block_info) {
-			if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
-			    memory_dependent.contains(block.condition.TryInstruction()))
-				return "wave64 splitting cannot prove loop memory independent of branch at pc " +
-				       std::to_string(block.start_pc);
+			// Check every conditional, including those outside SCCs: an acyclic
+			// branch can otherwise hide memory dependence in the edge selection of
+			// constant phis feeding a later loop. Indirect targets were rejected above.
+			for (const auto& block : program.block_info) {
+				if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+				    memory_dependent.contains(block.condition.TryInstruction()))
+					return "wave64 splitting cannot prove loop memory independent of branch at pc " +
+					       std::to_string(block.start_pc);
+			}
 		}
 	}
 
@@ -310,7 +315,7 @@ ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
 	}
 	const auto host_layout = PlanComputeWorkgroup({64, 1, 1}, limits);
 	if (!host_layout) { plan.error = "device cannot fit a complete wave64 workgroup"; return plan; }
-	plan.error = ProveSplitWaveConvergence(program);
+	plan.error = ProveSplitWaveConvergence(program, count > 64);
 	if (!plan.error.empty()) return plan;
 	plan.layout.host_size = host_layout->host_size;
 	plan.wave_partition_factor = count / 64;

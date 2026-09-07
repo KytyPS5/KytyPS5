@@ -377,6 +377,8 @@ struct EmitterState {
 	uint32_t                                         wave_scratch_variable = 0;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
+	uint32_t                                         native_subgroup_size    = 0;
+	uint32_t                                         graphics_loop_counter_variable = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
@@ -654,6 +656,7 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
 uint32_t EmitHostLocalInvocationIndex(EmitterState& state);
 uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate);
+uint32_t NormalizeWaveLaneTarget(EmitterState& state, uint32_t target);
 uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target);
 uint32_t EmitWaveFindFirst(EmitterState& state, uint32_t ballot);
 

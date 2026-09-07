@@ -629,7 +629,8 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::WriteLane: {
 			const auto hit = state.builder.AllocateId();
 			state.builder.AddFunction({OpIEqual, TypeBool(state), hit,
-			                           EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2)});
+			                           EmitSubgroupLocalInvocationId(state),
+			                           NormalizeWaveLaneTarget(state, ctx.Arg(inst, 2))});
 			ctx.Emit(inst, OpSelect, IR::Type::U32, {hit, ctx.Arg(inst, 1), ctx.Arg(inst, 0)});
 			return true;
 		}
@@ -678,8 +679,10 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 					source_exec = EmitBallotLaneActiveBool(state, ballot, target);
 				} else {
 					source_exec = state.builder.AllocateId();
+					const auto native_target = NormalizeWaveLaneTarget(state, target);
 					state.builder.AddFunction({OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-					                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3), target});
+					                           ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 3),
+					                           native_target});
 				}
 				result = state.builder.AllocateId();
 				state.builder.AddFunction({OpSelect, TypeU32(state), result, source_exec, shuffled,

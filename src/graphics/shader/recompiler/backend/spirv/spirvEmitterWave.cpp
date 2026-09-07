@@ -2,6 +2,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+bool IsPartitionedGraphicsWave64(const EmitterState& state) {
+	return state.stage != ShaderType::Compute && state.wave_size == 64u &&
+	       state.native_subgroup_size == 32u;
+}
 void WaveBarrier(EmitterState& state) {
 	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
 	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
@@ -46,9 +50,20 @@ uint32_t WordFirst(EmitterState& state, uint32_t word) {
 
 uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate) {
 	if (!state.compute_execution.IsSplitWave64()) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), result,
+		const auto native = state.builder.AllocateId();
+		state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), native,
 		                           ConstantU32(state, ScopeSubgroup), predicate});
+		if (!IsPartitionedGraphicsWave64(state)) {
+			return native;
+		}
+		// Fragment and vertex stages cannot rendezvous two physical subgroups through
+		// workgroup memory. Keep each 32-lane partition internally coherent and expose
+		// its predicate bits through both halves of the guest wave64 mask.
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, TypeU32(state), bits, native, 0});
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(state, 4), result,
+		                           bits, bits, ConstantU32(state, 0), ConstantU32(state, 0)});
 		return result;
 	}
 	// Every actual guest lane has its own host invocation and scratch slot. This
@@ -73,8 +88,17 @@ uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate) {
 	return result;
 }
 
+uint32_t NormalizeWaveLaneTarget(EmitterState& state, uint32_t target) {
+	if (!IsPartitionedGraphicsWave64(state)) {
+		return target;
+	}
+	// Map either guest half to the corresponding lane of this native half.
+	return EmitBinaryU32(state, OpBitwiseAnd, target, ConstantU32(state, 31));
+}
+
 uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target) {
 	if (!state.compute_execution.IsSplitWave64()) {
+		target = NormalizeWaveLaneTarget(state, target);
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), result,
 		                           ConstantU32(state, ScopeSubgroup), source, target});

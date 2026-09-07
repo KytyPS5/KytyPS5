@@ -54,6 +54,7 @@ struct DeferredContinuePatch {
 
 struct StructuredFunctionState {
 	std::unordered_set<const IR::Block*>           dedicated_continues;
+	std::unordered_set<const IR::Block*>           guarded_loop_bodies;
 	std::vector<DeferredContinuePatch>             deferred_continues;
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
@@ -160,6 +161,23 @@ const IR::Block* DedicatedContinueBody(const IR::Program& program, const IR::Blo
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction({OpReturn});
+}
+
+uint32_t EmitGraphicsLoopWithinBudget(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	EXIT_IF(state.graphics_loop_counter_variable == 0);
+	constexpr uint32_t MaxGraphicsLoopIterations = 256;
+	const auto counter = state.builder.AllocateId();
+	const auto within  = state.builder.AllocateId();
+	const auto next    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLoad, TypeU32(state), counter, state.graphics_loop_counter_variable});
+	state.builder.AddFunction({OpULessThan, TypeBool(state), within, counter,
+	                           ConstantU32(state, MaxGraphicsLoopIterations)});
+	state.builder.AddFunction(
+	    {OpIAdd, TypeU32(state), next, counter, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpStore, state.graphics_loop_counter_variable, next});
+	return within;
 }
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& structured,
@@ -387,15 +405,35 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	StructuredFunctionState structured;
 	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
-		if (const auto* body = DedicatedContinueBody(ctx.program, ctx.program.blocks[index],
-		                                            ctx.program.block_info[index]); body != nullptr) {
+		const auto& info = ctx.program.block_info[index];
+		if (const auto* body = DedicatedContinueBody(ctx.program, ctx.program.blocks[index], info);
+		    body != nullptr) {
 			structured.dedicated_continues.insert(body);
+		}
+		if (ctx.state.graphics_loop_counter_variable != 0 && info.terminator.loop_header) {
+			const auto* merge = TargetBlock(ctx.program, info.terminator.merge_block);
+			const IR::Block* body = nullptr;
+			if (info.terminator.kind == CFG::TerminatorKind::Branch) {
+				body = TargetBlock(ctx.program, info.terminator.true_block);
+			} else if (info.terminator.kind == CFG::TerminatorKind::ConditionalBranch) {
+				const auto* on_true  = TargetBlock(ctx.program, info.terminator.true_block);
+				const auto* on_false = TargetBlock(ctx.program, info.terminator.false_block);
+				body = on_true == merge ? on_false : on_false == merge ? on_true : nullptr;
+			}
+			if (body != nullptr && body != merge) {
+				structured.guarded_loop_bodies.insert(body);
+			}
 		}
 	}
 	ctx.state.builder.AddFunction({OpBranch, ctx.Label(ctx.program.blocks.front())});
 	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
 		const auto* block = ctx.program.blocks[index];
+		bool        emit_loop_guard = structured.guarded_loop_bodies.contains(block);
 		EmitBlock(ctx, block, [&](const IR::Inst& inst) {
+			if (emit_loop_guard && inst.GetOpcode() != IR::ValueOpcode::Phi) {
+				EmitKillIfBoolFalse(ctx.state, EmitGraphicsLoopWithinBudget(ctx));
+				emit_loop_guard = false;
+			}
 			EmitStructuredInstruction(ctx, structured, inst);
 		});
 		if (structured.dedicated_continues.contains(block) &&
@@ -677,6 +715,13 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (state.stage == ShaderType::Pixel && state.wave_size == 64u &&
+	    state.native_subgroup_size == 32u &&
+	    std::ranges::any_of(program.block_info,
+	                        [](const IR::BlockInfo& info) { return info.terminator.loop_header; })) {
+		state.graphics_loop_counter_variable = state.builder.AllocateId();
+		state.builder.AddName(state.graphics_loop_counter_variable, "graphics_loop_counter");
+	}
 	for (const auto* block: program.blocks) {
 		ctx.labels.emplace(block, state.builder.AllocateId());
 	}
@@ -764,6 +809,11 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           state.pixel_valid_mask_variable, StorageClassFunction});
 	}
+	if (state.graphics_loop_counter_variable != 0) {
+		state.builder.AddFunction({OpVariable,
+		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
+		                           state.graphics_loop_counter_variable, StorageClassFunction});
+	}
 	if (cooperative) DeclareCooperativeFunctionVariables(ctx, *cooperative);
 	if (state.program.dispatcher_fallback) {
 		for (const auto* block: program.blocks) {
@@ -789,6 +839,10 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(
 		    {OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
+	}
+	if (state.graphics_loop_counter_variable != 0) {
+		state.builder.AddFunction(
+		    {OpStore, state.graphics_loop_counter_variable, ConstantU32(state, 0)});
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

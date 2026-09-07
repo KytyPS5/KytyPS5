@@ -41,6 +41,7 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 		const auto source_active = EmitBallotLaneActiveBool(state, ballot, target);
 		return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
 	}
+	target = NormalizeWaveLaneTarget(state, target);
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), shuffled,
 	                           ConstantU32(state, ScopeSubgroup), source, target});

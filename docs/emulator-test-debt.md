@@ -321,9 +321,9 @@ exact shader now passes resource tracking and compute-execution precheck in abou
 The bounded game run materialized all five candidates, emitted 103,404 SPIR-V words, compiled the
 shader as number 159 and advanced through six more shaders before the separate GPU draw fault.
 
-## Long compute dispatch watchdog isolation
+## GPU command completion fault isolation
 
-Status: runtime diagnosis in progress; production fix not started; automated regression deferred.
+Status: production diagnostics and native game validation complete; automated regression deferred.
 
 Observed trigger: after `7ceb0f3417f926f9` successfully materializes, emits 103,404 SPIR-V
 words, and compiles as shader 159, the game compiles six more shaders and the NVIDIA driver emits
@@ -358,6 +358,54 @@ Required tests:
   proving tiling neither invents work nor exceeds Vulkan limits.
 - Native Windows game run with validation plus a System-event check, proving the target dispatch
   completes without `nvlddmkm` 153 and execution advances beyond the current shader frontier.
+
+## Graphics wave64 on native subgroup32
+
+Status: production fix, native build, SPIR-V validation and game validation complete; automated
+regression deferred.
+
+Observed trigger: a wave64 pixel shader can be emitted for a host whose graphics stages execute
+with native subgroup size 32. The captured shader `964747887d898821` contains subgroup shuffles
+to guest lanes 31 and 63, and the lane-63 value controls a structured loop exit. Passing 63
+directly to `OpGroupNonUniformShuffle` is outside the native subgroup and leaves the result
+undefined. The corresponding four-vertex auto draw returns from recording but resets the NVIDIA
+driver while the renderer waits for completion.
+
+Exact cross-half exchange cannot be reconstructed with workgroup scratch and barriers in a
+fragment stage. The safe graphics fallback therefore has to define a coherent partitioned
+wave64 model: each native subgroup32 executes one guest half, guest lane selectors address the
+corresponding local lane, and native ballot bits are reflected into both 32-bit guest words. This
+keeps subgroup operations finite and deterministic while retaining an explicit correctness debt
+for values that truly differ between the two guest halves.
+
+Required tests:
+
+- Pixel and vertex wave64 compilation with a native subgroup32 profile, proving every constant
+  and dynamic `ReadLane`/DPP shuffle index supplied to SPIR-V is within 0...31.
+- Ballot, `EXEC`/`VCC`, WQM, find-first and lane-active cases proving both guest mask words use the
+  same native-half predicate and all derived bit tests remain internally consistent.
+- A bounded graphics loop whose exit reads guest lanes 31 and 63, proving the emitted module
+  validates and terminates on a native subgroup32 device instead of causing a watchdog reset.
+- A partitioned pixel loop that stops normally on iteration 255 and one that never makes
+  progress, proving the safety counter preserves the valid exit and terminates the latter
+  fragment after at most 256 body iterations. Multiple and nested loops must share a documented
+  per-invocation budget without creating invalid SPIR-V edges or broken Phi dominance.
+- Wave32, native subgroup64 and compute cooperative-wave64 cases proving the partitioned graphics
+  fallback does not alter their SPIR-V or execution plan.
+- Cross-half values that intentionally differ, documenting the approximation and proving the
+  emulator rejects or selects a future exact implementation before claiming pixel correctness.
+- Native Windows replay of the captured pixel/vertex pair followed by a game run, draw completion
+  markers and a System-event query proving the failing auto draw completes without a new
+  `nvlddmkm` 153 event.
+
+Current evidence: the emitted pixel module for `964747887d898821` passes `spirv-val` with the
+loop counter inserted at the direct loop-body entry after Phi nodes. In native run
+`yotei-integrated-20260907-073053-841d50`, the formerly failing four-vertex auto draw produced
+`after-complete`; later draw and dispatch commands completed, no new `nvlddmkm` event appeared,
+and execution advanced from shader 164 through shader 171. The next failure is an independent
+CPU decoder rejection of GFX10 `MUBUF opcode 0x20` in compute shader `d7a83911714a58ee`.
+This evidence proves the watchdog failure is cleared for the captured path; it does not prove
+exact guest cross-half values or non-black pixel output.
 
 ## Periodic Vulkan pipeline-cache checkpoints
 

@@ -551,6 +551,9 @@ struct PipelineCache::ProgramCache {
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.host_profile = host_profile;
+		// Native subgroup width also constrains graphics wave operations. Compute
+		// consumes the remaining workgroup limits through the same host profile.
+		options.compute_workgroup_limits = compute_workgroup_limits;
 		if constexpr (stage == ShaderType::Vertex) {
 			options.user_data_base = 8;
 			options.scratch_dwords = input_info.scratch_size_dwords;
@@ -559,7 +562,6 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.scratch_dwords = input_info.scratch_size_dwords;
 			options.wave_size      = input_info.wave_size;
-			options.compute_workgroup_limits = compute_workgroup_limits;
 		}
 		CaptureDispatchedShader(params, options, lookup_key.static_state, guest_workgroups);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);

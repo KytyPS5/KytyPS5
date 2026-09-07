@@ -386,8 +386,15 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	}
 	EmitterState state(program, input_info, specialization);
 	state.f64_certificate = f64;
-	state.stage     = program.stage;
-	state.wave_size = program.wave_size;
+	state.stage                = program.stage;
+	state.wave_size            = program.wave_size;
+	state.native_subgroup_size = compute_workgroup_limits.native_subgroup_size;
+	if (state.stage != ShaderType::Compute && state.wave_size == 64u &&
+	    state.native_subgroup_size == 32u) {
+		LOGF("graphics wave64 partitioned over native subgroup32: hash=0x%016" PRIx64
+		     " stage=%u\n",
+		     program.shader_hash, static_cast<unsigned>(program.stage));
+	}
 	if (state.stage == ShaderType::Compute) {
 		if (input_info.compute == nullptr) {
 			Fail(program, "compute shader requires stage input information");

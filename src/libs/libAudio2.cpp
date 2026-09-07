@@ -261,7 +261,11 @@ static AudioInternal::Format audioout2_data_format_to_audio_format(uint32_t data
 				case 8:
 					return is_std ? AudioInternal::Format::Float8ChStd
 					              : AudioInternal::Format::Float8Ch;
-				case 12: return AudioInternal::Format::Float12Ch;
+				case 12:
+					if (!is_std) {
+						return AudioInternal::Format::Float12Ch;
+					}
+					break;
 				default: break;
 			}
 			break;
@@ -272,7 +276,6 @@ static AudioInternal::Format audioout2_data_format_to_audio_format(uint32_t data
 				case 8:
 					return is_std ? AudioInternal::Format::Signed16bit8ChStd
 					              : AudioInternal::Format::Signed16bit8Ch;
-				case 12: return AudioInternal::Format::Signed16bit12Ch;
 				default: break;
 			}
 			break;

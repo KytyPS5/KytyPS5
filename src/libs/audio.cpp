@@ -105,7 +105,7 @@ private:
 		Format   format           = Format::Unknown;
 		uint64_t last_output_time = 0;
 		int      channels_num     = 0;
-		int      volume[16]       = {};
+		int      volume[12]       = {};
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
@@ -127,14 +127,12 @@ private:
 	static bool            FormatIsFloat(Format format);
 	static bool            FormatIsStd(Format format);
 	static uint32_t        BytesPerSample(Format format);
-	static uint32_t        FrameSize(const PortOut& port);
+	static uint32_t        OutputChannels(const PortOut& port);
 	static SDL_AudioFormat SdlFormat(Format format);
 	static bool            OpenSdlDevice(PortOut* port);
 	static void            CloseSdlDevice(PortOut* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
-	static void            DownmixToStereo(const PortOut& port, const void* data,
-	                                       std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
 };
 
@@ -203,9 +201,14 @@ Audio::~Audio() {
 }
 
 bool Audio::FormatIsFloat(Format format) {
-	return (format == Format::FloatMono || format == Format::FloatStereo ||
-	        format == Format::Float8Ch || format == Format::Float8ChStd ||
-	        format == Format::Float12Ch);
+	switch (format) {
+		case Format::FloatMono:
+		case Format::FloatStereo:
+		case Format::Float8Ch:
+		case Format::Float8ChStd:
+		case Format::Float12Ch: return true;
+		default: return false;
+	}
 }
 
 bool Audio::FormatIsStd(Format format) {
@@ -216,8 +219,9 @@ uint32_t Audio::BytesPerSample(Format format) {
 	return FormatIsFloat(format) ? sizeof(float) : sizeof(int16_t);
 }
 
-uint32_t Audio::FrameSize(const PortOut& port) {
-	return BytesPerSample(port.format) * port.channels_num;
+uint32_t Audio::OutputChannels(const PortOut& port) {
+	// SDL only takes up to 8 channels. Keep the guest buffer's channel count separate.
+	return std::min(port.channels_num, 8);
 }
 
 SDL_AudioFormat Audio::SdlFormat(Format format) {
@@ -235,8 +239,7 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
-	desired.channels =
-	    static_cast<Uint8>(port->channels_num > 8 ? 2 : port->channels_num);
+	desired.channels = static_cast<Uint8>(OutputChannels(*port));
 	desired.samples  = static_cast<Uint16>(port->samples_num);
 	desired.callback = nullptr;
 
@@ -276,8 +279,9 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 
 	const auto frames           = port.samples_num;
 	const auto channels         = static_cast<uint32_t>(port.channels_num);
+	const auto output_channels  = OutputChannels(port);
 	const auto bytes_per_sample = BytesPerSample(port.format);
-	const auto src_size         = frames * channels * bytes_per_sample;
+	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
 
 	bool volume_changed = false;
 	for (uint32_t ch = 0; ch < channels; ch++) {
@@ -287,24 +291,35 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		}
 	}
 
-	if (!volume_changed && !FormatIsStd(port.format)) {
+	if (!volume_changed && !reorder) {
 		return data;
 	}
 
-	buffer->resize(src_size);
+	buffer->resize(frames * output_channels * bytes_per_sample);
 
-	static constexpr uint32_t STD_8CH_MAP[8] = {0, 1, 2, 3, 6, 7, 4, 5};
+	// SDL wants back speakers before side speakers; non-STD PCM has them reversed.
+	static constexpr uint32_t SDL_8CH_MAP[8] = {0, 1, 2, 3, 6, 7, 4, 5};
 
 	if (FormatIsFloat(port.format)) {
 		auto*       dst = reinterpret_cast<float*>(buffer->data());
 		const auto* src = static_cast<const float*>(data);
 
 		for (uint32_t frame = 0; frame < frames; frame++) {
-			for (uint32_t ch = 0; ch < channels; ch++) {
-				const auto src_ch =
-				    (FormatIsStd(port.format) && channels == 8 ? STD_8CH_MAP[ch] : ch);
-				dst[frame * channels + ch] = src[frame * channels + src_ch] *
-				                             (static_cast<float>(port.volume[ch]) / 32768.0f);
+			for (uint32_t ch = 0; ch < output_channels; ch++) {
+				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
+				dst[frame * output_channels + ch] =
+				    src[frame * channels + src_ch] *
+				    (static_cast<float>(port.volume[src_ch]) / 32768.0f);
+			}
+			if (channels == 12) {
+				// Add the four top channels to their front/back channels, turning 12 into 8.
+				// SDL handles the rest if the output device has fewer channels.
+				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
+				for (uint32_t ch = 0; ch < 4; ch++) {
+					dst[frame * output_channels + HEIGHT_DST[ch]] +=
+					    src[frame * channels + 8 + ch] *
+					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f);
+				}
 			}
 		}
 	} else {
@@ -312,79 +327,21 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		const auto* src = static_cast<const int16_t*>(data);
 
 		for (uint32_t frame = 0; frame < frames; frame++) {
-			for (uint32_t ch = 0; ch < channels; ch++) {
-				const auto src_ch =
-				    (FormatIsStd(port.format) && channels == 8 ? STD_8CH_MAP[ch] : ch);
+			for (uint32_t ch = 0; ch < output_channels; ch++) {
+				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[ch] / 32768;
+				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
 					sample = std::numeric_limits<int16_t>::min();
 				}
-				dst[frame * channels + ch] = static_cast<int16_t>(sample);
+				dst[frame * output_channels + ch] = static_cast<int16_t>(sample);
 			}
 		}
 	}
 
 	return buffer->data();
-}
-
-// SDL2 only accepts 1..8 channels (SDL_SupportedChannelCount), so downmix an
-// unsupported layout (12ch 7.1.4) to stereo before handing it to SDL.
-//
-// PS5 SceAudioOut2 12-channel (7.1.4) buffer order:
-//   [0..3]  FL FR FC LFE            (front bed + low-frequency effects)
-//   [4..7]  side/rear surrounds     (SL SR BL BR in the "std" order;
-//                                     BL BR SL SR in the non-std order)
-//   [8..11] top/height channels     (TFL TFR TBL TBR)
-//
-// The first four channels are L R C LFE in every SceAudioOut2 convention. The
-// four surround/back channels are summed into L/R with one shared weight and the
-// four top channels with another, so their internal ordering (std vs non-std)
-// does not change the stereo result.
-//
-// Downmix matrix (stereo L/R):
-//   center       kCenter  = -3 dB (ITU-R BS.775 Lo/Ro)
-//   surround/back kSurround = -6 dB  (folded in conservatively to avoid clipping)
-//   top/height   kTop     = -9 dB  (folded in as ambience)
-//   LFE          discarded (standard for a stereo downmix)
-void Audio::DownmixToStereo(const PortOut& port, const void* data, std::vector<uint8_t>* buffer) {
-	const uint32_t frames = port.samples_num;
-	const uint32_t src_ch = port.channels_num;
-
-	constexpr float kCenter   = 0.70710678f; // -3 dB
-	constexpr float kSurround = 0.5f;        // -6 dB
-	constexpr float kTop      = 0.35355339f; // -9 dB
-
-	if (FormatIsFloat(port.format)) {
-		buffer->resize(frames * 2 * sizeof(float));
-		auto*       dst = reinterpret_cast<float*>(buffer->data());
-		const auto* src = static_cast<const float*>(data);
-		for (uint32_t f = 0; f < frames; f++) {
-			const float* in = src + static_cast<size_t>(f) * src_ch;
-			dst[f * 2 + 0] = in[0] + kCenter * in[2] + kSurround * (in[4] + in[6]) +
-			                  kTop * (in[8] + in[10]);
-			dst[f * 2 + 1] = in[1] + kCenter * in[2] + kSurround * (in[5] + in[7]) +
-			                  kTop * (in[9] + in[11]);
-		}
-		return;
-	}
-
-	// Fixed-point approximations of the same matrix: 181/256 ~ kCenter, >>1 ~ 0.5,
-	// 90/256 ~ kTop.
-	buffer->resize(frames * 2 * sizeof(int16_t));
-	auto*       dst = reinterpret_cast<int16_t*>(buffer->data());
-	const auto* src = static_cast<const int16_t*>(data);
-	for (uint32_t f = 0; f < frames; f++) {
-		const int16_t* in = src + static_cast<size_t>(f) * src_ch;
-		const int32_t l = in[0] + ((static_cast<int32_t>(in[2]) * 181) >> 8) +
-		                  (in[4] >> 1) + (in[6] >> 1) + ((in[8] * 90) >> 8) + ((in[10] * 90) >> 8);
-		const int32_t r = in[1] + ((static_cast<int32_t>(in[2]) * 181) >> 8) +
-		                  (in[5] >> 1) + (in[7] >> 1) + ((in[9] * 90) >> 8) + ((in[11] * 90) >> 8);
-		dst[f * 2 + 0] = static_cast<int16_t>(std::clamp(l, -32768, 32767));
-		dst[f * 2 + 1] = static_cast<int16_t>(std::clamp(r, -32768, 32767));
-	}
 }
 
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
@@ -395,26 +352,18 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
-
-	// Downmix unsupported layouts (12ch 7.1.4) to stereo before SDL sees them.
-	std::vector<uint8_t> downmix_buffer;
-	uint32_t             queue_channels = port->channels_num;
-	uint32_t             queue_bytes    = FrameSize(*port) * port->samples_num;
-	if (queue_channels > 8) {
-		DownmixToStereo(*port, prepared_data, &downmix_buffer);
-		prepared_data  = downmix_buffer.data();
-		queue_channels = 2;
-		queue_bytes    = port->samples_num * 2 * BytesPerSample(port->format);
-	}
+	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
+	const auto           output_channels = OutputChannels(*port);
+	const auto           prepared_size =
+	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
 	std::vector<uint8_t> convert_buffer;
 	const void*          queue_data = prepared_data;
-	uint32_t             queue_size = queue_bytes;
+	uint32_t             queue_size = prepared_size;
 
 	SDL_AudioCVT cvt {};
 	const int    cvt_result =
-	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(queue_channels),
+	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(output_channels),
 	                      static_cast<int>(port->freq), port->audio_spec.format,
 	                      port->audio_spec.channels, port->audio_spec.freq);
 
@@ -424,11 +373,11 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	if (cvt_result > 0) {
-		convert_buffer.resize(queue_bytes * cvt.len_mult);
-		std::memcpy(convert_buffer.data(), prepared_data, queue_bytes);
+		convert_buffer.resize(prepared_size * cvt.len_mult);
+		std::memcpy(convert_buffer.data(), prepared_data, prepared_size);
 
 		cvt.buf = convert_buffer.data();
-		cvt.len = static_cast<int>(queue_bytes);
+		cvt.len = static_cast<int>(prepared_size);
 
 		if (SDL_ConvertAudio(&cvt) < 0) {
 			LOGF("AudioOut: SDL_ConvertAudio failed: %s\n", SDL_GetError());
@@ -487,7 +436,6 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				case Format::Float8Ch:
 				case Format::Signed16bit8ChStd:
 				case Format::Float8ChStd: port.channels_num = 8; break;
-				case Format::Signed16bit12Ch:
 				case Format::Float12Ch: port.channels_num = 12; break;
 				default: EXIT("unknown format");
 			}
@@ -561,20 +509,9 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 			auto bit = bitflag & 0x1u;
 
 			if (bit == 1) {
-				int src_index = i;
-				if (port.format == Format::Float8ChStd ||
-				    port.format == Format::Signed16bit8ChStd) {
-					switch (i) {
-						case 4: src_index = 6; break;
-						case 5: src_index = 7; break;
-						case 6: src_index = 4; break;
-						case 7: src_index = 5; break;
-						default:;
-					}
-				}
-				port.volume[i] = volume[src_index];
+				port.volume[i] = volume[i];
 
-				LOGF("\t port.volume[%d] = volume[%d] (%d)\n", i, src_index, volume[src_index]);
+				LOGF("\t port.volume[%d] = volume[%d] (%d)\n", i, i, volume[i]);
 			}
 		}
 

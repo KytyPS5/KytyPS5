@@ -227,7 +227,8 @@ interface VUID.
 
 ## Missing producer declarations for consumed graphics-stage parameters
 
-Status: diagnosis complete; production fix not started; automated regression deferred.
+Status: production fix, native build and bounded game validation complete; automated regression
+deferred.
 
 Observed trigger: a fragment shader declares a per-vertex `array[3] of vec4` input at SPIR-V
 Location 2, while the paired vertex shader does not declare an output at that location. Both
@@ -248,6 +249,14 @@ Required tests:
   requirement participates in the static key and cannot reuse an incompatible module.
 - Host `maxVertexOutputComponents` admission and a bounded validation run beyond the pipeline pair
   containing vertex shader `ee4f153aa500d327`.
+
+The program cache now compiles the active pixel stage first and carries its exact guest-source to
+host-location parameter links into the paired vertex static key. Vertex compilation keeps matching
+exports, duplicates a produced value when collision remapping needs an alias, removes an
+unconsumed output that occupies a required location, and declares an unwritten synthetic output
+when the guest producer is absent. A native Windows build of both targets completed. Diagnostic
+run `yotei-integrated-20260907-051751-146531` advanced from shader 142 to 158 without the previous
+Location 2 VUID or another validation/fatal message.
 
 ## Periodic Vulkan pipeline-cache checkpoints
 

@@ -22307,6 +22307,10 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   code.push_back(EncodeMimg0(0x2d, 0x1));
   code.push_back(EncodeMimg1(0, 20, 0, 0, true));
   AppendStoreVgpr(&code, 0, 0);
+  // Ordinary and comparison reads of one sharp require distinct SPIR-V image types.
+  code.push_back(EncodeMimg0(0x27, 0x1));
+  code.push_back(EncodeMimg1(1, 22, 0, 0, true));
+  AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
   TestCase test;
@@ -22314,7 +22318,9 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+  test.required_spirv = {"OpTypeImage %float 2D 0", "OpTypeImage %float 2D 1",
+                         "OpImageSampleDrefExplicitLod", "OpImageSampleExplicitLod",
+                         "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
 }
@@ -28097,6 +28103,7 @@ int main(int argc, char **argv) {
     CheckSampledDepthResource();
     CheckDepthTextureEncoding(vulkan.RuntimeRenderer());
     vulkan.CheckComparisonDepthTexture();
+    RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

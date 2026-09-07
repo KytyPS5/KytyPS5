@@ -24963,31 +24963,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-void CheckDepthTextureEncoding(RenderContext &renderer) {
-  auto &context = renderer.GetGraphics();
-  CommandScheduler scheduler(renderer, context);
-  const auto make_info = [](uint32_t width, uint32_t height, uint32_t pitch,
-                            uint32_t layers, vk::Format format,
-                            Prospero::ImageType type, uint32_t samples = 1) {
-    ImageInfo info{};
-    info.pixel_format = format;
-    info.guest_format = Prospero::BufferFormat::k32Float;
-    info.type = type;
-    info.extent = {width, height, 1};
-    info.resources = {1, layers};
-    info.pitch = pitch;
-    info.bytes_per_block = 4;
-    info.samples = samples;
-    info.tile_mode = Prospero::TileMode::kDepth;
-    info.mip_layout[0] = {0, static_cast<uint64_t>(pitch) * height * layers * 4,
-                          pitch, height};
-    return info;
-  };
-
-  Image image(context, scheduler,
-              make_info(1344, 756, 1408, 1, vk::Format::eD32SfloatS8Uint,
-                        Prospero::ImageType::kColor2D));
-  image.usage.depth_target = true;
+void CheckDepthTextureEncoding() {
   const ShaderTextureResource disabled_sampler_tweaks{{
       0x05135600u,
       0xc1600000u,
@@ -25000,7 +24976,7 @@ void CheckDepthTextureEncoding(RenderContext &renderer) {
   }};
   Require("DepthTextureEncoding", "disabled sampler tweaks",
           disabled_sampler_tweaks.PerfMod5() == 0 &&
-              IsSupportedDepthTextureEncoding(disabled_sampler_tweaks, image),
+              IsSupportedDepthTextureEncoding(disabled_sampler_tweaks),
           "valid sampler modulation factor zero was rejected");
 
   const ShaderTextureResource uncompressed_msaa{{
@@ -25013,23 +24989,17 @@ void CheckDepthTextureEncoding(RenderContext &renderer) {
       0x00000000u,
       0x00000000u,
   }};
-  auto msaa_info = make_info(1920, 1080, 1920, 1, vk::Format::eD32Sfloat,
-                             Prospero::ImageType::kColor2D, 2);
-  msaa_info.mip_layout[0] = {0, 0x010e0000, 1920, 1152};
-  Image msaa_image(context, scheduler, msaa_info);
-  msaa_image.usage.depth_target = true;
   Require("DepthTextureEncoding", "uncompressed 2x MSAA depth",
-          IsSupportedDepthTextureEncoding(uncompressed_msaa, msaa_image),
+          IsSupportedDepthTextureEncoding(uncompressed_msaa),
           "valid uncompressed MSAA depth descriptor required an HTILE "
           "compatibility flag");
 
   auto r128_msaa = uncompressed_msaa;
   std::fill(r128_msaa.fields + 4, r128_msaa.fields + 8, 0u);
   Require("DepthTextureEncoding", "R128 uncompressed 2x MSAA depth",
-          IsSupportedDepthTextureEncoding(r128_msaa, msaa_image, true),
+          IsSupportedDepthTextureEncoding(r128_msaa, true),
           "valid R128 MSAA depth descriptor required omitted dwords");
 
-  constexpr uint64_t captured_htile_address = 0x106d48000ull;
   const ShaderTextureResource compressed_descriptor{{
       0x0104d500u,
       0xc1600000u,
@@ -25040,44 +25010,37 @@ void CheckDepthTextureEncoding(RenderContext &renderer) {
       0x80280000u,
       0x000106d4u,
   }};
-  image.info.metadata.range = {captured_htile_address, 0x1000};
-  image.info.metadata.kind = ImageMetadataKind::Htile;
-  auto mismatched_metadata = compressed_descriptor;
-  mismatched_metadata.fields[7] ^= 1u;
-  auto mismatched_metadata_low = compressed_descriptor;
-  mismatched_metadata_low.fields[6] ^= 1u << 24u;
+  Require("DepthTextureEncoding", "compressed HTILE descriptor",
+          IsSupportedDepthTextureEncoding(compressed_descriptor),
+          "valid compressed depth descriptor required a prior depth target");
+
+  const ShaderTextureResource first_use_depth{{
+      0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
+      0x00000000u, 0x00700000u, 0x80280000u, 0x000225fdu,
+  }};
+  Require("DepthTextureEncoding", "PPSA30490 first-use 1x1 depth",
+          IsSupportedDepthTextureEncoding(first_use_depth),
+          "captured comparison texture required tracked HTILE metadata");
+
+  auto missing_metadata = compressed_descriptor;
+  missing_metadata.fields[6] &= 0x00ffffffu;
+  missing_metadata.fields[7] = 0;
+  auto out_of_range_metadata = compressed_descriptor;
+  out_of_range_metadata.fields[7] = TRACKER_ADDRESS_SIZE >> 16u;
+  auto unaligned_metadata = compressed_descriptor;
+  unaligned_metadata.fields[6] ^= 1u << 24u;
   auto dcc_only_control = compressed_descriptor;
   dcc_only_control.fields[6] |= 1u << 22u;
   auto non_msaa_iterate_256 = compressed_descriptor;
   non_msaa_iterate_256.fields[6] |= 1u << 10u;
-  const bool accepts_compressed =
-      IsSupportedDepthTextureEncoding(compressed_descriptor, image);
-  image.info.metadata.kind = ImageMetadataKind::Dcc;
-  const bool rejects_dcc =
-      !IsSupportedDepthTextureEncoding(compressed_descriptor, image);
-  image.info.metadata.kind = ImageMetadataKind::None;
-  const bool rejects_none =
-      !IsSupportedDepthTextureEncoding(compressed_descriptor, image);
-  image.info.metadata.kind = ImageMetadataKind::Htile;
-  image.info.metadata.range.size = 0;
-  const bool rejects_empty =
-      !IsSupportedDepthTextureEncoding(compressed_descriptor, image);
-  image.info.metadata.range.size =
-      TRACKER_ADDRESS_SIZE - captured_htile_address + 1u;
-  const bool rejects_overflow =
-      !IsSupportedDepthTextureEncoding(compressed_descriptor, image);
-  image.info.metadata.range.size = 0x1000;
   Require(
-      "DepthTextureEncoding", "compressed HTILE descriptor",
-      accepts_compressed &&
-          !IsSupportedDepthTextureEncoding(mismatched_metadata, image) &&
-          !IsSupportedDepthTextureEncoding(mismatched_metadata_low, image) &&
-          !IsSupportedDepthTextureEncoding(dcc_only_control, image) &&
-          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256, image),
-      "compressed sampled depth did not require its exact tracked HTILE");
-  Require("DepthTextureEncoding", "tracked HTILE state",
-          rejects_dcc && rejects_none && rejects_empty && rejects_overflow,
-          "compressed sampled depth accepted invalid tracked metadata");
+      "DepthTextureEncoding", "invalid HTILE encoding",
+      !IsSupportedDepthTextureEncoding(missing_metadata) &&
+          !IsSupportedDepthTextureEncoding(out_of_range_metadata) &&
+          !IsSupportedDepthTextureEncoding(unaligned_metadata) &&
+          !IsSupportedDepthTextureEncoding(dcc_only_control) &&
+          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256),
+      "compressed sampled depth accepted an unsupported address or control");
 
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
 }
@@ -28194,7 +28157,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
-    CheckDepthTextureEncoding(vulkan.RuntimeRenderer());
+    CheckDepthTextureEncoding();
     vulkan.CheckComparisonDepthTexture();
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
@@ -28274,7 +28237,7 @@ int main(int argc, char **argv) {
   CheckSampledVideoOutView(vulkan.RuntimeRenderer());
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
-  CheckDepthTextureEncoding(vulkan.RuntimeRenderer());
+  CheckDepthTextureEncoding();
   vulkan.CheckComparisonDepthTexture();
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();

@@ -198,8 +198,7 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 	       descriptor.BaseArray5() == 0;
 }
 
-bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, const Image& image,
-                                     bool r128) {
+bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
@@ -230,17 +229,15 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, co
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
 	return (descriptor.fields[6] & 0x00ffffffu) == expected_control && metadata_addr != 0 &&
-	       descriptor.TileMode() == Prospero::TileMode::kDepth &&
-	       image.info.tile_mode == Prospero::TileMode::kDepth &&
-	       image.info.metadata.kind == ImageMetadataKind::Htile &&
-	       image.info.metadata.range.Valid() && image.info.metadata.range.address == metadata_addr;
+	       metadata_addr < TRACKER_ADDRESS_SIZE && (metadata_addr & 0x7fffu) == 0 &&
+	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
 static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
-	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, image, resource.r128);
+	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, resource.r128);
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {

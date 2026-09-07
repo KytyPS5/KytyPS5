@@ -605,10 +605,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 		                       : depth_attachment_layout(depth);
-		const bool written =
-		    depth.depth_write_enable ||
-		    static_cast<bool>(depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil);
-		if (!feedback && written && image.binding.is_bound) {
+		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
+		if (depth.depth_write_enable) {
+			writable |= vk::ImageAspectFlagBits::eDepth;
+		}
+		const auto pixel_writable = feedback ? writable & ~vk::ImageAspectFlagBits::eDepth : writable;
+		if (static_cast<bool>(image.binding.pixel_sampled_aspects & pixel_writable) ||
+		    static_cast<bool>(image.binding.other_sampled_aspects & writable)) {
 			layout = vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.

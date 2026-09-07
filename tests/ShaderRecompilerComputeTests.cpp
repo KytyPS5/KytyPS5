@@ -10126,9 +10126,13 @@ public:
                     shared_rendering.depth_stencil_attachment.image_layout ==
                         expected_layout &&
                     shared_image.backing.state.layout == expected_layout &&
-                    shared_image.backing.state.access_mask == expected_access,
-                "a shader alias replaced the depth/stencil attachment layout "
-                "or dropped an attachment access");
+                    shared_image.backing.state.access_mask == expected_access &&
+                    shared_image.binding.pixel_sampled_aspects ==
+                        vk::ImageAspectFlagBits::eDepth &&
+                    shared_image.binding.other_sampled_aspects ==
+                        vk::ImageAspectFlagBits::eDepth,
+                "a shader alias replaced the depth/stencil attachment layout, "
+                "dropped an attachment access or lost its sampled aspects");
         scheduler.BeginRendering(shared_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);

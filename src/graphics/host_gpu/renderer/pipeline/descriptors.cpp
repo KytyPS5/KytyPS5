@@ -964,6 +964,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		const auto host_view =
+		    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+		if (host_view != image.views.end()) {
+			auto& sampled = program.stage == ShaderType::Pixel
+			                    ? image.binding.pixel_sampled_aspects
+			                    : image.binding.other_sampled_aspects;
+			sampled |= host_view->info.aspect;
+		}
 	}
 }
 

@@ -42,6 +42,8 @@ struct ImageBinding {
 	bool             needs_rebind  = false;
 	bool             force_general = false;
 	bool             shader_write  = false;
+	vk::ImageAspectFlags pixel_sampled_aspects;
+	vk::ImageAspectFlags other_sampled_aspects;
 };
 
 class Image final {

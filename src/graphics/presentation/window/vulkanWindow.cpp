@@ -623,22 +623,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	supported_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
 	supported_features2.pNext = mesh_extension ? static_cast<void*>(&supported_mesh)
 	                                           : static_cast<void*>(&supported_features13);
-	const bool feedback_extensions =
-	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
-	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
-	vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout {};
-	vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic {};
-	if (feedback_extensions) {
-		feedback_dynamic.pNext = supported_features2.pNext;
-		feedback_layout.pNext  = &feedback_dynamic;
-		supported_features2.pNext = &feedback_layout;
-	}
 	physical_device.getFeatures2(&supported_features2);
-	graphics.attachment_feedback_loop_enabled =
-	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
-	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
-	LOGF("Vulkan attachment feedback loop: %s\n",
-	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 	if (graphics.mesh_shader_enabled) {
 		vk::PhysicalDeviceProperties2 properties {};
@@ -746,11 +731,6 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
 	create_info.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
-	if (graphics.attachment_feedback_loop_enabled) {
-		feedback_dynamic.pNext =
-		    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
-		create_info.pNext = &feedback_layout;
-	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1136,11 +1116,6 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
-		}
-		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
-		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
-			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 	}
 

@@ -54,9 +54,6 @@ namespace {
 	}
 	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
-			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
-		}
 		return usage;
 	}
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {

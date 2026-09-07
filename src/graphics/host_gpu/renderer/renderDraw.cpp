@@ -850,7 +850,14 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
 			break;
-		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+		default: {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Skipping draw with unknown primitive type: %u\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()));
+			}
+			return false;
+		}
 	}
 
 	return true;

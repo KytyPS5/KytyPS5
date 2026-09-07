@@ -19,6 +19,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -174,15 +175,24 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		ConfigureGarbageCollectionBudget(m_graphics.GetTotalMemoryBudget());
+	}
+}
+
+void TextureCache::ConfigureGarbageCollectionBudget(uint64_t available_budget) {
+	constexpr int64_t GiB = 1024ll * 1024 * 1024;
+	const auto budget = static_cast<int64_t>(std::min<uint64_t>(available_budget, INT64_MAX));
+	const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+	m_pressure_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	m_critical_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	// Keep reusable images resident until memory is actually under pressure.
+	m_trigger_gc_memory = m_pressure_gc_memory;
+	if (const auto* legacy = std::getenv("KYTY_TEXTURE_CACHE_EARLY_GC");
+	    legacy != nullptr && std::strcmp(legacy, "1") == 0) {
+		m_trigger_gc_memory =
+		    static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
 }
 

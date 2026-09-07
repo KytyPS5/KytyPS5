@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/releaseMemBatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -61,6 +62,11 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	void            FlushPendingReleaseMem();
+	bool DeferReleaseMemFlush(std::span<const uint32_t> current,
+	                          std::span<const uint32_t> next) {
+		return m_release_mem_batch.Defer(current, next);
+	}
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -173,6 +179,7 @@ private:
 
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
+	ReleaseMemBatch m_release_mem_batch;
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;

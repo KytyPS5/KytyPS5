@@ -404,8 +404,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// Read-only dispatches need ordering, but no memory visibility operation.
+	const bool writes_memory =
+	    has_storage_writes || program.info.uses_dma || bindings.gds.buffer != nullptr ||
+	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                [](const auto& resource) { return resource.written || resource.atomic; }) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& resource) { return resource.written || resource.atomic; });
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
 	ResetBindings();
 }
 

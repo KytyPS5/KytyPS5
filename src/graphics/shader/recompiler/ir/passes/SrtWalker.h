@@ -24,7 +24,7 @@ struct SrtRuntime {
 	std::optional<std::array<uint32_t, 3>> compute_workgroups;
 };
 
-// A raw scalar read bounded by an unsigned loop guard or one actual dispatch axis.
+// A raw scalar read bounded by a loop guard or one actual dispatch axis.
 // offset_scale/index + offset_bias uses U32 arithmetic BEFORE separate signed
 // memory_offset addition/alignment, matching raw SMEM address evaluation.
 struct BoundedSrtReadProof {
@@ -39,6 +39,7 @@ struct BoundedSrtReadProof {
 	uint32_t offset_bias = 0;
 	uint32_t memory_offset = 0;
 	uint32_t workgroup_axis = UINT32_MAX;
+	bool count_signed = false;
 };
 std::optional<BoundedSrtReadProof> ProveBoundedSrtRead(const Program& program,
                                                      const Inst& read);

@@ -1208,7 +1208,7 @@ public:
 		}
 		if (initial == nullptr || latch == nullptr || initial == latch) return {};
 		const auto index = Value(const_cast<Inst*>(phi));
-		const auto make_proof = [&](Value count) {
+		const auto make_proof = [&](Value count, bool count_signed = false) {
 			return BoundedSrtReadProof {
 			    .index = index,
 			    .count = count,
@@ -1219,7 +1219,8 @@ public:
 			    .source_dwords = source_dwords,
 			    .offset_scale = offset.scale,
 			    .offset_bias = offset.bias,
-			    .memory_offset = memory.offset};
+			    .memory_offset = memory.offset,
+			    .count_signed = count_signed};
 		};
 		// A canonical post-test loop consumes index i, increments it once in the
 		// latch, and repeats while next < a positive constant. Requiring the read
@@ -1250,8 +1251,10 @@ public:
 				const bool signed_less = compare->GetOpcode() == ValueOpcode::SLessThan32;
 				if (bound.IsImmediate() && bound.GetType() == Type::U32 && bound.U32() != 0u &&
 				    (unsigned_less || (signed_less && bound.U32() <= INT32_MAX))) {
+					const Block* source_scope = buffer_read ? read.Parent() : header;
 					for (uint32_t word = 0; word < source_dwords; ++word)
-						if (!RuntimeReadsDominate(address->Arg(word), header)) return {};
+						if (!RuntimeReadsDominate(address->Arg(word), source_scope,
+						                          buffer_read ? &read : nullptr)) return {};
 					return make_proof(bound);
 				}
 			}
@@ -1284,24 +1287,31 @@ public:
 		const auto* compare = condition.TryInstruction();
 		if (compare == nullptr || compare->NumArgs() != 2u) return {};
 		Value count;
+		bool count_signed = false;
 		if (compare->GetOpcode() == ValueOpcode::ULessThan32 && compare->Arg(0).Resolve() == index)
 			count = compare->Arg(1).Resolve();
 		else if (compare->GetOpcode() == ValueOpcode::UGreaterThan32 && compare->Arg(1).Resolve() == index)
 			count = compare->Arg(0).Resolve();
+		else if (compare->GetOpcode() == ValueOpcode::SLessThan32 && compare->Arg(0).Resolve() == index) {
+			count = compare->Arg(1).Resolve();
+			count_signed = true;
+		}
 		else return {};
 		if (count.GetType() != Type::U32 || !ValidateRuntimeValue(m_program, count)) return {};
 		// Roots may be loaded in the preheader or in this unavoidable guard
 		// chain. Both execute even when N is zero; success-only pointer loads
 		// remain ineligible for eager snapshot evaluation.
 		if (!RuntimeReadsDominate(count, guard)) return {};
+		const Block* source_scope = buffer_read ? read.Parent() : guard;
 		for (uint32_t word = 0; word < source_dwords; ++word)
-			if (!RuntimeReadsDominate(address->Arg(word), guard)) return {};
+			if (!RuntimeReadsDominate(address->Arg(word), source_scope,
+			                          buffer_read ? &read : nullptr)) return {};
 		const auto success_id = invert ? info.terminator.false_block : info.terminator.true_block;
 		const auto* success = m_by_id.at(success_id);
 		// Removing the successful i<N edge must make the actual read unreachable.
 		// Block dominance alone is insufficient when the guard's false path merges.
 		if (Reachable(read.Parent(), nullptr, guard, success)) return {};
-		return make_proof(count);
+		return make_proof(count, count_signed);
 	}
 
 private:
@@ -1601,26 +1611,46 @@ private:
 		return false;
 	}
 	bool RuntimeReadsDominate(Value root, const Block* header, const Inst* before = nullptr) const {
-		std::vector<Value> work {root};
-		std::unordered_set<const Inst*> visited;
+		struct PendingValue {
+			Value value;
+			bool position_covered = false;
+		};
+		std::vector<PendingValue> work {{root, false}};
+		std::unordered_set<const Inst*> visited_covered;
+		std::unordered_set<const Inst*> visited_uncovered;
 		while (!work.empty()) {
-			const auto value = work.back().Resolve();
+			const auto pending = work.back();
 			work.pop_back();
+			const auto value = pending.value.Resolve();
 			const auto* inst = value.TryInstruction();
-			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst == nullptr) continue;
+			if (pending.position_covered) {
+				if (visited_uncovered.contains(inst) || !visited_covered.insert(inst).second) continue;
+			} else if (!visited_uncovered.insert(inst).second) {
+				continue;
+			}
 			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 				const auto slot = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
 				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 				    slot.U32() >= m_program.srt_reads.size()) return false;
-				work.push_back(m_program.srt_reads[slot.U32()].value);
-			}
-			if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-			    inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				// BuildSrtPlan may remove the raw instruction from its block after
+				// inserting this flat snapshot use. The surviving ReadConst owns the
+				// original execution position for the complete source expression.
 				if (inst->Parent() == nullptr || !Dominates(inst->Parent(), header)) return false;
 				if (before != nullptr && (!Dominates(inst->Parent(), before->Parent()) ||
 				    (inst->Parent() == before->Parent() && !Precedes(*inst, *before)))) return false;
+				work.push_back({m_program.srt_reads[slot.U32()].value, true});
 			}
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) work.push_back(inst->Arg(arg));
+			if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			    inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				if (!pending.position_covered) {
+					if (inst->Parent() == nullptr || !Dominates(inst->Parent(), header)) return false;
+					if (before != nullptr && (!Dominates(inst->Parent(), before->Parent()) ||
+					    (inst->Parent() == before->Parent() && !Precedes(*inst, *before)))) return false;
+				}
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+				work.push_back({inst->Arg(arg), pending.position_covered});
 		}
 		return true;
 	}

@@ -277,7 +277,7 @@ private:
 				}
 				const BoundedSrtRead read {address_source, count_source,
 				                          proof->offset_scale, proof->offset_bias, proof->memory_offset,
-				                          proof->workgroup_axis};
+				                          proof->workgroup_axis, proof->count_signed};
 				auto found = std::ranges::find(m_bounded_srt_reads, read);
 				uint32_t read_id = static_cast<uint32_t>(found - m_bounded_srt_reads.begin());
 				if (found == m_bounded_srt_reads.end()) m_bounded_srt_reads.push_back(read);
@@ -306,6 +306,7 @@ private:
 			const auto& next = m_bounded_srt_reads[words[word]->read_id];
 			if (words[word]->proof.index != words[0]->proof.index ||
 			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    first.count_signed != next.count_signed ||
 			    next.workgroup_axis != UINT32_MAX ||
 			    first.offset_scale != next.offset_scale || first.offset_bias != next.offset_bias ||
 			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
@@ -344,6 +345,7 @@ private:
 			const auto& next = m_bounded_srt_reads[words[word]->read_id];
 			if (words[word]->proof.index != words[0]->proof.index ||
 			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    first.count_signed != next.count_signed ||
 			    next.workgroup_axis != UINT32_MAX || first.offset_scale != next.offset_scale ||
 			    first.offset_bias != next.offset_bias ||
 			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
@@ -1137,8 +1139,13 @@ private:
 			bad_dword = 0;
 		}
 		if (!ValidateSource(descriptor, bad_dword)) {
+			const auto value = descriptor.dwords[bad_dword].Resolve();
+			const auto* definition = value.TryInstruction();
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			                     ValueOpcodeName(expected), bad_dword) +
+			             (definition != nullptr
+			                  ? fmt::format(" (root={})", ValueOpcodeName(definition->GetOpcode()))
+			                  : fmt::format(" (type={})", TypeName(value.GetType()))));
 		}
 		source = InternSource(descriptor);
 	}

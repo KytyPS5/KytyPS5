@@ -229,3 +229,106 @@ Required tests:
   entries on native subgroup-32 wave64 execution, including repeated and all-null entries.
 - Native Windows audit of the captured shader class and a bounded game run beyond its original
   `GetImageResource dword 0 is not a valid runtime value` failure.
+
+## Signed integer storage images
+
+Status: production fix, native build and bounded game validation complete; automated regression deferred.
+
+Observed trigger: a compute shader writes one component through a regular eight-dword 2D image
+descriptor whose guest format is `k16SInt`. Resource specialization rejected every signed
+integer storage image even though the descriptor maps directly to a Vulkan signed integer
+format and the shader does not use image atomics.
+
+Required tests:
+
+- Binding ABI coverage for signed storage images in each supported dimension, confirming that
+  sampled signed, storage signed, storage unsigned and atomic unsigned arrays remain distinct.
+- SPIR-V validation and Vulkan readback for `R8Sint`, `R16Sint`, `R8G8Sint`, `R16G16Sint`,
+  `R8G8B8A8Sint`, `R16G16B16A16Sint`, `R32Sint`, and the wider signed 32-bit formats supported
+  by the renderer.
+- Store conversion cases for negative, zero and positive 32-bit shader values, including
+  narrowing/clamping behavior of 8-bit and 16-bit signed image formats and component masks.
+- Signed storage reads and read/write resources must return the original signed component bits
+  to guest U32 registers; signed image atomics must remain rejected until their Vulkan contract
+  is implemented explicitly.
+- Mixed shaders using signed and unsigned storage images of the same dimension must allocate
+  separate descriptor bindings and pass descriptor-budget checks for compute and pixel stages.
+- Native Windows audit of `cs_0001dee4` and a bounded game run beyond shader
+  `753c552fae650ec4` and its `storage image descriptor ... unsupported format 12` failure.
+
+## GFX10 packed D16 formatted buffer loads
+
+Status: production fix, native build, exact shader audit and bounded game validation complete;
+automated regression deferred.
+
+Observed trigger: compute shader `da7e70d9fcafe48c` repeatedly uses GFX10 MUBUF opcode
+`0x83` (`BUFFER_LOAD_FORMAT_D16_XYZW`). The current decoder rejects the instruction before
+CFG construction. GFX10 also defines the related `0x80` through `0x82` load forms, whose one
+to four converted 16-bit components occupy one or two packed VGPRs.
+
+Required tests:
+
+- Decoder coverage for opcodes `0x80` through `0x83`, including exact destination DWORD and
+  logical component counts, formatted metadata, addressing flags and raw diagnostic output.
+- Vulkan readback for float, UNORM, SNORM, scaled, UINT and SINT descriptor formats, proving
+  float-class results become IEEE half values while integer-class results retain their low
+  sixteen result bits.
+- Packing cases for X, XY, XYZ and XYZW, including preservation of the unused high half of
+  the active destination VGPR for X and XYZ.
+- EXEC-disabled and split-wave64 cases proving all destination bits remain unchanged for
+  inactive guest lanes, including when VDATA overlaps VADDR.
+- Descriptor swizzle and out-of-bounds cases covering memory, zero and one selectors and a
+  format whose source record is wider than the packed destination.
+- Native Windows audit of the captured shader class and a bounded game run beyond shader
+  `da7e70d9fcafe48c` and its `unsupported family=MUBUF opcode=0x83` failure.
+
+## Loop-indexed scalar-buffer descriptor tables
+
+Status: production fix, native build, exact shader audit and bounded game validation complete;
+automated regression deferred.
+
+Observed trigger: a compute shader reads four correlated descriptor DWORDs from a scalar
+buffer table. A loop-carried induction Phi starts at zero, advances by one, and contributes
+`index * 196` to every table column. The loop is guarded by a signed comparison against a
+runtime-uniform positive bound. Existing bounded-read proofs cover constant post-test bounds
+and unsigned runtime pre-test bounds, so resource tracking leaves the descriptor words as
+ordinary `ReadConstBuffer` values and later rejects them as host-unavailable runtime roots.
+
+Required tests:
+
+- Positive pre-test and post-test loops with `i = 0`, `next = i + 1`, a signed positive
+  runtime bound and a 196-byte row stride, checking the exact materialized row count.
+- Four correlated descriptor DWORD reads with consecutive memory offsets, checking that they
+  share one coherent scalar-buffer snapshot and retain the live loop index for selection.
+- Zero and negative signed bounds, signed overflow boundaries, `INT32_MAX`, unknown signs,
+  cyclic bound provenance, non-unit updates, decrementing loops and multiple latches must be
+  rejected or use explicitly defined zero-iteration/count semantics.
+- Conditional or non-dominating scalar-buffer roots, mismatched column addresses, counts,
+  strides, indices and offsets must fail closed instead of combining unrelated words.
+- Materialization limits, address overflow, dirty-memory retry and aliasing cases must preserve
+  transactional snapshots and never expose a partially read descriptor table.
+- Native Windows audit and bounded game run beyond `da7e70d9fcafe48c` PC `0x000005d4`,
+  followed by SPIR-V/Vulkan validation of the selected buffer resources.
+
+## Misaligned tiled image descriptors
+
+Status: diagnosis in progress; automated regression deferred.
+
+Observed trigger: after 127 shaders compile and the loop-indexed descriptor shader creates a
+valid Vulkan pipeline, image binding reaches `PrepareImage` with a guest address that does not
+meet the alignment returned by `TileGetTextureTotalSize`. The old fatal reports only the failed
+boolean expression, so the descriptor format, tile mode, dimensions, computed size/alignment
+and address delta are not yet visible.
+
+Required tests:
+
+- Diagnostic coverage proving every rejected image layout reports the guest address, computed
+  size and alignment, format, type, tile mode, dimensions, levels and raw descriptor DWORDs.
+- Linear and tiled image descriptors at exact, over-aligned and misaligned base addresses,
+  including mipmapped, array, volume, multisample, sampled and storage resources.
+- Alias/view cases where a descriptor intentionally starts inside an existing backing image,
+  checking whether a compatible subresource view is selected instead of creating a new image.
+- Rejection cases for zero size/alignment, arithmetic overflow, unsupported tile modes and
+  addresses that cannot map to a valid guest subresource without copying or rebasing.
+- Vulkan validation and readback for any implemented rebase/copy path, followed by a bounded
+  native game run beyond the current `descriptors.cpp` image-alignment failure.

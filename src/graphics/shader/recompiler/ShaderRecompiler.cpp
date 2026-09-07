@@ -638,6 +638,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (options.dump_ir && options.early_dump) {
+		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+		     IR::ProgramToString(ir).c_str());
+	}
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {

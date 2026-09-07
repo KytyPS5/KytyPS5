@@ -58,6 +58,32 @@ Required tests:
 - Repeated permutations and mixed small/large shaders proving that each detailed dump applies the
   same bound and that concise phase tracing remains available for every program.
 
+## Depth attachment rediscovery after resource preparation
+
+Status: production fix and native game validation complete; automated regression deferred.
+
+Observed trigger: draw setup discovers color/depth attachments before shader resources, vertex
+buffers and descriptor bindings are prepared. That preparation can synchronously finish work and
+replace an aliased cached image. Color attachments already rediscover and rebind their descriptor
+at final acquisition, while an equally stale depth attachment terminated the emulator with
+`depth target changed after render-state discovery`.
+
+Required tests:
+
+- A draw where sampled or storage resource preparation invalidates the initially discovered depth
+  image, checking that final attachment acquisition finds and binds a replacement from the original
+  depth descriptor.
+- Registered, missing, unregistered and `needs_rebind` owner cases, including replacement with a
+  different `ImageId` and reuse of a compatible existing depth image.
+- Depth-only and mixed color/depth draws proving that extent, layer count, sample count, format,
+  image view, pipeline rendering state and dynamic depth/stencil state use the final image.
+- HTile and stencil cases proving rediscovery preserves metadata ownership, deferred clears,
+  stencil association and the exact guest backing ranges.
+- Negative cases for an actually incompatible replacement, invalid view or mixed sample count,
+  checking that the existing precise validation remains after rediscovery.
+- Native Vulkan validation with an alias transition between discovery and acquisition, followed by
+  a bounded game run past the captured renderer invariant.
+
 ## Unsigned bitfield selectors for bounded resource tables
 
 Status: production fix and corpus validation in progress; automated regression deferred.

@@ -655,7 +655,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
-			EXIT("depth target changed after render-state discovery\n");
+			if (owner != nullptr) {
+				owner->binding = {};
+			}
+			depth.image_id = cache.FindImage(depth.desc);
+			BindRenderTarget(depth.image_id);
 		}
 		depth.image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		if (depth.htile && depth.depth_clear_enable && !cache.ClearMeta(depth.htile_buffer_vaddr)) {

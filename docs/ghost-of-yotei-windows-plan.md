@@ -7,8 +7,8 @@
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
 остаётся frame 124 в запуске `010001-1fc2ba`. Последняя проверка исправления
-`020716-69504b` дошла до frame 121, полностью скомпилировала `c6b0…` и сама
-завершилась кодом 321 на следующем renderer invariant. Signed storage shader
+`021530-0b1686` дошла до frame 120, прошла повторное depth attachment discovery
+и сама завершилась кодом 321 на следующем compute resource materialization. Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
 выпускают SPIR-V и создают Vulkan pipelines. Текущий блокер находится при binding
 следующего image descriptor теперь пройден: 256-байтный placed-view адрес больше
@@ -149,7 +149,8 @@ alignment tiled surface и сохранил точный placed-view guest range
 `053b2c82226fe5ed` успешно созданы pipelines `c090…`, `be4e…`, `3176…` и
 `916e…`; `c6b0…` теперь проходит Normalize, TrackResources и SPIR-V emission.
 Независимый phase trace сократил журнал этого пути до 188 KiB/2066 строк и выявил
-следующий блокер: depth target меняется после первоначального render-state discovery.
+следующий блокер: `8457901d80b91921` проходит resource tracking, но его runtime
+resources пока не материализуются.
 
 ## Состояние по уровням проверки
 
@@ -162,7 +163,7 @@ alignment tiled surface и сохранил точный placed-view guest range
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `020716-69504b` с validation дошёл до frame 121, скомпилировал 135 shaders и подтвердил `c6b0…` через SPIR-V; процесс сам завершился кодом 321 на `depth target changed after render-state discovery`. Максимум прежней сборки — frame 124. | Первый ненулевой видимый кадр ещё не достигнут; нужен общий повторный discovery/validation depth state. |
+| Реальная игра | `021530-0b1686` с validation дошёл до frame 120, прошёл depth rediscovery и скомпилировал 135 shaders; следующий `8457…` завершил TrackResources. Максимум прежней сборки — frame 124. | Первый ненулевой видимый кадр ещё не достигнут; `MaterializeResources` для `8457…` вернул false без точной причины. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -208,17 +209,18 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-020716-69504b` |
-| SHA-256 запущенного emulator | `c2dc50714dd925de6029a4fe0fa54b208c485a4e0b073ee738e1377c47547f10` |
-| Время UTC | `2026-09-07T02:07:16.7674200Z` → `02:13:10.3505861Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-021530-0b1686` |
+| SHA-256 запущенного emulator | `bb4a17e3fe0c4ee64f438f5a65aa94d0a4562b734ced749ebff9034069333db7` |
+| Время UTC | `2026-09-07T02:15:30.2016386Z` → `02:17:14.9866631Z` |
 | Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 1280×720; внутренние основные targets 480×270 |
 | Завершение | Самостоятельный exit code 321 до timeout 360 с; процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 121; FPS 0,526609; flips CPU/GPU 0/109; prepared 109, ready 109, shown 108; 135 shaders скомпилированы |
+| Наблюдаемое исполнение | frame 120; FPS 0,060975; flips CPU/GPU 0/109; prepared 109, ready 109, shown 108; 135 shaders скомпилированы |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
 | Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 443 слова, emission 60 мс, shader №132 завершён |
-| Текущая ошибка | `depth target changed after render-state discovery` в `renderDraw.cpp:658`, после успешной компиляции shader №135 |
+| Пройденная renderer-ошибка | Устаревший depth attachment повторно найден и привязан по исходному descriptor перед final view acquisition; прежнего `depth target changed after render-state discovery` нет |
+| Текущая ошибка | `8457901d80b91921`: decode 1109, CFG 126 blocks/8 loops, Normalize 5115, TrackResources 5058; `MaterializeResources` вернул false в `pipelineCache.cpp:568` до SPIR-V |
 | Диагностика | `KYTY_SHADER_PHASE_TRACE=1` при silent guest log сохранил все phase begin/end в stdout: 188 KiB, 2066 строк вместо прежних 244 MiB/10 140 670 строк |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 

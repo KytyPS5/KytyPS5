@@ -108,7 +108,7 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	const auto& sc          = hw.GetStencilControl();
 	const auto& sm          = hw.GetStencilMask();
 	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
-	const bool depth_active = dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable ||
+	const bool depth_active = dc.z_enable || dc.depth_bounds_enable ||
 	                          rc.depth_clear_enable || rc.copy_depth_to_color;
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
@@ -239,7 +239,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
-	r.depth_write_enable      = dc.z_write_enable && !z.depth_view.depth_write_disable;
+	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
+	                            !z.depth_view.depth_write_disable && !r.depth_clear_enable;
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
@@ -328,7 +329,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 	const auto           available = ImageViewOps::DepthAspectMask(format);
 	vk::ImageAspectFlags writes {};
 	if ((available & vk::ImageAspectFlagBits::eDepth) &&
-	    (depth_load_clear_enable || (depth_test_enable && depth_write_enable))) {
+	    (depth_load_clear_enable || depth_write_enable)) {
 		writes |= vk::ImageAspectFlagBits::eDepth;
 	}
 	if (!(available & vk::ImageAspectFlagBits::eStencil)) {

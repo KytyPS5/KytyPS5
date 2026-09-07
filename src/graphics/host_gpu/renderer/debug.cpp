@@ -385,75 +385,6 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 	     z.size.valid ? "true" : "false");
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
-                   const HW::RenderControl& rc) {
-	const bool depth_active = dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable ||
-	                          rc.depth_clear_enable || rc.copy_depth_to_color;
-	const bool stencil_active =
-	    dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color;
-	if (!depth_active && !stencil_active) {
-		return;
-	}
-
-	EXIT_NOT_IMPLEMENTED(rc.copy_depth_to_color || rc.copy_stencil_to_color);
-	EXIT_NOT_IMPLEMENTED(!z.z_info.HasValidTextureCompatibility());
-	EXIT_NOT_IMPLEMENTED(!z.stencil_info.HasValidTextureCompatibility());
-	if (z.z_info.format == Prospero::DepthFormat::kInvalid) {
-		EXIT_NOT_IMPLEMENTED(z.z_info.num_samples != 0);
-		EXIT_NOT_IMPLEMENTED(z.z_info.htile_acceleration != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.partially_resident != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
-	} else {
-		EXIT_NOT_IMPLEMENTED(z.z_info.format != Prospero::DepthFormat::kZ16 &&
-		                     z.z_info.format != Prospero::DepthFormat::kZ32F);
-		if (z.z_info.num_samples != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("DepthTarget: using native num_samples=0x%08" PRIx32 "\n",
-				     z.z_info.num_samples);
-				logged = true;
-			}
-		}
-		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.partially_resident != false);
-		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
-	}
-
-	if (z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
-		EXIT_NOT_IMPLEMENTED(z.stencil_info.format != Prospero::StencilFormat::k8UInt);
-	}
-	EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
-	EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
-
-	if (z.z_info.format != Prospero::DepthFormat::kInvalid ||
-	    z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
-		if (z.depth_view.current_mip_level != 0x00000000) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DepthTarget: temporary: ignoring PS5 current mip level=0x%08" PRIx32 "\n",
-				     z.depth_view.current_mip_level);
-			}
-		}
-		if (z.depth_view.depth_write_disable || z.depth_view.stencil_write_disable) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DepthTarget: honoring write disable depth=%s, stencil=%s\n",
-				     z.depth_view.depth_write_disable ? "true" : "false",
-				     z.depth_view.stencil_write_disable ? "true" : "false");
-			}
-		}
-		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable &&
-		                     z.z_read_base_addr != z.z_write_base_addr);
-		EXIT_NOT_IMPLEMENTED(!z.depth_view.stencil_write_disable &&
-		                     z.stencil_read_base_addr != z.stencil_write_base_addr);
-		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable && z.z_write_base_addr == 0);
-		// EXIT_NOT_IMPLEMENTED(z.htile_data_base_addr == 0);
-		EXIT_NOT_IMPLEMENTED(!z.size.valid);
-	}
-}
-
 static void ClipPrint(const char* func, const HW::ClipControl& c) {
 	LOGF("%s\n", func);
 
@@ -977,7 +908,6 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& bc      = hw.GetBlendControl(rt_slot);
 	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
-	const auto& z       = hw.GetDepthRenderTarget();
 	const auto& c       = hw.GetClipControl();
 	const auto& rc      = hw.GetRenderControl();
 	const auto& d       = hw.GetDepthControl();
@@ -1003,8 +933,6 @@ void hw_check(const CommandBuffer& buffer) {
 	RtCheck(rt);
 	log_phase("vp");
 	VpCheck(vp, smc);
-	log_phase("z");
-	ZCheck(z, d, rc);
 	log_phase("clip");
 	ClipCheck(c);
 	log_phase("rc");

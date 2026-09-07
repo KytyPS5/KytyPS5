@@ -391,8 +391,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
 	vk_buffer.setBlendConstants(blend_constants.data());
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(
-	    depth.depth_write_enable && !depth.depth_clear_enable ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
 
 	const auto& mode              = ctx.GetModeControl();

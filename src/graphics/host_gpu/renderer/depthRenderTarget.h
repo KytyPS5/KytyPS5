@@ -26,6 +26,7 @@ struct RenderDepthInfo {
 	bool                        depth_meta_clear_enable  = false;
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
+	// Effective draw writes; discovery applies test, target-write and clear controls.
 	bool                        depth_write_enable       = false;
 	vk::CompareOp               depth_compare_op         = vk::CompareOp::eNever;
 	bool                        depth_bounds_test_enable = false;
@@ -42,10 +43,6 @@ struct RenderDepthInfo {
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
-
-inline bool depth_attachment_read_only(const RenderDepthInfo& depth) {
-	return !depth.AttachmentWriteAspects();
-}
 
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);

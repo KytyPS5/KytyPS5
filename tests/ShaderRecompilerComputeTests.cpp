@@ -9574,8 +9574,16 @@ public:
       phased_depth_target.size.valid = true;
       registers.SetDepthRenderTarget(phased_depth_target);
       HW::DepthControl phased_depth_control{};
-      phased_depth_control.z_enable = true;
       phased_depth_control.z_write_enable = true;
+      registers.SetDepthControl(phased_depth_control);
+      registers.SetRenderControl({});
+      RenderDepthInfo disabled_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), disabled_depth);
+      Require(name, "disabled tests with stale depth write enable",
+              !disabled_depth.image_id,
+              "a dormant depth write bit bound a depth attachment");
+      phased_depth_control.z_enable = true;
       registers.SetDepthControl(phased_depth_control);
       HW::RenderControl phased_render_control{};
       phased_render_control.resummarize_enable = true;
@@ -9727,7 +9735,7 @@ public:
           name, "depth-only target with stale stencil state",
           depth_only.image_id && depth_only.desc.view_info.format == vk::Format::eD32Sfloat &&
               (depth_only.desc.info.metadata.kind == ImageMetadataKind::Htile) &&
-              depth_only.depth_test_enable && depth_only.depth_write_enable &&
+              depth_only.depth_test_enable && !depth_only.depth_write_enable &&
               depth_only.depth_clear_enable &&
               !depth_only.stencil_test_enable &&
               !depth_only.stencil_clear_enable &&
@@ -9838,6 +9846,12 @@ public:
           Require(name, "bounds deferred HTile clear",
                   texture_cache.ClearMeta(depth_only_htile_address),
                   "depth-only HTile was not registered");
+        } else {
+          bounds_target.z_write_base_addr = depth_only_address;
+          bounds_target.depth_view.depth_write_disable = false;
+          bounds_control.z_write_enable = true;
+          registers.SetDepthRenderTarget(bounds_target);
+          registers.SetDepthControl(bounds_control);
         }
         RenderDepthInfo bounds_depth{};
         RenderExecutorTestAccess::ResolveRenderDepthTarget(
@@ -26397,12 +26411,12 @@ void CheckStencilAttachmentAccess() {
 void CheckDepthAttachmentWrites() {
   RenderDepthInfo target{};
   target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
-  target.depth_write_enable = true;
   Require("DepthAttachmentWrites", "disabled depth test",
           !target.AttachmentWriteAspects(),
           "disabled depth testing claimed a depth write");
 
   target.depth_test_enable = true;
+  target.depth_write_enable = true;
   target.depth_compare_op = vk::CompareOp::eLess;
   Require("DepthAttachmentWrites", "depth write",
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eDepth,
@@ -26506,6 +26520,7 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
           "a load clear changed the guest depth-write layout");
+  attachment.depth_test_enable = true;
   attachment.depth_write_enable = true;
   Require("DynamicRenderingState", "depth-write stencil-read layout",
           depth_attachment_layout(attachment) ==

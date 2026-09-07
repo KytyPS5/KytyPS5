@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -101,15 +102,37 @@ public:
 		if (!m_program.srt_plan_complete) {
 			Fail(0, "SRT plan is not ready");
 		}
-		PlanBoundedReads();
-		PlanIndirectImages();
-		PlanInlineDescriptors();
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				Collect(inst);
+		const char* trace_env = std::getenv("KYTY_RESOURCE_TRACKING_TRACE");
+		const bool  trace     = trace_env != nullptr && *trace_env != '\0';
+		const auto phase = [&](const char* name, auto&& action) {
+			const auto start = std::chrono::steady_clock::now();
+			if (trace) {
+				std::printf("ResourceTracking begin: hash=0x%016" PRIx64 " phase=%s\n",
+				            m_program.shader_hash, name);
+				std::fflush(stdout);
 			}
-		}
-		LinkImageAliases();
+			action();
+			if (trace) {
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                         std::chrono::steady_clock::now() - start)
+				                         .count();
+				std::printf("ResourceTracking end: hash=0x%016" PRIx64
+				            " phase=%s elapsed_ms=%" PRId64 "\n",
+				            m_program.shader_hash, name, elapsed);
+				std::fflush(stdout);
+			}
+		};
+		phase("PlanBoundedReads", [&] { PlanBoundedReads(); });
+		phase("PlanIndirectImages", [&] { PlanIndirectImages(); });
+		phase("PlanInlineDescriptors", [&] { PlanInlineDescriptors(); });
+		phase("Collect", [&] {
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					Collect(inst);
+				}
+			}
+		});
+		phase("LinkImageAliases", [&] { LinkImageAliases(); });
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -121,8 +144,8 @@ public:
 				memory.sampler = patch.sampler;
 			}
 		}
-		ApplyBoundedRootReads();
-		ApplyBoundedReads();
+		phase("ApplyBoundedRootReads", [&] { ApplyBoundedRootReads(); });
+		phase("ApplyBoundedReads", [&] { ApplyBoundedReads(); });
 		for (const auto& plan: m_indirect_images) {
 			plan.handle->SetArg(0, plan.key);
 			for (uint32_t dword = 0; dword < 4u; dword++) {
@@ -317,18 +340,22 @@ private:
 	}
 
 	bool CollectBoundedDependencies(Value value, std::vector<const BoundedReadPlan*>& dependencies,
-	                                std::unordered_set<const Inst*>& visiting) const {
+	                                std::unordered_set<const Inst*>& visiting,
+	                                std::unordered_set<const Inst*>& completed) const {
 		value = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return true;
+		if (completed.contains(inst)) return true;
 		if (const auto* bounded = BoundedRead(inst); bounded != nullptr) {
 			if (std::ranges::find(dependencies, bounded) == dependencies.end())
 				dependencies.push_back(bounded);
+			completed.insert(inst);
 			return true;
 		}
 		if (!visiting.insert(inst).second) return false;
 		const auto finish = [&](bool result) {
 			visiting.erase(inst);
+			if (result) completed.insert(inst);
 			return result;
 		};
 		if (inst->GetOpcode() == ValueOpcode::ReadConst && inst->NumArgs() == 2u) {
@@ -336,10 +363,10 @@ private:
 			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 			    slot.U32() >= m_program.srt_reads.size()) return finish(false);
 			return finish(CollectBoundedDependencies(m_program.srt_reads[slot.U32()].value,
-			                                           dependencies, visiting));
+			                                           dependencies, visiting, completed));
 		}
 		for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
-			if (!CollectBoundedDependencies(inst->Arg(arg), dependencies, visiting))
+			if (!CollectBoundedDependencies(inst->Arg(arg), dependencies, visiting, completed))
 				return finish(false);
 		}
 		return finish(true);
@@ -358,8 +385,10 @@ private:
 	                                 uint32_t& source, std::string& rejection) {
 		std::vector<const BoundedReadPlan*> dependencies;
 		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> completed;
 		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
-			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting)) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting,
+			                                completed)) {
 				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
 				return false;
 			}
@@ -398,8 +427,10 @@ private:
 	                                uint32_t& source, std::string& rejection) {
 		std::vector<const BoundedReadPlan*> dependencies;
 		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> completed;
 		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
-			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting)) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting,
+			                                completed)) {
 				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
 				return false;
 			}
@@ -436,8 +467,10 @@ private:
 	                                  uint32_t& source, std::string& rejection) {
 		std::vector<const BoundedReadPlan*> dependencies;
 		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> completed;
 		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
-			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting)) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting,
+			                                completed)) {
 				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
 				return false;
 			}

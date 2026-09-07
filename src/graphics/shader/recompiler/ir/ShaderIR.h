@@ -454,9 +454,9 @@ struct ShaderInfo {
 	// Bound compiler work independently of the host device. Final descriptor layouts
 	// must also fit the Vulkan device limits after resource specialization.
 	static constexpr uint32_t MaxBuffers      = 128;
-	static constexpr uint32_t MaxImages       = 128;
+	static constexpr uint32_t MaxImages       = 512;
 	static constexpr uint32_t MaxSamplers     = 128;
-	static constexpr uint32_t MaxSampledPairs = 256;
+	static constexpr uint32_t MaxSampledPairs = 512;
 
 	std::vector<BoundedSrtLayout>     bounded_srt_reads;
 	std::vector<BufferTableLayout>    buffer_tables;
@@ -544,6 +544,9 @@ struct DescriptorSource {
 		// Direct inline descriptors read four compact/sampler words or eight image words.
 		// ImageTable retains its separate packed selector and eight-word table-entry format.
 		uint32_t descriptor_dwords = 4;
+		// Exclusive selector bound proven by a dominating unsigned CFG guard. Zero means
+		// unknown, so materialization retains the conservative wrapped-U32 domain.
+		uint32_t selector_limit = 0;
 
 		bool operator==(const InlineDescriptor& other) const = default;
 	};

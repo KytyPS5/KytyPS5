@@ -981,12 +981,24 @@ private:
 		return found == m_inline_descriptors.end() ? nullptr : &*found;
 	}
 
-	static bool MatchInlineStride(Value key, uint32_t& stride) {
+	static bool MatchInlineStride(Value key, uint32_t& stride, Value* selector = nullptr) {
 		const auto* multiply = key.Resolve().TryInstruction();
-		return multiply != nullptr && multiply->GetOpcode() == ValueOpcode::IMul32 &&
-		       multiply->NumArgs() == 2u &&
-		       (ImmediateU32(multiply->Arg(0), stride) || ImmediateU32(multiply->Arg(1), stride)) &&
-		       stride != 0u;
+		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
+		    multiply->NumArgs() != 2u) {
+			return false;
+		}
+		Value selected;
+		if (ImmediateU32(multiply->Arg(0), stride)) {
+			selected = multiply->Arg(1).Resolve();
+		} else if (ImmediateU32(multiply->Arg(1), stride)) {
+			selected = multiply->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		if (selector != nullptr) {
+			*selector = selected;
+		}
+		return stride != 0u;
 	}
 
 	bool TryMakeInlineDescriptor(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan,
@@ -1032,7 +1044,8 @@ private:
 		// Keep the wrapped byte offset on the GPU, including loop-carried selectors.
 		// Only the buffer descriptor itself must be runtime-uniform.
 		uint32_t stride = 0;
-		if (!MatchInlineStride(plan.key, stride)) {
+		Value    selector;
+		if (!MatchInlineStride(plan.key, stride, &selector)) {
 			return false;
 		}
 		DescriptorSource buffer_source;
@@ -1049,6 +1062,8 @@ private:
 		source.inline_descriptor = DescriptorSource::InlineDescriptor {
 		    buffer_source_index, stride, base_offset, 0u};
 		source.inline_descriptor->descriptor_dwords = descriptor_dwords;
+		source.inline_descriptor->selector_limit =
+		    DominatingSelectorLimit(selector, handle.Parent());
 		plan.handle = &handle;
 		plan.source = InternSource(source);
 		plan.read_count = descriptor_dwords;
@@ -1145,7 +1160,8 @@ private:
 		plan.key = material_read->Arg(1).Resolve();
 		uint32_t stride = 0;
 		auto* buffer = material_read->Arg(0).Resolve().TryInstruction();
-		if (buffer == nullptr || !MatchInlineStride(plan.key, stride)) {
+		Value selector;
+		if (buffer == nullptr || !MatchInlineStride(plan.key, stride, &selector)) {
 			return false;
 		}
 		DescriptorSource address_source;
@@ -1168,6 +1184,8 @@ private:
 		source.inline_descriptor = DescriptorSource::InlineDescriptor {
 		    buffer_index, stride, memory->offset, 0u,
 		    DescriptorSource::InlineDescriptor::ImageTable {InternSource(address_source), table_offset, index_shift, index_mask}};
+		source.inline_descriptor->selector_limit =
+		    DominatingSelectorLimit(selector, handle.Parent());
 		plan.handle = &handle;
 		plan.source = InternSource(source);
 		plan.root_count = 6u;
@@ -1248,6 +1266,88 @@ private:
 		if (found == m_program.blocks.end()) return nullptr;
 		const auto index = static_cast<size_t>(found - m_program.blocks.begin());
 		return index < m_program.block_info.size() ? &m_program.block_info[index] : nullptr;
+	}
+
+	const Block* BlockById(uint32_t id) const {
+		for (size_t index = 0; index < m_program.block_info.size() &&
+		                       index < m_program.blocks.size(); ++index) {
+			if (m_program.block_info[index].id == id) {
+				return m_program.blocks[index];
+			}
+		}
+		return nullptr;
+	}
+
+	bool ReachableWithout(const Block* start, const Block* target,
+	                      const Block* excluded) const {
+		if (start == nullptr || target == nullptr || start == excluded) {
+			return false;
+		}
+		std::vector<const Block*> pending {start};
+		std::unordered_set<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == excluded || !visited.insert(block).second) {
+				continue;
+			}
+			if (block == target) {
+				return true;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				pending.push_back(successor);
+			}
+		}
+		return false;
+	}
+
+	bool Dominates(const Block* dominator, const Block* block) const {
+		return dominator != nullptr && block != nullptr && !m_program.blocks.empty() &&
+		       (dominator == block ||
+		        !ReachableWithout(m_program.blocks.front(), block, dominator));
+	}
+
+	uint32_t DominatingSelectorLimit(Value selector, const Block* access) const {
+		selector = selector.Resolve();
+		uint32_t limit = 0;
+		for (size_t index = 0; index < m_program.block_info.size() &&
+		                       index < m_program.blocks.size(); ++index) {
+			const auto* guard = m_program.blocks[index];
+			const auto& term  = m_program.block_info[index].terminator;
+			if (guard == access || term.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    !Dominates(guard, access)) {
+				continue;
+			}
+			const auto* compare = m_program.block_info[index].condition.Resolve().TryInstruction();
+			if (compare == nullptr || compare->NumArgs() != 2u ||
+			    compare->Arg(0).Resolve() != selector) {
+				continue;
+			}
+			uint32_t candidate_limit = 0;
+			if (!ImmediateU32(compare->Arg(1), candidate_limit) || candidate_limit == 0u) {
+				continue;
+			}
+			uint32_t bounded_id = 0;
+			if (compare->GetOpcode() == ValueOpcode::ULessThan32) {
+				bounded_id = term.true_block;
+			} else if (compare->GetOpcode() == ValueOpcode::UGreaterThanEqual32) {
+				bounded_id = term.false_block;
+			} else {
+				continue;
+			}
+			const auto other_id = bounded_id == term.true_block ? term.false_block : term.true_block;
+			const auto* bounded = BlockById(bounded_id);
+			const auto* other   = BlockById(other_id);
+			// Excluding the guard prevents a later loop iteration from making the opposite
+			// successor appear to reach this access. The selected edge must be the only
+			// immediate guarded region containing the descriptor handle.
+			if (!ReachableWithout(bounded, access, guard) ||
+			    ReachableWithout(other, access, guard)) {
+				continue;
+			}
+			limit = limit == 0u ? candidate_limit : std::min(limit, candidate_limit);
+		}
+		return limit;
 	}
 
 	Value LowerRuntimeDescriptorPhi(Value value, Inst& anchor) {

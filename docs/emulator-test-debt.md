@@ -126,6 +126,42 @@ Required tests:
 - Split native32, native64 and cooperative multi-wave execution coverage, with a collective inside
   the conditional arm to prove accepted branches keep both native halves at matching rendezvous.
 
+## Guard-bounded inline sampled tables
+
+Status: production fix and native game validation complete; automated regression deferred.
+
+Observed trigger: a material shader multiplies a dynamically reduced selector by a 368-byte record
+stride, but a dominating unsigned branch admits descriptor loads only while the selector is below
+255. The old materializer discarded that CFG fact and enumerated the full wrapped-U32 domain:
+1,445 in-buffer offsets at 16-byte GCD spacing, exhausting the candidate limit on records the shader
+cannot access. Invalid images also retained unrelated adjacent sampler words as artificial pairs.
+After preserving the guard, the table has 24 candidates; combined with 115 direct images it needs
+138 dense image slots. A second static-state/runtime permutation of the same shader needs 285 dense
+images. The compiler image and sampled-pair ceilings are raised to 512 while sampler capacity
+remains 128 and final renderer admission continues to enforce the physical Vulkan descriptor limits.
+
+Required tests:
+
+- Direct image and sampler tables under equivalent dominating `selector < limit` and
+  `selector >= limit` guards, proving only the bounded branch records the exclusive limit.
+- Nested and loop-carried guarded selectors, including a path that bypasses the guard and an
+  opposite branch that can re-enter through a loop, proving the bound is accepted only when the
+  guarded edge is the sole immediate region containing the descriptor handle.
+- A selector without a proven guard, proving materialization retains full wrapped-U32/GCD
+  enumeration and its existing probe limit.
+- A wrapped selector that visits valid records and misaligned words, proving every invalid image is
+  paired with the canonical null sampler while valid image/sampler combinations stay distinct.
+- Multiple different sampler bit patterns beside null images, proving they map to one candidate and
+  do not consume sampler origins, point-sampler clones or sampled-pair slots.
+- Null and valid image candidates sharing the same selector, checking exact key-to-candidate mapping,
+  emitted switch cases and a native sampled readback for both paths.
+- A genuinely bounded table with 129 distinct compatible image/sampler pairs, proving the unchanged
+  sampler and sampled-pair ceilings still reject real resource pressure transactionally.
+- Shaders with 138 and 285 total direct and indirect images, plus a 513th-image/pair rejection,
+  checking dense remapping, bounded compiler work and physical Vulkan descriptor-budget validation.
+- The captured shader with selector limit 255 and stride 368, followed by Vulkan and SPIR-V
+  validation and a game run that advances past its former 129th artificial pair.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

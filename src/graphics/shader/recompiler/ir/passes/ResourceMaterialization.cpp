@@ -383,6 +383,7 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 	    image.descriptor_offset > UINT32_MAX - (image.descriptor_dwords - 1u) * 4u ||
 	    (sampler != nullptr && (image.buffer_source != sampler->buffer_source ||
 	                            image.selector_stride != sampler->selector_stride ||
+	                            image.selector_limit != sampler->selector_limit ||
 	                            sampler->descriptor_dwords != 4u ||
 	                            sampler->descriptor_offset > UINT32_MAX - 12u ||
 	                            sampler->image_table.has_value()))) {
@@ -401,7 +402,9 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 		    "inline image table at pc 0x{:08x} requires a bounded 8-bit index and valid raw address metadata", pc));
 	}
 	const auto size = ScalarBufferSize(buffer);
-	const auto step = std::gcd<uint64_t>(image.selector_stride, uint64_t {1} << 32u);
+	const auto step = image.selector_limit != 0u
+	                      ? static_cast<uint64_t>(image.selector_stride)
+	                      : std::gcd<uint64_t>(image.selector_stride, uint64_t {1} << 32u);
 	const auto first_offset = sampler != nullptr
 	                              ? std::min(image.descriptor_offset, sampler->descriptor_offset)
 	                              : image.descriptor_offset;
@@ -409,9 +412,14 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 	// would miss wrap aliases: for stride 872 every multiple of eight is reachable.
 	// Match ReadScalarBufferWord's widened immediate addition and independent dword bounds.
 	const auto last_byte = size >= 4u ? ((size - 4u) & ~uint64_t {3}) + 3u : 0u;
-	const auto probe_count = size >= 4u && last_byte >= first_offset
-	                             ? std::min<uint64_t>(UINT32_MAX, last_byte - first_offset) / step + 1u
-	                             : 0u;
+	const auto probe_count = image.selector_limit != 0u
+	                             ? static_cast<uint64_t>(image.selector_limit)
+	                             : size >= 4u && last_byte >= first_offset
+	                                   ? std::min<uint64_t>(UINT32_MAX,
+	                                                        last_byte - first_offset) /
+	                                             step +
+	                                         1u
+	                                   : 0u;
 	const auto fail = [&](std::string_view reason, size_t pairs) {
 		return SpecializationFail(fmt::format(
 		    "inline sampled pair at pc 0x{:08x}: {} (size={} stride={} buffer_stride={} probes={} pairs={})",
@@ -483,6 +491,13 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 		    !ValidImageDescriptor(candidate_image,
 		                          !image.image_table.has_value() && image.descriptor_dwords == 4u)) {
 			candidate_image.dwords.fill(0u);
+		}
+		// Invalid or null image records cannot be sampled meaningfully. The sampler bits beside
+		// them are frequently unrelated material data when a wrapped selector lands between
+		// records, and retaining those bits creates distinct Vulkan resources for the same null
+		// result. Canonicalize the whole sampled pair so only valid images consume sampler slots.
+		if (sampler != nullptr && NullImageDescriptor(candidate_image)) {
+			candidate_sampler = null_sampler;
 		}
 		size_t candidate = 0;
 		while (candidate < next.descriptors.size() &&

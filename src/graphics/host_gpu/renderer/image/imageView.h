@@ -140,7 +140,8 @@ inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_fo
 IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	return resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage &&
 	       (resource.numeric_class == Prospero::TextureNumericClass::Float ||
-	        resource.numeric_class == Prospero::TextureNumericClass::Uint) &&
+	        resource.numeric_class == Prospero::TextureNumericClass::Uint ||
+	        resource.numeric_class == Prospero::TextureNumericClass::Sint) &&
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||

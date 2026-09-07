@@ -496,16 +496,13 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool descriptor_ok    = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok      = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
-	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class    = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
-	    raw_sint_storage ||
-	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
-	     numeric_class != Prospero::TextureNumericClass::Sint &&
-	     (resource.atomic || uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint)) &&
-	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt ||
-	     format == Prospero::BufferFormat::k32Float));
+	    numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	    ((!resource.atomic && resource.numeric_class == numeric_class) ||
+	     (resource.atomic && uint_resource &&
+	      (format == Prospero::BufferFormat::k32UInt ||
+	       format == Prospero::BufferFormat::k32Float)));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -780,7 +777,7 @@ NormalizeTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
 	}
 
 	const auto pixel_format        = surface_format.vk_format;
-	const auto storage_view_format = storage && (format == Prospero::BufferFormat::k32SInt || resource.atomic)
+	const auto storage_view_format = storage && resource.atomic
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto unorm_compare_format = !storage && resource.depth_compare &&

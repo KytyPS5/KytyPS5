@@ -260,7 +260,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = FirstComparisonImageBinding + 7u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -273,8 +273,8 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -320,7 +320,8 @@ DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledSintBinding  = 15u;
 	constexpr uint32_t StorageFloatBinding = FirstStorageImageBinding;
 	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 5u;
-	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 5u;
+	constexpr uint32_t StorageSintBinding  = StorageUintBinding + 5u;
+	constexpr uint32_t AtomicUintBinding   = StorageSintBinding + 5u;
 
 	// One descriptor variable must not mix ordinary image reads and Dref
 	// accesses: static descriptor validation combines its image operations.
@@ -356,7 +357,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 			switch (image.numeric_class) {
 				case Prospero::TextureNumericClass::Float: base = StorageFloatBinding; break;
 				case Prospero::TextureNumericClass::Uint: base = StorageUintBinding; break;
-				case Prospero::TextureNumericClass::Sint:
+				case Prospero::TextureNumericClass::Sint: base = StorageSintBinding; break;
 				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
 				default: return std::nullopt;
 			}
@@ -429,6 +430,9 @@ struct BoundedSrtRead {
 	// UINT32_MAX selects count_source; otherwise count_source must be UINT32_MAX
 	// and the axis is bounded by the current guest dispatch supplied at materialization.
 	uint32_t workgroup_axis = UINT32_MAX;
+	// A signed loop guard executes only for positive int32 counts. Materialization
+	// clamps zero and negative runtime values to the loop's zero-iteration case.
+	bool count_signed = false;
 	bool operator==(const BoundedSrtRead&) const = default;
 };
 

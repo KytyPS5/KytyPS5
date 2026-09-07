@@ -562,7 +562,8 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			if (!EvaluateDescriptorSource(program, read.count_source, clean_runtime, count)) {
 				return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its count", id));
 			}
-			size = count.dwords[0];
+			const auto raw_count = count.dwords[0];
+			size = read.count_signed && static_cast<int32_t>(raw_count) <= 0 ? 0u : raw_count;
 		}
 		probes += size;
 		if (probes > MaxIndirectImageProbes ||
@@ -649,6 +650,7 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 			    snapshot.bounded_srt_reads[read_id].count != count ||
 			    program.bounded_srt_reads[read_id].count_source != first.count_source ||
 			    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+			    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
 			    program.bounded_srt_reads[read_id].workgroup_axis != UINT32_MAX ||
 			    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
 			    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
@@ -738,6 +740,7 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 			    specialization.bounded_srt_reads[read_id].count != count ||
 			    program.bounded_srt_reads[read_id].count_source != first.count_source ||
 			    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+			    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
 			    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
 			    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
 			    program.bounded_srt_reads[read_id].memory_offset !=
@@ -1177,8 +1180,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
 		// Float image atomics use a CAS loop on raw R32Uint texels. Keep the
 		// specialized SPIR-V image type consistent with the host atomic view.
 		image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
@@ -1194,14 +1195,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			}
 		}
 		if (storage) {
-			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
-			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+			if (image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
 				return SpecializationFail(
 				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
 				                static_cast<uint32_t>(format)));
-			}
-			if (raw_sint_storage) {
-				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare && !image.needs_manual_depth_compare &&

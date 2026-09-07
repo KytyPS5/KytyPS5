@@ -9471,6 +9471,16 @@ void TestMeshInputAssembly() {
        0x40000305, 1, 2, 3, 0, 15, false},
       {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
        0x40000305, 2, 1, 3, 0, 12, false},
+      {Prospero::PrimitiveType::kPointList, 12, 265, 22, 0, 2, 0x1002, 0,
+       0x40000101, 0, 0, 0, 528, 0xabcd, true},
+      {Prospero::PrimitiveType::kPointList, 12, 265, 22, 1, 2, 0x1002, 0,
+       0x40000101, 1, 0, 0, 532, 0, false},
+      {Prospero::PrimitiveType::kPointList, 1, 1, 0, 0, 0, 0, 11,
+       0x40000101, 0, 0, 0, 0, 11, false},
+      {Prospero::PrimitiveType::kPointList, 12, 265, 1, 1, 4, 0x1000, 5,
+       0x40000c0c, 1, 0, 0, 52, 0xabcd0128, true},
+      {Prospero::PrimitiveType::kPointList, 12, 265, 1, 64, 4, 0x1000, 0,
+       0x41000000, 64, 0, 0, 304, 0, false},
   };
   for (const auto &test : cases) {
     ShaderVertexInputInfo input{};
@@ -9532,7 +9542,7 @@ void TestMeshInputAssembly() {
     }
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed triangle assembly, wave counts, vertex ID, or instance ID");
+          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
 

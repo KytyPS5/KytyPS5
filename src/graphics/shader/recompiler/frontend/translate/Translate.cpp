@@ -1082,13 +1082,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
 			                                           u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
+			const auto size  = u32(mesh.InputPrimitiveSize());
 			const auto chunk = entry_ir.IMul(primitive_chunk, step);
 			const auto vertices =
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
-			    entry_ir.ULessThan(vertices, u32(3)), u32(0),
+			    entry_ir.ULessThan(vertices, size), u32(0),
 			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
-			                                       {subtract_saturate(vertices, u32(3)), step})),
+			                                       {subtract_saturate(vertices, size), step})),
 			                  u32(1)));
 			const auto wave            = entry_ir.ShiftRightLogical(local, u32(6));
 			const auto wave_base       = entry_ir.BitwiseAnd(local, u32(~63u));
@@ -1103,17 +1104,23 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                                                     vertex_count)));
 			// GS adjacency addresses local ES records in LDS. Strip winding alternates
 			// with the global primitive number, including across subgroup boundaries.
-			const auto parity = mesh.InputPrimitiveStep() == 1u
+			const auto parity = mesh.input_primitive ==
+			                            static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
 			                        ? entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1))
 			                        : u32(0);
 			const auto vertex = entry_ir.IMul(local, step);
 			const auto first  = entry_ir.IAdd(vertex, parity);
-			const auto second = entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity);
+			const auto second = mesh.InputPrimitiveSize() == 3u
+			                        ? entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity)
+			                        : u32(0);
+			const auto third = mesh.InputPrimitiveSize() == 3u
+			                       ? entry_ir.IAdd(vertex, u32(2))
+			                       : u32(0);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
 			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
 			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-			                      entry_ir.ShiftLeftLogical(entry_ir.IAdd(vertex, u32(2)), u32(2)));
+			                      entry_ir.ShiftLeftLogical(third, u32(2)));
 			const auto input_vertex = entry_ir.IAdd(chunk, local);
 			const auto index_bytes  = draw(3);
 			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));

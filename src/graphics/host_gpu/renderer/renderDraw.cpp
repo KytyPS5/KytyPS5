@@ -544,11 +544,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer,
 		                        &htile_fill, &htile_fill_known);
+		const bool stencil_compressed = depth.desc.info.metadata.stencil_compressed;
+		const bool depth_uniform =
+		    meta_cleared && htile_fill_known && !htile_fill_clears_depth(htile_fill) &&
+		    htile_fill_depth_uniform(htile_fill, stencil_compressed);
 		const bool depth_meta_clear =
-		    meta_cleared && (!htile_fill_known || htile_fill_clears_depth(htile_fill));
-		depth.stencil_meta_clear_enable = meta_cleared && htile_fill_known &&
-		                                  depth.desc.info.metadata.stencil_compressed &&
+		    meta_cleared &&
+		    (!htile_fill_known || htile_fill_clears_depth(htile_fill) || depth_uniform);
+		depth.stencil_meta_clear_enable = meta_cleared && htile_fill_known && stencil_compressed &&
 		                                  htile_fill_clears_stencil(htile_fill);
+		if (depth_uniform) {
+			depth.depth_clear_value = htile_fill_depth_value(htile_fill, stencil_compressed);
+		}
 		depth.depth_load_clear_enable = depth.depth_clear_enable || depth_meta_clear;
 		if (meta_cleared &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {

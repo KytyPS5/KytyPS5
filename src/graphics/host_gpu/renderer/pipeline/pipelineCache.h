@@ -217,8 +217,13 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
+	uint32_t      m_new_driver_pipelines = 0;
+	uint64_t      m_saved_driver_cache_hash = 0;
+	bool          m_has_saved_driver_cache_hash = false;
 
 	void InitializeDriverCache();
+	bool SaveDriverCacheLocked(bool checkpoint);
+	void CheckpointDriverCacheLocked();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

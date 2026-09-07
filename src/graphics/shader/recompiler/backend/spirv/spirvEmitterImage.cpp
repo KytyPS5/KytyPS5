@@ -281,31 +281,35 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	return vector;
 }
 
-uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                      const ImageSampleLayout& layout, ImageDimension dimension) {
+// An image_*_o offset operand packs one 6-bit signed texel offset per spatial dimension at bits 0,
+// 8 and 16. Fills `values` as i32, zero where there is none, and returns whether any was present.
+bool SpatialOffsets(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                    const ImageSampleLayout& layout, ImageDimension dimension,
+                    uint32_t (&values)[3]) {
 	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto zero       = ConstantI32(ctx.state, 0);
-	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
-		if (components == 1u) return zero;
-		const auto result = ctx.state.builder.AllocateId();
-		if (components == 3u) {
-			ctx.state.builder.AddFunction(
-			    {OpCompositeConstruct, TypeI32Vector(ctx.state, 3), result, zero, zero, zero});
-		} else {
-			ctx.state.builder.AddFunction(
-			    {OpCompositeConstruct, TypeI32Vector(ctx.state, 2), result, zero, zero});
-		}
-		return result;
+	for (auto& value: values) {
+		value = zero;
 	}
-	const auto packed    = Unary(ctx.state, OpBitcast, TypeI32(ctx.state),
-	                             AddressU32(ctx, mem, address, layout.offset));
-	uint32_t   values[3] = {zero, zero, zero};
+	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
+		return false;
+	}
+	const auto packed = Unary(ctx.state, OpBitcast, TypeI32(ctx.state),
+	                          AddressU32(ctx, mem, address, layout.offset));
 	for (uint32_t index = 0; index < components; index++) {
 		values[index] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction({OpBitFieldSExtract, TypeI32(ctx.state), values[index],
 		                               packed, ConstantU32(ctx.state, index * 8u),
 		                               ConstantU32(ctx.state, 6)});
 	}
+	return true;
+}
+
+uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                      const ImageSampleLayout& layout, ImageDimension dimension) {
+	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
+	uint32_t   values[3] {};
+	SpatialOffsets(ctx, mem, address, layout, dimension, values);
 	if (components == 1u) return values[0];
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
@@ -314,6 +318,67 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	} else {
 		ctx.state.builder.AddFunction(
 		    {OpCompositeConstruct, TypeI32Vector(ctx.state, 2), result, values[0], values[1]});
+	}
+	return result;
+}
+
+// Fold an image_sample_*_o texel offset into the coordinate: ConstOffset needs a compile-time
+// constant while a GCN offset lives in a VGPR, and the dynamic Offset operand is gather-only
+// (VUID-StandaloneSpirv-Offset-04663), so a sample would otherwise drop the offset entirely.
+uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                          const ImageSampleLayout& layout, ImageDimension dimension, uint32_t coord,
+                          uint32_t resource) {
+	// A cube map has no continuous texel grid across a face seam; GCN leaves the form undefined.
+	if (ctx.state.program.info.images.at(mem.resource).cube) return coord;
+	uint32_t offsets[3] {};
+	if (!SpatialOffsets(ctx, mem, address, layout, dimension, offsets)) return coord;
+
+	auto&       state = ctx.state;
+	const auto& info  = ImageDimensionInfoFor(dimension);
+	state.builder.RequireCapability(CapabilityImageQuery);
+	const auto image = LoadSampledImageDescriptor(state, resource);
+	const auto size  = state.builder.AllocateId();
+	if (info.multisampled != 0u) {
+		state.builder.AddFunction(
+		    {OpImageQuerySize, ImageViewSizeType(state, dimension), size, image});
+	} else {
+		state.builder.AddFunction({OpImageQuerySizeLod, ImageViewSizeType(state, dimension), size,
+		                           image, ConstantU32(state, 0)});
+	}
+
+	const auto coord_components   = info.coordinate_components;
+	const auto spatial_components = info.spatial_components;
+	uint32_t   shifted[3] {};
+	for (uint32_t index = 0; index < coord_components; index++) {
+		auto value = coord;
+		if (coord_components > 1u) {
+			value = state.builder.AllocateId();
+			state.builder.AddFunction({OpCompositeExtract, TypeF32(state), value, coord, index});
+		}
+		// An array layer is not a spatial axis and takes no offset.
+		if (index < spatial_components) {
+			auto extent = size;
+			if (coord_components > 1u) {
+				extent = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpCompositeExtract, TypeU32(state), extent, size, index});
+			}
+			const auto scaled =
+			    Binary(state, OpFDiv, TypeF32(state),
+			           Unary(state, OpConvertSToF, TypeF32(state), offsets[index]),
+			           Unary(state, OpConvertUToF, TypeF32(state), extent));
+			value = Binary(state, OpFAdd, TypeF32(state), value, scaled);
+		}
+		shifted[index] = value;
+	}
+	if (coord_components == 1u) return shifted[0];
+	const auto result = state.builder.AllocateId();
+	if (coord_components == 3u) {
+		state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                           shifted[0], shifted[1], shifted[2]});
+	} else {
+		state.builder.AddFunction(
+		    {OpCompositeConstruct, TypeF32Vector(state, 2), result, shifted[0], shifted[1]});
 	}
 	return result;
 }
@@ -733,9 +798,11 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
-			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
+			const auto sampled = MakeSampledImage(state, resource, mem.sampler);
+			const auto shifted =
+			    OffsetCoordinate(ctx, mem, *address, layout, dimension, coord, resource);
+			const auto            sample = state.builder.AllocateId();
+			std::vector<uint32_t> words {opcode, result_type, sample, sampled, shifted};
 			if (dref) {
 				words.push_back(dref_value);
 			}

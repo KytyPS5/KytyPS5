@@ -373,6 +373,7 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
 uint32_t EmitHostLocalInvocationIndex(EmitterState& state);
 uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate);
+uint32_t NormalizeWaveLaneTarget(EmitterState& state, uint32_t target);
 uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target);
 uint32_t EmitWaveFindFirst(EmitterState& state, uint32_t ballot);
 

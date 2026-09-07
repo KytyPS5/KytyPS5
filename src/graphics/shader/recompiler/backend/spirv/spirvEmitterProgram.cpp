@@ -57,6 +57,7 @@ struct DeferredContinuePatch {
 
 struct StructuredFunctionState {
 	std::unordered_set<const IR::Block*>           dedicated_continues;
+	std::unordered_set<const IR::Block*>           guarded_loop_bodies;
 	std::vector<DeferredContinuePatch>             deferred_continues;
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
@@ -723,6 +724,13 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (state.stage == ShaderType::Pixel && state.wave_size == 64u &&
+	    state.native_subgroup_size == 32u &&
+	    std::ranges::any_of(program.block_info,
+	                        [](const IR::BlockInfo& info) { return info.terminator.loop_header; })) {
+		state.graphics_loop_counter_variable = state.builder.AllocateId();
+		state.builder.AddName(state.graphics_loop_counter_variable, "graphics_loop_counter");
+	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
 		state.labels.emplace(block, label);
@@ -852,6 +860,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.graphics_loop_counter_variable != 0) {
+		state.builder.AddFunction(
+		    {OpStore, state.graphics_loop_counter_variable, ConstantU32(state, 0)});
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

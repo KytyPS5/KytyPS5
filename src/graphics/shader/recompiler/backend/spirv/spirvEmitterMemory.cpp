@@ -16,6 +16,7 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	if (state.lane_count == 2) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
+	target = NormalizeWaveLaneTarget(state, target);
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
 	                          ConstantU32(state, spv::ScopeSubgroup), source, target);

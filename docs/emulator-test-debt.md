@@ -203,3 +203,29 @@ Required tests:
   their separate ordering and publication contracts have executable coverage.
 - Native Windows audit and SPIR-V validation of the captured shader class, followed by a
   bounded game run beyond the original shader-admission failure.
+
+## Bounded image descriptors in constant post-test loops
+
+Status: production fix, native build, offline audit and bounded game validation complete;
+automated regression deferred.
+
+Observed trigger: a compute shader walks an eight-dword image descriptor table with a
+loop-carried index initialized to zero. The descriptor is consumed before the latch increments
+the index and repeats while the incremented signed value is less than the positive constant
+bound. The bounded-read planner recognized only guards reached before the table read, and the
+specialization path could turn bounded descriptor columns into buffer resources only.
+
+Required tests:
+
+- Planner cases for canonical post-test loops with `i = 0`, `next = i + 1`, and a backedge
+  guarded by signed or unsigned `next < positive_constant`, checking the exact dense count.
+- Rejection cases for zero, negative, overflowing, runtime, non-unit, decrementing, multiple
+  latch and non-dominating update forms, plus a read that does not dominate the latch.
+- An eight-column image table with consecutive dword offsets and one shared bounded selector,
+  checking null/invalid descriptor normalization, candidate deduplication and dense key mapping.
+- Mismatched count/address sources, strides, offsets, selectors, column widths and resource
+  reuse must fail closed instead of combining unrelated descriptor words.
+- SPIR-V and Vulkan readback cases for storage-image reads and writes through several table
+  entries on native subgroup-32 wave64 execution, including repeated and all-null entries.
+- Native Windows audit of the captured shader class and a bounded game run beyond its original
+  `GetImageResource dword 0 is not a valid runtime value` failure.

@@ -74,6 +74,8 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
 		    ConstantU32(state, 0xffu));
+		state.memory_byte_limits[i] =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_limit_dword + i);
 	}
 }
 
@@ -117,6 +119,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
 	                           ConstantU32(state, array_index)});
 	access.byte_offset = state.memory_byte_offsets[array_index];
+	access.byte_limit  = state.memory_byte_limits[array_index];
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
@@ -186,6 +189,20 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction({OpULessThan, TypeBool(state), in_bounds, index, access.length});
 	return in_bounds;
+}
+
+uint32_t EmitMemoryByteRangeInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                     uint32_t address, uint32_t byte_count) {
+	const auto end = EmitAddU32(state, address, ConstantU32(state, byte_count));
+	const auto no_overflow = state.builder.AllocateId();
+	state.builder.AddFunction({OpUGreaterThanEqual, TypeBool(state), no_overflow, end, address});
+	const auto within_limit = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThanEqual, TypeBool(state), within_limit, end,
+	                           access.byte_limit});
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLogicalAnd, TypeBool(state), result, no_overflow, within_limit});
+	return result;
 }
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,

@@ -395,8 +395,13 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
 	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	const auto in_bounds = mem.kind == IR::ResourceKind::Buffer ||
+	                               mem.kind == IR::ResourceKind::ScalarBuffer
+	                           ? EmitMemoryByteRangeInBounds(ctx.state, access.resource, address,
+	                                                         bits / 8u)
+	                           : EmitMemoryElementInBounds(ctx.state, access.resource, access.index);
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+	    ctx.state, in_bounds, [&]() {
 		    return LoadSubwordInBounds(ctx, access.resource, address, access.index, bits,
 		                               sign_extend);
 	    });
@@ -421,20 +426,31 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
-	const auto word = LoadWordInBounds(ctx, resource, index);
+	auto&      state = ctx.state;
+	const auto word  = LoadWordInBounds(ctx, resource, index);
 	const auto byte =
-	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address, ConstantU32(ctx.state, 3));
+	    Binary(state, OpBitwiseAnd, TypeU32(state), address, ConstantU32(state, 3));
 	const auto shift =
-	    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), byte, ConstantU32(ctx.state, 3));
-	const auto value =
-	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
-	           Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), word, shift),
-	           ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu));
+	    Binary(state, OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+	auto value = Binary(state, OpShiftRightLogical, TypeU32(state), word, shift);
+	if (bits == 16u) {
+		const auto crosses = Binary(state, OpIEqual, TypeBool(state), byte, ConstantU32(state, 3));
+		const auto next = EmitValueOrZeroIfCondition(state, crosses, [&]() {
+			return LoadWordInBounds(ctx, resource,
+			                        Binary(state, OpIAdd, TypeU32(state), index,
+			                               ConstantU32(state, 1)));
+		});
+		value = Binary(
+		    state, OpBitwiseOr, TypeU32(state), value,
+		    Binary(state, OpShiftLeftLogical, TypeU32(state), next, ConstantU32(state, 8)));
+	}
+	value = Binary(state, OpBitwiseAnd, TypeU32(state), value,
+	               ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	if (!sign_extend) return value;
-	const auto left = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), value,
-	                         ConstantU32(ctx.state, 32u - bits));
-	return Binary(ctx.state, OpShiftRightArithmetic, TypeU32(ctx.state), left,
-	              ConstantU32(ctx.state, 32u - bits));
+	const auto left = Binary(state, OpShiftLeftLogical, TypeU32(state), value,
+	                         ConstantU32(state, 32u - bits));
+	return Binary(state, OpShiftRightArithmetic, TypeU32(state), left,
+	              ConstantU32(state, 32u - bits));
 }
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
@@ -572,9 +588,11 @@ bool LdsHasCompetingInvocations(const EmitterState& state) {
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
+	auto&      state = ctx.state;
+	const auto byte = Binary(state, OpBitwiseAnd, TypeU32(state), address, ConstantU32(state, 3));
 	const auto shift   = Binary(
 	    ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-	    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), address, ConstantU32(ctx.state, 3)),
+	    byte,
 	    ConstantU32(ctx.state, 3));
 	const auto mask  = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
 	                          ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu), shift);
@@ -582,25 +600,47 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	                          Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), data,
 	                                 ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
 	                          shift);
-	const auto merge = [&](uint32_t old) {
+	const auto merge = [&](uint32_t old, uint32_t update_mask, uint32_t update_value) {
 		return Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
 		              Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), old,
-		                     Unary(ctx.state, OpNot, TypeU32(ctx.state), mask)),
-		              value);
+		                     Unary(ctx.state, OpNot, TypeU32(ctx.state), update_mask)),
+		              update_value);
 	};
-	if (UsesPackedLds64(ctx.state, resource)) {
-		AtomicUpdatePackedLdsWord(ctx.state, resource.object_pointer, index, merge);
-		return;
-	}
-	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	if (mem.kind == IR::ResourceKind::Scratch ||
-	    (mem.kind == IR::ResourceKind::Lds && !LdsHasCompetingInvocations(ctx.state))) {
-		// Private storage has no other writer that could be lost by this RMW.
-		const auto old = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), old, pointer});
-		ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
-	} else {
-		AtomicUpdate(ctx.state, pointer, mem.kind, merge);
+	const auto update_word = [&](uint32_t target_index, uint32_t update_mask,
+	                             uint32_t update_value) {
+		if (UsesPackedLds64(state, resource)) {
+			AtomicUpdatePackedLdsWord(state, resource.object_pointer, target_index,
+			                          [&](uint32_t old) {
+				                          return merge(old, update_mask, update_value);
+			                          });
+			return;
+		}
+		const auto pointer = EmitMemoryElementPointer(state, resource, target_index);
+		if (mem.kind == IR::ResourceKind::Scratch ||
+		    (mem.kind == IR::ResourceKind::Lds && !LdsHasCompetingInvocations(state))) {
+			// Private storage has no other writer that could be lost by this RMW.
+			const auto old = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, TypeU32(state), old, pointer});
+			state.builder.AddFunction({OpStore, pointer, merge(old, update_mask, update_value)});
+		} else {
+			AtomicUpdate(state, pointer, mem.kind, [&](uint32_t old) {
+				return merge(old, update_mask, update_value);
+			});
+		}
+	};
+	update_word(index, mask, value);
+	if (bits == 16u) {
+		const auto crosses = Binary(state, OpIEqual, TypeBool(state), byte, ConstantU32(state, 3));
+		EmitIfCondition(state, crosses, [&]() {
+			const auto next_index =
+			    Binary(state, OpIAdd, TypeU32(state), index, ConstantU32(state, 1));
+			const auto next_mask    = ConstantU32(state, 0xffu);
+			const auto next_value = Binary(state, OpBitwiseAnd, TypeU32(state),
+			                               Binary(state, OpShiftRightLogical, TypeU32(state), data,
+			                                      ConstantU32(state, 8)),
+			                               next_mask);
+			update_word(next_index, next_mask, next_value);
+		});
 	}
 }
 
@@ -610,8 +650,13 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
 	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	const auto in_bounds = mem.kind == IR::ResourceKind::Buffer ||
+	                               mem.kind == IR::ResourceKind::ScalarBuffer
+	                           ? EmitMemoryByteRangeInBounds(ctx.state, access.resource, address,
+	                                                         bits / 8u)
+	                           : EmitMemoryElementInBounds(ctx.state, access.resource, access.index);
 	EmitIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+	    ctx.state, in_bounds, [&]() {
 		    StoreSubwordInBounds(ctx, mem, access.resource, address, access.index, bits, data);
 	    });
 }
@@ -1030,7 +1075,8 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 		                                   plan.addresses[component], ConstantU32(ctx.state, 2));
 		plan.indices[component]   = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 		const auto component_bound =
-		    EmitMemoryElementInBounds(ctx.state, resource, plan.indices[component]);
+		    EmitMemoryByteRangeInBounds(ctx.state, resource, plan.addresses[component],
+		                                std::max(plan.info.component_bits[component] / 8u, 1u));
 		if (first_bound) {
 			plan.in_bounds = component_bound;
 			first_bound    = false;

@@ -380,6 +380,7 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_limits {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -682,6 +683,7 @@ struct MemoryResourceAccess {
 	uint32_t         length           = 0;
 	uint32_t         index_offset     = 0;
 	uint32_t         byte_offset      = 0;
+	uint32_t         byte_limit       = 0;
 	bool             add_index_offset = false;
 };
 
@@ -697,6 +699,9 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+
+uint32_t EmitMemoryByteRangeInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                     uint32_t address, uint32_t byte_count);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

@@ -190,6 +190,39 @@ the game then advanced to renderer descriptor binding and failed at the next ind
 buffer offset boundary. Exact null roots specialize to zero before pointer arithmetic, while
 non-null unreadable and GPU-dirty roots retain the existing fail-closed path.
 
+## Storage-buffer backing offsets beyond the packed residual ABI
+
+Status: production fix and native build complete; bounded game validation in progress;
+automated regression deferred.
+
+Observed trigger: after the optional null SRT shader compiles, renderer binding obtains a guest
+storage-buffer subrange whose offset inside a shared Vulkan backing cannot be represented by the
+current one-byte residual field or violates the access-shape admission rules. The current fatal
+does not print the guest address, backing offset, device alignment, residual, range or resource
+access facts, so the exact boundary must be measured before selecting a representation.
+
+Required tests:
+
+- Shared backings with residual offsets at 0, 1, 3, 4, 255, 256 and the device alignment minus
+  one, checking the descriptor offset, bound range and shader-visible effective byte address.
+- Raw, scalar, typed, formatted 8-bit and formatted 16-bit reads and writes at aligned and
+  unaligned guest addresses, including accesses spanning two native DWORDs.
+- A residual wider than the packed one-byte shader-data field, proving it is either rebased into
+  a dedicated buffer view or represented by a wider ABI without truncation.
+- Exact-end, partial-DWORD-tail, maximum Vulkan range and arithmetic-overflow cases, checking that
+  out-of-range guest bytes cannot become visible through alignment expansion.
+- Read/write and atomic resources backed by an existing larger allocation, checking cache
+  invalidation and aliasing after any rebase or dedicated-view fallback.
+- Vulkan validation/readback plus a bounded game run past the renderer failure following shader
+  `ee4f153aa500d327`.
+
+Diagnosis measured vertex slot 6 at guest address `0x80760a1a16`, size `0x240`, Vulkan alignment
+16 and residual 6. The resource is descriptor-formatted-only, read-only and non-atomic. The new
+shader-data layout carries an exact byte limit per buffer, so the Vulkan range may be rounded to a
+complete DWORD without exposing padding to guest accesses; 16-bit cross-DWORD loads and stores
+join or split their two backing words. Both native targets build. Cache-warming runs have reached
+shader 131 without fatal or validation output but have not yet returned to the slot-6 binding.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

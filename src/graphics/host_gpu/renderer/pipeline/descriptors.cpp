@@ -130,18 +130,20 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
-// Descriptor-formatted byte components accept any byte alignment without a
-// two-word load/store. The proof covers every use of the
-// resource; one formatted use must not authorize a neighboring raw/typed access.
-static bool SupportsByteStorageOffset(const ShaderBufferResource& descriptor,
-                                      const ShaderRecompiler::IR::BufferResource& resource) {
+// Descriptor-formatted 8-bit and 16-bit components can be rebased from any byte
+// alignment. The emitter joins or splits a 16-bit access that crosses a DWORD.
+// The proof covers every use of the resource; one formatted use must not
+// authorize a neighboring raw/typed access.
+static bool SupportsSubwordStorageOffset(const ShaderBufferResource& descriptor,
+                                         const ShaderRecompiler::IR::BufferResource& resource) {
 	if (!resource.descriptor_formatted_only || !resource.formatted || resource.scalar ||
 	    resource.atomic) return false;
 	const auto format = ShaderRecompiler::Format::GetFormatInfo(descriptor.Format());
 	if (format.type == ShaderRecompiler::Format::ComponentType::Unknown ||
 	    format.packed_bitfield || format.component_count == 0u) return false;
 	for (uint32_t component = 0; component < format.component_count; ++component) {
-		if (format.component_bits[component] != 8u) return false;
+		const auto bits = format.component_bits[component];
+		if (bits != 8u && bits != 16u) return false;
 	}
 	return true;
 }
@@ -150,9 +152,10 @@ static BufferView NativeStorageBuffer(RenderContext&                            
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
                                       ShaderType stage, uint32_t slot, uint32_t& buffer_offset,
-                                      BufferId id) {
+                                      uint32_t& buffer_limit, BufferId id) {
 	BufferView result;
 	buffer_offset = 0;
+	buffer_limit  = 0;
 
 	const auto address = descriptor.Base48();
 	const auto stride  = descriptor.Stride();
@@ -178,19 +181,34 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsByteStorageOffset(descriptor, resource)) ||
+	if ((byte_adjustment && !SupportsSubwordStorageOffset(descriptor, resource)) ||
 	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64
+		     " requested=0x%016" PRIx64 " size=0x%016" PRIx64 " backing_offset=0x%016" PRIx64
+		     " alignment=0x%016" PRIx64 " aligned_offset=0x%016" PRIx64
+		     " adjustment=0x%016" PRIx64 " max_range=0x%016" PRIx64
+		     " formatted=%d descriptor_formatted_only=%d scalar=%d atomic=%d written=%d\n",
+		     static_cast<uint32_t>(stage), slot, address, requested_size, size,
+		     static_cast<uint64_t>(offset), static_cast<uint64_t>(alignment),
+		     static_cast<uint64_t>(aligned_offset), static_cast<uint64_t>(adjustment),
+		     static_cast<uint64_t>(max_range), resource.formatted,
+		     resource.descriptor_formatted_only, resource.scalar, resource.atomic, resource.written);
 	}
-	// Runtime-array length counts complete DWORDs. A partial last DWORD needs
-	// a separate guest-byte bound before its host backing can be rounded up.
-	if (byte_adjustment && (size + adjustment) % sizeof(uint32_t) != 0) {
-		EXIT("storage buffer offset adjustment is unsupported: partial DWORD tail\n");
+	const auto byte_limit = size + adjustment;
+	const auto padding = (sizeof(uint32_t) - byte_limit % sizeof(uint32_t)) % sizeof(uint32_t);
+	if (padding > max_range - byte_limit || aligned_offset > buffer->Size() ||
+	    byte_limit + padding > buffer->Size() - aligned_offset) {
+		EXIT("storage buffer aligned range exceeds its backing: stage=%u slot=%u "
+		     "guest=0x%016" PRIx64 " byte_limit=0x%016" PRIx64 " padding=%" PRIu64
+		     " backing_offset=0x%016" PRIx64 " backing_size=0x%016" PRIx64 "\n",
+		     static_cast<uint32_t>(stage), slot, address, byte_limit, padding,
+		     static_cast<uint64_t>(aligned_offset), buffer->Size());
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
+	buffer_limit  = static_cast<uint32_t>(byte_limit);
 	result.buffer = buffer->Handle();
 	result.offset = aligned_offset;
-	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	result.range  = static_cast<vk::DeviceSize>(byte_limit + padding);
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -1306,10 +1324,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& [descriptor, buffer_id] = prepared.buffer_sources[i];
 		uint32_t buffer_offset              = 0;
+		uint32_t buffer_limit               = 0;
 		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
 		                                                program.info.buffers[i], program.stage, i,
-		                                                buffer_offset, buffer_id));
+		                                                buffer_offset, buffer_limit, buffer_id));
 		pack_memory_offset(i, buffer_offset);
+		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

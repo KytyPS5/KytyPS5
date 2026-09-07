@@ -5,16 +5,17 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#elif defined(__APPLE__)
-#include <csignal>
-#include <sys/ucontext.h>
 #else
 #include <algorithm>
 #include <csignal>
 #include <cstdlib>
 #include <initializer_list>
-#include <ucontext.h> // IWYU pragma: keep
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h> // IWYU pragma: keep
+#endif
 #endif
 
 // IWYU pragma: no_include <errhandlingapi.h>
@@ -32,6 +33,51 @@ static std::atomic_uint32_t g_install_state {0};
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+
+// macOS uses the same POSIX platform setting and needs a signal stack too.
+class ThreadSignalStack {
+public:
+	ThreadSignalStack() {
+		const auto page_size = static_cast<size_t>(::getpagesize());
+		const auto stack_size =
+		    (std::max<size_t>(64 * 1024, MINSIGSTKSZ) + page_size - 1) & ~(page_size - 1);
+		if (::posix_memalign(&m_memory, page_size, stack_size) != 0) {
+			return;
+		}
+
+		stack_t stack {};
+		stack.ss_sp   = m_memory;
+		stack.ss_size = stack_size;
+		if (::sigaltstack(&stack, &m_previous) != 0) {
+			std::free(m_memory);
+			m_memory = nullptr;
+		}
+	}
+
+	~ThreadSignalStack() {
+		if (m_memory != nullptr && ::sigaltstack(&m_previous, nullptr) == 0) {
+			std::free(m_memory);
+		}
+	}
+
+	[[nodiscard]] bool IsInitialized() const { return m_memory != nullptr; }
+
+	KYTY_CLASS_NO_COPY(ThreadSignalStack)
+
+private:
+	void*   m_memory = nullptr;
+	stack_t m_previous {};
+};
+
+bool InitializeThreadSignalStack() {
+	// Keep fault handling off guest stacks, which GPU tracking can make read-only.
+	thread_local ThreadSignalStack signal_stack;
+	return signal_stack.IsInitialized();
+}
+
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -166,46 +212,6 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 
 #else
 
-class ThreadSignalStack {
-public:
-	ThreadSignalStack() {
-		const auto page_size = static_cast<size_t>(::getpagesize());
-		const auto stack_size =
-		    (std::max<size_t>(64 * 1024, MINSIGSTKSZ) + page_size - 1) & ~(page_size - 1);
-		if (::posix_memalign(&m_memory, page_size, stack_size) != 0) {
-			return;
-		}
-
-		stack_t stack {};
-		stack.ss_sp   = m_memory;
-		stack.ss_size = stack_size;
-		if (::sigaltstack(&stack, &m_previous) != 0) {
-			std::free(m_memory);
-			m_memory = nullptr;
-		}
-	}
-
-	~ThreadSignalStack() {
-		if (m_memory != nullptr && ::sigaltstack(&m_previous, nullptr) == 0) {
-			std::free(m_memory);
-		}
-	}
-
-	[[nodiscard]] bool IsInitialized() const { return m_memory != nullptr; }
-
-	KYTY_CLASS_NO_COPY(ThreadSignalStack)
-
-private:
-	void*   m_memory = nullptr;
-	stack_t m_previous {};
-};
-
-bool InitializeThreadSignalStack() {
-	// Keep fault handling off guest stacks, which GPU tracking can make read-only.
-	thread_local ThreadSignalStack signal_stack;
-	return signal_stack.IsInitialized();
-}
-
 // x86-64 page-fault error bits.
 constexpr uint64_t PAGE_FAULT_ERROR_WRITE       = 0x02;
 constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION = 0x10;
@@ -295,7 +301,7 @@ bool InstallHandler(Handler handler) {
 #elif defined(__APPLE__)
 	struct sigaction sa {};
 	sa.sa_sigaction = SignalHandler;
-	sa.sa_flags     = SA_SIGINFO;
+	sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
 	sigemptyset(&sa.sa_mask);
 	// The guest signal-dispatch path (KernelRaiseException) interrupts threads with
 	// SIGUSR1; block it while a fault is being resolved so a stop-the-world request

@@ -28702,6 +28702,19 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, MaskSccSaveexecBranchesTheWholeWave());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-cases-only") == 0) {
+    VulkanHarness vulkan;
+    const auto tests = MakeCases();
+    const auto graphics_tests = MakeGraphicsCases();
+    CheckOpcodeCoverage(tests, graphics_tests);
+    for (const auto &test : tests) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : graphics_tests) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);

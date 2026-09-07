@@ -1,18 +1,19 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
 Обновлено **7 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
-Рабочая ветка — `yotei-windows-bringup` fork `fxpw/KytyPS5`; draft PR —
-[#497](https://github.com/KytyPS5/KytyPS5/pull/497).
+Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
-остаётся frame 124 в запуске `010001-1fc2ba`. Последняя проверка исправления
-`021530-0b1686` дошла до frame 120, прошла повторное depth attachment discovery
-и сама завершилась кодом 321 на следующем compute resource materialization. Signed storage shader
+остаётся frame 124. Последняя проверка исправления `033022-89f2cb` дошла до
+frame 123, полностью прошла runtime materialization следующего compute shader и
+сама завершилась кодом 321 уже при проверке wave64 lowering. Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
-выпускают SPIR-V и создают Vulkan pipelines. Текущий блокер находится при binding
-следующего image descriptor теперь пройден: 256-байтный placed-view адрес больше
-не проверяется как начало отдельной 4-КБ allocation. Проверочный readback первых восьми source
+выпускают SPIR-V и создают Vulkan pipelines. Зависимые bounded buffer/image/sampler
+descriptors для `8457901d80b91921` теперь материализуются; текущий блокер —
+недоказанная wave-uniform branch на guest PC 612 при split wave64. Прежний image
+blocker также пройден: 256-байтный placed-view адрес больше не проверяется как
+начало отдельной 4-КБ allocation. Проверочный readback первых восьми source
 frames соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый
 полезный кадр пока не доказан.
 
@@ -84,8 +85,8 @@ flowchart TD
 | 2 | Загрузка гостя | Loader читает executable и модули, разрешает импорты, создаёт память и стартовые потоки. | Отсутствие loader/import fatal; прогресс гостевого лога. | **PASS**. Игра многократно доходит до графической инициализации. |
 | 3 | Команды GPU | Guest записывает PM4/compute/draw команды; Kyty разбирает очереди и формирует renderer calls. | Логи `GraphicsRenderDispatchDirect`, draw/dispatch counters. | **PASS** для достигнутого пути. Выполнены сотни команд и повторяющиеся кадры. |
 | 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **Частично**. Текущий строгий batch: 714/825 дошли до своей проверяемой границы; 111 остановились. Это не означает 714 готовых Vulkan pipeline. |
-| 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **PASS для достигнутого игрового пути.** Constant-bound pre/post-test loops поддерживают согласованные snapshots buffer- и восьмисловных image-descriptor tables. `5f3fdf61a7ca4a20` материализует шесть записей с живым GPU-индексом. Остальной корпус поддержан частично. |
-| 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **PASS для достигнутого игрового пути.** `e52e19c6923301d0` проходит как structured CFG; `f802a6b9d9904f74` принят как один полный split wave64; `5f3fdf61a7ca4a20` выпускает валидный SPIR-V с indirect storage-image read. |
+| 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **PASS для достигнутого игрового пути.** Помимо прямых bounded tables, `8457901d80b91921` материализует GPU-selected buffer, image и sampler expressions через общую snapshot-транзакцию, включая deferred flat slots и нулевые OOB/null-tail кандидаты. Остальной корпус поддержан частично. |
+| 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **Текущий блокер.** `8457901d80b91921` дошёл до `SPIR-V EmitProgram`, но split-wave64 validation остановился на недоказанной wave-uniform branch, guest PC 612. Прежние `e52e…`, `f802…` и `5f3f…` проходят свои проверенные границы. |
 | 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/checkpointed/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для persistent cache.** Принудительно остановленный запуск сохранил семь промежуточных версий вплоть до 7,07 MiB; следующий запуск загрузил их. Неизменившийся blob отсекается по хэшу. |
 | 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **Частично.** `e52e…` исправлен до 14–16 мс steady; главный известный compute-блокер `916e…` остаётся около 6,1 с. |
 | 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 110 GPU flips, 109 shown. Это ещё не доказывает полезные пиксели. |
@@ -148,9 +149,13 @@ pipeline. Фикс отделил 256-байтное выравнивание а
 alignment tiled surface и сохранил точный placed-view guest range. После
 `053b2c82226fe5ed` успешно созданы pipelines `c090…`, `be4e…`, `3176…` и
 `916e…`; `c6b0…` теперь проходит Normalize, TrackResources и SPIR-V emission.
-Независимый phase trace сократил журнал этого пути до 188 KiB/2066 строк и выявил
-следующий блокер: `8457901d80b91921` проходит resource tracking, но его runtime
-resources пока не материализуются.
+Независимый phase trace сократил журнал этого пути до сотен KiB и выявил
+последовательность причин в `8457901d80b91921`. Общий materializer теперь
+распознаёт зависимые buffer/image/sampler expressions, связывает image/sampler
+кандидаты одним selector group, откладывает GPU-selected flat slots, сохраняет
+scalar-buffer OOB/null tails как нулевые descriptors и отделяет предел одного
+16-битного домена от общего 64-МиБ snapshot budget. Shader прошёл
+`MaterializeResources`; следующий блокер находится в split-wave64 validation.
 
 ## Состояние по уровням проверки
 
@@ -158,12 +163,12 @@ resources пока не материализуются.
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows build/install commit `3a73ed7` плюс diagnostic trace завершён; последний runtime binary SHA-256 `c2dc50714dd925de6029a4fe0fa54b208c485a4e0b073ee738e1377c47547f10`. | Commit-only hash diagnostic-изменения появится после milestone commit/rebuild; полный CTest отложен как test debt. |
+| Установленный эмулятор | Windows `shader_cfg_tests` и `kyty_emulator` собраны, install tree обновлён; descriptor milestone commit `b66a4a8`, последний runtime binary SHA-256 `0663ad724b3cb4166a490d676294559f1b93794013f22cc12f070f6b4e3b23e7`. | Полный CTest для накопленных быстрых исправлений отложен как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `021530-0b1686` с validation дошёл до frame 120, прошёл depth rediscovery и скомпилировал 135 shaders; следующий `8457…` завершил TrackResources. Максимум прежней сборки — frame 124. | Первый ненулевой видимый кадр ещё не достигнут; `MaterializeResources` для `8457…` вернул false без точной причины. |
+| Реальная игра | `033022-89f2cb` с validation дошёл до frame 123 и 135 завершённых shaders; `8457…` прошёл TrackResources и runtime materialization, затем вошёл в SPIR-V emission. Максимум всех прогонов — frame 124. | Первый ненулевой видимый кадр ещё не достигнут; текущая точная ошибка — split wave64 не доказал wave-uniform branch на PC 612. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -209,19 +214,20 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-021530-0b1686` |
-| SHA-256 запущенного emulator | `bb4a17e3fe0c4ee64f438f5a65aa94d0a4562b734ced749ebff9034069333db7` |
-| Время UTC | `2026-09-07T02:15:30.2016386Z` → `02:17:14.9866631Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-033022-89f2cb` |
+| SHA-256 запущенного emulator | `0663ad724b3cb4166a490d676294559f1b93794013f22cc12f070f6b4e3b23e7` |
+| Время UTC | `2026-09-07T03:30:22.7619390Z` → `03:32:06.5914960Z` |
 | Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 1280×720; внутренние основные targets 480×270 |
-| Завершение | Самостоятельный exit code 321 до timeout 360 с; процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 120; FPS 0,060975; flips CPU/GPU 0/109; prepared 109, ready 109, shown 108; 135 shaders скомпилированы |
+| Завершение | Самостоятельный exit code 321 до timeout 240 с; процессов Kyty после runner нет |
+| Наблюдаемое исполнение | frame 123; FPS 0,085213; flips CPU/GPU 0/112; prepared 112, ready 112, shown 111; 135 shaders полностью скомпилированы |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
 | Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 443 слова, emission 60 мс, shader №132 завершён |
 | Пройденная renderer-ошибка | Устаревший depth attachment повторно найден и привязан по исходному descriptor перед final view acquisition; прежнего `depth target changed after render-state discovery` нет |
-| Текущая ошибка | `8457901d80b91921`: decode 1109, CFG 126 blocks/8 loops, Normalize 5115, TrackResources 5058; `MaterializeResources` вернул false в `pipelineCache.cpp:568` до SPIR-V |
-| Диагностика | `KYTY_SHADER_PHASE_TRACE=1` при silent guest log сохранил все phase begin/end в stdout: 188 KiB, 2066 строк вместо прежних 244 MiB/10 140 670 строк |
+| Пройденный descriptor-блокер | `8457901d80b91921`: decode 1109, CFG 126 blocks/8 loops, Normalize 5115, TrackResources 5074. Buffer/image/sampler expressions с 16-битным bounded selector материализованы; shader вошёл в `SPIR-V EmitProgram` |
+| Текущая ошибка | SPIR-V validation: `wave64 splitting cannot prove wave-uniform branch at pc 612` для `8457901d80b91921`, stage compute |
+| Диагностика | `KYTY_SHADER_PHASE_TRACE=1` при silent guest log сохранил точную смену стадии; предшествующие прогоны отдельно подтвердили исправление cumulative snapshot limit и null-tail candidate 6 |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым

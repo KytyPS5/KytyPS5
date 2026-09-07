@@ -596,8 +596,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (feedback && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		const auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		                             : depth_attachment_layout(depth);
+		auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		                       : depth_attachment_layout(depth);
+		const bool written =
+		    depth.depth_write_enable ||
+		    static_cast<bool>(depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil);
+		if (!feedback && written && image.binding.is_bound) {
+			layout = vk::ImageLayout::eGeneral;
+		}
 		// The attachment store writes even when guest depth/stencil tests do not.
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;

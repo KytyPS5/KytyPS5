@@ -15,9 +15,9 @@ struct MimgSampleInfo {
 };
 
 struct MimgGatherInfo {
-	uint32_t encoding = 0;
-	Opcode   decoded  = Opcode::UNSUPPORTED;
-	uint32_t flags    = 0;
+	uint32_t    encoding = 0;
+	const char* name     = nullptr;
+	uint32_t    flags    = 0;
 };
 
 struct MimgAtomicInfo {
@@ -182,18 +182,39 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
-    {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
-    {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
-    {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
-    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
-     ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x58u, Opcode::IMAGE_GATHER4_C_O,
-     ImageSampleFlagCompare | ImageSampleFlagOffset},
-    {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
+    {0x40u, "image_gather4", 0},
+    {0x41u, "image_gather4_cl", ImageSampleFlagLodClamp},
+    {0x44u, "image_gather4_l", ImageSampleFlagLod},
+    {0x45u, "image_gather4_b", ImageSampleFlagBias},
+    {0x46u, "image_gather4_b_cl", ImageSampleFlagBias | ImageSampleFlagLodClamp},
+    {0x47u, "image_gather4_lz", ImageSampleFlagLevelZero},
+    {0x48u, "image_gather4_c", ImageSampleFlagCompare},
+    {0x49u, "image_gather4_c_cl", ImageSampleFlagCompare | ImageSampleFlagLodClamp},
+    {0x4cu, "image_gather4_c_l", ImageSampleFlagCompare | ImageSampleFlagLod},
+    {0x4du, "image_gather4_c_b", ImageSampleFlagCompare | ImageSampleFlagBias},
+    {0x4eu, "image_gather4_c_b_cl",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp},
+    {0x4fu, "image_gather4_c_lz", ImageSampleFlagCompare | ImageSampleFlagLevelZero},
+    {0x50u, "image_gather4_o", ImageSampleFlagOffset},
+    {0x51u, "image_gather4_cl_o", ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x54u, "image_gather4_l_o", ImageSampleFlagLod | ImageSampleFlagOffset},
+    {0x55u, "image_gather4_b_o", ImageSampleFlagBias | ImageSampleFlagOffset},
+    {0x56u, "image_gather4_b_cl_o",
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x57u, "image_gather4_lz_o", ImageSampleFlagLevelZero | ImageSampleFlagOffset},
+    {0x58u, "image_gather4_c_o", ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x59u, "image_gather4_c_cl_o",
+     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x5cu, "image_gather4_c_l_o",
+     ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset},
+    {0x5du, "image_gather4_c_b_o",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset},
+    {0x5eu, "image_gather4_c_b_cl_o",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset},
+    {0x5fu, "image_gather4_c_lz_o",
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
+    {0x61u, "image_gather4h", ImageSampleFlagGatherHorizontal},
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
@@ -221,7 +242,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		return Opcode::IMAGE_SAMPLE;
 	}
 	if (gather != nullptr) {
-		return gather->decoded;
+		return Opcode::IMAGE_GATHER4;
 	}
 	if (atomic != nullptr) {
 		return atomic->decoded;
@@ -403,6 +424,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 const char* MimgSampleOpcodeName(uint32_t opcode) {
 	const auto* sample = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
 	return sample != nullptr ? sample->name : nullptr;
+}
+
+const char* MimgGatherOpcodeName(uint32_t opcode) {
+	const auto* gather = Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
+	return gather != nullptr ? gather->name : nullptr;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

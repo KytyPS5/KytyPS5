@@ -7,6 +7,7 @@
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -25,6 +26,8 @@
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
+#include <QVulkanInstance>
+#include <QVulkanWindow>
 #include <QtAlgorithms>
 
 #include "ui_configuration_edit_dialog.h"
@@ -163,6 +166,35 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->spinBox_user_id->setValue(info.user_id);
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	m_ui->comboBox_gpu->clear();
+	m_ui->comboBox_gpu->addItem(tr("Auto"));
+#if defined(__APPLE__)
+	if (!qEnvironmentVariableIsSet("QT_VULKAN_LIB")) {
+		const auto base    = QCoreApplication::applicationDirPath();
+		auto       library = base + "/libMoltenVK.dylib";
+		if (!QFileInfo::exists(library)) {
+			library = base + "/../Frameworks/libMoltenVK.dylib";
+		}
+		if (QFileInfo::exists(library)) {
+			qputenv("QT_VULKAN_LIB", library.toUtf8());
+		}
+	}
+#endif
+	QVulkanInstance instance;
+	instance.setApiVersion(QVersionNumber(1, 3, 0));
+#if !defined(__APPLE__)
+	instance.setFlags(QVulkanInstance::NoPortabilityDrivers);
+#endif
+	if (instance.create()) {
+		QVulkanWindow window;
+		window.setVulkanInstance(&instance);
+		for (const auto& device: window.availablePhysicalDevices()) {
+			m_ui->comboBox_gpu->addItem(QString::fromUtf8(device.deviceName));
+		}
+	}
+	m_ui->comboBox_gpu->setCurrentIndex(
+	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
+	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
@@ -306,6 +338,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();

@@ -169,7 +169,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
 	if (Config::GetGpuIndex() >= 0) {
-		devices = {devices[Config::GetGpuIndex()]};
+		if (static_cast<size_t>(Config::GetGpuIndex()) < devices.size()) {
+			devices = {devices[Config::GetGpuIndex()]};
+		} else {
+			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
+			     Config::GetGpuIndex());
+		}
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;

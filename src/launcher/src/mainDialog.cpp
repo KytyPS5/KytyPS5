@@ -229,6 +229,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--user-name" << info.user_name;
 	args << "--user-id" << QString::number(info.user_id);
 	args << "--present-mode" << EnumToText(info.present_mode);
+	if (info.gpu_index >= 0) {
+		args << "--gpu" << QString::number(info.gpu_index);
+	}
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
 	}

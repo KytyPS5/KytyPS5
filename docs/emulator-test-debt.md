@@ -407,6 +407,38 @@ CPU decoder rejection of GFX10 `MUBUF opcode 0x20` in compute shader `d7a8391171
 This evidence proves the watchdog failure is cleared for the captured path; it does not prove
 exact guest cross-half values or non-black pixel output.
 
+## GFX10 byte-to-D16 buffer loads
+
+Status: production fix, native build, exact shader audit and bounded game validation complete;
+automated regression deferred.
+
+Observed trigger: compute shader `d7a83911714a58ee` reaches a GFX10 MUBUF instruction with raw
+words `[0xe080e000 0x80040003]` at guest PC `0x60`. The current decoder rejects opcode `0x20`.
+Independent GFX1030 disassembly identifies it as `buffer_load_ubyte_d16`; the adjacent opcodes
+`0x21...0x23` are the high-half unsigned form and the low/high signed-byte forms.
+
+Required tests:
+
+- Decode exact GFX10 MUBUF opcodes `0x20...0x23` to unsigned/signed byte-to-D16 low/high
+  operations with one destination DWORD, eight memory bits, and the correct destination-half
+  selector. Existing non-D16 byte and short opcodes must retain their current metadata.
+- Unsigned byte values `0x00`, `0x7f`, `0x80`, and `0xff`, proving zero extension to the selected
+  16-bit half while the other half of VDATA is preserved exactly.
+- Signed byte values at the same boundaries, proving sign extension to 16 bits before insertion
+  and preservation of the unselected half for both low and high forms.
+- Indexed, offset, scalar-offset, combined-address and out-of-bounds reads, proving the new forms
+  reuse the shared buffer address and bounds path and replace only their selected half.
+- Decode rejection around reserved neighboring encodings plus replay of the exact captured
+  shader, proving support is based on the ISA opcode family rather than a title or shader hash.
+- Native Windows game run proving `d7a83911714a58ee` advances beyond CFG, translation, SPIR-V
+  validation and pipeline creation without regressing the preceding graphics-wave64 draw.
+
+Current evidence: native `shader_cfg_tests --audit-shader` decodes all 55 instructions and
+passes the exact capture through CFG, IR translation and resource tracking. In game run
+`yotei-integrated-20260907-075324-3c906f`, `d7a83911714a58ee` emitted 6,537 SPIR-V words,
+compiled as shader 172, and its 76x1x1 dispatch completed in 63,618 us. Execution then compiled
+two more shaders and stopped independently in resource tracking for `6cc64dee32dc7094`.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

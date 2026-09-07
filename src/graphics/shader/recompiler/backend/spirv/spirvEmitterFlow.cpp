@@ -508,6 +508,13 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    {OpAccessChain, TypePointer(state, StorageClassOutput, TypeF32Vector(state, 4)),
 			     pointer, variable, ConstantU32(state, 0)});
 			state.builder.AddFunction({OpStore, pointer, value});
+		} else if (state.stage == ShaderType::Vertex &&
+		           exp.kind == IR::ExportTargetKind::Parameter) {
+			for (const auto& output: state.outputs) {
+				if (output.kind == IR::StageOutputKind::Parameter && output.index == exp.index) {
+					state.builder.AddFunction({OpStore, output.variable_id, value});
+				}
+			}
 		} else {
 			state.builder.AddFunction({OpStore, variable, value});
 		}

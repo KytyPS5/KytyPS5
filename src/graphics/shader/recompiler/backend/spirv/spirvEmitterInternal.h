@@ -545,7 +545,8 @@ uint32_t VertexParameterVectorOrScalarType(EmitterState& state, VertexInputScala
 uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);
 
-bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
+bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index,
+               uint32_t location);
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program);
 

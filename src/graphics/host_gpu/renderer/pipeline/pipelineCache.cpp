@@ -389,7 +389,8 @@ struct PipelineCache::ProgramCache {
 		}
 	};
 
-	static constexpr std::size_t MaxStaticKeyWords = 14 + ShaderVertexInputInfo::RES_MAX * 13;
+	static constexpr std::size_t MaxStaticKeyWords =
+	    15 + ShaderVertexInputInfo::PARAM_LINK_MAX * 2 + ShaderVertexInputInfo::RES_MAX * 13;
 
 	template <ShaderType Stage>
 	Permutation CompilePermutation(const ShaderParams&                          params,
@@ -839,8 +840,34 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
 	GraphicsPrograms  result;
+	vertex_info.linked_param_count = 0;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		std::vector<uint32_t> active_inputs;
+		for (const auto& input: pixel_info.stage.program->info.inputs) {
+			if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter) {
+				active_inputs.push_back(input.location);
+			}
+		}
+		for (const auto input: active_inputs) {
+			const auto source = ShaderPixelParameterMappedLocation(pixel_info, input);
+			const auto location = ShaderPixelParameterLocation(pixel_info, active_inputs, input);
+			EXIT_IF(source >= 32u || location >= 32u);
+			bool duplicate = false;
+			for (uint32_t i = 0; i < vertex_info.linked_param_count; ++i) {
+				if (vertex_info.linked_param_sources[i] == source &&
+				    vertex_info.linked_param_locations[i] == location) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (!duplicate) {
+				EXIT_IF(vertex_info.linked_param_count >= ShaderVertexInputInfo::PARAM_LINK_MAX);
+				const auto link = vertex_info.linked_param_count++;
+				vertex_info.linked_param_sources[link]   = source;
+				vertex_info.linked_param_locations[link] = location;
+			}
+		}
 	}
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
 	return result;

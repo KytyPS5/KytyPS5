@@ -79,6 +79,7 @@ struct ShaderFloatingPointState {
 
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
+	static constexpr uint32_t PARAM_LINK_MAX = 32;
 
 	ShaderBufferResource    resources[RES_MAX];
 	ShaderVertexDestination resources_dst[RES_MAX];
@@ -92,6 +93,9 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	uint32_t                linked_param_sources[PARAM_LINK_MAX]   = {};
+	uint32_t                linked_param_locations[PARAM_LINK_MAX] = {};
+	uint32_t                linked_param_count                     = 0;
 	ShaderClipSpaceTransform clip_space;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;

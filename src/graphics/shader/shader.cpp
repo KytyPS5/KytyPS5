@@ -762,6 +762,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.resources_num);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	EXIT_IF(info.linked_param_count > ShaderVertexInputInfo::PARAM_LINK_MAX);
+	key.push_back(info.linked_param_count);
+	for (uint32_t i = 0; i < info.linked_param_count; ++i) {
+		key.push_back(info.linked_param_sources[i]);
+		key.push_back(info.linked_param_locations[i]);
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {

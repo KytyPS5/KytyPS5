@@ -38,9 +38,9 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 }
 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind,
-               uint32_t index) {
-	return std::any_of(outputs.begin(), outputs.end(), [kind, index](const OutputBinding& binding) {
-		return binding.kind == kind && binding.index == index;
+               uint32_t index, uint32_t location) {
+	return std::any_of(outputs.begin(), outputs.end(), [=](const OutputBinding& binding) {
+		return binding.kind == kind && binding.index == index && binding.location == location;
 	});
 }
 
@@ -50,7 +50,7 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 		                        input.debug_name, input.per_vertex});
 	}
 	for (const auto& output: program.info.outputs) {
-		if (HasOutput(state.outputs, output.kind, output.index)) {
+		if (HasOutput(state.outputs, output.kind, output.index, output.location)) {
 			continue;
 		}
 		state.outputs.push_back({output.kind, output.index, output.location, 0, output.debug_name});

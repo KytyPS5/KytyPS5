@@ -550,6 +550,9 @@ struct DescriptorSource {
 		// Direct inline descriptors read four compact/sampler words or eight image words.
 		// ImageTable retains its separate packed selector and eight-word table-entry format.
 		uint32_t descriptor_dwords = 4;
+		// Exclusive selector bound proven by a dominating unsigned CFG guard. Zero means
+		// unknown, so materialization retains the conservative wrapped-U32 domain.
+		uint32_t selector_limit = 0;
 
 		bool operator==(const InlineDescriptor& other) const = default;
 	};

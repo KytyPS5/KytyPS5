@@ -8328,6 +8328,38 @@ void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgAlternatingSharedReturns() {
+  // PS 0x845315ec188c33db: nested conditions alternate between two shared
+  // terminal epilogues. Each branch must leave through its own selection merge.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 8), // outer -> second return or middle condition
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 2), // middle -> first return or inner condition
+      EncodeSopc(0x06, 2, 128),
+      EncodeSopp(0x04, 4), // inner -> second return or first return
+      EncodeVop1(0x01, 0, 129),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+      EncodeVop1(0x01, 0, 130),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 5u, "alternating returns fixture has the wrong CFG");
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "alternating returns duplicated a terminal epilogue");
+
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+  Check(!result.program.dispatcher_fallback,
+        "alternating returns did not use structured control flow");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgLoopSharedRegion() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0),      // loop condition
@@ -12791,6 +12823,7 @@ int main() {
   TestSharedReturnPreservesDescriptorDominance();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
+  TestNewShaderRecompilerCfgAlternatingSharedReturns();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();

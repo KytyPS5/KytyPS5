@@ -1454,24 +1454,19 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	std::vector<uint32_t> region;
 	std::vector<uint32_t> pending = {header.terminator.true_block, header.terminator.false_block};
 	const auto*           loop    = FindInnermostContainingLoop(graph, header.id);
-	const auto global_merge = graph.FindNearestCommonPostDominator(header.terminator.true_block,
-	                                                               header.terminator.false_block);
 	while (!pending.empty()) {
 		const auto block_id = pending.back();
 		pending.pop_back();
 		if (block_id == merge || Contains(region, block_id) ||
-		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block)) ||
-		    IsEnclosingLinearExit(graph, header.id, block_id) ||
-		    (block_id == global_merge && HasLinearPathToTerminal(graph, block_id))) {
+		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block))) {
 			continue;
 		}
 		const auto* block = graph.FindBlock(block_id);
 		if (block == nullptr) {
 			continue;
 		}
-		if (block->successors.empty()) {
-			continue;
-		}
+		// A return terminates its own block; a branch to a shared return still has to
+		// obey selection entry/exit rules, just like any other branch.
 		AddUnique(region, block_id);
 		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
 	}

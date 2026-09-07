@@ -607,10 +607,11 @@ private:
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
-			if (m_bounded_candidate.has_value() && base == 0u) {
-				// A bounded selector proof can over-approximate the live keys after the
-				// descriptor pointer table ends. Preserve a null descriptor for that tail;
-				// non-null unreadable addresses below still fail closed.
+			if (base == 0u) {
+				// Runtime resource discovery is eager, while guest shaders commonly guard
+				// optional SRT roots before using their descriptors. Preserve the exact null
+				// root as a zero word; every non-null unreadable or GPU-dirty address below
+				// still fails closed.
 				result = 0u;
 				return true;
 			}

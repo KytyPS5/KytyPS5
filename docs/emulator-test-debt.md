@@ -162,6 +162,34 @@ Required tests:
 - The captured shader with selector limit 255 and stride 368, followed by Vulkan and SPIR-V
   validation and a game run that advances past its former 129th artificial pair.
 
+## Null optional scalar-address descriptor roots
+
+Status: production fix, native build and bounded game validation complete; automated regression
+deferred.
+
+Observed trigger: eager host materialization of a vertex shader descriptor source evaluates four
+`LoadAddressU32` words from an optional SRT pointer whose exact 48-bit base is zero. Adding the
+descriptor's first offset produces guest address `0x10`, which is intentionally unmapped; the
+optional branch should specialize to a null descriptor without weakening failures for non-null
+unreadable or GPU-dirty memory.
+
+Required tests:
+
+- A four-word buffer descriptor source loaded from an exact null `GetAddressResource` base with
+  positive immediate offsets, proving every word materializes as zero.
+- Null bases with zero, positive and negative scalar/immediate offsets, proving pointer arithmetic
+  is not performed after the null root is established.
+- A non-null readable base, proving ordinary descriptor words remain unchanged.
+- A non-null unreadable base and a non-null GPU-dirty specialization read, proving both still fail
+  closed with the exact guest address.
+- A guarded runtime path where the optional descriptor is unused when null and used when present,
+  checking null binding behavior and the captured `ee4f153aa500d327` vertex shader.
+
+Validation compiled `ee4f153aa500d327` through resource tracking and emitted 15,847 SPIR-V words;
+the game then advanced to renderer descriptor binding and failed at the next independent storage
+buffer offset boundary. Exact null roots specialize to zero before pointer arithmetic, while
+non-null unreadable and GPU-dirty roots retain the existing fail-closed path.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

@@ -44,7 +44,7 @@ void Rendezvous(EmitterState& state, uint32_t memory = MemorySemanticsWorkgroupM
 uint32_t ScratchPointer(EmitterState& state, uint32_t index) {
 	const auto id = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
-	                           id, state.wave_scratch_variable, index});
+	                           id, state.wave_scratch_variable, EmitWaveScratchIndex(state, index)});
 	return id;
 }
 

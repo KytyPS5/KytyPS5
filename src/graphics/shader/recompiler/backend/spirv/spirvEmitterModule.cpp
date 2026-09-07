@@ -679,10 +679,35 @@ void DefineModule(EmitterState& state) {
 			}
 			EXIT_IF(scratch_dwords % 64u != 0u);
 		}
-		// One slot per actual host invocation; guest LDS is a separate array.
+		uint32_t ballot_dwords = 0;
+		if (state.requirements.subgroup_ballot) {
+			const auto wave_count =
+			    state.compute_execution.IsCooperativeWave64() ? scratch_dwords / 64u : 1u;
+			EXIT_IF(wave_count > UINT32_MAX / 2u);
+			ballot_dwords = wave_count * 2u;
+		}
+		EXIT_IF(scratch_dwords > UINT32_MAX - ballot_dwords);
+		// Without WorkgroupMemoryExplicitLayoutKHR, Workgroup variables alias.
+		// Guest LDS and split-wave scratch must occupy disjoint indices of one
+		// u32 array. 64-bit LDS atomics keep a separate u64 array.
+		uint32_t lds_dwords = 0;
+		if (!state.requirements.function_lds && !state.requirements.shared_int64_atomics &&
+		    HasGuestLdsAccess(state.program)) {
+			lds_dwords = LdsDwordCount(state);
+			EXIT_IF(lds_dwords > UINT32_MAX - scratch_dwords - ballot_dwords);
+		}
+		state.wave_scratch_base_dwords = lds_dwords;
+		state.wave_ballot_base_dwords = scratch_dwords;
 		state.wave_scratch_variable = state.builder.DefineGlobalVariable(
-		    TypeU32ArrayPointer(state, StorageClassWorkgroup, scratch_dwords), StorageClassWorkgroup);
-		state.builder.AddName(state.wave_scratch_variable, "wave64_collective_scratch");
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup,
+		                        lds_dwords + scratch_dwords + ballot_dwords),
+		    StorageClassWorkgroup);
+		if (lds_dwords != 0) {
+			state.lds_variable = state.wave_scratch_variable;
+			state.builder.AddName(state.lds_variable, "lds_dwords");
+		} else {
+			state.builder.AddName(state.wave_scratch_variable, "wave64_collective_scratch");
+		}
 	}
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
@@ -726,9 +751,14 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
-	if (!state.compute_execution.IsSplitWave64() && (state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id)) {
+	if (!state.compute_execution.IsSplitWave64() &&
+	    (state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
+	     state.requirements.subgroup_local_invocation_id)) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
+	}
+	if (state.compute_execution.IsSplitWave64() && state.requirements.subgroup_ballot) {
+		state.builder.RequireCapability(CapabilityGroupNonUniform);
+		state.builder.RequireCapability(CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.requirements.subgroup_ballot && !state.compute_execution.IsSplitWave64()) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);

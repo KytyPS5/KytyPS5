@@ -46,6 +46,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -411,6 +412,195 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
       count++;
     }
     i += word_count;
+  }
+  return count;
+}
+
+uint32_t SpirvNamedVariableLoadCount(const std::vector<uint32_t> &binary,
+                                     const char *name) {
+  uint32_t variable = 0;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return 0;
+    if ((binary[offset] & 0xffffu) == 5u && words >= 3u) {
+      std::string instruction_name;
+      for (size_t word = offset + 2u; word < offset + words; ++word) {
+        for (uint32_t byte = 0; byte < 4u; ++byte) {
+          const char character =
+              static_cast<char>((binary[word] >> (byte * 8u)) & 0xffu);
+          if (character == '\0') break;
+          instruction_name.push_back(character);
+        }
+      }
+      if (instruction_name == name) variable = binary[offset + 1u];
+    }
+    offset += words;
+  }
+  if (variable == 0u) return 0;
+  uint32_t loads = 0;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return 0;
+    if ((binary[offset] & 0xffffu) == 61u && words >= 4u &&
+        binary[offset + 3u] == variable)
+      ++loads;
+    offset += words;
+  }
+  return loads;
+}
+
+bool SpirvSplitWaveBallotHasLeaderComparisons(const std::vector<uint32_t> &binary) {
+  uint32_t local_index_variable = 0;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return false;
+    if ((binary[offset] & 0xffffu) == 5u && words >= 3u) {
+      std::string instruction_name;
+      for (size_t word = offset + 2u; word < offset + words; ++word) {
+        for (uint32_t byte = 0; byte < 4u; ++byte) {
+          const char character =
+              static_cast<char>((binary[word] >> (byte * 8u)) & 0xffu);
+          if (character == '\0') break;
+          instruction_name.push_back(character);
+        }
+      }
+      if (instruction_name == "gl_LocalInvocationIndex")
+        local_index_variable = binary[offset + 1u];
+    }
+    offset += words;
+  }
+  if (local_index_variable == 0u) return false;
+
+  std::unordered_set<uint32_t> local_index_values;
+  std::unordered_set<uint32_t> zero_constants;
+  std::unordered_set<uint32_t> thirty_two_constants;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return false;
+    const uint32_t opcode = binary[offset] & 0xffffu;
+    if (opcode == 43u && words >= 4u && binary[offset + 3u] == 0u)
+      zero_constants.insert(binary[offset + 2u]);
+    if (opcode == 43u && words >= 4u && binary[offset + 3u] == 32u)
+      thirty_two_constants.insert(binary[offset + 2u]);
+    if (opcode == 61u && words >= 4u && binary[offset + 3u] == local_index_variable)
+      local_index_values.insert(binary[offset + 2u]);
+    offset += words;
+  }
+  bool compares_zero = false;
+  bool compares_thirty_two = false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return false;
+    if ((binary[offset] & 0xffffu) == 170u && words >= 5u) {
+      const bool has_local_index =
+          local_index_values.contains(binary[offset + 3u]) ||
+          local_index_values.contains(binary[offset + 4u]);
+      compares_zero =
+          compares_zero ||
+          (has_local_index && (zero_constants.contains(binary[offset + 3u]) ||
+                               zero_constants.contains(binary[offset + 4u])));
+      compares_thirty_two =
+          compares_thirty_two ||
+          (has_local_index &&
+           (thirty_two_constants.contains(binary[offset + 3u]) ||
+            thirty_two_constants.contains(binary[offset + 4u])));
+    }
+    offset += words;
+  }
+  return compares_zero && compares_thirty_two;
+}
+
+bool SpirvHasZeroTestedBitwiseOrDeMorgan(const std::vector<uint32_t> &binary) {
+  constexpr uint32_t OpConstant = 43u;
+  constexpr uint32_t OpLogicalNot = 168u;
+  constexpr uint32_t OpLogicalAnd = 167u;
+  constexpr uint32_t OpIEqual = 170u;
+  constexpr uint32_t OpBitwiseAnd = 199u;
+  std::unordered_set<uint32_t> zero_constants;
+  std::unordered_set<uint32_t> bitwise_ands;
+  std::unordered_map<uint32_t, std::array<uint32_t, 2>> equal_operands;
+  std::unordered_map<uint32_t, std::array<uint32_t, 2>> logical_and_operands;
+  std::unordered_map<uint32_t, uint32_t> logical_not_operands;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) {
+      return false;
+    }
+    const uint32_t opcode = binary[offset] & 0xffffu;
+    if (opcode == OpConstant && words == 4u && binary[offset + 3] == 0u) {
+      zero_constants.insert(binary[offset + 2]);
+    } else if (opcode == OpBitwiseAnd && words == 5u) {
+      bitwise_ands.insert(binary[offset + 2]);
+    } else if (opcode == OpIEqual && words == 5u) {
+      equal_operands[binary[offset + 2]] = {binary[offset + 3], binary[offset + 4]};
+    } else if (opcode == OpLogicalAnd && words == 5u) {
+      logical_and_operands[binary[offset + 2]] = {binary[offset + 3], binary[offset + 4]};
+    } else if (opcode == OpLogicalNot && words == 4u) {
+      logical_not_operands[binary[offset + 2]] = binary[offset + 3];
+    }
+    offset += words;
+  }
+  const auto is_zero_test = [&](uint32_t id) {
+    const auto it = equal_operands.find(id);
+    if (it == equal_operands.end()) {
+      return false;
+    }
+    const auto operands = it->second;
+    const uint32_t value = zero_constants.contains(operands[0]) ? operands[1] : operands[0];
+    return (zero_constants.contains(operands[0]) || zero_constants.contains(operands[1])) &&
+           bitwise_ands.contains(value);
+  };
+  for (const auto &[logical_not, logical_and] : logical_not_operands) {
+    (void)logical_not;
+    const auto and_it = logical_and_operands.find(logical_and);
+    if (and_it != logical_and_operands.end() && is_zero_test(and_it->second[0]) &&
+        is_zero_test(and_it->second[1])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Count OpControlBarrier with ImageMemory whose nearest preceding image access
+// is `after_opcode` (OpImageFetch=95 or OpImageWrite=99). Sampled fetches are
+// not image-memory publications; a barrier on them is the split-wave defect.
+uint32_t CountImageMemoryBarriersAfter(const std::vector<uint32_t> &binary,
+                                       uint32_t after_opcode) {
+  constexpr uint32_t OpConstant = 43u;
+  constexpr uint32_t OpImageFetch = 95u;
+  constexpr uint32_t OpImageWrite = 99u;
+  constexpr uint32_t OpControlBarrier = 224u;
+  constexpr uint32_t ImageMemory = 0x00000800u;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  uint32_t last_image = 0;
+  uint32_t count = 0;
+  if (binary.size() < 5 || binary[0] != 0x07230203u) {
+    return 0;
+  }
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16;
+    if (words == 0 || words > binary.size() - offset) {
+      return count;
+    }
+    const uint32_t op = binary[offset] & 0xffffu;
+    const auto *args = binary.data() + offset + 1;
+    if (op == OpConstant && words == 4) {
+      constants[args[1]] = args[2];
+    }
+    if (op == OpImageFetch || op == OpImageWrite) {
+      last_image = op;
+    }
+    if (op == OpControlBarrier && words == 4) {
+      const auto semantics = constants.find(args[2]);
+      if (semantics != constants.end() &&
+          (semantics->second & ImageMemory) != 0u) {
+        if (last_image == after_opcode) {
+          count++;
+        }
+        last_image = 0;
+      }
+    }
+    offset += words;
   }
   return count;
 }
@@ -6575,7 +6765,7 @@ void TestNewShaderRecompilerMubufFormatTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
+void TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x04),
       EncodeMubuf1(0, 0, 1), // buffer_store_format_x
@@ -6602,11 +6792,35 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "OpArrayLength"),
-        "formatted store SPIR-V lacks runtime storage-buffer bounds check");
+  Check(!SpirvContainsOpcode(result.spirv, 68u),
+        "formatted store SPIR-V retained the driver-crashing OpArrayLength");
+  Check(SpirvContainsOpcode(result.spirv, 176u),
+        "formatted store SPIR-V lacks dynamic byte-limit bounds checks");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
+}
+
+void TestStorageBufferBoundsAvoidDynamicArrayLengthLowering() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x04),
+      EncodeMubuf1(0, 0, 1), // buffer_store_format_x
+      0xbf810000u,
+  };
+
+  std::array<uint32_t, 64> user_data{};
+  user_data[1] = 4u << 16u;
+  user_data[2] = 5u;
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(!SpirvContainsOpcode(result.spirv, 68u),
+        "storage-buffer lowering retained the driver-crashing OpArrayLength");
+  Check(SpirvContainsOpcode(result.spirv, 176u),
+        "storage-buffer lowering lost dynamic byte-limit bounds checks");
 }
 
 void TestNewShaderRecompilerTypedBufferTranslation() {
@@ -9036,6 +9250,17 @@ void TestCooperativeWave64GeometryAndBudget() {
   using F=CooperativeExecutionFixture;
   using O=F::O;
   using V=F::V;
+  {
+    F f({8,8,1});
+    const auto own=f.Emit(0,O::ShiftLeftLogical32,{f.local,V(2u)});
+    f.Shared(0,O::WriteSharedU32,{own,f.local,V(true)});
+    f.Emit(0,O::Barrier);
+    const auto read=f.Shared(0,O::LoadSharedU32,{own,V(true)});
+    f.Emit(0,O::ReferenceU32,{read});
+    f.KeepWave(0);
+    Check(f.Plan().error.empty() && f.Plan().IsSplitWave64() && !f.Plan().IsCooperativeWave64(),
+          "one complete guest wave64 keeps LDS/barriers on the split host workgroup");
+  }
   for (const auto shape : {std::array<uint32_t,3>{128,1,1},
                           std::array<uint32_t,3>{8,4,4},
                           std::array<uint32_t,3>{16,16,1}}) {
@@ -10046,6 +10271,10 @@ void TestComputeExecutionPlanningBoundaries() {
             "wave64 plan lost split mode or wave partition count");
       Check(WorkgroupInvocationCount(plan.layout.host_size) == std::min(test.size,64u),
             "wave64 plan added or discarded real invocations");
+      if (test.size == 64) {
+        Check(!plan.IsCooperativeWave64(),
+              "one complete guest wave64 must not enter the multi-wave cooperative scheduler");
+      }
     }
   }
   compute.threads_num[2] = 256;
@@ -10231,9 +10460,11 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
     offset += words;
   }
   // Identify storage from OpVariable -> OpTypePointer -> OpTypeArray -> length.
-  // The fixture reserves 128 guest DWORDs and the software wave has 64 slots;
-  // neither debug names nor the order of variable declarations is significant.
-  uint32_t lds = 0, wave = 0;
+  // Guest LDS is either its own 128-DWORD array plus scratch, or the prefix of
+  // one combined Workgroup array. Scratch AccessChains add lds_dwords and must
+  // not count as guest LDS stores. Ballot aggregate words follow the
+  // per-lane scratch suffix and are ignored by this guest-LDS checker.
+  uint32_t lds = 0, wave = 0, combined = 0;
   for (const auto& [variable, type] : workgroup_variables) {
     const auto pointer = pointees.find(type);
     if (pointer == pointees.end()) return false;
@@ -10247,16 +10478,48 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
     } else if (length->second == 64u) {
       if (wave != 0) return false;
       wave = variable;
+    } else if (length->second == lds_dwords + 64u ||
+               length->second == lds_dwords + 66u) {
+      if (combined != 0) return false;
+      combined = variable;
     }
   }
-  if (lds == 0 || wave == 0 || lds == wave) return false;
+  if (combined != 0) {
+    if (lds != 0 || wave != 0) return false;
+    lds = combined;
+  } else if (lds == 0 || wave == 0 || lds == wave) {
+    return false;
+  }
+  std::unordered_set<uint32_t> scratch_index_ids, scratch_pointers;
+  if (combined != 0) {
+    for (const auto& inst : instructions) {
+      if (inst.opcode != 128u || inst.args.size() != 4) continue;
+      const auto adds_base = [&](uint32_t id) {
+        const auto found = constants.find(id);
+        return found != constants.end() && found->second == lds_dwords;
+      };
+      if (adds_base(inst.args[2]) || adds_base(inst.args[3]))
+        scratch_index_ids.insert(inst.args[1]);
+    }
+    for (const auto& inst : instructions) {
+      if ((inst.opcode != 65u && inst.opcode != 66u) || inst.args.size() < 4 ||
+          inst.args[2] != combined)
+        continue;
+      const auto index = inst.args[3];
+      const auto constant = constants.find(index);
+      if (scratch_index_ids.contains(index) ||
+          (constant != constants.end() && constant->second >= lds_dwords))
+        scratch_pointers.insert(inst.args[1]);
+    }
+  }
   const auto root = [&](uint32_t pointer) {
     std::unordered_set<uint32_t> seen;
     while (pointer_bases.contains(pointer)) {
+      if (scratch_pointers.contains(pointer)) return 0u;
       if (!seen.insert(pointer).second) return 0u;
       pointer = pointer_bases.at(pointer);
     }
-    return pointer;
+    return scratch_pointers.contains(pointer) ? 0u : pointer;
   };
   std::vector<size_t> accesses;
   std::vector<std::vector<size_t>> edges(instructions.size());
@@ -10282,7 +10545,7 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
     if (inst.opcode == 61u && args.size() >= 3 && root(args[2]) == lds)
       accesses.push_back(index);
     if (inst.opcode == 62u && args.size() >= 2 && root(args[0]) == lds)
-      return false; // Concurrent guest DWORD writers must not become plain stores.
+      accesses.push_back(index);
     if (inst.opcode == 228u && args.size() >= 1 && root(args[0]) == lds) {
       if (args.size() != 4) return false;
       const auto scope = constants.find(args[1]);
@@ -10306,7 +10569,7 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
     }
   }
   // Full initialization followed by the sparse body W/R/W/R.
-  const uint32_t expected_ops[] = {228u, 228u, 61u, 228u, 61u};
+  const uint32_t expected_ops[] = {62u, 62u, 61u, 62u, 61u};
   if (accesses.size() != std::size(expected_ops)) return false;
   for (size_t i = 0; i < accesses.size(); ++i)
     if (instructions[accesses[i]].opcode != expected_ops[i]) return false;
@@ -10353,7 +10616,104 @@ bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
   return true;
 }
 
-void TestSingleWaveLdsSpirvPhaseOrdering() {
+bool SpirvSplitWaveBallotLoadsAggregateWords(const std::vector<uint32_t>& binary,
+                                             uint32_t lds_dwords) {
+  struct Instruction {
+    uint32_t opcode;
+    std::vector<uint32_t> args;
+  };
+  std::vector<Instruction> instructions;
+  std::unordered_map<uint32_t, uint32_t> constants, arrays, pointees;
+  std::unordered_map<uint32_t, Instruction> definitions;
+  uint32_t workgroup_variable = 0;
+  uint32_t workgroup_length = 0;
+  if (binary.size() < 5 || binary[0] != 0x07230203u) return false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16;
+    if (words == 0 || words > binary.size() - offset) return false;
+    const uint32_t opcode = binary[offset] & 0xffffu;
+    std::vector<uint32_t> args(binary.begin() + offset + 1,
+                               binary.begin() + offset + words);
+    if (opcode == 43u && args.size() == 3) constants[args[1]] = args[2];
+    if (opcode == 28u && args.size() == 3) arrays[args[0]] = args[2];
+    if (opcode == 32u && args.size() == 3) pointees[args[0]] = args[2];
+    if (opcode == 59u && args.size() >= 3 && args[2] == 4u) {
+      const auto pointer = pointees.find(args[0]);
+      if (pointer == pointees.end()) return false;
+      const auto array = arrays.find(pointer->second);
+      if (array == arrays.end()) return false;
+      const auto length = constants.find(array->second);
+      if (length == constants.end() || workgroup_variable != 0) return false;
+      workgroup_variable = args[1];
+      workgroup_length = length->second;
+    }
+    if (opcode == 65u || opcode == 128u || opcode == 194u || opcode == 196u ||
+        opcode == 197u || opcode == 198u || opcode == 199u) {
+      if (args.size() < 2) return false;
+      definitions.emplace(args[1], Instruction{opcode, args});
+    }
+    instructions.push_back({opcode, std::move(args)});
+    offset += words;
+  }
+  const uint32_t ballot_base = lds_dwords + 64u;
+  if (workgroup_variable == 0 || workgroup_length != ballot_base + 2u) return false;
+
+  const auto evaluate = [&](const auto& self, uint32_t id,
+                            std::unordered_set<uint32_t>& active) -> std::optional<uint32_t> {
+    const auto constant = constants.find(id);
+    if (constant != constants.end()) return constant->second;
+    if (!active.insert(id).second) return std::nullopt;
+    const auto definition = definitions.find(id);
+    if (definition == definitions.end()) {
+      active.erase(id);
+      return std::nullopt;
+    }
+    const auto& args = definition->second.args;
+    if (args.size() != 4) {
+      active.erase(id);
+      return std::nullopt;
+    }
+    const auto lhs = self(self, args[2], active);
+    const auto rhs = self(self, args[3], active);
+    if (!lhs || !rhs) {
+      active.erase(id);
+      return std::nullopt;
+    }
+    std::optional<uint32_t> result;
+    switch (definition->second.opcode) {
+      case 128u: result = *lhs + *rhs; break; // OpIAdd
+      case 194u: result = *lhs >> (*rhs & 31u); break; // OpShiftRightLogical
+      case 196u: result = *lhs << (*rhs & 31u); break; // OpShiftLeftLogical
+      case 197u: result = *lhs | *rhs; break; // OpBitwiseOr
+      case 198u: result = *lhs ^ *rhs; break; // OpBitwiseXor
+      case 199u: result = *lhs & *rhs; break; // OpBitwiseAnd
+      default: break;
+    }
+    active.erase(id);
+    return result;
+  };
+
+  bool loaded_lower = false;
+  bool loaded_upper = false;
+  for (const auto& instruction : instructions) {
+    if (instruction.opcode != 61u || instruction.args.size() < 3) continue;
+    const auto access = definitions.find(instruction.args[2]);
+    if (access == definitions.end() || access->second.opcode != 65u ||
+        access->second.args.size() < 4 || access->second.args[2] != workgroup_variable)
+      continue;
+    std::unordered_set<uint32_t> active;
+    const auto index = evaluate(evaluate, access->second.args[3], active);
+    if (!index) continue;
+    if (*index == ballot_base) loaded_lower = true;
+    if (*index == ballot_base + 1u) loaded_upper = true;
+  }
+  return loaded_lower && loaded_upper;
+}
+
+void TestSingleWaveLdsSpirvPhaseOrdering(bool check_phase_ordering = true,
+                                          const char* spirv_dump_path = nullptr,
+                                          bool check_zero_predicate = false,
+                                          bool check_mixed_or_consumer = false) {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
   IR::Program program;
@@ -10371,7 +10731,9 @@ void TestSingleWaveLdsSpirvPhaseOrdering() {
       {emit(O::BitwiseXor32, {lane, IR::Value(32u)}), IR::Value(2u)});
   const auto active = emit(O::ULessThan32, {lane, IR::Value(48u)});
   const auto write = [&](uint32_t value, IR::Value exec) {
-    auto& inst = block->AppendNewInst(O::WriteSharedU32, {own, IR::Value(value), exec});
+    const auto address = emit(O::SelectU32, {exec, own, IR::Value(96u)});
+    auto& inst =
+        block->AppendNewInst(O::WriteSharedU32, {address, IR::Value(value), exec});
     inst.SetFlags(IR::MemoryFlags{.index = 0});
   };
   const auto read = [&] {
@@ -10382,6 +10744,23 @@ void TestSingleWaveLdsSpirvPhaseOrdering() {
   write(1000u, IR::Value(true));
   const auto ballot = emit(O::Ballot, {active});
   emit(O::ReferenceU32, {emit(O::CompositeExtractU32x4, {ballot, IR::Value(1u)})});
+  if (check_zero_predicate) {
+    const auto lower = emit(O::CompositeExtractU32x4, {ballot, IR::Value(0u)});
+    const auto upper = emit(O::CompositeExtractU32x4, {ballot, IR::Value(1u)});
+    const auto lower_mask = emit(O::BitwiseAnd32, {lower, IR::Value(0xaaaaaaaau)});
+    const auto upper_mask = emit(O::BitwiseAnd32, {upper, IR::Value(0x55555555u)});
+    const auto merged = emit(O::BitwiseOr32, {lower_mask, upper_mask});
+    const auto nonzero = emit(O::INotEqual32, {merged, IR::Value(0u)});
+    const auto observed = emit(O::SelectU32, {nonzero, IR::Value(1u), IR::Value(0u)});
+    emit(O::ReferenceU32, {observed});
+    const auto zero = emit(O::IEqual32, {merged, IR::Value(0u)});
+    const auto observed_zero = emit(O::SelectU32, {zero, IR::Value(1u), IR::Value(0u)});
+    emit(O::ReferenceU32, {observed_zero});
+    if (check_mixed_or_consumer) {
+      const auto mixed = emit(O::BitwiseOr32, {lower_mask, upper_mask});
+      emit(O::ReferenceU32, {mixed});
+    }
+  }
   write(2000u, active);
   read();
   write(3000u, active);
@@ -10404,6 +10783,37 @@ void TestSingleWaveLdsSpirvPhaseOrdering() {
   translated.program = std::move(program);
   const auto compiled = CompileProgram(std::move(translated), options, {}, 0);
   CheckSpirvBinaryValidates(compiled.spirv);
+  if (spirv_dump_path != nullptr) {
+    auto* file = std::fopen(spirv_dump_path, "wb");
+    Check(file != nullptr, "could not open the synthetic SPIR-V dump");
+    const auto bytes = compiled.spirv.size() * sizeof(uint32_t);
+    Check(std::fwrite(compiled.spirv.data(), 1, bytes, file) == bytes,
+          "could not write the synthetic SPIR-V dump");
+    Check(std::fclose(file) == 0, "could not close the synthetic SPIR-V dump");
+  }
+  const auto ballot_source = DisassembleSpirvBinary(compiled.spirv);
+  Check(!Common::ContainsStr(ballot_source, "OpGroupNonUniformBallot") &&
+            !Common::ContainsStr(ballot_source, "OpCapability GroupNonUniformBallot"),
+        "split wave64 ballot used a native subgroup ballot instead of workgroup reconstruction");
+  Check(SpirvNamedVariableLoadCount(compiled.spirv, "gl_LocalInvocationIndex") == 1u,
+        "split wave64 emitter reloaded the host local invocation index");
+  const auto ballot_ors = SpirvInstructionOpcodeCount(compiled.spirv, 197u);
+  Check(ballot_ors == (check_mixed_or_consumer ? 1u : 0u),
+        "split wave64 ballot emitted an unexpected integer OR reduction");
+  if (check_zero_predicate) {
+    Check(SpirvHasZeroTestedBitwiseOrDeMorgan(compiled.spirv),
+          "nonzero-tested split ballot mask did not lower through De Morgan equality");
+  }
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 229u) == 0u &&
+            SpirvInstructionOpcodeCount(compiled.spirv, 241u) == 0u,
+        "split wave64 ballot introduced aggregate atomics");
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 228u) == 0u,
+        "collision-free lane-indexed LDS stores acquired atomics");
+  Check(SpirvContainsOpcode(compiled.spirv, 224u),
+        "split wave64 ballot omitted workgroup barriers");
+  Check(MeasureSpirv(compiled.spirv).workgroup_variables == 1u,
+        "split wave64 LDS and collective scratch used separate Workgroup variables");
+  if (!check_phase_ordering) return;
   Check(SpirvLdsPhasesAreSynchronized(compiled.spirv, 128),
         "guest LDS RAW/WAR ordering needs workgroup barriers outside sparse-EXEC guards");
   // Execution rendezvous alone is insufficient: the checker must also require
@@ -10437,6 +10847,102 @@ void TestSingleWaveLdsSpirvPhaseOrdering() {
   CheckSpirvBinaryValidates(missing_memory_order);
   Check(!SpirvLdsPhasesAreSynchronized(missing_memory_order, 128),
         "LDS ordering checker accepted barriers without WorkgroupMemory ordering");
+}
+
+void TestSplitWave64CyclicImageSpirvRendezvous() {
+  using namespace ShaderRecompiler;
+  // Bounded analogue of the Screen Space Shadows class: one complete guest
+  // wave64 on native32, LDS, a uniform loop, IMAGE_LOAD/IMAGE_STORE, and a
+  // wave op. Guest IMAGE_LOAD lowers to sampled OpImageFetch; that fetch must
+  // not pick up ImageMemory control barriers. Writes still rendezvous the two
+  // native halves. No proprietary shader bytes.
+  auto compile = [](bool cyclic_store) {
+    std::vector<uint32_t> shader{
+        EncodeVop1(0x01, 0, 128), // v0 = 0 LDS address
+        EncodeVop1(0x01, 1, 129), // v1 = 1 LDS data
+        EncodeVop1(0x01, 4, 128), // v4 = 0 image coords
+        EncodeSMovB32(16, 128),   // s16 = 0 loop counter
+    };
+    const auto loop = shader.size();
+    shader.push_back(EncodeDs0(0x0d, 0));
+    shader.push_back(EncodeDs1(0, 1, 0)); // ds_write_b32
+    shader.push_back(EncodeDs0(0x36, 0));
+    shader.push_back(EncodeDs1(2, 0, 0)); // ds_read_b32 v2
+    shader.push_back(EncodeMimg0(0x00, 0xf));
+    shader.push_back(EncodeMimg1(20, 0, 0, 4)); // image_load
+    if (cyclic_store) {
+      shader.push_back(EncodeMimg0(0x08, 0xf));
+      shader.push_back(EncodeMimg1(20, 0, 0, 4)); // image_store
+    } else {
+      shader.push_back(EncodeDs0(0x0d, 8));
+      shader.push_back(EncodeDs1(0, 20, 0)); // keep the fetch live without a store
+    }
+    shader.push_back(EncodeSop2(0x00, 16, 16, 129)); // s16 += 1
+    shader.push_back(EncodeSopc(0x0a, 16, 130));     // s16 < 2
+    const auto branch = shader.size();
+    shader.push_back(EncodeSopp(
+        0x05, static_cast<uint32_t>(static_cast<int32_t>(loop) -
+                                    static_cast<int32_t>(branch) - 1)));
+    shader.push_back(EncodeVop3Word0(0x360, 24));
+    shader.push_back(EncodeVop3Word1(2 + 256, 128, 0)); // s24 = readlane v2
+    shader.push_back(EncodeVop1(0x01, 5, 24));         // v5 = s24, keeps the wave op live
+    shader.push_back(EncodeDs0(0x0d, 4));
+    shader.push_back(EncodeDs1(0, 5, 0));
+    shader.push_back(EncodeSopp(0x01));
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    compute.lds_size_dwords = 128;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 64;
+    options.dump_ir = true;
+    options.user_data = ImageTestUserData();
+    options.input_info.compute = &compute;
+    options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+    auto result = RecompileForTest(shader, options);
+    const auto plan = PlanComputeExecution(result.program, options.input_info,
+                                           options.compute_workgroup_limits);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(MeasureSpirv(result.spirv).workgroup_variables == 1u,
+          "split wave64 LDS and collective scratch used separate Workgroup variables");
+    Check(SpirvUnsignedLessThanBoundCount(result.spirv, 128u) != 0u,
+          "guest LDS bounds did not keep the declared 128-DWORD allocation");
+    if (!(plan.error.empty() && plan.IsSplitWave64() &&
+          !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u)) {
+      std::fprintf(stderr,
+                   "split analogue plan error='%s' split=%u cooperative=%u factor=%u\n",
+                   plan.error.c_str(), plan.IsSplitWave64() ? 1u : 0u,
+                   plan.IsCooperativeWave64() ? 1u : 0u, plan.wave_partition_factor);
+    }
+    Check(plan.error.empty() && plan.IsSplitWave64() &&
+              !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u,
+          "looped LDS+image wave64 analogue left the split native32 workgroup");
+    Check(plan.SynchronizesSplitWaveMemory() == cyclic_store,
+          "cyclic image-store proof did not select split-wave memory rendezvous");
+    Check(SpirvContainsOpcode(result.spirv, 95u),
+          "IMAGE_LOAD analogue omitted OpImageFetch");
+    Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
+                               "OpGroupNonUniformBallot"),
+          "split analogue used a native subgroup ballot");
+    return std::pair{std::move(result.spirv), plan.SynchronizesSplitWaveMemory()};
+  };
+
+  const auto stored = compile(true);
+  Check(SpirvContainsOpcode(stored.first, 99u),
+        "IMAGE_STORE analogue omitted OpImageWrite");
+  Check(CountImageMemoryBarriersAfter(stored.first, 95u) == 0u,
+        "split wave64 attached ImageMemory control barriers to sampled OpImageFetch");
+  Check(CountImageMemoryBarriersAfter(stored.first, 99u) != 0u,
+        "split wave64 dropped ImageMemory rendezvous after cyclic image writes");
+
+  const auto reads = compile(false);
+  Check(!SpirvContainsOpcode(reads.first, 99u),
+        "read-only analogue unexpectedly emitted OpImageWrite");
+  Check(CountImageMemoryBarriersAfter(reads.first, 95u) == 0u &&
+            CountImageMemoryBarriersAfter(reads.first, 99u) == 0u,
+        "read-only image loop acquired ImageMemory control barriers");
 }
 
 void TestGraphicsFunctionLdsStoresRemainPrivate() {
@@ -10561,12 +11067,12 @@ void TestComputeExecutionWaveScratchBudget() {
   ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
   // No LDS access: unused declarations must not inflate the actual allocation.
   compute.lds_size_dwords = UINT32_MAX;
-  limits.max_shared_memory_bytes = 256;
+  limits.max_shared_memory_bytes = 264;
   Check(PlanComputeExecution(program,input,limits).IsSplitWave64(),
-        "wave scratch should fit exactly 256 shared bytes");
-  limits.max_shared_memory_bytes = 255;
+        "wave scratch and ballot aggregate words should fit exactly 264 shared bytes");
+  limits.max_shared_memory_bytes = 263;
   Check(!PlanComputeExecution(program,input,limits).error.empty(),
-        "software wave64 scratch exceeded the device shared memory limit");
+        "software wave64 scratch and ballot aggregate words exceeded the device shared memory limit");
   IR::MemoryInfo memory{};
   memory.kind = IR::ResourceKind::Lds;
   program.memory_info.push_back(memory);
@@ -10574,12 +11080,12 @@ void TestComputeExecutionWaveScratchBudget() {
   read.SetFlags(IR::MemoryFlags{.index=0});
   entry->AppendNewInst(O::ReferenceU32,{IR::Value(&read)});
   compute.lds_size_dwords = 128;
-  limits.max_shared_memory_bytes = 768;
+  limits.max_shared_memory_bytes = 776;
   Check(PlanComputeExecution(program,input,limits).IsSplitWave64(),
-        "guest LDS and wave scratch should fit their exact combined limit");
-  limits.max_shared_memory_bytes = 767;
+        "guest LDS, wave scratch and ballot aggregate words should fit their exact combined limit");
+  limits.max_shared_memory_bytes = 775;
   Check(!PlanComputeExecution(program,input,limits).error.empty(),
-        "combined guest LDS and wave scratch exceeded the device limit");
+        "combined guest LDS, wave scratch and ballot aggregate words exceeded the device limit");
   limits.max_shared_memory_bytes = UINT32_MAX;
   compute.lds_size_dwords = UINT32_MAX;
   Check(!PlanComputeExecution(program,input,limits).error.empty(),
@@ -11235,21 +11741,19 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       Common::FindIndex(source, std::string("OpBranchConditional"), 0);
-  const auto array_length =
-      Common::FindIndex(source, std::string("OpArrayLength"), 0);
   const auto bounds_branch = Common::FindIndex(
-      source, std::string("OpBranchConditional"), array_length);
+      source, std::string("OpBranchConditional"), exec_branch + 1u);
   const auto element_access = Common::FindIndex(
       source, std::string("OpAccessChain %_ptr_StorageBuffer_uint"), 0);
   Check(exec_branch != Common::FIND_INVALID_INDEX,
         "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != Common::FIND_INVALID_INDEX,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
   Check(bounds_branch != Common::FIND_INVALID_INDEX,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
+        "buffer load SPIR-V lacks storage-buffer byte-limit bounds branch");
+  Check(!SpirvContainsOpcode(result.spirv, 68u),
+        "buffer load SPIR-V retained OpArrayLength on a storage-buffer descriptor");
   Check(element_access != Common::FIND_INVALID_INDEX,
         "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
+  Check(exec_branch < bounds_branch,
         "buffer load bounds check was emitted outside EXEC guard");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
@@ -11282,15 +11786,16 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
-    const auto array_length =
-        Common::FindIndex(source, std::string("OpArrayLength"), 0);
+    const auto exec_branch =
+        Common::FindIndex(source, std::string("OpBranchConditional"), 0);
     const auto bounds_branch = Common::FindIndex(
-        source, std::string("OpBranchConditional"), array_length);
+        source, std::string("OpBranchConditional"), exec_branch + 1u);
     const auto atomic = Common::FindIndex(source, std::string(test.spirv), 0);
     const auto memory_barrier =
         Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
-    Check(array_length != Common::FIND_INVALID_INDEX &&
+    Check(exec_branch != Common::FIND_INVALID_INDEX &&
               bounds_branch != Common::FIND_INVALID_INDEX &&
+              !SpirvContainsOpcode(result.spirv, 68u) &&
               atomic != Common::FIND_INVALID_INDEX &&
               memory_barrier != Common::FIND_INVALID_INDEX,
           "buffer atomic SPIR-V lacks its bounds guard, operation, or barrier");
@@ -11336,15 +11841,16 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
-    const auto array_length =
-        Common::FindIndex(source, std::string("OpArrayLength"), 0);
+    const auto exec_branch =
+        Common::FindIndex(source, std::string("OpBranchConditional"), 0);
     const auto bounds_branch = Common::FindIndex(
-        source, std::string("OpBranchConditional"), array_length);
+        source, std::string("OpBranchConditional"), exec_branch + 1u);
     const auto atomic =
         Common::FindIndex(source, std::string(test.spirv_name), 0);
     const auto memory_barrier =
         Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
-    Check(array_length != Common::FIND_INVALID_INDEX &&
+    Check(!SpirvContainsOpcode(result.spirv, 68u) &&
+              exec_branch != Common::FIND_INVALID_INDEX &&
               bounds_branch != Common::FIND_INVALID_INDEX &&
               atomic != Common::FIND_INVALID_INDEX && bounds_branch < atomic,
           "64-bit buffer atomic was not guarded by storage-buffer bounds");
@@ -14800,6 +15306,32 @@ int main(int argc, char* argv[]) {
     Libs::Graphics::TestCooperativeWave64LegacyBarrierInsertionScope();
     return 0;
   }
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--single-wave64-ballot-spirv-only") == 0) {
+    Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
+        true, argc == 3 ? argv[2] : nullptr);
+    std::puts("KYTY_SINGLE_WAVE64_BALLOT_SPIRV_PASS");
+    return 0;
+  }
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--single-wave64-ballot-zero-predicate-spirv-only") == 0) {
+    Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
+        true, argc == 3 ? argv[2] : nullptr, true);
+    std::puts("KYTY_SINGLE_WAVE64_BALLOT_ZERO_PREDICATE_PASS");
+    return 0;
+  }
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--single-wave64-ballot-mixed-consumer-spirv-only") == 0) {
+    Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
+        true, argc == 3 ? argv[2] : nullptr, true, true);
+    std::puts("KYTY_SINGLE_WAVE64_BALLOT_MIXED_CONSUMER_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--split-wave64-cyclic-image-spirv-only") == 0) {
+    Libs::Graphics::TestSplitWave64CyclicImageSpirvRendezvous();
+    std::puts("KYTY_SPLIT_WAVE64_CYCLIC_IMAGE_SPIRV_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-scalar-read-branch-only") == 0) {
     Libs::Graphics::TestCooperativeWave64ScalarReadBranchUniformity();
     return 0;
@@ -14847,6 +15379,22 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-bounds-only") == 0) {
+    EnsureConfigInitialized();
+    TestStorageBufferBoundsAvoidDynamicArrayLengthLowering();
+    std::puts("KYTY_STORAGE_BUFFER_BOUNDS_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-access-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerBufferLoadsGuardedByExec();
+    TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
+    TestCapturedBufferAtomicsX2();
+    std::puts("KYTY_STORAGE_BUFFER_ACCESS_PASS");
+    return 0;
+  }
+
   EnsureConfigInitialized();
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
@@ -14861,6 +15409,8 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly();
+  TestStorageBufferBoundsAvoidDynamicArrayLengthLowering();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
@@ -14930,6 +15480,9 @@ int main(int argc, char* argv[]) {
   TestComputeExecutionPlanningBoundaries();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();
+  TestSingleWaveLdsSpirvPhaseOrdering(true, nullptr, true);
+  TestSingleWaveLdsSpirvPhaseOrdering(true, nullptr, true, true);
+  TestSplitWave64CyclicImageSpirvRendezvous();
   TestGraphicsFunctionLdsStoresRemainPrivate();
   TestSingletonLdsStoresDoNotNeedAtomics();
   TestMixedComparisonImagesUseSeparateSpirvVariables();

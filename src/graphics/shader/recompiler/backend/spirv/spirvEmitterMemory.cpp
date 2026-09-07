@@ -581,6 +581,37 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
+bool IsLaneDwordAddress(IR::Value value) {
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::ShiftLeftLogical32 ||
+	    inst->NumArgs() != 2u || !inst->Arg(1).IsImmediate() || inst->Arg(1).U32() != 2u)
+		return false;
+	const auto* lane = inst->Arg(0).TryInstruction();
+	return lane != nullptr && lane->GetOpcode() == IR::ValueOpcode::LaneId &&
+	       lane->NumArgs() == 0u;
+}
+
+bool LdsStoreIsCollisionFree(const EmitterState& state, const IR::Inst& inst,
+                             const IR::MemoryInfo& mem) {
+	if (mem.kind != IR::ResourceKind::Lds || state.requirements.function_lds ||
+	    !state.compute_execution.IsSplitWave64() ||
+	    state.compute_execution.IsCooperativeWave64() ||
+	    state.compute_workgroup.host_size != std::array<uint32_t, 3>{64u, 1u, 1u} ||
+	    inst.NumArgs() < 3u)
+		return false;
+
+	const auto address = inst.Arg(0);
+	if (IsLaneDwordAddress(address)) return true;
+
+	// EXEC lowering can preserve the lane-based address only on the active arm.
+	// The inactive arm is never stored, so it does not need an injectivity proof.
+	const auto exec = inst.Arg(inst.NumArgs() - 1u);
+	const auto* select = address.TryInstruction();
+	return select != nullptr && select->GetOpcode() == IR::ValueOpcode::SelectU32 &&
+	       select->NumArgs() == 3u && select->Arg(0) == exec &&
+	       IsLaneDwordAddress(select->Arg(1));
+}
+
 bool LdsHasCompetingInvocations(const EmitterState& state) {
 	return !state.requirements.function_lds &&
 	       state.compute_workgroup.host_size != std::array<uint32_t, 3>{1u, 1u, 1u};
@@ -669,8 +700,8 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 	});
 }
 
-void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
-                       uint32_t data) {
+void StoreWordInBounds(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                       const MemoryResourceAccess& resource, uint32_t index, uint32_t data) {
 	auto& state = ctx.state;
 	if (UsesPackedLds64(state, resource)) {
 		AtomicUpdatePackedLdsWord(state, resource.object_pointer, index,
@@ -678,7 +709,8 @@ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resour
 		return;
 	}
 	const auto pointer = EmitMemoryElementPointer(state, resource, index);
-	if (resource.kind == IR::ResourceKind::Lds && LdsHasCompetingInvocations(state)) {
+	if (resource.kind == IR::ResourceKind::Lds && LdsHasCompetingInvocations(state) &&
+	    !LdsStoreIsCollisionFree(state, inst, mem)) {
 		// Guest LDS serializes competing DWORD writes. Plain Vulkan stores would
 		// race even when all active lanes write the same value. Preserve every
 		// writer without specifying a winner for different values. Existing DS
@@ -697,7 +729,7 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    StoreWordInBounds(ctx, access.resource, access.index, data);
+		    StoreWordInBounds(ctx, inst, mem, access.resource, access.index, data);
 	    });
 }
 
@@ -854,7 +886,8 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource = PrepareStorageBufferResourceAccess(
-		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
+		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state),
+		        3u);
 		    const auto byte_address = ByteAddress(ctx, inst, mem);
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
@@ -1197,16 +1230,16 @@ uint32_t LoadFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
 	    });
 }
 
-void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                            const PreparedFormattedMemory& plan, uint32_t component,
-                            uint32_t data) {
+void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
+                            const IR::MemoryInfo& mem, const PreparedFormattedMemory& plan,
+                            uint32_t component, uint32_t data) {
 	if (component >= plan.info.component_count) return;
 	const auto bits = plan.info.component_bits[component];
 	if (bits == 8u || bits == 16u) {
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {
-		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
+		StoreWordInBounds(ctx, inst, mem, plan.resource, plan.indices[component], data);
 	}
 }
 
@@ -1260,7 +1293,7 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 					const auto data = state.builder.AllocateId();
 					state.builder.AddFunction(
 					    {OpCompositeExtract, TypeU32(state), data, composite, component});
-					StoreFormattedInBounds(ctx, mem, plan, component, data);
+					StoreFormattedInBounds(ctx, inst, mem, plan, component, data);
 				}
 			});
 			return;
@@ -1313,7 +1346,7 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			const auto access = PrepareMemoryElement(ctx, mem, resource, raw_index);
 			EmitIfCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
 			                [&]() {
-				                StoreWordInBounds(ctx, access.resource, access.index,
+				                StoreWordInBounds(ctx, inst, mem, access.resource, access.index,
 				                                  ctx.Arg(inst, component + 1u));
 			                });
 		}

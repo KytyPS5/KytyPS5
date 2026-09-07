@@ -53,6 +53,7 @@ enum : uint32_t {
 	CapabilityImageQuery                     = 50,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
+	CapabilityGroupNonUniformArithmetic      = 63,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
@@ -284,9 +285,14 @@ enum : uint32_t {
 	OpKill                         = 252,
 	OpReturn                       = 253,
 	OpReturnValue                  = 254,
+	OpGroupNonUniformBitwiseOr     = 360,
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
+};
+
+enum : uint32_t {
+	GroupOperationReduce = 0,
 };
 
 enum : uint32_t {
@@ -375,6 +381,9 @@ struct EmitterState {
 	ComputeExecutionPlan                             compute_execution;
 	IR::F64Certificate                               f64_certificate;
 	uint32_t                                         wave_scratch_variable = 0;
+	uint32_t                                         wave_scratch_base_dwords = 0;
+	uint32_t                                         wave_ballot_base_dwords = 0;
+	uint32_t                                         host_local_invocation_index = 0;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
 	uint32_t                                         native_subgroup_size    = 0;
@@ -681,6 +690,8 @@ void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 
+uint32_t EmitWaveScratchIndex(EmitterState& state, uint32_t lane);
+
 struct MemoryResourceAccess {
 	IR::ResourceKind kind             = IR::ResourceKind::None;
 	uint32_t         object_pointer   = 0;
@@ -696,7 +707,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          uint32_t variable,
-                                                         uint32_t pointer_type);
+                                                         uint32_t pointer_type,
+                                                         uint32_t element_shift);
 
 uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
                                 uint32_t raw_index);

@@ -391,6 +391,45 @@ uint32_t EmitUnpackHalf(EmitterState& state, uint32_t bits) {
 	return result;
 }
 
+const IR::Inst* ZeroTestedBitwiseOr(const IR::Inst& compare) {
+	if ((compare.GetOpcode() != IR::ValueOpcode::IEqual32 &&
+	     compare.GetOpcode() != IR::ValueOpcode::INotEqual32) ||
+	    compare.NumArgs() != 2) {
+		return nullptr;
+	}
+	for (size_t operand = 0; operand < 2; ++operand) {
+		const auto value = compare.Arg(operand).Resolve();
+		const auto other = compare.Arg(operand ^ 1u).Resolve();
+		const auto* bitwise_or = value.TryInstruction();
+		if (bitwise_or == nullptr || bitwise_or->GetOpcode() != IR::ValueOpcode::BitwiseOr32 ||
+		    bitwise_or->GetType() != IR::Type::U32 || !other.IsImmediate() ||
+		    other.GetType() != IR::Type::U32 || other.U32() != 0u ||
+		    bitwise_or->Uses().empty()) {
+			continue;
+		}
+		bool all_uses_are_zero_tests = true;
+		for (const auto& use : bitwise_or->Uses()) {
+			const auto* user = use.user;
+			if (user == nullptr ||
+			    (user->GetOpcode() != IR::ValueOpcode::IEqual32 &&
+			     user->GetOpcode() != IR::ValueOpcode::INotEqual32) ||
+			    user->NumArgs() != 2u || use.operand > 1u) {
+				all_uses_are_zero_tests = false;
+				break;
+			}
+			const auto user_other = user->Arg(use.operand ^ 1u).Resolve();
+			if (!user_other.IsImmediate() || user_other.GetType() != IR::Type::U32 ||
+			    user_other.U32() != 0u) {
+				all_uses_are_zero_tests = false;
+				break;
+			}
+		}
+		if (!all_uses_are_zero_tests) continue;
+		return bitwise_or;
+	}
+	return nullptr;
+}
+
 } // namespace
 
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -589,7 +628,13 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                             ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::BitwiseAnd32: return binary(OpBitwiseAnd, IR::Type::U32);
-		case IR::ValueOpcode::BitwiseOr32: return binary(OpBitwiseOr, IR::Type::U32);
+		case IR::ValueOpcode::BitwiseOr32:
+			if (!inst.Uses().empty() &&
+			    ZeroTestedBitwiseOr(*inst.Uses()[0].user) == &inst) {
+				ctx.Define(inst, state.builder.Constant(OpUndef, TypeU32(state), {}));
+				return true;
+			}
+			return binary(OpBitwiseOr, IR::Type::U32);
 		case IR::ValueOpcode::BitwiseXor32: return binary(OpBitwiseXor, IR::Type::U32);
 		case IR::ValueOpcode::BitwiseNot32: return unary(OpNot, IR::Type::U32);
 		case IR::ValueOpcode::BitwiseAnd64:
@@ -655,12 +700,29 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		case IR::ValueOpcode::SLessThan32: return binary(OpSLessThan, IR::Type::U1);
 		case IR::ValueOpcode::ULessThan32: return binary(OpULessThan, IR::Type::U1);
-		case IR::ValueOpcode::IEqual32: return binary(OpIEqual, IR::Type::U1);
+		case IR::ValueOpcode::IEqual32:
+		case IR::ValueOpcode::INotEqual32: {
+			if (const auto* bitwise_or = ZeroTestedBitwiseOr(inst)) {
+				const auto left_zero = NewBinary(state, OpIEqual, TypeBool(state),
+				                                 ctx.Arg(*bitwise_or, 0),
+				                                 ConstantU32(state, 0));
+				const auto right_zero = NewBinary(state, OpIEqual, TypeBool(state),
+				                                  ctx.Arg(*bitwise_or, 1),
+				                                  ConstantU32(state, 0));
+				const auto both_zero =
+				    NewBinary(state, OpLogicalAnd, TypeBool(state), left_zero, right_zero);
+				ctx.Define(inst, inst.GetOpcode() == IR::ValueOpcode::IEqual32
+				                     ? both_zero
+				                     : NewUnary(state, OpLogicalNot, TypeBool(state), both_zero));
+				return true;
+			}
+			return binary(inst.GetOpcode() == IR::ValueOpcode::IEqual32 ? OpIEqual : OpINotEqual,
+			              IR::Type::U1);
+		}
 		case IR::ValueOpcode::SLessThanEqual32: return binary(OpSLessThanEqual, IR::Type::U1);
 		case IR::ValueOpcode::ULessThanEqual32: return binary(OpULessThanEqual, IR::Type::U1);
 		case IR::ValueOpcode::SGreaterThan32: return binary(OpSGreaterThan, IR::Type::U1);
 		case IR::ValueOpcode::UGreaterThan32: return binary(OpUGreaterThan, IR::Type::U1);
-		case IR::ValueOpcode::INotEqual32: return binary(OpINotEqual, IR::Type::U1);
 		case IR::ValueOpcode::SGreaterThanEqual32: return binary(OpSGreaterThanEqual, IR::Type::U1);
 		case IR::ValueOpcode::UGreaterThanEqual32: return binary(OpUGreaterThanEqual, IR::Type::U1);
 		case IR::ValueOpcode::IEqual64:

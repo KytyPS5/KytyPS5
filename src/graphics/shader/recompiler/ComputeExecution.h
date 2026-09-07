@@ -35,6 +35,10 @@ struct ComputeExecutionPlan {
 	return offset <= 0xfffcu && (offset & 3u) == 0u;
 }
 
+// Live shared accesses, not unused LDS reservations. Emission uses the same
+// predicate so split-wave scratch and guest LDS occupy one Workgroup array.
+[[nodiscard]] bool HasGuestLdsAccess(const IR::Program& program);
+
 // Pure, deterministic and shared by emission and the runtime pipeline cache.
 // A nonempty error forbids emission/dispatch; offline width zero remains native.
 [[nodiscard]] ComputeExecutionPlan PlanComputeExecution(

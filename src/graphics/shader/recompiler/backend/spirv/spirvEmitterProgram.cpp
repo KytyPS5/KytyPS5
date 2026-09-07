@@ -316,17 +316,32 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 			planning_only = index < ctx.program.memory_info.size() &&
 			                ctx.program.memory_info[index].planning_only;
 		}
-		const bool external_memory = buffer_access != IR::BufferAccess::None ||
-		                             address_access != IR::AddressAccess::None ||
-		                             image_access != IR::ImageAccess::None ||
-		                             inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer;
+		// Sampled fetches and other reads consume already-published values.
+		// Attaching ImageMemory control barriers to OpImageFetch inside loops
+		// is not required for split-half write→read order and aborts some
+		// native32 compilers. Rendezvous only after operations that publish.
+		const bool publishes_external =
+		    buffer_access == IR::BufferAccess::Write ||
+		    buffer_access == IR::BufferAccess::Atomic ||
+		    address_access == IR::AddressAccess::Write ||
+		    image_access == IR::ImageAccess::Write ||
+		    image_access == IR::ImageAccess::Atomic;
 		if (ctx.state.compute_execution.SynchronizesSplitWaveMemory() &&
-		    external_memory && !planning_only) {
+		    publishes_external && !planning_only) {
 			auto& state = ctx.state;
+			uint32_t semantics = MemorySemanticsAcquireRelease;
+			if (buffer_access == IR::BufferAccess::Write ||
+			    buffer_access == IR::BufferAccess::Atomic ||
+			    address_access == IR::AddressAccess::Write) {
+				semantics |= MemorySemanticsUniformMemory;
+			}
+			if (image_access == IR::ImageAccess::Write ||
+			    image_access == IR::ImageAccess::Atomic) {
+				semantics |= MemorySemanticsImageMemory;
+			}
 			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
-			                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
-			                           MemorySemanticsAcquireRelease | MemorySemanticsUniformMemory |
-			                           MemorySemanticsImageMemory)});
+			                           ConstantU32(state, ScopeDevice),
+			                           ConstantU32(state, semantics)});
 		}
 		return;
 	}

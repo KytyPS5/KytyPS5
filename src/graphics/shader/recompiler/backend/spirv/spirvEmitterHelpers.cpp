@@ -232,9 +232,12 @@ uint32_t EmitHostLocalInvocationIndex(EmitterState& state) {
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
-	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, TypeU32(state), value, variable});
-	return value;
+	if (state.host_local_invocation_index == 0) {
+		state.host_local_invocation_index = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeU32(state),
+		                           state.host_local_invocation_index, variable});
+	}
+	return state.host_local_invocation_index;
 }
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state) {

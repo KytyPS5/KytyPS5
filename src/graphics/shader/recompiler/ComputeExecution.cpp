@@ -95,16 +95,6 @@ bool IsSupportedSplitOperation(O op) {
 	}
 }
 
-bool HasGuestLdsAccess(const IR::Program& program) {
-	for (const auto* block : program.blocks) for (const auto& inst : *block) {
-		if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) continue;
-		const auto index = inst.Flags<IR::MemoryFlags>().index;
-		if (index < program.memory_info.size() && program.memory_info[index].kind == IR::ResourceKind::Lds)
-			return true;
-	}
-	return false;
-}
-
 bool HasWaveOperations(const IR::Program& program) {
 	if (program.spirv_requirements && (program.spirv_requirements->subgroup_ballot ||
 	    program.spirv_requirements->subgroup_shuffle || program.spirv_requirements->subgroup_local_invocation_id)) return true;
@@ -116,6 +106,14 @@ bool HasWaveOperations(const IR::Program& program) {
 			case O::SwizzleU32: case O::BpermuteU32: case O::DataAppend: case O::DataConsume: return true;
 			default: break;
 		}
+	}
+	return false;
+}
+
+bool HasWaveBallot(const IR::Program& program) {
+	if (program.spirv_requirements && program.spirv_requirements->subgroup_ballot) return true;
+	for (const auto* block : program.blocks) for (const auto& inst : *block) {
+		if (inst.GetOpcode() == O::Ballot) return true;
 	}
 	return false;
 }
@@ -590,6 +588,16 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 }
 } // namespace
 
+bool HasGuestLdsAccess(const IR::Program& program) {
+	for (const auto* block : program.blocks) for (const auto& inst : *block) {
+		if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) continue;
+		const auto index = inst.Flags<IR::MemoryFlags>().index;
+		if (index < program.memory_info.size() && program.memory_info[index].kind == IR::ResourceKind::Lds)
+			return true;
+	}
+	return false;
+}
+
 ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
                                           ShaderStageInputInfo input_info,
                                           const ComputeWorkgroupLimits& limits) {
@@ -633,7 +641,10 @@ ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
 	}
 	if (count % 64 != 0) { plan.error = "wave64 splitting requires complete guest waves"; return plan; }
 	// Multi-wave shared storage and guest barriers require a cooperative host
-	// group. Independent waves retain the smaller partitioned execution path.
+	// group. One complete guest wave already occupies a single 64-invocation
+	// host workgroup, so split-wave collectives reconstruct wave64 state with
+	// workgroup scratch instead of the software scheduler. Independent waves
+	// retain the smaller partitioned execution path.
 	// If that path cannot prove cross-wave progress, a later bounded fallback
 	// may keep the complete guest workgroup together. Reservations without live
 	// accesses do not allocate the lazy guest array.
@@ -650,7 +661,10 @@ ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
 
 	const auto try_mode = [&](bool cooperative) {
 		auto candidate = plan;
-		const uint64_t collective_dwords = cooperative ? uint64_t{count} : 64ull;
+		const uint64_t wave_count = cooperative ? uint64_t{count} / 64u : 1u;
+		const uint64_t ballot_dwords = HasWaveBallot(program) ? wave_count * 2u : 0u;
+		const uint64_t collective_dwords =
+		    (cooperative ? uint64_t{count} : 64ull) + ballot_dwords;
 		const uint64_t shared_bytes = collective_dwords * sizeof(uint32_t) +
 		                              (uses_lds ? uint64_t{cs->lds_size_dwords} * sizeof(uint32_t) : 0);
 		if (shared_bytes > limits.max_shared_memory_bytes) {

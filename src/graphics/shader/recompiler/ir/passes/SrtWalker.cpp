@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cinttypes>
 #include <fmt/format.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -1214,23 +1217,54 @@ public:
 		const bool address_read = opcode == ValueOpcode::LoadAddressU32 && read.NumArgs() == 4u;
 		const bool buffer_read = opcode == ValueOpcode::ReadConstBuffer && read.NumArgs() == 2u;
 		if (!address_read && !buffer_read) return {};
+		if (buffer_read) {
+			const char* trace_env = std::getenv("KYTY_SHADER_PHASE_TRACE");
+			if (trace_env != nullptr && *trace_env != '\0' && std::string_view(trace_env) != "0")
+				std::fprintf(stderr, "shader SRT: buffer read pc=0x%08" PRIx32
+				                         " uses=%zu\n",
+				             read.Flags<MemoryFlags>().pc, read.Uses().size());
+		}
+		const bool trace_image_read = buffer_read && std::ranges::any_of(read.Uses(), [](const Use& use) {
+			return use.user != nullptr && use.user->GetOpcode() == ValueOpcode::GetImageResource;
+		});
+		const auto trace_reject = [&](const char* reason) {
+			const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+			if (trace_image_read && value != nullptr && *value != '\0' &&
+			    std::string_view(value) != "0")
+				std::fprintf(stderr, "shader SRT: image buffer proof pc=0x%08" PRIx32
+				                         " rejected at %s\n",
+				             read.Flags<MemoryFlags>().pc, reason);
+		};
 		const auto flags = read.Flags<MemoryFlags>();
-		if (flags.index >= m_program.memory_info.size()) return {};
+		if (flags.index >= m_program.memory_info.size()) {
+			trace_reject("memory index");
+			return {};
+		}
 		const auto& memory = m_program.memory_info[flags.index];
 		const auto expected_kind = address_read ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
 		if (memory.kind != expected_kind || memory.planning_only ||
 		    memory.data_dwords != 1u || memory.data_bits != 32u ||
-		    (address_read && (!Immediate(read.Arg(2), 0u) || read.Arg(3).Resolve() != Value(true)))) return {};
+			(address_read && (!Immediate(read.Arg(2), 0u) || read.Arg(3).Resolve() != Value(true)))) {
+			trace_reject("memory shape");
+			return {};
+		}
 		const auto* address = read.Arg(0).Resolve().TryInstruction();
 		const uint32_t source_dwords = address_read ? 2u : 4u;
 		const auto expected_handle = address_read ? ValueOpcode::GetAddressResource : ValueOpcode::GetBufferResource;
 		if (address == nullptr || address->GetOpcode() != expected_handle ||
-		    address->NumArgs() != source_dwords) return {};
+		    address->NumArgs() != source_dwords) {
+			trace_reject("buffer handle");
+			return {};
+		}
 		for (uint32_t word = 0; word < source_dwords; ++word)
-			if (!ValidateRuntimeValue(m_program, address->Arg(word))) return {};
+			if (!ValidateRuntimeValue(m_program, address->Arg(word))) {
+				trace_reject("buffer root");
+				return {};
+			}
 		BoundedOffset offset;
 		std::unordered_set<const Inst*> visiting;
 		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr) {
+			trace_reject("offset");
 			return {};
 		}
 		if (m_program.dispatcher_fallback ? !BuildBlockIndex() : !BuildGraph()) return {};
@@ -1247,12 +1281,33 @@ public:
 		}
 		const auto maximum = workgroup ? std::optional<uint32_t>{} :
 		                                FiniteMaximum(Value(const_cast<Inst*>(offset.index)));
+		if (m_program.dispatcher_fallback && buffer_read &&
+		    read.Arg(1).Resolve().TryInstruction() != nullptr) {
+			const char* trace_env = std::getenv("KYTY_SHADER_PHASE_TRACE");
+			if (trace_env != nullptr && *trace_env != '\0' && std::string_view(trace_env) != "0") {
+				std::fprintf(stderr,
+				             "shader SRT: buffer selector bound pc=0x%08" PRIx32 " maximum=%s\n",
+				             flags.pc, maximum.has_value() ? "known" : "unknown");
+			}
+		}
 		if (workgroup || maximum.has_value()) {
+			const auto trace = [] {
+				const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+				return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+			}();
+			const bool dispatcher_descriptor_table =
+			    m_program.dispatcher_fallback &&
+			    IsDispatcherDescriptorTableRead(read, Value(const_cast<Inst*>(offset.index)));
+			if (trace && m_program.dispatcher_fallback && buffer_read && !dispatcher_descriptor_table)
+				std::fprintf(stderr, "shader SRT: dispatcher descriptor table proof rejected pc=0x%08" PRIx32
+				                         " before root checks\n",
+				             flags.pc);
 			// Dispatcher emission preserves the guest CFG but does not provide the structured
 			// loop guarantees used by the wider proof below. A finite table read in a
 			// single-entry unconditional prefix has no cyclic dominance dependency.
 			if (m_program.dispatcher_fallback &&
-			    (workgroup || !DispatcherEntryPrefixPrecedes(*offset.index, read))) {
+			    (workgroup ||
+			     (!DispatcherEntryPrefixPrecedes(*offset.index, read) && !dispatcher_descriptor_table))) {
 				return {};
 			}
 			// The dense enclosure includes every possible GPU value. Keep the key
@@ -1282,8 +1337,16 @@ public:
 			const Block* source_scope = buffer_read ? read.Parent() : prefix;
 			for (uint32_t word = 0; word < source_dwords; ++word) {
 				const bool safe = m_program.dispatcher_fallback
-				                      ? RuntimeReadsPrecedeEntry(address->Arg(word), read)
+				                      ? (dispatcher_descriptor_table
+				                             ? RuntimeReadsDominate(address->Arg(word), read.Parent(), &read)
+				                             : RuntimeReadsPrecedeEntry(address->Arg(word), read))
 				                      : RuntimeReadsDominate(address->Arg(word), source_scope, &read);
+				if (trace && m_program.dispatcher_fallback && buffer_read &&
+				    dispatcher_descriptor_table && !safe)
+					std::fprintf(stderr,
+					             "shader SRT: dispatcher descriptor table root rejected pc=0x%08" PRIx32
+					             " word=%u\n",
+					             flags.pc, word);
 				if (!safe) return {};
 			}
 			return BoundedSrtReadProof {
@@ -1448,7 +1511,18 @@ private:
 		if (inst == nullptr || !m_ids.contains(inst->Parent())) return {};
 		if (const auto found = m_finite_values.find(inst); found != m_finite_values.end())
 			return found->second;
-		if (!m_finite_visiting.insert(inst).second) return {};
+		if (!m_finite_visiting.insert(inst).second) {
+			// Dispatcher SSA can represent a finite selection as a cyclic Phi/Select
+			// expression after structurization fails. These nodes only choose an
+			// already-existing value; they do not manufacture a new range. Use the
+			// least unsigned value for the revisited edge and let the acyclic arms
+			// establish the actual maximum. Other cyclic arithmetic remains rejected.
+			const auto opcode = inst->GetOpcode();
+			return m_program.dispatcher_fallback &&
+			               (opcode == ValueOpcode::Phi || opcode == ValueOpcode::SelectU32)
+			           ? std::optional<uint32_t> {0u}
+			           : std::nullopt;
+		}
 		const auto finish = [&](std::optional<uint32_t> result) {
 			m_finite_visiting.erase(inst);
 			m_finite_values.emplace(inst, result);
@@ -1510,7 +1584,8 @@ private:
 		}
 		if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0u &&
 		    inst->NumArgs() == inst->NumPhiBlocks() &&
-		    inst->NumArgs() == inst->Parent()->ImmPredecessors().size()) {
+		    (m_program.dispatcher_fallback ||
+		     inst->NumArgs() == inst->Parent()->ImmPredecessors().size())) {
 			std::unordered_set<const Block*> incoming;
 			uint32_t maximum = 0u;
 			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
@@ -1756,6 +1831,81 @@ private:
 			    next->ImmPredecessors().front() != current) return false;
 			current = next;
 		}
+	}
+	bool IsDispatcherDescriptorTableRead(const Inst& read, Value selector) const {
+		struct Handle {
+			const Inst* handle;
+			uint32_t    width;
+		};
+		std::vector<Handle> handles;
+		for (const auto& use: read.Uses()) {
+			if (use.user == nullptr) continue;
+			const auto opcode = use.user->GetOpcode();
+			const uint32_t width = opcode == ValueOpcode::GetImageResource ? 8u
+			                         : opcode == ValueOpcode::GetBufferResource ? 4u : 0u;
+			if (width == 0u || use.operand >= width) continue;
+			if (std::ranges::none_of(handles, [&](const Handle& candidate) {
+				    return candidate.handle == use.user;
+			    }))
+				handles.push_back({use.user, width});
+		}
+		if (handles.empty() || selector.Resolve().TryInstruction() == nullptr) return false;
+		const auto trace = [] {
+			const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+			return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		}();
+		for (const auto& candidate: handles) {
+			const auto* handle = candidate.handle;
+			const auto width = candidate.width;
+			uint32_t scale = 0;
+			uint32_t bias = 0;
+			bool address_table = false;
+			bool valid = true;
+			if (handle->NumArgs() != width) continue;
+			for (uint32_t word = 0; word < width; ++word) {
+				const auto* column = handle->Arg(word).Resolve().TryInstruction();
+				const bool address_read = column != nullptr &&
+				                          column->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				                          column->NumArgs() == 4u;
+				const bool buffer_read = column != nullptr &&
+				                         column->GetOpcode() == ValueOpcode::ReadConstBuffer &&
+				                         column->NumArgs() == 2u;
+				if (!address_read && !buffer_read) {
+					valid = false;
+					break;
+				}
+				BoundedOffset offset;
+				std::unordered_set<const Inst*> visiting;
+				const bool parsed = ParseBoundedOffset(column->Arg(1), offset, visiting);
+				const bool same_selector =
+				    parsed && offset.index != nullptr &&
+				    EquivalentValue(m_program, Value(const_cast<Inst*>(offset.index)), selector);
+				if (!parsed || !same_selector) {
+					if (trace && buffer_read)
+						std::fprintf(stderr,
+						             "shader SRT: descriptor table column rejected word=%u parsed=%s "
+						             "index=%s same_selector=%s\n",
+						             word, parsed ? "yes" : "no",
+						             offset.index == nullptr
+						                 ? "none"
+						                 : ValueOpcodeName(offset.index->GetOpcode()).data(),
+						             same_selector ? "yes" : "no");
+					valid = false;
+					break;
+				}
+				if (word == 0u) {
+					scale = offset.scale;
+					bias = offset.bias;
+					address_table = address_read;
+				} else if (offset.scale != scale ||
+				           (address_table && offset.bias != bias)) {
+					valid = false;
+					break;
+				}
+			}
+			if (valid) return true;
+		}
+		return false;
 	}
 	bool RuntimeReadsPrecedeEntry(Value root, const Inst& before) const {
 		struct PendingValue {

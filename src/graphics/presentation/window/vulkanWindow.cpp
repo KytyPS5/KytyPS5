@@ -171,7 +171,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
 	if (Config::GetGpuIndex() >= 0) {
-		devices = {devices[Config::GetGpuIndex()]};
+		const auto gpu_index = static_cast<size_t>(Config::GetGpuIndex());
+		if (gpu_index >= devices.size()) {
+			EXIT("GPU index %d is out of range (available=%zu)\n",
+			     Config::GetGpuIndex(), devices.size());
+		}
+		devices = {devices[gpu_index]};
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;

@@ -779,6 +779,35 @@ Required tests:
 - Native Windows audit of the captured shader class and a bounded game run beyond its original
   `GetImageResource dword 0 is not a valid runtime value` failure.
 
+## Scalar-buffer image tables with shifted wave-uniform selectors
+
+Status: production fix and bounded game validation reached the next independent buffer boundary;
+automated regression deferred.
+
+Observed trigger: an eight-DWORD image descriptor was read from one scalar-buffer table with
+the same `ReadFirstLane` selector multiplied by 32 using `ShiftLeftLogical32`. Resource
+tracking recognized equivalent `selector * stride` and planned the existing inline image-table
+materialization only for sampled images, so an `ImageRead` reached the generic runtime-value
+validator with `ReadConstBuffer` roots.
+
+Required tests:
+
+- Four- and eight-DWORD scalar-buffer descriptors using `selector * stride` and
+  `selector << shift`, proving equivalent keys produce the same inline table and GPU selector
+  mapping.
+- `ImageRead`, `ImageSampleRaw`, image-query and storage-image variants, including compact
+  R128 descriptors, null/OOB table entries, repeated descriptors and the existing probe/dense
+  image limits.
+- Dominating selector limits, unknown wrapped-U32 selectors and scalar-buffer strides of zero,
+  one, 16, 32 and non-power-of-two values, checking that valid in-range words are enumerated
+  without inventing host descriptors.
+- Writable/dirty table backing, unavailable specialization memory, alias overlap and
+  transactionality cases, proving inline image materialization fails closed rather than
+  snapshotting a GPU-written descriptor table.
+- Exact `6cc64dee32dc7094` audit plus native game validation through guest PC `0x4d64`; the
+  current run passes that image failure and stops next at a separate
+  `GetBufferResource` scalar-buffer descriptor at PC `0x656c`.
+
 ## Signed integer storage images
 
 Status: production fix, native build and bounded game validation complete; automated regression deferred.
@@ -890,3 +919,128 @@ Required tests:
 Validation reached the original `053b2c82226fe5ed` storage write, created its Vulkan pipeline
 and continued through four later compute pipelines without an image-layout fatal or Vulkan VUID.
 The exact placed address was preserved rather than rounded to a tile boundary.
+
+## Single-wave64 collectives on native subgroup32
+
+Status: production split wave64 ballot is the 64-lane workgroup OR without
+`OpGroupNonUniformBallot`; one complete guest wave stays on the split host
+workgroup. Guest 32-bit LDS and collective scratch share one Workgroup `u32`
+array (LDS prefix, scratch suffix) because SPIR-V Workgroup variables alias
+without `WorkgroupMemoryExplicitLayoutKHR`. Sampled `OpImageFetch` no longer
+takes ImageMemory control barriers; image writes still rendezvous. The compact
+native-subgroup ballot and single-wave cooperative admission experiments were
+reverted. Automated Vulkan/readback regression deferred.
+
+Observed trigger: a complete 64-invocation guest wave uses subgroup operations on a
+host whose native subgroup is 32. `OpGroupNonUniformBallot` mixed with workgroup
+scratch aborts `nvgpucomp64.dll` on RTX 5060 Ti. Restoring the RTX 4060 64-lane
+scratch OR lets the first 34 shader variants create pipelines and complete, including
+the graphics pair `cc2b833287f423b9`/`2e17013fdae4d8ac`. The same compiler then
+dies while compiling Screen Space Shadows `b90e2024732c6111` (`cs=0x8000399500`,
+64×1×1, LDS, loops, ballot/image). RTX 4060 compiled that module (48 929 SPIR-V
+words) and reached frame 125. Combining the Workgroup arrays (run
+`yotei-integrated-20260907-163447-2da1c9`, SHA
+`94eeb7449ba940752ea493c1b9efffbd256c38e7333fc7ae660a3220f03f8d1f`) and dropping
+ImageMemory-after-fetch (`161953-de0599`) did not move that frontier.
+
+Required tests:
+
+- Native32 planner cases for 64-invocation wave64 collectives with and without
+  LDS/barriers, proving one complete guest wave stays on the split 64-invocation host
+  workgroup while multi-wave shared storage still selects the cooperative scheduler.
+- SPIR-V validation proving split ballots use the 64-lane workgroup reconstruction,
+  workgroup barriers and no `OpGroupNonUniformBallot`/`CapabilityGroupNonUniformBallot`.
+  The reconstruction must not expand one ballot into a long per-invocation
+  `OpLoad`/`OpBitwiseOr` chain: a bounded shared-word reduction may use
+  `OpAtomicExchange`/`OpAtomicOr` (or an equally bounded workgroup primitive) and
+  must preserve the two guest mask words.
+- If the reduction uses the existing per-lane scratch slots, a leader-only
+  aggregate write is a valid bounded alternative to per-invocation aggregate
+  atomics. The regression must check that each logical wave publishes both
+  aggregate words after the per-lane barrier, and must retain the same result
+  for full, sparse and repeated predicates.
+- Split+LDS modules declare exactly one Workgroup variable; guest LDS bounds stay
+  the declared DWORD allocation; scratch AccessChains are `IAdd(lane, lds_dwords)`
+  and must not be counted as competing LDS stores. Ballot aggregate words follow
+  the complete per-lane scratch suffix with a separate two-word stride per
+  cooperative wave; they must not alias `WavePublish` slots. 64-bit LDS atomics
+  still emit a separate `u64` array.
+- Vulkan readback for full and sparse/inactive EXEC lanes, repeated collectives,
+  and looped LDS plus ballot, including a bounded analogue of the `b90e` loop/image
+  pattern. Reusing the aggregate slots for a later ballot must not observe the
+  previous mask, and cooperative multi-wave bases must remain disjoint.
+- A shared `BitwiseOr32` used by multiple `IEqual32`/`INotEqual32` zero tests must
+  lower each comparison through the equivalent De Morgan boolean form without
+  emitting the integer OR; mixed nonzero consumers must retain the integer result.
+- Host profiles with native subgroup64, native subgroup32 and unavailable subgroup-size
+  control, proving the admission rule follows device capabilities rather than a title
+  or shader hash.
+- Native Windows game retry past `b90e2024732c6111` on RTX 50-series, comparing
+  frame progress with the RTX 4060 result.
+
+## Native32 wave64 barrier/image pipeline lowering
+
+Status: b90e pipeline correction, native synthetic regression and the RTX 5060 Ti
+game pipeline/dispatch path are GREEN; exact standalone probe compatibility and
+nonzero surface output remain pending.
+
+Observed trigger: the current `b90e2024732c6111` SPIR-V module passes
+`vkCreateShaderModule` and `vkCreatePipelineLayout`, then crashes the NVIDIA compiler
+inside `vkCreateComputePipelines` on the RTX 5060 Ti. The same lowering family must
+remain valid when the guest wave64 contains LDS reads/writes, repeated barriers,
+sampled image fetches, image publication and a 64-lane ballot. The test must not
+identify the title, shader hash or guest address.
+
+Required tests:
+
+- A bounded synthetic one-wave64/native-subgroup32 module with LDS, a loop, ballot
+  reconstruction, image fetch and image write, proving SPIR-V validation and the
+  isolated `vkCreateComputePipelines` probe both complete without a driver fault.
+- Lowering variants that remove each operation family independently, followed by a
+  mechanically minimized public fixture, proving the failure is attributed to the
+  shared wave64/barrier/LDS/image construction rather than module size or unrelated
+  shader code.
+- Split ballot output must use the defined 64-lane workgroup reconstruction, with
+  exactly one aliased Workgroup `u32` allocation for LDS plus scratch where explicit
+  Workgroup layout is unavailable; per-lane scratch starts after the LDS prefix and
+  ballot aggregate words follow that scratch region without aliasing it.
+  A 64-bit LDS atomic path must retain its separate typed storage.
+- Collision-free DWORD stores whose byte address is exactly `(LaneId << 2)` or an
+  EXEC-select of that address must use plain `OpStore` only for one complete
+  64-invocation split host workgroup; arbitrary offsets, competing addresses,
+  Function LDS, cooperative mode and non-64 host sizes must retain atomics.
+- A split-ballot result consumed as
+  `(lower & mask0) | (upper & mask1) != 0` must preserve the independent mask
+  semantics while lowering the final zero-test without an integer OR over
+  Workgroup-derived values. The regression must check the value-graph semantics
+  (for example, De Morgan `!(lower_mask == 0 && upper_mask == 0)`), not only
+  opcode counts. This is a narrow zero-test optimization; arbitrary guest
+  integer OR operations must retain their exact 32-bit result.
+- Sampled image fetches must not acquire `ImageMemory` publication semantics;
+  image writes and image atomics must retain the required rendezvous and their
+  publication scope must be `Workgroup`, not a device-wide scope invented by the
+  lowering.
+- Neighboring native subgroup64, wave32, no-LDS, read-only-image, inactive-EXEC and
+  multi-wave/cooperative cases must keep their existing admission and SPIR-V
+  contracts. Unsupported cyclic or cross-wave cases must still reject closed.
+- Run the exact saved module through `vk_spv_probe.exe` before and after each
+  candidate, record the exit/output, and only then retry the real 1280x720 game
+  path with all owned processes confirmed stopped.
+
+The current isolated minimization of fresh module
+`_Build/runs/yotei-integrated-20260907-183157-411634/...b90e2024732c6111.spv`
+produced a valid neutral-body module that passes both `spirv-val` and the isolated
+probe. Independent family variants showed that removing barriers, atomics or image
+operations alone does not clear the crash, while neutralizing loads, access chains or
+all integer ORs does. Delta probing then isolated one downstream OR (ordinal 23,
+`(lower & mask0) | (upper & mask1) != 0`) as the necessary compiler-sensitive
+shape in that module. The shared emitter now rewrites only this semantically narrow
+zero-test form to logical comparisons; arbitrary integer OR results remain unchanged.
+The synthetic RED/GREEN artifact and probe results are retained under `_Build/analysis`.
+The fresh game run `_Build/runs/yotei-integrated-20260907-211101-9da340` reached
+frame 158 with `b90e2024732c6111` and `a7661ff4ea282325` completed. The exact
+captured `b90e` artifact still crashes the minimal standalone probe during
+pipeline creation, while the real game layout creates its pipeline successfully;
+the difference is retained as an open probe-layout boundary. Eight source
+readbacks remain RGB zero with alpha 3, so this result does not claim the first
+nonzero frame.

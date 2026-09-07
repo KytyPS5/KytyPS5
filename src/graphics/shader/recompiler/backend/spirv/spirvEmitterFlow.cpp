@@ -601,6 +601,16 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
 			return true;
 		case IR::ValueOpcode::Ballot: ctx.Define(inst, ctx.Ballot(inst.Arg(0))); return true;
+		case IR::ValueOpcode::AnyLane: {
+			const auto ballot = ctx.Ballot(inst.Arg(0));
+			const auto low    = state.builder.AllocateId();
+			const auto high   = state.builder.AllocateId();
+			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
+			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
+			ctx.Emit(inst, OpINotEqual, IR::Type::U1,
+			         {EmitBinaryU32(state, OpBitwiseOr, low, high), ConstantU32(state, 0)});
+			return true;
+		}
 		case IR::ValueOpcode::ReadFirstLane: {
 			const auto ballot = ctx.Ballot(inst.Arg(1));
 			const auto lane   = ctx.FirstLane(ballot);

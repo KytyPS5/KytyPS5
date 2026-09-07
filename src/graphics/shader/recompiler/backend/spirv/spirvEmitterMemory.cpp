@@ -1074,6 +1074,82 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 	return ConstructU32Composite(ctx.state, components, values);
 }
 
+uint32_t PackFormattedD16Pair(ValueEmitContext& ctx, const Format::BufferFormatInfo& info,
+                              uint32_t low, uint32_t high) {
+	if (info.type == Format::ComponentType::Uint || info.type == Format::ComponentType::Sint) {
+		const auto mask = ConstantU32(ctx.state, 0xffffu);
+		return Binary(
+		    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+		    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low, mask),
+		    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+		           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high, mask),
+		           ConstantU32(ctx.state, 16u)));
+	}
+	const auto low_float  = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), low);
+	const auto high_float = Unary(ctx.state, OpBitcast, TypeF32(ctx.state), high);
+	const auto pair       = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(
+	    {OpCompositeConstruct, TypeF32Vector(ctx.state, 2), pair, low_float, high_float});
+	const auto packed = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpExtInst, TypeU32(ctx.state), packed, GlslStd450(ctx.state),
+	                               GlslPackHalf2x16, pair});
+	return packed;
+}
+
+uint32_t ConstructFormattedD16Result(ValueEmitContext& ctx,
+                                     const Format::BufferFormatInfo& info,
+                                     const std::array<uint32_t, 4>& values,
+                                     uint32_t packed_words, uint32_t components) {
+	std::array<uint32_t, 4> packed {};
+	for (uint32_t word = 0; word < packed_words; word++) {
+		const auto low_index  = word * 2u;
+		const auto high_index = low_index + 1u;
+		const auto high = high_index < components ? values[high_index] : ConstantU32(ctx.state, 0);
+		packed[word] = PackFormattedD16Pair(ctx, info, values[low_index], high);
+	}
+	return packed_words == 1u ? packed[0]
+	                          : ConstructU32Composite(ctx.state, packed_words, packed);
+}
+
+uint32_t LoadFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
+                          const IR::MemoryInfo& mem, uint32_t packed_words) {
+	auto& state       = ctx.state;
+	const auto type   = packed_words == 1u ? TypeU32(state) : TypeU32Composite(state, packed_words);
+	const auto zero   = packed_words == 1u ? ConstantU32(state, 0)
+	                                     : ConstantU32CompositeZero(state, packed_words);
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), type, zero, [&]() {
+		    const auto resource = PrepareMemoryResourceAccess(state, mem);
+		    const auto format   = BufferFormat(ctx, inst, mem);
+		    if (!Format::IsKnownFormat(format)) {
+			    std::array<uint32_t, 4> raw {};
+			    for (uint32_t word = 0; word < packed_words; word++) {
+				    raw[word] =
+				        LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, word), resource);
+			    }
+			    return packed_words == 1u ? raw[0]
+			                                  : ConstructU32Composite(state, packed_words, raw);
+		    }
+		    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource,
+		                                             mem.component_count, FormattedAccess::Load);
+		    const auto result = [&](bool in_bounds) {
+			    std::array<uint32_t, 4> values {};
+			    for (uint32_t component = 0; component < mem.component_count; component++) {
+				    if (in_bounds) {
+					    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
+				    } else {
+					    const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
+					    values[component] = FormattedConstant(ctx, plan.info, source.kind);
+				    }
+			    }
+			    return ConstructFormattedD16Result(ctx, plan.info, values, packed_words,
+			                                       mem.component_count);
+		    };
+		    return EmitValueOrDefaultIfCondition(state, plan.in_bounds, type, result(false),
+		                                         [&]() { return result(true); });
+	    });
+}
+
 void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                             const PreparedFormattedMemory& plan, uint32_t component,
                             uint32_t data) {
@@ -1089,10 +1165,13 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	const auto mem = ctx.Memory(inst);
+	if (mem.formatted && mem.data_bits == 16u) {
+		return LoadFormattedD16(ctx, inst, mem, components);
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
-		    const auto mem      = ctx.Memory(inst);
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
 		    const auto format =
 		        mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
@@ -1464,7 +1543,8 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto mem   = ctx.Memory(inst);
 		uint32_t   value = 0;
 		if (op == IR::ValueOpcode::LoadBufferU32 && mem.formatted)
-			value = FormattedLoad(ctx, inst, mem);
+			value = mem.data_bits == 16u ? LoadFormattedD16(ctx, inst, mem, 1u)
+			                                : FormattedLoad(ctx, inst, mem);
 		else if (op == IR::ValueOpcode::LoadAddressU8 || op == IR::ValueOpcode::LoadBufferU8 ||
 		         op == IR::ValueOpcode::LoadSharedU8)
 			value = LoadSubword(ctx, inst, mem, 8, false);

@@ -433,8 +433,12 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
+				const bool packed_d16 = memory.formatted && memory.data_bits == 16u &&
+				                        memory.component_count > memory.data_dwords &&
+				                        memory.component_count <= memory.data_dwords * 2u;
 				if (buffer_components > 1u &&
-				    (memory.kind != ResourceKind::Buffer || memory.data_bits != 32u ||
+				    (memory.kind != ResourceKind::Buffer ||
+				     (memory.data_bits != 32u && !packed_d16) ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));

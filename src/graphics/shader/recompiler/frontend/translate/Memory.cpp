@@ -435,7 +435,13 @@ bool Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
 	const auto      sign = memory.data_signed;
-	switch (bits) {
+	if (memory.formatted && bits == 16u) {
+		switch (memory.data_dwords) {
+			case 1u: opcode = IR::ValueOpcode::LoadBufferU32; break;
+			case 2u: opcode = IR::ValueOpcode::LoadBufferU32x2; break;
+			default: return false;
+		}
+	} else switch (bits) {
 		case 8u: opcode = IR::ValueOpcode::LoadBufferU8; break;
 		case 16u: opcode = IR::ValueOpcode::LoadBufferU16; break;
 		case 32u:
@@ -454,7 +460,18 @@ bool Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto loaded =
 	    ir.Emit(opcode, {resource, address.index, address.offset, address.soffset, ir.GetExec()},
 	            AddMemoryInfo(memory, inst.pc));
-	if (bits != 32u) {
+	if (memory.formatted && bits == 16u) {
+		for (uint32_t word = 0; word < memory.data_dwords; word++) {
+			auto packed = memory.data_dwords == 1u ? loaded : ir.CompositeExtract(loaded, word);
+			if (word * 2u + 1u >= memory.component_count) {
+				const auto old_high = ir.BitwiseAnd(
+				    ReadU32(OffsetOperand(inst.dst, word)), IR::U32(IR::Value(0xffff0000u)));
+				packed = ir.BitwiseOr(
+				    ir.BitwiseAnd(IR::U32(packed), IR::U32(IR::Value(0x0000ffffu))), old_high);
+			}
+			WriteOperand(OffsetOperand(inst.dst, word), packed);
+		}
+	} else if (bits != 32u) {
 		WriteOperand(inst.dst, WidenSubdword(loaded, bits, sign));
 	} else if (memory.data_dwords == 1u) {
 		WriteOperand(inst.dst, loaded);
@@ -916,6 +933,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:

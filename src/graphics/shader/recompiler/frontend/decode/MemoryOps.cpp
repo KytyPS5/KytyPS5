@@ -13,6 +13,7 @@ struct MemoryOpcodeInfo {
 	bool     data_signed = false;
 	bool     typed       = false;
 	bool     formatted   = false;
+	uint32_t data_components = 0;
 };
 
 constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
@@ -50,6 +51,10 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
     {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
     {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
+	{0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true, 1},
+	{0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+	{0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
+	{0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
     {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
@@ -152,6 +157,7 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 	inst.data_signed = info->data_signed;
 	inst.typed       = info->typed;
 	inst.formatted   = info->formatted;
+	inst.data_components = info->data_components;
 }
 
 bool IsDsWriteOpcode(Opcode opcode) {

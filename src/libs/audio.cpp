@@ -332,14 +332,30 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 
 // SDL2 only accepts 1..8 channels (SDL_SupportedChannelCount), so downmix an
 // unsupported layout (12ch 7.1.4) to stereo before handing it to SDL.
-// PS5 SceAudioOut2 12ch order: FL FR FC LFE SL SR BL BR TFL TFR TBL TBR.
+//
+// PS5 SceAudioOut2 12-channel (7.1.4) buffer order:
+//   [0..3]  FL FR FC LFE            (front bed + low-frequency effects)
+//   [4..7]  side/rear surrounds     (SL SR BL BR in the "std" order;
+//                                     BL BR SL SR in the non-std order)
+//   [8..11] top/height channels     (TFL TFR TBL TBR)
+//
+// The first four channels are L R C LFE in every SceAudioOut2 convention. The
+// four surround/back channels are summed into L/R with one shared weight and the
+// four top channels with another, so their internal ordering (std vs non-std)
+// does not change the stereo result.
+//
+// Downmix matrix (stereo L/R):
+//   center       kCenter  = -3 dB (ITU-R BS.775 Lo/Ro)
+//   surround/back kSurround = -6 dB  (folded in conservatively to avoid clipping)
+//   top/height   kTop     = -9 dB  (folded in as ambience)
+//   LFE          discarded (standard for a stereo downmix)
 void Audio::DownmixToStereo(const PortOut& port, const void* data, std::vector<uint8_t>* buffer) {
 	const uint32_t frames = port.samples_num;
 	const uint32_t src_ch = port.channels_num;
 
-	constexpr float c = 0.70710678f; // center
-	constexpr float s = 0.5f;        // surrounds / backs
-	constexpr float t = 0.35355339f; // tops
+	constexpr float kCenter   = 0.70710678f; // -3 dB
+	constexpr float kSurround = 0.5f;        // -6 dB
+	constexpr float kTop      = 0.35355339f; // -9 dB
 
 	if (FormatIsFloat(port.format)) {
 		buffer->resize(frames * 2 * sizeof(float));
@@ -347,23 +363,25 @@ void Audio::DownmixToStereo(const PortOut& port, const void* data, std::vector<u
 		const auto* src = static_cast<const float*>(data);
 		for (uint32_t f = 0; f < frames; f++) {
 			const float* in = src + static_cast<size_t>(f) * src_ch;
-			dst[f * 2 + 0] =
-			    in[0] + c * in[2] + s * (in[4] + in[6]) + t * (in[8] + in[10]);
-			dst[f * 2 + 1] =
-			    in[1] + c * in[2] + s * (in[5] + in[7]) + t * (in[9] + in[11]);
+			dst[f * 2 + 0] = in[0] + kCenter * in[2] + kSurround * (in[4] + in[6]) +
+			                  kTop * (in[8] + in[10]);
+			dst[f * 2 + 1] = in[1] + kCenter * in[2] + kSurround * (in[5] + in[7]) +
+			                  kTop * (in[9] + in[11]);
 		}
 		return;
 	}
 
+	// Fixed-point approximations of the same matrix: 181/256 ~ kCenter, >>1 ~ 0.5,
+	// 90/256 ~ kTop.
 	buffer->resize(frames * 2 * sizeof(int16_t));
 	auto*       dst = reinterpret_cast<int16_t*>(buffer->data());
 	const auto* src = static_cast<const int16_t*>(data);
 	for (uint32_t f = 0; f < frames; f++) {
 		const int16_t* in = src + static_cast<size_t>(f) * src_ch;
 		const int32_t l = in[0] + ((static_cast<int32_t>(in[2]) * 181) >> 8) +
-		                  (in[4] >> 1) + (in[6] >> 1) + (in[8] >> 2) + (in[10] >> 2);
+		                  (in[4] >> 1) + (in[6] >> 1) + ((in[8] * 90) >> 8) + ((in[10] * 90) >> 8);
 		const int32_t r = in[1] + ((static_cast<int32_t>(in[2]) * 181) >> 8) +
-		                  (in[5] >> 1) + (in[7] >> 1) + (in[9] >> 2) + (in[11] >> 2);
+		                  (in[5] >> 1) + (in[7] >> 1) + ((in[9] * 90) >> 8) + ((in[11] * 90) >> 8);
 		dst[f * 2 + 0] = static_cast<int16_t>(std::clamp(l, -32768, 32767));
 		dst[f * 2 + 1] = static_cast<int16_t>(std::clamp(r, -32768, 32767));
 	}

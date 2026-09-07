@@ -6007,6 +6007,30 @@ void TestPixelAncillaryLayerInput() {
     CheckSpirvBinaryValidates(wqm_result.spirv);
   }
 
+  const uint32_t loop[] = {
+      EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
+      EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
+      EncodeSop1(0x24, 12, 0),   // Narrow EXEC while saving the widened mask.
+      EncodeSop1(0x04, 10, 126), // Save the final export mask.
+      EncodeSopp(0x08, 6),       // Skip the body when EXEC is zero.
+      EncodeVop3Word0(0x148, 5), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
+      EncodeSMovB32(2, 128),
+      EncodeSop2(0x00, 2, 2, 129),
+      EncodeSopc(0x0a, 2, 131),
+      EncodeSopp(0x05, 0xfffdu), // Repeat the scalar loop three times.
+      EncodeSop1(0x04, 126, 12), // Pack under the widened mask.
+      EncodeVop2(0x2f, 6, 5 + 256, 5),
+      EncodeSop1(0x04, 126, 10), // Export only lanes that entered the body.
+      EncodeExp0(0x00, 0x1, true, false, true), EncodeExp1(6, 0, 0, 0), EncodeSopp(0x01),
+  };
+  auto loop_result = RecompileForTest(loop, options);
+  Check(ProgramHasInput(loop_result.program, StageInputKind::Layer) &&
+            !ProgramHasInput(loop_result.program, StageInputKind::PackedAncillary),
+        "loop and skipped body retained the symbolic ancillary input after field lowering");
+  Check(SpirvContainsOpcode(loop_result.spirv, 246u),
+        "ancillary regression did not retain its scalar loop");
+  CheckSpirvBinaryValidates(loop_result.spirv);
+
   const uint32_t unused[] = {EncodeSopp(0x01)};
   auto unused_result = RecompileForTest(unused, options);
   Check(!ProgramHasInput(unused_result.program, StageInputKind::Layer) &&
@@ -6031,120 +6055,12 @@ void TestPixelAncillaryLayerInput() {
   shader[1] = EncodeVop3Word1(5 + 256, 128 + 12, 128 + 4);
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "unsupported live ancillary field was silently replaced");
+  shader[1] = EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11);
+  shader[4] = EncodeExp0(0x00, 0x7);
+  shader[5] = EncodeExp1(6, 7, 5, 0);
+  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+              "direct raw ancillary export was silently replaced after field lowering");
 #endif
-}
-
-void TestMaskedValueDemand() {
-  using namespace ShaderRecompiler::IR;
-  enum class Use { Guarded, Conjunction, Wqm, WqmConjunction, WqmOtherGuard,
-                   TrueArm, Unguarded, OtherGuard, Predicate,
-                   ReadLane, ExplicitLod, ExplicitGradient, LevelZero, ImplicitLod,
-                   Mixed, Phi, Loop };
-  for (const auto use : {Use::Guarded, Use::Conjunction, Use::Wqm,
-                         Use::WqmConjunction, Use::WqmOtherGuard,
-                         Use::TrueArm, Use::Unguarded,
-                         Use::OtherGuard, Use::Predicate, Use::ReadLane,
-                         Use::ExplicitLod, Use::ExplicitGradient, Use::LevelZero,
-                         Use::ImplicitLod, Use::Mixed, Use::Phi, Use::Loop}) {
-    Program program;
-    for (uint32_t i = 0; i < 4; ++i) {
-      program.block_storage.push_back(std::make_unique<Block>());
-      program.blocks.push_back(program.block_storage.back().get());
-    }
-    auto &entry = *program.blocks[0];
-    auto &join = *program.blocks[3];
-    entry.AddBranch(program.blocks[1]);
-    entry.AddBranch(program.blocks[2]);
-    program.blocks[1]->AddBranch(&join);
-    program.blocks[2]->AddBranch(&join);
-    if (use == Use::Loop) join.AddBranch(&entry);
-    const auto input = Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
-                                                 {Value(static_cast<ScalarReg>(0))}));
-    const auto predicate = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32,
-                                                      {input, Value(0u)}));
-    const auto other = Value(&entry.AppendNewInst(ValueOpcode::IEqual32,
-                                                  {input, Value(2u)}));
-    auto mask = predicate;
-    if (use == Use::Wqm || use == Use::WqmConjunction || use == Use::WqmOtherGuard) {
-      // WQM includes the original active lanes and additional helper lanes.
-      const auto helpers = Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
-                                                       {Value(static_cast<ScalarReg>(1))}));
-      const auto helper = Value(&entry.AppendNewInst(ValueOpcode::INotEqual32,
-                                                      {helpers, Value(0u)}));
-      mask = Value(&entry.AppendNewInst(ValueOpcode::LogicalOr, {predicate, helper}));
-    }
-    auto &masked = entry.AppendNewInst(ValueOpcode::SelectU32,
-                                        {mask, Value(10u), Value(20u)});
-    Value value(&masked);
-    if (use == Use::Phi || use == Use::Loop) {
-      auto &phi = join.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
-      phi.AddPhiOperand(program.blocks[1], value);
-      phi.AddPhiOperand(program.blocks[2], Value(0u));
-      value = Value(&phi);
-    }
-    value = Value(&join.AppendNewInst(ValueOpcode::BitCastF32U32, {value}));
-    value = Value(&join.AppendNewInst(ValueOpcode::FPMul32, {value, Value::F32(2.f)}));
-    value = Value(&join.AppendNewInst(ValueOpcode::BitCastU32F32, {value}));
-    if (use == Use::ReadLane) {
-      value = Value(&join.AppendNewInst(ValueOpcode::ReadLane, {value, Value(0u)}));
-    }
-    if (use == Use::ExplicitLod || use == Use::ExplicitGradient ||
-        use == Use::LevelZero || use == Use::ImplicitLod) {
-      const auto zero = Value(0u);
-      auto &address = join.AppendNewInst(ValueOpcode::MakeImageAddress,
-          {value, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero});
-      auto &image = entry.AppendNewInst(ValueOpcode::GetImageResource,
-          {zero, zero, zero, zero, zero, zero, zero, zero});
-      auto &sampler = entry.AppendNewInst(ValueOpcode::GetSamplerResource,
-          {zero, zero, zero, zero});
-      auto &memory = program.memory_info.emplace_back();
-      switch (use) {
-      case Use::ExplicitLod:
-        memory.image_sample_flags =
-            ShaderRecompiler::Decoder::ImageSampleFlagLod;
-        break;
-      case Use::ExplicitGradient:
-        memory.image_sample_flags =
-            ShaderRecompiler::Decoder::ImageSampleFlagDerivative;
-        break;
-      case Use::LevelZero:
-        memory.image_sample_flags =
-            ShaderRecompiler::Decoder::ImageSampleFlagLevelZero;
-        break;
-      default:
-        break;
-      }
-      value = Value(&join.AppendNewInst(ValueOpcode::ImageSampleRaw,
-                                         {Value(&image), Value(&sampler), Value(&address)}));
-      value = Value(&join.AppendNewInst(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}));
-    }
-    auto guard = predicate;
-    if (use == Use::Conjunction || use == Use::WqmConjunction) {
-      guard = Value(&join.AppendNewInst(ValueOpcode::LogicalAnd, {predicate, other}));
-    } else if (use == Use::WqmOtherGuard) {
-      guard = Value(&join.AppendNewInst(ValueOpcode::IEqual32, {input, Value(0u)}));
-    } else if (use == Use::OtherGuard) {
-      guard = other;
-    } else if (use == Use::Unguarded) {
-      guard = Value(true);
-    } else if (use == Use::Predicate) {
-      guard = Value(&join.AppendNewInst(ValueOpcode::INotEqual32, {value, Value(0u)}));
-    } else if (use == Use::TrueArm) {
-      value = Value(&join.AppendNewInst(ValueOpcode::SelectU32, {predicate, value, Value(0u)}));
-      guard = Value(true);
-    }
-    value = Value(&join.AppendNewInst(ValueOpcode::CompositeConstructU32x4,
-                                       {value, Value(0u), Value(0u), Value(0u)}));
-    join.AppendNewInst(ValueOpcode::SetAttribute, {value, guard});
-    if (use == Use::Mixed) join.AppendNewInst(ValueOpcode::SetAttribute, {value, Value(true)});
-    EliminateMaskedValues(program);
-    const bool removed = Value(&masked).Resolve() == Value(10u);
-    const bool safe = use == Use::Guarded || use == Use::Conjunction ||
-                      use == Use::Wqm || use == Use::WqmConjunction || use == Use::TrueArm ||
-                      use == Use::ExplicitLod || use == Use::ExplicitGradient ||
-                      use == Use::LevelZero || use == Use::Phi;
-    Check(removed == safe, "masked value demand crossed an unguarded or nonlocal use");
-  }
 }
 
 void TestGraphicsCreateInterpolantMapping() {
@@ -12787,7 +12703,6 @@ int main() {
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
-  TestMaskedValueDemand();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();

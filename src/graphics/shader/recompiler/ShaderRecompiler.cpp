@@ -651,9 +651,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
-	IR::EliminateMaskedValues(ir);
-	IR::RemoveIdentities(ir.blocks);
-	IR::EliminateDeadCode(ir.blocks);
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),

@@ -268,20 +268,13 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_WQM_B64(const Decoder::Instruction& inst) {
-	const auto source_mask = ReadMask(inst.src0);
 	const auto mask_valid  = ReadMaskValid(inst.src0);
 	const auto result =
 	    IR::U64(ir.Emit(IR::ValueOpcode::WqmU64, {ReadOperand(inst.src0, IR::Type::U64)}));
-	// WQM activates whole quads and cannot clear an already active lane.
-	const auto widened_mask = ir.LogicalOr(source_mask, ThreadBit(ExtractU64(result)));
 	WriteOperand(DestinationOperand(inst), result);
-	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
-		ir.SetExec(widened_mask);
-	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
-		ir.SetVcc(widened_mask);
-	} else if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
-		ir.SetThreadBitScalarReg(dst, widened_mask);
+		ir.SetThreadBitScalarReg(dst, ThreadBit(ExtractU64(result)));
 		ir.SetScalarMaskTag(dst, mask_valid);
 	}
 	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));

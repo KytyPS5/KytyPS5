@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
-#include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -118,95 +118,6 @@ bool FoldSelect(Inst& inst) {
 	return false;
 }
 
-bool IsSelect(ValueOpcode opcode) {
-	return opcode == ValueOpcode::SelectU1 || opcode == ValueOpcode::SelectU32 ||
-	       opcode == ValueOpcode::SelectF32;
-}
-
-bool Implies(Value condition, Value required, uint32_t depth = 0) {
-	condition = condition.Resolve();
-	required = required.Resolve();
-	if (condition == required) return true;
-	if (depth >= 64u) return false;
-	const auto* target = required.TryInstruction();
-	if (target != nullptr && target->GetOpcode() == ValueOpcode::LogicalOr &&
-	    (Implies(condition, target->Arg(0), depth + 1u) ||
-	     Implies(condition, target->Arg(1), depth + 1u))) {
-		return true;
-	}
-	const auto* inst = condition.TryInstruction();
-	return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
-	       (Implies(inst->Arg(0), required, depth + 1u) ||
-	        Implies(inst->Arg(1), required, depth + 1u));
-}
-
-bool IsAcyclic(const BlockList& blocks) {
-	std::unordered_map<const Block*, bool> completed;
-	const auto visit = [&](auto&& self, const Block* block) -> bool {
-		const auto [entry, added] = completed.emplace(block, false);
-		if (!added) return entry->second;
-		for (const auto* successor: block->ImmSuccessors()) {
-			if (!self(self, successor)) return false;
-		}
-		completed[block] = true;
-		return true;
-	};
-	for (const auto* block: blocks) {
-		if (!visit(visit, block)) return false;
-	}
-	return true;
-}
-
-class MaskedUses {
-public:
-	MaskedUses(const Program& program, Value condition)
-	    : program(program), condition(condition.Resolve()) {}
-
-	bool OnlyWhenActive(const Inst& inst) {
-		const auto [entry, added] = completed.emplace(&inst, false);
-		if (!added) return entry->second;
-		for (const auto& use: inst.Uses()) {
-			const auto& user = *use.user;
-			const auto  op   = user.GetOpcode();
-			if (IsSelect(op)) {
-				if (use.operand == 0) return false;
-				if (use.operand == 1 && Implies(user.Arg(0), condition)) continue;
-			} else if (op == ValueOpcode::SetAttribute) {
-				if (use.operand == 0 && Implies(user.Arg(1), condition)) continue;
-				return false;
-			} else if (!IsLaneLocal(user, use.operand)) {
-				return false;
-			}
-			if (!OnlyWhenActive(user)) return false;
-		}
-		completed[&inst] = true;
-		return true;
-	}
-
-private:
-	bool IsLaneLocal(const Inst& inst, size_t operand) const {
-		const auto op = inst.GetOpcode();
-		// These opcode-table groups contain only construction, conversion and arithmetic.
-		if ((op >= ValueOpcode::BitCastU16F16 && op <= ValueOpcode::BitFieldSExtract) ||
-		    (op >= ValueOpcode::WqmU64 && op <= ValueOpcode::FPFract32) ||
-		    op == ValueOpcode::Identity || op == ValueOpcode::Phi ||
-		    op == ValueOpcode::MakeImageAddress) {
-			return true;
-		}
-		if (op != ValueOpcode::ImageSampleRaw || operand != 2) return false;
-		// Explicit LOD or gradients keep coordinates local; implicit derivatives read neighbors.
-		const auto index = inst.Flags<MemoryFlags>().index;
-		return index < program.memory_info.size() &&
-		       (program.memory_info[index].image_sample_flags &
-		        (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagLevelZero |
-		         Decoder::ImageSampleFlagDerivative)) != 0;
-	}
-
-	const Program&                       program;
-	Value                                condition;
-	std::unordered_map<const Inst*, bool> completed;
-};
-
 bool FoldPhi(Inst& inst) {
 	Value same;
 	for (size_t index = 0; index < inst.NumArgs(); index++) {
@@ -283,7 +194,8 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
-void FoldInstruction(Block& block, Block::iterator instruction) {
+void FoldInstruction(Block& block, Block::iterator instruction,
+                      std::unordered_set<Inst*>& lowered_ancillary) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
@@ -315,7 +227,7 @@ void FoldInstruction(Block& block, Block::iterator instruction) {
 			const auto value  = Arg(inst, 0);
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
-			const auto* source = value.TryInstruction();
+			auto* source = value.TryInstruction();
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
 			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
 			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
@@ -333,6 +245,7 @@ void FoldInstruction(Block& block, Block::iterator instruction) {
 						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
 						inst.SetArg(0, Value(&*input));
 						inst.SetArg(1, Value(offset.U32() - field.start));
+						lowered_ancillary.insert(source);
 						return;
 					}
 				}
@@ -697,23 +610,25 @@ void FoldInstruction(Block& block, Block::iterator instruction) {
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks) {
+	std::unordered_set<Inst*> lowered_ancillary;
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			FoldInstruction(*block, inst);
+			FoldInstruction(*block, inst, lowered_ancillary);
 		}
 	}
-}
-
-void EliminateMaskedValues(Program& program) {
-	// A loop-carried value may have been produced under a previous iteration's predicate.
-	if (!IsAcyclic(program.blocks)) return;
-	for (auto block = program.blocks.rbegin(); block != program.blocks.rend(); ++block) {
-		auto& instructions = (*block)->Instructions();
-		for (auto inst = instructions.rbegin(); inst != instructions.rend(); ++inst) {
-			if (IsSelect(inst->GetOpcode()) &&
-			    MaskedUses(program, inst->Arg(0)).OnlyWhenActive(*inst)) {
-				Replace(*inst, inst->Arg(1));
+	// Normalize retained PHI/select values only after every supported field read has
+	// been lowered; direct raw consumers remain unsupported.
+	for (auto* source: lowered_ancillary) {
+		const bool retained_only = std::ranges::all_of(source->Uses(), [](const Use& use) {
+			const auto& user = *use.user;
+			if (!user.HasUses() && !user.MayHaveSideEffects()) {
+				return true;
 			}
+			return user.GetOpcode() == ValueOpcode::Phi ||
+			       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u);
+		});
+		if (retained_only) {
+			Replace(*source, Value(0u));
 		}
 	}
 }

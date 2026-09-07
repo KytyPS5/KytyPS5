@@ -79,6 +79,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.memory_limit_dword  = next.memory_offset_dword + (next.memory_offset_count + 3u) / 4u;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

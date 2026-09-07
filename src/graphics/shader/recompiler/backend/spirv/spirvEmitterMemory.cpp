@@ -682,7 +682,8 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 		                                   plan.addresses[component], ConstantU32(ctx.state, 2));
 		plan.indices[component]   = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 		const auto component_bound =
-		    EmitMemoryElementInBounds(ctx.state, resource, plan.indices[component]);
+		    EmitMemoryByteRangeInBounds(ctx.state, resource, plan.addresses[component],
+		                                std::max(plan.info.component_bits[component] / 8u, 1u));
 		if (first_bound) {
 			plan.in_bounds = component_bound;
 			first_bound    = false;

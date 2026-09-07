@@ -131,6 +131,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
                     uint32_t slot, uint32_t& buffer_offset) {
 	buffer_offset = 0;
+	buffer_limit  = 0;
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
@@ -147,14 +148,28 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsByteStorageOffset(descriptor, resource)) ||
+	if ((byte_adjustment && !SupportsSubwordStorageOffset(descriptor, resource)) ||
 	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64
+		     " requested=0x%016" PRIx64 " size=0x%016" PRIx64 " backing_offset=0x%016" PRIx64
+		     " alignment=0x%016" PRIx64 " aligned_offset=0x%016" PRIx64
+		     " adjustment=0x%016" PRIx64 " max_range=0x%016" PRIx64
+		     " formatted=%d descriptor_formatted_only=%d scalar=%d atomic=%d written=%d\n",
+		     static_cast<uint32_t>(stage), slot, address, requested_size, size,
+		     static_cast<uint64_t>(offset), static_cast<uint64_t>(alignment),
+		     static_cast<uint64_t>(aligned_offset), static_cast<uint64_t>(adjustment),
+		     static_cast<uint64_t>(max_range), resource.formatted,
+		     resource.descriptor_formatted_only, resource.scalar, resource.atomic, resource.written);
 	}
-	// Runtime-array length counts complete DWORDs. A partial last DWORD needs
-	// a separate guest-byte bound before its host backing can be rounded up.
-	if (byte_adjustment && (size + adjustment) % sizeof(uint32_t) != 0) {
-		EXIT("storage buffer offset adjustment is unsupported: partial DWORD tail\n");
+	const auto byte_limit = size + adjustment;
+	const auto padding = (sizeof(uint32_t) - byte_limit % sizeof(uint32_t)) % sizeof(uint32_t);
+	if (padding > max_range - byte_limit || aligned_offset > buffer->Size() ||
+	    byte_limit + padding > buffer->Size() - aligned_offset) {
+		EXIT("storage buffer aligned range exceeds its backing: stage=%u slot=%u "
+		     "guest=0x%016" PRIx64 " byte_limit=0x%016" PRIx64 " padding=%" PRIu64
+		     " backing_offset=0x%016" PRIx64 " backing_size=0x%016" PRIx64 "\n",
+		     static_cast<uint32_t>(stage), slot, address, byte_limit, padding,
+		     static_cast<uint64_t>(aligned_offset), buffer->Size());
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
@@ -1182,6 +1197,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

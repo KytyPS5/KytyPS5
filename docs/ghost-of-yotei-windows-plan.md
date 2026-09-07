@@ -3,7 +3,7 @@
 Обновлено **7 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-**Эмулятор доходит до shader №174 и показа подготовленных поверхностей, но
+**Эмулятор доходит до 181 полностью скомпилированного shader-варианта и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
 служебного счётчика остаётся frame 126 в capture-прогоне. Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
@@ -34,9 +34,10 @@ frames соседнего запуска 960×540 всё ещё показал �
 GFX10 byte-to-D16 opcodes `0x20...0x23` теперь декодируются как общая группа с
 unsigned/signed расширением, выбором low/high half и сохранением соседней половины
 VGPR. Compute shader `d7a83911714a58ee` выпустил SPIR-V и завершил dispatch.
-Текущая граница — resource tracking большого compute shader `6cc64dee32dc7094`:
-DWORD 0 buffer descriptor происходит из `LoadAddressU32` и пока не признаётся
-допустимым runtime-значением на guest PC `0x530`.
+В большом compute shader `6cc64dee32dc7094` теперь доказан конечный selector
+0...31 и однозначный dispatcher entry prefix для buffer table с шагом 16;
+прежний отказ на PC `0x530` пройден. Текущая граница того же shader — DWORD 0
+image descriptor из `LoadAddressU32` на guest PC `0x7c4`.
 
 Persistent Vulkan pipeline cache работает и переживает перезапуск. Новые driver
 pipelines сохраняются каждые 16 созданий, поэтому принудительный timeout больше
@@ -106,11 +107,11 @@ flowchart TD
 | 2 | Загрузка гостя | Loader читает executable и модули, разрешает импорты, создаёт память и стартовые потоки. | Отсутствие loader/import fatal; прогресс гостевого лога. | **PASS**. Игра многократно доходит до графической инициализации. |
 | 3 | Команды GPU | Guest записывает PM4/compute/draw команды; Kyty разбирает очереди и формирует renderer calls. | Логи `GraphicsRenderDispatchDirect`, draw/dispatch counters. | **PASS** для достигнутого пути. Выполнены сотни команд и повторяющиеся кадры. |
 | 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **Частично**. Текущий строгий batch: 714/825 дошли до своей проверяемой границы; 111 остановились. Это не означает 714 готовых Vulkan pipeline. |
-| 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **FAIL / текущая граница.** Достигнутый путь до shader №174 проходит, включая bounded tables и wave-uniform image candidates. В `6cc64dee32dc7094` DWORD 0 buffer descriptor имеет root `LoadAddressU32`; общий tracker пока отвергает это runtime-происхождение на PC `0x530`. |
+| 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **FAIL / текущая граница.** В `6cc64dee32dc7094` конечная 32-элементная buffer table в dispatcher entry prefix теперь планируется; прежний PC `0x530` пройден. Следующий независимый отказ — image descriptor с root `LoadAddressU32` на PC `0x7c4`. |
 | 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **PASS для достигнутого пути.** `8457901d80b91921` выпускает 102 791 слово, `7ceb0f3417f926f9` — 103 404 слова; оба прошли достигнутую runtime-компиляцию. Остальной корпус поддержан частично. |
 | 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/checkpointed/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для persistent cache.** Принудительно остановленный запуск сохранил семь промежуточных версий вплоть до 7,07 MiB; следующий запуск загрузил их. Неизменившийся blob отсекается по хэшу. |
-| 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **PASS для достигнутого пути.** Прежний auto draw 4×1 с PS `964747…` и VS `f0a524…` завершился; после него также завершились последующие команды без нового `nvlddmkm`. Текущий запуск остановлен раньше следующей GPU-команды CPU-декодером shader №172. |
-| 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 113 GPU flips, 112 shown. Это ещё не доказывает полезные пиксели. |
+| 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **PASS для достигнутого пути.** Прежний auto draw 4×1 с PS `964747…` и VS `f0a524…` завершился; после него также завершились последующие команды без нового `nvlddmkm`. Текущий запуск остановлен resource tracker до dispatch `6cc64dee…`. |
+| 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 111 GPU flips, 110 shown. Это ещё не доказывает полезные пиксели. |
 | 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **FAIL / текущий correctness-блокер.** Первые восемь readback 960×540: RGB полностью 0, alpha 3. |
 | 11 | Видимый кадр | Swapchain показывает ненулевое изображение, затем должны появиться меню и ввод. | Screenshot/readback + стабильный прогон без fatal/VUID. | **Не достигнут.** Служебные `frame` и `shown` нельзя считать первым кадром. |
 
@@ -158,8 +159,9 @@ resource specialization, layout, render state и выбранных игрой p
 поток: обязательные CPU/GPU regression-тесты, полный CTest, Vulkan validation и
 длинный стабильный прогон должны быть закрыты до отправки изменений upstream.
 
-Сейчас быстрый цикл довёл текущую сборку до shader №174; последний диагностический
-запуск `075324-3c906f` дошёл до frame 125, а максимум счётчика остаётся frame 126.
+Сейчас быстрый цикл довёл текущую сборку до 181 полностью скомпилированного shader-варианта;
+последний диагностический запуск `082303-3ae95a` дошёл до frame 124, а максимум
+счётчика в более длинном capture-прогоне остаётся frame 126.
 Runtime-регрессия
 `5be616…` устранена, `e52e…` переведён с dispatcher на валидный structured CFG,
 а несовместимый sampled color view поверх depth/stencil backing заменяется
@@ -204,8 +206,10 @@ wave64 lane targets до native subgroup32 и добавления конечн�
 этот draw получил `after-complete`; без нового `nvlddmkm` завершились и следующие
 команды. Следующим общим исправлением добавлены четыре GFX10 byte-to-D16 buffer
 load opcode. `d7a83911714a58ee` стал shader №172 и завершил dispatch; ещё два
-shader-варианта скомпилировались. Текущий blocker — runtime-происхождение DWORD 0
-buffer descriptor из `LoadAddressU32` в `6cc64dee32dc7094`.
+shader-варианта скомпилировались. В `6cc64dee32dc7094` общий bounded proof теперь
+принимает конечную buffer table из dispatcher entry prefix и проходит прежний
+PC `0x530`; следующий blocker — runtime-происхождение DWORD 0 image descriptor
+из `LoadAddressU32` на PC `0x7c4`.
 
 ## Состояние по уровням проверки
 
@@ -213,12 +217,12 @@ buffer descriptor из `LoadAddressU32` в `6cc64dee32dc7094`.
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; текущий диагностический binary SHA-256 `5a8ee9d0186e748077b8c564cecd17af13f92c8fdf4b23f763f6a0977722e7ff`. | `shader_cfg_tests` собран на byte-to-D16 milestone; полный CTest отложен как test debt. |
+| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; текущий диагностический binary SHA-256 `1cb82769375b508f961b3c4f1922f537fbac1fc137d4aa75ca6b844d9b7b20e9`. | `shader_cfg_tests` собран с dispatcher entry-prefix proof; полный CTest отложен как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `_Build/runs/yotei-integrated-20260907-075324-3c906f`: frame 125, shader №174. `d7a839…` и два следующих shader прошли; новых NVIDIA reset нет. | Первый ненулевой видимый кадр не достигнут; текущий блокер — общий resource tracking path для buffer descriptor из `LoadAddressU32` в `6cc64dee…`. |
+| Реальная игра | `_Build/runs/yotei-integrated-20260907-082303-3ae95a`: frame 124, 181 shader-вариант полностью скомпилирован. `6cc64dee…` прошёл прежний buffer failure на PC `0x530`; новых NVIDIA reset нет. | Первый ненулевой видимый кадр не достигнут; текущий блокер — image descriptor из `LoadAddressU32` на PC `0x7c4` того же shader. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -264,12 +268,12 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-075324-3c906f` |
-| SHA-256 запущенного emulator | `5a8ee9d0186e748077b8c564cecd17af13f92c8fdf4b23f763f6a0977722e7ff` |
-| Время UTC | `2026-09-07T07:53:24.8826762Z` → `07:57:51.6459721Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-082303-3ae95a` |
+| SHA-256 запущенного emulator | `1cb82769375b508f961b3c4f1922f537fbac1fc137d4aa75ca6b844d9b7b20e9` |
+| Время UTC | `2026-09-07T08:23:03.7441875Z` → `08:25:47.8166585Z` |
 | Режим | Fast, Immediate, окно 1280×720; полная compute/draw synchronization и shader phase trace, guest log выключен |
 | Завершение | Самостоятельный exit 321 на resource-tracking fatal; новых System events `nvlddmkm` с начала запуска нет, процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 125; FPS 0,062759; flips CPU/GPU 0/112; prepared 112, ready 112, shown 111; 174 shader-варианта полностью скомпилированы |
+| Наблюдаемое исполнение | frame 124; FPS 0,075949; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 181 shader-вариант полностью скомпилирован |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
@@ -284,8 +288,9 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | Пройденная descriptor-граница | `7ceb0f3417f926f9`: decode 732, CFG 53 blocks/2 loops, Normalize 3207; memoized TrackResources завершается, пять correlated image candidates материализуются, SPIR-V 103 404 слова, shader №159. |
 | Пройденная graphics-wave64 граница | PS `964747887d898821`: decode 234, CFG 22 blocks/1 loop, structured 26 blocks, Normalize/TrackResources 1 174, SPIR-V 9 820 слов. Все shuffle targets ограничены native subgroup32, ballot отражён в обе guest mask halves, а общий pixel-loop counter завершает fragment после 256 входов в тело. Модуль проходит `spirv-val`; прежний auto draw и следующие команды получают `after-complete` без нового NVIDIA reset. |
 | Пройденная byte-to-D16 граница | GFX10 MUBUF `0x20...0x23` декодируются как unsigned/signed byte-to-D16 low/high loads с сохранением соседней половины VDATA. `d7a83911714a58ee`: decode 55, structured CFG 4 blocks, Normalize/TrackResources 198, SPIR-V 6 537 слов, shader №172; dispatch 76×1×1 завершён за 63 618 мкс. |
-| Текущая граница | Compute shader `6cc64dee32dc7094`, guest address `0x80001dfb00`, grid 4096×1×1: decode 5 370, CFG 346 blocks/9 loops, dispatcher fallback, Normalize 27 733; TrackResources fatal на PC `0x530`: `GetBufferResource dword 0 is not a valid runtime value (root=LoadAddressU32)`. |
-| Диагностика | `_Build/runs/yotei-integrated-20260907-075324-3c906f` с полной compute/draw synchronization, shader capture и phase trace. После `d7a839…` shader `b5d1ae71f2600147` стал №173, `371e66f59d563929` — №174; оба dispatch завершились. Следующий шаг — доказать и материализовать общий buffer-descriptor root из `LoadAddressU32`. |
+| Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят прежний `GetBufferResource` fatal на PC `0x530`. |
+| Текущая граница | Тот же compute shader, guest address `0x80001dfb00`, grid 4096×1×1: decode 5 370, CFG 346 blocks/9 loops, dispatcher fallback, Normalize 27 733; TrackResources fatal на PC `0x7c4`: `GetImageResource dword 0 is not a valid runtime value (root=LoadAddressU32)`. Перед IMAGE_LOAD две 8-DWORD image tables индексируются тем же selector с шагом 32. |
+| Диагностика | `_Build/runs/yotei-integrated-20260907-082303-3ae95a` с полной compute/draw synchronization и shader phase trace. Запуск самостоятельно завершился exit 321; процессов Kyty после runner и новых System events `nvlddmkm` нет. Следующий шаг — доказать общий bounded image-descriptor path после control-flow split, не ослабляя admission для условных raw reads. |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым
@@ -642,7 +647,7 @@ derivatives определяется по живому ImageQueryLod. Успех
 ## Как выбираются следующие исправления
 
 Первый приоритет — **подтверждённый следующий отказ реального запуска**:
-сейчас ResourceTracking для descriptor из `86da5eb7b8257bb0`, PC `0x530`.
+сейчас ResourceTracking image descriptor в `6cc64dee32dc7094`, PC `0x7c4`.
 Коэффициентные snapshots, LDS-записи и aligned GDS append доставлены;
 `916e…` и `7655…` завершились в игре без прежних отказов.
 Полный корпус нужен параллельно, чтобы собирать общие группы ошибок и не
@@ -652,7 +657,7 @@ derivatives определяется по живому ImageQueryLod. Успех
 
 | Приоритет / слой | Следующая проверяемая работа | Условие завершения |
 | --- | --- | --- |
-| 1. Runtime buffer descriptor | Воспроизвести выбор descriptor через CNDMASK/ReadFirstLane и scalar address arithmetic из нового класса `86da…`; доказать согласованность четырёх DWORD, bounds и aliases. | Native RED до правки, общий механизм, неизменный полный readback с GPUAV и повторный запуск игры. |
+| 1. Runtime image descriptor | Доказать согласованность восьми DWORD двух image tables, индексируемых конечным selector после control-flow split в `6cc64dee…`, включая execution scope и null/OOB варианты. | Exact audit проходит PC `0x7c4`, затем shader достигает materialization/SPIR-V и реальный 4096×1×1 dispatch завершается. |
 | 2. Batch diagnostics | Ранний planner-аудит выполнен по всему корпусу. Следом — capture недостающих runtime descriptors и параметров графических стадий для materialization/SPIR-V. | Полные стадии проверены с реальным контекстом; неизвестные данные не заменены фиктивными ресурсами. |
 | 3. ISA-группы из корпуса | WQM_B32; затем подтверждённые MUBUF/VOPC/SOP/DS/MIMG семейства по семантике, а не только частоте. | Независимые exact oracles, decoder/CPU/GPU проверки; повторный корпус. Для D16 отдельно доказать packing, unused half, преобразования/rounding и OOB. |
 | 4. Resource provenance | Оставшиеся buffer/image origins, неоднородные candidates и динамические runtime зависимости. | Корректные correlation/bounds/lifetime/alias правила без подмены ненулевого дескриптора «похожим». |

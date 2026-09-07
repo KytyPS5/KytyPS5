@@ -26,6 +26,21 @@ inline constexpr bool htile_fill_clears_stencil(uint32_t fill) {
 	return ((fill >> 8u) & 0x3u) == 0u;
 }
 
+inline constexpr bool htile_fill_depth_uniform(uint32_t fill, bool stencil_compressed) {
+	if ((fill & 0xfu) == 0xfu) {
+		return false;
+	}
+	if (stencil_compressed) {
+		return ((fill >> 12u) & 0x3fu) == 0u;
+	}
+	return ((fill >> 4u) & 0x3fffu) == ((fill >> 18u) & 0x3fffu);
+}
+
+inline constexpr float htile_fill_depth_value(uint32_t fill, bool stencil_compressed) {
+	const uint32_t z = stencil_compressed ? fill >> 18u : (fill >> 4u) & 0x3fffu;
+	return static_cast<float>(z) / 16383.0f;
+}
+
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;

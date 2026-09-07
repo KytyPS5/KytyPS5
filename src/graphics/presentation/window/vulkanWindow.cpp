@@ -1120,6 +1120,18 @@ void WindowContext::CreateVulkan() {
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
 
+	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
+	    .format = vk::Format::eBc1RgbaUnormBlock,
+	    .type = vk::ImageType::e2D,
+	    .tiling = vk::ImageTiling::eOptimal,
+	    .usage = vk::ImageUsageFlagBits::eSampled,
+	    .flags = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+	};
+	const auto block_texel_view_props =
+	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info);
+	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
+	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
+
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",

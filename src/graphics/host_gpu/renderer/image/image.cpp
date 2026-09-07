@@ -26,12 +26,13 @@ namespace {
 	}
 }
 
-[[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const ImageInfo& info) {
+[[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
+                                                   const ImageInfo& info) {
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
 		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
-		if (Prospero::BlockCompressedBytesPerBlock(info.guest_format) != 0) {
+		if (info.IsBlock() && graphics.supports_block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
 		}
 	}
@@ -47,6 +48,10 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+	if (info.IsBlock()) {
+		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+		       vk::ImageUsageFlagBits::eSampled;
+	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
 	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
@@ -662,7 +667,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.layers      = info.IsVolume() ? 1u : info.resources.layers;
 	backing.mip_levels  = info.resources.levels;
 	backing.samples     = info.samples;
-	backing.flags       = ImageCreateFlags(info);
+	backing.flags       = ImageCreateFlags(graphics, info);
 	backing.usage       = ImageUsageFlags(graphics, info);
 
 	vk::ImageCreateInfo create {};

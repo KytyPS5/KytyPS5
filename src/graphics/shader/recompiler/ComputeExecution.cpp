@@ -513,10 +513,22 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			if (varying.contains(inst)) continue;
 			const auto op = inst->GetOpcode();
 			bool is_uniform = false;
-			if (op == O::ReadConstBuffer) {
-				// The SPIR-V backend executes one scalar-buffer value per guest wave
-				// and broadcasts lane zero across split native32 halves.
+			const auto scalar_address_read = [&] {
+				if (op != O::LoadAddressU32) return false;
+				const auto index = inst->Flags<IR::MemoryFlags>().index;
+				return index < program.memory_info.size() &&
+				       program.memory_info[index].kind == IR::ResourceKind::ScalarAddress;
+			}();
+			if (op == O::ReadConstBuffer || scalar_address_read) {
+				// These opcodes model scalar memory instructions. Cooperative lowering
+				// broadcasts their result, while ordinary split lowering gives every lane
+				// the same proved-uniform address recipe. Vector/raw memory kinds retain
+				// the rejection boundary.
 				is_uniform = true;
+				if (scalar_address_read) {
+					for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+						is_uniform &= uniform(inst->Arg(arg));
+				}
 			} else if (op == O::LaneId || op == O::DppMoveU32 || op == O::Dpp8MoveU32 ||
 			    op == O::Permlane16U32 || op == O::WriteLane || op == O::WqmMask ||
 			    op == O::UndefU1 || op == O::UndefU8 || op == O::UndefU16 ||
@@ -540,9 +552,35 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		if (!uniform(append->Arg(0)))
 			return "wave64 GDS append requires wave-uniform M0";
 	}
+	const auto varying_chain = [&](IR::Value root) {
+		std::string result;
+		std::unordered_set<const IR::Inst*> visited;
+		std::function<void(IR::Value)> append = [&](IR::Value value) {
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !varying.contains(inst)) return;
+			if (!result.empty()) result += " -> ";
+			result += IR::ValueOpcodeName(inst->GetOpcode());
+			if (!visited.insert(inst).second) {
+				result += " (cycle)";
+				return;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+				const auto* dependency = inst->Arg(arg).TryInstruction();
+				if (dependency != nullptr && varying.contains(dependency)) {
+					append(inst->Arg(arg));
+					return;
+				}
+			}
+		};
+		append(root);
+		return result;
+	};
 	for (const auto& block : program.block_info) {
-		if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch && !uniform(block.condition))
-			return "wave64 splitting cannot prove wave-uniform branch at pc " + std::to_string(block.start_pc);
+		if (block.terminator.kind == CFG::TerminatorKind::ConditionalBranch && !uniform(block.condition)) {
+			return "wave64 splitting cannot prove wave-uniform branch at pc " +
+			       std::to_string(block.start_pc) + "; varying chain " +
+			       varying_chain(block.condition);
+		}
 	}
 	// Dispatcher lowering selects the next static block ID from these same
 	// proved-uniform branch conditions. With indirect and unsupported targets

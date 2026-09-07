@@ -98,6 +98,34 @@ Required tests:
 - Writable-alias and transactionality cases proving no eager snapshot overlaps a writable guest
   range and no partial candidates escape after any dependent read fails.
 
+## Wave64 uniformity through bounded resource selection
+
+Status: production fix, offline manifest audit and native game validation complete; automated
+regression deferred.
+
+Observed trigger: a split-wave64 compute shader reaches a conditional branch after its
+buffer/image/sampler resources have been specialized from a bounded selector. The execution
+planner rejects the branch at guest PC 612 because the current greatest-fixed-point analysis
+classifies at least one value in the condition as lane-varying without reporting the dependency
+that caused the classification.
+
+Required tests:
+
+- A branch whose condition depends on each runtime resource-selection opcode that is emitted once
+  per guest wave, proving only values with an explicit wave-uniform execution contract are accepted.
+- A scalar `LoadAddressU32` branch with a uniform handle/offset and matching `ScalarAddress`
+  metadata, plus varying-handle, varying-offset, missing-metadata and non-scalar-address rejection
+  cases.
+- The corresponding per-lane buffer/image result and lane/subgroup-derived selectors, proving a
+  bounded descriptor table alone never makes the resource operation's returned data uniform.
+- Nested `ReadConst`, `ReadBoundedSrtU32`, scalar-address arithmetic, comparisons, selects and Phi
+  nodes, checking that uniformity propagates through pure operations and loop-carried values only
+  when every reachable input and control edge is uniform.
+- A diagnostic case that reports the first varying opcode/value chain and guest PC for a rejected
+  branch, so corpus failures can be grouped without weakening the convergence rule.
+- Split native32, native64 and cooperative multi-wave execution coverage, with a collective inside
+  the conditional arm to prove accepted branches keep both native halves at matching rendezvous.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

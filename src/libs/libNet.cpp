@@ -1414,13 +1414,41 @@ namespace LibNpCommerce {
 
 LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
+constexpr int COMMERCE_STATUS_NONE        = 0;
+constexpr int COMMERCE_STATUS_INITIALIZED = 1;
+
+constexpr int COMMERCE_ERROR_NOT_INITIALIZED     = static_cast<int>(0x80B80003u);
+constexpr int COMMERCE_ERROR_ALREADY_INITIALIZED = static_cast<int>(0x80B80004u);
+
+static int g_commerce_status = COMMERCE_STATUS_NONE;
+
+static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+	PRINT_NAME();
+	if (g_commerce_status != COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_ALREADY_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_INITIALIZED;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+	PRINT_NAME();
+	if (g_commerce_status == COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_NOT_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_NONE;
+	return OK;
+}
+
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
-	return 0; // SCE_COMMON_DIALOG_STATUS_NONE
+	return g_commerce_status;
 }
 
 LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
+	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 

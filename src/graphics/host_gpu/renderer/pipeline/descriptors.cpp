@@ -1025,12 +1025,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const bool depth_feedback =
 					    layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
 					    program.stage == ShaderType::Pixel;
+					const bool general = layout == vk::ImageLayout::eGeneral;
 					const bool depth_read =
-					    depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+					    general || depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
 					const bool stencil_read =
-					    layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+					    general || layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
 					if ((aspect & vk::ImageAspectFlagBits::eDepth && !depth_read) ||

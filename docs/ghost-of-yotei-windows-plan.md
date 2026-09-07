@@ -6,13 +6,14 @@
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
 служебного счётчика теперь frame 126 в capture-прогоне; последний validation-run
-`034732-964f67` дошёл до frame 124, полностью скомпилировал три новых compute
-shader и сам завершился кодом 321 при materialization следующего pixel shader. Signed storage shader
+`042032-f7d8ab` дошёл до frame 123 и shader №141. Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
 выпускают SPIR-V и создают Vulkan pipelines. Зависимые bounded buffer/image/sampler
 descriptors для `8457901d80b91921` теперь материализуются, а scalar-address branch
-на guest PC 612 доказана wave-uniform. Текущий блокер — 129-я уникальная пара
-inline image/sampler у `f8927c09f4b928c7` при dense image limit 128. Прежний image
+на guest PC 612 доказана wave-uniform. Guard-bounded inline table у
+`f8927c09f4b928c7` теперь использует 255 допустимых selector values вместо
+1 445 ложных wrap-кандидатов; shader выпустил 203 924 SPIR-V слова. Текущий
+блокер — optional SRT с null base в vertex shader `ee4f153aa500d327`. Прежний image
 blocker также пройден: 256-байтный placed-view адрес больше не проверяется как
 начало отдельной 4-КБ allocation. Проверочный readback первых восьми source
 frames соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый
@@ -158,8 +159,9 @@ scalar-buffer OOB/null tails как нулевые descriptors и отделяе
 16-битного домена от общего 64-МиБ snapshot budget. Shader прошёл
 `MaterializeResources`. Отдельный uniformity-анализ доказал scalar `LoadAddressU32`
 по `ScalarAddress` metadata и uniform operands; `8457…` выпустил SPIR-V и стал
-shader №136. Следующий блокер находится в inline sampled-pair materialization
-pixel shader `f8927c09f4b928c7`.
+shader №136. Inline sampled table у `f8927c09f4b928c7` сохраняет доказанный
+доминирующим CFG guard предел selector, канонизирует null image/sampler пары и
+укладывается в bounded compiler budget 512 images/pairs; shader стал №139.
 
 ## Состояние по уровням проверки
 
@@ -167,12 +169,12 @@ pixel shader `f8927c09f4b928c7`.
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows `shader_cfg_tests` и `kyty_emulator` собраны, install tree обновлён; descriptor milestone `b66a4a8`, scalar-address uniformity milestone `633b180`; последний runtime binary SHA-256 `f2c59fff65f5e8fbfc611e9ac0986f5ca8e46a79e82def09113a42d6ec08cc6b`. | Binary собран из содержимого pre-commit worktree с тем же production-кодом; полный CTest отложен как test debt. |
+| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; descriptor milestone `b66a4a8`, scalar-address uniformity milestone `633b180`; последний runtime binary SHA-256 `856ab4d0a165d1a97d5e3b0cbd712a6bee8d06ca1fe85f06bd8360ad3bf799fc`. | Binary собран из содержимого pre-commit worktree с тем же production-кодом; `shader_cfg_tests` для нового header budget и полный CTest отложены как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `034732-964f67` с validation дошёл до frame 124 и shader №138; `8457…` полностью прошёл materialization, SPIR-V и pipeline, после него прошли `3570…` и `e80c…`. Capture-run достиг frame 126. | Первый ненулевой видимый кадр ещё не достигнут; `f892…` требует 129 уникальных inline sampled pairs при dense limit 128. |
+| Реальная игра | `042032-f7d8ab` с validation дошёл до frame 123 и shader №141; `f892…` полностью прошёл bounded materialization и выпустил SPIR-V, после него прошли `16fc…` и `975c…`. Capture-run достиг frame 126. | Первый ненулевой видимый кадр ещё не достигнут; `ee4f…` не материализует optional descriptor через null SRT base. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -218,21 +220,22 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-034732-964f67` |
-| SHA-256 запущенного emulator | `f2c59fff65f5e8fbfc611e9ac0986f5ca8e46a79e82def09113a42d6ec08cc6b` |
-| Время UTC | `2026-09-07T03:47:32.6317022Z` → `03:49:20.4785502Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-042032-f7d8ab` |
+| SHA-256 запущенного emulator | `856ab4d0a165d1a97d5e3b0cbd712a6bee8d06ca1fe85f06bd8360ad3bf799fc` |
+| Время UTC | `2026-09-07T04:20:33.0027844Z` → `04:22:37.5696173Z` |
 | Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 1280×720; внутренние основные targets 480×270 |
 | Завершение | Самостоятельный exit code 321 до timeout 240 с; процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 124; FPS 0,085228; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 138 shaders полностью скомпилированы |
+| Наблюдаемое исполнение | frame 123; FPS 0,085225; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 141 shader полностью скомпилирован |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
 | Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 443 слова, emission 60 мс, shader №132 завершён |
 | Пройденная renderer-ошибка | Устаревший depth attachment повторно найден и привязан по исходному descriptor перед final view acquisition; прежнего `depth target changed after render-state discovery` нет |
 | Пройденный descriptor-блокер | `8457901d80b91921`: decode 1109, CFG 126 blocks/8 loops, Normalize 5115, TrackResources 5074, SPIR-V 102 791 слово; bounded expressions и uniform scalar-address branch пройдены, shader №136 завершён |
-| Пройденные следующие shaders | `3570528edd66651a` стал №137 (SPIR-V 7 872 слова), `e80c528999326b0e` стал №138 (74 070 слов) |
-| Текущая ошибка | `f8927c09f4b928c7`, pixel, PC `0x00000910`: inline sampled table, size 23 184, stride 368, 1 445 probes; обнаружена 129-я уникальная image/sampler pair при limit 128 |
-| Диагностика | Offline dispatched-manifest audit воспроизвёл и затем подтвердил исправление wave64 plan при обеих трактовках `ADD_TID`; phase trace зафиксировал переход к следующему shader |
+| Пройденные следующие shaders | `3570528edd66651a` стал №137 (SPIR-V 7 872 слов), `e80c528999326b0e` — №138 (74 070), `f8927c09f4b928c7` — №139 (203 924), `16fc5de632960733` — №140 (2 588), `975c2837903937d1` — №141 (15 413) |
+| Пройденный sampled-table блокер | Доминирующий guard доказывает `selector < 255` при stride 368; вместо 1 445 GCD probes материализуются 255 selector values. Null image пары канонизируются; compiler budget ограничен 512 images/pairs с отдельной проверкой Vulkan device limits. |
+| Текущая ошибка | `ee4f153aa500d327`, vertex, PC `0x00000074`: descriptor source 1 (`buffer1`) вычисляет `LoadAddressU32` от null base со смещением `0x10`; eager host materialization не создаёт null descriptor |
+| Диагностика | Targeted IR dump `_Build/analysis/f8927c09-inline-selector-ir.txt` подтвердил selector `%1258` и доминирующий unsigned guard; validation-run подтвердил переход через SPIR-V emission к трём следующим shaders |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым
@@ -294,7 +297,7 @@ image до оконного масштабирования. В первых во
 | Слой | Реализованный результат | Сохраняющиеся границы |
 | --- | --- | --- |
 | Windows и первые ISA-препятствия | Native emulator/launcher, IMAGE_ATOMIC_FMIN/FMAX, DPP8; исправление numeric class atomic image. Исходные коммиты #490 включены в fork. | Старые отчёты `doesnt-boot`, MIMG `0x1f` и `LocalSize Z 256 > 64` — история, а не нынешняя точка отказа. |
-| Дескрипторы и SRT | Compact/full inline images, sampler pairs, ограниченные динамические таблицы; лимиты 128 buffers/images/samplers и 256 pairs с host-budget guards. | Не все виды динамической адресации, неоднородных image candidates и происхождения дескрипторов доказаны. |
+| Дескрипторы и SRT | Compact/full inline images, sampler pairs, ограниченные динамические таблицы; лимиты 128 buffers/samplers и 512 images/pairs с compiler/device budget guards. | Не все виды динамической адресации, неоднородных image candidates и происхождения дескрипторов доказаны. |
 | Scalar masks и инструкции | Числовые EXEC/VCC, ballot, raw-word aliases, SCC/ветвления, проверенные SAVEEXEC/WQM_B64, SDWA MOV и четыре неформатных D16 MUBUF операции. | `S_WQM_B32` и форматные D16 остаются отдельными задачами; старую boolean-only модель маски возвращать нельзя. |
 | Wave64 на native subgroup32 | Логические lane/mask, обмен между половинами, корректные guest IDs; разделение независимых волн и отдельный cooperative режим с одной полной host workgroup. | Каждый режим проходит проверку применимости. Перенос индекса через `&31`, пропуск волн или снятие всех guards не заменяют wave64. |
 | LDS и cooperative исполнение | Shared LDS, min/max/OR, guest barriers, разные числа итераций волн, раннее завершение и разные acyclic static barrier sites одного rendezvous. Конкурирующие DWORD stores используют Workgroup atomic store; четыре collision-регрессии и семь multiwave-сценариев проходят с GPUAV. `916e…` выполнился в игре. | Wide stores остаются отдельными DWORD-записями, а не одной транзакцией; cyclic guest barriers и остальные неподтверждённые случаи отвергаются. |

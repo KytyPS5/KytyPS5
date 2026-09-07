@@ -13,10 +13,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
-#include <array>
 #include <cstring>
 #include <limits>
-#include <optional>
 
 namespace Libs::Graphics::Sync {
 
@@ -55,69 +53,8 @@ uint64_t ReadReferenceClock() {
 	return value;
 }
 
-enum class EndOfPipeCompletion { None, Interrupt, Flip, FlipAndInterrupt };
-
-struct EndOfPipeSignal {
-	CommandBuffer*          buffer          = nullptr;
-	uint64_t                submit_id       = 0;
-	CommandBufferDebugOp    debug_operation = CommandBufferDebugOp::Unknown;
-	std::array<uint32_t, 4> debug_args      = {};
-	uint64_t                debug_data      = 0;
-	std::optional<uint64_t> destination;
-	EndOfPipeCompletion     completion         = EndOfPipeCompletion::None;
-	uint64_t                completion_data    = 0;
-	int                     interrupt_event_id = 0;
-};
-
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBack };
-
-static void ValidateEndOfPipeSignal(const EndOfPipeSignal& signal) {
-	if (signal.destination.has_value()) {
-		EXIT_IF(*signal.destination == 0);
-	}
-	EXIT_IF(signal.buffer == nullptr);
-	(void)signal.buffer->Handle();
-}
-
-static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
-	ValidateEndOfPipeSignal(signal);
-	signal.buffer->SetDebugInfo(static_cast<uint32_t>(signal.debug_operation), signal.submit_id,
-	                            signal.debug_args[0], signal.debug_args[1], signal.debug_args[2],
-	                            signal.debug_args[3], signal.debug_data);
-
-	auto& renderer  = signal.buffer->GetContext();
-	auto& scheduler = renderer.GetCommandScheduler();
-	if (signal.completion != EndOfPipeCompletion::None) {
-		EXIT_IF(!scheduler.Active() || signal.buffer != &scheduler.Current());
-	}
-	switch (signal.completion) {
-		case EndOfPipeCompletion::None: return;
-		case EndOfPipeCompletion::Interrupt: {
-			const auto context_id = static_cast<uint32_t>(signal.completion_data);
-			const auto event_id   = signal.interrupt_event_id;
-			scheduler.DeferPriorityOperation([&renderer, event_id, context_id] {
-				renderer.TriggerInterrupt(event_id, context_id);
-			});
-			return;
-		}
-		case EndOfPipeCompletion::Flip: {
-			const auto request_id = signal.completion_data;
-			scheduler.DeferPriorityOperation(
-			    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
-			return;
-		}
-		case EndOfPipeCompletion::FlipAndInterrupt: {
-			const auto request_id = signal.completion_data;
-			const auto event_id   = signal.interrupt_event_id;
-			scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
-				renderer.GetVideoOut().CompleteFlip(request_id);
-				renderer.TriggerInterrupt(event_id, 0);
-			});
-			return;
-		}
-	}
-}
 
 static CommandBufferDebugOp DebugOperation(EndOfPipeWriteAction action) {
 	switch (action) {
@@ -139,24 +76,20 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  uint64_t value, EndOfPipeWriteSize size,
                                  EndOfPipeWriteAction action, int interrupt_event_id = 0,
                                  uint32_t context_id = 0) {
+	EXIT_IF(destination == 0);
+	(void)buffer.Handle();
+
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
 	const auto value_high = static_cast<uint32_t>(value >> 32u);
-	const bool interrupt  = TriggersInterrupt(action);
-
-	EndOfPipeSignal signal {
-	    .buffer          = &buffer,
-	    .submit_id       = submit_id,
-	    .debug_operation = DebugOperation(action),
-	    .debug_args      = interrupt ? std::array {width, context_id, value_low, value_high}
-	                                 : std::array {width, value_low, value_high, 0u},
-	    .debug_data      = destination,
-	    .destination     = destination,
-	    .completion      = interrupt ? EndOfPipeCompletion::Interrupt : EndOfPipeCompletion::None,
-	    .completion_data = interrupt ? context_id : value,
-	    .interrupt_event_id = interrupt_event_id,
-	};
-	RecordEndOfPipeSignal(signal);
+	const auto operation  = static_cast<uint32_t>(DebugOperation(action));
+	if (TriggersInterrupt(action)) {
+		buffer.SetDebugInfo(operation, submit_id, width, context_id, value_low, value_high,
+		                    destination);
+		TriggerEopEventAtEndOfPipe(buffer, interrupt_event_id, context_id);
+	} else {
+		buffer.SetDebugInfo(operation, submit_id, width, value_low, value_high, 0, destination);
+	}
 }
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -167,15 +100,10 @@ void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst
 
 void WriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                            uint32_t dw_offset, uint32_t dw_num) {
-	const auto destination = reinterpret_cast<uint64_t>(dst_gpu_addr);
-	RecordEndOfPipeSignal({
-	    .buffer          = &buffer,
-	    .submit_id       = submit_id,
-	    .debug_operation = CommandBufferDebugOp::EopWrite,
-	    .debug_args      = {dw_offset, dw_num, 0, 0},
-	    .debug_data      = destination,
-	    .destination     = destination,
-	});
+	EXIT_IF(dst_gpu_addr == nullptr);
+	(void)buffer.Handle();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id,
+	                    dw_offset, dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 }
 
 void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
@@ -273,54 +201,53 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
                                                   int handle, int index, int flip_mode,
                                                   int64_t flip_arg, uint64_t request_id,
                                                   int event_id) {
-	const auto destination = reinterpret_cast<uint64_t>(dst_gpu_addr);
-	RecordEndOfPipeSignal({
-	    .buffer             = &buffer,
-	    .submit_id          = submit_id,
-	    .debug_operation    = CommandBufferDebugOp::EopWriteBackFlip,
-	    .debug_args         = {static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                           static_cast<uint32_t>(flip_mode), value},
-	    .debug_data         = static_cast<uint64_t>(flip_arg),
-	    .destination        = destination,
-	    .completion         = EndOfPipeCompletion::FlipAndInterrupt,
-	    .completion_data    = request_id,
-	    .interrupt_event_id = event_id,
+	EXIT_IF(dst_gpu_addr == nullptr);
+	(void)buffer.Handle();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWriteBackFlip), submit_id,
+	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
+	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
+
+	auto& renderer  = buffer.GetContext();
+	auto& scheduler = renderer.GetCommandScheduler();
+	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
+		renderer.GetVideoOut().CompleteFlip(request_id);
+		renderer.TriggerInterrupt(event_id, 0);
 	});
 }
 
 void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
                                 uint32_t value, int handle, int index, int flip_mode,
                                 int64_t flip_arg, uint64_t request_id) {
-	const auto destination = reinterpret_cast<uint64_t>(dst_gpu_addr);
-	RecordEndOfPipeSignal({
-	    .buffer          = &buffer,
-	    .submit_id       = submit_id,
-	    .debug_operation = CommandBufferDebugOp::EopFlip,
-	    .debug_args      = {static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                        static_cast<uint32_t>(flip_mode), value},
-	    .debug_data      = static_cast<uint64_t>(flip_arg),
-	    .destination     = destination,
-	    .completion      = EndOfPipeCompletion::Flip,
-	    .completion_data = request_id,
-	});
+	EXIT_IF(dst_gpu_addr == nullptr);
+	(void)buffer.Handle();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopFlip), submit_id,
+	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
+	                    static_cast<uint32_t>(flip_mode), value, static_cast<uint64_t>(flip_arg));
+
+	auto& renderer  = buffer.GetContext();
+	auto& scheduler = renderer.GetCommandScheduler();
+	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	scheduler.DeferPriorityOperation(
+	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
 }
 
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,
                               int flip_mode, int64_t flip_arg, uint64_t request_id) {
-	RecordEndOfPipeSignal({
-	    .buffer          = &buffer,
-	    .submit_id       = submit_id,
-	    .debug_operation = CommandBufferDebugOp::EopOnlyFlip,
-	    .debug_args      = {static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
-	                        static_cast<uint32_t>(flip_mode), 0},
-	    .debug_data      = static_cast<uint64_t>(flip_arg),
-	    .completion      = EndOfPipeCompletion::Flip,
-	    .completion_data = request_id,
-	});
+	(void)buffer.Handle();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopOnlyFlip), submit_id,
+	                    static_cast<uint32_t>(handle), static_cast<uint32_t>(index),
+	                    static_cast<uint32_t>(flip_mode), 0, static_cast<uint64_t>(flip_arg));
+
+	auto& renderer  = buffer.GetContext();
+	auto& scheduler = renderer.GetCommandScheduler();
+	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	scheduler.DeferPriorityOperation(
+	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
 }
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
-	ValidateEndOfPipeSignal({.buffer = &buffer});
+	(void)buffer.Handle();
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());

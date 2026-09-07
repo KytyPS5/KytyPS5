@@ -288,6 +288,38 @@ semantic rejection in 114 ms; the same shader previously remained inside `Collec
 75 seconds before it was stopped. The next rejection is an unevaluable `ReadFirstLane` image
 descriptor word and is tracked separately from this traversal-performance defect.
 
+## Wave-uniform image descriptor candidate selection
+
+Status: production fix, native build, and exact captured-shader audit complete; runtime
+materialization/game validation and automated regression deferred.
+
+Observed trigger: compute shader `7ceb0f3417f926f9` builds eight correlated image-descriptor
+DWORDs through matching `Phi` and `SelectU32` graphs, broadcasts every selected DWORD with
+`ReadFirstLane`, and samples the resulting wave-uniform descriptor at guest PC `0x0000066c`.
+The correlated graph has four host-readable descriptor candidates plus a null candidate, but a
+single descriptor source cannot currently retain and materialize that finite candidate set.
+
+Required tests:
+
+- Eight `ReadFirstLane` roots with one active mask and isomorphic `Phi`/`SelectU32` topology,
+  proving correlated `ReadConst` leaves become complete descriptor candidates rather than a
+  Cartesian product of independent DWORDs.
+- Mixed immediate and flat-SRT candidate DWORDs, repeated candidates, and the all-zero null
+  candidate, proving materialization preserves exact descriptor tuples and deduplicates safely.
+- Mismatched active masks, control topology, Phi predecessors, descriptor widths, invalid flat
+  slots, cyclic tuples, and more candidates than the dense image limit, proving recognition fails
+  closed.
+- Two different descriptors with the same selected key DWORD, proving specialization rejects the
+  ambiguous mapping instead of silently binding the wrong image.
+- Native Windows audit of captured `compute_7ceb0f3417f926f9_7847dd7220f76d66.json`, followed by a
+  bounded game run past guest PC `0x0000066c` with Vulkan validation enabled.
+
+Current evidence: the shared recognizer accepts only eight `ReadFirstLane` roots with the same
+active mask and matching `Phi`/`SelectU32` topology. It extracted four host-readable descriptor
+tuples plus the null tuple from the captured shader. Both native Windows targets build, and the
+exact shader now passes resource tracking and compute-execution precheck in about 0.27 seconds.
+Runtime descriptor materialization and SPIR-V/Vulkan execution still require the bounded game run.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

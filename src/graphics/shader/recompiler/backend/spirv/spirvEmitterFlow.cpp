@@ -602,6 +602,20 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 	return ctx.Ballot(predicate);
 }
 
+uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
+	auto&      state  = ctx.state;
+	const auto ballot = ctx.Ballot(predicate);
+	const auto low    = state.builder.AllocateId();
+	const auto high   = state.builder.AllocateId();
+	const auto any    = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), low, ballot, 0});
+	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), high, ballot, 1});
+	state.builder.AddFunction({spv::OpINotEqual, TypeBool(state), any,
+	                           EmitBinaryU32(state, spv::OpBitwiseOr, low, high),
+	                           ConstantU32(state, 0)});
+	return any;
+}
+
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto lane   = ctx.FirstLane(ballot);

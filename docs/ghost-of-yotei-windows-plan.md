@@ -6,15 +6,15 @@
 
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** В
-последнем диагностическом запуске `000802-a0ce57` счётчик дошёл до frame 115,
-эмулятор подготовил 102 GPU flips и показал 101. После прогрева скорость дошла
-до 2,251087 FPS при внутреннем разрешении 480×270. Shader
-`5f3fdf61a7ca4a20` теперь проходит bounded image descriptor materialization,
-SPIR-V emission и создание Vulkan compute pipeline. Трёхминутное окно теста
-завершилось graceful timeout с exit 0, без fatal и VUID; максимальный прежний
-прогресс остаётся frame 116. Проверочный readback первых восьми source frames
-соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый полезный
-кадр пока не доказан.
+последнем запуске `005515-830dc5` счётчик дошёл до frame 123, эмулятор подготовил
+111 GPU flips и показал 110. Скорость перед самостоятельным выходом составляла
+0,799277 FPS при внутреннем разрешении 480×270. Signed storage shader
+`753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
+выпускают SPIR-V и создают Vulkan pipelines. Текущий блокер находится при binding
+следующего image descriptor: его guest-адрес не соответствует alignment,
+рассчитанному tiled-layout кодом. Проверочный readback первых восьми source
+frames соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый
+полезный кадр пока не доказан.
 
 Persistent Vulkan pipeline cache работает и переживает перезапуск. Он убрал
 примерно 60-секундную первую компиляцию самого тяжёлого pipeline, но не устранил
@@ -134,14 +134,16 @@ resource specialization, layout, render state и выбранных игрой p
 поток: обязательные CPU/GPU regression-тесты, полный CTest, Vulkan validation и
 длинный стабильный прогон должны быть закрыты до отправки изменений upstream.
 
-Сейчас быстрый цикл довёл текущую сборку до frame 115 при прежнем максимуме 116. Runtime-регрессия
+Сейчас быстрый цикл довёл текущую сборку до подтверждённого frame 123. Runtime-регрессия
 `5be616…` устранена, `e52e…` переведён с dispatcher на валидный structured CFG,
 а несовместимый sampled color view поверх depth/stencil backing заменяется
 отдельным цветовым образом с переносом 32-битных texel-данных. Ациклический
 buffer atomic return для `f802a6b9d9904f74` также пройден. Ограниченная таблица
-image-дескрипторов `5f3fdf61a7ca4a20` материализуется и доходит до успешного
-создания compute pipeline. Следующая цель — продолжить поиск первой записи,
-которая должна сделать source frame ненулевым.
+image-дескрипторов `5f3fdf61a7ca4a20` материализуется. Signed storage image
+`753c552fae650ec4`, GFX10 packed D16 loads и две loop-indexed scalar-buffer
+descriptor tables в `da7e70d9fcafe48c` также проходят до успешного создания
+pipeline. Следующая цель — классифицировать misaligned tiled image descriptor и
+реализовать корректный общий binding/alias path.
 
 ## Состояние по уровням проверки
 
@@ -149,12 +151,12 @@ image-дескрипторов `5f3fdf61a7ca4a20` материализуется
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows build/install текущего рабочего дерева завершён; проверенный runtime binary SHA-256 `f531a78ee63f8f7b93aa7fa4e4f644bb62a58d9ebf36de66443e6069dae28001`. | Binary имеет ожидаемый banner `c4da2f5-dirty`; commit-only banner ещё не пересобран. |
+| Установленный эмулятор | Windows build/install текущего рабочего дерева завершён; проверенный runtime binary SHA-256 `15d77da9bba65fa6dd74325fcbd1b21b94afb8f29be2e665d6baa2bbff7354ca`. | Binary имеет ожидаемый banner `cf88512-dirty`; commit-only banner ещё не пересобран. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache создан, загружен и сохранён при graceful timeout; прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сокращает steady GPU execution автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | Максимум остаётся frame 116. Новый `000802-a0ce57` дошёл до frame 115 и штатно завершился по 180-секундному timeout без fatal/VUID. `5f3fdf61a7ca4a20` прошёл materialization, SPIR-V и `vkCreateComputePipelines`. | Первый ненулевой видимый кадр ещё не достигнут; pipeline закончил компиляцию при закрытии окна, поэтому фактическое исполнение нового dispatch этим прогоном не доказано. |
+| Реальная игра | `005515-830dc5` достиг frame 123, скомпилировал 127 shaders; `753c…` и `da7e…` создали Vulkan pipelines без validation/resource fatal. | Первый ненулевой видимый кадр ещё не достигнут; текущий blocker — misaligned tiled image descriptor в `PrepareImage`. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -200,15 +202,15 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-000802-a0ce57` |
-| SHA-256 запущенного emulator | `f531a78ee63f8f7b93aa7fa4e4f644bb62a58d9ebf36de66443e6069dae28001` |
-| Время UTC | `2026-09-07T00:08:02.1839862Z` → `00:11:11.3282504Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-005515-830dc5` |
+| SHA-256 запущенного emulator | `15d77da9bba65fa6dd74325fcbd1b21b94afb8f29be2e665d6baa2bbff7354ca` |
+| Время UTC | `2026-09-07T00:55:16.0485082Z` → `00:56:38.2260985Z` |
 | Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 1280×720; внутренние основные targets 480×270 |
-| Завершение | 180-секундный timeout; graceful close успешен, exit 0; fatal/VUID/resource-specialization errors — 0; процессов Kyty после выхода нет |
-| Наблюдаемое исполнение | frame 115; FPS 2,251087; flips CPU/GPU 0/102; prepared 102, ready 102, shown 101. Максимальный предыдущий прогресс — frame 116. |
+| Завершение | Самостоятельный exit 321 на image-layout alignment blocker; процессов Kyty после выхода нет |
+| Наблюдаемое исполнение | frame 123; FPS 0,799277; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 127 shaders compiled |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
-| Пройденный блокер | `5f3fdf61a7ca4a20`, compute PC `0x26c`: post-test loop с индексами 0…5 теперь создаёт согласованный snapshot восьми колонок image descriptor table, сохраняет живой индекс для indirect `ImageRead`, выпускает SPIR-V и создаёт pipeline |
-| Текущий блокер | Нового deterministic fatal за 180 секунд не выявлено. Ближайшая задача — подтвердить исполнение нового compute dispatch и найти первую отсутствующую запись в чёрный source frame |
+| Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
+| Текущий блокер | `PrepareImage`, `descriptors.cpp:774`: рассчитаны ненулевые texture size/alignment, но guest image address misaligned; до следующего исправления нужны полные параметры descriptor/layout |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым

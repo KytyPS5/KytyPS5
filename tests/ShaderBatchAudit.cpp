@@ -273,6 +273,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       options.scratch_dwords = manifest.at("scratch_dwords");
       const bool dump_ir = std::getenv("KYTY_SHADER_AUDIT_DUMP_IR") != nullptr;
       options.dump_ir = dump_ir;
+      options.early_dump = dump_ir;
       options.input_info.compute = &info;
       Json profiles = Json::array();
       const bool initial_barriers = info.needs_lds_barriers;

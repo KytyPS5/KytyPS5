@@ -1183,6 +1183,7 @@ public:
 		    header->ImmPredecessors().size() != 2u) return {};
 		const Block* initial = nullptr;
 		const Block* latch = nullptr;
+		Value latch_update;
 		for (size_t incoming = 0; incoming < 2u; ++incoming) {
 			const auto* predecessor = phi->PhiBlock(incoming);
 			if (predecessor == nullptr || !m_ids.contains(predecessor) ||
@@ -1202,9 +1203,59 @@ public:
 				if (!ParseBoundedOffset(value, update, update_visiting) || update.index != phi ||
 				    update.scale != 1u || update.bias != 1u) return {};
 				latch = predecessor;
+				latch_update = value;
 			}
 		}
 		if (initial == nullptr || latch == nullptr || initial == latch) return {};
+		const auto index = Value(const_cast<Inst*>(phi));
+		const auto make_proof = [&](Value count) {
+			return BoundedSrtReadProof {
+			    .index = index,
+			    .count = count,
+			    .address_low = address->Arg(0).Resolve(),
+			    .address_high = address->Arg(1).Resolve(),
+			    .descriptor_word2 = source_dwords == 4u ? address->Arg(2).Resolve() : Value {},
+			    .descriptor_word3 = source_dwords == 4u ? address->Arg(3).Resolve() : Value {},
+			    .source_dwords = source_dwords,
+			    .offset_scale = offset.scale,
+			    .offset_bias = offset.bias,
+			    .memory_offset = memory.offset};
+		};
+		// A canonical post-test loop consumes index i, increments it once in the
+		// latch, and repeats while next < a positive constant. Requiring the read
+		// to dominate that latch proves the accessed dense range is [0, bound).
+		// Runtime and non-positive signed bounds need max(1, N) materialization
+		// semantics and remain unsupported here.
+		const auto& latch_info = m_program.block_info[m_ids.at(latch)];
+		if (latch_info.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+		    latch_update.TryInstruction() != nullptr &&
+		    latch_update.TryInstruction()->Parent() == latch && Dominates(read.Parent(), latch)) {
+			auto latch_condition = latch_info.condition.Resolve();
+			bool latch_invert = false;
+			std::unordered_set<const Inst*> latch_condition_visited;
+			while (const auto* inst = latch_condition.TryInstruction()) {
+				if (!latch_condition_visited.insert(inst).second) return {};
+				if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
+				latch_invert = !latch_invert;
+				latch_condition = inst->Arg(0).Resolve();
+			}
+			const auto* compare = latch_condition.TryInstruction();
+			const auto repeat_id = latch_invert ? latch_info.terminator.false_block
+			                                    : latch_info.terminator.true_block;
+			if (compare != nullptr && compare->NumArgs() == 2u &&
+			    repeat_id == m_program.block_info[m_ids.at(header)].id &&
+			    compare->Arg(0).Resolve() == latch_update) {
+				const auto bound = compare->Arg(1).Resolve();
+				const bool unsigned_less = compare->GetOpcode() == ValueOpcode::ULessThan32;
+				const bool signed_less = compare->GetOpcode() == ValueOpcode::SLessThan32;
+				if (bound.IsImmediate() && bound.GetType() == Type::U32 && bound.U32() != 0u &&
+				    (unsigned_less || (signed_less && bound.U32() <= INT32_MAX))) {
+					for (uint32_t word = 0; word < source_dwords; ++word)
+						if (!RuntimeReadsDominate(address->Arg(word), header)) return {};
+					return make_proof(bound);
+				}
+			}
+		}
 		// SSA construction may put the induction Phi in a separate empty header.
 		// Follow only an unavoidable, single-entry unconditional chain to its
 		// guard: every visit to the Phi must execute the same comparison.
@@ -1232,7 +1283,6 @@ public:
 		}
 		const auto* compare = condition.TryInstruction();
 		if (compare == nullptr || compare->NumArgs() != 2u) return {};
-		const auto index = Value(const_cast<Inst*>(phi));
 		Value count;
 		if (compare->GetOpcode() == ValueOpcode::ULessThan32 && compare->Arg(0).Resolve() == index)
 			count = compare->Arg(1).Resolve();
@@ -1251,17 +1301,7 @@ public:
 		// Removing the successful i<N edge must make the actual read unreachable.
 		// Block dominance alone is insufficient when the guard's false path merges.
 		if (Reachable(read.Parent(), nullptr, guard, success)) return {};
-		return BoundedSrtReadProof {
-		    .index = index,
-		    .count = count,
-		    .address_low = address->Arg(0).Resolve(),
-		    .address_high = address->Arg(1).Resolve(),
-		    .descriptor_word2 = source_dwords == 4u ? address->Arg(2).Resolve() : Value {},
-		    .descriptor_word3 = source_dwords == 4u ? address->Arg(3).Resolve() : Value {},
-		    .source_dwords = source_dwords,
-		    .offset_scale = offset.scale,
-		    .offset_bias = offset.bias,
-		    .memory_offset = memory.offset};
+		return make_proof(count);
 	}
 
 private:

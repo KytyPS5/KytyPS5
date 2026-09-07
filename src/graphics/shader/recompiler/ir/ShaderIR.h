@@ -501,6 +501,12 @@ struct DescriptorSource {
 		bool operator==(const BoundedBuffer&) const = default;
 	};
 
+	struct BoundedImage {
+		std::array<uint32_t, 8> reads {};
+		uint32_t key_arg = 0;
+		bool operator==(const BoundedImage&) const = default;
+	};
+
 	struct InlineDescriptor {
 		struct ImageTable {
 			uint32_t address_source = 0;
@@ -538,6 +544,7 @@ struct DescriptorSource {
 	std::optional<IndirectImage> indirect_image;
 	std::optional<InlineDescriptor> inline_descriptor;
 	std::optional<BoundedBuffer> bounded_buffer;
+	std::optional<BoundedImage> bounded_image;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };

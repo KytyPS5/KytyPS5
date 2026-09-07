@@ -240,6 +240,10 @@ private:
 		Value index;
 		std::array<Value, 3> roots;
 	};
+	struct BoundedImagePlan {
+		Inst* handle = nullptr;
+		Value index;
+	};
 
 	void PlanBoundedReads() {
 		if (m_program.stage != ShaderType::Compute) return;
@@ -324,6 +328,40 @@ private:
 		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; }))
 			m_bounded_buffers.push_back({&handle, words[0]->proof.index,
 			                            {descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2]}});
+		return true;
+	}
+
+	bool MakeBoundedImageSource(Inst& handle, uint32_t& source) {
+		if (handle.NumArgs() != 8u) return false;
+		std::array<const BoundedReadPlan*, 8> words;
+		for (uint32_t word = 0; word < words.size(); ++word) {
+			words[word] = BoundedRead(handle.Arg(word).Resolve().TryInstruction());
+			if (words[word] == nullptr || words[word]->proof.source_dwords != 2u) return false;
+		}
+		const auto& first = m_bounded_srt_reads[words[0]->read_id];
+		if (first.workgroup_axis != UINT32_MAX) return false;
+		for (uint32_t word = 1; word < words.size(); ++word) {
+			const auto& next = m_bounded_srt_reads[words[word]->read_id];
+			if (words[word]->proof.index != words[0]->proof.index ||
+			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    next.workgroup_axis != UINT32_MAX || first.offset_scale != next.offset_scale ||
+			    first.offset_bias != next.offset_bias ||
+			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
+		}
+		DescriptorSource descriptor;
+		descriptor.dword_count = 8u;
+		descriptor.dwords[0] = words[0]->proof.address_low;
+		descriptor.dwords[1] = words[0]->proof.address_high;
+		descriptor.dwords[2] = words[0]->proof.count;
+		for (uint32_t word = 3; word < descriptor.dword_count; ++word)
+			descriptor.dwords[word] = Value(0u);
+		descriptor.bounded_image.emplace();
+		for (uint32_t word = 0; word < words.size(); ++word)
+			descriptor.bounded_image->reads[word] = words[word]->read_id;
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_images,
+		    [&](const BoundedImagePlan& plan) { return plan.handle == &handle; }))
+			m_bounded_images.push_back({&handle, words[0]->proof.index});
 		return true;
 	}
 
@@ -427,6 +465,10 @@ private:
 		for (const auto& plan : m_bounded_buffers) {
 			plan.handle->SetArg(0, plan.index);
 			for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, plan.roots[word - 1u]);
+		}
+		for (const auto& plan : m_bounded_images) {
+			plan.handle->SetArg(0, plan.index);
+			for (uint32_t word = 1; word < 8u; ++word) plan.handle->SetArg(word, Value(0u));
 		}
 		std::erase_if(m_program.dynamic_reads, [](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
@@ -1080,6 +1122,7 @@ private:
 			}
 		}
 		if (expected == ValueOpcode::GetBufferResource && MakeBoundedBufferSource(*handle, source)) return;
+		if (expected == ValueOpcode::GetImageResource && MakeBoundedImageSource(*handle, source)) return;
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
@@ -1369,7 +1412,8 @@ private:
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
 				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_image.has_value() || image_source->inline_descriptor.has_value()) {
+				    image_source->indirect_image.has_value() || image_source->inline_descriptor.has_value() ||
+				    image_source->bounded_image.has_value()) {
 					continue;
 				}
 				bool alias = true;
@@ -1393,6 +1437,7 @@ private:
 	std::vector<const Inst*> m_bounded_root_visited;
 	std::vector<Inst*> m_bounded_root_reads;
 	std::vector<BoundedBufferPlan> m_bounded_buffers;
+	std::vector<BoundedImagePlan> m_bounded_images;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
 	std::vector<IndirectImagePlan> m_indirect_images;

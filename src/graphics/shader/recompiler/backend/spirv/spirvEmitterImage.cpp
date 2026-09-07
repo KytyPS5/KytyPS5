@@ -624,6 +624,107 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	}
 }
 
+template <typename Emit>
+uint32_t EmitIndirectImageValue(ValueEmitContext& ctx, const IR::Inst& inst,
+                                IR::Value image_arg, const IR::ImageResource& image,
+                                uint32_t result_type, Emit&& emit) {
+	auto& state = ctx.state;
+	const auto* handle = image_arg.ResolveInstruction();
+	const auto* source = image.source < ctx.program.descriptor_sources.size()
+	                         ? &ctx.program.descriptor_sources[image.source]
+	                         : nullptr;
+	const auto key_arg = source != nullptr && source->bounded_image.has_value()
+	                         ? source->bounded_image->key_arg
+	                         : source != nullptr && source->inline_descriptor.has_value()
+	                               ? source->inline_descriptor->key_arg
+	                               : source != nullptr && source->indirect_image.has_value()
+	                                     ? source->indirect_image->key_arg : UINT32_MAX;
+	if (handle == nullptr || key_arg >= handle->NumArgs()) {
+		ctx.Fail(inst, "has invalid indirect image key provenance");
+		return 0;
+	}
+	const auto key = ctx.Def(handle->Arg(key_arg));
+	if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
+	    image.indirect_resources.size() < 2u) {
+		ctx.Fail(inst, "has no indirect image runtime mapping");
+		return 0;
+	}
+	const auto LoadMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                           state.flattened_srt_variable, ConstantU32(state, 0), index});
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+		return value;
+	};
+	const auto mapping  = ConstantU32(state, image.indirect_mapping_offset);
+	auto       low      = ConstantU32(state, 0u);
+	auto       high     = LoadMapping(mapping);
+	auto       selected = ConstantU32(state, 0u);
+	for (uint32_t iteration = 0; iteration < image.indirect_search_iterations; ++iteration) {
+		const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
+		const auto mid = Binary(state, OpShiftRightLogical, TypeU32(state),
+		                        Binary(state, OpIAdd, TypeU32(state), low, high),
+		                        ConstantU32(state, 1u));
+		const auto probe = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpSelect, TypeU32(state), probe, active, mid, ConstantU32(state, 0u)});
+		const auto entry = Binary(
+		    state, OpIAdd, TypeU32(state), mapping,
+		    Binary(state, OpIAdd, TypeU32(state),
+		           Binary(state, OpShiftLeftLogical, TypeU32(state), probe,
+		                  ConstantU32(state, 1u)),
+		           ConstantU32(state, 1u)));
+		const auto mapped_key = LoadMapping(entry);
+		const auto candidate =
+		    LoadMapping(Binary(state, OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+		const auto equal = Binary(state, OpIEqual, TypeBool(state), mapped_key, key);
+		const auto match = Binary(state, OpLogicalAnd, TypeBool(state), active, equal);
+		const auto next_selected = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpSelect, TypeU32(state), next_selected, match, candidate, selected});
+		selected = next_selected;
+		const auto less = Binary(state, OpULessThan, TypeBool(state), mapped_key, key);
+		const auto take_upper = Binary(state, OpLogicalAnd, TypeBool(state), active, less);
+		const auto take_lower = Binary(state, OpLogicalAnd, TypeBool(state), active,
+		                               Unary(state, OpLogicalNot, TypeBool(state), less));
+		const auto next_low = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpSelect, TypeU32(state), next_low, take_upper,
+		     Binary(state, OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low});
+		low = next_low;
+		const auto next_high = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, TypeU32(state), next_high, take_lower, mid, high});
+		high = next_high;
+	}
+
+	const auto default_label = state.builder.AllocateId();
+	const auto merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
+	std::vector<uint32_t> switch_words {OpSwitch, selected, default_label};
+	for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); ++candidate) {
+		labels[candidate - 1u] = state.builder.AllocateId();
+		switch_words.push_back(candidate);
+		switch_words.push_back(labels[candidate - 1u]);
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction(switch_words);
+	std::vector<uint32_t> phi_words {OpPhi, result_type, state.builder.AllocateId()};
+	EmitLabel(state, default_label);
+	phi_words.push_back(emit(image.indirect_resources[0]));
+	phi_words.push_back(default_label);
+	state.builder.AddFunction({OpBranch, merge_label});
+	for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); ++candidate) {
+		EmitLabel(state, labels[candidate - 1u]);
+		phi_words.push_back(emit(image.indirect_resources[candidate]));
+		phi_words.push_back(labels[candidate - 1u]);
+		state.builder.AddFunction({OpBranch, merge_label});
+	}
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi_words);
+	return phi_words[2];
+}
+
 } // namespace
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -670,25 +771,34 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);
 		const auto  numeric_class  = image.numeric_class;
 		const auto  condition      = ctx.Arg(inst, 2);
+		const auto  result_type    = ImageVectorType(state, numeric_class, 4);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
-			        const auto descriptor = LoadSampledImageDescriptor(state, mem.resource);
-			        const auto color      = state.builder.AllocateId();
-			        const auto coord      = CoordU32(ctx, mem, *address, dimension);
-			        if (dimension_info.multisampled != 0u) {
-				        state.builder.AddFunction(
-				            {OpImageFetch, ImageVectorType(state, numeric_class, 4), color,
-				             descriptor, coord, ImageOperandsSampleMask,
-				             AddressU32(ctx, mem, *address, dimension_info.coordinate_components)});
-			        } else {
-				        state.builder.AddFunction({OpImageFetch,
-				                                   ImageVectorType(state, numeric_class, 4), color,
-				                                   descriptor, coord, ImageOperandsLodMask,
-				                                   LodU32(ctx, mem, *address, dimension)});
-			        }
+			        const auto EmitRead = [&](uint32_t resource) {
+				        const auto descriptor = LoadSampledImageDescriptor(state, resource);
+				        const auto color      = state.builder.AllocateId();
+				        const auto coord      = CoordU32(ctx, mem, *address, dimension);
+				        if (dimension_info.multisampled != 0u) {
+					        state.builder.AddFunction(
+					            {OpImageFetch, result_type, color, descriptor, coord,
+					             ImageOperandsSampleMask,
+					             AddressU32(ctx, mem, *address,
+					                        dimension_info.coordinate_components)});
+				        } else {
+					        state.builder.AddFunction(
+					            {OpImageFetch, result_type, color, descriptor, coord,
+					             ImageOperandsLodMask, LodU32(ctx, mem, *address, dimension)});
+				        }
+				        return color;
+			        };
+			        const auto color = image.indirect_root == mem.resource
+			                               ? EmitIndirectImageValue(ctx, inst, image_arg, image,
+			                                                        result_type, EmitRead)
+			                               : EmitRead(mem.resource);
+			        if (color == 0u) return ConstantU32CompositeZero(state, 4);
 			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
 			                            false, mem);
 		        }));
@@ -925,10 +1035,12 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto* source = image.source < ctx.program.descriptor_sources.size()
 		                         ? &ctx.program.descriptor_sources[image.source]
 		                         : nullptr;
-		const auto key_arg = source != nullptr && source->inline_descriptor.has_value()
-		                         ? source->inline_descriptor->key_arg
-		                         : source != nullptr && source->indirect_image.has_value()
-		                               ? source->indirect_image->key_arg : UINT32_MAX;
+		const auto key_arg = source != nullptr && source->bounded_image.has_value()
+		                         ? source->bounded_image->key_arg
+		                         : source != nullptr && source->inline_descriptor.has_value()
+		                               ? source->inline_descriptor->key_arg
+		                               : source != nullptr && source->indirect_image.has_value()
+		                                     ? source->indirect_image->key_arg : UINT32_MAX;
 		if (handle == nullptr || key_arg >= handle->NumArgs()) {
 			ctx.Fail(inst, "has invalid indirect image key provenance");
 			return true;

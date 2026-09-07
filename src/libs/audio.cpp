@@ -811,22 +811,15 @@ int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32
 	     "\t freq    = %u\n",
 	     user_id, type, index, len, freq);
 
-	if (user_id != 255 && user_id != 1) {
-		LOGF("\t temporary: accepting unsupported audio input user_id %d\n", user_id);
-	}
 	EXIT_NOT_IMPLEMENTED(type != 1);
 	EXIT_NOT_IMPLEMENTED(index != 0);
 
 	Audio::Format format = Audio::Format::Unknown;
 
 	switch (param) {
-		case 0: format = Audio::Format::Signed16bitMono; break;
+		case 1: format = Audio::Format::Signed16bitMono; break;
 		case 2: format = Audio::Format::Signed16bitStereo; break;
-		default:
-			LOGF("\t temporary: using signed 16-bit stereo for unsupported audio input param %u\n",
-			     param);
-			format = Audio::Format::Signed16bitStereo;
-			break;
+		default: return AUDIO_IN_ERROR_INVALID_PARAM;
 	}
 
 	LOGF("\t param   = %u (%s)\n", param, Common::EnumName(format).c_str());

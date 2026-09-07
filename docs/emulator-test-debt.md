@@ -312,23 +312,32 @@ Required tests:
 
 ## Misaligned tiled image descriptors
 
-Status: diagnosis in progress; automated regression deferred.
+Status: production fix, native build and bounded game validation complete; automated regression
+deferred.
 
 Observed trigger: after 127 shaders compile and the loop-indexed descriptor shader creates a
-valid Vulkan pipeline, image binding reaches `PrepareImage` with a guest address that does not
-meet the alignment returned by `TileGetTextureTotalSize`. The old fatal reports only the failed
-boolean expression, so the descriptor format, tile mode, dimensions, computed size/alignment
-and address delta are not yet visible.
+valid Vulkan pipeline, image binding receives a 16x16 `k16_16_16_16Float` storage image using
+`kStandard4KB`. Its SRD address is 256-byte aligned but has offset `0x800` within the 4-KB
+allocation alignment returned by `TileGetTextureTotalSize`. That alignment describes a
+standalone allocation; the descriptor's address describes a placed image view, and the detiler
+already evaluates tiled offsets relative to that address while separately satisfying Vulkan
+buffer-offset alignment.
 
 Required tests:
 
 - Diagnostic coverage proving every rejected image layout reports the guest address, computed
   size and alignment, format, type, tile mode, dimensions, levels and raw descriptor DWORDs.
-- Linear and tiled image descriptors at exact, over-aligned and misaligned base addresses,
-  including mipmapped, array, volume, multisample, sampled and storage resources.
+- Linear and tiled image descriptors at exact, over-aligned and 256-byte placed-view addresses,
+  including mipmapped, array, volume, multisample, sampled and storage resources. Allocation
+  helpers must continue reporting the full tile-block alignment.
 - Alias/view cases where a descriptor intentionally starts inside an existing backing image,
   checking whether a compatible subresource view is selected instead of creating a new image.
 - Rejection cases for zero size/alignment, arithmetic overflow, unsupported tile modes and
-  addresses that cannot map to a valid guest subresource without copying or rebasing.
+  malformed descriptor address encodings. A placed view must retain its exact guest range;
+  rounding the address down to the allocation boundary is forbidden.
 - Vulkan validation and readback for any implemented rebase/copy path, followed by a bounded
   native game run beyond the current `descriptors.cpp` image-alignment failure.
+
+Validation reached the original `053b2c82226fe5ed` storage write, created its Vulkan pipeline
+and continued through four later compute pipelines without an image-layout fatal or Vulkan VUID.
+The exact placed address was preserved rather than rounded to a tile boundary.

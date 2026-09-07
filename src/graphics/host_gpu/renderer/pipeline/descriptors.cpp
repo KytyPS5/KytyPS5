@@ -770,8 +770,24 @@ NormalizeTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels, tile,
 		                        volume, size);
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	// TileGetTextureTotalSize reports the alignment required for a standalone
+	// allocation. An image SRD carries a 256-byte-granular view address and guest
+	// software may place a small surface inside a larger allocation at that
+	// granularity. The transfer path computes every tiled offset relative to the
+	// SRD address, so requiring allocation alignment here rejects valid placed
+	// views and does not protect any host Vulkan requirement.
+	if (size.size == 0 || size.align == 0) {
+		EXIT("unsupported texture layout: addr=0x%016" PRIx64
+		     " size=%" PRIu64 " align=%" PRIu64 " width=%u height=%u depth=%u"
+		     " levels=%u samples=%u type=%u tile=%u format=%u storage=%u atomic=%u"
+		     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     address, size.size, size.align, width, height, depth, levels, samples,
+		     static_cast<uint32_t>(type), static_cast<uint32_t>(tile),
+		     static_cast<uint32_t>(format), storage ? 1u : 0u, resource.atomic ? 1u : 0u,
+		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+		     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		     descriptor.fields[6], descriptor.fields[7]);
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}

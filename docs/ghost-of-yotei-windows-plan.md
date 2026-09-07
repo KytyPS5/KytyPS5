@@ -6,15 +6,16 @@
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
 служебного счётчика теперь frame 126 в capture-прогоне; последний validation-run
-`042633-4abf12` дошёл до frame 124 и shader №142. Signed storage shader
+`050132-2367b3` дошёл до frame 124 и shader №142. Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
 выпускают SPIR-V и создают Vulkan pipelines. Зависимые bounded buffer/image/sampler
 descriptors для `8457901d80b91921` теперь материализуются, а scalar-address branch
 на guest PC 612 доказана wave-uniform. Guard-bounded inline table у
 `f8927c09f4b928c7` теперь использует 255 допустимых selector values вместо
 1 445 ложных wrap-кандидатов; shader выпустил 203 924 SPIR-V слова. Optional SRT
-с null base в vertex shader `ee4f153aa500d327` теперь выпускает SPIR-V. Текущий
-блокер — renderer отклоняет смещение storage buffer относительно Vulkan alignment. Прежний image
+с null base в vertex shader `ee4f153aa500d327` теперь выпускает SPIR-V. Точный
+byte-limit и cross-DWORD доступ устранили renderer blocker на R16 storage buffer с residual 6.
+Текущий блокер — несовпадающий vertex/fragment interface в Location 2. Прежний image
 blocker также пройден: 256-байтный placed-view адрес больше не проверяется как
 начало отдельной 4-КБ allocation. Проверочный readback первых восьми source
 frames соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый
@@ -164,7 +165,11 @@ shader №136. Inline sampled table у `f8927c09f4b928c7` сохраняет д�
 доминирующим CFG guard предел selector, канонизирует null image/sampler пары и
 укладывается в bounded compiler budget 512 images/pairs; shader стал №139.
 Optional null SRT root у `ee4f153aa500d327` теперь специализируется до нулевых
-descriptor words до сложения адреса; shader выпустил 15 847 SPIR-V слов и стал №142.
+descriptor words до сложения адреса; с текущей byte-limit ABI shader выпустил
+16 490 SPIR-V слов и стал №142.
+Renderer передаёт каждому storage buffer точную guest byte-limit отдельно от выравнивающего
+residual; R16 subword loads/stores поддерживают пересечение границы DWORD. Проблемный vertex
+slot 6 с guest address `0x80760a1a16`, residual 6 и размером `0x240` успешно привязан.
 
 ## Состояние по уровням проверки
 
@@ -172,12 +177,12 @@ descriptor words до сложения адреса; shader выпустил 15 
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; optional-null-SRT milestone `c090814`; последний runtime binary SHA-256 `c5b83b30f5d33e8ff6e5778c47203caa26227b0e2f73fcae1680d778d1ef9793`. | Binary собран из содержимого pre-commit worktree с тем же production-кодом; полный CTest отложен как test debt. |
+| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; storage byte-limit milestone `5c7661d`; последний runtime binary SHA-256 `e4b832505865a712b7008a409f84d8a23c207b9337c616be11647cf93f8db54f`. | Оба native target собраны; полный CTest отложен как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `042633-4abf12` с validation дошёл до frame 124 и shader №142; `ee4f…` полностью прошёл resource tracking и выпустил SPIR-V. Capture-run достиг frame 126. | Первый ненулевой видимый кадр ещё не достигнут; следующий renderer binding отклоняет storage-buffer offset adjustment. |
+| Реальная игра | `050132-2367b3` с validation дошёл до frame 124 и shader №142; `ee4f…` выпустил SPIR-V, а R16 slot 6 с residual 6 успешно привязан. Capture-run достиг frame 126. | Первый ненулевой видимый кадр ещё не достигнут; следующая graphics pipeline отклонена из-за отсутствующего vertex output Location 2. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -223,12 +228,12 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-042633-4abf12` |
-| SHA-256 запущенного emulator | `c5b83b30f5d33e8ff6e5778c47203caa26227b0e2f73fcae1680d778d1ef9793` |
-| Время UTC | `2026-09-07T04:26:33.7223403Z` → `04:28:24.0244009Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-050132-2367b3` |
+| SHA-256 запущенного emulator | `e4b832505865a712b7008a409f84d8a23c207b9337c616be11647cf93f8db54f` |
+| Время UTC | `2026-09-07T05:01:32.5282472Z` → `05:08:07.6115056Z` |
 | Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 1280×720; внутренние основные targets 480×270 |
 | Завершение | Самостоятельный exit code 321 до timeout 240 с; процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 124; FPS 0,085214; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 142 shader полностью скомпилированы |
+| Наблюдаемое исполнение | frame 124; FPS 0,085211; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 142 shader полностью скомпилированы |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
@@ -237,8 +242,9 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | Пройденный descriptor-блокер | `8457901d80b91921`: decode 1109, CFG 126 blocks/8 loops, Normalize 5115, TrackResources 5074, SPIR-V 102 791 слово; bounded expressions и uniform scalar-address branch пройдены, shader №136 завершён |
 | Пройденные следующие shaders | `3570528edd66651a` стал №137 (SPIR-V 7 872 слов), `e80c528999326b0e` — №138 (74 070), `f8927c09f4b928c7` — №139 (203 924), `16fc5de632960733` — №140 (2 588), `975c2837903937d1` — №141 (15 413) |
 | Пройденный sampled-table блокер | Доминирующий guard доказывает `selector < 255` при stride 368; вместо 1 445 GCD probes материализуются 255 selector values. Null image пары канонизируются; compiler budget ограничен 512 images/pairs с отдельной проверкой Vulkan device limits. |
-| Пройденный null-SRT блокер | `ee4f153aa500d327`, vertex: exact null `LoadAddressU32` root создаёт нулевые descriptor words; TrackResources завершён, выпущено 15 847 SPIR-V слов, shader №142 |
-| Текущая ошибка | Renderer `NativeStorageBuffer`: `storage buffer offset adjustment is unsupported` при привязке следующего pipeline; точные guest address/size/alignment/adjustment ещё требуется вывести в диагностику |
+| Пройденный null-SRT блокер | `ee4f153aa500d327`, vertex: exact null `LoadAddressU32` root создаёт нулевые descriptor words; TrackResources завершён, с текущей ABI выпущено 16 490 SPIR-V слов, shader №142 |
+| Пройденный buffer-offset блокер | Vertex slot 6: guest `0x80760a1a16`, size `0x240`, alignment 16, residual 6, descriptor-formatted R16 read-only. Vulkan view округлён до DWORD, точная guest byte-limit проверяется в SPIR-V; прежнего fatal нет |
+| Текущая ошибка | `vkCreateGraphicsPipelines`, VUID `RuntimeSpirv-OpEntryPoint-08743`: fragment per-vertex input `Location 2 Component 0` (`array[3] of vec4`) не имеет output-декларации в предыдущем vertex stage |
 | Диагностика | Targeted IR dump `_Build/analysis/f8927c09-inline-selector-ir.txt` подтвердил selector `%1258` и доминирующий unsigned guard; validation-run подтвердил переход через SPIR-V emission к трём следующим shaders |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 

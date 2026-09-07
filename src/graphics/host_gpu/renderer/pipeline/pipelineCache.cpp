@@ -45,6 +45,8 @@ namespace Libs::Graphics {
 
 namespace {
 
+constexpr uint32_t DriverCacheCheckpointInterval = 16;
+
 bool IsLowerHex(std::string_view value, size_t expected_size) {
 	return value.size() == expected_size &&
 	       std::ranges::all_of(value, [](unsigned char c) {
@@ -714,6 +716,8 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
+		m_saved_driver_cache_hash     = XXH3_64bits(initial_data.data(), initial_data.size());
+		m_has_saved_driver_cache_hash = true;
 		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
 		                 path);
 	} else {
@@ -723,8 +727,15 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	if (SaveDriverCacheLocked(false)) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
+}
+
+bool PipelineCache::SaveDriverCacheLocked(bool checkpoint) {
 	if (m_driver_cache == nullptr) {
-		return;
+		return false;
 	}
 
 	size_t               size = 0;
@@ -747,15 +758,23 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 VulkanToString(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	if (m_has_saved_driver_cache_hash && payload_hash == m_saved_driver_cache_hash &&
+	    Common::File::IsFileExisting(m_driver_cache_path)) {
+		if (!checkpoint) {
+			PipelineCacheLog("Vulkan pipeline cache: unchanged {} bytes in {}", payload.size(),
+			                 Common::PathToString(m_driver_cache_path));
+		}
+		return true;
+	}
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -772,12 +791,25 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
+		return false;
+	}
+	PipelineCacheLog("Vulkan pipeline cache: {} {} bytes to {}",
+	                 checkpoint ? "checkpointed" : "saved", payload.size(),
+	                 Common::PathToString(m_driver_cache_path));
+	m_saved_driver_cache_hash     = payload_hash;
+	m_has_saved_driver_cache_hash = true;
+	return true;
+}
+
+void PipelineCache::CheckpointDriverCacheLocked() {
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	if (++m_new_driver_pipelines < DriverCacheCheckpointInterval) {
+		return;
+	}
+	m_new_driver_pipelines = 0;
+	SaveDriverCacheLocked(true);
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1003,6 +1035,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCacheLocked();
 
 	return *iter->second;
 }
@@ -1038,6 +1071,7 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCacheLocked();
 
 	return *iter->second;
 }

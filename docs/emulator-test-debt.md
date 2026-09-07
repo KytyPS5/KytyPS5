@@ -4,6 +4,35 @@ This file records regression coverage deferred during fast launch bring-up. Each
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
 
+## Periodic Vulkan pipeline-cache checkpoints
+
+Status: production fix and two-run native game validation complete; automated regression
+deferred.
+
+Observed trigger: bounded emulator runs often end by externally terminating the process
+after the window does not close within its grace period. The Vulkan driver cache was only
+serialized during normal renderer destruction, so every forced stop discarded all pipelines
+compiled since startup and made the next run repeat the same expensive work.
+
+Required tests:
+
+- A cache-lifecycle case that creates enough new graphics and compute pipelines to cross the
+  checkpoint threshold, then verifies that a complete signature, payload hash and driver blob
+  are written without destroying the live `VkPipelineCache`.
+- A continuation case that creates more pipelines after a checkpoint and proves the same live
+  cache handle remains usable until final shutdown.
+- Threshold boundary cases for zero, one less than the interval, the exact interval and several
+  intervals, checking that cache hits do not count as newly created pipelines.
+- A warm-cache case where newly created emulator pipeline objects leave the driver blob unchanged,
+  checking that hash comparison suppresses redundant replacement of the on-disk cache.
+- Disabled, empty and failed-driver-query cases proving that checkpoint attempts remain harmless
+  and do not prevent later pipeline creation or final cleanup.
+- File replacement and interrupted-write cases proving that a fully written temporary file is
+  used and a truncated or mismatched cache cannot be accepted on the next launch.
+- Concurrent graphics/compute creation coverage proving that serialization covers cache mutation
+  and snapshot extraction, followed by two native Windows runs where the first is force-stopped
+  and the second reports a compatible loaded cache.
+
 ## Unsigned bitfield selectors for bounded resource tables
 
 Status: production fix and corpus validation in progress; automated regression deferred.

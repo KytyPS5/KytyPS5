@@ -240,18 +240,30 @@ void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modi
 }
 
 void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
-	const bool scalar_copy =
-	    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.src0.kind == Decoder::OperandKind::Sgpr;
+	const bool mask_source = inst.src0.kind == Decoder::OperandKind::Sgpr ||
+	                         inst.src0.kind == Decoder::OperandKind::ExecLo ||
+	                         inst.src0.kind == Decoder::OperandKind::VccLo;
 	IR::U1 source_mask;
 	IR::U1 source_mask_valid;
-	if (scalar_copy) {
-		source_mask       = ir.GetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.src0.reg));
-		source_mask_valid = ir.GetScalarMaskTag(static_cast<IR::ScalarReg>(inst.src0.reg));
+	if (mask_source) {
+		// A full VCC copy carries its predicate even in wave32; ReadMask also handles
+		// individual 32-bit VCC halves, which cannot preserve that provenance.
+		source_mask = inst.src0.kind == Decoder::OperandKind::VccLo ? ir.GetVcc()
+		                                                          : ReadMask(inst.src0);
+		source_mask_valid = ReadMaskValid(inst.src0);
 	}
+	// Preserve all 64 scalar bits independently of the per-thread predicate.
 	WriteU32Pair(inst.dst, ReadU32Pair(inst.src0));
-	if (scalar_copy) {
-		ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.dst.reg), source_mask);
-		ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(inst.dst.reg), source_mask_valid);
+	if (mask_source) {
+		switch (inst.dst.kind) {
+			case Decoder::OperandKind::ExecLo: ir.SetExec(source_mask); break;
+			case Decoder::OperandKind::VccLo: ir.SetVcc(source_mask); break;
+			case Decoder::OperandKind::Sgpr:
+				ir.SetThreadBitScalarReg(static_cast<IR::ScalarReg>(inst.dst.reg), source_mask);
+				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(inst.dst.reg), source_mask_valid);
+				break;
+			default: break;
+		}
 	}
 }
 

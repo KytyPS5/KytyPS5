@@ -1167,13 +1167,29 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
+		case Decoder::Opcode::IMAGE_GATHER4:
+		case Decoder::Opcode::IMAGE_GATHER4_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_L:
+		case Decoder::Opcode::IMAGE_GATHER4_B:
+		case Decoder::Opcode::IMAGE_GATHER4_B_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_C_L:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_CL:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_O:
+		case Decoder::Opcode::IMAGE_GATHER4_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_L_O:
+		case Decoder::Opcode::IMAGE_GATHER4_B_O:
+		case Decoder::Opcode::IMAGE_GATHER4_B_CL_O:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
 

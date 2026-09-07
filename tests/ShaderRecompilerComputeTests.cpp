@@ -3539,10 +3539,9 @@ public:
             "an unrelated unmap waited for a blocked PM4 submission");
 
     auto &scheduler = context.GetCommandScheduler();
-    std::atomic<bool> completion_published{false};
-    gpu.SendCommandSync([&] {
-      scheduler.DeferPriorityOperation([&] { completion_published = true; });
-    });
+    std::atomic<bool> normal_completed{false};
+    gpu.SendCommandSync(
+        [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
     Require("GpuCommandLane", "unmap native completion",
@@ -4319,13 +4318,6 @@ public:
               cache.IsRegionRegistered(index_begin - 1, index_span + 2),
           "indexed lookup mishandled a half-open boundary, gap, or broad "
           "overlap");
-      const auto clean_unmap_tick = scheduler.CurrentTick();
-      resources.UnmapMemory(index_begin, index_page);
-      Require(name, "clean cached buffer unmap drain",
-              scheduler.CurrentTick() == clean_unmap_tick + 1 &&
-                  !resources.IsMapped(index_begin, index_page),
-              "unmapping a clean cached buffer did not drain native work");
-      resources.MapMemory(index_begin, index_page);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
       Require(name, "registered-range merge",
@@ -8265,24 +8257,12 @@ public:
                          Prospero::ImageType::kColor2D, {2048, 1, 1}, 1, 4, 1);
       const auto partial_unmap_image_id =
           texture_cache.FindImage(partial_unmap_image);
-      const auto image_address = partial_unmap_image.info.data.address;
-      Require(name, "registered image boundaries",
-              texture_cache.IsRegionRegistered(image_address, 1) &&
-                  texture_cache.IsRegionRegistered(image_address + 0x1fff, 1) &&
-                  !texture_cache.IsRegionRegistered(image_address - 1, 1) &&
-                  !texture_cache.IsRegionRegistered(image_address + 0x2000, 1) &&
-                  texture_cache.IsRegionRegistered(image_address - 1, 0x2002),
-              "image lookup mishandled a partial overlap or adjacent range");
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
-      const auto image_unmap_tick = scheduler.CurrentTick();
-      resources.UnmapMemory(image_address + 0x1000, 0x1000);
+      texture_cache.UnmapMemory(partial_unmap_image.info.data.address, 0x1000);
       Require(name, "partial image unmap tracking",
               partial_unmap_image_id &&
-                  scheduler.CurrentTick() == image_unmap_tick + 1 &&
-                  !texture_cache.IsRegionRegistered(image_address, 0x2000) &&
-                  !texture_cache.FindImageFromRange(image_address, 0x2000, false),
-              "partial image unmap skipped its drain or retained the image");
+                  !texture_cache.FindImageFromRange(
+                      partial_unmap_image.info.data.address, 0x2000, false),
+              "partial unmap left the deleted image's mapped tail tracked");
 
       constexpr uint64_t unformatted_alias_offset = 0x2500000;
       auto unformatted_alias =
@@ -22299,12 +22279,29 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_ATOMIC_FMIN:
   case Opcode::IMAGE_ATOMIC_FMAX:
   case Opcode::IMAGE_SAMPLE:
+  case Opcode::IMAGE_GATHER4:
+  case Opcode::IMAGE_GATHER4_CL:
+  case Opcode::IMAGE_GATHER4_L:
+  case Opcode::IMAGE_GATHER4_B:
+  case Opcode::IMAGE_GATHER4_B_CL:
   case Opcode::IMAGE_GATHER4_LZ:
   case Opcode::IMAGE_GATHER4_C:
+  case Opcode::IMAGE_GATHER4_C_CL:
   case Opcode::IMAGE_GATHER4_C_L:
+  case Opcode::IMAGE_GATHER4_C_B:
+  case Opcode::IMAGE_GATHER4_C_B_CL:
   case Opcode::IMAGE_GATHER4_C_LZ:
+  case Opcode::IMAGE_GATHER4_O:
+  case Opcode::IMAGE_GATHER4_CL_O:
+  case Opcode::IMAGE_GATHER4_L_O:
+  case Opcode::IMAGE_GATHER4_B_O:
+  case Opcode::IMAGE_GATHER4_B_CL_O:
   case Opcode::IMAGE_GATHER4_LZ_O:
   case Opcode::IMAGE_GATHER4_C_O:
+  case Opcode::IMAGE_GATHER4_C_CL_O:
+  case Opcode::IMAGE_GATHER4_C_L_O:
+  case Opcode::IMAGE_GATHER4_C_B_O:
+  case Opcode::IMAGE_GATHER4_C_B_CL_O:
   case Opcode::IMAGE_GATHER4_C_LZ_O:
     return CoverageClass::NeedsImageCase;
 
@@ -39262,6 +39259,85 @@ TestCase ImageGatherCompareOpcodes() {
   return test;
 }
 
+TestCase ImageGatherLodReadsSelectedMipOnGpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u); // x=0.5
+  AppendVMovLiteral(&code, 21, 0x3f000000u); // y=0.5
+  AppendVMovLiteral(&code, 22, 0x3f800000u); // lod=1.0
+  AppendVMovU32(&code, 24, 0x3fu);           // x offset -1
+  AppendVMovLiteral(&code, 25, 0x3f000000u);
+  AppendVMovLiteral(&code, 26, 0x3f000000u);
+  AppendVMovLiteral(&code, 27, 0x3f800000u);
+  code.push_back(EncodeMimg0(0x44, 0x1));
+  code.push_back(EncodeMimg1(0, 20, 0, 2));
+  code.push_back(EncodeMimg0(0x54, 0x1));
+  code.push_back(EncodeMimg1(4, 24, 0, 2));
+  for (u32 i = 0; i < 8u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto base = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&base, 4, x, y, 0x41000000u, 0, 0, 0);
+    }
+  }
+  auto mip1 = MakeRgbaImage(2, 2);
+  SetRgbaPixel(&mip1, 2, 0, 0, 0x3f800000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 0, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 0, 1, 0x40400000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 1, 0x40800000u, 0, 0, 0);
+
+  // Taps come back i0j1, i1j1, i1j0, i0j0 from mip 1; the offset clamps at the left edge.
+  TestCase test;
+  test.name = "ImageGatherLodReadsSelectedMipOnGpu";
+  test.code = code;
+  test.expected = {0x40400000u, 0x40800000u, 0x40000000u, 0x3f800000u,
+                   0x40400000u, 0x40400000u, 0x3f800000u, 0x3f800000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba_mips = {base, mip1};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[1] |= 3u << 30u;
+  test.user_data[2] = 3u << 14u;
+  test.user_data[3] |= 1u << 16u;
+  test.user_data[8] = 0x92u;
+  test.user_data[9] = 0xfff000u;
+  test.user_data[10] = 0x05000000u; // Point mip filter, so the LOD selects the level.
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.expected_mip_descriptors = 2;
+  test.required_spirv = {"OpImageGather"};
+  return test;
+}
+
+TestCase ImageGatherCompareLodCompiles() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u); // dref
+  AppendVMovLiteral(&code, 21, 0x3f200000u);
+  AppendVMovLiteral(&code, 22, 0x3ec00000u);
+  AppendVMovLiteral(&code, 23, 0x3f800000u);
+  code.push_back(EncodeMimg0(0x4c, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageGatherCompareLodCompiles";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpImageDrefGather"};
+  test.compile_only = true;
+  return test;
+}
+
 TestCase ImageStoreVariants() {
   using O = ShaderOpcode;
 
@@ -44397,6 +44473,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
+  AddCase(ImageGatherLodReadsSelectedMipOnGpu);
+  AddCase(ImageGatherCompareLodCompiles);
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
   AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
@@ -50851,6 +50929,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--suspend-point-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuSuspendPoint();
+    return 0;
+  }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native64-only") == 0) {

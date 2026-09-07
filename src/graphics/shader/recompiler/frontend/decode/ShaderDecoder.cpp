@@ -123,10 +123,12 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* sample_name =
-	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
+	const char* mimg_name = nullptr;
+	if (inst.opcode == Opcode::IMAGE_SAMPLE) {
+		mimg_name = MimgSampleOpcodeName(inst.opcode_id);
+	}
 	const std::string_view name =
-	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
+	    mimg_name != nullptr ? mimg_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
 	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
@@ -140,13 +142,29 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_GATHER4_CL:
 		case Opcode::IMAGE_GATHER4_L:
+		case Opcode::IMAGE_GATHER4_B:
+		case Opcode::IMAGE_GATHER4_B_CL:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_CL:
 		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_B:
+		case Opcode::IMAGE_GATHER4_C_B_CL:
 		case Opcode::IMAGE_GATHER4_C_LZ:
+		case Opcode::IMAGE_GATHER4_O:
+		case Opcode::IMAGE_GATHER4_CL_O:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_B_O:
+		case Opcode::IMAGE_GATHER4_B_CL_O:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4_C_CL_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
+		case Opcode::IMAGE_GATHER4_C_B_O:
+		case Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Opcode::IMAGE_GATHER4H:
 			text += fmt::format(" sample_flags={} addr_components={}",
@@ -612,13 +630,29 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_GATHER4_CL:
 		case Opcode::IMAGE_GATHER4_L:
+		case Opcode::IMAGE_GATHER4_B:
+		case Opcode::IMAGE_GATHER4_B_CL:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_CL:
 		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_B:
+		case Opcode::IMAGE_GATHER4_C_B_CL:
 		case Opcode::IMAGE_GATHER4_C_LZ:
+		case Opcode::IMAGE_GATHER4_O:
+		case Opcode::IMAGE_GATHER4_CL_O:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_B_O:
+		case Opcode::IMAGE_GATHER4_B_CL_O:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
+		case Opcode::IMAGE_GATHER4_C_CL_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
+		case Opcode::IMAGE_GATHER4_C_B_O:
+		case Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:

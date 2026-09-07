@@ -580,10 +580,11 @@ uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, u
 }
 
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                    uint32_t coord, Prospero::TextureNumericClass numeric_class) {
+                                    uint32_t coord, Prospero::TextureNumericClass numeric_class,
+                                    uint32_t sampler_id, uint32_t mip) {
 	auto& state = ctx.state;
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto image = LoadImageDescriptor(state, mem.resource);
+	const auto image = LoadImageDescriptor(state, mem.resource, mip);
 	const auto width = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32(state), width, image,
 	                          ConstantU32(state, 0));
@@ -596,8 +597,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
 	                                 ConstantF32(state, 0x3f000000u)));
 
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
+	const auto sampled     = MakeSampledImage(state, mem.resource, sampler_id, mip);
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
 	const auto component = ImageGatherSource(state, mem);
@@ -991,15 +991,22 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			if (dimension == ImageDimension::Dim1D) {
 				if (image.indirect_root == mem.resource || dref ||
-				    !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
 					return;
 				}
-				const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-				                            dimension_info.coordinate_components, image.cube);
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
+				const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+				const auto gather     = [&](uint32_t mip) {
+					return EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class, sampler_id,
+					                                  mip);
+				};
+				const auto sample =
+				    image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
+				        ? EmitIndexSwitch(
+				              state, GatherMip(ctx, inst, mem, *address, layout, image.mip_count),
+				              image.mip_count, ImageVectorType(state, numeric_class, 4), gather)
+				        : gather(0);
 				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
 				                              numeric_class, false, mem, true));
 				return;

@@ -355,8 +355,8 @@ bool IsVop2LiteralMadOpcode(uint32_t opcode) {
 }
 
 bool IsUnsupportedVop3EncodedVop2Alias(uint32_t opcode) {
-	return IsVop2LiteralMadOpcode(opcode) || opcode == 0x02u || opcode == 0x2bu ||
-	       opcode == 0x39u || opcode == 0x3au;
+	return IsVop2LiteralMadOpcode(opcode) || opcode == 0x02u || opcode == 0x39u ||
+	       opcode == 0x3au;
 }
 
 Opcode LookupVop3Opcode(uint32_t opcode) {

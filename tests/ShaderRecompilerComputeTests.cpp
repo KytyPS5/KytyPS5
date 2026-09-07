@@ -17137,6 +17137,35 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+TestCase Vop3FmacF32NegatedSourceAccumulates() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  constexpr u32 registers[] = {13, 20, 29};
+  for (u32 sample = 0; sample < 2; sample++) {
+    for (u32 source = 0; source < 3; source++) {
+      AppendVMovU32(&code, 30, (sample * 3 + source) * sizeof(u32));
+      AppendBufferLoadDword(&code, registers[source], 30);
+    }
+    code.push_back(0xd52b001du);
+    code.push_back(0x4002290du); // v_fmac_f32_e64 v29, v13, -v20
+    AppendStoreVgpr(&code, 29, sample);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3FmacF32NegatedSourceAccumulates";
+  test.code = std::move(code);
+  test.initial = {0x40000000u, 0x40400000u, 0x41200000u,
+                  0x3f800001u, 0x3f7ffffeu, 0x3f800000u};
+  // 10 - 2*3 = 4; 1 - (1+2^-23)*(1-2^-23) = 2^-46, not rounded zero.
+  test.expected = {0x40800000u, 0x28800000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAC_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpFNegate", "Fma"};
+  return test;
+}
+
 TestCase Vop3LdexpSourceModifier() {
   using O = ShaderOpcode;
 
@@ -23596,6 +23625,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);

@@ -568,7 +568,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
-		const auto layout = depth_attachment_layout(depth);
+		const bool feedback = image.binding.is_bound && !depth_attachment_read_only(depth);
+		if (feedback && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+			EXIT("depth attachment feedback loop is not supported by the host\n");
+		}
+		const auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		                             : depth_attachment_layout(depth);
 		// The attachment store writes even when guest depth/stencil tests do not.
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
@@ -1143,6 +1148,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
 	                         state.color_count, state.depth_info);
+	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		const auto aspects =
+		    rendering.depth_stencil_attachment.image_layout ==
+		            vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		        ? ImageViewOps::DepthAspectMask(state.depth_info.desc.view_info.format)
+		        : vk::ImageAspectFlags {};
+		vk_buffer.setAttachmentFeedbackLoopEnableEXT(aspects);
+	}
 
 	LogDrawPhase(draw.name, "BeginRendering");
 	if (set_auto_debug) {

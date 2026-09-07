@@ -702,7 +702,7 @@ void CreatePipelineInternal(
 	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
 	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
-	const vk::DynamicState dynamic_states[] = {
+	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
 	    vk::DynamicState::eScissorWithCount,
 	    vk::DynamicState::eLineWidth,
@@ -715,22 +715,20 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
-#if !defined(__APPLE__)
-	    // Keep last so depth-only pipelines can omit this dynamic state.
-	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
-#endif
 	};
-	auto dynamic_states_count =
-	    static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
 #if !defined(__APPLE__)
-	if (rendering.color_count == 0) {
-		dynamic_states_count--;
+	if (rendering.color_count != 0) {
+		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
 #endif
+	if (graphics.attachment_feedback_loop_enabled) {
+		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+	}
+	const auto dynamic_states_count = static_cast<uint32_t>(dynamic_states.size());
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};
 	dynamic_state.dynamicStateCount = dynamic_states_count;
-	dynamic_state.pDynamicStates    = dynamic_states;
+	dynamic_state.pDynamicStates    = dynamic_states.data();
 
 	vk::GraphicsPipelineCreateInfo  pipeline_info {};
 	vk::PipelineRenderingCreateInfo rendering_info {};

@@ -923,6 +923,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16:
 		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_DWORD:

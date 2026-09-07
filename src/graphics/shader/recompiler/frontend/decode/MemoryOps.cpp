@@ -49,6 +49,10 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1du, Opcode::BUFFER_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
+    {0x20u, Opcode::BUFFER_LOAD_UBYTE_D16, 1, 8},
+    {0x21u, Opcode::BUFFER_LOAD_UBYTE_D16_HI, 1, 8},
+    {0x22u, Opcode::BUFFER_LOAD_SBYTE_D16, 1, 8, true},
+    {0x23u, Opcode::BUFFER_LOAD_SBYTE_D16_HI, 1, 8, true},
     {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
     {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
 	{0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true, 1},
@@ -293,10 +297,17 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	if (inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
+	if (inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
+	    inst.opcode == Opcode::BUFFER_LOAD_SBYTE_D16 ||
+	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
+	    inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16_HI ||
+	    inst.opcode == Opcode::BUFFER_LOAD_SBYTE_D16_HI ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
 		// RDNA2 D16 loads replace one half of VDATA and preserve the other.
-		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ? 4u : 5u;
+		const bool high = inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16_HI ||
+		                  inst.opcode == Opcode::BUFFER_LOAD_SBYTE_D16_HI ||
+		                  inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI;
+		inst.dst.sdwa_sel = high ? 5u : 4u;
 	} else if (inst.opcode == Opcode::BUFFER_STORE_BYTE_D16_HI ||
 	           inst.opcode == Opcode::BUFFER_STORE_SHORT_D16_HI) {
 		// VDATA is the store source: narrow its high half to eight or sixteen bits.

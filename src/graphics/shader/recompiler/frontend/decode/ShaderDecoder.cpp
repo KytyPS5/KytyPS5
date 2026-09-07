@@ -583,6 +583,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_LOAD_UBYTE:
 		case Opcode::BUFFER_LOAD_USHORT:
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_SHORT_D16:
 		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_LOAD_DWORD:

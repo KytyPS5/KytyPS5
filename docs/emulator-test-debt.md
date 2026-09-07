@@ -33,6 +33,31 @@ Required tests:
   and snapshot extraction, followed by two native Windows runs where the first is force-stopped
   and the second reports a compatible loaded cache.
 
+## Bounded shader diagnostic dumps
+
+Status: production fix and native game validation complete; automated regression deferred.
+
+Observed trigger: file diagnostics serialize decoded ISA and native IR more than once for every
+new shader. Large dispatcher programs can expand to tens of thousands or millions of IR
+instructions; one bounded game run produced a 254 MiB log with 10,468,972 lines and reached its
+timeout while formatting an early IR dump, before the next compiler phase could be observed.
+
+Required tests:
+
+- Small structured and dispatcher shaders below the instruction budget, checking that decoded ISA,
+  pre-resource IR and final IR remain present and unchanged in diagnostic output.
+- Exact-boundary and over-budget shaders, checking that expensive IR string construction is skipped
+  and replaced by a compact message containing the actual instruction count and configured limit.
+- A large dispatcher shader proving that normalization, resource tracking, specialization and
+  SPIR-V emission still execute when verbose IR text is omitted.
+- Phase-marker coverage around normalization/resource tracking so a timeout can be assigned to a
+  compiler phase even when the detailed dump is suppressed.
+- A silent guest-log run with `KYTY_SHADER_PHASE_TRACE=1`, checking that concise decode, CFG,
+  normalization, resource-tracking and SPIR-V markers reach stdout without enabling the shared
+  high-volume logger.
+- Repeated permutations and mixed small/large shaders proving that each detailed dump applies the
+  same bound and that concise phase tracing remains available for every program.
+
 ## Unsigned bitfield selectors for bounded resource tables
 
 Status: production fix and corpus validation in progress; automated regression deferred.

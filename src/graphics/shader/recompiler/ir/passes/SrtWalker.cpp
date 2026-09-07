@@ -32,6 +32,19 @@ std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::stri
 	                   StageName(program.stage), pc, message);
 }
 
+std::string ValueShape(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() == Type::U32) {
+			return fmt::format("0x{:08x}", value.U32());
+		}
+		return fmt::format("immediate:{}", TypeName(value.GetType()));
+	}
+	const auto* inst = value.TryInstruction();
+	return inst != nullptr ? std::string(ValueOpcodeName(inst->GetOpcode()))
+	                       : fmt::format("undefined:{}", TypeName(value.GetType()));
+}
+
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
 		return false;
@@ -418,9 +431,13 @@ class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
-	          Value active_mask = {})
+	          Value active_mask = {}, std::span<const BoundedSrtLayout> bounded_layouts = {},
+	          std::span<const uint32_t> bounded_flat = {},
+	          std::optional<uint32_t> bounded_candidate = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_bounded_layouts(bounded_layouts), m_bounded_flat(bounded_flat),
+	      m_bounded_candidate(bounded_candidate) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -431,7 +448,16 @@ public:
 		return true;
 	}
 
+	const std::string& FailureReason() const { return m_failure_reason; }
+
 private:
+	bool Fail(std::string reason) {
+		if (m_failure_reason.empty()) {
+			m_failure_reason = std::move(reason);
+		}
+		return false;
+	}
+
 	static float Float32(uint64_t bits) {
 		return std::bit_cast<float>(static_cast<uint32_t>(bits));
 	}
@@ -448,12 +474,13 @@ private:
 				case Type::U32: result = value.U32(); return true;
 				case Type::U64: result = value.U64(); return true;
 				case Type::F32: result = Float32Bits(value.F32Value()); return true;
-				default: return false;
+				default: return Fail(fmt::format("unsupported immediate type {}", TypeName(value.GetType())));
 			}
 		}
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
-			return false;
+			return Fail(fmt::format("non-immediate value has no defining instruction (type={})",
+			                        TypeName(value.GetType())));
 		}
 		if (!m_reserved) {
 			m_cache.reserve(m_program.value_storage.size());
@@ -469,11 +496,17 @@ private:
 			return true;
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
-			return false;
+			return Fail(fmt::format("cyclic dependency at {}", ValueOpcodeName(inst->GetOpcode())));
 		}
 		m_visiting.push_back(inst);
 		uint64_t out = 0;
 		if (!EvaluateInst(*inst, out)) {
+			m_visiting.pop_back();
+			const auto opcode = ValueOpcodeName(inst->GetOpcode());
+			if (m_failure_reason.empty()) {
+				return Fail(fmt::format("cannot evaluate {}", opcode));
+			}
+			m_failure_reason = fmt::format("{} -> {}", opcode, m_failure_reason);
 			return false;
 		}
 		m_visiting.pop_back();
@@ -510,7 +543,7 @@ private:
 		}
 		const auto* source = inst.Arg(0).ResolveInstruction();
 		if (source == nullptr) {
-			return false;
+			return Fail("composite extraction source is unavailable");
 		}
 		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 			return EvaluateWide(source->Arg(component), result);
@@ -533,18 +566,19 @@ private:
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
-			return false;
+			return Fail(fmt::format("scalar read memory index {} exceeds metadata count {}",
+			                        flags.index, m_program.memory_info.size()));
 		}
 		const auto& mem    = m_program.memory_info[flags.index];
 		const auto* handle = inst.Arg(0).ResolveInstruction();
 		if (handle == nullptr) {
-			return false;
+			return Fail("scalar read has no descriptor handle");
 		}
 		uint64_t low    = 0;
 		uint64_t high   = 0;
 		uint64_t offset = 0;
 		if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
-			return false;
+			return m_failure_reason.empty() ? Fail("scalar read address evaluation failed") : false;
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
@@ -553,10 +587,10 @@ private:
 			uint64_t records = 0;
 			uint64_t word3   = 0;
 			if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-				return false;
+				return m_failure_reason.empty() ? Fail("scalar-buffer descriptor evaluation failed") : false;
 			}
 			if (immediate < 0) {
-				return false;
+				return Fail(fmt::format("scalar-buffer read has negative immediate offset {}", immediate));
 			}
 			const auto byte_offset =
 			    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
@@ -566,14 +600,26 @@ private:
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return false;
+				// S_BUFFER_LOAD returns zero beyond its descriptor extent. Bounded descriptor
+				// enumeration can legitimately visit such over-approximated candidates.
+				result = 0u;
+				return true;
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
+			if (m_bounded_candidate.has_value() && base == 0u) {
+				// A bounded selector proof can over-approximate the live keys after the
+				// descriptor pointer table ends. Preserve a null descriptor for that tail;
+				// non-null unreadable addresses below still fail closed.
+				result = 0u;
+				return true;
+			}
 			const auto relative = (immediate & ~int64_t {3}) +
 			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 			if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-				return false;
+				return Fail(fmt::format(
+				    "scalar-address read overflows guest range (base=0x{:016x} offset={})",
+				    base & ~uint64_t {3}, relative));
 			}
 		}
 		uint32_t word = 0;
@@ -582,11 +628,11 @@ private:
 				const auto message = Diagnostic(m_program, flags.pc,
 				    fmt::format("cannot read descriptor memory at guest address 0x{:016x}", address));
 				std::fprintf(stderr, "%s\n", message.c_str());
-				return false;
+				return Fail(fmt::format("guest descriptor memory read failed at 0x{:016x}", address));
 			}
 		} else {
 			if (!HostMemoryRangeIsReadable(address, sizeof(word))) {
-				return false;
+				return Fail(fmt::format("host descriptor memory is unreadable at 0x{:016x}", address));
 			}
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
@@ -607,7 +653,10 @@ private:
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 				if (reg < m_program.user_data_base ||
 				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
-					return false;
+					return Fail(fmt::format(
+					    "user-data register s{} is outside runtime span s{}..s{}", reg,
+					    m_program.user_data_base,
+					    m_program.user_data_base + static_cast<uint32_t>(m_runtime.user_data.size())));
 				}
 				result = m_runtime.user_data[reg - m_program.user_data_base];
 				return true;
@@ -616,8 +665,12 @@ private:
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
 				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1));
-				return active.EvaluateWide(inst.Arg(0), result);
+				                 inst.Arg(1), m_bounded_layouts, m_bounded_flat,
+				                 m_bounded_candidate);
+				if (!active.EvaluateWide(inst.Arg(0), result)) {
+					return Fail(fmt::format("ReadFirstLane source failed: {}", active.FailureReason()));
+				}
+				return true;
 			}
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
@@ -637,11 +690,36 @@ private:
 					return false;
 				}
 				if (slot.U32() < m_clean_flat_slots.size() &&
-				    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
-					return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
-					                                       result);
+				    m_clean_flat_slots[slot.U32()] == ResourcePlan::FlatSlotClean &&
+				    m_clean_evaluator != nullptr) {
+					if (!m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
+					                                      result)) {
+						return Fail(fmt::format("clean SRT slot {} failed: {}", slot.U32(),
+						                        m_clean_evaluator->FailureReason()));
+					}
+					return true;
 				}
 				return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
+			}
+			case ValueOpcode::ReadBoundedSrtU32: {
+				if (!m_bounded_candidate.has_value()) {
+					return Fail("bounded SRT value requires candidate enumeration");
+				}
+				const auto id = inst.Flags<uint32_t>();
+				if (id >= m_bounded_layouts.size()) {
+					return Fail(fmt::format("bounded SRT read {} exceeds layout count {}", id,
+					                        m_bounded_layouts.size()));
+				}
+				const auto& layout = m_bounded_layouts[id];
+				if (*m_bounded_candidate >= layout.count ||
+				    layout.flat_offset > m_bounded_flat.size() ||
+				    *m_bounded_candidate >= m_bounded_flat.size() - layout.flat_offset) {
+					return Fail(fmt::format(
+					    "bounded SRT read {} candidate {} exceeds count {} or flat snapshot", id,
+					    *m_bounded_candidate, layout.count));
+				}
+				result = m_bounded_flat[layout.flat_offset + *m_bounded_candidate];
+				return true;
 			}
 			case ValueOpcode::LoadAddressU32:
 			case ValueOpcode::ReadConstBuffer:
@@ -930,8 +1008,12 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
+	std::span<const BoundedSrtLayout>          m_bounded_layouts;
+	std::span<const uint32_t>                  m_bounded_flat;
+	std::optional<uint32_t>                    m_bounded_candidate;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
+	std::string                               m_failure_reason;
 	bool                                      m_reserved = false;
 };
 
@@ -949,7 +1031,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (!program.srt_plan_complete) {
 		return false;
 	}
-	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
+	if (std::ranges::any_of(clean_flat_slots, [](uint8_t mode) {
+		    return mode == ResourcePlan::FlatSlotClean;
+	    }) &&
 	    runtime.read_specialization_memory == nullptr) {
 		return false;
 	}
@@ -968,8 +1052,30 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		value.dword_count = source->dword_count;
 		for (uint32_t index = 0; index < source->dword_count; index++) {
 			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+				std::string layout;
+				for (uint32_t word = 0; word < source->dword_count; ++word) {
+					if (!layout.empty()) layout += ", ";
+					layout += ValueShape(source->dwords[word]);
+				}
+				std::string roles;
+				const auto append_role = [&](std::string role) {
+					if (!roles.empty()) roles += ", ";
+					roles += std::move(role);
+				};
+				for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource)
+					if (program.info.buffers[resource].source == source_index)
+						append_role(fmt::format("buffer{}", resource));
+				for (uint32_t resource = 0; resource < program.info.images.size(); ++resource)
+					if (program.info.images[resource].source == source_index)
+						append_role(fmt::format("image{}", resource));
+				for (uint32_t resource = 0; resource < program.info.samplers.size(); ++resource)
+					if (program.info.samplers[resource].source == source_index)
+						append_role(fmt::format("sampler{}", resource));
+				if (roles.empty()) roles = "planning-only";
 				const auto message = Diagnostic(program, 0u,
-				    fmt::format("descriptor source {} dword {} evaluation failed", source_index, index));
+				    fmt::format(
+				        "descriptor source {} dword {} evaluation failed: {}; roles=[{}] layout=[{}]",
+				        source_index, index, evaluator.FailureReason(), roles, layout));
 				std::fprintf(stderr, "%s\n", message.c_str());
 				return false;
 			}
@@ -980,8 +1086,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
-			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
-			                      clean_flat_slots[read.flat_offset] != 0u;
+			const auto mode = read.flat_offset < clean_flat_slots.size()
+			                      ? clean_flat_slots[read.flat_offset]
+			                      : ResourcePlan::FlatSlotOrdinary;
+			if (mode == ResourcePlan::FlatSlotDeferred) continue;
+			const bool clean    = mode == ResourcePlan::FlatSlotClean;
 			auto&      selected = clean ? clean_evaluator : evaluator;
 			if (read.flat_offset >= flattened.size() ||
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
@@ -1732,6 +1841,30 @@ bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
 		return false;
 	}
 	result = results.front();
+	return true;
+}
+
+bool EvaluateBoundedDescriptorSource(const ResourcePlan& program, uint32_t source,
+                                     const SrtRuntime& runtime,
+                                     std::span<const BoundedSrtLayout> layouts,
+                                     std::span<const uint32_t> flattened_srt,
+                                     uint32_t candidate, DescriptorValue& result) {
+	const auto* descriptor = Source(program, source);
+	if (descriptor == nullptr) return false;
+	Evaluator evaluator(program, runtime, {}, nullptr, {}, layouts, flattened_srt, candidate);
+	DescriptorValue next;
+	next.dword_count = descriptor->dword_count;
+	for (uint32_t word = 0; word < descriptor->dword_count; ++word) {
+		if (!evaluator.Evaluate(descriptor->dwords[word], next.dwords[word])) {
+			const auto message = Diagnostic(
+			    program, 0u,
+			    fmt::format("bounded descriptor source {} candidate {} dword {} failed: {}",
+			                source, candidate, word, evaluator.FailureReason()));
+			std::fprintf(stderr, "%s\n", message.c_str());
+			return false;
+		}
+	}
+	result = next;
 	return true;
 }
 

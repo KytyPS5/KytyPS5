@@ -52,6 +52,14 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value);
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);
 
+// Evaluates a descriptor expression for one candidate of an already captured bounded SRT table.
+// ReadBoundedSrtU32 ignores its live GPU key only within this host enumeration transaction.
+bool EvaluateBoundedDescriptorSource(const ResourcePlan& program, uint32_t source,
+                                     const SrtRuntime& runtime,
+                                     std::span<const BoundedSrtLayout> layouts,
+                                     std::span<const uint32_t> flattened_srt,
+                                     uint32_t candidate, DescriptorValue& result);
+
 // Evaluates one runtime snapshot transactionally. Scalar values and ReadConst results shared by
 // several descriptors are memoized once across the batch.
 bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,

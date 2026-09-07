@@ -4,6 +4,100 @@ This file records regression coverage deferred during fast launch bring-up. Each
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
 
+## Runtime descriptor-evaluation failure diagnostics
+
+Status: production diagnostic and native game validation complete; automated regression deferred.
+
+Observed trigger: a descriptor source can pass the static runtime-value validator and still
+fail when evaluated against the current dispatch state. The old message identified only the
+source and DWORD, hiding whether the cause was a short user-data span, a cyclic value, an
+unsupported opcode, invalid memory metadata, an out-of-range scalar-buffer read or unavailable
+guest memory. This made a generic correction indistinguishable from a transient dirty-resource
+retry.
+
+Required tests:
+
+- Immediate, user-data and shader-base sources proving that successful evaluation remains silent
+  and a user-data index outside the current runtime span reports both the requested and available
+  ranges.
+- Unsupported opcode, undefined value, malformed composite extraction and cyclic dependency
+  cases proving that the deepest failing opcode/reason is retained in the source/DWORD diagnostic.
+- Scalar-address and scalar-buffer reads covering invalid metadata, failed address arguments,
+  negative/out-of-range offsets and unavailable guest memory, with the computed address included
+  where one exists.
+- `ReadFirstLane` and clean-snapshot delegation cases proving that a nested evaluator's reason is
+  propagated through the outer descriptor source rather than replaced by a generic failure.
+- Transactional materialization checks proving that detailed diagnostics do not mutate the
+  previous `ResourceSnapshot` or `ResourceSpecialization` on failure.
+
+## Bounded descriptor columns behind flattened SRT slots
+
+Status: production fix and native game validation complete; automated regression deferred.
+
+Observed trigger: `BuildSrtPlan` can replace a scalar descriptor-table load with `ReadConst`,
+while the saved flat slot still resolves to a read that resource tracking later converts to
+`ReadBoundedSrtU32`. Bounded buffer/image recognition looked only at the immediate handle argument,
+so it missed four/eight correlated columns hidden behind those flat slots. Ordinary runtime
+materialization then tried to evaluate the GPU-selected bounded value as one invariant descriptor.
+
+Required tests:
+
+- Four correlated buffer-descriptor columns passed directly as bounded reads and through four
+  distinct `ReadConst` flat slots, checking that both forms produce the same dense candidate table.
+- Eight correlated image-descriptor columns behind flattened slots, checking descriptor
+  deduplication, key mapping and null/invalid descriptor normalization.
+- Mixed direct/flattened columns, nested flat slots and shared flat slots proving recognition
+  follows only exact `SrtRead` values, rejects a slot cycle and preserves the live GPU selector.
+- Rejection cases for an invalid flat index, a non-immediate slot, unrelated bounded reads,
+  mismatched count/address/stride/bias, partial descriptors and workgroup-indexed tables.
+- Materialization and SPIR-V checks proving the flattened snapshot remains immutable, all column
+  reads share one coherent transaction, and the generated resource-table lookup is bounds safe.
+
+## Dependent buffer, image and sampler descriptors addressed by bounded SRT values
+
+Status: production fix and native game validation complete; automated regression deferred.
+
+Observed trigger: a buffer, image or sampler descriptor can be loaded through `LoadAddressU32`
+whose address itself comes from one or more `ReadBoundedSrtU32` values. The bounded values are
+GPU-selected, so ordinary host evaluation cannot produce one invariant descriptor; direct
+four/eight-column table recognition also does not apply because the bounded read is an address
+dependency rather than a descriptor DWORD.
+
+Required tests:
+
+- A bounded low/high pointer pair feeding four dependent `LoadAddressU32` descriptor words,
+  checking that materialization evaluates every proved selector candidate and preserves the live
+  selector in generated SPIR-V.
+- The equivalent eight-word image descriptor, including invalid/null normalization, typed
+  candidate specialization and sampled/storage binding selection.
+- A four-word sampler expression paired with an image expression using the same proved selector,
+  checking that every dense image candidate receives the matching sampler descriptor and depth
+  comparison function.
+- Repeated image descriptors with different sampler descriptors, proving candidate deduplication
+  uses the image/sampler pair and does not silently collapse distinct filtering state.
+- Candidate deduplication, zero-count and repeated-address cases, checking dense buffer IDs and the
+  flattened selector mapping against an independent oracle.
+- A bounded scalar-buffer dependency whose final candidate is outside the descriptor byte extent,
+  checking that it snapshots the guest buffer-load zero result while an unavailable in-range host
+  read still fails the transaction.
+- Dependent descriptor evaluation through scalar-buffer and raw-address reads, checking that an
+  out-of-bounds scalar-buffer word and a null-base raw read in an over-approximated bounded
+  candidate produce zero, while every non-null unavailable or GPU-dirty address still fails.
+- Multiple bounded dependencies with the same key/count but different source tables, and nested
+  runtime-uniform address arithmetic, proving one coherent snapshot transaction covers all reads.
+- Several descriptor columns sharing one 16-bit selector domain, proving the 65,536-candidate
+  limit applies to each read while a separate bounded total-word budget covers the coherent
+  snapshot; also check that exceeding either limit fails before any partial snapshot escapes.
+- Flattened `ReadConst` slots wrapping GPU-selected address dependencies, checking that the base
+  snapshot reserves those slots without eagerly evaluating them and candidate evaluation still
+  follows the original saved value graph.
+- Rejection cases for different selector values, counts, signedness, workgroup axes, invalid read
+  IDs, dependency cycles, unavailable/dirty descriptor memory and descriptor/resource limits.
+- A bounded sampler used without a correlatable bounded image, and an image referenced with two
+  different bounded sampler tables, proving unsupported independent sampler selection fails closed.
+- Writable-alias and transactionality cases proving no eager snapshot overlaps a writable guest
+  range and no partial candidates escape after any dependent read fails.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

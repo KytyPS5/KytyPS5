@@ -5,8 +5,11 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -244,6 +247,10 @@ private:
 		Inst* handle = nullptr;
 		Value index;
 	};
+	struct BoundedSamplerPlan {
+		Inst* handle = nullptr;
+		Value index;
+	};
 
 	void PlanBoundedReads() {
 		if (m_program.stage != ShaderType::Compute) return;
@@ -292,16 +299,192 @@ private:
 		return found == m_bounded_reads.end() ? nullptr : &*found;
 	}
 
-	bool MakeBoundedBufferSource(Inst& handle, uint32_t& source) {
-		if (handle.NumArgs() != 4u) return false;
+	const BoundedReadPlan* BoundedReadValue(Value value) const {
+		value = value.Resolve();
+		const Inst* read = value.TryInstruction();
+		std::unordered_set<uint32_t> visited_slots;
+		while (read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+		       read->NumArgs() == 2u) {
+			const auto slot = read->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size() ||
+			    !visited_slots.insert(slot.U32()).second) {
+				return nullptr;
+			}
+			read = m_program.srt_reads[slot.U32()].value.Resolve().TryInstruction();
+		}
+		return BoundedRead(read);
+	}
+
+	bool CollectBoundedDependencies(Value value, std::vector<const BoundedReadPlan*>& dependencies,
+	                                std::unordered_set<const Inst*>& visiting) const {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return true;
+		if (const auto* bounded = BoundedRead(inst); bounded != nullptr) {
+			if (std::ranges::find(dependencies, bounded) == dependencies.end())
+				dependencies.push_back(bounded);
+			return true;
+		}
+		if (!visiting.insert(inst).second) return false;
+		const auto finish = [&](bool result) {
+			visiting.erase(inst);
+			return result;
+		};
+		if (inst->GetOpcode() == ValueOpcode::ReadConst && inst->NumArgs() == 2u) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) return finish(false);
+			return finish(CollectBoundedDependencies(m_program.srt_reads[slot.U32()].value,
+			                                           dependencies, visiting));
+		}
+		for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+			if (!CollectBoundedDependencies(inst->Arg(arg), dependencies, visiting))
+				return finish(false);
+		}
+		return finish(true);
+	}
+
+	uint32_t InternBoundedSelector(Value selector) {
+		selector = selector.Resolve();
+		for (uint32_t group = 0; group < m_bounded_selectors.size(); ++group) {
+			if (EquivalentValue(m_program, selector, m_bounded_selectors[group])) return group;
+		}
+		m_bounded_selectors.push_back(selector);
+		return static_cast<uint32_t>(m_bounded_selectors.size() - 1u);
+	}
+
+	bool MakeBoundedBufferExpression(Inst& handle, DescriptorSource descriptor,
+	                                 uint32_t& source, std::string& rejection) {
+		std::vector<const BoundedReadPlan*> dependencies;
+		std::unordered_set<const Inst*> visiting;
+		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting)) {
+				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
+				return false;
+			}
+		}
+		if (dependencies.empty()) return false;
+		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		if (first.workgroup_axis != UINT32_MAX) {
+			rejection = "descriptor dependency is indexed by a workgroup axis";
+			return false;
+		}
+		for (const auto* dependency: dependencies) {
+			const auto& read = m_bounded_srt_reads[dependency->read_id];
+			if (dependency->proof.index != dependencies.front()->proof.index ||
+			    read.count_source != first.count_source || read.count_signed != first.count_signed ||
+			    read.workgroup_axis != first.workgroup_axis) {
+				rejection = "descriptor dependencies do not share one selector and count";
+				return false;
+			}
+		}
+		descriptor.bounded_buffer.emplace();
+		descriptor.bounded_buffer->expression = true;
+		descriptor.bounded_buffer->selector_group =
+		    InternBoundedSelector(dependencies.front()->proof.index);
+		for (const auto* dependency: dependencies)
+			descriptor.bounded_buffer->dependencies.push_back(dependency->read_id);
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_buffers,
+		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; })) {
+			m_bounded_buffers.push_back(
+			    {&handle, dependencies.front()->proof.index, {Value(0u), Value(0u), Value(0u)}});
+		}
+		return true;
+	}
+
+	bool MakeBoundedImageExpression(Inst& handle, DescriptorSource descriptor,
+	                                uint32_t& source, std::string& rejection) {
+		std::vector<const BoundedReadPlan*> dependencies;
+		std::unordered_set<const Inst*> visiting;
+		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting)) {
+				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
+				return false;
+			}
+		}
+		if (dependencies.empty()) return false;
+		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		if (first.workgroup_axis != UINT32_MAX) {
+			rejection = "descriptor dependency is indexed by a workgroup axis";
+			return false;
+		}
+		for (const auto* dependency: dependencies) {
+			const auto& read = m_bounded_srt_reads[dependency->read_id];
+			if (dependency->proof.index != dependencies.front()->proof.index ||
+			    read.count_source != first.count_source || read.count_signed != first.count_signed ||
+			    read.workgroup_axis != first.workgroup_axis) {
+				rejection = "descriptor dependencies do not share one selector and count";
+				return false;
+			}
+		}
+		descriptor.bounded_image.emplace();
+		descriptor.bounded_image->expression = true;
+		descriptor.bounded_image->selector_group =
+		    InternBoundedSelector(dependencies.front()->proof.index);
+		for (const auto* dependency: dependencies)
+			descriptor.bounded_image->dependencies.push_back(dependency->read_id);
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_images,
+		    [&](const BoundedImagePlan& plan) { return plan.handle == &handle; }))
+			m_bounded_images.push_back({&handle, dependencies.front()->proof.index});
+		return true;
+	}
+
+	bool MakeBoundedSamplerExpression(Inst& handle, DescriptorSource descriptor,
+	                                  uint32_t& source, std::string& rejection) {
+		std::vector<const BoundedReadPlan*> dependencies;
+		std::unordered_set<const Inst*> visiting;
+		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting)) {
+				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
+				return false;
+			}
+		}
+		if (dependencies.empty()) return false;
+		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		if (first.workgroup_axis != UINT32_MAX) {
+			rejection = "descriptor dependency is indexed by a workgroup axis";
+			return false;
+		}
+		for (const auto* dependency: dependencies) {
+			const auto& read = m_bounded_srt_reads[dependency->read_id];
+			if (dependency->proof.index != dependencies.front()->proof.index ||
+			    read.count_source != first.count_source || read.count_signed != first.count_signed ||
+			    read.workgroup_axis != first.workgroup_axis) {
+				rejection = "descriptor dependencies do not share one selector and count";
+				return false;
+			}
+		}
+		descriptor.bounded_sampler.emplace();
+		descriptor.bounded_sampler->selector_group =
+		    InternBoundedSelector(dependencies.front()->proof.index);
+		for (const auto* dependency: dependencies)
+			descriptor.bounded_sampler->dependencies.push_back(dependency->read_id);
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_samplers,
+		    [&](const BoundedSamplerPlan& plan) { return plan.handle == &handle; }))
+			m_bounded_samplers.push_back({&handle, dependencies.front()->proof.index});
+		return true;
+	}
+
+	bool MakeBoundedBufferSource(Inst& handle, uint32_t& source, std::string& rejection) {
+		const auto reject = [&](std::string reason) {
+			rejection = std::move(reason);
+			return false;
+		};
+		if (handle.NumArgs() != 4u) return reject("descriptor width is not four DWORDs");
 		std::array<const BoundedReadPlan*, 4> words;
 		for (uint32_t word = 0; word < words.size(); ++word) {
-			words[word] = BoundedRead(handle.Arg(word).Resolve().TryInstruction());
-			if (words[word] == nullptr) return false;
+			words[word] = BoundedReadValue(handle.Arg(word));
+			if (words[word] == nullptr)
+				return reject(fmt::format("column {} is not a proved bounded read", word));
 		}
 		const auto& first = m_bounded_srt_reads[words[0]->read_id];
 		// Workgroup snapshots currently cover scalar payloads, not descriptor candidates.
-		if (first.workgroup_axis != UINT32_MAX) return false;
+		if (first.workgroup_axis != UINT32_MAX)
+			return reject("column 0 is indexed by a workgroup axis");
 		for (uint32_t word = 1; word < words.size(); ++word) {
 			const auto& next = m_bounded_srt_reads[words[word]->read_id];
 			if (words[word]->proof.index != words[0]->proof.index ||
@@ -309,7 +492,11 @@ private:
 			    first.count_signed != next.count_signed ||
 			    next.workgroup_axis != UINT32_MAX ||
 			    first.offset_scale != next.offset_scale || first.offset_bias != next.offset_bias ||
-			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
+			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t))
+				return reject(fmt::format(
+				    "column {} is not correlated (read={} first_read={} offset={} expected={})",
+				    word, words[word]->read_id, words[0]->read_id, next.memory_offset,
+				    first.memory_offset + word * sizeof(uint32_t)));
 		}
 		DescriptorSource descriptor;
 		descriptor.dword_count = 4u;
@@ -322,6 +509,7 @@ private:
 		                           ? words[0]->proof.descriptor_word3
 		                           : Value(0u);
 		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer {};
+		descriptor.bounded_buffer->selector_group = InternBoundedSelector(words[0]->proof.index);
 		for (uint32_t word = 0; word < words.size(); ++word)
 			descriptor.bounded_buffer->reads[word] = words[word]->read_id;
 		source = InternSource(descriptor);
@@ -336,7 +524,7 @@ private:
 		if (handle.NumArgs() != 8u) return false;
 		std::array<const BoundedReadPlan*, 8> words;
 		for (uint32_t word = 0; word < words.size(); ++word) {
-			words[word] = BoundedRead(handle.Arg(word).Resolve().TryInstruction());
+			words[word] = BoundedReadValue(handle.Arg(word));
 			if (words[word] == nullptr || words[word]->proof.source_dwords != 2u) return false;
 		}
 		const auto& first = m_bounded_srt_reads[words[0]->read_id];
@@ -358,6 +546,7 @@ private:
 		for (uint32_t word = 3; word < descriptor.dword_count; ++word)
 			descriptor.dwords[word] = Value(0u);
 		descriptor.bounded_image.emplace();
+		descriptor.bounded_image->selector_group = InternBoundedSelector(words[0]->proof.index);
 		for (uint32_t word = 0; word < words.size(); ++word)
 			descriptor.bounded_image->reads[word] = words[word]->read_id;
 		source = InternSource(descriptor);
@@ -472,6 +661,10 @@ private:
 			plan.handle->SetArg(0, plan.index);
 			for (uint32_t word = 1; word < 8u; ++word) plan.handle->SetArg(word, Value(0u));
 		}
+		for (const auto& plan : m_bounded_samplers) {
+			plan.handle->SetArg(0, plan.index);
+			for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
+		}
 		std::erase_if(m_program.dynamic_reads, [](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
 			return inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32;
@@ -503,6 +696,24 @@ private:
 			retain(read.address_source);
 			if (read.workgroup_axis == UINT32_MAX) retain(read.count_source);
 		}
+		for (const auto& buffer: m_info.buffers) {
+			if (buffer.source < m_sources.size() && m_sources[buffer.source].bounded_buffer.has_value() &&
+			    m_sources[buffer.source].bounded_buffer->expression) {
+				retain(buffer.source);
+			}
+		}
+		for (const auto& image: m_info.images) {
+			if (image.source < m_sources.size() && m_sources[image.source].bounded_image.has_value() &&
+			    m_sources[image.source].bounded_image->expression) {
+				retain(image.source);
+			}
+		}
+		for (const auto& sampler: m_info.samplers) {
+			if (sampler.source < m_sources.size() &&
+			    m_sources[sampler.source].bounded_sampler.has_value()) {
+				retain(sampler.source);
+			}
+		}
 	}
 
 	uint32_t InternSource(const DescriptorSource& descriptor) {
@@ -511,7 +722,9 @@ private:
 			if (current.dword_count != descriptor.dword_count ||
 			    current.indirect_image != descriptor.indirect_image ||
 			    current.inline_descriptor != descriptor.inline_descriptor ||
-			    current.bounded_buffer != descriptor.bounded_buffer) {
+			    current.bounded_buffer != descriptor.bounded_buffer ||
+			    current.bounded_image != descriptor.bounded_image ||
+			    current.bounded_sampler != descriptor.bounded_sampler) {
 				continue;
 			}
 			bool same = true;
@@ -1123,10 +1336,36 @@ private:
 				handle->SetArg(dword, LowerRuntimeDescriptorPhi(handle->Arg(dword), *handle));
 			}
 		}
-		if (expected == ValueOpcode::GetBufferResource && MakeBoundedBufferSource(*handle, source)) return;
+		std::string bounded_rejection;
+		if (expected == ValueOpcode::GetBufferResource &&
+		    MakeBoundedBufferSource(*handle, source, bounded_rejection)) return;
+		bool has_bounded_column = false;
+		if (expected == ValueOpcode::GetBufferResource) {
+			for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
+				has_bounded_column |= BoundedReadValue(handle->Arg(word)) != nullptr;
+			}
+		}
+		if (has_bounded_column) {
+			static const bool trace = [] {
+				const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+				return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+			}();
+			if (trace) {
+				std::fprintf(stderr,
+				             "shader resource tracking: hash=0x%016" PRIx64
+				             " pc=0x%08" PRIx32 " bounded buffer recognition rejected: %s\n",
+				             m_program.shader_hash, pc, bounded_rejection.c_str());
+			}
+		}
 		if (expected == ValueOpcode::GetImageResource && MakeBoundedImageSource(*handle, source)) return;
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
+		if (expected == ValueOpcode::GetBufferResource &&
+		    MakeBoundedBufferExpression(*handle, descriptor, source, bounded_rejection)) return;
+		if (expected == ValueOpcode::GetImageResource &&
+		    MakeBoundedImageExpression(*handle, descriptor, source, bounded_rejection)) return;
+		if (expected == ValueOpcode::GetSamplerResource &&
+		    MakeBoundedSamplerExpression(*handle, descriptor, source, bounded_rejection)) return;
 		uint32_t bad_dword = 0;
 		if (expected == ValueOpcode::GetImageResource) {
 			for (; bad_dword < descriptor.dword_count; bad_dword++) {
@@ -1445,6 +1684,8 @@ private:
 	std::vector<Inst*> m_bounded_root_reads;
 	std::vector<BoundedBufferPlan> m_bounded_buffers;
 	std::vector<BoundedImagePlan> m_bounded_images;
+	std::vector<BoundedSamplerPlan> m_bounded_samplers;
+	std::vector<Value>             m_bounded_selectors;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
 	std::vector<IndirectImagePlan> m_indirect_images;

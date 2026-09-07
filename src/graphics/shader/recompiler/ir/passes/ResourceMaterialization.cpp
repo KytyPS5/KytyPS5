@@ -24,6 +24,12 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
+// A 16-bit selector can feed multiple descriptors and their address expressions.
+// Bound each selector domain independently, then apply an explicit memory budget
+// to the whole coherent transaction instead of treating the first 65,536 words
+// as a semantic limit. This includes 256 full-width selector columns.
+constexpr uint64_t MaxBoundedSnapshotBytes = 64u * 1024u * 1024u;
+constexpr uint64_t MaxBoundedSnapshotWords = MaxBoundedSnapshotBytes / sizeof(uint32_t);
 
 struct IndirectImage {
 	uint32_t                     resource = 0;
@@ -41,6 +47,10 @@ struct MaterializedSnapshot {
 	ResourceSnapshot           resources;
 	std::vector<IndirectImage> indirect_images;
 	std::vector<BoundedSrtLayout> bounded_srt_reads;
+	std::vector<std::vector<DescriptorValue>> bounded_buffer_expressions;
+	std::vector<std::vector<DescriptorValue>> bounded_image_expressions;
+	std::vector<std::vector<DescriptorValue>> bounded_sampler_expressions;
+	std::vector<uint8_t> bounded_sampler_consumed;
 };
 
 bool SpecializationFail(std::string_view message) {
@@ -172,7 +182,7 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 			const auto slot = inst->Arg(1).Resolve();
 			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
-				slots[slot.U32()] = 1u;
+				slots[slot.U32()] = ResourcePlan::FlatSlotClean;
 				pending.push_back(program.srt_reads[slot.U32()].value);
 			}
 			continue;
@@ -181,6 +191,36 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 			pending.push_back(inst->Arg(arg));
 		}
 	}
+}
+
+void MarkDeferredFlatSlots(const ResourcePlan& program, const DescriptorSource* source,
+	                       std::span<uint8_t> slots) {
+	if (source == nullptr) return;
+	std::vector<const Inst*> visiting;
+	std::function<bool(Value)> depends_on_bounded = [&](Value value) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32) return true;
+		if (std::ranges::find(visiting, inst) != visiting.end()) return false;
+		visiting.push_back(inst);
+		bool dependent = false;
+		if (inst->GetOpcode() == ValueOpcode::ReadConst && inst->NumArgs() == 2u) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < program.srt_reads.size() && slot.U32() < slots.size()) {
+				dependent = depends_on_bounded(program.srt_reads[slot.U32()].value);
+				if (dependent) slots[slot.U32()] = ResourcePlan::FlatSlotDeferred;
+			}
+		} else {
+			for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+				dependent = depends_on_bounded(inst->Arg(arg)) || dependent;
+		}
+		visiting.pop_back();
+		return dependent;
+	};
+	for (uint32_t word = 0; word < source->dword_count; ++word)
+		depends_on_bounded(source->dwords[word]);
 }
 
 uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
@@ -532,7 +572,7 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	}
 	SrtRuntime clean_runtime = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
-	uint64_t probes = 0;
+	uint64_t snapshot_words = 0;
 	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
 		const auto& read = program.bounded_srt_reads[id];
 		const auto* address_source = Source(program, read.address_source);
@@ -565,13 +605,16 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			const auto raw_count = count.dwords[0];
 			size = read.count_signed && static_cast<int32_t>(raw_count) <= 0 ? 0u : raw_count;
 		}
-		probes += size;
-		if (probes > MaxIndirectImageProbes ||
+		if (size > MaxIndirectImageProbes ||
+		    snapshot_words > MaxBoundedSnapshotWords - uint64_t{size} ||
 		    snapshot.resources.flattened_srt.size() > UINT32_MAX - uint64_t{size}) {
 			return SpecializationFail(fmt::format(
-			    "bounded SRT read {} exceeds the probe/flat limit (count={} stride={} bias={} probes={} limit={})",
-			    id, size, read.offset_scale, read.offset_bias, probes, MaxIndirectImageProbes));
+			    "bounded SRT read {} exceeds the candidate/snapshot limit "
+			    "(count={} stride={} bias={} words={} candidate_limit={} word_limit={})",
+			    id, size, read.offset_scale, read.offset_bias, snapshot_words + uint64_t{size},
+			    MaxIndirectImageProbes, MaxBoundedSnapshotWords));
 		}
+		snapshot_words += size;
 		auto& flat = snapshot.resources.flattened_srt;
 		const auto start = static_cast<uint32_t>(flat.size());
 		snapshot.bounded_srt_reads.push_back({size, start});
@@ -600,8 +643,10 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 				                           ? uint64_t{address_words.dwords[2]}
 				                           : uint64_t{stride} * address_words.dwords[2];
 				if (aligned > bytes || bytes - aligned < sizeof(uint32_t)) {
-					return SpecializationFail(fmt::format(
-					    "bounded buffer read {} index {} exceeds its source descriptor", id, index));
+					// Scalar buffer loads return zero outside the descriptor extent. Preserve that
+					// guest result in the candidate snapshot without touching host memory.
+					flat.push_back(0u);
+					continue;
 				}
 				offset = static_cast<int64_t>(aligned);
 			} else {
@@ -625,6 +670,143 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	return true;
 }
 
+bool MaterializeBoundedBufferExpressions(const ResourcePlan& program, const SrtRuntime& runtime,
+	                                      MaterializedSnapshot& snapshot) {
+	snapshot.bounded_buffer_expressions.resize(program.info.buffers.size());
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	for (uint32_t logical = 0; logical < program.info.buffers.size(); ++logical) {
+		const auto* source = Source(program, program.info.buffers[logical].source);
+		if (source == nullptr || !source->bounded_buffer.has_value() ||
+		    !source->bounded_buffer->expression) {
+			continue;
+		}
+		const auto& bounded = *source->bounded_buffer;
+		if (source->dword_count != 4u || bounded.key_arg != 0u ||
+		    bounded.dependencies.empty()) {
+			return SpecializationFail("bounded buffer expression has invalid metadata");
+		}
+		const auto first = bounded.dependencies.front();
+		if (first >= snapshot.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded buffer expression has an invalid dependency");
+		}
+		const auto count = snapshot.bounded_srt_reads[first].count;
+		for (const auto dependency: bounded.dependencies) {
+			if (dependency >= snapshot.bounded_srt_reads.size() ||
+			    snapshot.bounded_srt_reads[dependency].count != count) {
+				return SpecializationFail(
+				    "bounded buffer expression dependencies have different candidate counts");
+			}
+		}
+		auto& candidates = snapshot.bounded_buffer_expressions[logical];
+		candidates.reserve(count);
+		for (uint32_t candidate = 0; candidate < count; ++candidate) {
+			DescriptorValue descriptor;
+			if (!EvaluateBoundedDescriptorSource(
+			        program, program.info.buffers[logical].source, clean_runtime,
+			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
+			        descriptor)) {
+				return SpecializationFail(fmt::format(
+				    "bounded buffer expression {} candidate {} cannot be evaluated", logical,
+				    candidate));
+			}
+			candidates.push_back(descriptor);
+		}
+	}
+	return true;
+}
+
+bool MaterializeBoundedImageExpressions(const ResourcePlan& program, const SrtRuntime& runtime,
+	                                     MaterializedSnapshot& snapshot) {
+	snapshot.bounded_image_expressions.resize(program.info.images.size());
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	for (uint32_t logical = 0; logical < program.info.images.size(); ++logical) {
+		const auto* source = Source(program, program.info.images[logical].source);
+		if (source == nullptr || !source->bounded_image.has_value() ||
+		    !source->bounded_image->expression) {
+			continue;
+		}
+		const auto& bounded = *source->bounded_image;
+		if (source->dword_count != 8u || bounded.key_arg != 0u ||
+		    bounded.dependencies.empty()) {
+			return SpecializationFail("bounded image expression has invalid metadata");
+		}
+		const auto first = bounded.dependencies.front();
+		if (first >= snapshot.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded image expression has an invalid dependency");
+		}
+		const auto count = snapshot.bounded_srt_reads[first].count;
+		for (const auto dependency: bounded.dependencies) {
+			if (dependency >= snapshot.bounded_srt_reads.size() ||
+			    snapshot.bounded_srt_reads[dependency].count != count) {
+				return SpecializationFail(
+				    "bounded image expression dependencies have different candidate counts");
+			}
+		}
+		auto& candidates = snapshot.bounded_image_expressions[logical];
+		candidates.reserve(count);
+		for (uint32_t candidate = 0; candidate < count; ++candidate) {
+			DescriptorValue descriptor;
+			if (!EvaluateBoundedDescriptorSource(
+			        program, program.info.images[logical].source, clean_runtime,
+			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
+			        descriptor)) {
+				return SpecializationFail(fmt::format(
+				    "bounded image expression {} candidate {} cannot be evaluated", logical,
+				    candidate));
+			}
+			candidates.push_back(descriptor);
+		}
+	}
+	return true;
+}
+
+bool MaterializeBoundedSamplerExpressions(const ResourcePlan& program, const SrtRuntime& runtime,
+	                                       MaterializedSnapshot& snapshot) {
+	snapshot.bounded_sampler_expressions.resize(program.info.samplers.size());
+	snapshot.bounded_sampler_consumed.resize(program.info.samplers.size());
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	for (uint32_t logical = 0; logical < program.info.samplers.size(); ++logical) {
+		const auto* source = Source(program, program.info.samplers[logical].source);
+		if (source == nullptr || !source->bounded_sampler.has_value()) continue;
+		const auto& bounded = *source->bounded_sampler;
+		if (source->dword_count != 4u || bounded.key_arg != 0u ||
+		    bounded.selector_group == UINT32_MAX || bounded.dependencies.empty()) {
+			return SpecializationFail("bounded sampler expression has invalid metadata");
+		}
+		const auto first = bounded.dependencies.front();
+		if (first >= snapshot.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded sampler expression has an invalid dependency");
+		}
+		const auto count = snapshot.bounded_srt_reads[first].count;
+		for (const auto dependency: bounded.dependencies) {
+			if (dependency >= snapshot.bounded_srt_reads.size() ||
+			    snapshot.bounded_srt_reads[dependency].count != count) {
+				return SpecializationFail(
+				    "bounded sampler expression dependencies have different candidate counts");
+			}
+		}
+		auto& candidates = snapshot.bounded_sampler_expressions[logical];
+		candidates.reserve(count);
+		for (uint32_t candidate = 0; candidate < count; ++candidate) {
+			DescriptorValue descriptor;
+			if (!EvaluateBoundedDescriptorSource(
+			        program, program.info.samplers[logical].source, clean_runtime,
+			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
+			        descriptor)) {
+				return SpecializationFail(fmt::format(
+				    "bounded sampler expression {} candidate {} cannot be evaluated", logical,
+				    candidate));
+			}
+			candidates.push_back(descriptor);
+		}
+		if (!candidates.empty()) snapshot.resources.samplers[logical] = candidates.front();
+	}
+	return true;
+}
+
 bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot& snapshot) {
 	for (uint32_t logical = 0; logical < program.info.images.size(); ++logical) {
 		const auto* source = Source(program, program.info.images[logical].source);
@@ -633,66 +815,112 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 		}
 		const auto& bounded = *source->bounded_image;
 		if (source->dword_count != 8u || bounded.key_arg != 0u ||
-		    program.bounded_srt_reads.empty()) {
+		    bounded.selector_group == UINT32_MAX || program.bounded_srt_reads.empty()) {
 			return SpecializationFail("bounded image has invalid source metadata");
 		}
-		const auto first_read = bounded.reads[0];
-		if (first_read >= snapshot.bounded_srt_reads.size()) {
-			return SpecializationFail("bounded image has an invalid read column");
-		}
-		const auto& first = program.bounded_srt_reads[first_read];
-		const auto count = snapshot.bounded_srt_reads[first_read].count;
-		for (uint32_t word = 0; word < bounded.reads.size(); ++word) {
-			const auto read_id = bounded.reads[word];
-			const auto expected_offset = uint64_t {first.memory_offset} +
-			                             uint64_t {word} * sizeof(uint32_t);
-			if (read_id >= snapshot.bounded_srt_reads.size() ||
-			    snapshot.bounded_srt_reads[read_id].count != count ||
-			    program.bounded_srt_reads[read_id].count_source != first.count_source ||
-			    program.bounded_srt_reads[read_id].address_source != first.address_source ||
-			    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
-			    program.bounded_srt_reads[read_id].workgroup_axis != UINT32_MAX ||
-			    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
-			    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
-			    program.bounded_srt_reads[read_id].memory_offset != expected_offset) {
-				return SpecializationFail(
-				    "bounded image columns do not form a correlated eight-word descriptor");
+		uint32_t count = 0;
+		if (bounded.expression) {
+			if (logical >= snapshot.bounded_image_expressions.size()) {
+				return SpecializationFail("bounded image expression candidates are missing");
 			}
+			count = static_cast<uint32_t>(snapshot.bounded_image_expressions[logical].size());
+		} else {
+			const auto first_read = bounded.reads[0];
+			if (first_read >= snapshot.bounded_srt_reads.size()) {
+				return SpecializationFail("bounded image has an invalid read column");
+			}
+			const auto& first = program.bounded_srt_reads[first_read];
+			count = snapshot.bounded_srt_reads[first_read].count;
+			for (uint32_t word = 0; word < bounded.reads.size(); ++word) {
+				const auto read_id = bounded.reads[word];
+				const auto expected_offset = uint64_t {first.memory_offset} +
+				                             uint64_t {word} * sizeof(uint32_t);
+				if (read_id >= snapshot.bounded_srt_reads.size() ||
+				    snapshot.bounded_srt_reads[read_id].count != count ||
+				    program.bounded_srt_reads[read_id].count_source != first.count_source ||
+				    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+				    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
+				    program.bounded_srt_reads[read_id].workgroup_axis != UINT32_MAX ||
+				    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
+				    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
+				    program.bounded_srt_reads[read_id].memory_offset != expected_offset) {
+					return SpecializationFail(
+					    "bounded image columns do not form a correlated eight-word descriptor");
+				}
+			}
+		}
+
+		uint32_t bounded_sampler = UINT32_MAX;
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != logical || pair.sampler >= program.info.samplers.size()) continue;
+			const auto* sampler_source = Source(program, program.info.samplers[pair.sampler].source);
+			if (sampler_source == nullptr || !sampler_source->bounded_sampler.has_value()) continue;
+			const auto& sampler = *sampler_source->bounded_sampler;
+			if (sampler.selector_group != bounded.selector_group) {
+				return SpecializationFail(fmt::format(
+				    "bounded image {} and sampler {} use different selectors", logical, pair.sampler));
+			}
+			if (bounded_sampler != UINT32_MAX && bounded_sampler != pair.sampler) {
+				return SpecializationFail(
+				    "one bounded image is paired with multiple bounded sampler tables");
+			}
+			bounded_sampler = pair.sampler;
 		}
 
 		IndirectImage table;
 		table.resource = logical;
 		table.probe_count = count;
+		if (bounded_sampler != UINT32_MAX) {
+			if (bounded_sampler >= snapshot.bounded_sampler_expressions.size() ||
+			    snapshot.bounded_sampler_expressions[bounded_sampler].size() != count) {
+				return SpecializationFail(
+				    "bounded image and sampler tables have different candidate counts");
+			}
+			table.sampler_resource = bounded_sampler;
+			snapshot.bounded_sampler_consumed[bounded_sampler] = 1u;
+		}
 		table.keys.reserve(count);
 		table.candidates.reserve(count);
 		table.descriptors.reserve(std::min<size_t>(count, ShaderInfo::MaxImages));
 		for (uint32_t index = 0; index < count; ++index) {
 			DescriptorValue descriptor;
-			descriptor.dword_count = 8u;
-			for (uint32_t word = 0; word < bounded.reads.size(); ++word) {
-				const auto& layout = snapshot.bounded_srt_reads[bounded.reads[word]];
-				const auto flat_index = uint64_t {layout.flat_offset} + index;
-				if (flat_index >= snapshot.resources.flattened_srt.size()) {
-					return SpecializationFail("bounded image column exceeds its captured snapshot");
+			if (bounded.expression) {
+				descriptor = snapshot.bounded_image_expressions[logical][index];
+			} else {
+				descriptor.dword_count = 8u;
+				for (uint32_t word = 0; word < bounded.reads.size(); ++word) {
+					const auto& layout = snapshot.bounded_srt_reads[bounded.reads[word]];
+					const auto flat_index = uint64_t {layout.flat_offset} + index;
+					if (flat_index >= snapshot.resources.flattened_srt.size()) {
+						return SpecializationFail("bounded image column exceeds its captured snapshot");
+					}
+					descriptor.dwords[word] =
+					    snapshot.resources.flattened_srt[static_cast<size_t>(flat_index)];
 				}
-				descriptor.dwords[word] =
-				    snapshot.resources.flattened_srt[static_cast<size_t>(flat_index)];
 			}
 			if (NullImageDescriptor(descriptor) ||
 			    !ValidImageDescriptor(descriptor, program.info.images[logical].r128)) {
 				descriptor.dwords.fill(0u);
 			}
-			const auto candidate = std::ranges::find(table.descriptors, descriptor);
-			if (candidate == table.descriptors.end()) {
+			const DescriptorValue* sampler = bounded_sampler == UINT32_MAX
+			                                     ? nullptr
+			                                     : &snapshot.bounded_sampler_expressions[bounded_sampler][index];
+			uint32_t candidate = 0;
+			while (candidate < table.descriptors.size() &&
+			       (table.descriptors[candidate] != descriptor ||
+			        (sampler != nullptr && table.samplers[candidate] != *sampler))) {
+				++candidate;
+			}
+			if (candidate == table.descriptors.size()) {
 				if (table.descriptors.size() >= ShaderInfo::MaxImages) {
 					return SpecializationFail("bounded image table exceeds the dense image limit");
 				}
 				table.descriptors.push_back(descriptor);
+				if (sampler != nullptr) table.samplers.push_back(*sampler);
 				table.candidates.push_back(
 				    static_cast<uint32_t>(table.descriptors.size() - 1u));
 			} else {
-				table.candidates.push_back(
-				    static_cast<uint32_t>(candidate - table.descriptors.begin()));
+				table.candidates.push_back(candidate);
 			}
 			table.keys.push_back(index);
 		}
@@ -705,6 +933,15 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 		snapshot.resources.images[logical] = table.descriptors[0];
 		if (table.descriptors.size() > 1u) {
 			snapshot.indirect_images.push_back(std::move(table));
+		}
+	}
+	for (uint32_t sampler = 0; sampler < program.info.samplers.size(); ++sampler) {
+		const auto* source = Source(program, program.info.samplers[sampler].source);
+		if (source != nullptr && source->bounded_sampler.has_value() &&
+		    (sampler >= snapshot.bounded_sampler_consumed.size() ||
+		     snapshot.bounded_sampler_consumed[sampler] == 0u)) {
+			return SpecializationFail(fmt::format(
+			    "bounded sampler {} has no correlated bounded image", sampler));
 		}
 	}
 	return true;
@@ -728,24 +965,35 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 		if (source->dword_count != 4u || bounded.key_arg != 0u || program.bounded_srt_reads.empty()) {
 			return SpecializationFail("bounded buffer has invalid source metadata");
 		}
-		const auto first_read = bounded.reads[0];
-		if (first_read >= specialization.bounded_srt_reads.size()) {
-			return SpecializationFail("bounded buffer has an invalid read column");
-		}
-		const auto& first = program.bounded_srt_reads[first_read];
-		const auto count = specialization.bounded_srt_reads[first_read].count;
-		for (uint32_t word = 0; word < bounded.reads.size(); word++) {
-			const auto read_id = bounded.reads[word];
-			if (read_id >= specialization.bounded_srt_reads.size() ||
-			    specialization.bounded_srt_reads[read_id].count != count ||
-			    program.bounded_srt_reads[read_id].count_source != first.count_source ||
-			    program.bounded_srt_reads[read_id].address_source != first.address_source ||
-			    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
-			    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
-			    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
-			    program.bounded_srt_reads[read_id].memory_offset !=
-			        uint64_t{first.memory_offset} + word * sizeof(uint32_t)) {
-				return SpecializationFail("bounded buffer columns do not form a correlated four-word descriptor");
+		uint32_t count = 0;
+		uint32_t diagnostic_stride = 0;
+		if (bounded.expression) {
+			if (logical >= materialized.bounded_buffer_expressions.size()) {
+				return SpecializationFail("bounded buffer expression candidates are missing");
+			}
+			count = static_cast<uint32_t>(materialized.bounded_buffer_expressions[logical].size());
+		} else {
+			const auto first_read = bounded.reads[0];
+			if (first_read >= specialization.bounded_srt_reads.size()) {
+				return SpecializationFail("bounded buffer has an invalid read column");
+			}
+			const auto& first = program.bounded_srt_reads[first_read];
+			count = specialization.bounded_srt_reads[first_read].count;
+			diagnostic_stride = first.offset_scale;
+			for (uint32_t word = 0; word < bounded.reads.size(); word++) {
+				const auto read_id = bounded.reads[word];
+				if (read_id >= specialization.bounded_srt_reads.size() ||
+				    specialization.bounded_srt_reads[read_id].count != count ||
+				    program.bounded_srt_reads[read_id].count_source != first.count_source ||
+				    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+				    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
+				    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
+				    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
+				    program.bounded_srt_reads[read_id].memory_offset !=
+				        uint64_t{first.memory_offset} + word * sizeof(uint32_t)) {
+					return SpecializationFail(
+					    "bounded buffer columns do not form a correlated four-word descriptor");
+				}
 			}
 		}
 		auto& table = specialization.buffer_tables[logical];
@@ -756,10 +1004,14 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 		table.mapping_flat_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
 		for (uint32_t index = 0; index < count; index++) {
 			DescriptorValue descriptor;
-			descriptor.dword_count = 4u;
-			for (uint32_t word = 0; word < 4u; word++) {
-				const auto& layout = specialization.bounded_srt_reads[bounded.reads[word]];
-				descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
+			if (bounded.expression) {
+				descriptor = materialized.bounded_buffer_expressions[logical][index];
+			} else {
+				descriptor.dword_count = 4u;
+				for (uint32_t word = 0; word < 4u; word++) {
+					const auto& layout = specialization.bounded_srt_reads[bounded.reads[word]];
+					descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
+				}
 			}
 			auto candidate = std::ranges::find_if(table.resources, [&](uint32_t resource) {
 				return buffers[resource] == descriptor;
@@ -769,7 +1021,7 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 				if (buffers.size() >= ShaderInfo::MaxBuffers) {
 					return SpecializationFail(fmt::format(
 					    "bounded buffer {} exceeds the dense buffer limit (count={} stride={} candidates={} buffers={} limit={})",
-					    logical, count, first.offset_scale, table.resources.size() + 1u,
+					    logical, count, diagnostic_stride, table.resources.size() + 1u,
 					    buffers.size() + 1u, ShaderInfo::MaxBuffers));
 				}
 				resource = static_cast<uint32_t>(buffers.size());
@@ -957,9 +1209,13 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	next.samplers.resize(program.info.samplers.size());
 	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
 		const auto* source = Source(program, program.info.samplers[index].source);
-		if (source != nullptr && source->inline_descriptor.has_value()) {
+		if (source != nullptr && (source->inline_descriptor.has_value() ||
+		                          source->bounded_sampler.has_value())) {
 			next.samplers[index].dword_count = 4u;
 		} else {
+			if (cursor == values.end()) {
+				return SpecializationFail("sampler materialization source list is incomplete");
+			}
 			next.samplers[index] = *cursor++;
 		}
 	}
@@ -982,6 +1238,15 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	}
 	if (!MaterializeBoundedReads(program, runtime, snapshot)) {
 		return SpecializationFail("bounded SRT materialization failed");
+	}
+	if (!MaterializeBoundedBufferExpressions(program, runtime, snapshot)) {
+		return SpecializationFail("bounded buffer expression materialization failed");
+	}
+	if (!MaterializeBoundedImageExpressions(program, runtime, snapshot)) {
+		return SpecializationFail("bounded image expression materialization failed");
+	}
+	if (!MaterializeBoundedSamplerExpressions(program, runtime, snapshot)) {
+		return SpecializationFail("bounded sampler expression materialization failed");
 	}
 	if (!MaterializeBoundedImages(program, snapshot)) {
 		return SpecializationFail("bounded image materialization failed");
@@ -1418,6 +1683,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		target.inline_descriptor = source.inline_descriptor;
 		target.bounded_buffer = source.bounded_buffer;
 		target.bounded_image = source.bounded_image;
+		target.bounded_sampler = source.bounded_sampler;
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);
 		}
@@ -1448,7 +1714,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	}
 	for (const auto& sampler: plan.info.samplers) {
 		const auto* source = Source(plan, sampler.source);
-		if (source != nullptr && source->inline_descriptor.has_value()) {
+		if (source != nullptr && (source->inline_descriptor.has_value() ||
+		                          source->bounded_sampler.has_value())) {
 			plan.requires_specialization_memory = true;
 		} else {
 			plan.materialization_sources.push_back(sampler.source);
@@ -1480,6 +1747,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 				MarkCleanFlatSlots(plan, Source(plan, source.inline_descriptor->image_table->address_source),
 				                   plan.clean_flat_slots);
 			}
+		}
+	}
+	for (const auto& source: plan.descriptor_sources) {
+		if ((source.bounded_buffer.has_value() && source.bounded_buffer->expression) ||
+		    (source.bounded_image.has_value() && source.bounded_image->expression) ||
+		    source.bounded_sampler.has_value()) {
+			MarkDeferredFlatSlots(plan, &source, plan.clean_flat_slots);
 		}
 	}
 	return plan;

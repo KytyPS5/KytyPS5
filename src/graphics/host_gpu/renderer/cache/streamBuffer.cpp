@@ -4,7 +4,6 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/vma.h"
 
 #include <cstring>
 #include <limits>
@@ -64,7 +63,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_buffer(std::make_unique<VulkanBuffer>()) {
+      m_size(size) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -87,51 +86,33 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
 	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_buffer->memory.allocation, &allocation_result));
+	    &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	m_buffer->buffer                 = native_buffer;
-	m_buffer->usage                  = flags;
-	m_buffer->buffer_size            = size;
-	m_buffer->memory.type            = allocation_result.memoryType;
-	graphics.device.getBufferMemoryRequirements(m_buffer->buffer, &m_buffer->memory.requirements);
-	if (static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
+	m_buffer = native_buffer;
+	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
-		address_info.buffer = m_buffer->buffer;
+		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
-	vmaGetAllocationMemoryProperties(graphics.allocator, m_buffer->memory.allocation, &properties);
-	m_buffer->memory.property = vk::MemoryPropertyFlags(properties);
+	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
+	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
 	}
-	VulkanTrackAllocation(m_buffer->memory);
 }
 
 Buffer::~Buffer() {
-	if (m_buffer->buffer != nullptr) {
-		VulkanUntrackAllocation(m_buffer->memory);
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer->buffer, m_buffer->memory.allocation);
+	if (m_buffer != nullptr) {
+		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
-}
-
-vk::Buffer Buffer::Handle() const noexcept {
-	return m_buffer->buffer;
-}
-
-uint64_t Buffer::Size() const noexcept {
-	return m_buffer->buffer_size;
-}
-
-bool Buffer::IsCoherent() const noexcept {
-	return bool(m_buffer->memory.property & vk::MemoryPropertyFlagBits::eHostCoherent);
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
@@ -153,7 +134,7 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
-		    vmaFlushAllocation(m_graphics->allocator, m_buffer->memory.allocation, offset, size);
+		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }
@@ -162,7 +143,7 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
-		    vmaInvalidateAllocation(m_graphics->allocator, m_buffer->memory.allocation, offset, size);
+		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }

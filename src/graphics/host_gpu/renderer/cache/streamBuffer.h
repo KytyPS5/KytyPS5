@@ -6,11 +6,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
 #include <vector>
+
+VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Libs::Graphics {
 
@@ -18,7 +19,6 @@ class CommandBuffer;
 class CommandScheduler;
 struct StreamBufferTestAccess;
 struct GraphicContext;
-struct VulkanBuffer;
 
 enum class MemoryUsage : uint8_t {
 	DeviceLocal,
@@ -42,10 +42,10 @@ public:
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
-	[[nodiscard]] vk::Buffer         Handle() const noexcept;
-	[[nodiscard]] uint64_t           Size() const noexcept;
+	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
+	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
-	[[nodiscard]] bool               IsCoherent() const noexcept;
+	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -88,7 +88,10 @@ private:
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
 	vk::DeviceAddress             m_device_address = 0;
-	std::unique_ptr<VulkanBuffer> m_buffer;
+	vk::Buffer                    m_buffer     = nullptr;
+	VmaAllocation                 m_allocation = nullptr;
+	uint64_t                      m_size;
+	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
 };
 

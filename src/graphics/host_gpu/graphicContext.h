@@ -14,7 +14,6 @@
 
 namespace Libs::Graphics {
 
-struct VulkanBuffer;
 struct VulkanImage;
 struct VulkanMemory;
 
@@ -118,11 +117,9 @@ private:
 };
 
 struct VulkanMemory {
-	vk::MemoryRequirements  requirements       = {};
 	vk::MemoryPropertyFlags property           = {};
 	vk::MemoryPropertyFlags preferred_property = {};
 	VmaAllocation           allocation         = nullptr;
-	uint32_t                type               = 0;
 };
 
 struct VulkanImageState {
@@ -138,7 +135,6 @@ struct VulkanImage {
 	vk::Format                    format      = vk::Format::eUndefined;
 	vk::ImageType                 image_type  = vk::ImageType::e2D;
 	vk::Extent3D                  extent      = {1, 1, 1};
-	uint32_t                      guest_pitch = 0;
 	uint32_t                      layers      = 1;
 	uint32_t                      mip_levels  = 1;
 	uint32_t                      samples     = 1;
@@ -150,12 +146,7 @@ struct VulkanImage {
 	Graphics::VulkanMemory        memory;
 };
 
-struct VulkanBuffer {
-	vk::Buffer           buffer = nullptr;
-	VulkanMemory         memory;
-	vk::BufferUsageFlags usage       = {};
-	uint64_t             buffer_size = 0;
-};
+
 
 } // namespace Libs::Graphics
 

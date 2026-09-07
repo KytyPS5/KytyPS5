@@ -659,7 +659,6 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.format      = info.pixel_format;
 	backing.image_type  = HostImageType(info.type);
 	backing.extent      = info.extent;
-	backing.guest_pitch = info.pitch;
 	backing.layers      = info.IsVolume() ? 1u : info.resources.layers;
 	backing.mip_levels  = info.resources.levels;
 	backing.samples     = info.samples;

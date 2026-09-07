@@ -18,36 +18,11 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/vma.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cinttypes>
 
 namespace Libs::Graphics {
-
-namespace {
-
-struct MemoryStats {
-	std::atomic_uint64_t allocated[VK_MAX_MEMORY_TYPES] {};
-	std::atomic_uint64_t count[VK_MAX_MEMORY_TYPES] {};
-};
-
-MemoryStats g_memory_stats;
-
-} // namespace
-
-void VulkanTrackAllocation(const VulkanMemory& memory) {
-	g_memory_stats.allocated[memory.type] += memory.requirements.size;
-	g_memory_stats.count[memory.type]++;
-}
-
-void VulkanUntrackAllocation(const VulkanMemory& memory) {
-	EXIT_IF(g_memory_stats.allocated[memory.type] < memory.requirements.size);
-	EXIT_IF(g_memory_stats.count[memory.type] == 0);
-	g_memory_stats.allocated[memory.type] -= memory.requirements.size;
-	g_memory_stats.count[memory.type]--;
-}
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -163,20 +138,16 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.preferredFlags =
 	    static_cast<vk::MemoryPropertyFlags::MaskType>(memory.preferred_property);
 
-	VmaAllocationInfo allocation_result {};
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &memory.allocation, &allocation_result));
+	                   &alloc_info, &native_image, &memory.allocation, nullptr));
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;
 	}
 
-	device.getImageMemoryRequirements(image.image, &memory.requirements);
-	memory.type = allocation_result.memoryType;
-	VulkanTrackAllocation(memory);
 	return true;
 }
 
@@ -185,7 +156,6 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.memory.allocation == nullptr);
 
 	auto& memory = image.memory;
-	VulkanUntrackAllocation(memory);
 	vmaDestroyImage(allocator, image.image, memory.allocation);
 	image.image            = nullptr;
 	memory.allocation      = nullptr;

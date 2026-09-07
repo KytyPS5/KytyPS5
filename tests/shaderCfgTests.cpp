@@ -1155,9 +1155,8 @@ void TestNativeShaderResourceDependencies() {
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a maximum-size strided buffer");
 
-  VulkanBuffer buffer;
-  buffer.buffer = reinterpret_cast<vk::Buffer::CType>(uintptr_t{1});
-  const auto gds_barrier = MakeGdsDependency(buffer.buffer);
+  const vk::Buffer buffer{reinterpret_cast<vk::Buffer::CType>(uintptr_t{1})};
+  const auto gds_barrier = MakeGdsDependency(buffer);
   Check((gds_barrier.srcAccessMask & vk::AccessFlagBits::eHostWrite) &&
             (gds_barrier.srcAccessMask & vk::AccessFlagBits::eTransferWrite) &&
             (gds_barrier.srcAccessMask & vk::AccessFlagBits::eShaderWrite) &&

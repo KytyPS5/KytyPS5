@@ -105,7 +105,7 @@ private:
 		Format   format           = Format::Unknown;
 		uint64_t last_output_time = 0;
 		int      channels_num     = 0;
-		int      volume[8]        = {};
+		int      volume[16]       = {};
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
@@ -133,6 +133,8 @@ private:
 	static void            CloseSdlDevice(PortOut* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
+	static void            DownmixToStereo(const PortOut& port, const void* data,
+	                                       std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
 };
 
@@ -202,7 +204,8 @@ Audio::~Audio() {
 
 bool Audio::FormatIsFloat(Format format) {
 	return (format == Format::FloatMono || format == Format::FloatStereo ||
-	        format == Format::Float8Ch || format == Format::Float8ChStd);
+	        format == Format::Float8Ch || format == Format::Float8ChStd ||
+	        format == Format::Float12Ch);
 }
 
 bool Audio::FormatIsStd(Format format) {
@@ -232,7 +235,8 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
-	desired.channels = static_cast<Uint8>(port->channels_num);
+	desired.channels =
+	    static_cast<Uint8>(port->channels_num > 8 ? 2 : port->channels_num);
 	desired.samples  = static_cast<Uint16>(port->samples_num);
 	desired.callback = nullptr;
 
@@ -326,6 +330,45 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
+// SDL2 only accepts 1..8 channels (SDL_SupportedChannelCount), so downmix an
+// unsupported layout (12ch 7.1.4) to stereo before handing it to SDL.
+// PS5 SceAudioOut2 12ch order: FL FR FC LFE SL SR BL BR TFL TFR TBL TBR.
+void Audio::DownmixToStereo(const PortOut& port, const void* data, std::vector<uint8_t>* buffer) {
+	const uint32_t frames = port.samples_num;
+	const uint32_t src_ch = port.channels_num;
+
+	constexpr float c = 0.70710678f; // center
+	constexpr float s = 0.5f;        // surrounds / backs
+	constexpr float t = 0.35355339f; // tops
+
+	if (FormatIsFloat(port.format)) {
+		buffer->resize(frames * 2 * sizeof(float));
+		auto*       dst = reinterpret_cast<float*>(buffer->data());
+		const auto* src = static_cast<const float*>(data);
+		for (uint32_t f = 0; f < frames; f++) {
+			const float* in = src + static_cast<size_t>(f) * src_ch;
+			dst[f * 2 + 0] =
+			    in[0] + c * in[2] + s * (in[4] + in[6]) + t * (in[8] + in[10]);
+			dst[f * 2 + 1] =
+			    in[1] + c * in[2] + s * (in[5] + in[7]) + t * (in[9] + in[11]);
+		}
+		return;
+	}
+
+	buffer->resize(frames * 2 * sizeof(int16_t));
+	auto*       dst = reinterpret_cast<int16_t*>(buffer->data());
+	const auto* src = static_cast<const int16_t*>(data);
+	for (uint32_t f = 0; f < frames; f++) {
+		const int16_t* in = src + static_cast<size_t>(f) * src_ch;
+		const int32_t l = in[0] + ((static_cast<int32_t>(in[2]) * 181) >> 8) +
+		                  (in[4] >> 1) + (in[6] >> 1) + (in[8] >> 2) + (in[10] >> 2);
+		const int32_t r = in[1] + ((static_cast<int32_t>(in[2]) * 181) >> 8) +
+		                  (in[5] >> 1) + (in[7] >> 1) + (in[9] >> 2) + (in[11] >> 2);
+		dst[f * 2 + 0] = static_cast<int16_t>(std::clamp(l, -32768, 32767));
+		dst[f * 2 + 1] = static_cast<int16_t>(std::clamp(r, -32768, 32767));
+	}
+}
+
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	EXIT_IF(port == nullptr);
 
@@ -335,15 +378,25 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
-	const auto           prepared_size = FrameSize(*port) * port->samples_num;
+
+	// Downmix unsupported layouts (12ch 7.1.4) to stereo before SDL sees them.
+	std::vector<uint8_t> downmix_buffer;
+	uint32_t             queue_channels = port->channels_num;
+	uint32_t             queue_bytes    = FrameSize(*port) * port->samples_num;
+	if (queue_channels > 8) {
+		DownmixToStereo(*port, prepared_data, &downmix_buffer);
+		prepared_data  = downmix_buffer.data();
+		queue_channels = 2;
+		queue_bytes    = port->samples_num * 2 * BytesPerSample(port->format);
+	}
 
 	std::vector<uint8_t> convert_buffer;
 	const void*          queue_data = prepared_data;
-	uint32_t             queue_size = prepared_size;
+	uint32_t             queue_size = queue_bytes;
 
 	SDL_AudioCVT cvt {};
 	const int    cvt_result =
-	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(port->channels_num),
+	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(queue_channels),
 	                      static_cast<int>(port->freq), port->audio_spec.format,
 	                      port->audio_spec.channels, port->audio_spec.freq);
 
@@ -353,11 +406,11 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	if (cvt_result > 0) {
-		convert_buffer.resize(prepared_size * cvt.len_mult);
-		std::memcpy(convert_buffer.data(), prepared_data, prepared_size);
+		convert_buffer.resize(queue_bytes * cvt.len_mult);
+		std::memcpy(convert_buffer.data(), prepared_data, queue_bytes);
 
 		cvt.buf = convert_buffer.data();
-		cvt.len = static_cast<int>(prepared_size);
+		cvt.len = static_cast<int>(queue_bytes);
 
 		if (SDL_ConvertAudio(&cvt) < 0) {
 			LOGF("AudioOut: SDL_ConvertAudio failed: %s\n", SDL_GetError());
@@ -416,6 +469,8 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				case Format::Float8Ch:
 				case Format::Signed16bit8ChStd:
 				case Format::Float8ChStd: port.channels_num = 8; break;
+				case Format::Signed16bit12Ch:
+				case Format::Float12Ch: port.channels_num = 12; break;
 				default: EXIT("unknown format");
 			}
 

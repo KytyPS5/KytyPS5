@@ -355,6 +355,21 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 
 } // namespace Libs::LibKernel
 
+void TestTwelveChannelFormat() {
+	const auto                     context = CreateContext();
+	const auto                     param   = MakeParam(0xc00); // 12ch float (7.1.4)
+	AudioOut2::AudioOut2PortHandle port    = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "12ch port create failed");
+
+	PortState state {};
+	AudioOut2::AudioOut2PortGetState(port, AsState(&state));
+	Check(state.num_channels == 12, "12ch data format reported the wrong channel count");
+
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 int main() {
 	TestSlotReuse();
 	TestFullTableRecovers();
@@ -363,6 +378,7 @@ int main() {
 	TestSynchronousDevicePushBypassesModelledQueue();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	TestTwelveChannelFormat();
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

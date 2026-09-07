@@ -15,6 +15,8 @@ enum class Format {
 	Float8Ch,
 	Signed16bit8ChStd,
 	Float8ChStd,
+	Signed16bit12Ch,
+	Float12Ch,
 };
 
 struct OutputParam {

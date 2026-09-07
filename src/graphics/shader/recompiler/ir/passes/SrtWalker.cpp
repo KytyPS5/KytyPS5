@@ -1207,7 +1207,7 @@ public:
 	explicit BoundedReadProof(const Program& program): m_program(program) {}
 
 	std::optional<BoundedSrtReadProof> Run(const Inst& read) {
-		if (m_program.stage != ShaderType::Compute || m_program.dispatcher_fallback || m_program.blocks.empty() ||
+		if (m_program.stage != ShaderType::Compute || m_program.blocks.empty() ||
 		    m_program.blocks.size() != m_program.block_info.size())
 			return {};
 		const auto opcode = read.GetOpcode();
@@ -1233,8 +1233,9 @@ public:
 		if (!ParseBoundedOffset(read.Arg(1), offset, visiting) || offset.index == nullptr) {
 			return {};
 		}
-		if (!BuildGraph()) return {};
+		if (m_program.dispatcher_fallback ? !BuildBlockIndex() : !BuildGraph()) return {};
 		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
+		if (m_program.dispatcher_fallback && workgroup) return {};
 		if (workgroup) {
 			// Acyclic shaders can execute this uniform-per-workgroup scalar read
 			// directly through the existing BDA emitter. Keep CPU snapshots for
@@ -1247,12 +1248,21 @@ public:
 		const auto maximum = workgroup ? std::optional<uint32_t>{} :
 		                                FiniteMaximum(Value(const_cast<Inst*>(offset.index)));
 		if (workgroup || maximum.has_value()) {
+			// Dispatcher emission preserves the guest CFG but does not provide the structured
+			// loop guarantees used by the wider proof below. A finite table read in a
+			// single-entry unconditional prefix has no cyclic dominance dependency.
+			if (m_program.dispatcher_fallback &&
+			    (workgroup || !DispatcherEntryPrefixPrecedes(*offset.index, read))) {
+				return {};
+			}
 			// The dense enclosure includes every possible GPU value. Keep the key
 			// live; only its constant bound is evaluated on the host. Existing
 			// materialization budgets and coherent-read checks apply to every entry.
 			if (maximum == UINT32_MAX) return {}; // max+1 must not wrap to an empty table.
-			if (!Dominates(offset.index->Parent(), read.Parent()) ||
-			    (offset.index->Parent() == read.Parent() && !Precedes(*offset.index, read))) return {};
+			if (!m_program.dispatcher_fallback &&
+			    (!Dominates(offset.index->Parent(), read.Parent()) ||
+			     (offset.index->Parent() == read.Parent() && !Precedes(*offset.index, read))))
+				return {};
 			// Only memory roots in the guaranteed entry prefix may be evaluated
 			// eagerly. A dispatch bound does not make a conditional pointer load
 			// unconditional, even when the coefficient itself is read later.
@@ -1270,8 +1280,12 @@ public:
 			// then fail closed when that guest address is unavailable, while the
 			// direct-address form retains the stricter unconditional entry prefix.
 			const Block* source_scope = buffer_read ? read.Parent() : prefix;
-			for (uint32_t word = 0; word < source_dwords; ++word)
-				if (!RuntimeReadsDominate(address->Arg(word), source_scope, &read)) return {};
+			for (uint32_t word = 0; word < source_dwords; ++word) {
+				const bool safe = m_program.dispatcher_fallback
+				                      ? RuntimeReadsPrecedeEntry(address->Arg(word), read)
+				                      : RuntimeReadsDominate(address->Arg(word), source_scope, &read);
+				if (!safe) return {};
+			}
 			return BoundedSrtReadProof {
 			    .index = Value(const_cast<Inst*>(offset.index)),
 			    .count = workgroup ? Value {} : Value(*maximum + 1u),
@@ -1285,6 +1299,7 @@ public:
 			    .memory_offset = memory.offset,
 			    .workgroup_axis = workgroup ? offset.index->Arg(1).Resolve().U32() : UINT32_MAX};
 		}
+		if (m_program.dispatcher_fallback) return {};
 		const auto* phi = offset.index;
 		if (phi->GetOpcode() != ValueOpcode::Phi) return {};
 		const auto* header = phi->Parent();
@@ -1720,6 +1735,64 @@ private:
 		}
 		return false;
 	}
+	bool DispatcherEntryPrefixPrecedes(const Inst& definition, const Inst& use) const {
+		if (definition.Parent() == nullptr || use.Parent() == nullptr ||
+		    !m_ids.contains(definition.Parent()) || !m_ids.contains(use.Parent())) return false;
+		const Block* current = m_program.blocks.front();
+		bool definition_block_seen = false;
+		std::unordered_set<const Block*> visited;
+		for (;;) {
+			if (!visited.insert(current).second) return false;
+			if (current == definition.Parent()) {
+				if (current == use.Parent()) return Precedes(definition, use);
+				definition_block_seen = true;
+			}
+			if (current == use.Parent()) return definition_block_seen;
+			const auto& terminator = m_program.block_info[m_ids.at(current)].terminator;
+			if (terminator.kind != CFG::TerminatorKind::Branch ||
+			    !m_by_id.contains(terminator.true_block)) return false;
+			const auto* next = m_by_id.at(terminator.true_block);
+			if (next->ImmPredecessors().size() != 1u ||
+			    next->ImmPredecessors().front() != current) return false;
+			current = next;
+		}
+	}
+	bool RuntimeReadsPrecedeEntry(Value root, const Inst& before) const {
+		struct PendingValue {
+			Value value;
+			bool  position_covered = false;
+		};
+		std::vector<PendingValue> work {{root, false}};
+		std::unordered_set<const Inst*> visited_covered;
+		std::unordered_set<const Inst*> visited_uncovered;
+		while (!work.empty()) {
+			const auto pending = work.back();
+			work.pop_back();
+			const auto value = pending.value.Resolve();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr) continue;
+			if (pending.position_covered) {
+				if (visited_uncovered.contains(inst) || !visited_covered.insert(inst).second) continue;
+			} else if (!visited_uncovered.insert(inst).second) {
+				continue;
+			}
+			bool covered = pending.position_covered;
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_program.srt_reads.size() ||
+				    !DispatcherEntryPrefixPrecedes(*inst, before)) return false;
+				work.push_back({m_program.srt_reads[slot.U32()].value, true});
+				covered = true;
+			}
+			if (!covered && (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			                 inst->GetOpcode() == ValueOpcode::ReadConstBuffer) &&
+			    !DispatcherEntryPrefixPrecedes(*inst, before)) return false;
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+				work.push_back({inst->Arg(arg), covered});
+		}
+		return true;
+	}
 	bool RuntimeReadsDominate(Value root, const Block* header, const Inst* before = nullptr) const {
 		struct PendingValue {
 			Value value;
@@ -1764,12 +1837,16 @@ private:
 		}
 		return true;
 	}
-	bool BuildGraph() {
+	bool BuildBlockIndex() {
 		for (uint32_t i = 0; i < m_program.blocks.size(); ++i) {
 			if (m_program.blocks[i] == nullptr || !m_ids.emplace(m_program.blocks[i], i).second ||
 			    m_program.block_info[i].id == UINT32_MAX ||
 			    !m_by_id.emplace(m_program.block_info[i].id, m_program.blocks[i]).second) return false;
 		}
+		return true;
+	}
+	bool BuildGraph() {
+		if (!BuildBlockIndex()) return false;
 		for (uint32_t i = 0; i < m_program.blocks.size(); ++i) {
 			const auto& term = m_program.block_info[i].terminator;
 			std::vector<const Block*> expected;

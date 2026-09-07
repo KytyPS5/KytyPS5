@@ -439,6 +439,40 @@ passes the exact capture through CFG, IR translation and resource tracking. In g
 compiled as shader 172, and its 76x1x1 dispatch completed in 63,618 us. Execution then compiled
 two more shaders and stopped independently in resource tracking for `6cc64dee32dc7094`.
 
+## Entry-prefix bounded SRT tables with dispatcher CFG fallback
+
+Status: production proof fix implemented and validated through the next captured/runtime
+resource-tracking boundary; automated regression and full materialization validation deferred.
+
+Observed trigger: compute shader `6cc64dee32dc7094` uses a five-bit unsigned extraction to form
+the byte offset `0x1030 + selector * 16`, then reads four descriptor DWORDs from the root SRT in
+an unconditional entry prefix that IR represents as several basic blocks. Its CFG requires the
+general dispatcher emitter because two headers share a structured merge. The bounded SRT proof
+previously rejected every dispatcher program before considering that this finite table read
+occurs before any control-flow split, so resource tracking later rejected descriptor DWORD 0
+with root `LoadAddressU32` at PC `0x530`.
+
+Required tests:
+
+- A dispatcher-fallback compute program whose single-entry, unconditional block chain contains a
+  five-bit selector and four correlated SRT reads at stride 16, proving exactly 32 coherent
+  descriptor candidates are materialized while the live selector remains on the GPU.
+- Entry-prefix ordering cases proving the selector definition and all raw descriptor reads follow
+  only unconditional edges with one predecessor and precede the consuming handle; a read after a
+  control-flow split, in a conditional block, or with a non-dominating address root must remain
+  rejected.
+- Phi, loop-carried, workgroup-indexed and non-finite selectors in a dispatcher program, proving
+  the narrow admission rule cannot inherit structured-loop or cross-block assumptions.
+- Address overflow, width 0/32, mismatched columns, non-consecutive offsets, unreadable memory,
+  snapshot retry, candidate and byte-budget boundaries, all failing closed without partial
+  descriptor publication.
+- A structured version of the same table and unrelated dispatcher shaders, proving the existing
+  bounded proofs and generic switch emitter retain their current behavior.
+- Exact captured-shader audit followed by native game validation. The current implementation
+  removes the PC `0x530` buffer-descriptor failure in both and reaches the independent image
+  descriptor at PC `0x7c4`; resource tracking, materialization, SPIR-V validation and the
+  4096x1x1 dispatch remain pending until that next blocker is fixed.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

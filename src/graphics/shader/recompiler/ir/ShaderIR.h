@@ -507,14 +507,29 @@ struct BlockInfo {
 struct DescriptorSource {
 	struct BoundedBuffer {
 		std::array<uint32_t, 4> reads {};
+		// Direct tables use one correlated read per descriptor DWORD. Expression tables
+		// evaluate the descriptor value graph once for every bounded selector candidate.
+		std::vector<uint32_t> dependencies;
+		uint32_t selector_group = UINT32_MAX;
 		uint32_t key_arg = 0;
+		bool expression = false;
 		bool operator==(const BoundedBuffer&) const = default;
 	};
 
 	struct BoundedImage {
 		std::array<uint32_t, 8> reads {};
+		std::vector<uint32_t> dependencies;
+		uint32_t selector_group = UINT32_MAX;
 		uint32_t key_arg = 0;
+		bool expression = false;
 		bool operator==(const BoundedImage&) const = default;
+	};
+
+	struct BoundedSampler {
+		std::vector<uint32_t> dependencies;
+		uint32_t selector_group = UINT32_MAX;
+		uint32_t key_arg = 0;
+		bool operator==(const BoundedSampler&) const = default;
 	};
 
 	struct InlineDescriptor {
@@ -557,6 +572,7 @@ struct DescriptorSource {
 	std::optional<InlineDescriptor> inline_descriptor;
 	std::optional<BoundedBuffer> bounded_buffer;
 	std::optional<BoundedImage> bounded_image;
+	std::optional<BoundedSampler> bounded_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -626,6 +642,8 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<BoundedSrtRead>          bounded_srt_reads;
+	// Per-slot evaluation mode. Deferred slots are owned by bounded descriptor
+	// expressions and are evaluated separately for each proved selector candidate.
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;

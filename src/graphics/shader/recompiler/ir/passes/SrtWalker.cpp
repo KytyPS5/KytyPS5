@@ -39,6 +39,19 @@ std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::stri
 	                   StageName(program.stage), pc, message);
 }
 
+std::string ValueShape(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() == Type::U32) {
+			return fmt::format("0x{:08x}", value.U32());
+		}
+		return fmt::format("immediate:{}", TypeName(value.GetType()));
+	}
+	const auto* inst = value.TryInstruction();
+	return inst != nullptr ? std::string(ValueOpcodeName(inst->GetOpcode()))
+	                       : fmt::format("undefined:{}", TypeName(value.GetType()));
+}
+
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
 		return false;

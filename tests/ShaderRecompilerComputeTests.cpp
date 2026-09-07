@@ -68,6 +68,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <tuple>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -10035,6 +10036,34 @@ public:
               "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
       DestroyBuffer(&bounds_readback);
       registers.SetDepthClearValue(0.0f);
+
+      for (const auto [fill, cleared, value] :
+           {std::tuple{0xfffffff0u, true, 0.0f}, std::tuple{0xfffffff1u, true, 1.0f},
+            std::tuple{0xfffc000fu, false, 0.0f}}) {
+        registers.SetDepthRenderTarget(depth_only_target);
+        registers.SetDepthControl(depth_only_control);
+        registers.SetRenderControl({});
+        Require(name, "recorded HTile fill",
+                texture_cache.ClearMeta(depth_only_htile_address, fill),
+                "depth-only HTile was not registered");
+        RenderDepthInfo fill_depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, 1, scheduler.Current(), fill_depth);
+        const auto fill_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, fill_depth);
+        Require(name, "recorded HTile fill depth decode",
+                fill_depth.image_id == depth_only.image_id &&
+                    fill_depth.depth_meta_clear_enable == cleared &&
+                    fill_depth.depth_load_clear_enable == cleared &&
+                    fill_rendering.depth_stencil_attachment.depth_clear == cleared &&
+                    (!cleared || fill_rendering.depth_stencil_attachment.clear_value[0] ==
+                                     std::bit_cast<uint32_t>(value)) &&
+                    !texture_cache.IsMetaCleared(depth_only_htile_address, 0),
+                "a recorded HTile fill did not clear depth to the value its HiZ range proves");
+        scheduler.BeginRendering(fill_rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
 
       auto shared_depth_descriptor = sampled_depth_descriptor;
       shared_depth_descriptor.fields[0] =

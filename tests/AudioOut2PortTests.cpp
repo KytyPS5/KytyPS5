@@ -258,6 +258,31 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestFloat12ChannelPortOutputsPcm() {
+	const auto context = CreateContext();
+	const auto param   = MakeParam(0x0c00);
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "12-channel port create failed");
+	Check(LiveDeviceCount() == 1, "12-channel port did not open an audio device");
+
+	PortState state {};
+	Check(AudioOut2::AudioOut2PortGetState(port, AsState(&state)) == OK,
+	      "12-channel port state query failed");
+	Check(state.num_channels == 12, "12-channel port lost its guest channel count");
+
+	float pcm[512 * 12] {};
+	SetPcm(port, pcm);
+	ResetOutputCalls();
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "12-channel PCM push failed");
+	const auto calls = OutputCalls();
+	Check(calls.size() == 1 && calls[0], "12-channel PCM did not reach the device backend");
+
+	AudioOut2::AudioOut2PortDestroy(port);
+	Check(LiveDeviceCount() == 0, "12-channel port leaked its audio device");
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 void TestAsynchronousDevicePushKeepsQueueBounded() {
 	const auto context = CreateContext(1);
 	const auto param   = MakeParam();
@@ -361,6 +386,7 @@ int main() {
 	TestConcurrentCreates();
 	TestContextDestroyCancelsPendingCreate();
 	TestSynchronousDevicePushBypassesModelledQueue();
+	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	std::printf("AudioOut2PortTests: all cases passed\n");

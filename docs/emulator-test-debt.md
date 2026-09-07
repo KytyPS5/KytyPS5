@@ -258,6 +258,36 @@ when the guest producer is absent. A native Windows build of both targets comple
 run `yotei-integrated-20260907-051751-146531` advanced from shader 142 to 158 without the previous
 Location 2 VUID or another validation/fatal message.
 
+## Shared descriptor dependency DAG traversal
+
+Status: production fix and exact captured-shader performance validation complete; bounded game
+validation and automated regression deferred.
+
+Observed trigger: captured compute shader `7ceb0f3417f926f9` reaches resource tracking with 3207
+normalized IR instructions, then spends more than 75 seconds in `Collect` for one
+`ImageSampleRaw`. The image and sampler descriptor values contain a large Phi/Select DAG with
+shared subgraphs. `CollectBoundedDependencies` remembers only the current recursion stack, so a
+valid acyclic subgraph is revisited once per incoming path and traversal grows exponentially.
+
+Required tests:
+
+- A diamond-shaped acyclic descriptor expression with exponentially many paths but linearly many
+  IR nodes, proving each completed node is traversed once for one descriptor.
+- Shared subgraphs across all image and sampler descriptor DWORDs, proving the completed-node set
+  is shared while every distinct bounded read is retained exactly once.
+- A real dependency cycle and an invalid `ReadConst` flat slot, proving both still fail closed and
+  cannot be hidden by completed-node memoization.
+- Two branches reaching different bounded reads below a shared parent, proving memoization does not
+  discard either dependency or merge unrelated selector/count groups.
+- Native Windows audit of captured `compute_7ceb0f3417f926f9_7847dd7220f76d66.json` under a strict
+  timeout, followed by a bounded game run beyond that compute shader.
+
+Current evidence: completed-node memoization is shared across every DWORD of one descriptor while
+the recursion-stack set still rejects cycles. The native Windows audit now reaches the next genuine
+semantic rejection in 114 ms; the same shader previously remained inside `Collect` for more than
+75 seconds before it was stopped. The next rejection is an unevaluable `ReadFirstLane` image
+descriptor word and is tracked separately from this traversal-performance defect.
+
 ## Periodic Vulkan pipeline-cache checkpoints
 
 Status: production fix and two-run native game validation complete; automated regression

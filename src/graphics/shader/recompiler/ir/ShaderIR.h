@@ -512,11 +512,20 @@ struct DescriptorSource {
 	};
 
 	struct BoundedImage {
+		struct CandidateDword {
+			uint32_t value = 0;
+			bool immediate = true;
+
+			bool operator==(const CandidateDword&) const = default;
+		};
+
 		std::array<uint32_t, 8> reads {};
 		std::vector<uint32_t> dependencies;
+		std::vector<std::array<CandidateDword, 8>> wave_candidates;
 		uint32_t selector_group = UINT32_MAX;
 		uint32_t key_arg = 0;
 		bool expression = false;
+		bool wave_uniform = false;
 		bool operator==(const BoundedImage&) const = default;
 	};
 

@@ -739,7 +739,7 @@ bool MaterializeBoundedImageExpressions(const ResourcePlan& program, const SrtRu
 	for (uint32_t logical = 0; logical < program.info.images.size(); ++logical) {
 		const auto* source = Source(program, program.info.images[logical].source);
 		if (source == nullptr || !source->bounded_image.has_value() ||
-		    !source->bounded_image->expression) {
+		    !source->bounded_image->expression || source->bounded_image->wave_uniform) {
 			continue;
 		}
 		const auto& bounded = *source->bounded_image;
@@ -829,12 +829,16 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 			continue;
 		}
 		const auto& bounded = *source->bounded_image;
-		if (source->dword_count != 8u || bounded.key_arg != 0u ||
-		    bounded.selector_group == UINT32_MAX || program.bounded_srt_reads.empty()) {
+		if (source->dword_count != 8u || bounded.key_arg >= source->dword_count ||
+		    (bounded.wave_uniform
+		         ? bounded.wave_candidates.empty()
+		         : bounded.selector_group == UINT32_MAX || program.bounded_srt_reads.empty())) {
 			return SpecializationFail("bounded image has invalid source metadata");
 		}
 		uint32_t count = 0;
-		if (bounded.expression) {
+		if (bounded.wave_uniform) {
+			count = static_cast<uint32_t>(bounded.wave_candidates.size());
+		} else if (bounded.expression) {
 			if (logical >= snapshot.bounded_image_expressions.size()) {
 				return SpecializationFail("bounded image expression candidates are missing");
 			}
@@ -871,6 +875,10 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 			const auto* sampler_source = Source(program, program.info.samplers[pair.sampler].source);
 			if (sampler_source == nullptr || !sampler_source->bounded_sampler.has_value()) continue;
 			const auto& sampler = *sampler_source->bounded_sampler;
+			if (bounded.wave_uniform) {
+				return SpecializationFail(
+				    "wave-uniform image cannot share an indexed bounded sampler");
+			}
 			if (sampler.selector_group != bounded.selector_group) {
 				return SpecializationFail(fmt::format(
 				    "bounded image {} and sampler {} use different selectors", logical, pair.sampler));
@@ -899,7 +907,26 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 		table.descriptors.reserve(std::min<size_t>(count, ShaderInfo::MaxImages));
 		for (uint32_t index = 0; index < count; ++index) {
 			DescriptorValue descriptor;
-			if (bounded.expression) {
+			if (bounded.wave_uniform) {
+				descriptor.dword_count = 8u;
+				for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+					const auto& candidate = bounded.wave_candidates[index][word];
+					if (candidate.immediate) {
+						descriptor.dwords[word] = candidate.value;
+						continue;
+					}
+					if (candidate.value >= program.srt_reads.size()) {
+						return SpecializationFail(
+						    "wave-uniform image candidate has an invalid flat SRT slot");
+					}
+					const auto flat = program.srt_reads[candidate.value].flat_offset;
+					if (flat >= snapshot.resources.flattened_srt.size()) {
+						return SpecializationFail(
+						    "wave-uniform image candidate exceeds its flat SRT snapshot");
+					}
+					descriptor.dwords[word] = snapshot.resources.flattened_srt[flat];
+				}
+			} else if (bounded.expression) {
 				descriptor = snapshot.bounded_image_expressions[logical][index];
 			} else {
 				descriptor.dword_count = 8u;
@@ -913,6 +940,7 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 					    snapshot.resources.flattened_srt[static_cast<size_t>(flat_index)];
 				}
 			}
+			const auto key = descriptor.dwords[bounded.key_arg];
 			if (NullImageDescriptor(descriptor) ||
 			    !ValidImageDescriptor(descriptor, program.info.images[logical].r128)) {
 				descriptor.dwords.fill(0u);
@@ -932,12 +960,22 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 				}
 				table.descriptors.push_back(descriptor);
 				if (sampler != nullptr) table.samplers.push_back(*sampler);
-				table.candidates.push_back(
-				    static_cast<uint32_t>(table.descriptors.size() - 1u));
-			} else {
-				table.candidates.push_back(candidate);
+				candidate = static_cast<uint32_t>(table.descriptors.size() - 1u);
 			}
-			table.keys.push_back(index);
+			if (bounded.wave_uniform) {
+				const auto existing_key = std::ranges::find(table.keys, key);
+				if (existing_key != table.keys.end()) {
+					const auto mapping = static_cast<size_t>(existing_key - table.keys.begin());
+					if (mapping >= table.candidates.size() ||
+					    table.candidates[mapping] != candidate) {
+						return SpecializationFail(
+						    "wave-uniform image candidates have an ambiguous key DWORD");
+					}
+					continue;
+				}
+			}
+			table.keys.push_back(bounded.wave_uniform ? key : index);
+			table.candidates.push_back(candidate);
 		}
 		if (table.descriptors.empty()) {
 			DescriptorValue null_descriptor;

@@ -463,6 +463,150 @@ private:
 		return true;
 	}
 
+	using WaveImageValues = std::array<Value, 8>;
+	using WaveImageCandidate =
+	    std::array<DescriptorSource::BoundedImage::CandidateDword, 8>;
+
+	static bool SameWaveValues(const WaveImageValues& left, const WaveImageValues& right) {
+		for (uint32_t word = 0; word < left.size(); ++word) {
+			if (left[word] != right[word]) return false;
+		}
+		return true;
+	}
+
+	bool DecodeWaveCandidate(Value value,
+	                         DescriptorSource::BoundedImage::CandidateDword& candidate) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() != Type::U32) return false;
+			candidate.value = value.U32();
+			candidate.immediate = true;
+			return true;
+		}
+		const auto* read = value.TryInstruction();
+		const auto slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+		                          read->NumArgs() == 2u
+		                      ? read->Arg(1).Resolve()
+		                      : Value {};
+		if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+		    slot.U32() >= m_program.srt_reads.size() ||
+		    !ValidateRuntimeValue(m_program, value)) {
+			return false;
+		}
+		candidate.value = slot.U32();
+		candidate.immediate = false;
+		return true;
+	}
+
+	bool CollectWaveImageCandidates(
+	    WaveImageValues values, std::vector<WaveImageCandidate>& candidates,
+	    std::vector<WaveImageValues>& visiting, std::vector<WaveImageValues>& completed) const {
+		for (auto& value: values) value = value.Resolve();
+		const auto same = [&](const WaveImageValues& current) {
+			return SameWaveValues(current, values);
+		};
+		if (std::ranges::find_if(completed, same) != completed.end()) return true;
+		if (std::ranges::find_if(visiting, same) != visiting.end()) return false;
+
+		WaveImageCandidate candidate;
+		bool terminal = true;
+		for (uint32_t word = 0; word < values.size(); ++word) {
+			terminal &= DecodeWaveCandidate(values[word], candidate[word]);
+		}
+		if (terminal) {
+			if (std::ranges::find(candidates, candidate) == candidates.end()) {
+				if (candidates.size() >= ShaderInfo::MaxImages) return false;
+				candidates.push_back(candidate);
+			}
+			completed.push_back(values);
+			return true;
+		}
+
+		std::array<const Inst*, 8> instructions {};
+		for (uint32_t word = 0; word < values.size(); ++word) {
+			instructions[word] = values[word].TryInstruction();
+			if (instructions[word] == nullptr) return false;
+		}
+		const auto opcode = instructions[0]->GetOpcode();
+		if (opcode != ValueOpcode::Phi && opcode != ValueOpcode::SelectU32) return false;
+		const auto argument_count = instructions[0]->NumArgs();
+		if (argument_count == 0u ||
+		    (opcode == ValueOpcode::SelectU32 && argument_count != 3u)) return false;
+		for (uint32_t word = 1; word < instructions.size(); ++word) {
+			if (instructions[word]->GetOpcode() != opcode ||
+			    instructions[word]->NumArgs() != argument_count) return false;
+		}
+		if (opcode == ValueOpcode::Phi) {
+			for (uint32_t word = 0; word < instructions.size(); ++word) {
+				if (instructions[word]->Parent() != instructions[0]->Parent() ||
+				    instructions[word]->NumPhiBlocks() != argument_count) return false;
+			}
+			for (uint32_t argument = 0; argument < argument_count; ++argument) {
+				for (uint32_t word = 1; word < instructions.size(); ++word) {
+					if (instructions[word]->PhiBlock(argument) !=
+					    instructions[0]->PhiBlock(argument)) return false;
+				}
+			}
+		} else {
+			const auto condition = instructions[0]->Arg(0).Resolve();
+			for (uint32_t word = 1; word < instructions.size(); ++word) {
+				if (!EquivalentValue(m_program, condition,
+				                     instructions[word]->Arg(0).Resolve())) return false;
+			}
+		}
+
+		visiting.push_back(values);
+		const uint32_t first_argument = opcode == ValueOpcode::SelectU32 ? 1u : 0u;
+		for (uint32_t argument = first_argument; argument < argument_count; ++argument) {
+			WaveImageValues next;
+			for (uint32_t word = 0; word < next.size(); ++word) {
+				next[word] = instructions[word]->Arg(argument);
+			}
+			if (!CollectWaveImageCandidates(next, candidates, visiting, completed)) {
+				visiting.pop_back();
+				return false;
+			}
+		}
+		visiting.pop_back();
+		completed.push_back(values);
+		return true;
+	}
+
+	bool MakeWaveUniformImageSource(Inst& handle, DescriptorSource descriptor,
+	                                uint32_t& source) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		WaveImageValues values;
+		Value active_mask;
+		for (uint32_t word = 0; word < values.size(); ++word) {
+			const auto* broadcast = handle.Arg(word).Resolve().TryInstruction();
+			if (broadcast == nullptr || broadcast->GetOpcode() != ValueOpcode::ReadFirstLane ||
+			    broadcast->NumArgs() != 2u || broadcast->Arg(0).GetType() != Type::U32 ||
+			    broadcast->Arg(1).GetType() != Type::U1) return false;
+			const auto current_mask = broadcast->Arg(1).Resolve();
+			if (word == 0u) {
+				active_mask = current_mask;
+			} else if (!EquivalentValue(m_program, active_mask, current_mask)) {
+				return false;
+			}
+			values[word] = broadcast->Arg(0);
+		}
+
+		std::vector<WaveImageCandidate> candidates;
+		std::vector<WaveImageValues> visiting;
+		std::vector<WaveImageValues> completed;
+		if (!CollectWaveImageCandidates(values, candidates, visiting, completed) ||
+		    candidates.empty()) return false;
+
+		descriptor.bounded_image.emplace();
+		descriptor.bounded_image->wave_uniform = true;
+		descriptor.bounded_image->wave_candidates = std::move(candidates);
+		descriptor.bounded_image->key_arg = 0u;
+		source = InternSource(descriptor);
+		return true;
+	}
+
 	bool MakeBoundedSamplerExpression(Inst& handle, DescriptorSource descriptor,
 	                                  uint32_t& source, std::string& rejection) {
 		std::vector<const BoundedReadPlan*> dependencies;
@@ -1493,6 +1637,8 @@ private:
 		if (expected == ValueOpcode::GetImageResource && MakeBoundedImageSource(*handle, source)) return;
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
+		if (expected == ValueOpcode::GetImageResource &&
+		    MakeWaveUniformImageSource(*handle, descriptor, source)) return;
 		if (expected == ValueOpcode::GetBufferResource &&
 		    MakeBoundedBufferExpression(*handle, descriptor, source, bounded_rejection)) return;
 		if (expected == ValueOpcode::GetImageResource &&

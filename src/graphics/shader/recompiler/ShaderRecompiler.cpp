@@ -22,7 +22,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
+#include <fmt/printf.h>
 #include <map>
 #include <span>
 #include <utility>
@@ -30,6 +33,22 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
+
+constexpr size_t MaxDiagnosticIrInstructions = 20000;
+
+template <typename... Args>
+void LogShaderPhase(const char* format, Args&&... args) {
+	auto message = fmt::sprintf(format, std::forward<Args>(args)...);
+	LOGF("%s", message.c_str());
+	static const bool trace_stdout = [] {
+		const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+		return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+	}();
+	if (trace_stdout && Log::GetDirection() != Log::Direction::Console) {
+		std::fwrite(message.data(), 1, message.size(), stdout);
+		std::fflush(stdout);
+	}
+}
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
@@ -43,6 +62,14 @@ std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	                    ir.dispatcher_fallback ? "dispatcher" : "structured", ir.scratch_dwords);
 	dump += IR::ProgramToString(ir);
 	return dump;
+}
+
+size_t CountIrInstructions(const IR::Program& ir) {
+	size_t count = 0;
+	for (const auto* block: ir.blocks) {
+		count += block->Instructions().size();
+	}
+	return count;
 }
 
 const char* StageName(ShaderType stage) {
@@ -64,7 +91,7 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
 	const auto  predecessors = block != nullptr ? block->predecessors.size() : 0u;
 	const auto  successors   = block != nullptr ? block->successors.size() : 0u;
-	LOGF("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
+	LogShaderPhase("%s CFG dispatcher fallback: stage=%s hash=0x%016" PRIx64
 	     " phase=%s failure=%s block=%" PRIu32 " pc=0x%08" PRIx32 "..0x%08" PRIx32 " preds=%" PRIu64
 	     " succs=%" PRIu64 " blocks=%" PRIu64 " loops=%" PRIu64 " back_edges=%" PRIu64
 	     " reason=%s\n",
@@ -502,7 +529,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 .count());
 	};
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	LogShaderPhase("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
@@ -546,10 +573,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+	LogShaderPhase("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
 	auto cfg = CFG::BuildGraph(decoded);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+	LogShaderPhase("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
@@ -565,7 +592,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
 		}
-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		LogShaderPhase("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     static_cast<uint64_t>(cfg.blocks.size()),
@@ -592,7 +619,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	LogShaderPhase("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	// HW_REG_MODE is id 1 in RDNA2's encoded hardware-register operand.
@@ -606,10 +633,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			ir.writes_fp_mode = true;
 		}
 	}
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	LogShaderPhase("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	LogShaderPhase("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR Normalize\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	IR::RewriteToSsa(ir.blocks);
 	IR::ConstantPropagationPass(ir.blocks);
 	IR::ResolveControlFlowIdentities(ir);
@@ -627,10 +656,24 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	const auto normalized_instruction_count = CountIrInstructions(ir);
+	LogShaderPhase("%s phase end: stage=%s hash=0x%016" PRIx64 " IR Normalize instructions=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(normalized_instruction_count), phase_ms());
 	if (options.dump_ir && options.early_dump) {
-		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
-		     IR::ProgramToString(ir).c_str());
+		if (normalized_instruction_count <= MaxDiagnosticIrInstructions) {
+			LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+			     IR::ProgramToString(ir).c_str());
+		} else {
+			LOGF("%s native IR before resource tracking omitted: instructions=%" PRIu64
+			     " limit=%" PRIu64 "\n",
+			     GetDumpLabel(options), static_cast<uint64_t>(normalized_instruction_count),
+			     static_cast<uint64_t>(MaxDiagnosticIrInstructions));
+		}
 	}
+	LogShaderPhase("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TrackResources\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
@@ -656,7 +699,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::AllocateBindings(ir, push_data_start_dword);
 	std::string ir_dump;
 	if (options.dump_ir) {
-		ir_dump = MakeIrDump(translated.cfg_dump, ir);
+		const auto instruction_count = CountIrInstructions(ir);
+		if (instruction_count <= MaxDiagnosticIrInstructions) {
+			ir_dump = MakeIrDump(translated.cfg_dump, ir);
+		} else {
+			ir_dump = fmt::format("<IR dump omitted: instructions={} limit={}>\n",
+			                      instruction_count, MaxDiagnosticIrInstructions);
+		}
 		if (options.early_dump) {
 			LOGF("%s native IR and bindings (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
 		}

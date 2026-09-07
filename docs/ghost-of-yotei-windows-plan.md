@@ -7,8 +7,8 @@
 **Эмулятор доходит до Vulkan dispatch и показа подготовленных поверхностей, но
 первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
 остаётся frame 124 в запуске `010001-1fc2ba`. Последняя проверка исправления
-`011206-631449` дошла до frame 122, подготовила 109 GPU flips и показала 108 до
-принудительного timeout. Signed storage shader
+`020716-69504b` дошла до frame 121, полностью скомпилировала `c6b0…` и сама
+завершилась кодом 321 на следующем renderer invariant. Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
 выпускают SPIR-V и создают Vulkan pipelines. Текущий блокер находится при binding
 следующего image descriptor теперь пройден: 256-байтный placed-view адрес больше
@@ -16,7 +16,9 @@
 frames соседнего запуска 960×540 всё ещё показал нулевой RGB, поэтому первый
 полезный кадр пока не доказан.
 
-Persistent Vulkan pipeline cache работает и переживает перезапуск. Он убрал
+Persistent Vulkan pipeline cache работает и переживает перезапуск. Новые driver
+pipelines сохраняются каждые 16 созданий, поэтому принудительный timeout больше
+не теряет весь прогрев; одинаковый payload повторно на диск не записывается. Cache убрал
 примерно 60-секундную первую компиляцию самого тяжёлого pipeline, но не устранил
 постоянное время GPU-исполнения. CFG-исправление снизило steady-время
 `e52e19c6923301d0` примерно с 8,37 с до 14–16 мс; `916ea8893e5b276a`
@@ -84,7 +86,7 @@ flowchart TD
 | 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **Частично**. Текущий строгий batch: 714/825 дошли до своей проверяемой границы; 111 остановились. Это не означает 714 готовых Vulkan pipeline. |
 | 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **PASS для достигнутого игрового пути.** Constant-bound pre/post-test loops поддерживают согласованные snapshots buffer- и восьмисловных image-descriptor tables. `5f3fdf61a7ca4a20` материализует шесть записей с живым GPU-индексом. Остальной корпус поддержан частично. |
 | 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **PASS для достигнутого игрового пути.** `e52e19c6923301d0` проходит как structured CFG; `f802a6b9d9904f74` принят как один полный split wave64; `5f3fdf61a7ca4a20` выпускает валидный SPIR-V с indirect storage-image read. |
-| 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для persistent cache.** Загружено 5,4 MiB, после запуска сохранено обновлённое содержимое. Жёсткое убийство процесса всё ещё не гарантирует сохранение новых записей. |
+| 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/checkpointed/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для persistent cache.** Принудительно остановленный запуск сохранил семь промежуточных версий вплоть до 7,07 MiB; следующий запуск загрузил их. Неизменившийся blob отсекается по хэшу. |
 | 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **Частично.** `e52e…` исправлен до 14–16 мс steady; главный известный compute-блокер `916e…` остаётся около 6,1 с. |
 | 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 110 GPU flips, 109 shown. Это ещё не доказывает полезные пиксели. |
 | 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **FAIL / текущий correctness-блокер.** Первые восемь readback 960×540: RGB полностью 0, alpha 3. |
@@ -145,7 +147,9 @@ descriptor tables в `da7e70d9fcafe48c` также проходят до усп�
 pipeline. Фикс отделил 256-байтное выравнивание адреса image SRD от allocation
 alignment tiled surface и сохранил точный placed-view guest range. После
 `053b2c82226fe5ed` успешно созданы pipelines `c090…`, `be4e…`, `3176…` и
-`916e…`; timeout застал следующий крупный `c6b0…` после IR translation.
+`916e…`; `c6b0…` теперь проходит Normalize, TrackResources и SPIR-V emission.
+Независимый phase trace сократил журнал этого пути до 188 KiB/2066 строк и выявил
+следующий блокер: depth target меняется после первоначального render-state discovery.
 
 ## Состояние по уровням проверки
 
@@ -153,12 +157,12 @@ alignment tiled surface и сохранил точный placed-view guest range
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows build/install текущего рабочего дерева завершён; проверенный runtime binary SHA-256 `2cc0279c59317cfaaaa03128466f8719b3f0287298b5a3c6b54e421f1bb7b076`. | Commit-only banner и hash появятся после milestone commit/rebuild. |
+| Установленный эмулятор | Windows build/install commit `3a73ed7` плюс diagnostic trace завершён; последний runtime binary SHA-256 `c2dc50714dd925de6029a4fe0fa54b208c485a4e0b073ee738e1377c47547f10`. | Commit-only hash diagnostic-изменения появится после milestone commit/rebuild; полный CTest отложен как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
-| Дополнительные проверки GPU/Vulkan | Persistent cache создан, загружен и сохранён при graceful timeout; прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сокращает steady GPU execution автоматически. |
+| Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `011206-631449` с validation прошёл placed-view descriptor и четыре последующих compute pipelines; timeout на frame 122 застал `c6b0…` после IR translation. Максимум прежней сборки — frame 124. | Первый ненулевой видимый кадр и следующий fatal ещё не достигнуты. |
+| Реальная игра | `020716-69504b` с validation дошёл до frame 121, скомпилировал 135 shaders и подтвердил `c6b0…` через SPIR-V; процесс сам завершился кодом 321 на `depth target changed after render-state discovery`. Максимум прежней сборки — frame 124. | Первый ненулевой видимый кадр ещё не достигнут; нужен общий повторный discovery/validation depth state. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -196,7 +200,7 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 служат указателями для рабочего стенда; опубликованный документ не предоставляет
 сами журналы, игровые бинарные данные или captures.
 
-## Последний реальный запуск и ближайший блокер
+## Последний диагностический запуск и ближайший блокер
 
 <!-- LATEST-RUNTIME-BEGIN: заменять карточку только по завершённому run.json и логам. -->
 
@@ -204,16 +208,18 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-011206-631449` |
-| SHA-256 запущенного emulator | `2cc0279c59317cfaaaa03128466f8719b3f0287298b5a3c6b54e421f1bb7b076` |
-| Время UTC | `2026-09-07T01:12:06.1620852Z` → `01:16:42.4699122Z` |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-020716-69504b` |
+| SHA-256 запущенного emulator | `c2dc50714dd925de6029a4fe0fa54b208c485a4e0b073ee738e1377c47547f10` |
+| Время UTC | `2026-09-07T02:07:16.7674200Z` → `02:13:10.3505861Z` |
 | Режим | Diagnostic, Vulkan/SPIR-V validation, FIFO, окно 1280×720; внутренние основные targets 480×270 |
-| Завершение | Timeout 240 с, затем принудительное завершение после неуспешного window-close; процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 122; FPS 0,535973; flips CPU/GPU 0/109; prepared 109, ready 109, shown 108; 117 уникальных stage/hash дошли до decode |
+| Завершение | Самостоятельный exit code 321 до timeout 360 с; процессов Kyty после runner нет |
+| Наблюдаемое исполнение | frame 121; FPS 0,526609; flips CPU/GPU 0/109; prepared 109, ready 109, shown 108; 135 shaders скомпилированы |
 | Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
-| Текущая граница | `c6b0a54eb5738565`: decode 4384 instructions, CFG 266 blocks/7 loops, dispatcher fallback из-за duplicate structured merge, IR translation завершён; timeout наступил до resource tracking/SPIR-V результата |
+| Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 443 слова, emission 60 мс, shader №132 завершён |
+| Текущая ошибка | `depth target changed after render-state discovery` в `renderDraw.cpp:658`, после успешной компиляции shader №135 |
+| Диагностика | `KYTY_SHADER_PHASE_TRACE=1` при silent guest log сохранил все phase begin/end в stdout: 188 KiB, 2066 строк вместо прежних 244 MiB/10 140 670 строк |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым
@@ -231,6 +237,12 @@ Persistent cache проверен двумя последовательными 
 вызов приблизился к steady времени. Подпись cache версии `KytyPC2` связывает
 его с точным worktree fingerprint и Vulkan device/driver/cache UUID, поэтому
 после изменения исходников старый blob корректно не переиспользуется.
+
+Commit `3a73ed7` добавил промежуточное сохранение после каждых 16 новых graphics
+или compute pipelines. Проверочный принудительно завершённый запуск сохранил семь
+последовательных checkpoints от 462 474 до 7 069 215 байт; следующий процесс
+загрузил последний файл и продолжил создание pipelines. Хэш уже записанного
+payload подавляет повторную замену файла, когда тёплый driver cache не изменился.
 
 Согласованное половинное разрешение уменьшило dispatch `916e…` с 240×135 до
 120×68 и steady время примерно с 24,32 до 6,13 с. Shader `e52e…` сохранил

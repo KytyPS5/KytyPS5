@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cinttypes>
 #include <fmt/format.h>
 #include <unordered_set>
 

@@ -15,8 +15,38 @@ uint32_t WavePointer(EmitterState& state, uint32_t lane) {
 	EXIT_IF(state.wave_scratch_variable == 0);
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
-	                           pointer, state.wave_scratch_variable, lane});
+	                           pointer, state.wave_scratch_variable,
+	                           EmitWaveScratchIndex(state, lane)});
 	return pointer;
+}
+uint32_t WaveBallotWordPointer(EmitterState& state, uint32_t lane) {
+	// Keep the aggregate words after the per-lane scratch area. Each invocation
+	// selects its half dynamically, but the reset and accumulation are separated
+	// by a workgroup barrier so the reset cannot race a contribution.
+	const auto word = EmitBinaryU32(
+	    state, OpBitwiseAnd,
+	    EmitBinaryU32(state, OpShiftRightLogical, lane, ConstantU32(state, 5)),
+	    ConstantU32(state, 1));
+	const auto wave = state.compute_execution.IsCooperativeWave64()
+	                      ? EmitBinaryU32(state, OpShiftRightLogical, lane,
+	                                      ConstantU32(state, 6))
+	                      : ConstantU32(state, 0);
+	const auto wave_offset = EmitBinaryU32(state, OpShiftLeftLogical, wave, ConstantU32(state, 1));
+	const auto relative = EmitBinaryU32(
+	    state, OpIAdd, ConstantU32(state, state.wave_ballot_base_dwords),
+	    EmitBinaryU32(state, OpIAdd, wave_offset, word));
+	return WavePointer(state, relative);
+}
+uint32_t WaveBallotWordPointer(EmitterState& state, uint32_t wave_base, uint32_t word) {
+	const auto wave = state.compute_execution.IsCooperativeWave64()
+	                      ? EmitBinaryU32(state, OpShiftRightLogical, wave_base,
+	                                      ConstantU32(state, 6))
+	                      : ConstantU32(state, 0);
+	const auto wave_offset = EmitBinaryU32(state, OpShiftLeftLogical, wave, ConstantU32(state, 1));
+	const auto relative = EmitBinaryU32(
+	    state, OpIAdd, ConstantU32(state, state.wave_ballot_base_dwords),
+	    EmitBinaryU32(state, OpIAdd, wave_offset, ConstantU32(state, word)));
+	return WavePointer(state, relative);
 }
 uint32_t WaveBase(EmitterState& state) {
 	if (!state.compute_execution.IsCooperativeWave64()) {
@@ -31,6 +61,12 @@ uint32_t WaveLoad(EmitterState& state, uint32_t lane, uint32_t wave_base) {
 	const auto index = state.compute_execution.IsCooperativeWave64()
 	                       ? EmitBinaryU32(state, OpIAdd, wave_base, lane) : lane;
 	const auto pointer = WavePointer(state, index);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), result, pointer});
+	return result;
+}
+uint32_t WaveBallotWordLoad(EmitterState& state, uint32_t wave_base, uint32_t word) {
+	const auto pointer = WaveBallotWordPointer(state, wave_base, word);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), result, pointer});
 	return result;
@@ -66,21 +102,31 @@ uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate) {
 		                           bits, bits, ConstantU32(state, 0), ConstantU32(state, 0)});
 		return result;
 	}
-	// Every actual guest lane has its own host invocation and scratch slot. This
-	// does not depend on the driver's mapping of invocations to native subgroups.
+	// A native subgroup is one half of the guest wave64 on the admitted split
+	// workgroup. Reduce each half with a subgroup bitwise OR, then publish one
+	// aggregate word through workgroup memory so every lane can see both halves.
 	const auto lane = EmitHostLocalInvocationIndex(state);
 	const auto bit_lane = EmitBinaryU32(state, OpBitwiseAnd, lane, ConstantU32(state, 31));
 	const auto bit = EmitBinaryU32(state, OpShiftLeftLogical, ConstantU32(state, 1), bit_lane);
 	const auto contribution = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelect, TypeU32(state), contribution, predicate, bit, ConstantU32(state, 0)});
-	WavePublish(state, contribution);
+	state.builder.AddFunction({OpSelect, TypeU32(state), contribution, predicate, bit,
+	                           ConstantU32(state, 0)});
+	const auto subgroup_word = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformBitwiseOr, TypeU32(state), subgroup_word,
+	                           ConstantU32(state, ScopeSubgroup), GroupOperationReduce,
+	                           contribution});
+	const auto subgroup_lane = EmitBinaryU32(state, OpBitwiseAnd, lane, ConstantU32(state, 31));
+	const auto leader = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpIEqual, TypeBool(state), leader, subgroup_lane, ConstantU32(state, 0)});
+	EmitIfCondition(state, leader, [&]() {
+		const auto pointer = WaveBallotWordPointer(state, lane);
+		state.builder.AddFunction({OpStore, pointer, subgroup_word});
+	});
+	WaveBarrier(state);
 	const auto wave_base = WaveBase(state);
-	std::array<uint32_t, 2> words{ConstantU32(state, 0), ConstantU32(state, 0)};
-	for (uint32_t index = 0; index < 64; ++index) {
-		words[index / 32] = EmitBinaryU32(state, OpBitwiseOr, words[index / 32],
-		                                 WaveLoad(state, ConstantU32(state, index), wave_base));
-	}
-	// No invocation may overwrite this shared array until all peers have read it.
+	std::array<uint32_t, 2> words{WaveBallotWordLoad(state, wave_base, 0),
+	                               WaveBallotWordLoad(state, wave_base, 1)};
 	WaveBarrier(state);
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(state, 4), result,

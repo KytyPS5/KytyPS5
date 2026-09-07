@@ -398,6 +398,8 @@ void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 
+uint32_t EmitWaveScratchIndex(EmitterState& state, uint32_t lane);
+
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;

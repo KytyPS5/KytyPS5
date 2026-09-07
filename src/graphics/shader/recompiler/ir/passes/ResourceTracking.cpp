@@ -1725,6 +1725,142 @@ private:
 				has_bounded_column |= BoundedReadValue(handle->Arg(word)) != nullptr;
 			}
 		}
+		if (expected == ValueOpcode::GetImageResource && m_program.dispatcher_fallback) {
+			static const bool trace = [] {
+				const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+				return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+			}();
+			if (trace) {
+				bool has_raw_descriptor = false;
+				for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
+					const auto value = handle->Arg(word).Resolve();
+					const auto* definition = value.TryInstruction();
+					has_raw_descriptor |= definition != nullptr &&
+					                      (definition->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+					                       definition->GetOpcode() == ValueOpcode::ReadConstBuffer);
+				}
+				if (has_raw_descriptor) {
+					const auto block_id = [&](const Inst* inst) {
+						if (inst == nullptr || inst->Parent() == nullptr) return UINT32_MAX;
+						for (uint32_t id = 0; id < m_program.blocks.size(); ++id)
+							if (m_program.blocks[id] == inst->Parent()) return m_program.block_info[id].id;
+						return UINT32_MAX;
+					};
+					std::fprintf(stderr,
+					             "shader resource tracking: dispatcher image handle pc=0x%08" PRIx32
+					             " args=%zu handle_block=%" PRIu32 "\n",
+					             pc, handle->NumArgs(), block_id(handle));
+					for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
+						const auto value = handle->Arg(word).Resolve();
+						const auto* definition = value.TryInstruction();
+						const auto offset = definition != nullptr && definition->NumArgs() > 1u
+						                        ? definition->Arg(1).Resolve()
+						                        : Value {};
+						const auto* offset_definition = offset.TryInstruction();
+						std::fprintf(stderr,
+						             "  image dword=%u opcode=%s block=%" PRIu32
+						             " uses=%zu bounded=%s offset=%s offset_arg0=%s "
+						             "offset_arg0_arg0=%s\n",
+						             word,
+						             definition == nullptr ? "immediate"
+						                                   : ValueOpcodeName(definition->GetOpcode()).data(),
+						             block_id(definition),
+						             definition == nullptr ? 0u : definition->Uses().size(),
+						             definition != nullptr &&
+						                     BoundedReadValue(Value(const_cast<Inst*>(definition))) != nullptr
+						                 ? "yes"
+						                 : "no",
+						             offset_definition == nullptr
+						                 ? (offset.IsImmediate() ? "immediate" : "unknown")
+						                 : ValueOpcodeName(offset_definition->GetOpcode()).data(),
+						             offset_definition == nullptr || offset_definition->NumArgs() == 0u
+						                 ? "none"
+						                 : (offset_definition->Arg(0).Resolve().TryInstruction() == nullptr
+						                        ? "immediate"
+						                        : ValueOpcodeName(offset_definition->Arg(0)
+						                                               .Resolve()
+						                                               .TryInstruction()
+						                                               ->GetOpcode())
+						                              .data()),
+						             offset_definition == nullptr || offset_definition->NumArgs() == 0u ||
+						                     offset_definition->Arg(0).Resolve().TryInstruction() == nullptr ||
+						                     offset_definition->Arg(0).Resolve().TryInstruction()->NumArgs() == 0u
+						                 ? "none"
+						                 : (offset_definition->Arg(0)
+						                                .Resolve()
+						                                .TryInstruction()
+						                                ->Arg(0)
+						                                .Resolve()
+						                                .TryInstruction() == nullptr
+						                        ? "immediate"
+						                        : ValueOpcodeName(offset_definition->Arg(0)
+						                                               .Resolve()
+						                                               .TryInstruction()
+						                                               ->Arg(0)
+						                                               .Resolve()
+						                                               .TryInstruction()
+						                                               ->GetOpcode())
+						                              .data()));
+						const auto* selector_definition =
+						    offset_definition == nullptr || offset_definition->NumArgs() == 0u
+						        ? nullptr
+						        : offset_definition->Arg(0).Resolve().TryInstruction();
+						if (selector_definition != nullptr &&
+						    selector_definition->GetOpcode() == ValueOpcode::ReadFirstLane &&
+						    selector_definition->NumArgs() > 0u) {
+							const auto* phi = selector_definition->Arg(0).Resolve().TryInstruction();
+							if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi) {
+								std::fprintf(stderr, "    selector phi args=%u", phi->NumArgs());
+								for (uint32_t arg = 0; arg < phi->NumArgs(); ++arg) {
+									const auto* incoming = phi->Arg(arg).Resolve().TryInstruction();
+									std::fprintf(stderr, " %u:%s", arg,
+									             incoming == nullptr
+									                 ? "immediate"
+									                 : ValueOpcodeName(incoming->GetOpcode()).data());
+									if (incoming != nullptr && incoming->GetOpcode() == ValueOpcode::SelectU32) {
+										std::fprintf(stderr, "(");
+										for (uint32_t select_arg = 0;
+										     select_arg < incoming->NumArgs(); ++select_arg) {
+											const auto* select_value =
+											    incoming->Arg(select_arg).Resolve().TryInstruction();
+											std::fprintf(stderr, "%s%s",
+											             select_arg == 0u ? "" : ",",
+											             select_value == nullptr
+											                 ? "immediate"
+											                 : ValueOpcodeName(select_value->GetOpcode())
+											                       .data());
+										}
+										std::fprintf(stderr, ")");
+									}
+								}
+								std::fprintf(stderr, "\n");
+							}
+						}
+						if (definition != nullptr &&
+						    definition->GetOpcode() == ValueOpcode::ReadConstBuffer &&
+						    definition->NumArgs() > 0u) {
+							const auto* buffer = definition->Arg(0).Resolve().TryInstruction();
+							if (buffer != nullptr) {
+								std::fprintf(stderr, "    buffer opcode=%s block=%" PRIu32
+								             " args=%zu\n",
+								             ValueOpcodeName(buffer->GetOpcode()).data(),
+								             block_id(buffer), buffer->NumArgs());
+								for (uint32_t arg = 0; arg < buffer->NumArgs(); ++arg) {
+									const auto* root = buffer->Arg(arg).Resolve().TryInstruction();
+									std::fprintf(stderr, "      buffer arg=%u opcode=%s block=%" PRIu32
+									             "\n",
+									             arg,
+									             root == nullptr
+									                 ? "immediate"
+									                 : ValueOpcodeName(root->GetOpcode()).data(),
+									             block_id(root));
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 		if (has_bounded_column) {
 			static const bool trace = [] {
 				const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");

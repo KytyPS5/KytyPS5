@@ -31,6 +31,14 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 	return ret;
 }
 
+uint32_t EmitStorageBufferElementCount(EmitterState& state, uint32_t byte_limit,
+                                       uint32_t element_shift) {
+	const auto rounded_limit =
+	    EmitAddU32(state, byte_limit, ConstantU32(state, (1u << element_shift) - 1u));
+	return EmitBinaryU32(state, OpShiftRightLogical, rounded_limit,
+	                     ConstantU32(state, element_shift));
+}
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -78,6 +86,13 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
+uint32_t EmitWaveScratchIndex(EmitterState& state, uint32_t lane) {
+	if (state.wave_scratch_base_dwords == 0) {
+		return lane;
+	}
+	return EmitAddU32(state, lane, ConstantU32(state, state.wave_scratch_base_dwords));
+}
+
 static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
@@ -94,7 +109,8 @@ static void EnsureLdsStorage(EmitterState& state) {
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          uint32_t variable,
-                                                         uint32_t pointer_type) {
+                                                         uint32_t pointer_type,
+                                                         uint32_t element_shift) {
 	if (variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");

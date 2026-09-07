@@ -461,6 +461,37 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
+bool IsLaneDwordAddress(IR::Value value) {
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != IR::ValueOpcode::ShiftLeftLogical32 ||
+	    inst->NumArgs() != 2u || !inst->Arg(1).IsImmediate() || inst->Arg(1).U32() != 2u)
+		return false;
+	const auto* lane = inst->Arg(0).TryInstruction();
+	return lane != nullptr && lane->GetOpcode() == IR::ValueOpcode::LaneId &&
+	       lane->NumArgs() == 0u;
+}
+
+bool LdsStoreIsCollisionFree(const EmitterState& state, const IR::Inst& inst,
+                             const IR::MemoryInfo& mem) {
+	if (mem.kind != IR::ResourceKind::Lds || state.requirements.function_lds ||
+	    !state.compute_execution.IsSplitWave64() ||
+	    state.compute_execution.IsCooperativeWave64() ||
+	    state.compute_workgroup.host_size != std::array<uint32_t, 3>{64u, 1u, 1u} ||
+	    inst.NumArgs() < 3u)
+		return false;
+
+	const auto address = inst.Arg(0);
+	if (IsLaneDwordAddress(address)) return true;
+
+	// EXEC lowering can preserve the lane-based address only on the active arm.
+	// The inactive arm is never stored, so it does not need an injectivity proof.
+	const auto exec = inst.Arg(inst.NumArgs() - 1u);
+	const auto* select = address.TryInstruction();
+	return select != nullptr && select->GetOpcode() == IR::ValueOpcode::SelectU32 &&
+	       select->NumArgs() == 3u && select->Arg(0) == exec &&
+	       IsLaneDwordAddress(select->Arg(1));
+}
+
 bool LdsHasCompetingInvocations(const EmitterState& state) {
 	return !state.requirements.function_lds &&
 	       state.compute_workgroup.host_size != std::array<uint32_t, 3>{1u, 1u, 1u};
@@ -805,9 +836,9 @@ uint32_t LoadFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
 	    });
 }
 
-void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                            const PreparedFormattedMemory& plan, uint32_t component,
-                            uint32_t data) {
+void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
+                            const IR::MemoryInfo& mem, const PreparedFormattedMemory& plan,
+                            uint32_t component, uint32_t data) {
 	if (component >= plan.info.component_count) return;
 	const auto bits = plan.info.component_bits[component];
 	if (bits == 16u && (plan.info.type == Format::ComponentType::Snorm ||
@@ -823,7 +854,7 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {
-		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
+		StoreWordInBounds(ctx, inst, mem, plan.resource, plan.indices[component], data);
 	}
 }
 

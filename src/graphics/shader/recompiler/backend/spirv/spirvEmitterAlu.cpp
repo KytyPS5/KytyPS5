@@ -290,6 +290,45 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	return Select(state, TypeU32(state), zero, ConstantU32(state, 0), high);
 }
 
+const IR::Inst* ZeroTestedBitwiseOr(const IR::Inst& compare) {
+	if ((compare.GetOpcode() != IR::ValueOpcode::IEqual32 &&
+	     compare.GetOpcode() != IR::ValueOpcode::INotEqual32) ||
+	    compare.NumArgs() != 2) {
+		return nullptr;
+	}
+	for (size_t operand = 0; operand < 2; ++operand) {
+		const auto value = compare.Arg(operand).Resolve();
+		const auto other = compare.Arg(operand ^ 1u).Resolve();
+		const auto* bitwise_or = value.TryInstruction();
+		if (bitwise_or == nullptr || bitwise_or->GetOpcode() != IR::ValueOpcode::BitwiseOr32 ||
+		    bitwise_or->GetType() != IR::Type::U32 || !other.IsImmediate() ||
+		    other.GetType() != IR::Type::U32 || other.U32() != 0u ||
+		    bitwise_or->Uses().empty()) {
+			continue;
+		}
+		bool all_uses_are_zero_tests = true;
+		for (const auto& use : bitwise_or->Uses()) {
+			const auto* user = use.user;
+			if (user == nullptr ||
+			    (user->GetOpcode() != IR::ValueOpcode::IEqual32 &&
+			     user->GetOpcode() != IR::ValueOpcode::INotEqual32) ||
+			    user->NumArgs() != 2u || use.operand > 1u) {
+				all_uses_are_zero_tests = false;
+				break;
+			}
+			const auto user_other = user->Arg(use.operand ^ 1u).Resolve();
+			if (!user_other.IsImmediate() || user_other.GetType() != IR::Type::U32 ||
+			    user_other.U32() != 0u) {
+				all_uses_are_zero_tests = false;
+				break;
+			}
+		}
+		if (!all_uses_are_zero_tests) continue;
+		return bitwise_or;
+	}
+	return nullptr;
+}
+
 } // namespace
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);

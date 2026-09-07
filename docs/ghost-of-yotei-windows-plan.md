@@ -1,11 +1,33 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **7 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Обновлено **8 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-**Эмулятор доходит до 181 полностью скомпилированного shader-варианта и показа подготовленных поверхностей, но
-первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.** Максимум
-служебного счётчика остаётся frame 126 в capture-прогоне. Signed storage shader
+Последний цикл **7 сентября 2026, 21:11–21:14 UTC** добавил общий lowering
+для доказанно инъективных split-wave64 LDS DWORD stores: адрес
+`(LaneId << 2) + offset` при одной полной host workgroup теперь использует
+обычный `OpStore`, а неопределённые/конфликтующие адреса сохраняют
+`OpAtomicStore`. Synthetic RED/GREEN с прямым и EXEC-select адресом пройден,
+а реальный RTX 5060 Ti run создал и выполнил прежние `b90e`/`a766` границы.
+Installed emulator SHA-256:
+`c3088432abe5babdbe573b8f651a74f11976129b9dbb0a639e8789d7a254570c`.
+
+Предыдущий цикл **7 сентября 2026, 18:50 UTC** добавил общий lowering
+zero-tested `BitwiseOr32` для split-wave64: когда integer OR имеет единственного
+потребителя `IEqual32`/`INotEqual32` с нулём, emitter сохраняет точную семантику
+через два integer compare и `OpLogicalAnd`/`OpLogicalOr`, не выпуская
+compiler-sensitive integer OR над Workgroup-derived словами. Synthetic RED/GREEN,
+`spirv-val` и изолированный Vulkan probe пройдены. Installed emulator SHA-256:
+`69459c99af122d2dd14e751e2e77c73794e9556546b662e06b0d70b71e8ca64d`.
+Fast-прогон `yotei-integrated-20260907-184839-3aecc7` дошёл до более поздних
+frame-39 dispatches; старый диагностический GPUAV-прогон
+`yotei-integrated-20260907-185013-3a240a` был остановлен на
+`a7661ff4ea282325`, что устранено следующим LDS lowering. Ненулевой rendered
+frame, меню и gameplay всё ещё **PENDING**.
+
+**Последний диагностический запуск дошёл до frame 158, 146 GPU flips и 145 shown,
+но первый ненулевой кадр, меню и управляемая сцена пока не подтверждены.**
+Signed storage shader
 `753c552fae650ec4` и packed-D16/descriptor shader `da7e70d9fcafe48c` теперь
 выпускают SPIR-V и создают Vulkan pipelines. Зависимые bounded buffer/image/sampler
 descriptors для `8457901d80b91921` теперь материализуются, а scalar-address branch
@@ -36,8 +58,10 @@ unsigned/signed расширением, выбором low/high half и сохр
 VGPR. Compute shader `d7a83911714a58ee` выпустил SPIR-V и завершил dispatch.
 В большом compute shader `6cc64dee32dc7094` теперь доказан конечный selector
 0...31 и однозначный dispatcher entry prefix для buffer table с шагом 16;
-прежний отказ на PC `0x530` пройден. Текущая граница того же shader — DWORD 0
-image descriptor из `LoadAddressU32` на guest PC `0x7c4`.
+прежний отказ на PC `0x530` пройден. Scalar-buffer image table с ключом
+`ReadFirstLane(Phi) << 5` теперь проходит общий inline image-table путь, включая
+`ImageRead`; текущая граница того же shader — отдельный `GetBufferResource` с root
+`ReadConstBuffer` на guest PC `0x656c`.
 
 Persistent Vulkan pipeline cache работает и переживает перезапуск. Новые driver
 pipelines сохраняются каждые 16 созданий, поэтому принудительный timeout больше
@@ -106,13 +130,13 @@ flowchart TD
 | 1 | Сборка | CMake/Ninja собирают Release `kyty_emulator`, тесты и install tree с DLL/plugins. | Native Windows build, CTest, hash установленного executable. | **PASS для текущего рабочего дерева.** `shader_cfg_tests` и `kyty_emulator` собраны и install обновлён. Последняя полная стабильная серия CTest остаётся 48/48; новые regression-тесты временно записываются как техдолг. |
 | 2 | Загрузка гостя | Loader читает executable и модули, разрешает импорты, создаёт память и стартовые потоки. | Отсутствие loader/import fatal; прогресс гостевого лога. | **PASS**. Игра многократно доходит до графической инициализации. |
 | 3 | Команды GPU | Guest записывает PM4/compute/draw команды; Kyty разбирает очереди и формирует renderer calls. | Логи `GraphicsRenderDispatchDirect`, draw/dispatch counters. | **PASS** для достигнутого пути. Выполнены сотни команд и повторяющиеся кадры. |
-| 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **Частично**. Текущий строгий batch: 714/825 дошли до своей проверяемой границы; 111 остановились. Это не означает 714 готовых Vulkan pipeline. |
-| 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **FAIL / текущая граница.** В `6cc64dee32dc7094` конечная 32-элементная buffer table в dispatcher entry prefix теперь планируется; прежний PC `0x530` пройден. Следующий независимый отказ — image descriptor с root `LoadAddressU32` на PC `0x7c4`. |
-| 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **PASS для достигнутого пути.** `8457901d80b91921` выпускает 102 791 слово, `7ceb0f3417f926f9` — 103 404 слова; оба прошли достигнутую runtime-компиляцию. Остальной корпус поддержан частично. |
-| 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/checkpointed/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для persistent cache.** Принудительно остановленный запуск сохранил семь промежуточных версий вплоть до 7,07 MiB; следующий запуск загрузил их. Неизменившийся blob отсекается по хэшу. |
-| 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **PASS для достигнутого пути.** Прежний auto draw 4×1 с PS `964747…` и VS `f0a524…` завершился; после него также завершились последующие команды без нового `nvlddmkm`. Текущий запуск остановлен resource tracker до dispatch `6cc64dee…`. |
-| 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 111 GPU flips, 110 shown. Это ещё не доказывает полезные пиксели. |
-| 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **FAIL / текущий correctness-блокер.** Первые восемь readback 960×540: RGB полностью 0, alpha 3. |
+| 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **PASS для достигнутого пути.** `004abfcd1b5e8fc7` и последующие shader-варианты декодируются и доходят до runtime frontier `b90e2024732c6111`. |
+| 5 | IR и ресурсы | Строится IR, доказывается происхождение buffer/image/sampler descriptors, runtime выбирает допустимую specialization. | Синтетический RED/GREEN, ResourceTracking tests, materialization с реальными runtime данными. | **PENDING для текущего запуска.** Старый путь `6cc64dee32dc7094` с PC `0x656c` не достигнут на RTX 5060 Ti; его `ReadConstBuffer` blocker остаётся неподтверждённым после смены GPU. |
+| 6 | CFG → SPIR-V | CFG структурируется; затем выпускается SPIR-V. Если структурирование невозможно, используется большой dispatcher с `OpSwitch`. | SPIR-V validation, размер модуля, отсутствие dispatcher fallback там, где добавлено доказательство. | **PASS для первого wave64 пути.** Compact ballot и `CapabilityGroupNonUniformBallot` проходят native validation; первый shader выпускает 1730 слов валидного SPIR-V. |
+| 7 | Vulkan pipeline и кэш | Создаются shader modules/layout/pipelines. In-process cache переиспользует их в одном запуске; `VkPipelineCache` сохраняет driver blob между запусками. | Сообщения `loaded/checkpointed/saved`, одинаковая build/GPU/driver signature, сравнение холодного и тёплого запуска. | **PASS для прежней границы.** `b90e2024732c6111` получил `vkCreateComputePipelines=Success`; standalone probe для exact артефакта всё ещё воспроизводит отдельный driver fault, поэтому общий probe-контракт ещё не закрыт. |
+| 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **PASS для достигнутого пути.** `a7661ff4ea282325` и `b90e2024732c6111` завершили dispatch; запуск дошёл до frame 158 без `ErrorDeviceLost`. |
+| 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 146 GPU flips, 145 shown. Это ещё не доказывает полезные пиксели. |
+| 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **FAIL / текущий correctness-блокер.** Восемь readback 480×270: RGB полностью 0, alpha 3. |
 | 11 | Видимый кадр | Swapchain показывает ненулевое изображение, затем должны появиться меню и ввод. | Screenshot/readback + стабильный прогон без fatal/VUID. | **Не достигнут.** Служебные `frame` и `shown` нельзя считать первым кадром. |
 
 ### Где кэшируются шейдеры и что это даёт
@@ -217,12 +241,12 @@ PC `0x530`; следующий blocker — runtime-происхождение DW
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; текущий диагностический binary SHA-256 `1cb82769375b508f961b3c4f1922f537fbac1fc137d4aa75ca6b844d9b7b20e9`. | `shader_cfg_tests` собран с dispatcher entry-prefix proof; полный CTest отложен как test debt. |
+| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; SHA-256 `c3088432abe5babdbe573b8f651a74f11976129b9dbb0a639e8789d7a254570c`. | `shader_cfg_tests --single-wave64-ballot-spirv-only` и zero-predicate regression PASS; полный CTest отложен как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | `_Build/runs/yotei-integrated-20260907-082303-3ae95a`: frame 124, 181 shader-вариант полностью скомпилирован. `6cc64dee…` прошёл прежний buffer failure на PC `0x530`; новых NVIDIA reset нет. | Первый ненулевой видимый кадр не достигнут; текущий блокер — image descriptor из `LoadAddressU32` на PC `0x7c4` того же shader. |
+| Реальная игра | RTX 5060 Ti Diagnostic 1280×720: `_Build/runs/yotei-integrated-20260907-211101-9da340`, `b90e`/`a766` pipeline и dispatch завершены, запуск дошёл до frame 158 и 145 shown. | Первый ненулевой видимый кадр не достигнут: readback `_Build/analysis/yotei-present-readback-20260907-2112.txt` показывает RGB=0, alpha=3. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -268,13 +292,15 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-082303-3ae95a` |
-| SHA-256 запущенного emulator | `1cb82769375b508f961b3c4f1922f537fbac1fc137d4aa75ca6b844d9b7b20e9` |
-| Время UTC | `2026-09-07T08:23:03.7441875Z` → `08:25:47.8166585Z` |
-| Режим | Fast, Immediate, окно 1280×720; полная compute/draw synchronization и shader phase trace, guest log выключен |
-| Завершение | Самостоятельный exit 321 на resource-tracking fatal; новых System events `nvlddmkm` с начала запуска нет, процессов Kyty после runner нет |
-| Наблюдаемое исполнение | frame 124; FPS 0,075949; flips CPU/GPU 0/111; prepared 111, ready 111, shown 110; 181 shader-вариант полностью скомпилирован |
-| Изображение | Окно оставалось чёрным. Последний отдельный readback первых восьми source frames 960×540: RGB min=max=0, alpha=3 |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-211101-9da340` |
+| SHA-256 запущенного emulator | `c3088432abe5babdbe573b8f651a74f11976129b9dbb0a639e8789d7a254570c` |
+| Время UTC | `2026-09-07T21:11:01.3824282Z` → `21:14:02.2620037Z` |
+| Режим | RTX 5060 Ti, окно 1280×720, Diagnostic, FIFO, capture shaders, sync dispatches и GPUAV; split wave64 использует один Workgroup `u32` array для LDS/scratch и отдельный ballot suffix |
+| Завершение | Timeout после 180 с, graceful close успешен, Windows exit `0`; `b90e` pipeline и dispatch завершены, `a766` dispatch также завершён |
+| Наблюдаемое исполнение | `a7661ff4ea282325` (`cs=0x80003afe00`) и `b90e2024732c6111` (`cs=0x8000399500`) получили `after-complete`; последний window title: frame 158, flips CPU/GPU 0/146, prepared/ready/shown 146/146/145 |
+| Текущая граница | Pipeline/execution blocker снят для этого RTX 5060 Ti game path. `vk_spv_probe.exe` на exact свежем `b90e` SPIR-V всё ещё завершается `-2147483645` во время `vkCreateComputePipelines`; это отдельная probe-layout граница, не результат реального game pipeline |
+| Диагностика | Synthetic `shader_cfg_tests --single-wave64-ballot-spirv-only` — GREEN; свежий game capture содержит `vkCreateComputePipelines done result=Success` для `b90e` и `after-complete` для его dispatch. |
+| Изображение | `_Build/analysis/yotei-present-readback-20260907-2112.txt`: восемь source frames 480×270, RGB min=max=0, alpha min=max=3; ненулевой полезный кадр пока не доказан |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
 | Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 533 слова с текущим ABI, shader завершён |
@@ -288,9 +314,10 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | Пройденная descriptor-граница | `7ceb0f3417f926f9`: decode 732, CFG 53 blocks/2 loops, Normalize 3207; memoized TrackResources завершается, пять correlated image candidates материализуются, SPIR-V 103 404 слова, shader №159. |
 | Пройденная graphics-wave64 граница | PS `964747887d898821`: decode 234, CFG 22 blocks/1 loop, structured 26 blocks, Normalize/TrackResources 1 174, SPIR-V 9 820 слов. Все shuffle targets ограничены native subgroup32, ballot отражён в обе guest mask halves, а общий pixel-loop counter завершает fragment после 256 входов в тело. Модуль проходит `spirv-val`; прежний auto draw и следующие команды получают `after-complete` без нового NVIDIA reset. |
 | Пройденная byte-to-D16 граница | GFX10 MUBUF `0x20...0x23` декодируются как unsigned/signed byte-to-D16 low/high loads с сохранением соседней половины VDATA. `d7a83911714a58ee`: decode 55, structured CFG 4 blocks, Normalize/TrackResources 198, SPIR-V 6 537 слов, shader №172; dispatch 76×1×1 завершён за 63 618 мкс. |
-| Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят прежний `GetBufferResource` fatal на PC `0x530`. |
-| Текущая граница | Тот же compute shader, guest address `0x80001dfb00`, grid 4096×1×1: decode 5 370, CFG 346 blocks/9 loops, dispatcher fallback, Normalize 27 733; TrackResources fatal на PC `0x7c4`: `GetImageResource dword 0 is not a valid runtime value (root=LoadAddressU32)`. Перед IMAGE_LOAD две 8-DWORD image tables индексируются тем же selector с шагом 32. |
-| Диагностика | `_Build/runs/yotei-integrated-20260907-082303-3ae95a` с полной compute/draw synchronization и shader phase trace. Запуск самостоятельно завершился exit 321; процессов Kyty после runner и новых System events `nvlddmkm` нет. Следующий шаг — доказать общий bounded image-descriptor path после control-flow split, не ослабляя admission для условных raw reads. |
+| Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят PC `0x530`; scalar-buffer image table с ключом `ReadFirstLane(Phi) << 5` также планируется через inline image path и проходит PC `0x4d64`. |
+| Предыдущая pipeline-граница | Screen Space Shadows `b90e2024732c6111` на RTX 5060 Ti: NVIDIA `nvgpucomp64.dll` падал с `0x80000003` во время компиляции. Collision-free LDS DWORD lowering сохранил atomics для конфликтующих адресов и в реальном run довёл `b90e` до успешного pipeline/dispatch. |
+| Текущая execution-граница | Прежний `a7661ff4ea282325` `ErrorDeviceLost` больше не воспроизвёлся в `_Build/runs/yotei-integrated-20260907-211101-9da340`; последняя граница — чёрный source readback, а не GPU completion. |
+| Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260907-211101-9da340`; `vk_spv_probe.exe` на exact `b90e` artifact всё ещё получает `-2147483645`, тогда как game pipeline получает Success. Readback сохранён отдельно в `_Build/analysis/yotei-present-readback-20260907-2112.txt`. |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым
@@ -354,7 +381,7 @@ image до оконного масштабирования. В первых во
 | Windows и первые ISA-препятствия | Native emulator/launcher, IMAGE_ATOMIC_FMIN/FMAX, DPP8; исправление numeric class atomic image. Исходные коммиты #490 включены в fork. | Старые отчёты `doesnt-boot`, MIMG `0x1f` и `LocalSize Z 256 > 64` — история, а не нынешняя точка отказа. |
 | Дескрипторы и SRT | Compact/full inline images, sampler pairs, ограниченные динамические таблицы; лимиты 128 buffers/samplers и 512 images/pairs с compiler/device budget guards. | Не все виды динамической адресации, неоднородных image candidates и происхождения дескрипторов доказаны. |
 | Scalar masks и инструкции | Числовые EXEC/VCC, ballot, raw-word aliases, SCC/ветвления, проверенные SAVEEXEC/WQM_B64, SDWA MOV и четыре неформатных D16 MUBUF операции. | `S_WQM_B32` и форматные D16 остаются отдельными задачами; старую boolean-only модель маски возвращать нельзя. |
-| Wave64 на native subgroup32 | Логические lane/mask, обмен между половинами, корректные guest IDs; разделение независимых волн и отдельный cooperative режим с одной полной host workgroup. | Каждый режим проходит проверку применимости. Перенос индекса через `&31`, пропуск волн или снятие всех guards не заменяют wave64. |
+| Wave64 на native subgroup32 | Логические lane/mask, обмен между половинами, корректные guest IDs; разделение независимых волн и отдельный cooperative режим с одной полной host workgroup. Guest LDS и split-wave scratch — один Workgroup `u32` массив (префикс LDS, суффикс scratch); 64-bit LDS atomics остаются отдельным `u64` array. | Каждый режим проходит проверку применимости. Перенос индекса через `&31`, пропуск волн или снятие всех guards не заменяют wave64. |
 | LDS и cooperative исполнение | Shared LDS, min/max/OR, guest barriers, разные числа итераций волн, раннее завершение и разные acyclic static barrier sites одного rendezvous. Конкурирующие DWORD stores используют Workgroup atomic store; четыре collision-регрессии и семь multiwave-сценариев проходят с GPUAV. `916e…` выполнился в игре. | Wide stores остаются отдельными DWORD-записями, а не одной транзакцией; cyclic guest barriers и остальные неподтверждённые случаи отвергаются. |
 | Cooperative SSBO | Ограниченный producer/consumer сценарий; `Coherent` buffer declarations и публикация через Workgroup barrier с `UniformMemory`. Полный readback, включая guards, проходит. | Общий BDA/SSBO alias-обмен и image publication не включены автоматически. Для доказанных коэффициентных чтений добавлены отдельные immutable snapshots. |
 | Depth/HTile | Раздельные comparison bindings, законное R32 → отдельное D32 представление, проверенный PCF; coherent импорт канонических HTile clear 0/1, metadata-only переходы, сохранение native depth owner/subview. | Смешанное/неизвестное HTile состояние, опасные writable aliases и неподдержанные layout/lifecycle переходы отвергаются. Это не общий HTile decompressor. |

@@ -25,9 +25,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -82,6 +84,59 @@ private:
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+}
+
+struct GpuSyncDiagnosticConfig {
+	bool                    enabled        = false;
+	bool                    valid          = true;
+	uint64_t                min_workgroups = 0;
+	bool                    exact_enabled  = false;
+	std::array<uint32_t, 3> exact_groups   = {};
+};
+
+static bool ParseUnsigned(std::string_view text, auto* value) {
+	if (text.empty()) {
+		return false;
+	}
+	const auto result = std::from_chars(text.data(), text.data() + text.size(), *value);
+	return result.ec == std::errc {} && result.ptr == text.data() + text.size();
+}
+
+static GpuSyncDiagnosticConfig GetGpuSyncDiagnosticConfig() {
+	GpuSyncDiagnosticConfig config {};
+	const auto*             enabled = std::getenv("KYTY_GPU_SYNC_DIAGNOSTICS");
+	config.enabled                  = enabled != nullptr && std::string_view(enabled) == "1";
+	if (!config.enabled) {
+		return config;
+	}
+
+	if (const auto* min_groups = std::getenv("KYTY_GPU_SYNC_MIN_WORKGROUPS");
+	    min_groups != nullptr && !ParseUnsigned(std::string_view(min_groups), &config.min_workgroups)) {
+		config.valid = false;
+	}
+
+	if (const auto* exact_groups = std::getenv("KYTY_GPU_SYNC_GROUPS"); exact_groups != nullptr) {
+		const auto parts = Common::Split(std::string_view(exact_groups), 'x', true);
+		config.exact_enabled = true;
+		config.valid = config.valid && parts.size() == config.exact_groups.size();
+		if (parts.size() == config.exact_groups.size()) {
+			for (size_t i = 0; i < parts.size(); i++) {
+				config.valid = config.valid && ParseUnsigned(std::string_view(parts[i]), &config.exact_groups[i]);
+			}
+		}
+	}
+	return config;
+}
+
+static uint64_t SaturatingWorkgroupCount(uint32_t x, uint32_t y, uint32_t z) {
+	uint64_t count = x;
+	for (const auto dimension: {y, z}) {
+		if (dimension != 0 && count > std::numeric_limits<uint64_t>::max() / dimension) {
+			return std::numeric_limits<uint64_t>::max();
+		}
+		count *= dimension;
+	}
+	return count;
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
@@ -876,7 +931,34 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
+	static const auto sync_diagnostics = GetGpuSyncDiagnosticConfig();
+	const bool trace_draw = sync_diagnostics.enabled && sync_diagnostics.valid &&
+	                        sync_diagnostics.min_workgroups == 0 &&
+	                        !sync_diagnostics.exact_enabled && args.index_count != 0 &&
+	                        args.instance_count != 0;
+	const auto& ps = m_sh_ctx.GetPs().ps_regs;
+	const auto& vs = m_sh_ctx.GetVs();
+	if (trace_draw) {
+		std::printf("GpuDrawSync: phase=before-wait type=indexed submit=%" PRIu64
+		            " count=%u instances=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64
+		            " gs=0x%016" PRIx64 "\n",
+		            m_submit_id, args.index_count, args.instance_count, ps.data_addr,
+		            vs.es_regs.data_addr, vs.gs_regs.data_addr);
+		std::fflush(stdout);
+		BufferFlushAndWait();
+		std::printf("GpuDrawSync: phase=before-complete type=indexed submit=%" PRIu64 "\n",
+		            m_submit_id);
+		std::fflush(stdout);
+	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	if (trace_draw) {
+		std::printf("GpuDrawSync: phase=after-wait type=indexed submit=%" PRIu64 "\n", m_submit_id);
+		std::fflush(stdout);
+		BufferFlushAndWait();
+		std::printf("GpuDrawSync: phase=after-complete type=indexed submit=%" PRIu64 "\n",
+		            m_submit_id);
+		std::fflush(stdout);
+	}
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1097,22 +1179,47 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		const auto& cs = m_sh_ctx.GetCs().cs_regs;
 		// Opt-in fault localization: prove completion before and after each guest dispatch.
 		// Keep normal queue scheduling asynchronous when this diagnostic is disabled.
-		static const bool sync_diagnostics = [] {
-			const auto* setting = std::getenv("KYTY_GPU_SYNC_DIAGNOSTICS");
-			return setting != nullptr && std::string_view(setting) == "1";
+		static const auto sync_diagnostics = GetGpuSyncDiagnosticConfig();
+		static const bool invalid_sync_diagnostics_logged = [] {
+			if (sync_diagnostics.enabled && !sync_diagnostics.valid) {
+				LOGF("GpuDispatchSync: invalid KYTY_GPU_SYNC_MIN_WORKGROUPS or "
+				     "KYTY_GPU_SYNC_GROUPS filter; diagnostic disabled\n");
+				Log::Flush();
+				std::printf("GpuDispatchSync: invalid KYTY_GPU_SYNC_MIN_WORKGROUPS or "
+				            "KYTY_GPU_SYNC_GROUPS filter; diagnostic disabled\n");
+				std::fflush(stdout);
+			}
+			return true;
 		}();
-		const bool trace_dispatch = sync_diagnostics && thread_group_x != 0 &&
-		                            thread_group_y != 0 && thread_group_z != 0;
+		(void)invalid_sync_diagnostics_logged;
+		const std::array<uint32_t, 3> dispatch_groups = {thread_group_x, thread_group_y,
+		                                                   thread_group_z};
+		const bool non_empty_dispatch = thread_group_x != 0 && thread_group_y != 0 &&
+		                                thread_group_z != 0;
+		const bool matches_minimum =
+		    SaturatingWorkgroupCount(thread_group_x, thread_group_y, thread_group_z) >=
+		    sync_diagnostics.min_workgroups;
+		const bool matches_exact = !sync_diagnostics.exact_enabled ||
+		                           dispatch_groups == sync_diagnostics.exact_groups;
+		const bool trace_dispatch = sync_diagnostics.enabled && sync_diagnostics.valid &&
+		                            non_empty_dispatch && matches_minimum && matches_exact;
 		uint64_t dispatch_begin = 0;
 		if (trace_dispatch) {
 			LOGF("GpuDispatchSync: phase=before-wait submit=%" PRIu64 " cs=0x%016" PRIx64
 			     " groups=%ux%ux%u\n", m_submit_id, cs.data_addr, thread_group_x,
 			     thread_group_y, thread_group_z);
 			Log::Flush();
+			std::printf("GpuDispatchSync: phase=before-wait submit=%" PRIu64
+			            " cs=0x%016" PRIx64 " groups=%ux%ux%u\n",
+			            m_submit_id, cs.data_addr, thread_group_x, thread_group_y, thread_group_z);
+			std::fflush(stdout);
 			BufferFlushAndWait();
 			dispatch_begin = Common::Timer::QueryPerformanceCounter();
 			LOGF("GpuDispatchSync: phase=before-complete cs=0x%016" PRIx64 "\n", cs.data_addr);
 			Log::Flush();
+			std::printf("GpuDispatchSync: phase=before-complete cs=0x%016" PRIx64 "\n",
+			            cs.data_addr);
+			std::fflush(stdout);
 		}
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
@@ -1133,6 +1240,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		if (trace_dispatch) {
 			LOGF("GpuDispatchSync: phase=after-wait cs=0x%016" PRIx64 "\n", cs.data_addr);
 			Log::Flush();
+			std::printf("GpuDispatchSync: phase=after-wait cs=0x%016" PRIx64 "\n", cs.data_addr);
+			std::fflush(stdout);
 			BufferFlushAndWait();
 			const auto dispatch_end = Common::Timer::QueryPerformanceCounter();
 			const auto frequency    = Common::Timer::QueryPerformanceFrequency();
@@ -1142,6 +1251,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			     " groups=%ux%ux%u elapsed_us=%" PRIu64 "\n",
 			     cs.data_addr, thread_group_x, thread_group_y, thread_group_z, elapsed_us);
 			Log::Flush();
+			std::printf("GpuDispatchSync: phase=after-complete cs=0x%016" PRIx64
+			            " groups=%ux%ux%u elapsed_us=%" PRIu64 "\n",
+			            cs.data_addr, thread_group_x, thread_group_y, thread_group_z, elapsed_us);
+			std::fflush(stdout);
 		}
 	}
 
@@ -1189,7 +1302,33 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
+	static const auto sync_diagnostics = GetGpuSyncDiagnosticConfig();
+	const bool trace_draw = sync_diagnostics.enabled && sync_diagnostics.valid &&
+	                        sync_diagnostics.min_workgroups == 0 &&
+	                        !sync_diagnostics.exact_enabled && args.vertex_count != 0 &&
+	                        args.instance_count != 0;
+	const auto& ps = m_sh_ctx.GetPs().ps_regs;
+	const auto& vs = m_sh_ctx.GetVs();
+	if (trace_draw) {
+		std::printf("GpuDrawSync: phase=before-wait type=auto submit=%" PRIu64
+		            " count=%u instances=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64
+		            " gs=0x%016" PRIx64 "\n",
+		            m_submit_id, args.vertex_count, args.instance_count, ps.data_addr,
+		            vs.es_regs.data_addr, vs.gs_regs.data_addr);
+		std::fflush(stdout);
+		BufferFlushAndWait();
+		std::printf("GpuDrawSync: phase=before-complete type=auto submit=%" PRIu64 "\n",
+		            m_submit_id);
+		std::fflush(stdout);
+	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	if (trace_draw) {
+		std::printf("GpuDrawSync: phase=after-wait type=auto submit=%" PRIu64 "\n", m_submit_id);
+		std::fflush(stdout);
+		BufferFlushAndWait();
+		std::printf("GpuDrawSync: phase=after-complete type=auto submit=%" PRIu64 "\n", m_submit_id);
+		std::fflush(stdout);
+	}
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

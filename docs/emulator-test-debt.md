@@ -290,8 +290,8 @@ descriptor word and is tracked separately from this traversal-performance defect
 
 ## Wave-uniform image descriptor candidate selection
 
-Status: production fix, native build, and exact captured-shader audit complete; runtime
-materialization/game validation and automated regression deferred.
+Status: production fix, native build, exact captured-shader audit and runtime game validation
+complete; automated regression deferred.
 
 Observed trigger: compute shader `7ceb0f3417f926f9` builds eight correlated image-descriptor
 DWORDs through matching `Phi` and `SelectU32` graphs, broadcasts every selected DWORD with
@@ -318,7 +318,46 @@ Current evidence: the shared recognizer accepts only eight `ReadFirstLane` roots
 active mask and matching `Phi`/`SelectU32` topology. It extracted four host-readable descriptor
 tuples plus the null tuple from the captured shader. Both native Windows targets build, and the
 exact shader now passes resource tracking and compute-execution precheck in about 0.27 seconds.
-Runtime descriptor materialization and SPIR-V/Vulkan execution still require the bounded game run.
+The bounded game run materialized all five candidates, emitted 103,404 SPIR-V words, compiled the
+shader as number 159 and advanced through six more shaders before the separate GPU draw fault.
+
+## Long compute dispatch watchdog isolation
+
+Status: runtime diagnosis in progress; production fix not started; automated regression deferred.
+
+Observed trigger: after `7ceb0f3417f926f9` successfully materializes, emits 103,404 SPIR-V
+words, and compiles as shader 159, the game compiles six more shaders and the NVIDIA driver emits
+Windows System event `nvlddmkm` 153 for `\\Device\\Video3`. The emulator then receives
+`UINT64_MAX` from `vkGetSemaphoreCounterValue` at scheduler tick 16720 and exits with code 321.
+That sentinel follows a real GPU driver fault; the semaphore invariant correctly prevents it from
+marking every pending resource free.
+
+Current evidence: a filtered synchronized run proved guest compute address `0x8000383f00` with
+grid `128x128x1` completes in 321,278 us. The same run later reproduced `nvlddmkm` 153 and the
+invalid timeline sentinel at tick 16718, so this dispatch is not the command that hangs the GPU.
+Synchronizing all compute and draw calls then isolated the reset to an auto draw with four
+vertices and one instance: pixel shader address `0x80003cbb00`, export/vertex shader address
+`0x8000408e00`, submit 636. Its preceding `65x65x1` compute dispatch completed in 7,824 us;
+the draw was recorded, but its completion wait produced the driver reset.
+
+Required tests:
+
+- Synchronized dispatch diagnostics around every non-empty guest dispatch, with strict optional
+  minimum-workgroup and exact-grid filters. Valid filters must isolate matching commands without
+  changing their execution; malformed filters must disable the diagnostic instead of silently
+  synchronizing every dispatch. The trace must prove the exact shader address, grid, local size,
+  and submit ID whose completion triggers the driver fault.
+- Synchronized indexed and auto-draw diagnostics with vertex/pixel shader addresses, primitive
+  counts, instance counts and submit IDs. Before/after completion markers must distinguish a
+  failing draw from queued work that only happens to be observed at the next compute wait.
+- A large finite dispatch split into base-workgroup tiles, proving every guest workgroup executes
+  exactly once and `WorkgroupId`/`GlobalInvocationId` retain the unsplit values.
+- Storage/image writes shared across tiles, proving submission boundaries preserve the original
+  dispatch's read/write ordering and descriptor lifetime.
+- Zero dimensions, thread-dimension mode, partitioned wave64 grids, and device workgroup limits,
+  proving tiling neither invents work nor exceeds Vulkan limits.
+- Native Windows game run with validation plus a System-event check, proving the target dispatch
+  completes without `nvlddmkm` 153 and execution advances beyond the current shader frontier.
 
 ## Periodic Vulkan pipeline-cache checkpoints
 

@@ -18191,6 +18191,52 @@ TestCase VectorVopcSdwaCmpxClassF32CapturedExecMask() {
   return test;
 }
 
+TestCase Wave32VccMasksPreserveOtherHalf() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Wave32VccMasksPreserveOtherHalf";
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 106, 0x12345678u);
+  AppendSMovLiteral(&code, 107, 0x2468ace0u);
+  AppendVMovU32(&code, 1, 20);
+  u32 offset = 0;
+  const auto check_masks = [&](u32 low, u32 high) {
+    AppendStoreSgprAtLaneDwordOffset(&code, 106, 0, offset);
+    AppendStoreSgprAtLaneDwordOffset(&code, 107, 0, offset + 4);
+    AppendVop3(&code, 0x101, 2, InlineU32(10), Vgpr(1), 107);
+    code.push_back(EncodeVop2(0x01, 3, InlineU32(10), 1));
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset + 8);
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, offset + 12);
+    test.expected.insert(test.expected.end(), 4, low);
+    test.expected.insert(test.expected.end(), 4, high);
+    for (u32 mask : {high, low}) {
+      for (u32 lane = 0; lane < 4; ++lane) {
+        test.expected.push_back((mask & (1u << lane)) != 0 ? 20u : 10u);
+      }
+    }
+    offset += 16;
+  };
+  // PPSA10737 keeps a table offset in VCC_LO while comparing into VCC_HI.
+  AppendVop3(&code, 0xc2, 107, InlineU32(1), Vgpr(0));
+  check_masks(0x12345678u, 2u);
+  AppendVop3(&code, 0xc2, 106, InlineU32(2), Vgpr(0));
+  check_masks(4u, 2u);
+  code.push_back(EncodeSop2(0x10, 106, 106, 107)); // s_or_b32
+  check_masks(6u, 2u);
+  code.push_back(EncodeSop1(0x04, 106, 193u)); // Explicit s_mov_b64 writes both.
+  check_masks(0xffffffffu, 0xffffffffu);
+  AppendEnd(&code);
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_OR_B32, O::V_MOV_B32,
+                  O::V_CMP_EQ_U32, O::V_CNDMASK_B32, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorCompareF16Ops() {
   using O = ShaderOpcode;
 
@@ -23655,6 +23701,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareClassF32);
   AddCase(VectorVopcSdwaCmpxClassF32CapturedExecMask);
   AddCase(VectorCompareF16Ops);
+  AddCase(Wave32VccMasksPreserveOtherHalf);
   AddCase(Vop2SdwaCndmaskSourceModifier);
   AddCase(Vop2SdwaCndmaskCapturedByte3Source);
   AddCase(Vop3CndmaskUsesSgprMaskLaneBits);
@@ -28024,6 +28071,7 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, Wave64CrossHalfLaneAndLds());
     RunCase(&vulkan, Wave64RawMasksAndScalarBranch());

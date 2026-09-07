@@ -240,10 +240,6 @@ void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modi
 }
 
 void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
-	if (IsExecOrVcc(inst.dst) || IsExecOrVcc(inst.src0)) {
-		WriteMask(inst.dst, ReadMask(inst.src0), true);
-		return;
-	}
 	const bool scalar_copy =
 	    inst.dst.kind == Decoder::OperandKind::Sgpr && inst.src0.kind == Decoder::OperandKind::Sgpr;
 	IR::U1 source_mask;

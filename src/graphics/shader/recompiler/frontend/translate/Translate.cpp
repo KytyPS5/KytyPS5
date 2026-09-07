@@ -631,7 +631,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi: return ir.GetExec();
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: return ir.GetVcc();
+		case Decoder::OperandKind::VccHi:
+			return current_wave_size == 32u
+			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
+			           : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
 		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
 		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
@@ -697,6 +700,10 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 		}
 		case Decoder::OperandKind::VccLo:
 		case Decoder::OperandKind::VccHi: {
+			if (!write_64 && current_wave_size == 32u) {
+				WriteRawU32(operand, mask[0]);
+				return mask;
+			}
 			ir.SetVcc(value);
 			ir.SetVccLo(mask[0]);
 			ir.SetVccHi(mask[1]);

@@ -192,8 +192,8 @@ non-null unreadable and GPU-dirty roots retain the existing fail-closed path.
 
 ## Storage-buffer backing offsets beyond the packed residual ABI
 
-Status: production fix and native build complete; bounded game validation in progress;
-automated regression deferred.
+Status: production fix, native build and bounded game validation complete; automated regression
+deferred.
 
 Observed trigger: after the optional null SRT shader compiles, renderer binding obtains a guest
 storage-buffer subrange whose offset inside a shared Vulkan backing cannot be represented by the
@@ -221,7 +221,33 @@ Diagnosis measured vertex slot 6 at guest address `0x80760a1a16`, size `0x240`, 
 shader-data layout carries an exact byte limit per buffer, so the Vulkan range may be rounded to a
 complete DWORD without exposing padding to guest accesses; 16-bit cross-DWORD loads and stores
 join or split their two backing words. Both native targets build. Cache-warming runs have reached
-shader 131 without fatal or validation output but have not yet returned to the slot-6 binding.
+shader 131 without fatal or validation output. The final stable-SHA validation run compiled all
+142 shaders, accepted the slot-6 binding and advanced to the next independent graphics-stage
+interface VUID.
+
+## Missing producer declarations for consumed graphics-stage parameters
+
+Status: diagnosis complete; production fix not started; automated regression deferred.
+
+Observed trigger: a fragment shader declares a per-vertex `array[3] of vec4` input at SPIR-V
+Location 2, while the paired vertex shader does not declare an output at that location. Both
+modules validate independently, but `vkCreateGraphicsPipelines` rejects their combined interface
+with VUID `RuntimeSpirv-OpEntryPoint-08743`.
+
+Required tests:
+
+- A pixel parameter consumed at a location exported by the vertex shader, proving no duplicate
+  output declaration is added and the original value remains connected.
+- A consumed pixel location absent from vertex exports, proving the producer declares a matching
+  `vec4` output and the graphics pipeline passes interface validation.
+- Per-vertex barycentric fragment inputs, including the three-element fragment array contract,
+  matched against the preceding vertex stage's non-array output declaration.
+- Sparse locations, flat and no-perspective inputs, repeated guest interpolator mappings and
+  collision-remapped host locations, with deterministic producer declarations for every consumer.
+- Vertex-program cache variants paired with different fragment input masks, proving the interface
+  requirement participates in the static key and cannot reuse an incompatible module.
+- Host `maxVertexOutputComponents` admission and a bounded validation run beyond the pipeline pair
+  containing vertex shader `ee4f153aa500d327`.
 
 ## Periodic Vulkan pipeline-cache checkpoints
 

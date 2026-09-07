@@ -1011,9 +1011,15 @@ static int ConvertMessageFlags(int flags) {
 	if ((flags & guest_msg_dontroute) != 0) {
 		host_flags |= MSG_DONTROUTE;
 	}
-	if ((flags & guest_msg_waitall) != 0) {
+		if ((flags & guest_msg_waitall) != 0) {
 		host_flags |= MSG_WAITALL;
 	}
+#if defined(_WIN32)
+	// Winsock's recv() rejects MSG_PEEK combined with MSG_WAITALL.
+	if ((host_flags & (MSG_PEEK | MSG_WAITALL)) == (MSG_PEEK | MSG_WAITALL)) {
+		host_flags &= ~MSG_WAITALL;
+	}
+#endif
 #if !defined(_WIN32)
 	if ((flags & guest_msg_dontwait) != 0) {
 		host_flags |= MSG_DONTWAIT;

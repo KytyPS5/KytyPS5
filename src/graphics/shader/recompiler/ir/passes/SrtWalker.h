@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -21,13 +22,20 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
+// Reuse only within one resource plan and one runtime snapshot. Active-lane
+// walks keep their own caches because their values depend on the EXEC mask.
+struct UniformValueCache {
+	std::unordered_map<const Inst*, uint64_t> values;
+};
+
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results);
+                           const SrtRuntime& runtime, std::span<uint32_t> results,
+                           UniformValueCache* cache = nullptr);
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);

@@ -454,10 +454,12 @@ class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
-	          Value active_mask = {}, uint32_t lane_depth = 0)
+	          Value active_mask = {}, uint32_t lane_depth = 0, size_t initial_capacity = 0,
+	          UniformValueCache* cache = nullptr)
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
 	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-	      m_lane_depth(lane_depth) {}
+	      m_lane_depth(lane_depth), m_initial_capacity(initial_capacity),
+	      m_cache(cache != nullptr ? cache->values : m_cache_storage) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -493,8 +495,12 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
+			const auto capacity =
+			    m_initial_capacity == 0
+			        ? m_program.value_storage.size()
+			        : std::min(m_initial_capacity, m_program.value_storage.size());
+			if (m_cache.empty()) m_cache.reserve(capacity);
+			m_visiting.reserve(capacity);
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
@@ -648,10 +654,13 @@ private:
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
-				// Bound recursive active-lane walks through loop-carried PHIs.
-				if (m_lane_depth >= 16u) return false;
+				// A loop-carried lane value can return to this instruction through a Phi.
+				// Nested active-lane evaluators have separate caches, so bound that recursion.
+				if (m_lane_depth >= 16u) {
+					return false;
+				}
 				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1), m_lane_depth + 1u);
+				                 inst.Arg(1), m_lane_depth + 1u, m_initial_capacity);
 				return active.EvaluateWide(inst.Arg(0), result);
 			}
 			case ValueOpcode::BitCastU32F32:
@@ -965,8 +974,10 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	uint32_t                                  m_lane_depth = 0;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
+	uint32_t                                   m_lane_depth       = 0;
+	size_t                                     m_initial_capacity = 0;
+	std::unordered_map<const Inst*, uint64_t>  m_cache_storage;
+	std::unordered_map<const Inst*, uint64_t>& m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };
@@ -1082,7 +1093,8 @@ void BuildSrtPlan(Program& program) {
 }
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results) {
+                           const SrtRuntime& runtime, std::span<uint32_t> results,
+                           UniformValueCache* cache) {
 	if (values.size() != results.size()) {
 		return false;
 	}
@@ -1090,7 +1102,10 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	clean.read_memory = runtime.read_specialization_memory != nullptr
 	                        ? runtime.read_specialization_memory
 	                        : +[](void*, uint64_t, uint32_t*) { return false; };
-	Evaluator evaluator(program, clean);
+	// Selector enumeration often requests only one leaf or a four-word buffer
+	// handle. Do not allocate space for the entire shader for each small walk;
+	// these containers still grow normally if the dependency graph is larger.
+	Evaluator evaluator(program, clean, {}, nullptr, {}, 0, 64, cache);
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (!evaluator.Evaluate(values[i], results[i])) {
 			return false;

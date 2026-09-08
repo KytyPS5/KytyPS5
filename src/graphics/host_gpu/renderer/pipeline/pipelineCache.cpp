@@ -24,6 +24,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -201,12 +202,12 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
-		std::vector<Permutation>           permutations;
+		// ShaderStageRuntime and prepared bindings retain pointers to program metadata.
+		// Appending a new resource specialization must not move existing entries.
+		std::deque<Permutation> permutations;
 	};
 
 	struct ProgramKeyHash {

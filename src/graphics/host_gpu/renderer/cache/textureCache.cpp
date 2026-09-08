@@ -187,15 +187,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 TextureCache::~TextureCache() {
-	std::vector<ImageId> registered;
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
-			registered.push_back(id);
+			UnregisterImage(id);
 		}
 	});
-	for (const auto id: registered) {
-		UnregisterImage(id);
-	}
 }
 
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,

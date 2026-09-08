@@ -290,6 +290,48 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
           std::fflush(stdout);
         }
         const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+        if (dump_ir) {
+          std::printf("KYTY_SHADER_AUDIT_TRACKED_IR_BEGIN barriers=%u\n%sKYTY_SHADER_AUDIT_TRACKED_IR_END\n",
+                      info.needs_lds_barriers ? 1u : 0u,
+                      ShaderRecompiler::IR::ProgramToString(translated.program).c_str());
+          std::fflush(stdout);
+        }
+        if (dump_ir) {
+          Json buffers = Json::array();
+          for (uint32_t logical = 0; logical < plan.info.buffers.size(); ++logical) {
+            const auto& buffer = plan.info.buffers[logical];
+            Json item{{"logical", logical}, {"source", buffer.source},
+                      {"first_use_pc", buffer.first_use_pc}, {"read", buffer.read},
+                      {"written", buffer.written}, {"atomic", buffer.atomic}};
+            if (buffer.source < plan.descriptor_sources.size()) {
+              const auto& source = plan.descriptor_sources[buffer.source];
+              item["dword_count"] = source.dword_count;
+              if (source.bounded_buffer.has_value()) {
+                const auto& bounded = *source.bounded_buffer;
+                item["bounded"] = {{"expression", bounded.expression},
+                                   {"selector_group", bounded.selector_group},
+                                   {"key_arg", bounded.key_arg},
+                                   {"reads", bounded.reads},
+                                   {"dependencies", bounded.dependencies}};
+              }
+            }
+            buffers.push_back(std::move(item));
+          }
+          Json bounded_reads = Json::array();
+          for (uint32_t index = 0; index < plan.bounded_srt_reads.size(); ++index) {
+            const auto& read = plan.bounded_srt_reads[index];
+            bounded_reads.push_back({{"index", index}, {"address_source", read.address_source},
+                                     {"count_source", read.count_source},
+                                     {"offset_scale", read.offset_scale},
+                                     {"offset_bias", read.offset_bias},
+                                     {"memory_offset", read.memory_offset},
+                                     {"workgroup_axis", read.workgroup_axis}});
+          }
+          std::printf("KYTY_SHADER_AUDIT_RESOURCE_PLAN %s\n",
+                      Json{{"buffers", std::move(buffers)},
+                           {"bounded_srt_reads", std::move(bounded_reads)}}.dump().c_str());
+          std::fflush(stdout);
+        }
         Json profile{{"needs_lds_barriers", info.needs_lds_barriers},
                      {"blocks", translated.program.blocks.size()},
                      {"buffers", plan.info.buffers.size()},

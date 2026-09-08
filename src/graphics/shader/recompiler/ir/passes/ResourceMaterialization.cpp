@@ -23,6 +23,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+constexpr uint64_t RegisteredBufferAddressLimit = uint64_t{1} << 40u;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
 // A 16-bit selector can feed multiple descriptors and their address expressions.
 // Bound each selector domain independently, then apply an explicit memory budget
@@ -1183,6 +1184,9 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 					descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
 				}
 			}
+			if (!CanonicalizeEnumeratedBufferDescriptor(descriptor)) {
+				return SpecializationFail("enumerated buffer candidate has invalid descriptor width");
+			}
 			auto candidate = std::ranges::find_if(table.resources, [&](uint32_t resource) {
 				return buffers[resource] == descriptor;
 			});
@@ -1216,7 +1220,6 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 	if (snapshot.immutable_srt_ranges.empty()) {
 		return true;
 	}
-	constexpr uint64_t buffer_limit = uint64_t{1} << 40u;
 	for (uint32_t resource = 0; resource < snapshot.buffers.size(); resource++) {
 		const auto& metadata = program.info.buffers[specialization.buffer_origins[resource]];
 		if ((!metadata.written && !metadata.atomic) || metadata.image_alias != BufferResource::NoImageAlias) {
@@ -1231,7 +1234,7 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 		if (descriptor.Type() != 0u || address == 0u || size == 0u) {
 			continue;
 		}
-		if (address >= buffer_limit) {
+		if (address >= RegisteredBufferAddressLimit) {
 			return SpecializationFail(fmt::format(
 			    "bounded SRT buffer writer {} base 0x{:x} exceeds the registered 40-bit address range "
 			    "(origin={} first_use_pc=0x{:08x} size={} descriptor={:08x}:{:08x}:{:08x}:{:08x})",
@@ -1242,7 +1245,8 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 		// NativeStorageBuffer clamps that requested footprint to the actual guest mapping.  The
 		// alias proof has no mapping lookup, so clamp only to the complete tracker address space:
 		// every range the renderer can bind remains a subset of this interval.
-		const auto write_end = address + std::min(size, buffer_limit - address);
+		const auto write_end =
+		    address + std::min(size, RegisteredBufferAddressLimit - address);
 		for (const auto& read: snapshot.immutable_srt_ranges) {
 			if (address < read.address + read.size && read.address < write_end) {
 				return SpecializationFail(fmt::format(

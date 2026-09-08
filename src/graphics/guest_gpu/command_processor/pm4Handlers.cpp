@@ -71,6 +71,23 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
+std::vector<uint32_t> ReadIndirectRegisterPairs(uint64_t address, uint32_t count) {
+	std::vector<uint32_t> pairs(static_cast<size_t>(count) * 2);
+	const auto            bytes = pairs.size() * sizeof(uint32_t);
+	if (LibKernel::Memory::TryReadGpuCleanBacking(address, pairs.data(), bytes, true)) {
+		return pairs;
+	}
+	// Only the GPU thread can synchronize a pending GPU writer, so only there does a
+	// refused read mean the pairs are unreadable. Parsing from any other thread reaches
+	// packets that point at host-owned register streams with no guest backing at all.
+	if (GuestGpu::IsGpuThread()) {
+		EXIT("cannot read indirect register pairs: address=0x%016" PRIx64 " count=%u\n", address,
+		     count);
+	}
+	std::memcpy(pairs.data(), reinterpret_cast<const void*>(address), bytes);
+	return pairs;
+}
+
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
 	return eop_event_type != 0x28u ||
 	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
@@ -1964,8 +1981,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -1974,6 +1991,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Make every pair visible before applying registers: a handler can flush GPU
+	// work or run completion callbacks that change the original guest allocation.
+	const auto pairs =
+	    ReadIndirectRegisterPairs(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
+	indirect_buffer = pairs.data();
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2034,8 +2056,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2045,6 +2067,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto pairs            = ReadIndirectRegisterPairs(indirect_address, indirect_num_dw);
+	indirect_buffer             = pairs.data();
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2097,8 +2121,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2107,6 +2131,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto pairs =
+	    ReadIndirectRegisterPairs(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
+	indirect_buffer = pairs.data();
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

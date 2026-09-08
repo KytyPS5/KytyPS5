@@ -72,6 +72,7 @@ bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view worktree_fingerprint);
 bool IsDriverCacheSignatureCompatibleForTest(
     std::string_view cached_signature, std::string_view expected_signature);
+std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -127,6 +128,19 @@ void TestShaderOptimizationSelection() {
   Check(!ShouldOptimizeShaderSpirvForTest(
             false, Config::ShaderOptimizationType::None),
         "None optimization mode admitted a module");
+}
+
+void TestShaderModuleDebugName() {
+  Check(ShaderModuleDebugNameForTest(ShaderType::Compute,
+                                     0xb90e2024732c6111ull) ==
+            "kyty_shader_cs_b90e2024732c6111",
+        "compute shader debug name is not stable and regex-selectable");
+  Check(ShaderModuleDebugNameForTest(ShaderType::Vertex, 0x1234ull) ==
+            "kyty_shader_vs_0000000000001234",
+        "vertex shader debug name lost its fixed-width hash");
+  Check(ShaderModuleDebugNameForTest(ShaderType::Pixel, 0x5678ull) ==
+            "kyty_shader_ps_0000000000005678",
+        "pixel shader debug name lost its stage");
 }
 
 void TestDriverPipelineCacheBuildIdentity() {
@@ -15463,6 +15477,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--spirv-optimization-only") == 0) {
     Libs::Graphics::TestShaderOptimizationSelection();
     std::puts("KYTY_SPIRV_OPTIMIZATION_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-debug-name-only") == 0) {
+    Libs::Graphics::TestShaderModuleDebugName();
+    std::puts("KYTY_SHADER_DEBUG_NAME_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-identity-only") == 0) {

@@ -1221,3 +1221,37 @@ module `f8927c09f4b928c7` also passes standalone `spirv-val`.
 
 Remaining validation: run the complete native test suite and add explicit nested
 and multiple-loop cases, including distinct continue targets and merge blocks.
+
+## GFX10 VOPC V_CMPX_NE_U16
+
+Status: production decoder/lowering, unchanged synthetic RED/GREEN, full CPU
+corpus audit and runtime reproduction complete; bounded post-fix game retry pending.
+
+Observed trigger: native run
+`_Build/runs/yotei-integrated-20260908-171938-6e189d` on `672af1f` completed the
+previous `6cc64dee32dc7094` and `34e090c623ad611c` frontiers, reached frame 222,
+then exited itself with code 321 while building CFG for compute shader
+`c8e8f554efbfadef`. The exact instruction at PC `0xf4` is compact VOPC raw
+`0x7d7a40ff`, opcode `0xbd`. LLVM's GFX10 VOPC table identifies `0xbd` as
+`V_CMPX_NE_U16`: compare the low unsigned halfwords for inequality, write the
+lane mask and update EXEC. No title, shader hash, address or install-path branch
+is involved.
+
+The final regression uses the captured first DWORD with a controlled literal and
+checks two-word decode, operands, EXEC destination, unsigned 16-bit inequality IR,
+dynamic EXEC update, decoded text and SPIR-V validation. The unchanged test first
+failed with `decoder rejected captured VOPC V_CMPX_NE_U16 fields`; after `5aaf3b4`
+it prints `KYTY_VOPC_CMPX_NE_U16_PASS`.
+
+Full corpus audit
+`_Build/shader-audits/yotei-current-20260908-vopc-bd/report.json` passes 741 of
+825 manifests. Both previous `0xbd` groups are absent: 19 compact manifests and
+7 SDWA manifests now pass their captured audit depth. Remaining validation:
+
+- Build and hash the full native `kyty_emulator` at the committed revision.
+- Run the same bounded GPUAV-lite/source-readback profile using the preserved
+  18 031 187-byte pipeline cache, prove `c8e8f554efbfadef` passes, and record the
+  next first fatal or first nonzero RGB.
+- Keep the 84 remaining corpus failures as independent debt. Do not claim them
+  fixed from this opcode result, and do not prioritize them over an earlier
+  runtime frontier without separate evidence.

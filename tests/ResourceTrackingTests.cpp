@@ -3119,6 +3119,7 @@ struct BoundedSnapshotReader {
   uint64_t fail_address = UINT64_MAX;
   uint32_t ordinary_reads = 0;
   uint32_t generated_descriptors = 0;
+  uint64_t unmapped_address = UINT64_MAX;
   bool change_repeated_reads = false;
 
   static bool Clean(void* userdata, uint64_t address, uint32_t* word) {
@@ -3148,6 +3149,10 @@ struct BoundedSnapshotReader {
   static bool Ordinary(void* userdata, uint64_t, uint32_t*) {
     ++static_cast<BoundedSnapshotReader*>(userdata)->ordinary_reads;
     return false;
+  }
+  static uint64_t Clamp(void* userdata, uint64_t address, uint64_t size) {
+    const auto& self = *static_cast<BoundedSnapshotReader*>(userdata);
+    return address == self.unmapped_address ? 0u : size;
   }
 };
 
@@ -3181,7 +3186,8 @@ void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_t
 
 SrtRuntime BoundedSnapshotRuntime(BoundedSnapshotReader& reader, std::span<const uint32_t> data) {
   return {.user_data=data, .read_memory=BoundedSnapshotReader::Ordinary, .userdata=&reader,
-          .read_specialization_memory=BoundedSnapshotReader::Clean};
+          .read_specialization_memory=BoundedSnapshotReader::Clean,
+          .clamp_memory_range=BoundedSnapshotReader::Clamp};
 }
 
 void CheckBoundedTransaction(const ResourceSnapshot& snapshot, const ResourceSnapshot& old_snapshot,
@@ -3549,9 +3555,9 @@ void TestBoundedMaterializationNullsForeignBufferSlots() {
                                                 0x0000af1eu, 0x3b32b6c8u};
   const std::array<uint32_t, 4> foreign_reserved{0x05500000u, 0x00000000u,
                                                  0x40000000u, 0x3f700000u};
-  const std::array<uint32_t, 4> foreign_range{0x0000022au, 0x200000c0u,
-                                              0xf001d380u, 0x00000000u};
-  const std::array descriptors{valid, foreign_address, foreign_reserved, foreign_range};
+  const std::array<uint32_t, 4> foreign_unmapped{0x43fa0000u, 0x00010000u,
+                                                 0x13214580u, 0x00000000u};
+  const std::array descriptors{valid, foreign_address, foreign_reserved, foreign_unmapped};
   for (uint32_t index = 0; index < descriptors.size(); ++index) {
     const auto& descriptor = descriptors[index];
     for (uint32_t word = 0; word < descriptor.size(); ++word) {
@@ -3560,6 +3566,7 @@ void TestBoundedMaterializationNullsForeignBufferSlots() {
     }
   }
   const std::array<uint32_t, 3> data{4u, 0x1000u, 0u};
+  reader.unmapped_address = 0x43fa0000u;
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot,

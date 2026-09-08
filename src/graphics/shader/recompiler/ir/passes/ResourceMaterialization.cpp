@@ -231,7 +231,7 @@ uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
 	           : static_cast<uint64_t>(descriptor.Stride()) * descriptor.NumRecords();
 }
 
-bool CanonicalizeEnumeratedBufferDescriptor(DescriptorValue& value) {
+bool CanonicalizeEnumeratedBufferDescriptor(DescriptorValue& value, const SrtRuntime& runtime) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) {
 		return false;
@@ -248,8 +248,9 @@ bool CanonicalizeEnumeratedBufferDescriptor(DescriptorValue& value) {
 	const auto address = descriptor.Base48();
 	const auto size    = ScalarBufferSize(descriptor);
 	if (address >= RegisteredBufferAddressLimit ||
-	    size > RegisteredBufferAddressLimit - address ||
-	    (descriptor.fields[3] & reserved_word3_mask) != 0u) {
+	    (descriptor.fields[3] & reserved_word3_mask) != 0u ||
+	    (address != 0u && size != 0u && runtime.clamp_memory_range != nullptr &&
+	     runtime.clamp_memory_range(runtime.userdata, address, size) == 0u)) {
 		value.dwords.fill(0u);
 	}
 	return true;
@@ -1065,7 +1066,8 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 }
 
 bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot& materialized,
-                        ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                        const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                        ResourceSpecialization& specialization) {
 	std::vector<DescriptorValue> buffers;
 	specialization.bounded_srt_reads = materialized.bounded_srt_reads;
 	if (!program.bounded_srt_reads.empty() ||
@@ -1153,7 +1155,7 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 					descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
 				}
 			}
-			if (!CanonicalizeEnumeratedBufferDescriptor(descriptor)) {
+			if (!CanonicalizeEnumeratedBufferDescriptor(descriptor, runtime)) {
 				return SpecializationFail("enumerated buffer candidate has invalid descriptor width");
 			}
 			auto candidate = std::ranges::find_if(table.resources, [&](uint32_t resource) {
@@ -1432,11 +1434,12 @@ template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializedSnapshot snapshot,
+                                        const SrtRuntime& runtime,
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization) {
 	auto                   next_snapshot = std::move(snapshot.resources);
 	ResourceSpecialization next_specialization;
-	if (!ExpandBufferTables(program, snapshot, next_snapshot, next_specialization)) {
+	if (!ExpandBufferTables(program, snapshot, runtime, next_snapshot, next_specialization)) {
 		return false;
 	}
 	next_specialization.buffers.reserve(next_snapshot.buffers.size());
@@ -1973,7 +1976,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;
 	}
-	return BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization);
+	return BuildResourceSpecialization(program, std::move(materialized), runtime, snapshot,
+	                                   specialization);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

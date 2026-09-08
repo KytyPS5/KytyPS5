@@ -12,6 +12,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemoryRangeClamper = uint64_t (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -22,6 +23,9 @@ struct SrtRuntime {
 	// Actual guest dispatch counts before host wave partitioning. Absent for graphics
 	// and offline callers that cannot prove a dispatch-dependent snapshot's bound.
 	std::optional<std::array<uint32_t, 3>> compute_workgroups;
+	// Optional renderer address-space query. A zero result means the requested
+	// base cannot be bound; a nonzero result is the contiguous mapped prefix.
+	SrtMemoryRangeClamper clamp_memory_range = nullptr;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

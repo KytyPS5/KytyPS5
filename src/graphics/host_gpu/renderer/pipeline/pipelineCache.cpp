@@ -157,6 +157,10 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
+uint64_t ClampShaderGuestMemory(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+}
+
 void CaptureDispatchedShader(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              std::span<const uint32_t> static_state,
@@ -617,6 +621,7 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderBacking,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .compute_workgroups         = guest_workgroups,
+		    .clamp_memory_range         = ClampShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(

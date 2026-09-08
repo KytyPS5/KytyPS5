@@ -2,10 +2,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-uint32_t EmitTrueBool(EmitterState& state) {
-	return ConstantBool(state, true);
-}
-
 DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
 	const auto quad_base = state.builder.AllocateId();
 	const auto lane      = state.builder.AllocateId();
@@ -23,7 +19,7 @@ DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uin
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, TypeU32(state), selected, selected0, ConstantU32(state, 3)});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, quad_base, selected});
-	return {target, EmitTrueBool(state)};
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
@@ -70,7 +66,7 @@ DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subi
 	    {OpIAdd, TypeU32(state), plus, lane, ConstantU32(state, 16u - amount)});
 	state.builder.AddFunction({OpSelect, TypeU32(state), selected, in_high, minus, plus});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row, selected});
-	return {target, EmitTrueBool(state)};
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row) {
@@ -87,7 +83,7 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	state.builder.AddFunction(
 	    {OpISub, TypeU32(state), mirrored, ConstantU32(state, lane_mask), lane});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, base, mirrored});
-	return {target, EmitTrueBool(state)};
+	return {target, ConstantBool(state, true)};
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
@@ -114,9 +110,9 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpBitwiseXor, TypeU32(state), target, subid, ConstantU32(state, control & 0xfu)});
-		return {target, EmitTrueBool(state)};
+		return {target, ConstantBool(state, true)};
 	}
-	return {subid, EmitTrueBool(state)};
+	return {subid, ConstantBool(state, true)};
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
@@ -203,7 +199,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                           ConstantU32(state, ScopeSubgroup), EmitTrueBool(state)});
+	                           ConstantU32(state, ScopeSubgroup), ConstantBool(state, true)});
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {

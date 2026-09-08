@@ -867,12 +867,23 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size, bool synchronize) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
+		}
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			if (!synchronize) {
+				return false;
+			}
+			// Descriptor indices may be produced by an earlier dispatch. ReadMemory batches
+			// nearby dirty ranges and waits for their completion before updating backing storage.
+			buffers.ReadMemory(vaddr, size);
+			if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+				return false;
+			}
 		}
 	}
 	return TryReadBacking(vaddr, data, size);

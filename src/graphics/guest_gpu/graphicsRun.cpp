@@ -691,12 +691,21 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	                                        : Pm4ProcessResult::Blocked;
 }
 
-void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands) {
+void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
+	auto& execution = *g_current_execution;
+	if (chain) {
+		// A chain replaces the rest of the calling stream. Keep its current packet
+		// until it has completed so suspended children retain normal resume bookkeeping.
+		auto& caller = execution.m_buffer_stack.back();
+		EXIT_IF(caller.offset_dw >= caller.commands.size());
+		const auto packet_words = KYTY_PM4_LEN(caller.commands[caller.offset_dw]);
+		EXIT_IF(packet_words > caller.commands.size() - caller.offset_dw);
+		caller.commands = caller.commands.first(caller.offset_dw + packet_words);
+	}
 	if (commands.empty()) {
 		return;
 	}
-	auto&      execution  = *g_current_execution;
 	const auto stop_depth = execution.m_buffer_stack.size();
 	execution.m_buffer_stack.push_back({commands});
 	ProcessPm4(execution, stop_depth);

@@ -129,7 +129,7 @@ public:
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
-	void             ProcessIndirectBuffer(std::span<const uint32_t> commands);
+	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain = false);
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
 

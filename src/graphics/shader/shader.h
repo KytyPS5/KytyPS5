@@ -102,7 +102,6 @@ struct ShaderVertexInputInfo {
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
 	int                     resources_num       = 0;
-	int                     fetch_shader_reg    = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
@@ -135,7 +134,6 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
-	bool                                           ps_pos_xy                    = false;
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;

@@ -184,7 +184,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 	if (count == 1u) {
 		state.builder.AddFunction({OpLoad, scalar_type, raw, input.variable_id});
 	} else {
-		const auto pointer_type = VertexParameterScalarPointerType(state, kind);
+		const auto pointer_type = TypePointer(state, StorageClassInput, scalar_type);
 		const auto pointer      = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, pointer_type, pointer, input.variable_id,
 		                           ConstantU32(state, component)});

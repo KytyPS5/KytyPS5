@@ -768,8 +768,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
-		const auto* source = image.source < ctx.program.descriptor_sources.size()
-		                         ? &ctx.program.descriptor_sources[image.source]
+		const auto* source = image.source < state.program.descriptor_sources.size()
+		                         ? &state.program.descriptor_sources[image.source]
 		                         : nullptr;
 		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
 		    source->indirect_image->key_arg >= handle->NumArgs()) {

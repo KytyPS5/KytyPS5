@@ -385,6 +385,7 @@ struct EmitterState {
 	uint32_t                   mesh_cull                             = 0;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
+	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
@@ -437,8 +438,7 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 }
 
 struct ValueEmitContext {
-	ValueEmitContext(EmitterState& state_, const IR::Program& program_)
-	    : state(state_), program(program_) {}
+	explicit ValueEmitContext(EmitterState& state_): state(state_) {}
 
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
@@ -460,11 +460,9 @@ struct ValueEmitContext {
 	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
-	const IR::Program&                                                 program;
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
-	const IR::Block*                                                   current_block = nullptr;
 	uint32_t                                                           scratch_u32_variable = 0;
 	ValueEmitContext*                                                  other_half = nullptr;
 	uint32_t                                                           half       = 0;
@@ -506,8 +504,6 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
-
-uint32_t VertexParameterScalarPointerType(EmitterState& state, VertexInputScalarKind kind);
 
 uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);
@@ -669,14 +665,7 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type);
 
-uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value);
-
-uint32_t EmitTBufferBitcastU32ToF32(EmitterState& state, uint32_t value);
-
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
-
-uint32_t EmitTBufferCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
-                                       uint32_t constant);
 
 uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t true_value,
                               uint32_t false_value);
@@ -764,7 +753,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
-void EmitProgram(EmitterState& state, const IR::Program& program);
+void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 

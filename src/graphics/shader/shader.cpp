@@ -593,7 +593,6 @@ static void ShaderGetStaticInputInfoPS(
 	}
 	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
 	ps_info.ps_pos_y                     = (active_inputs & 0x00000200u) != 0;
-	ps_info.ps_pos_xy                    = ps_info.ps_pos_x && ps_info.ps_pos_y;
 	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
 	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
 	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;

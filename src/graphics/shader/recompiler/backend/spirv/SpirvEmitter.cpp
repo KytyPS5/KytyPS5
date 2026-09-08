@@ -332,7 +332,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
 	DefineModule(state);
-	EmitProgram(state, program);
+	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
 	                            state.interface_variables);
 

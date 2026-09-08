@@ -118,18 +118,19 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
+	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
-			const auto* merge = TargetBlock(ctx.program, term.merge_block);
-			const auto* cont  = TargetBlock(ctx.program, term.continue_block);
+			const auto* merge = TargetBlock(program, term.merge_block);
+			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
 				ctx.state.builder.AddFunction(
 				    {OpLoopMerge, ctx.Label(merge), ctx.Label(cont), LoopControlNone});
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
 		           term.merge_block != UINT32_MAX) {
-			if (const auto* merge = TargetBlock(ctx.program, term.merge_block); merge != nullptr) {
+			if (const auto* merge = TargetBlock(program, term.merge_block); merge != nullptr) {
 				ctx.state.builder.AddFunction(
 				    {OpSelectionMerge, ctx.Label(merge), SelectionControlNone});
 			}
@@ -138,7 +139,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch: {
-			const auto* target = TargetBlock(ctx.program, term.true_block);
+			const auto* target = TargetBlock(program, term.true_block);
 			if (target == nullptr) {
 				EmitReturn(ctx);
 				return;
@@ -148,8 +149,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			return;
 		}
 		case CFG::TerminatorKind::ConditionalBranch: {
-			const auto* true_block  = TargetBlock(ctx.program, term.true_block);
-			const auto* false_block = TargetBlock(ctx.program, term.false_block);
+			const auto* true_block  = TargetBlock(program, term.true_block);
+			const auto* false_block = TargetBlock(program, term.false_block);
 			if (true_block == nullptr || false_block == nullptr || info.condition.IsEmpty()) {
 				EmitReturn(ctx);
 				return;
@@ -166,7 +167,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 
 void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                           const IR::Block* from, uint32_t target) {
-	const auto* block = TargetBlock(ctx.program, target);
+	const auto* block = TargetBlock(ctx.state.program, target);
 	if (block != nullptr) {
 		StoreDispatcherPhiEdge(ctx, dispatcher, from, block);
 		if (ctx.other_half != nullptr) {
@@ -272,10 +273,7 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 
 template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
-	ctx.current_block = block;
-	if (ctx.other_half != nullptr) {
-		ctx.other_half->current_block = block;
-	}
+	ctx.state.current_block = block;
 	EmitLabel(ctx.state, ctx.Label(block));
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
@@ -288,7 +286,6 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
-			lane.current_block  = block;
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
@@ -315,28 +312,29 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
+	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
-	ctx.state.builder.AddFunction({OpBranch, ctx.Label(ctx.program.blocks.front())});
-	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
-		const auto* block = ctx.program.blocks[index];
+	ctx.state.builder.AddFunction({OpBranch, ctx.Label(program.blocks.front())});
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block, ctx.program.block_info[index]);
+		EmitStructuredTerminator(ctx, block, program.block_info[index]);
 	}
 	PatchStructuredPhis(ctx, structured);
 }
 
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
 	auto&       state = ctx.state;
-	const auto* entry = ctx.program.blocks.front();
+	const auto* entry = state.program.blocks.front();
 	state.builder.AddFunction({OpBranch, ctx.Label(entry)});
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
 	const auto initial_pc =
-	    EmitDispatcherNextPc(ctx, dispatcher, entry, ctx.program.block_info.front());
+	    EmitDispatcherNextPc(ctx, dispatcher, entry, state.program.block_info.front());
 	const auto initial_parent = state.current_label;
 	state.builder.AddFunction({OpBranch, dispatcher.header_label});
 
@@ -357,21 +355,21 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(
 	    {OpSelectionMerge, dispatcher.after_switch_label, SelectionControlNone});
 	std::vector<uint32_t> words {OpSwitch, pc, dispatcher.after_switch_label};
-	for (size_t index = 1; index < ctx.program.blocks.size(); index++) {
-		words.push_back(ctx.program.block_info[index].id);
-		words.push_back(ctx.Label(ctx.program.blocks[index]));
+	for (size_t index = 1; index < state.program.blocks.size(); index++) {
+		words.push_back(state.program.block_info[index].id);
+		words.push_back(ctx.Label(state.program.blocks[index]));
 	}
 	state.builder.AddFunction(words);
 	std::vector<uint32_t> next_pc_words {OpPhi, TypeU32(state), next_pc,
 	                                     ConstantU32(state, UINT32_MAX), dispatcher.select_label};
 
-	for (size_t index = 1; index < ctx.program.blocks.size(); index++) {
-		EmitBlock(ctx, ctx.program.blocks[index],
+	for (size_t index = 1; index < state.program.blocks.size(); index++) {
+		EmitBlock(ctx, state.program.blocks[index],
 		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			          EmitDispatcherInstruction(lane, dispatcher, inst);
 		          });
-		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, ctx.program.blocks[index],
-		                                           ctx.program.block_info[index]);
+		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
+		                                           state.program.block_info[index]);
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction({OpBranch, dispatcher.after_switch_label});
@@ -423,8 +421,8 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	if (inst == nullptr) {
 		Fail("direct SPIR-V emitter received a non-value argument");
 	}
-	if (dispatcher_spills != nullptr && current_block != nullptr &&
-	    inst->Parent() != current_block) {
+	if (dispatcher_spills != nullptr && state.current_block != nullptr &&
+	    inst->Parent() != state.current_block) {
 		if (const auto found = dispatcher_spills->find(inst); found != dispatcher_spills->end()) {
 			if (const auto loaded = dispatcher_block_loads.find(inst);
 			    loaded != dispatcher_block_loads.end() &&
@@ -571,11 +569,11 @@ const IR::Inst* ValueEmitContext::ImageAddress(IR::Value value) {
 }
 
 const IR::MemoryInfo& ValueEmitContext::Memory(const IR::Inst& inst) const {
-	return program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+	return state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
 }
 
 const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
-	return program.export_info.at(inst.Flags<IR::ExportFlags>().index);
+	return state.program.export_info.at(inst.Flags<IR::ExportFlags>().index);
 }
 
 uint32_t ValueEmitContext::Label(const IR::Block* block) const {
@@ -584,20 +582,21 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 
 [[noreturn]] void ValueEmitContext::Fail(const char* reason) const {
 	EXIT("SPIR-V emission failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
-	     program.shader_hash, static_cast<unsigned>(program.stage), reason);
+	     state.program.shader_hash, static_cast<unsigned>(state.program.stage), reason);
 	std::abort();
 }
 
 [[noreturn]] void ValueEmitContext::Fail(const IR::Inst& inst, const char* reason) const {
 	EXIT("SPIR-V emission failed: hash=0x%016" PRIx64 " stage=%u opcode=%s reason=%s\n",
-	     program.shader_hash, static_cast<unsigned>(program.stage),
+	     state.program.shader_hash, static_cast<unsigned>(state.program.stage),
 	     IR::ValueOpcodeName(inst.GetOpcode()), reason);
 	std::abort();
 }
 
-void EmitProgram(EmitterState& state, const IR::Program& program) {
-	ValueEmitContext ctx(state, program);
-	ValueEmitContext high(state, program);
+void EmitProgram(EmitterState& state) {
+	const auto&      program = state.program;
+	ValueEmitContext ctx(state);
+	ValueEmitContext high(state);
 	if (state.lane_count == 2) {
 		ctx.other_half  = &high;
 		high.other_half = &ctx;

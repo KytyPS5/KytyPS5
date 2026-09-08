@@ -1656,11 +1656,23 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    image.dimension != image_class.dimension &&
 			    program.info.images[root_index].resource_class == ImageResourceClass::Sampled &&
 			    !program.info.images[root_index].depth_compare;
+			// Ordinary sampled descriptors apply DstSel through each candidate's native
+			// image-view component mapping. Shader-converted and manual-comparison images
+			// instead consume shader_swizzle in SPIR-V and therefore still require one
+			// common permutation value.
+			const bool heterogeneous_sampled_view_swizzle =
+			    image.shader_swizzle != image_class.shader_swizzle &&
+			    program.info.images[root_index].resource_class == ImageResourceClass::Sampled &&
+			    !program.info.images[root_index].depth_compare &&
+			    image.conversion_format == Prospero::BufferFormat::kInvalid &&
+			    image_class.conversion_format == Prospero::BufferFormat::kInvalid &&
+			    !image.needs_manual_depth_compare && !image_class.needs_manual_depth_compare;
 			if (image.numeric_class != image_class.numeric_class ||
 			    (image.dimension != image_class.dimension && !heterogeneous_sampled_dimension) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle ||
+			    (image.shader_swizzle != image_class.shader_swizzle &&
+			     !heterogeneous_sampled_view_swizzle) ||
 			    image.cube != image_class.cube ||
 			    image.needs_manual_depth_compare != image_class.needs_manual_depth_compare) {
 				return SpecializationFail(

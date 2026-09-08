@@ -241,7 +241,12 @@ bool CanonicalizeEnumeratedBufferDescriptor(DescriptorValue& value) {
 	// an unselected row can decode to a 48-bit address that the renderer cannot
 	// register.  Keep the switch topology stable, but make that foreign row the
 	// same safe null candidate used by native descriptor binding.
-	if (descriptor.Base48() >= RegisteredBufferAddressLimit) {
+	// RDNA2 buffer descriptor bits 115:116 and 121:123 are reserved.  Random
+	// payload can otherwise resemble a small-address, very large buffer and
+	// reach native binding even though it is not a legal descriptor.
+	constexpr uint32_t reserved_word3_mask = 0x0e180000u;
+	if (descriptor.Base48() >= RegisteredBufferAddressLimit ||
+	    (descriptor.fields[3] & reserved_word3_mask) != 0u) {
 		value.dwords.fill(0u);
 	}
 	return true;

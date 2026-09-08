@@ -34,7 +34,7 @@ class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
-	          Value active_mask = {});
+	          Value active_mask = {}, uint32_t lane_depth = 0);
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -60,6 +60,7 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	uint32_t                        m_lane_depth = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };
 

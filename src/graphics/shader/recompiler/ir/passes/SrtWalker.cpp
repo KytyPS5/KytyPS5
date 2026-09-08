@@ -462,10 +462,10 @@ private:
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
-                     Value active_mask)
+                     Value active_mask, uint32_t lane_depth)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+      m_lane_depth(lane_depth), m_context(AcquireContext(program)) {}
 
 SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
 
@@ -667,10 +667,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 		case ValueOpcode::ReadFirstLane: {
+			if (m_lane_depth >= 16u) return false;
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
+			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1), m_lane_depth + 1u);
 			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
-			                  inst.Arg(1));
+			                  inst.Arg(1), m_lane_depth + 1u);
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:

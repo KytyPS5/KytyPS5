@@ -328,6 +328,13 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 	return value;
 }
 
+uint32_t SignExtendSubword(EmitterState& state, uint32_t value, uint32_t bits) {
+	const auto left = Binary(state, OpShiftLeftLogical, TypeU32(state), value,
+	                         ConstantU32(state, 32u - bits));
+	return Binary(state, OpShiftRightArithmetic, TypeU32(state), left,
+	              ConstantU32(state, 32u - bits));
+}
+
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
 	const auto word = LoadWordInBounds(ctx, resource, index);
@@ -986,8 +993,12 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 
 void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	const auto mem = ctx.Memory(inst);
+	if (mem.formatted && mem.data_bits == 16u) {
+		StoreFormattedD16(ctx, inst, mem, components);
+		return;
+	}
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto mem       = ctx.Memory(inst);
 		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto info = Format::GetFormatInfo(

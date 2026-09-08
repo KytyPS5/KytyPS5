@@ -1288,7 +1288,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
-	Relocate(program);
+	RelocateAll();
 	if (!GamePatch::ApplyPending(program)) {
 		EXIT("Failed to apply pending game cheat\n");
 	}

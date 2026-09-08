@@ -8,12 +8,12 @@ namespace Libs::Graphics {
 // RDNA2 hardware BVH4 node layout traversed by IMAGE_BVH_INTERSECT_RAY /
 // IMAGE_BVH64_INTERSECT_RAY. The layout is fixed by the hardware, not PS5-specific: any game
 // driving this instruction on real hardware must produce data in this shape. Cross-referenced
-// against Mesa RADV's src/amd/vulkan/bvh/bvh.h (MIT-licensed) as the practical reference, since
-// RADV must build BVHs in this exact format for its own ray-query support.
+// against Mesa RADV's src/amd/vulkan/bvh/ (bvh.h for node layout, bvh_helpers.h for node-pointer
+// packing; MIT-licensed) as the practical reference, since RADV must build BVHs in this exact
+// format for its own ray-query support.
 //
-// The tag/shift arithmetic for decoding a packed guest node pointer into (type, byte offset) is
-// not yet verified and is intentionally not implemented here; callers currently locate node
-// bytes some other way. See docs/superpowers/specs for the fuller design notes.
+// Node pointers are relative to the node pool base (the accel-structure header's bvh_offset),
+// not a fixed or global address; locating that base is not implemented here.
 
 enum class BvhNodeType : uint32_t {
 Triangle = 0,
@@ -39,6 +39,13 @@ float    vertices[3][3];
 uint32_t triangle_id;
 uint32_t geometry_id_and_flags;
 uint32_t id;
+};
+
+// A decoded guest BVH node pointer/id: which node type it refers to, and its byte offset from
+// the start of the node pool (the accel-structure header's node-pool base is not modeled here).
+struct BvhNodeId {
+BvhNodeType type;
+uint32_t    byte_offset;
 };
 
 } // namespace Libs::Graphics

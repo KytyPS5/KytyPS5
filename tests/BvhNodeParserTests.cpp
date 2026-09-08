@@ -96,6 +96,39 @@ Check(node.id == 0x9abcu,
       "triangle node id did not match the raw bytes (reserved2 skip wrong?)");
 }
 
+void TestDecodeBvhNodeIdMatchesKnownRootPointer() {
+using namespace Libs::Graphics;
+
+// RADV_BVH_ROOT_NODE: pointer value 5 (type Box32, offset 0) per Mesa RADV.
+const auto root = DecodeBvhNodeId(5u);
+Check(root.type == BvhNodeType::Box32, "root node pointer did not decode as Box32");
+Check(root.byte_offset == 0u, "root node pointer did not decode to offset 0");
+}
+
+void TestBvhNodeIdRoundTripsForEveryTypeAndSeveralOffsets() {
+using namespace Libs::Graphics;
+
+const BvhNodeType types[] = {
+    BvhNodeType::Triangle,
+    BvhNodeType::Box16,
+    BvhNodeType::Box32,
+    BvhNodeType::Instance,
+    BvhNodeType::Aabb,
+};
+const uint32_t offsets[] = {0u, 64u, 128u, 192u, 65536u};
+
+for (const auto type: types) {
+for (const auto offset: offsets) {
+const uint32_t   id      = EncodeBvhNodeId(type, offset);
+const BvhNodeId  decoded = DecodeBvhNodeId(id);
+Check(decoded.type == type,
+      "node id round trip did not preserve type for some (type, offset) pair");
+Check(decoded.byte_offset == offset,
+      "node id round trip did not preserve byte offset for some (type, offset) pair");
+}
+}
+}
+
 } // namespace
 
 namespace Common {
@@ -110,6 +143,8 @@ void DbgExit(int) { std::abort(); }
 int main() {
 TestParseBvhBox32NodeExtractsChildrenAndBounds();
 TestParseBvhTriangleNodeExtractsVerticesAndIds();
+TestDecodeBvhNodeIdMatchesKnownRootPointer();
+TestBvhNodeIdRoundTripsForEveryTypeAndSeveralOffsets();
 std::puts("BvhNodeParserTests: all cases passed");
 return 0;
 }

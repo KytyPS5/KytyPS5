@@ -57,4 +57,16 @@ node.id = ReadU32(raw, 60u);
 return node;
 }
 
+BvhNodeId DecodeBvhNodeId(uint32_t id) {
+return BvhNodeId {
+    .type        = static_cast<BvhNodeType>(id & 0x7u),
+    .byte_offset = (id & ~0x7u) << 3u,
+};
+}
+
+uint32_t EncodeBvhNodeId(BvhNodeType type, uint32_t byte_offset) {
+EXIT_IF((byte_offset & 0x3Fu) != 0u);
+return (byte_offset >> 3u) | static_cast<uint32_t>(type);
+}
+
 } // namespace Libs::Graphics

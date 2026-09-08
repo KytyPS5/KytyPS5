@@ -3,6 +3,22 @@
 Обновлено **8 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Текущий цикл **8 сентября 2026, 14:21–15:14 UTC** выборочно перенёс доказанный
+подкласс heterogeneous indirect images из PR #383. Synthetic RED воспроизвёл
+таблицу, где sampled candidates совпадают по numeric/mip/conversion/cube/compare,
+но имеют dimensions 2D и 1D. В `22242aa` materialization допускает только этот
+безопасный подкласс, а `ImageRead`/`ImageSampleRaw` строят координаты и image type
+для каждого candidate отдельно; несовпадающие numeric class и неподдержанные
+query/gather остаются fail-closed. Неизменённые resource и SPIR-V тесты GREEN.
+
+Установленный emulator SHA-256:
+`1c4a3d2dc6a80c5896f2849774cdb6dc9e1d49e1b14275ed5d550488392bed50`.
+Bounded GPUAV run `_Build/runs/yotei-integrated-20260908-150356-e59dec` с окном
+320×180 достиг frame 132 / 120 GPU flips / 119 shown и прошёл прежний PC `0x7c4`.
+Новый первый fatal — indirect image table PC `0x78b8`: candidates отличаются
+dimension 2D/1D и shader swizzle `0x24c/0`. Source readback frames 110–119 всё ещё
+RGB=0, alpha=3. Первый ненулевой RGB остаётся **PENDING**.
+
 Текущий цикл **8 сентября 2026, 13:26–14:06 UTC** исправил точный dispatcher
 variant compute shader `6cc64dee32dc7094`. Прежний run до frame 179 не
 компилировал этот variant, поэтому вывод о том, что `b247c0f` закрыл PC `0x656c`,
@@ -357,15 +373,15 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260908-140320-cf909d` |
-| SHA-256 запущенного emulator | `ee33baac73ada2a5c29686a1bdbdec842c64f58276e67bd692441df06682c269` |
-| Время UTC | `2026-09-08T14:03:20.4728762Z` → `14:05:37.6417335Z` |
-| Режим | RTX 5060 Ti, окно 1280×720, Diagnostic, FIFO, GPUAV, quiet guest/shader logs; без shader capture, sync-dispatch и source readback |
-| Завершение | Не timeout: Windows exit `321` после resource-specialization fatal; процесс завершён, зависших task-owned процессов нет; VUID/data-race строк `0` |
-| Наблюдаемое исполнение | Последний window title: frame 139, flips CPU/GPU 0/125, prepared/ready/shown 125/125/124; скомпилировано 174 shaders. Run прошёл прежний PC `0x656c` и остановился на следующей resource specialization. |
-| Текущая граница | `indirect image table at pc 0x000007c4 has incompatible candidates`; следующий шаг — exact RED и selective port общей heterogeneous-image семантики из PR #383. |
-| Диагностика | RED `_Build/logs/dispatcher-signed-buffer-loop-red-20260908.txt`; GREEN `_Build/logs/dispatcher-signed-buffer-loop-green-20260908.txt`; exact audit `_Build/logs/6cc64dee-dispatcher-signed-green-20260908.stdout.txt`. |
-| Изображение | Новый quiet run readback не записывал. Последний authoritative `_Build/analysis/yotei-present-after-inline-buffer-20260908.txt`: 55 source frames 110–164, 480×270, RGB min=max=0, alpha min=max=3; ненулевой полезный кадр пока не доказан. |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260908-150356-e59dec` |
+| SHA-256 запущенного emulator | `1c4a3d2dc6a80c5896f2849774cdb6dc9e1d49e1b14275ed5d550488392bed50` |
+| Время UTC | `2026-09-08T15:03:56.8024802Z` → `15:14:01.9625954Z` |
+| Режим | RTX 5060 Ti, окно 320×180, Diagnostic, FIFO, GPUAV с отключёнными shared-memory-race/sanitizer и лимитом 128 instrumentations/pass, quiet guest/shader logs, phase trace и source readback |
+| Завершение | Достигнут resource-specialization fatal во время timeout closure: Windows exit `321`; task-owned процесс завершён, зависших процессов нет. Wrapper также отметил timeout draining redirected output. |
+| Наблюдаемое исполнение | Последний window title: frame 132, flips CPU/GPU 0/120, prepared/ready/shown 120/120/119; скомпилировано 174 shaders. Run прошёл прежний PC `0x7c4`. |
+| Текущая граница | `indirect image table at pc 0x000078b8 has incompatible candidates`: exemplar/candidate dimensions `3/1`, shader swizzles `0x24c/0`; следующий шаг — exact RED и candidate-specific swizzle lowering. |
+| Диагностика | Dimension-only RED/GREEN `_Build/logs/heterogeneous-indirect-images-red-20260908.txt` и `_Build/logs/heterogeneous-indirect-images-green-20260908.txt`; SPIR-V GREEN `_Build/logs/heterogeneous-indirect-images-spirv-green-20260908.txt`; runtime phase trace в последнем run. |
+| Изображение | `_Build/analysis/yotei-present-gpuav-lite-long-20260908.txt`: 10 source frames 110–119, 480×270, RGB min=max=0, alpha min=max=3; ненулевой полезный кадр пока не доказан. |
 | Пройденный scalar-buffer блокер | `6cc64dee32dc7094`, PC `0x656c`: signed runtime Phi loop со stride 196 и дополнительным mask guard доказан по полному dispatcher CFG; четыре correlated descriptor words материализуются общим buffer-table path. |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
@@ -382,8 +398,8 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | Пройденная byte-to-D16 граница | GFX10 MUBUF `0x20...0x23` декодируются как unsigned/signed byte-to-D16 low/high loads с сохранением соседней половины VDATA. `d7a83911714a58ee`: decode 55, structured CFG 4 blocks, Normalize/TrackResources 198, SPIR-V 6 537 слов, shader №172; dispatch 76×1×1 завершён за 63 618 мкс. |
 | Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят PC `0x530`; scalar-buffer image table с ключом `ReadFirstLane(Phi) << 5` также планируется через inline image path и проходит PC `0x4d64`. |
 | Предыдущая pipeline-граница | Screen Space Shadows `b90e2024732c6111` на RTX 5060 Ti: NVIDIA `nvgpucomp64.dll` падал с `0x80000003` во время компиляции. Collision-free LDS DWORD lowering сохранил atomics для конфликтующих адресов и в реальном run довёл `b90e` до успешного pipeline/dispatch. |
-| Текущая execution-граница | CS `6cc64dee32dc7094` проходит прежний PC `0x656c`; следующий shader resource specialization отвергает heterogeneous indirect image candidates на PC `0x7c4`. Correctness-цель ненулевого source RGB остаётся незакрытой. |
-| Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260908-140320-cf909d`; последний source readback сохранён отдельно в `_Build/analysis/yotei-present-after-inline-buffer-20260908.txt`. |
+| Текущая execution-граница | CS `6cc64dee32dc7094` проходит прежний PC `0x656c` и dimension-only PC `0x7c4`; следующий indirect image table на PC `0x78b8` требует candidate-specific dimension и shader swizzle. Correctness-цель ненулевого source RGB остаётся незакрытой. |
+| Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260908-150356-e59dec`; source readback `_Build/analysis/yotei-present-gpuav-lite-long-20260908.txt`. |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым

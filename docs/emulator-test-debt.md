@@ -888,12 +888,27 @@ shown frames and passes PC `0x656c`. The next fatal is `indirect image table at 
 incompatible candidates`; it is a separate heterogeneous-image resource class and the next RED
 target. No source readback was recorded in that quiet run.
 
+The dimension-only heterogeneous-image subset is now covered by unchanged RED/GREEN selectors:
+`_Build/logs/heterogeneous-indirect-images-red-20260908.txt`,
+`_Build/logs/heterogeneous-indirect-images-green-20260908.txt` and
+`_Build/logs/heterogeneous-indirect-images-spirv-green-20260908.txt`. Materialization accepts
+sampled non-comparison candidates whose only differing layout property is 1D versus 2D and the
+sample/read emitter derives coordinates per candidate. Numeric-class mismatch still rejects
+transactionally; query/gather dimensions remain fail-closed.
+
+Commit `22242aa` bounded run `_Build/runs/yotei-integrated-20260908-150356-e59dec` reaches frame
+132 / 119 shown and passes PC `0x7c4`. The next fatal is PC `0x78b8`, where candidates differ in
+both dimension (`3/1`) and shader swizzle (`0x24c/0`). The next RED must prove candidate-specific
+swizzle semantics rather than weakening compatibility globally. Source frames 110–119 remain
+RGB zero with alpha 3.
+
 Remaining validation:
 
 - Add signed-overflow/`INT32_MAX`, cyclic bound provenance, multiple latches and dirty-memory
   transactional boundaries without weakening the current fail-closed proof.
-- Reproduce the exact PC `0x7c4` image candidates and evaluate PR #383 against the current
-  immutable/null/comparison/device-limit resource model.
+- Reproduce the exact PC `0x78b8` dimension-plus-swizzle candidates and extend only sample/read
+  operations that can apply the swizzle per switch candidate; keep query/gather and incompatible
+  numeric/conversion/comparison cases rejected.
 
 ## Signed integer storage images
 

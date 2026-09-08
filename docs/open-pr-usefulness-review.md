@@ -5,8 +5,8 @@
 Снимок GitHub: **68 открытых PR** на 8 сентября 2026 года. Два из них draft:
 [#470](https://github.com/KytyPS5/KytyPS5/pull/470) и
 [#497](https://github.com/KytyPS5/KytyPS5/pull/497). Сравнение выполнено с веткой
-`yotei-windows-bringup`: первоначальный обзор — на `b247c0f`, runtime-уточнение
-ниже — после `90fed2b` (`shader: prove signed descriptor loops in dispatcher CFG`).
+`yotei-windows-bringup`: первоначальный обзор — на `b247c0f`, runtime-уточнения
+ниже — после `90fed2b` и selective port `22242aa`.
 
 Проверены метаданные, описания и состав diff всех 68 PR. Для shader/renderer,
 новых PR #493/#497/#500/#503/#504/#506/#508/#509 и кандидатов, пересекающихся
@@ -28,15 +28,16 @@
 dispatcher CFG. В `90fed2b` dispatcher теперь строит и проверяет полный CFG и
 использует тот же строгий proof. Неизменённый synthetic RED, точный manifest и
 игра проходят PC `0x656c`. Новый первый fatal — `indirect image table` с
-несовместимыми candidates на PC `0x7c4`; поэтому ближайший доказанный кандидат —
-selective port общего механизма heterogeneous indirect images из **#383**.
+несовместимыми candidates на PC `0x7c4`. В `22242aa` перенесён только доказанный
+dimension-only подкласс из **#383**; игра проходит его и останавливается на новом
+PC `0x78b8`, где дополнительно различается shader swizzle (`0x24c/0`).
 
 Самые полезные следующие кандидаты:
 
-1. **#383 — heterogeneous indirect images.** Новый bounded run упирается именно
-   в несовместимые candidates indirect image table на PC `0x7c4`. Сначала нужен
-   точный RED по найденному shader manifest, затем перенос только общей модели
-   heterogeneous candidates с сохранением текущих null/immutable/limit checks.
+1. **#383 — heterogeneous indirect images.** Dimension-only sampled subset уже
+   выборочно перенесён и GREEN. Новый bounded run проходит PC `0x7c4`, затем
+   упирается в PC `0x78b8` с dimension+swizzle candidates. Следующий перенос —
+   только candidate-specific sample/read swizzle с сохранением fail-closed правил.
 2. **#468 — `S_WQM_B32`.** Это подтверждённый decode gap двух shader manifests.
    Нужен адаптированный numeric/raw-word вариант с RED/GREEN, а не прямой перенос
    старой boolean-модели.

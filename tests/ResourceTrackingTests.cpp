@@ -3532,6 +3532,48 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   }
 }
 
+void TestBoundedMaterializationNullsForeignBufferSlots() {
+  Fixture fixture;
+  InitializeBoundedSnapshot(fixture, 4u, true);
+  auto& writer = fixture.program.info.buffers[0];
+  writer.written = true;
+  writer.first_use_pc = 0x1d94u;
+  const auto plan = ExtractResourcePlan(fixture.program);
+
+  BoundedSnapshotReader reader;
+  const std::array<uint32_t, 4> valid{0x20000u, 4u << 16u, 4u, 0u};
+  // Captured table bytes from an unselected foreign row.  Interpreted as a
+  // buffer descriptor, its Base48 is outside the renderer's registered 40-bit
+  // guest address range and therefore cannot be bound as a real candidate.
+  const std::array<uint32_t, 4> foreign{0x0000af71u, 0x3b1cb71eu,
+                                        0x0000af1eu, 0x3b32b6c8u};
+  for (uint32_t index = 0; index < 2u; ++index) {
+    const auto& descriptor = index == 0u ? valid : foreign;
+    for (uint32_t word = 0; word < descriptor.size(); ++word) {
+      reader.words.emplace_back(0x1000u + index * 16u + word * 4u,
+                                descriptor[word]);
+    }
+  }
+  const std::array<uint32_t, 3> data{2u, 0x1000u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot,
+                             specialization),
+        "bounded writable table with an unaddressable foreign slot failed materialization");
+  Check(snapshot.buffers.size() == 2u &&
+            snapshot.buffers[0].dword_count == valid.size() &&
+            std::equal(valid.begin(), valid.end(), snapshot.buffers[0].dwords.begin()) &&
+            std::ranges::all_of(snapshot.buffers[1].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "foreign bounded buffer slot was not canonicalized to a distinct null candidate");
+  const auto& table = specialization.buffer_tables[0];
+  Check(table.count == 2u && table.resources == std::vector<uint32_t>{0u, 1u} &&
+            std::vector<uint32_t>(snapshot.flattened_srt.begin() + table.mapping_flat_offset,
+                                  snapshot.flattened_srt.end()) ==
+                std::vector<uint32_t>{0u, 1u},
+        "foreign bounded buffer slot lost its stable runtime mapping");
+}
+
 enum class FiniteSelectorScenario {
   Select, Phi, CarryOffset, UnknownArm, UndefArm, CyclicPhi,
   ConditionalRoot, MixedColumns, MixedIndex, VertexStage, EmptyExecUndef,
@@ -4412,7 +4454,9 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-writer-alias-only") == 0) {
+      TestBoundedMaterializationCandidatesAndRemap();
       TestBoundedMaterializationRejectsWritableAliases();
+      TestBoundedMaterializationNullsForeignBufferSlots();
       std::cout << "KYTY_BOUNDED_WRITER_ALIAS_PASS\n";
       return 0;
     }
@@ -4490,6 +4534,8 @@ int main(int argc, char** argv) {
     Run("TestBoundedMaterializationCandidatesAndRemap", TestBoundedMaterializationCandidatesAndRemap);
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);
+    Run("TestBoundedMaterializationNullsForeignBufferSlots",
+        TestBoundedMaterializationNullsForeignBufferSlots);
     Run("phi validation", TestPhiValidation);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);

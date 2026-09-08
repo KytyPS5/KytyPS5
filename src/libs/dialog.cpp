@@ -306,6 +306,7 @@ LIB_NAME("SaveDataDialog", "SaveDataDialog");
 
 constexpr int SAVE_STATUS_NONE        = 0;
 constexpr int SAVE_STATUS_INITIALIZED = 1;
+constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
 constexpr int SAVE_MODE_LIST          = 1;
 constexpr int SAVE_MODE_PROGRESS_BAR  = 5;
@@ -435,7 +436,10 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		}
 	}
 
-	g_save_status = SAVE_STATUS_FINISHED;
+	// Progress dialogs stay open while the application performs the operation.
+	// Reporting FINISHED here makes clients reopen them instead of starting work.
+	g_save_status =
+	    g_save_mode == SAVE_MODE_PROGRESS_BAR ? SAVE_STATUS_RUNNING : SAVE_STATUS_FINISHED;
 
 	return OK;
 }

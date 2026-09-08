@@ -164,8 +164,16 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	Submission   submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
-	submission.commands          = draw_commands;
-	submission.constant_commands = constant_commands;
+	submission.owned_commands    = std::make_unique<uint32_t[]>(draw_commands.size());
+	std::memcpy(submission.owned_commands.get(), draw_commands.data(), draw_commands.size_bytes());
+	submission.commands = {submission.owned_commands.get(), draw_commands.size()};
+	if (!constant_commands.empty()) {
+		submission.owned_constant_commands = std::make_unique<uint32_t[]>(constant_commands.size());
+		std::memcpy(submission.owned_constant_commands.get(), constant_commands.data(),
+		            constant_commands.size_bytes());
+		submission.constant_commands = {submission.owned_constant_commands.get(),
+		                                constant_commands.size()};
+	}
 	submission.reset_processor   = m_graphics_done;
 	m_graphics_done              = false;
 	Enqueue(std::move(submission));
@@ -181,7 +189,13 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
-	submission.commands = commands;
+	// The submitted ACB packets belong to the queue until they have been consumed.
+	// Retaining the caller's temporary packet span lets later submissions overwrite
+	// registers and commands while this queue is waiting. Indirect-buffer addresses
+	// inside these packets still refer to guest memory and are resolved at execution.
+	submission.owned_commands = std::make_unique<uint32_t[]>(commands.size());
+	std::memcpy(submission.owned_commands.get(), commands.data(), commands.size_bytes());
+	submission.commands = {submission.owned_commands.get(), commands.size()};
 	Enqueue(std::move(submission));
 }
 

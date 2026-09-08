@@ -711,6 +711,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	if (resource.depth_compare && !desc.info.IsDepth()) {
+		const auto id = texture_cache.GetColorComparisonImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);

@@ -544,6 +544,89 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	return id;
 }
 
+ImageId TextureCache::GetColorComparisonImage(ImageDesc& desc) {
+	// Color comparison sampling needs normalized texels in a depth image on Vulkan.
+	// Keep immutable snapshots separate from guest-backed color images so ordinary
+	// color reads and already prepared draws retain their original contents.
+	const auto& source = desc.info;
+	if (source.pixel_format != vk::Format::eR8G8B8A8Unorm || source.samples != 1 ||
+	    source.type != Prospero::ImageType::kColor2D || source.resources.levels != 1 ||
+	    source.resources.layers != 1 || source.HasMetadata() ||
+	    (desc.view_info.mapping.r != vk::ComponentSwizzle::eIdentity &&
+	     desc.view_info.mapping.r != vk::ComponentSwizzle::eR)) {
+		EXIT("unsupported color comparison texture: format=%u extent=%u,%u levels=%u layers=%u\n",
+		     static_cast<unsigned>(source.pixel_format), source.extent.width, source.extent.height,
+		     source.resources.levels, source.resources.layers);
+	}
+	std::vector<uint8_t> bytes(source.data.size);
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(source.data.address, bytes.data(),
+	                                                     bytes.size(), true)) {
+		EXIT("color comparison texture requires readable, GPU-clean backing\n");
+	}
+	TileSurfaceLayout surface {};
+	if (source.IsTiled() && !TileGetTiledTextureLayout(
+	                            {source.guest_format, source.tile_mode, TileSurfaceDimension::Dim2D,
+	                             source.extent.width, source.extent.height, 1, 1, 1},
+	                            surface)) {
+		EXIT("unsupported color comparison texture tiling\n");
+	}
+	std::vector<float> texels(static_cast<size_t>(source.extent.width) * source.extent.height);
+	for (uint32_t y = 0; y < source.extent.height; ++y) {
+		for (uint32_t x = 0; x < source.extent.width; ++x) {
+			uint64_t offset = (static_cast<uint64_t>(y) * source.pitch + x) * 4;
+			if (source.IsTiled()) {
+				const auto& block  = surface.texture.block;
+				const auto& mip    = surface.mips[0];
+				const auto  sx     = x + mip.tail_x;
+				const auto  sy     = y + mip.tail_y;
+				const auto  bx     = sx / block.block_width;
+				const auto  by     = sy / block.block_height;
+				const auto columns = (mip.padded_width + block.block_width - 1) / block.block_width;
+				uint32_t   within  = 0;
+				uint32_t   swizzle = 0;
+				EXIT_IF(!TileGetBlockOffset(block, sx % block.block_width, sy % block.block_height,
+				                            0, within) ||
+				        !TileGetBlockXor(block, bx, by, swizzle));
+				offset = mip.offset +
+				         (static_cast<uint64_t>(by) * columns + bx) * block.block_size +
+				         (within ^ swizzle);
+			}
+			EXIT_IF(offset >= bytes.size());
+			texels[static_cast<size_t>(y) * source.extent.width + x] = bytes[offset] / 255.0f;
+		}
+	}
+	ImageInfo info {};
+	info.pixel_format      = vk::Format::eD32Sfloat;
+	info.guest_format      = Prospero::BufferFormat::k32Float;
+	info.type              = source.type;
+	info.extent            = source.extent;
+	info.pitch             = source.extent.width;
+	info.bytes_per_block   = sizeof(float);
+	info.mip_layout[0]     = {0, texels.size() * sizeof(float), info.pitch, info.extent.height};
+	desc.info              = info;
+	desc.view_info.format  = info.pixel_format;
+	desc.view_info.aspect  = vk::ImageAspectFlagBits::eDepth;
+	desc.view_info.mapping = vk::ComponentMapping {};
+	std::scoped_lock lock {m_lock};
+	for (auto& cached: m_color_comparison_images) {
+		if (m_slot_images[cached.id].info.extent == info.extent && cached.texels == texels) {
+			cached.last_used = m_gc_tick;
+			return cached.id;
+		}
+	}
+	const auto          id     = InsertImage(info);
+	auto&               buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Stream);
+	const auto          size   = texels.size() * sizeof(float);
+	const auto          offset = buffer.Copy(texels.data(), size, 256);
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset     = offset;
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1};
+	copy.imageExtent      = info.extent;
+	m_slot_images[id].Upload(std::span {&copy, 1}, buffer.Handle(), offset, size);
+	m_color_comparison_images.push_back({id, std::move(texels), m_gc_tick});
+	return id;
+}
+
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
 	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
@@ -1991,6 +2074,12 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	std::erase_if(m_color_comparison_images, [&](const ColorComparisonImage& image) {
+		if (tick - image.last_used <= NumFramesBeforeRemoval) return false;
+		const auto id = image.id;
+		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		return true;
+	});
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

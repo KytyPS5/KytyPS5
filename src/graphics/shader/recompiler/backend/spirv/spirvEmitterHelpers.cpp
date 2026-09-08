@@ -210,7 +210,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, active_ballot, 0});
 	uint32_t mask = low;
-	if (state.wave_size == 64u) {
+	if (state.program.wave_size == 64u) {
 		const auto high     = state.builder.AllocateId();
 		const auto in_high  = state.builder.AllocateId();
 		const auto selected = state.builder.AllocateId();
@@ -235,7 +235,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), hit, mask, bit});
 	state.builder.AddFunction({OpINotEqual, TypeBool(state), active, hit, ConstantU32(state, 0)});
 	state.builder.AddFunction(
-	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.wave_size)});
+	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.program.wave_size)});
 	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), ret, active, in_range});
 	return ret;
 }

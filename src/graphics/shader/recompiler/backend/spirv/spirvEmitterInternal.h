@@ -360,7 +360,6 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	const IR::SpirvRequirements&                     requirements;
 	ShaderType                                       stage                   = ShaderType::Unknown;
-	uint32_t                                         wave_size               = 64;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
@@ -401,6 +400,7 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	std::unordered_map<const IR::Block*, uint32_t> labels;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -462,7 +462,6 @@ struct ValueEmitContext {
 	EmitterState&                                                      state;
 	const IR::Program&                                                 program;
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
-	std::unordered_map<const IR::Block*, uint32_t>                     labels;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
 	const IR::Block*                                                   current_block = nullptr;
@@ -496,8 +495,6 @@ struct F32Class {
 	uint32_t zero = 0;
 };
 
-uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr);
-
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
@@ -511,9 +508,6 @@ uint32_t VertexParameterComponentCount(const InputBinding& input);
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
 uint32_t VertexParameterScalarPointerType(EmitterState& state, VertexInputScalarKind kind);
-
-uint32_t VertexParameterVectorOrScalarType(EmitterState& state, VertexInputScalarKind kind,
-                                           uint32_t components);
 
 uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);

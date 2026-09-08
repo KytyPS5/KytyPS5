@@ -360,34 +360,6 @@ uint32_t VertexParameterScalarPointerType(EmitterState& state, VertexInputScalar
 	}
 }
 
-uint32_t VertexParameterVectorOrScalarType(EmitterState& state, VertexInputScalarKind kind,
-                                           uint32_t components) {
-	switch (kind) {
-		case VertexInputScalarKind::Sint:
-			switch (components) {
-				case 1: return TypeI32(state);
-				case 2: return TypeI32Vector(state, 2);
-				case 3: return TypeI32Vector(state, 3);
-				default: return TypeI32Vector(state, 4);
-			}
-		case VertexInputScalarKind::Uint:
-			switch (components) {
-				case 1: return TypeU32(state);
-				case 2: return TypeU32Vector(state, 2);
-				case 3: return TypeU32Vector(state, 3);
-				default: return TypeU32Vector(state, 4);
-			}
-		case VertexInputScalarKind::Float:
-		default:
-			switch (components) {
-				case 1: return TypeF32(state);
-				case 2: return TypeF32Vector(state, 2);
-				case 3: return TypeF32Vector(state, 3);
-				default: return TypeF32Vector(state, 4);
-			}
-	}
-}
-
 uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components) {
 	switch (kind) {

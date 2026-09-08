@@ -239,7 +239,7 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		}
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			const auto* predecessor = inst.PhiBlock(index);
-			if (predecessor == nullptr || !ctx.labels.contains(predecessor)) {
+			if (predecessor == nullptr || !ctx.state.labels.contains(predecessor)) {
 				ctx.Fail(inst, "has a predecessor outside the structured function");
 			}
 		}
@@ -579,7 +579,7 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 }
 
 uint32_t ValueEmitContext::Label(const IR::Block* block) const {
-	return labels.at(block);
+	return state.labels.at(block);
 }
 
 [[noreturn]] void ValueEmitContext::Fail(const char* reason) const {
@@ -610,8 +610,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
-		ctx.labels.emplace(block, label);
-		high.labels.emplace(block, label);
+		state.labels.emplace(block, label);
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();

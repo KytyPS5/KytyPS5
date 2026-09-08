@@ -3501,11 +3501,19 @@ void TestBoundedMaterializationLimitsAreTransactional() {
 }
 
 void TestBoundedMaterializationRejectsWritableAliases() {
-  for (const bool overlap : {false,true}) {
+  struct Scenario {
+    bool overlap;
+    bool oversized;
+  };
+  for (const auto [overlap, oversized] :
+       {Scenario{false, false}, Scenario{true, false},
+        Scenario{false, true}, Scenario{true, true}}) {
     Fixture fixture;
     InitializeBoundedSnapshot(fixture,4u,true);
+    const uint32_t address = overlap ? 0x100cu : oversized ? 0x2000u : 0x1010u;
     const auto writer=AddBoundedSnapshotSource(fixture,
-        {Value(overlap ? 0x100cu : 0x1010u),Value(0u),Value(4u),Value(0u)});
+        {Value(address), Value(oversized ? 0x3fffu << 16u : 0u),
+         Value(oversized ? UINT32_MAX : 4u), Value(0u)});
     fixture.program.info.buffers.push_back({.source=writer,.written=true});
     auto plan=ExtractResourcePlan(fixture.program);
     BoundedSnapshotReader reader; reader.generated_descriptors=1u;
@@ -3516,7 +3524,10 @@ void TestBoundedMaterializationRejectsWritableAliases() {
     const auto old_snapshot=snapshot;
     const auto old_specialization=specialization;
     const bool accepted=MaterializeResources(plan,BoundedSnapshotRuntime(reader,data),snapshot,specialization);
-    Check(accepted != overlap,"bounded source final-word alias or exact-end disjoint writer misclassified");
+    Check(accepted != overlap,
+          oversized
+              ? "oversized bounded writer was rejected before conservative alias classification"
+              : "bounded source final-word alias or exact-end disjoint writer misclassified");
     if (overlap) CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
   }
 }
@@ -4398,6 +4409,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-srt-materialization-only") == 0) {
       TestFiniteSelectorSrtMaterialization();
       std::cout << "KYTY_FINITE_SELECTOR_SRT_MATERIALIZATION_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-writer-alias-only") == 0) {
+      TestBoundedMaterializationRejectsWritableAliases();
+      std::cout << "KYTY_BOUNDED_WRITER_ALIAS_PASS\n";
       return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-active-proof-only") == 0) {

@@ -1176,11 +1176,17 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 		if (descriptor.Type() != 0u || address == 0u || size == 0u) {
 			continue;
 		}
-		if (address >= buffer_limit || size > buffer_limit - address) {
-			return SpecializationFail("bounded SRT buffer writer exceeds the registered 40-bit address range");
+		if (address >= buffer_limit) {
+			return SpecializationFail(
+			    "bounded SRT buffer writer base exceeds the registered 40-bit address range");
 		}
+		// Buffer descriptors may conservatively declare more records than the mapped VMA.
+		// NativeStorageBuffer clamps that requested footprint to the actual guest mapping.  The
+		// alias proof has no mapping lookup, so clamp only to the complete tracker address space:
+		// every range the renderer can bind remains a subset of this interval.
+		const auto write_end = address + std::min(size, buffer_limit - address);
 		for (const auto& read: snapshot.immutable_srt_ranges) {
-			if (address < read.address + read.size && read.address < address + size) {
+			if (address < read.address + read.size && read.address < write_end) {
 				return SpecializationFail(fmt::format(
 				    "immutable SRT snapshot overlaps writable buffer {} (source=0x{:x}+{} writer=0x{:x}+{})",
 				    resource, read.address, read.size, address, size));

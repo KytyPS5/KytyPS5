@@ -7,25 +7,6 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, value});
-	return result;
-}
-
-uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs, uint32_t rhs) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, lhs, rhs});
-	return result;
-}
-
-uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition, uint32_t true_value,
-                uint32_t false_value) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelect, type, result, condition, true_value, false_value});
-	return result;
-}
-
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
@@ -290,12 +271,6 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = index};
 }
 
-PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                           const MemoryResourceAccess& resource,
-                                           uint32_t                    raw_index) {
-	return {.resource = resource, .index = EmitMemoryElementIndex(ctx.state, resource, raw_index)};
-}
-
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
 
@@ -304,10 +279,10 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
-	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
+	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
-	    [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -323,11 +298,10 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto address   = ByteAddress(ctx, inst, mem);
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
-	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    return LoadSubwordInBounds(ctx, access.resource, address, access.index, bits,
-		                               sign_extend);
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
 	    });
 }
 
@@ -505,10 +479,10 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto address   = ByteAddress(ctx, inst, mem);
 	const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
-	const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
 	EmitIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-		    StoreSubwordInBounds(ctx, mem, access.resource, address, access.index, bits, data);
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+		    StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
 	    });
 }
 
@@ -521,12 +495,11 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
-	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
+	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    ctx.state.builder.AddFunction(
-		        {OpStore, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-		         data});
+		        {OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
 	    });
 }
 
@@ -963,10 +936,10 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 			                                                    ConstantU32(state, component * 4u));
 			    const auto raw_index = Binary(state, OpShiftRightLogical, TypeU32(state), address,
 			                                  ConstantU32(state, 2));
-			    const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+			    const auto index     = EmitMemoryElementIndex(state, resource, raw_index);
 			    values[component]    = EmitValueOrZeroIfCondition(
-			        state, EmitMemoryElementInBounds(state, access.resource, access.index),
-			        [&]() { return LoadWordInBounds(ctx, access.resource, access.index); });
+			        state, EmitMemoryElementInBounds(state, resource, index),
+			        [&]() { return LoadWordInBounds(ctx, resource, index); });
 		    }
 		    return ConstructU32Composite(state, components, values);
 	    });
@@ -984,11 +957,10 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			                                              ConstantU32(state, component * 4u));
 			const auto raw_index =
 			    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-			const auto access = PrepareMemoryElement(ctx, mem, resource, raw_index);
-			EmitIfCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
+			const auto index = EmitMemoryElementIndex(state, resource, raw_index);
+			EmitIfCondition(state, EmitMemoryElementInBounds(state, resource, index),
 			                [&]() {
-				                StoreWordInBounds(ctx, access.resource, access.index,
-				                                  ctx.Arg(inst, component + 1u));
+				                StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, component + 1u));
 			                });
 		}
 	});

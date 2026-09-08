@@ -435,12 +435,7 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 			return id;
 		}
 	}
-	if (const auto found = definitions.find(inst); found != definitions.end()) {
-		return found->second;
-	}
-	const auto id = state.builder.AllocateId();
-	definitions.emplace(inst, id);
-	return id;
+	return Result(*inst);
 }
 
 uint32_t ValueEmitContext::Arg(const IR::Inst& inst, size_t index) {
@@ -535,10 +530,12 @@ uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 
 uint32_t ValueEmitContext::Emit(const IR::Inst& inst, uint32_t opcode, IR::Type type,
                                 std::initializer_list<uint32_t> args) {
-	std::vector<uint32_t> words {opcode, TypeId(type), Result(inst)};
+	const auto type_id = TypeId(type);
+	const auto result  = Result(inst);
+	std::vector<uint32_t> words {opcode, type_id, result};
 	words.insert(words.end(), args.begin(), args.end());
 	state.builder.AddFunction(words);
-	return Result(inst);
+	return result;
 }
 
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {

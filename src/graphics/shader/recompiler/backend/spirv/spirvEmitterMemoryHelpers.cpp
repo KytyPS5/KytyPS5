@@ -206,15 +206,6 @@ bool IsSignedFormatComponent(Format::ComponentType type) {
 	       type == Format::ComponentType::Sscaled;
 }
 
-uint32_t EmitHalfToF32Bits(EmitterState& state, uint32_t raw) {
-	const auto unpacked = state.builder.AllocateId();
-	const auto value    = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), GlslUnpackHalf2x16, raw});
-	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), value, unpacked, 0});
-	return EmitBitcastF32ToU32(state, value);
-}
-
 uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	const auto mantissa_bits = bits == 11u ? 6u : 5u;
 	const auto mantissa_mask = (1u << mantissa_bits) - 1u;
@@ -295,7 +286,7 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 				return raw;
 			}
 			if (bits == 16u) {
-				return EmitHalfToF32Bits(state, raw);
+				return EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw));
 			}
 			return EmitUFloatToF32Bits(state, raw, bits);
 		default: return raw;
@@ -316,8 +307,7 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 		uint32_t key;
 	};
 	const auto classify = [&](uint32_t bits) {
-		const auto value = EmitBitcastU32ToF32(state, bits);
-		const auto cls   = EmitClassifyF32(state, value);
+		const auto cls = EmitClassifyF32Bits(state, bits);
 		const auto negative = EmitCompareU32Constant(
 		    state, OpINotEqual, EmitAndConstant(state, bits, 0x80000000u), 0u);
 		const auto negative_key = state.builder.AllocateId();

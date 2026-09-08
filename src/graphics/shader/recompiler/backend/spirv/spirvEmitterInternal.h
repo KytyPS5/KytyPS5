@@ -437,6 +437,26 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.builder.AddFunction({OpLabel, label});
 }
 
+inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({opcode, type, result, value});
+	return result;
+}
+
+inline uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs,
+                            uint32_t rhs) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({opcode, type, result, lhs, rhs});
+	return result;
+}
+
+inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition,
+                            uint32_t true_value, uint32_t false_value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, type, result, condition, true_value, false_value});
+	return result;
+}
+
 struct ValueEmitContext {
 	explicit ValueEmitContext(EmitterState& state_): state(state_) {}
 
@@ -672,8 +692,6 @@ uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t 
 
 bool IsSignedFormatComponent(Format::ComponentType type);
 
-uint32_t EmitHalfToF32Bits(EmitterState& state, uint32_t raw);
-
 uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
@@ -723,6 +741,8 @@ uint32_t EmitLogicalAndBool(EmitterState& state, uint32_t lhs, uint32_t rhs);
 uint32_t EmitLogicalOrBool(EmitterState& state, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitLogicalNotBool(EmitterState& state, uint32_t value);
+
+F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
 

@@ -544,11 +544,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
-		depth.depth_meta_clear_enable =
+		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
-		if (depth.depth_meta_clear_enable &&
+		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
@@ -898,13 +898,12 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer, vk::PrimitiveTo
 	return true;
 }
 
-bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
-                                            const DrawCallInfo& draw,
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
                                             bool log_setup_phases, DrawRenderState& state) {
 	auto& ctx = buffer.GetRegisters();
 
-	if (ResolveColorTargets(submit_id, buffer, render_target_slice_offset)) {
+	if (ResolveColorTargets(buffer, render_target_slice_offset)) {
 		return false;
 	}
 	if (log_setup_phases) {
@@ -913,7 +912,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
 		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
-			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
+			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
@@ -923,7 +922,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	if (log_setup_phases) {
 		LogDrawPhase(draw.name, "ResolveRenderDepthTarget");
 	}
-	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
+	ResolveRenderDepthTarget(buffer, state.depth_info);
 
 	state.ps_active       = DrawHasActivePixelShader(buffer);
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
@@ -1316,7 +1315,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.guest_element_size = static_cast<uint32_t>(index_size / args.index_count);
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, true,
 	                            state)) {
 		ResetBindings();
 		return;
@@ -1393,7 +1392,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, false,
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();
 		return;
@@ -1440,8 +1439,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	ResetBindings();
 }
 
-bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,
-                                         uint32_t render_target_slice_offset) {
+bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
 	const auto& hw = buffer.GetRegisters();
 	if (hw.GetColorControl().mode != 3) {
 		return false;
@@ -1455,8 +1453,8 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 
 	RenderColorInfo src {};
 	RenderColorInfo dst {};
-	ResolveRenderColorTarget(submit_id, buffer, src, render_target_slice_offset, 0, true, true);
-	ResolveRenderColorTarget(submit_id, buffer, dst, render_target_slice_offset, 1, true, true);
+	ResolveRenderColorTarget(buffer, src, render_target_slice_offset, 0, true, true);
+	ResolveRenderColorTarget(buffer, dst, render_target_slice_offset, 1, true, true);
 	if (!src.image_id || !dst.image_id) {
 		return false;
 	}

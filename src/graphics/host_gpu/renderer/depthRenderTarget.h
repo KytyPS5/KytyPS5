@@ -23,7 +23,6 @@ struct RenderDepthInfo {
 	TextureCache::ImageDesc     desc;
 	bool                        depth_clear_enable       = false;
 	bool                        depth_load_clear_enable  = false;
-	bool                        depth_meta_clear_enable  = false;
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
 	// Effective draw writes; discovery applies test, target-write and clear controls.

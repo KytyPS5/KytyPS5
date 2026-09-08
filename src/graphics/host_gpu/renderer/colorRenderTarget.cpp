@@ -41,16 +41,13 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
-                                              RenderColorInfo& r,
+void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
-                                              uint32_t render_target_slot, bool ignore_target_mask,
+                                              uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
-	const auto  rt_slot = (render_target_slot == UINT32_MAX ? render_target_first_bound_slot(buffer)
-	                                                        : render_target_slot);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {

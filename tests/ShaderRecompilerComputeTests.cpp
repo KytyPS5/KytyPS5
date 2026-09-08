@@ -410,7 +410,7 @@ struct RenderExecutorTestAccess {
     std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
     bool compute = false;
     for (const auto *prepared : stages) {
-      const auto &program = *prepared->program;
+      const auto &program = *prepared->runtime->program;
       compute |= program.stage == ShaderType::Compute;
       const auto shader_stage = program.stage == ShaderType::Vertex
                                     ? vk::ShaderStageFlagBits::eVertex
@@ -460,7 +460,7 @@ struct RenderExecutorTestAccess {
                                                 PreparedBindings &bindings) {
     std::array<PreparedBindings *, 1> stages{&bindings};
     auto pipeline = CreateDescriptorPipeline(executor, stages);
-    const auto bind_point = bindings.program->stage == ShaderType::Compute
+    const auto bind_point = bindings.runtime->program->stage == ShaderType::Compute
                                 ? vk::PipelineBindPoint::eCompute
                                 : vk::PipelineBindPoint::eGraphics;
     executor.CommitBindings(buffer, bind_point, pipeline, stages);
@@ -498,17 +498,15 @@ struct RenderExecutorTestAccess {
   }
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
-                                       uint64_t submit_id,
                                        CommandBuffer &buffer,
                                        RenderDepthInfo &depth) {
-    executor.ResolveRenderDepthTarget(submit_id, buffer, depth);
+    executor.ResolveRenderDepthTarget(buffer, depth);
   }
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
-                                       uint64_t submit_id,
                                        CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(submit_id, buffer, color, 0, slot);
+    executor.ResolveRenderColorTarget(buffer, color, 0, slot);
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -1848,15 +1846,12 @@ public:
     pixel_program.bindings.push_data_start_dword = 0;
     pixel_program.bindings.user_data_registers = {0, 1};
     pixel_program.bindings.memory_offset_dword = 2;
-    ShaderRecompiler::IR::ResourceSnapshot snapshot{};
-    PreparedBindings vertex{};
-    vertex.program = &vertex_program;
-    vertex.snapshot = &snapshot;
-    vertex.shader_data = {0x11111111u, 0x22222222u};
-    PreparedBindings pixel{};
-    pixel.program = &pixel_program;
-    pixel.snapshot = &snapshot;
-    pixel.shader_data = {0x33333333u, 0x44444444u};
+    ShaderStageRuntime vertex_runtime{.program = &vertex_program};
+    vertex_runtime.resources.user_data = {0x11111111u, 0x22222222u};
+    ShaderStageRuntime pixel_runtime{.program = &pixel_program};
+    pixel_runtime.resources.user_data = {0x33333333u, 0x44444444u};
+    auto vertex = context.GetRenderExecutor().PrepareBindings(vertex_runtime);
+    auto pixel = context.GetRenderExecutor().PrepareBindings(pixel_runtime);
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
@@ -7853,7 +7848,7 @@ public:
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 1, scheduler.Current(), color, 0);
+          executor, scheduler.Current(), color, 0);
       const auto attachment =
           texture_cache.FindRenderTarget(color.image_id, color.desc);
       const auto &image = texture_cache.GetImage(color.image_id);
@@ -7955,7 +7950,7 @@ public:
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 1, scheduler.Current(), color, 0);
+          executor, scheduler.Current(), color, 0);
       const auto attachment =
           texture_cache.FindRenderTarget(color.image_id, color.desc);
       const auto &image = texture_cache.GetImage(color.image_id);
@@ -7988,7 +7983,7 @@ public:
           0, {.base_array_slice_index = 7, .last_array_slice_index = 7});
       RenderColorInfo sliced_color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 2, scheduler.Current(), sliced_color, 0);
+          executor, scheduler.Current(), sliced_color, 0);
       RenderDepthInfo no_depth{};
       const auto sliced_rendering =
           RenderExecutorTestAccess::AcquireRenderTargets(
@@ -8074,7 +8069,7 @@ public:
                                    .last_array_slice_index = 32});
         RenderColorInfo volume_color{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
-            executor, 3, scheduler.Current(), volume_color, 0);
+            executor, scheduler.Current(), volume_color, 0);
         const auto volume_rendering =
             RenderExecutorTestAccess::AcquireRenderTargets(
                 executor, scheduler.Current(), &volume_color, 1, no_depth);
@@ -8210,7 +8205,7 @@ public:
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 1, scheduler.Current(), color, 0);
+          executor, scheduler.Current(), color, 0);
       RenderDepthInfo no_depth{};
       const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &color, 1, no_depth);
@@ -8603,7 +8598,7 @@ public:
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 1, scheduler.Current(), color, 0);
+          executor, scheduler.Current(), color, 0);
       const auto attachment =
           texture_cache.FindRenderTarget(color.image_id, color.desc);
       const auto &image = texture_cache.GetImage(color.image_id);
@@ -8713,7 +8708,7 @@ public:
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, 1, scheduler.Current(), color, 0);
+          executor, scheduler.Current(), color, 0);
       const auto attachment =
           texture_cache.FindRenderTarget(color.image_id, color.desc);
       const auto &image = texture_cache.GetImage(color.image_id);
@@ -9120,8 +9115,8 @@ public:
                                 mipped_storage_descriptor,
                                 overwide_mipped_storage_descriptor,
                                 overwide_mipped_storage_descriptor};
-      mipped_prepared.program = &mipped_program;
-      mipped_prepared.snapshot = &mipped_snapshot;
+      ShaderStageRuntime mipped_runtime{&mipped_program, std::move(mipped_snapshot)};
+      mipped_prepared.runtime = &mipped_runtime;
       mipped_prepared.images.push_back(
           std::move(plain_mipped_storage_binding));
       mipped_prepared.images.push_back(
@@ -9516,9 +9511,8 @@ public:
       split_program.info = std::move(split_ir.info);
       split_program.bindings = std::move(split_ir.bindings);
       PreparedBindings split_bindings{};
-      ShaderRecompiler::IR::ResourceSnapshot split_snapshot{};
-      split_bindings.program = &split_program;
-      split_bindings.snapshot = &split_snapshot;
+      ShaderStageRuntime split_runtime{.program = &split_program};
+      split_bindings.runtime = &split_runtime;
       split_bindings.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
            split_storage_desc});
@@ -9594,7 +9588,7 @@ public:
       registers.SetRenderControl({});
       RenderDepthInfo disabled_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), disabled_depth);
+          executor, scheduler.Current(), disabled_depth);
       Require(name, "disabled tests with stale depth write enable",
               !disabled_depth.image_id,
               "a dormant depth write bit bound a depth attachment");
@@ -9606,7 +9600,7 @@ public:
 
       RenderDepthInfo phased_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), phased_depth);
+          executor, scheduler.Current(), phased_depth);
       auto non_texture_compatible_target = phased_depth_target;
       non_texture_compatible_target.z_info.texture_compatibility =
           Prospero::TextureCompatiblePlaneCompression::kDisable;
@@ -9615,7 +9609,7 @@ public:
       registers.SetDepthRenderTarget(non_texture_compatible_target);
       RenderDepthInfo non_texture_compatible_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), non_texture_compatible_depth);
+          executor, scheduler.Current(), non_texture_compatible_depth);
       Require(
           name, "depth texture compatibility identity",
           phased_depth.image_id && (phased_depth.desc.info.metadata.kind == ImageMetadataKind::Htile) &&
@@ -9628,7 +9622,6 @@ public:
                   phased_depth.desc.info.metadata.range &&
               phased_depth.desc.info.metadata.stencil_compressed &&
               !phased_depth.depth_clear_enable &&
-              !phased_depth.depth_meta_clear_enable &&
               !texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
               !texture_cache.GetImage(phased_depth.image_id).IsGpuModified() &&
               !texture_cache.GetImage(phased_depth.image_id).usage.depth_target,
@@ -9661,7 +9654,7 @@ public:
       registers.SetStencilMask(read_only_stencil_mask);
       RenderDepthInfo read_only_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), read_only_depth);
+          executor, scheduler.Current(), read_only_depth);
       Require(
           name, "read-only depth/stencil target without write addresses",
           read_only_depth.image_id == phased_depth.image_id &&
@@ -9685,7 +9678,7 @@ public:
       registers.SetRenderControl(read_only_render_control);
       RenderDepthInfo read_only_clear_depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), read_only_clear_depth);
+          executor, scheduler.Current(), read_only_clear_depth);
       Require(name, "read-only stencil clear suppression",
               read_only_clear_depth.image_id == phased_depth.image_id &&
                   !read_only_clear_depth.stencil_clear_enable &&
@@ -9707,7 +9700,7 @@ public:
           phased_rendering.depth_stencil_attachment.image_view != nullptr &&
               phased_rendering.num_color_attachments == 0 &&
               phased_rendering.depth_stencil_attachment.has_depth &&
-              phased_depth.depth_meta_clear_enable &&
+              phased_rendering.depth_stencil_attachment.depth_clear &&
               phased_depth.depth_load_clear_enable &&
               texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
               !texture_cache.IsMetaCleared(
@@ -9745,7 +9738,7 @@ public:
       registers.SetRenderControl(depth_only_render_control);
       RenderDepthInfo depth_only{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), depth_only);
+          executor, scheduler.Current(), depth_only);
       Require(
           name, "depth-only target with stale stencil state",
           depth_only.image_id && depth_only.desc.view_info.format == vk::Format::eD32Sfloat &&
@@ -9870,7 +9863,7 @@ public:
         }
         RenderDepthInfo bounds_depth{};
         RenderExecutorTestAccess::ResolveRenderDepthTarget(
-            executor, 1, scheduler.Current(), bounds_depth);
+            executor, scheduler.Current(), bounds_depth);
         auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, bounds_vertex, bounds_pixel, true);
         const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
@@ -9884,7 +9877,6 @@ public:
                 bounds_depth.image_id == depth_only.image_id &&
                     bounds_depth.depth_bounds_test_enable &&
                     !bounds_depth.depth_write_enable &&
-                    bounds_depth.depth_meta_clear_enable == (pass == 0) &&
                     bounds_depth.depth_load_clear_enable == (pass == 0) &&
                     !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
                     bounds_rendering.depth_stencil_attachment.image_layout == readonly_layout &&
@@ -9955,7 +9947,7 @@ public:
         registers.SetStencilMask(shared_stencil_mask);
         RenderDepthInfo shared_depth{};
         RenderExecutorTestAccess::ResolveRenderDepthTarget(
-            executor, 1, scheduler.Current(), shared_depth);
+            executor, scheduler.Current(), shared_depth);
         auto shared_bindings =
             RenderExecutorTestAccess::PrepareGraphicsBindings(
                 executor, shared_depth_vertex, shared_depth_pixel, true);

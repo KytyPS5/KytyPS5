@@ -509,7 +509,7 @@ void TestReadWriteWatcherInteractions() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count <= 0x7fff; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }

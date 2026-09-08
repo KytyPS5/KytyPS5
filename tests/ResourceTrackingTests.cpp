@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -3313,7 +3314,8 @@ void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_t
   if (buffer_table) {
     Check(columns == 4u, "test descriptor table must have four columns");
     const auto source = AddBoundedSnapshotSource(fixture, {Value(0u),Value(0u),Value(0u),Value(0u)});
-    program.descriptor_sources[source].bounded_buffer = DescriptorSource::BoundedBuffer{{0u,1u,2u,3u},0u};
+    program.descriptor_sources[source].bounded_buffer =
+        DescriptorSource::BoundedBuffer{{0u, 1u, 2u, 3u}, {}, 0u};
     program.info.buffers.push_back({.source=source});
   }
 }
@@ -4513,6 +4515,11 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--inline-buffer-table-only") == 0) {
+      TestInlineBufferDescriptorTable();
+      std::cout << "KYTY_INLINE_BUFFER_TABLE_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-srt-proof-only") == 0) {
       TestFiniteSelectorSrtProof();
       std::cout << "KYTY_FINITE_SELECTOR_SRT_PROOF_PASS\n";
@@ -4645,6 +4652,14 @@ int DbgNotImplementedHandler(const char *expression, const char *file,
 
 void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 } // namespace Common
+
+namespace Libs::Graphics {
+SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+  static_cast<void>(format);
+  return SurfaceFormatInfo(vk::Format::eR32Sfloat,
+                           Prospero::BufferFormat::kInvalid);
+}
+} // namespace Libs::Graphics
 
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.

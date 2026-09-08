@@ -1810,7 +1810,7 @@ private:
 						    selector_definition->NumArgs() > 0u) {
 							const auto* phi = selector_definition->Arg(0).Resolve().TryInstruction();
 							if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi) {
-								std::fprintf(stderr, "    selector phi args=%u", phi->NumArgs());
+								std::fprintf(stderr, "    selector phi args=%zu", phi->NumArgs());
 								for (uint32_t arg = 0; arg < phi->NumArgs(); ++arg) {
 									const auto* incoming = phi->Arg(arg).Resolve().TryInstruction();
 									std::fprintf(stderr, " %u:%s", arg,
@@ -2094,7 +2094,10 @@ private:
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc,
-			               m_sources[source].bounded_buffer.has_value() ? resource : UINT32_MAX);
+			               (m_sources[source].bounded_buffer.has_value() ||
+			                m_sources[source].inline_descriptor.has_value())
+			                   ? resource
+			                   : UINT32_MAX);
 			return;
 		}
 		if (address_info.access != AddressAccess::None) {
@@ -2177,7 +2180,8 @@ private:
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
 			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
-			    buffer_source->bounded_buffer.has_value()) {
+			    buffer_source->bounded_buffer.has_value() ||
+			    buffer_source->inline_descriptor.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {

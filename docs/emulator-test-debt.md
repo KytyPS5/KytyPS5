@@ -834,6 +834,33 @@ Required tests:
   current run passes that image failure and stops next at a separate
   `GetBufferResource` scalar-buffer descriptor at PC `0x656c`.
 
+## Guarded inline scalar-buffer descriptor tables
+
+Status: synthetic RED/GREEN and neighboring rejection boundaries pass; native game retry pending.
+
+Observed trigger: compute shader `6cc64dee32dc7094` reads four correlated descriptor DWORDs
+with `S_BUFFER_LOAD_DWORDX4`, using one loop-carried `ReadFirstLane(Phi)` selector multiplied
+by the 16-byte descriptor stride. A dominating unsigned guard bounds the selector, but resource
+tracking previously supported this inline scalar-buffer pattern only for image and sampler
+handles. The unchanged regression failed at guest PC `0x656c` with
+`GetBufferResource dword 0 is not a valid runtime value (root=ReadConstBuffer)`.
+
+The shared buffer path now reuses inline-descriptor recognition only when a dominating CFG guard
+proves an exact nonzero selector limit. Coherent specialization reads all four descriptor words
+for each candidate, produces one logical buffer table and leaves the live selector on the GPU.
+Unguarded selectors and mismatched descriptor columns retain the prior closed failure. RED is
+`_Build/logs/inline-buffer-table-red-20260908-v2.txt`; the unchanged selector and its two
+negative boundaries are GREEN in `_Build/logs/inline-buffer-table-green-20260908-v2.txt`.
+
+Remaining validation:
+
+- Repeat the exact captured shader and bounded game run through PC `0x656c`, then record the next
+  independent blocker or the first nonzero source RGB frame.
+- Add stride overflow/wrap, zero/OOB descriptors, unreadable/GPU-dirty backing, duplicate
+  candidates, write-alias and 128-resource limit cases.
+- Repair the pre-existing full `resource_tracking_tests` failure in the invariant indirect-image
+  wrapped-immediate boundary; it occurs before the inline-table cases and is not counted GREEN.
+
 ## Signed integer storage images
 
 Status: production fix, native build and bounded game validation complete; automated regression deferred.

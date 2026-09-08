@@ -26,9 +26,12 @@
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
+#include <QtAlgorithms>
+
+#if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
 #include <QVulkanWindow>
-#include <QtAlgorithms>
+#endif
 
 #include "ui_configuration_edit_dialog.h"
 
@@ -168,6 +171,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
+	// Keep Auto when Qt is built without Vulkan support.
+#if QT_CONFIG(vulkan)
 #if defined(__APPLE__)
 	if (!qEnvironmentVariableIsSet("QT_VULKAN_LIB")) {
 		const auto base    = QCoreApplication::applicationDirPath();
@@ -192,6 +197,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 			m_ui->comboBox_gpu->addItem(QString::fromUtf8(device.deviceName));
 		}
 	}
+#endif
 	m_ui->comboBox_gpu->setCurrentIndex(
 	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
 	                                                                            : 0);

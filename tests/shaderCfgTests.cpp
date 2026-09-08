@@ -4328,7 +4328,7 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   Check(decoded.family == Decoder::Family::VOPC &&
             decoded.opcode == Decoder::Opcode::V_CMPX_CLASS_F32 &&
             decoded.opcode_id == 0x98u && decoded.word_count == 2u &&
-            decoded.raw_count == 2u &&
+            decoded.raw[0] == shader[0] && decoded.raw[1] == shader[1] &&
             decoded.dst.kind == Decoder::OperandKind::ExecLo &&
             decoded.src_count == 2u &&
             decoded.src0.kind == Decoder::OperandKind::Vgpr &&

@@ -77,8 +77,7 @@ enum class EmbeddedFetchValueType {
 	AttribTable,
 	Attrib,
 	BufferTable,
-	Buffer,
-	Index
+	Buffer
 };
 
 struct EmbeddedFetchSgprInfo {
@@ -86,10 +85,6 @@ struct EmbeddedFetchSgprInfo {
 	int                    attrib_id = 0;
 	uint32_t               value     = 0;
 	std::vector<uint32_t>  prolog_loads;
-};
-
-struct EmbeddedFetchVgprInfo {
-	EmbeddedFetchValueType type = EmbeddedFetchValueType::Unknown;
 };
 
 using EmbeddedFetchVectorLanes = std::map<uint64_t, EmbeddedFetchSgprInfo>;
@@ -108,7 +103,6 @@ void ClearEmbeddedFetchVectorLanes(EmbeddedFetchVectorLanes* lanes, uint32_t reg
 	lanes->erase(first, last);
 }
 
-using EmbeddedFetchLoad = Frontend::EmbeddedFetchLoad;
 using EmbeddedFetchData = Frontend::EmbeddedFetchPlan;
 
 bool IsDecodedSgpr(const Decoder::Operand& op) {
@@ -244,7 +238,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	const int buffer_reg = input_info->fetch_buffer_reg + shift_regs;
 
 	std::array<EmbeddedFetchSgprInfo, 108> sgprs {};
-	std::array<EmbeddedFetchVgprInfo, 256> vgprs {};
+	std::array<bool, 256>                 vgpr_is_index {};
 	EmbeddedFetchVectorLanes               vector_lanes;
 	const bool                             track_vector_lanes =
 	    std::none_of(decoded.instructions.begin(), decoded.instructions.end(),
@@ -299,8 +293,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		switch (inst.opcode) {
 			case Decoder::Opcode::V_WRITELANE_B32: {
 				uint32_t lane = 0;
-				if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
-					vgprs[inst.dst.reg] = {};
+				if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgpr_is_index.size()) {
+					vgpr_is_index[inst.dst.reg] = false;
 				}
 				if (track_vector_lanes && IsDecodedVgpr(inst.dst) && IsDecodedSgpr(inst.src0) &&
 				    DecodedSgprReg(inst.src0) < sgprs.size() &&
@@ -405,13 +399,13 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
 					}
 				} else if (inst.opcode == Decoder::Opcode::V_CNDMASK_B32) {
-					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size()) {
+					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgpr_is_index.size()) {
 						ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg);
 					}
-					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgprs.size() &&
+					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgpr_is_index.size() &&
 					    IsDecodedVgpr(inst.src0) && inst.src0.reg == 8 &&
 					    IsDecodedVgpr(inst.src1) && inst.src1.reg == 5) {
-						vgprs[inst.dst.reg].type = EmbeddedFetchValueType::Index;
+						vgpr_is_index[inst.dst.reg] = true;
 					}
 				} else if (IsEmbeddedFetchAttribPropagationAlu(inst)) {
 					if (IsDecodedSgpr(inst.dst) && IsDecodedSgpr(inst.src0) &&
@@ -441,16 +435,11 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						}
 					}
 				} else if (IsEmbeddedFetchBufferLoad(inst)) {
-					if (IsDecodedVgpr(inst.src0) && inst.src0.reg < vgprs.size() &&
-					    vgprs[inst.src0.reg].type == EmbeddedFetchValueType::Index &&
+					if (IsDecodedVgpr(inst.src0) && inst.src0.reg < vgpr_is_index.size() &&
+					    vgpr_is_index[inst.src0.reg] &&
 					    IsDecodedSgpr(inst.src1) && DecodedSgprReg(inst.src1) < sgprs.size() &&
 					    sgprs[DecodedSgprReg(inst.src1)].type == EmbeddedFetchValueType::Buffer) {
-						const auto&       buffer = sgprs[DecodedSgprReg(inst.src1)];
-						EmbeddedFetchLoad load;
-						load.pc           = inst.pc;
-						load.attrib_id    = buffer.attrib_id;
-						load.components   = DecodedDstSize(inst);
-						load.prolog_loads = buffer.prolog_loads;
+						const auto& buffer = sgprs[DecodedSgprReg(inst.src1)];
 						if (data.loads.empty()) {
 							if (!vertex_offset_conflict) {
 								data.vertex_offset_sgpr = vertex_offset_candidate;
@@ -459,7 +448,11 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 								data.instance_offset_sgpr = instance_offset_candidate;
 							}
 						}
-						data.loads.push_back(load);
+						auto& load        = data.loads.emplace_back();
+						load.pc           = inst.pc;
+						load.attrib_id    = buffer.attrib_id;
+						load.components   = DecodedDstSize(inst);
+						load.prolog_loads = buffer.prolog_loads;
 					}
 				}
 				break;
@@ -467,7 +460,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		if (inst.opcode == Decoder::Opcode::V_MOVRELD_B32) {
 			vector_lanes.clear();
 		} else if (inst.opcode != Decoder::Opcode::V_WRITELANE_B32 && IsDecodedVgpr(inst.dst)) {
-			for (uint32_t i = 0; i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgprs.size();
+			for (uint32_t i = 0;
+			     i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgpr_is_index.size();
 			     i++) {
 				ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg + i);
 			}
@@ -664,11 +658,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::EliminateDeadCode(ir.blocks);
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
-	if (options.stage == ShaderType::Vertex) {
-		ir.info.vertex_offset_sgpr   = embedded_fetch.vertex_offset_sgpr;
-		ir.info.instance_offset_sgpr = embedded_fetch.instance_offset_sgpr;
-	}
-
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

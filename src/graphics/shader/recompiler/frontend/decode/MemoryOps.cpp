@@ -231,7 +231,6 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t soffset = (word1 >> 25u) & 0x7fu;
 
 	inst.pc          = pc;
-	inst.word        = word0;
 	inst.word_count  = 2;
 	inst.offset      = SignExtendU32(word1 & 0x1fffffu, 21u);
 	inst.glc         = ((word0 >> 16u) & 1u) != 0;
@@ -263,7 +262,6 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t soffset = (word1 >> 24u) & 0xffu;
 
 	inst.pc          = pc;
-	inst.word        = word0;
 	inst.word_count  = 2;
 	inst.offset      = word0 & 0xfffu;
 	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
@@ -299,7 +297,6 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t soffset = (word1 >> 24u) & 0xffu;
 
 	inst.pc            = pc;
-	inst.word          = word0;
 	inst.word_count    = 2;
 	inst.offset        = word0 & 0xfffu;
 	inst.idxen         = ((word0 >> 13u) & 1u) != 0;
@@ -339,7 +336,6 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t addr   = word1 & 0xffu;
 
 	inst.pc             = pc;
-	inst.word           = word0;
 	inst.word_count     = 2;
 	inst.offset         = seg == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
 	inst.glc            = ((word0 >> 16u) & 1u) != 0;
@@ -384,7 +380,6 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	const uint32_t addr    = word1 & 0xffu;
 
 	inst.pc          = pc;
-	inst.word        = word0;
 	inst.word_count  = 2;
 	inst.offset      = offset0 | (offset1 << 8u);
 	inst.gds         = ((word0 >> 17u) & 1u) != 0u;

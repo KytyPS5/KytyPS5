@@ -349,7 +349,6 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const auto*    atomic = LookupAtomic(opcode);
 
 	inst.pc                 = pc;
-	inst.word               = word0;
 	inst.word_count         = word_count;
 	inst.family             = Family::MIMG;
 	inst.opcode_id          = opcode;

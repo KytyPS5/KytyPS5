@@ -1534,7 +1534,6 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t vsrc1  = (word >> 9u) & 0xffu;
 
 	inst.pc        = pc;
-	inst.word      = word;
 	inst.family    = Family::VOP2;
 	inst.opcode_id = opcode;
 	inst.opcode    = LookupVop2Opcode(opcode);
@@ -1562,7 +1561,6 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t vdst   = (word >> 17u) & 0xffu;
 
 	inst.pc        = pc;
-	inst.word      = word;
 	inst.family    = Family::VOP1;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(VOP1_OPS, opcode);
@@ -1599,7 +1597,6 @@ void DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t vsrc1  = (word >> 9u) & 0xffu;
 
 	inst.pc        = pc;
-	inst.word      = word;
 	inst.family    = Family::VOPC;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(VOPC_OPS, opcode);
@@ -1638,7 +1635,6 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t neg    = (word1 >> 29u) & 0x7u;
 
 	inst.pc        = pc;
-	inst.word      = word0;
 	inst.family    = Family::VOP3;
 	inst.opcode_id = opcode;
 	inst.opcode    = LookupVop3Opcode(opcode);
@@ -1792,7 +1788,6 @@ void DecodeVop3p(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	const uint32_t neg         = (word1 >> 29u) & 0x7u;
 
 	inst.pc        = pc;
-	inst.word      = word0;
 	inst.family    = Family::VOP3P;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(VOP3P_OPS, opcode);
@@ -1842,7 +1837,6 @@ void DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_ind
 	const uint32_t vsrc   = word & 0xffu;
 
 	inst.pc         = pc;
-	inst.word       = word;
 	inst.word_count = 1;
 	inst.family     = Family::VINTRP;
 	inst.opcode_id  = opcode;

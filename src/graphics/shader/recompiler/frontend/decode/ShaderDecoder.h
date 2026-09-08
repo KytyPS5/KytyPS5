@@ -634,7 +634,6 @@ struct Operand {
 	OperandKind kind       = OperandKind::Unknown;
 	uint32_t    value      = 0;
 	int32_t     signed_val = 0;
-	float       float_val  = 0.0f;
 	uint32_t    reg        = 0;
 	uint32_t    sdwa_sel   = 6;
 	// Native 16-bit destinations use the same selector fields internally but preserve the
@@ -659,10 +658,8 @@ struct Operand {
 
 struct Instruction {
 	uint32_t       pc                          = 0;
-	uint32_t       word                        = 0;
 	uint32_t       word_count                  = 1;
 	uint32_t       raw[MaxInstructionRawWords] = {};
-	uint32_t       raw_count                   = 1;
 	Family         family                      = Family::Unknown;
 	uint32_t       opcode_id                   = 0;
 	Opcode         opcode                      = Opcode::UNKNOWN;
@@ -696,7 +693,6 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
-	int32_t        branch_offset                                = 0;
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;

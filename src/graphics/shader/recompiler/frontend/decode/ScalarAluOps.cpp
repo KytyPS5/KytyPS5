@@ -129,7 +129,6 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
 
 	inst.pc        = pc;
-	inst.word      = word;
 	inst.family    = Family::SOP1;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
@@ -169,7 +168,6 @@ void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
 
 	inst.pc        = pc;
-	inst.word      = word;
 	inst.family    = Family::SOP2;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP2_OPS, opcode);
@@ -194,7 +192,6 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                           : static_cast<int32_t>(static_cast<int16_t>(word & 0xffffu));
 
 	inst.pc              = pc;
-	inst.word            = word;
 	inst.family          = Family::SOPK;
 	inst.opcode_id       = opcode;
 	inst.opcode          = Detail::LookupOpcode(SOPK_OPS, opcode);
@@ -250,7 +247,6 @@ void DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t opcode = (word >> 16u) & 0x7fu;
 
 	inst.pc        = pc;
-	inst.word      = word;
 	inst.family    = Family::SOPC;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOPC_OPS, opcode);
@@ -272,7 +268,6 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t simm   = word & 0xffffu;
 
 	inst.pc              = pc;
-	inst.word            = word;
 	inst.family          = Family::SOPP;
 	inst.opcode_id       = opcode;
 	inst.opcode          = Detail::LookupOpcode(SOPP_OPS, opcode);
@@ -288,8 +283,8 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                  inst.opcode == Opcode::S_TTRACEDATA || inst.opcode == Opcode::S_INST_PREFETCH)
 	                     ? 1
 	                     : 0;
-	inst.branch_offset = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;
-	inst.branch_target = pc + 4u + static_cast<uint32_t>(inst.branch_offset);
+	const auto branch_offset = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;
+	inst.branch_target = pc + 4u + static_cast<uint32_t>(branch_offset);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

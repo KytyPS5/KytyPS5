@@ -33,7 +33,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		WriteMask(inst.dst, old, true);
 	} else {
 		WriteRawU32(inst.dst, ir.GetExecLo());
-		if (current_wave_size == 64u) {
+		if (program.wave_size == 64u) {
 			const auto low_half =
 			    ir.ULessThan(IR::U32(ir.Emit(IR::ValueOpcode::LaneId)), IR::U32(IR::Value(32u)));
 			result = IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {low_half, result, old}));
@@ -328,7 +328,7 @@ void Translator::V_READFIRSTLANE_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_READLANE_B32(const Decoder::Instruction& inst) {
-	const auto lane_mask = IR::U32(IR::Value(current_wave_size == 32u ? 31u : 63u));
+	const auto lane_mask = IR::U32(IR::Value(program.wave_size == 32u ? 31u : 63u));
 	const auto lane      = ir.BitwiseAnd(ReadU32(inst.src1), lane_mask);
 	WriteOperand(DestinationOperand(inst),
 	             ir.Emit(IR::ValueOpcode::ReadLane, {ReadU32(inst.src0), lane}));
@@ -336,7 +336,7 @@ void Translator::V_READLANE_B32(const Decoder::Instruction& inst) {
 
 void Translator::V_WRITELANE_B32(const Decoder::Instruction& inst) {
 	EXIT_IF(inst.dst.kind != Decoder::OperandKind::Vgpr);
-	const auto lane_mask = IR::U32(IR::Value(current_wave_size == 32u ? 31u : 63u));
+	const auto lane_mask = IR::U32(IR::Value(program.wave_size == 32u ? 31u : 63u));
 	const auto reg       = static_cast<IR::VectorReg>(inst.dst.reg);
 	const auto lane      = ir.BitwiseAnd(ReadU32(inst.src1), lane_mask);
 	const auto result    = IR::U32(

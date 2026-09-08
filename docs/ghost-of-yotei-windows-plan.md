@@ -357,15 +357,16 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | --- | --- |
 | Версия игры | `APP_VER = 01.512.000` |
 | Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260907-211101-9da340` |
-| SHA-256 запущенного emulator | `c3088432abe5babdbe573b8f651a74f11976129b9dbb0a639e8789d7a254570c` |
-| Время UTC | `2026-09-07T21:11:01.3824282Z` → `21:14:02.2620037Z` |
-| Режим | RTX 5060 Ti, окно 1280×720, Diagnostic, FIFO, capture shaders, sync dispatches и GPUAV; split wave64 использует один Workgroup `u32` array для LDS/scratch и отдельный ballot suffix |
-| Завершение | Timeout после 180 с, graceful close успешен, Windows exit `0`; `b90e` pipeline и dispatch завершены, `a766` dispatch также завершён |
-| Наблюдаемое исполнение | `a7661ff4ea282325` (`cs=0x80003afe00`) и `b90e2024732c6111` (`cs=0x8000399500`) получили `after-complete`; последний window title: frame 158, flips CPU/GPU 0/146, prepared/ready/shown 146/146/145 |
-| Текущая граница | Pipeline/execution blocker снят для этого RTX 5060 Ti game path. `vk_spv_probe.exe` на exact свежем `b90e` SPIR-V всё ещё завершается `-2147483645` во время `vkCreateComputePipelines`; это отдельная probe-layout граница, не результат реального game pipeline |
+| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260908-131508-5d7cde` |
+| SHA-256 запущенного emulator | `6cb5830eccb168dd2530e4efee0712b0512b3b9993641c32d05520eb6c3ff7bf` |
+| Время UTC | `2026-09-08T13:15:09.0325316Z` → `13:20:12.3635764Z` |
+| Режим | RTX 5060 Ti, окно 1280×720, Diagnostic, FIFO, capture shaders, sync dispatches и GPUAV; source readback с кадра 110 |
+| Завершение | Timeout после 300 с, graceful close успешен, Windows exit `0`; validation/resource fatal отсутствует |
+| Наблюдаемое исполнение | Последний window title: frame 179, flips CPU/GPU 0/165, prepared/ready/shown 165/165/164. Все наблюдаемые dispatch/draw waits завершились; run прошёл прежний PC `0x656c` и прежний frame-158 максимум. |
+| Текущая граница | Нового execution blocker в bounded run нет. Correctness blocker остаётся чёрным source surface; следующий шаг — более длинный тёплый run без phase dump/capture/sync overhead и параллельная трассировка producer chain. |
 | Диагностика | Synthetic `shader_cfg_tests --single-wave64-ballot-spirv-only` — GREEN; свежий game capture содержит `vkCreateComputePipelines done result=Success` для `b90e` и `after-complete` для его dispatch. |
-| Изображение | `_Build/analysis/yotei-present-readback-20260907-2112.txt`: восемь source frames 480×270, RGB min=max=0, alpha min=max=3; ненулевой полезный кадр пока не доказан |
+| Изображение | `_Build/analysis/yotei-present-after-inline-buffer-20260908.txt`: 55 source frames 110–164, 480×270, RGB min=max=0, alpha min=max=3; ненулевой полезный кадр пока не доказан |
+| Пройденный inline-buffer блокер | `6cc64dee32dc7094`, PC `0x656c`: guarded `ReadFirstLane(Phi) * 16` scalar-buffer descriptor table материализуется в общий buffer-table path; run проходит без прежнего resource-tracking fatal. |
 | Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
 | Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
 | Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 533 слова с текущим ABI, shader завершён |
@@ -381,8 +382,8 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | Пройденная byte-to-D16 граница | GFX10 MUBUF `0x20...0x23` декодируются как unsigned/signed byte-to-D16 low/high loads с сохранением соседней половины VDATA. `d7a83911714a58ee`: decode 55, structured CFG 4 blocks, Normalize/TrackResources 198, SPIR-V 6 537 слов, shader №172; dispatch 76×1×1 завершён за 63 618 мкс. |
 | Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят PC `0x530`; scalar-buffer image table с ключом `ReadFirstLane(Phi) << 5` также планируется через inline image path и проходит PC `0x4d64`. |
 | Предыдущая pipeline-граница | Screen Space Shadows `b90e2024732c6111` на RTX 5060 Ti: NVIDIA `nvgpucomp64.dll` падал с `0x80000003` во время компиляции. Collision-free LDS DWORD lowering сохранил atomics для конфликтующих адресов и в реальном run довёл `b90e` до успешного pipeline/dispatch. |
-| Текущая execution-граница | PS `f8927c09f4b928c7` больше не нарушает структурные правила SPIR-V: новый игровой dump проходит standalone `spirv-val`. Текущий 180-секундный GPUAV run закончился штатным timeout до прохождения прежнего frame-158 максимума; последняя correctness-граница остаётся чёрным source readback. |
-| Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260907-211101-9da340`; `vk_spv_probe.exe` на exact `b90e` artifact всё ещё получает `-2147483645`, тогда как game pipeline получает Success. Readback сохранён отдельно в `_Build/analysis/yotei-present-readback-20260907-2112.txt`. |
+| Текущая execution-граница | PS `f8927c09f4b928c7` и CS `6cc64dee32dc7094` пройдены. Текущий 300-секундный GPUAV run завершён штатным timeout на frame 179 без нового fatal; последняя correctness-граница остаётся чёрным source readback. |
+| Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260908-131508-5d7cde`; readback сохранён отдельно в `_Build/analysis/yotei-present-after-inline-buffer-20260908.txt`. Из завершённого run удалены только 840-МБ phase guest-log и 257-МБ повторные shader captures; компактные run/stdout/stderr/readback сохранены. |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 
 Текущий game executable получен из сохранённого исходного файла обратимым
@@ -1016,7 +1017,7 @@ VUID или совпавшего readback недостаточно. Соседн
 
 ## Guarded inline buffer descriptor tables
 
-Status: shared synthetic regression GREEN; current-tree emulator builds; game retry pending.
+Status: shared synthetic regression and bounded native game retry GREEN; first nonzero frame pending.
 
 The next `6cc64dee32dc7094` failure at guest PC `0x656c` is the buffer analogue of the
 existing inline image-table path: `S_BUFFER_LOAD_DWORDX4` reads one 16-byte descriptor selected
@@ -1029,11 +1030,13 @@ shader hash, guest address or install-path condition.
 The unchanged RED is `_Build/logs/inline-buffer-table-red-20260908-v2.txt`; GREEN including
 unguarded-selector and mismatched-column rejection boundaries is
 `_Build/logs/inline-buffer-table-green-20260908-v2.txt`. `kyty_emulator` and `launcher` build
-successfully. The complete focused suite currently stops earlier on the pre-existing invariant
+successfully. Game run `_Build/runs/yotei-integrated-20260908-131508-5d7cde` reaches frame 179,
+passes the former PC `0x656c` fatal and exits cleanly at the 300-second bound. The complete focused
+suite currently stops earlier on the pre-existing invariant
 indirect-image wrapped-immediate expectation, so it is not reported as a full-suite pass.
 
-Next: install the current binary, run Yōtei with bounded source readback, and either record a
-nonzero RGB frame or isolate the next independent correctness blocker.
+Next: use the warm cache for a longer low-overhead readback run while continuing to trace the
+known black producer chain; require nonzero source RGB before claiming a rendered frame.
 
 ## Как поддерживать этот статус
 

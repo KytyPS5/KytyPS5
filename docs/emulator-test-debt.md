@@ -836,7 +836,8 @@ Required tests:
 
 ## Guarded inline scalar-buffer descriptor tables
 
-Status: synthetic RED/GREEN and neighboring rejection boundaries pass; native game retry pending.
+Status: synthetic RED/GREEN, neighboring rejection boundaries and bounded native game retry pass;
+the first nonzero frame remains pending.
 
 Observed trigger: compute shader `6cc64dee32dc7094` reads four correlated descriptor DWORDs
 with `S_BUFFER_LOAD_DWORDX4`, using one loop-carried `ReadFirstLane(Phi)` selector multiplied
@@ -854,8 +855,9 @@ negative boundaries are GREEN in `_Build/logs/inline-buffer-table-green-20260908
 
 Remaining validation:
 
-- Repeat the exact captured shader and bounded game run through PC `0x656c`, then record the next
-  independent blocker or the first nonzero source RGB frame.
+- Preserve the game result from `_Build/runs/yotei-integrated-20260908-131508-5d7cde`: frame 179,
+  shown 164, clean 300-second timeout and no former PC `0x656c` fatal. Its 55 source readbacks at
+  frames 110–164 remain RGB zero with alpha 3, so this does not claim a rendered frame.
 - Add stride overflow/wrap, zero/OOB descriptors, unreadable/GPU-dirty backing, duplicate
   candidates, write-alias and 128-resource limit cases.
 - Repair the pre-existing full `resource_tracking_tests` failure in the invariant indirect-image

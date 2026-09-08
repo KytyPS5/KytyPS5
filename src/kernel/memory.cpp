@@ -916,6 +916,12 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_guest_address_space != nullptr &&
+	    g_guest_address_space->IsHostAccessRestored(fault_vaddr, access)) {
+		return true;
+	}
+#endif
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 

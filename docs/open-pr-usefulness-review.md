@@ -6,7 +6,7 @@
 [#470](https://github.com/KytyPS5/KytyPS5/pull/470) и
 [#497](https://github.com/KytyPS5/KytyPS5/pull/497). Сравнение выполнено с веткой
 `yotei-windows-bringup`: первоначальный обзор — на `b247c0f`, runtime-уточнения
-ниже — после `90fed2b` и selective port `22242aa`.
+ниже — после `90fed2b`, selective image ports и runtime checkpoint `5aaf3b4`.
 
 Проверены метаданные, описания и состав diff всех 68 PR. Для shader/renderer,
 новых PR #493/#497/#500/#503/#504/#506/#508/#509 и кандидатов, пересекающихся
@@ -32,12 +32,18 @@ dispatcher CFG. В `90fed2b` dispatcher теперь строит и прове�
 dimension-only подкласс из **#383**; игра проходит его и останавливается на новом
 PC `0x78b8`, где дополнительно различается shader swizzle (`0x24c/0`).
 
+Последующие selective shared fixes закрыли candidate-specific sampled swizzle,
+indirect storage writes и runtime specialization; целиком #383 вливать больше не
+нужно. Run `672af1f` прошёл эти resource frontiers и сам завершился на новом
+decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
+закрывает его общим ISA lowering. Новый полный shader audit даёт **741/825**
+вместо 714/825; обе прежние группы `0xbd` (19 compact + 7 SDWA) исчезли.
+
 Самые полезные следующие кандидаты:
 
-1. **#383 — heterogeneous indirect images.** Dimension-only sampled subset уже
-   выборочно перенесён и GREEN. Новый bounded run проходит PC `0x7c4`, затем
-   упирается в PC `0x78b8` с dimension+swizzle candidates. Следующий перенос —
-   только candidate-specific sample/read swizzle с сохранением fail-closed правил.
+1. **#383 — heterogeneous indirect images.** Нужные достигнутые sampled и storage
+   подклассы уже выборочно перенесены, synthetic/runtime GREEN; целый PR больше не
+   нужен. Оставшиеся hunks рассматривать только при новом exact RED.
 2. **#468 — `S_WQM_B32`.** Это подтверждённый decode gap двух shader manifests.
    Нужен адаптированный numeric/raw-word вариант с RED/GREEN, а не прямой перенос
    старой boolean-модели.
@@ -92,6 +98,10 @@ PC `0x78b8`, где дополнительно различается shader swi
 - Из #500 уже выборочно перенесены нужные для достигнутого пути идеи: DWORD pattern
   clear/HTILE, sampled-depth layout и связанные общие механизмы. Остаток #500 надо
   рассматривать по одному commit только после соответствующего RED.
+- Полный повторный shader audit после runtime `V_CMPX_NE_U16` сохранён в
+  `_Build/shader-audits/yotei-current-20260908-vopc-bd/report.json`: 741/825,
+  84 pending. Corpus failures остаются очередью независимых механизмов, а не
+  основанием сливать какой-либо большой PR целиком.
 
 ## Что не следует переносить целиком
 
@@ -141,7 +151,7 @@ PC `0x78b8`, где дополнительно различается shader swi
 | [#376 BC storage aliases](https://github.com/KytyPS5/KytyPS5/pull/376) | **P2:** полезно для compressed storage aliases, но текущий целевой surface не BC. |
 | [#377 1D-array RT tests](https://github.com/KytyPS5/KytyPS5/pull/377) | **test:** production не меняет; хороший соседний regression test. |
 | [#379 ELF/SELF bounds](https://github.com/KytyPS5/KytyPS5/pull/379) | **P2/separate:** полезная loader hardening и retail aligned-tail compatibility; текущие модули уже загружаются. |
-| [#383 heterogeneous indirect images](https://github.com/KytyPS5/KytyPS5/pull/383) | **P1:** вероятный следующий resource class для batch-аудита; интегрировать с current immutable tables/null/comparison rules. |
+| [#383 heterogeneous indirect images](https://github.com/KytyPS5/KytyPS5/pull/383) | **covered selectively:** достигнутые sampled dimension/swizzle и storage write specialization подклассы перенесены с более строгими current rules; не merge whole. |
 | [#402 library tracing flag](https://github.com/KytyPS5/KytyPS5/pull/402) | **diagnostic:** полезен для массовой диагностики library calls, без изменения guest behavior. |
 | [#403 NaN saturate](https://github.com/KytyPS5/KytyPS5/pull/403) | **P2:** корректная явная NaN semantics; пересекается с #430, выбрать один минимальный вариант после RED. |
 | [#409 unhandled crash reporting](https://github.com/KytyPS5/KytyPS5/pull/409) | **diagnostic P1:** ценно для длинных запусков и silent termination; проверить reentrancy/flush отдельно. |
@@ -180,7 +190,7 @@ PC `0x78b8`, где дополнительно различается shader swi
 | [#488 minimized window crash](https://github.com/KytyPS5/KytyPS5/pull/488) | **P2/separate:** полезный WSI fix, но не влияет на обычный не-minimized запуск. |
 | [#490 float image atomics](https://github.com/KytyPS5/KytyPS5/pull/490) | **covered:** production semantics уже в ветке; текущий PR head лишь другая актуализация того же класса. |
 | [#493 opt-in BVH stub](https://github.com/KytyPS5/KytyPS5/pull/493) | **diagnostic only:** decode/message полезны; always-miss не является реализацией ray tracing и не нужен Yōtei сейчас. |
-| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** наша рабочая ветка; после опубликованного head уже есть локальный `b247c0f`. |
+| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** наша рабочая ветка; локальный checkpoint `5aaf3b4` закрывает runtime `V_CMPX_NE_U16`, post-fix game retry pending. |
 | [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **partly covered/do not merge whole:** часть уже перенесена; оставшиеся typed stores, indirect sync/dispatch, stencil upload и null handling брать только по отдельному RED. |
 | [#503 negative printf precision](https://github.com/KytyPS5/KytyPS5/pull/503) | **P2/separate:** корректный libc fix с хорошим focused coverage; не связан с renderer/shader failure. |
 | [#504 rejected-open descriptor leak](https://github.com/KytyPS5/KytyPS5/pull/504) | **P2/separate:** однострочный kernel cleanup с тестами; полезен глобально, не текущему run. |
@@ -190,10 +200,11 @@ PC `0x78b8`, где дополнительно различается shader swi
 
 ## Рекомендуемая очередь без конфликтов со вторым агентом
 
-1. Разобрать точные candidates нового `indirect image table` на PC `0x7c4` и
-   воспроизвести несовместимость неизменённым synthetic RED.
-2. Сверить #383 с текущими immutable table, null-resource, comparison и device-limit
-   правилами; переносить только недостающую shared-семантику heterogeneous images.
+1. Собрать и запустить `5aaf3b4`, подтвердить прохождение runtime
+   `c8e8f554efbfadef`/VOPC `0xbd` и получить следующий первый fatal либо nonzero RGB.
+2. Сохранять оставшиеся 84 corpus failures как независимый backlog; поднимать
+   конкретную группу раньше runtime frontier только при доказанной общей
+   correctness-зависимости.
 3. После correctness frontier измерить #461, #420, #484, #483 и четыре части #506
    по отдельности. Оптимизации не объединять до измерений.
 4. Для black-frame расследования сначала доказать потерю ownership/clear state.

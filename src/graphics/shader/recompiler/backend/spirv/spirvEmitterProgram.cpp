@@ -808,6 +808,13 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	state.builder.AddFunction(
 	    {OpFunction, TypeVoid(state), state.main_func, FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
+	for (const auto variable: state.wave_ballot_word_variables) {
+		if (variable != 0) {
+			state.builder.AddFunction(
+			    {OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)), variable,
+			     StorageClassFunction});
+		}
+	}
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsDwordCount(state)),
@@ -846,7 +853,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           ctx.scratch_u32_variable, StorageClassFunction});
 	}
-	if (state.gds_variable != 0) {
+	if (state.gds_variable != 0 && HasGuestGdsAccess(state.program)) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpArrayLength, TypeU32(state), state.gds_length, state.gds_variable, 0});

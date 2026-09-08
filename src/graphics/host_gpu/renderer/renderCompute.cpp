@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -28,6 +29,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -45,7 +48,9 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+	                                                const CommandBuffer& buffer, uint32_t group_x,
+	                                                uint32_t group_y, uint32_t group_z,
+	                                                uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	// Snapshot-dependent stores require shader execution and the immutable-source
@@ -68,12 +73,24 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		ShaderBufferResource fill_descriptor {};
+		uint32_t             fill_value = 0;
+		uint64_t             fill_size  = 0;
+		const bool uniform_fill = ResolveComputeImageClear(
+		    input, group_x, group_y, group_z, mode, fill_descriptor, fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const bool known =
+				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
+				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
+				          : cache.ClearMeta(descriptor.Base48())) {
+					if (known) {
+						buffer.GetContext().GetBufferCache().FillBuffer(
+						    fill_descriptor.Base48(), fill_size, fill_value, false);
+					}
 					return true;
 				}
 			}
@@ -82,10 +99,10 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
-bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
-                              uint32_t group_y, uint32_t group_z, uint32_t mode,
-                              ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
-                              uint64_t& resolved_size) {
+static bool ResolveComputeUniformImageClear(
+	const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y, uint32_t group_z,
+	uint32_t mode, ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
+	uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty()) {
@@ -133,6 +150,77 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	resolved_clear      = clear;
 	resolved_size       = size;
 	return true;
+}
+
+static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+	                                  uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                                  ShaderBufferResource& resolved_descriptor,
+	                                  uint32_t& resolved_clear, uint64_t& resolved_size) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = input.stage.resources;
+	const auto& user_data = resources.user_data;
+	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty() ||
+	    program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() ||
+	    !resources.images.empty() || !resources.samplers.empty() || program.info.uses_dma ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || user_data.size() != 10 ||
+	    program.user_data_base != 0) {
+		return false;
+	}
+	const auto& resource   = program.info.buffers.front();
+	const auto& raw        = resources.buffers.front();
+	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	if (!resource.written || resource.read || resource.atomic || resource.scalar ||
+	    resource.max_byte_extent != sizeof(uint32_t) ||
+	    (resource.formatted && descriptor.Format() != Prospero::BufferFormat::k32UInt) ||
+	    (descriptor.Stride() != sizeof(uint32_t) && descriptor.Stride() != 0) ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
+	    descriptor.Base48() == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != user_data[i]) {
+			return false;
+		}
+	}
+	const uint32_t clear  = user_data[4];
+	const uint32_t period = user_data[9];
+	const uint32_t slots  = period == 0u ? 4u : std::min(period, 4u);
+	for (uint32_t slot = 1; slot < slots; slot++) {
+		if (user_data[4 + slot] != clear) {
+			return false;
+		}
+	}
+	if (input.threads_num[0] != 64 || input.threads_num[1] != 1 ||
+	    input.threads_num[2] != 1 || group_x == 0 || group_y != 1 || group_z != 1 ||
+	    !input.group_id[0] || input.group_id[1] || input.group_id[2] ||
+	    input.thread_ids_num != 1 || input.wave_size != 64 || input.tg_size_en) {
+		return false;
+	}
+	const uint32_t count = user_data[8];
+	const uint64_t size  = BufferDescriptorSize(descriptor);
+	const uint64_t covered_size = static_cast<uint64_t>(count) * sizeof(uint32_t);
+	const uint64_t required_groups =
+	    (static_cast<uint64_t>(count) + input.threads_num[0] - 1u) / input.threads_num[0];
+	if (count == 0 || size == 0 || size > UINT32_MAX || covered_size != size ||
+	    required_groups != group_x) {
+		return false;
+	}
+	resolved_descriptor = descriptor;
+	resolved_clear      = clear;
+	resolved_size       = size;
+	return true;
+}
+
+bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+	                              uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                              ShaderBufferResource& resolved_descriptor,
+	                              uint32_t& resolved_clear, uint64_t& resolved_size) {
+	return ResolveComputeUniformImageClear(input, group_x, group_y, group_z, mode,
+	                                       resolved_descriptor, resolved_clear, resolved_size) ||
+	       ResolveComputePatternFill(input, group_x, group_y, group_z, mode,
+	                                 resolved_descriptor, resolved_clear, resolved_size);
 }
 
 static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, CommandBuffer& command,
@@ -260,7 +348,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y,
+	                               thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -365,6 +454,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	auto bindings = PrepareBindings(input_info.stage);
+	if (program.compute_wave_ballot_storage) {
+		uint64_t group_count = 1;
+		for (const auto groups: *dispatch_groups) {
+			if (groups == 0 || group_count > UINT64_MAX / groups) {
+				EXIT("wave64 ballot dispatch scratch size overflow\n");
+			}
+			group_count *= groups;
+		}
+		if (program.compute_wave_ballot_dwords == 0 ||
+		    group_count > UINT64_MAX / program.compute_wave_ballot_dwords) {
+			EXIT("wave64 ballot dispatch scratch size overflow\n");
+		}
+		bindings.wave_ballot_dwords =
+		    group_count * program.compute_wave_ballot_dwords;
+	}
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.GetGpuResources().PrepareBda();
@@ -392,6 +496,73 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch((*dispatch_groups)[0], (*dispatch_groups)[1], (*dispatch_groups)[2]);
+
+	if (const char* readback_address = std::getenv("KYTY_COMPUTE_READBACK_ADDRESS");
+	    readback_address != nullptr && *readback_address != '\0' &&
+	    std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK") != nullptr) {
+		char* end = nullptr;
+		const auto address = std::strtoull(readback_address, &end, 0);
+		static std::atomic<uint32_t> readback_count = 0;
+		if (end != readback_address && *end == '\0') {
+			for (const auto& binding: bindings.resources.images) {
+				if (binding.desc.type != TextureCache::BindingType::Storage ||
+				    binding.desc.info.data.address != address ||
+				    readback_count.fetch_add(1, std::memory_order_relaxed) >= 16) {
+					continue;
+				}
+				const bool scheduled =
+				    m_context.GetTextureCache().TryDownloadImage(binding.image_id);
+				LOGF("ComputeReadback: shader=0x%016" PRIx64 " addr=0x%016" PRIx64
+				     " scheduled=%d\n",
+				     input_info.stage.program->shader_hash, address, scheduled ? 1 : 0);
+				static std::atomic<uint32_t> input_readback_count = 0;
+				if (std::getenv("KYTY_COMPUTE_READBACK_INPUTS") != nullptr &&
+				    input_readback_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					for (uint32_t image_index = 0;
+					     image_index < bindings.resources.images.size(); image_index++) {
+						const auto& image = program.info.images[image_index];
+						if (image.resource_class !=
+						    ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+							continue;
+						}
+						const auto& input = bindings.resources.images[image_index];
+						const bool input_scheduled =
+						    m_context.GetTextureCache().TryDownloadImage(input.image_id);
+						LOGF("ComputeReadbackInput: shader=0x%016" PRIx64
+						     " index=%u addr=0x%016" PRIx64 " scheduled=%d\n",
+						     input_info.stage.program->shader_hash, image_index,
+						     input.desc.info.data.address, input_scheduled ? 1 : 0);
+						if (std::getenv("KYTY_COMPUTE_READBACK_STATE") != nullptr) {
+							const auto& native =
+							    m_context.GetTextureCache().GetImage(input.image_id);
+							LOGF(
+							    "ComputeReadbackInputState: shader=0x%016" PRIx64
+							    " index=%u image=%u fmt=%u guest_fmt=%u tile=%u"
+							    " depth=%d usage=t%d/s%d/r%d/d%d/v%d"
+							    " dirty=g%d/b%d/c%d backing_fmt=%u layout=%u\n",
+							    input_info.stage.program->shader_hash, image_index,
+							    input.image_id.index,
+							    static_cast<uint32_t>(native.info.pixel_format),
+							    static_cast<uint32_t>(native.info.guest_format),
+							    static_cast<uint32_t>(native.info.tile_mode),
+							    native.info.IsDepth() ? 1 : 0,
+							    native.usage.texture ? 1 : 0,
+							    native.usage.storage ? 1 : 0,
+							    native.usage.render_target ? 1 : 0,
+							    native.usage.depth_target ? 1 : 0,
+							    native.usage.video_out ? 1 : 0,
+							    native.IsGpuModified() ? 1 : 0,
+							    native.IsBufferModified() ? 1 : 0,
+							    native.IsCpuDirty() ? 1 : 0,
+							    static_cast<uint32_t>(native.backing.format),
+							    static_cast<uint32_t>(native.backing.state.layout));
+						}
+					}
+				}
+				break;
+			}
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

@@ -31,12 +31,26 @@
 
 namespace Libs::Graphics {
 
+uint64_t PresentReadbackEnvU64(const char* name, uint64_t fallback) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || *value == '\0') {
+		return fallback;
+	}
+	char*                  end    = nullptr;
+	const unsigned long long parsed = std::strtoull(value, &end, 10);
+	if (end == value || *end != '\0') {
+		return fallback;
+	}
+	return static_cast<uint64_t>(parsed);
+}
+
 struct Presenter::Frame {
 	VulkanImage image;
 	uint64_t    present_tick = 0;
 	bool        busy          = false;
 	bool        reusing_last  = false;
 	bool        guest_surface = false;
+	Image*      guest_source  = nullptr;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -110,6 +124,7 @@ public:
 		frame->busy          = true;
 		frame->reusing_last  = false;
 		frame->guest_surface = false;
+		frame->guest_source  = nullptr;
 		m_mutex.Unlock();
 
 		WaitForFrame(*frame);
@@ -342,34 +357,50 @@ struct Presenter::Impl {
 
 	void CapturePreparedFrame(Presenter::Frame& frame) {
 		const char* path = std::getenv("KYTY_PRESENT_READBACK_PATH");
+		const bool capture_source = std::getenv("KYTY_PRESENT_READBACK_SOURCE") != nullptr;
+		const auto* source_image =
+		    capture_source && frame.guest_source != nullptr ? frame.guest_source : nullptr;
+		const auto capture_format =
+		    source_image != nullptr ? source_image->backing.format : frame.image.format;
+		const auto capture_extent = source_image != nullptr
+		                                ? source_image->backing.extent
+		                                : vk::Extent3D {frame.image.extent.width,
+		                                                frame.image.extent.height, 1};
+		const auto capture_handle =
+		    source_image != nullptr ? source_image->backing.image : frame.image.image;
 		static uint32_t trace_count = 0;
 		if (path != nullptr && *path != '\0' && trace_count < 16) {
 			std::printf("PresentReadback: guest=%d format=%d extent=%ux%u count=%" PRIu64 "\n",
-			            frame.guest_surface ? 1 : 0, static_cast<int>(frame.image.format),
-			            frame.image.extent.width, frame.image.extent.height, present_readback_count);
+			            frame.guest_surface ? 1 : 0, static_cast<int>(capture_format),
+			            capture_extent.width, capture_extent.height, present_readback_count);
 			std::fflush(stdout);
 			trace_count++;
 		}
-		if (!frame.guest_surface || path == nullptr || *path == '\0' ||
-		    present_readback_count >= 8) {
+		if (!frame.guest_surface || path == nullptr || *path == '\0') {
 			return;
 		}
-		if (frame.image.format != vk::Format::eA2B10G10R10UnormPack32 &&
-		    frame.image.format != vk::Format::eR8G8B8A8Unorm &&
-		    frame.image.format != vk::Format::eB8G8R8A8Unorm &&
-		    frame.image.format != vk::Format::eR8G8B8A8Srgb &&
-		    frame.image.format != vk::Format::eB8G8R8A8Srgb) {
+		const auto frame_index = present_readback_frame++;
+		const auto frame_start = PresentReadbackEnvU64("KYTY_PRESENT_READBACK_START", 0);
+		const auto frame_limit = PresentReadbackEnvU64("KYTY_PRESENT_READBACK_LIMIT", 8);
+		if (frame_index < frame_start || present_readback_count >= frame_limit) {
 			return;
 		}
-		const uint64_t size = uint64_t {frame.image.extent.width} * frame.image.extent.height * 4u;
+		if (capture_format != vk::Format::eA2B10G10R10UnormPack32 &&
+		    capture_format != vk::Format::eR8G8B8A8Unorm &&
+		    capture_format != vk::Format::eB8G8R8A8Unorm &&
+		    capture_format != vk::Format::eR8G8B8A8Srgb &&
+		    capture_format != vk::Format::eB8G8R8A8Srgb) {
+			return;
+		}
+		const uint64_t size = uint64_t {capture_extent.width} * capture_extent.height * 4u;
 		Buffer download(window.graphic_ctx, present_scheduler, MemoryUsage::Download, 0,
 		                vk::BufferUsageFlagBits::eTransferDst, size);
 		auto& command = present_scheduler.BeginCommand();
 		vk::BufferImageCopy copy {};
-		copy.bufferRowLength = frame.image.extent.width;
+		copy.bufferRowLength = capture_extent.width;
 		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		copy.imageExtent = frame.image.extent;
-		command.Handle().copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+		copy.imageExtent = capture_extent;
+		command.Handle().copyImageToBuffer(capture_handle, vk::ImageLayout::eTransferSrcOptimal,
 		                                   download.Handle(), 1, &copy);
 		vk::BufferMemoryBarrier2 barrier {};
 		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
@@ -396,7 +427,7 @@ struct Presenter::Impl {
 		const auto bytes = download.Mapped();
 		for (uint64_t offset = 0; offset < size; offset += 4) {
 			std::array<uint32_t, 4> values {};
-			if (frame.image.format == vk::Format::eA2B10G10R10UnormPack32) {
+			if (capture_format == vk::Format::eA2B10G10R10UnormPack32) {
 				uint32_t packed = 0;
 				std::memcpy(&packed, bytes.data() + static_cast<size_t>(offset), sizeof(packed));
 				values = {packed & 0x3ffu, (packed >> 10u) & 0x3ffu,
@@ -421,8 +452,8 @@ struct Presenter::Impl {
 			             "frame=%" PRIu64 " width=%u height=%u format=%d colored=%" PRIu64
 			             " nonzero=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			             " min=%u,%u,%u,%u max=%u,%u,%u,%u\n",
-			             present_readback_count, frame.image.extent.width, frame.image.extent.height,
-			             static_cast<int>(frame.image.format), colored_pixels, nonzero[0], nonzero[1],
+			             frame_index, capture_extent.width, capture_extent.height,
+			             static_cast<int>(capture_format), colored_pixels, nonzero[0], nonzero[1],
 			             nonzero[2], nonzero[3], minimum[0], minimum[1], minimum[2], minimum[3],
 			             maximum[0], maximum[1], maximum[2], maximum[3]);
 			std::fclose(output);
@@ -473,6 +504,7 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_ime_revision {0};
+	uint64_t              present_readback_frame = 0;
 	uint64_t              present_readback_count = 0;
 	uint32_t              present_source_trace_count = 0;
 };
@@ -831,6 +863,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->guest_surface = true;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
+	frame->guest_source = &image;
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}

@@ -89,6 +89,9 @@ static std::atomic<uint32_t> g_draw_input_log_count   = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
 static std::atomic<uint32_t> g_shader_stage_log_count = 0;
 static std::atomic<uint32_t> g_video_out_draw_trace_count = 0;
+static std::atomic<uint32_t> g_video_out_draw_readback_count = 0;
+static std::atomic<uint32_t> g_render_target_readback_count = 0;
+static std::atomic<uint32_t> g_render_target_input_readback_count = 0;
 
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 
@@ -665,11 +668,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (depth.htile && depth.depth_clear_enable && !cache.ClearMeta(depth.htile_buffer_vaddr)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
+		uint32_t   htile_fill       = 0;
+		bool       htile_fill_known = false;
+		const bool meta_cleared =
+		    depth.htile && cache.IsMetaCleared(depth.htile_buffer_vaddr,
+		                                        depth.desc.view_info.base_layer, &htile_fill,
+		                                        &htile_fill_known);
 		depth.depth_meta_clear_enable =
-		    depth.htile &&
-		    cache.IsMetaCleared(depth.htile_buffer_vaddr, depth.desc.view_info.base_layer);
+		    meta_cleared && (!htile_fill_known || htile_fill_clears_depth(htile_fill));
+		depth.stencil_meta_clear_enable =
+		    meta_cleared && htile_fill_known && depth.desc.info.metadata.stencil_compressed &&
+		    htile_fill_clears_stencil(htile_fill);
 		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
-		if (depth.depth_meta_clear_enable &&
+		if (meta_cleared &&
 		    !cache.TouchMeta(depth.htile_buffer_vaddr, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
@@ -712,7 +723,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear  = depth.stencil_clear_enable || depth.stencil_meta_clear_enable;
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -1234,6 +1245,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 					    image.usage.video_out ? 1 : 0, image.IsGpuModified() ? 1 : 0,
 					    image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0);
 				}
+				if (std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK") != nullptr &&
+				    !pixel.resources.images.empty() &&
+				    g_video_out_draw_readback_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					const auto image_id = pixel.resources.images.front().image_id;
+					const bool scheduled = cache.TryDownloadImage(image_id);
+					std::printf("VideoOutDrawReadback: image_id=%u scheduled=%d\n",
+					            image_id.index, scheduled ? 1 : 0);
+				}
 				std::fflush(stdout);
 			}
 		}
@@ -1289,6 +1308,83 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+
+	if (const char* readback_address = std::getenv("KYTY_RENDER_TARGET_READBACK_ADDRESS");
+	    readback_address != nullptr && *readback_address != '\0' &&
+	    g_render_target_readback_count.load(std::memory_order_relaxed) < 16) {
+		char* end = nullptr;
+		const auto address = std::strtoull(readback_address, &end, 0);
+		if (end != readback_address && *end == '\0') {
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				const auto& target = state.color_info[i];
+				if (!target.image_id || target.base_addr != address ||
+				    g_render_target_readback_count.fetch_add(1, std::memory_order_relaxed) >= 16) {
+					continue;
+				}
+				const bool scheduled =
+				    m_context.GetTextureCache().TryDownloadImage(target.image_id);
+				const auto ps_hash = state.ps_active && state.ps_input_info.stage.program != nullptr
+				                         ? state.ps_input_info.stage.program->shader_hash
+				                         : 0;
+				std::printf("RenderTargetReadback: frame=%d draw=%s ps=0x%016" PRIx64
+				            " addr=0x%016" PRIx64 " scheduled=%d\n",
+				            m_context.GetGpu().GetFrameNum(), draw.name, ps_hash, address,
+				            scheduled ? 1 : 0);
+				const auto& user_data = state.ps_input_info.stage.resources.user_data;
+				if (user_data.size() >= 2) {
+					const uint64_t source = uint64_t {user_data[0]} | (uint64_t {user_data[1]} << 32u);
+					uint32_t       values[4] = {};
+					const bool     readable =
+					    LibKernel::Memory::TryReadBacking(source, values, sizeof(values));
+					std::printf(
+					    "RenderTargetReadbackInput: source=0x%016" PRIx64
+					    " readable=%d ud=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32
+					    " raw=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 "\n",
+					    source, readable ? 1 : 0, user_data[0], user_data[1],
+					    user_data.size() > 2 ? user_data[2] : 0,
+					    user_data.size() > 3 ? user_data[3] : 0, values[0], values[1],
+					    values[2], values[3]);
+				}
+				if (bindings.pixel.has_value() && bindings.pixel->program != nullptr) {
+					for (uint32_t image_index = 0;
+					     image_index < bindings.pixel->resources.images.size(); image_index++) {
+						const auto& binding  = bindings.pixel->resources.images[image_index];
+						const auto& resource = bindings.pixel->program->info.images[image_index];
+						std::printf(
+						    "RenderTargetReadbackImage: index=%u class=%u source=%u"
+						    " addr=0x%016" PRIx64 " size=0x%016" PRIx64
+						    " extent=%ux%ux%u format=%d\n",
+						    image_index, static_cast<uint32_t>(resource.resource_class),
+						    resource.source, binding.desc.info.data.address,
+						    binding.desc.info.data.size, binding.desc.info.extent.width,
+						    binding.desc.info.extent.height, binding.desc.info.extent.depth,
+						    static_cast<int>(binding.desc.info.pixel_format));
+					}
+				}
+				if (std::getenv("KYTY_RENDER_TARGET_READBACK_INPUTS") != nullptr &&
+				    bindings.pixel.has_value() && bindings.pixel->program != nullptr &&
+				    g_render_target_input_readback_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+					for (uint32_t image_index = 0;
+					     image_index < bindings.pixel->resources.images.size(); image_index++) {
+						const auto& binding  = bindings.pixel->resources.images[image_index];
+						const auto& resource = bindings.pixel->program->info.images[image_index];
+						if (resource.resource_class !=
+						    ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+							continue;
+						}
+						const bool input_scheduled =
+						    m_context.GetTextureCache().TryDownloadImage(binding.image_id);
+						std::printf(
+						    "RenderTargetReadbackInputImage: index=%u addr=0x%016" PRIx64
+						    " scheduled=%d\n",
+						    image_index, binding.desc.info.data.address,
+						    input_scheduled ? 1 : 0);
+					}
+				}
+				std::fflush(stdout);
+			}
+		}
+	}
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

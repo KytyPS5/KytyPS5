@@ -1272,7 +1272,9 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
-		descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+		if (!program.compute_wave_ballot_storage) {
+			descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+		}
 	}
 	return prepared;
 }
@@ -1330,6 +1332,14 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                                buffer_offset, buffer_limit, buffer_id));
 		pack_memory_offset(i, buffer_offset);
 		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
+	}
+	if (program.compute_wave_ballot_storage) {
+		EXIT_IF(prepared.wave_ballot_dwords == 0 ||
+		        prepared.wave_ballot_dwords >
+		            std::numeric_limits<size_t>::max() / sizeof(uint32_t));
+		std::vector<uint32_t> ballot_scratch(
+		    static_cast<size_t>(prepared.wave_ballot_dwords), 0u);
+		resources.gds = NativeUpload(m_context, ballot_scratch);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

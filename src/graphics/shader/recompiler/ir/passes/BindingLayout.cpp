@@ -67,7 +67,43 @@ bool UsesGds(const Program& program) {
 	return uses_gds;
 }
 
+bool NeedsWave64BallotStorageImpl(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.wave_size != 64u) {
+		return false;
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::Ballot:
+				case ValueOpcode::DppMoveU32:
+				case ValueOpcode::Dpp8MoveU32:
+				case ValueOpcode::ReadFirstLane:
+				case ValueOpcode::ReadLane:
+				case ValueOpcode::DppUpdateU32:
+				case ValueOpcode::Dpp8UpdateU32:
+				case ValueOpcode::WqmMask:
+				case ValueOpcode::WriteLane:
+				case ValueOpcode::Permlane16U32:
+				case ValueOpcode::SwizzleU32:
+				case ValueOpcode::BpermuteU32:
+					return true;
+				default:
+					break;
+			}
+			const auto shared = SharedAccessOf(inst.GetOpcode());
+			if (shared == SharedAccess::Append || shared == SharedAccess::Consume) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 } // namespace
+
+bool NeedsWave64BallotStorage(const Program& program) {
+	return NeedsWave64BallotStorageImpl(program);
+}
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
@@ -124,7 +160,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	if (UsesGds(program) || NeedsWave64BallotStorage(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (program.info.uses_dma) {

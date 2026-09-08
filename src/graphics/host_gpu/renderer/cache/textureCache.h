@@ -72,8 +72,10 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr);
+	                                 uint32_t* fill_value = nullptr,
+	                                 bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	// Returns true when registered DCC absorbed the fill and the caller may skip the dispatch.
 	// False may still record PendingDcc state, but the guest dispatch must execute.
 	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
@@ -100,6 +102,7 @@ private:
 		uint32_t clear_mask = 0;
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
+		bool     fill_known = false;
 	};
 
 	struct OverlapResult {

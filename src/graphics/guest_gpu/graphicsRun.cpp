@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/gpuSyncDiagnostics.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -23,13 +24,11 @@
 #include "libs/errno.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -86,14 +85,6 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
 }
 
-struct GpuSyncDiagnosticConfig {
-	bool                    enabled        = false;
-	bool                    valid          = true;
-	uint64_t                min_workgroups = 0;
-	bool                    exact_enabled  = false;
-	std::array<uint32_t, 3> exact_groups   = {};
-};
-
 static bool ParseUnsigned(std::string_view text, auto* value) {
 	if (text.empty()) {
 		return false;
@@ -126,17 +117,6 @@ static GpuSyncDiagnosticConfig GetGpuSyncDiagnosticConfig() {
 		}
 	}
 	return config;
-}
-
-static uint64_t SaturatingWorkgroupCount(uint32_t x, uint32_t y, uint32_t z) {
-	uint64_t count = x;
-	for (const auto dimension: {y, z}) {
-		if (dimension != 0 && count > std::numeric_limits<uint64_t>::max() / dimension) {
-			return std::numeric_limits<uint64_t>::max();
-		}
-		count *= dimension;
-	}
-	return count;
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
@@ -932,10 +912,8 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		     args.base_vertex, args.first_instance);
 	}
 	static const auto sync_diagnostics = GetGpuSyncDiagnosticConfig();
-	const bool trace_draw = sync_diagnostics.enabled && sync_diagnostics.valid &&
-	                        sync_diagnostics.min_workgroups == 0 &&
-	                        !sync_diagnostics.exact_enabled && args.index_count != 0 &&
-	                        args.instance_count != 0;
+	const bool non_empty_draw = args.index_count != 0 && args.instance_count != 0;
+	const bool trace_draw     = GpuSyncDiagnosticMatchesDraw(sync_diagnostics, non_empty_draw);
 	const auto& ps = m_sh_ctx.GetPs().ps_regs;
 	const auto& vs = m_sh_ctx.GetVs();
 	if (trace_draw) {
@@ -1192,17 +1170,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			return true;
 		}();
 		(void)invalid_sync_diagnostics_logged;
-		const std::array<uint32_t, 3> dispatch_groups = {thread_group_x, thread_group_y,
-		                                                   thread_group_z};
-		const bool non_empty_dispatch = thread_group_x != 0 && thread_group_y != 0 &&
-		                                thread_group_z != 0;
-		const bool matches_minimum =
-		    SaturatingWorkgroupCount(thread_group_x, thread_group_y, thread_group_z) >=
-		    sync_diagnostics.min_workgroups;
-		const bool matches_exact = !sync_diagnostics.exact_enabled ||
-		                           dispatch_groups == sync_diagnostics.exact_groups;
-		const bool trace_dispatch = sync_diagnostics.enabled && sync_diagnostics.valid &&
-		                            non_empty_dispatch && matches_minimum && matches_exact;
+		const bool trace_dispatch = GpuSyncDiagnosticMatchesDispatch(
+		    sync_diagnostics, thread_group_x, thread_group_y, thread_group_z);
 		uint64_t dispatch_begin = 0;
 		if (trace_dispatch) {
 			LOGF("GpuDispatchSync: phase=before-wait submit=%" PRIu64 " cs=0x%016" PRIx64
@@ -1303,10 +1272,8 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = m_num_instances;
 	}
 	static const auto sync_diagnostics = GetGpuSyncDiagnosticConfig();
-	const bool trace_draw = sync_diagnostics.enabled && sync_diagnostics.valid &&
-	                        sync_diagnostics.min_workgroups == 0 &&
-	                        !sync_diagnostics.exact_enabled && args.vertex_count != 0 &&
-	                        args.instance_count != 0;
+	const bool non_empty_draw = args.vertex_count != 0 && args.instance_count != 0;
+	const bool trace_draw     = GpuSyncDiagnosticMatchesDraw(sync_diagnostics, non_empty_draw);
 	const auto& ps = m_sh_ctx.GetPs().ps_regs;
 	const auto& vs = m_sh_ctx.GetVs();
 	if (trace_draw) {

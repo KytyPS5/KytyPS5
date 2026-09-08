@@ -203,7 +203,9 @@ private:
 	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	                                                     const CommandBuffer& buffer,
+	                                                     uint32_t group_x, uint32_t group_y,
+	                                                     uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	std::vector<ImageId>                  m_bound_images;

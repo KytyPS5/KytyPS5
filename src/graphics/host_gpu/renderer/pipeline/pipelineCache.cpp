@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -207,12 +208,18 @@ void CaptureDispatchedShader(const ShaderParams& params,
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() &&
+	    std::getenv("KYTY_DUMP_SPIRV_BEFORE_VALIDATE") == nullptr) {
 		return;
 	}
 	static std::atomic_int id = 0;
 	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
 	                                                             id++, stage_name, shader_hash);
+	if (std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE") != nullptr) {
+		std::printf("DumpSpirvBegin: stage=%s hash=0x%016" PRIx64 " words=%zu path=%s\n",
+		            stage_name, shader_hash, spirv.size(), Common::PathToString(path).c_str());
+		std::fflush(stdout);
+	}
 	Common::File::CreateDirectories(path.parent_path());
 	Common::File file(path);
 	if (file.IsInvalid()) {
@@ -221,6 +228,10 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+	if (std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE") != nullptr) {
+		std::printf("DumpSpirvEnd: stage=%s hash=0x%016" PRIx64 "\n", stage_name, shader_hash);
+		std::fflush(stdout);
+	}
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
@@ -432,22 +443,83 @@ struct PipelineCache::ProgramCache {
 			            stage_name, options.shader_hash, original_words, result.spirv.size(), elapsed);
 			std::fflush(stdout);
 		}
+		if (std::getenv("KYTY_DUMP_SPIRV_BEFORE_VALIDATE") != nullptr) {
+			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		}
 		uint32_t wave_partition_factor = 1;
+		bool     wave_ballot_storage   = false;
+		uint32_t wave_ballot_dwords    = 0;
 		if constexpr (Stage == ShaderType::Compute) {
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("ComputePlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
+				std::fflush(stdout);
+			}
 			// The renderer no longer owns the CFG after TakeCompiledInfo. Preserve
 			// the exact dispatch geometry selected by the same compiler planner.
 			const auto execution = ShaderRecompiler::PlanComputeExecution(
 			    result.program, options.input_info, options.compute_workgroup_limits);
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("ComputePlanEnd: hash=0x%016" PRIx64 " error=%s\n", options.shader_hash,
+				            execution.error.c_str());
+				std::fflush(stdout);
+			}
 			if (!execution.error.empty()) {
 				EXIT("compute execution plan failed: %s\n", execution.error.c_str());
 			}
 			wave_partition_factor = execution.wave_partition_factor;
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("BallotPlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
+				std::fflush(stdout);
+			}
+			const bool needs_wave_ballot_storage =
+			    ShaderRecompiler::IR::NeedsWave64BallotStorage(result.program);
+			const bool has_guest_gds = ShaderRecompiler::HasGuestGdsAccess(result.program);
+			wave_ballot_storage =
+			    execution.IsSplitWave64() && needs_wave_ballot_storage && !has_guest_gds;
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("BallotPlanEnd: hash=0x%016" PRIx64 " split=%u needs=%u gds=%u\n",
+				            options.shader_hash, execution.IsSplitWave64(),
+				            needs_wave_ballot_storage, has_guest_gds);
+				std::fflush(stdout);
+			}
+			if (wave_ballot_storage) {
+				uint64_t host_invocations = 1;
+				for (const auto size: execution.layout.host_size) {
+					if (size == 0 || host_invocations > UINT64_MAX / size) {
+						EXIT("wave64 ballot host workgroup size overflow\n");
+					}
+					host_invocations *= size;
+				}
+				if (host_invocations == 0 || (host_invocations % 64u) != 0u ||
+				    host_invocations / 64u > UINT32_MAX / 2u) {
+					EXIT("wave64 ballot host workgroup has an invalid wave count\n");
+				}
+				wave_ballot_dwords =
+				    static_cast<uint32_t>((host_invocations / 64u) * 2u);
+			}
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("ComputePlanPostBallot: hash=0x%016" PRIx64 "\n", options.shader_hash);
+				std::fflush(stdout);
+			}
+		}
+		if (optimization_trace != nullptr && *optimization_trace != '\0') {
+			std::printf("CompilePermutationPostPlan: hash=0x%016" PRIx64 "\n", options.shader_hash);
+			std::fflush(stdout);
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		if (optimization_trace != nullptr && *optimization_trace != '\0') {
+			std::printf("CompilePermutationPostOriginal: hash=0x%016" PRIx64 "\n", options.shader_hash);
+			std::fflush(stdout);
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
+		}
+		if (optimization_trace != nullptr && *optimization_trace != '\0') {
+			std::printf("CompilePermutationPostValidation: hash=0x%016" PRIx64 "\n",
+			            options.shader_hash);
+			std::fflush(stdout);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
@@ -469,6 +541,8 @@ struct PipelineCache::ProgramCache {
 		}
 		auto compiled_info = std::move(result.program).TakeCompiledInfo();
 		compiled_info.compute_wave_partition_factor = wave_partition_factor;
+		compiled_info.compute_wave_ballot_storage = wave_ballot_storage;
+		compiled_info.compute_wave_ballot_dwords  = wave_ballot_dwords;
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(compiled_info),

@@ -4,6 +4,27 @@ This file records regression coverage deferred during fast launch bring-up. Each
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
 
+## Compressed video-out metadata on a native render-target alias
+
+Status: regression test added; run against the unfixed implementation before the
+shared cache correction.
+
+Observed trigger: a guest color target is first discovered as a native render target
+with DCC metadata, then the same allocation is acquired through VideoOut with an
+explicit compressed-surface classification. `TextureCache::FindImage` correctly
+reuses the native image, but the requested VideoOut metadata must not be lost when
+the cache record was created by the render-target path.
+
+Required tests:
+
+- A render-target discovery followed by a compressed VideoOut lookup for the same
+  backing must reuse the native image and retain the VideoOut compression/control
+  metadata needed by presentation.
+- An uncompressed VideoOut lookup must not erase DCC metadata already registered
+  for a native render target.
+- The alias must remain GPU-owned and must not trigger a guest upload or compressed
+  readback while preparing the frame.
+
 ## Runtime descriptor-evaluation failure diagnostics
 
 Status: production diagnostic and native game validation complete; automated regression deferred.
@@ -323,7 +344,8 @@ shader as number 159 and advanced through six more shaders before the separate G
 
 ## GPU command completion fault isolation
 
-Status: production diagnostics and native game validation complete; automated regression deferred.
+Status: production diagnostics and native game validation complete; dispatch-filter and draw
+eligibility regression added; end-to-end GPU fault-isolation coverage remains deferred.
 
 Observed trigger: after `7ceb0f3417f926f9` successfully materializes, emits 103,404 SPIR-V
 words, and compiles as shader 159, the game compiles six more shaders and the NVIDIA driver emits
@@ -350,6 +372,10 @@ Required tests:
 - Synchronized indexed and auto-draw diagnostics with vertex/pixel shader addresses, primitive
   counts, instance counts and submit IDs. Before/after completion markers must distinguish a
   failing draw from queued work that only happens to be observed at the next compute wait.
+- Focused `--gpu-sync-diagnostic-only` coverage must keep non-empty draws traceable when either
+  dispatch-only filter is set, while retaining minimum/exact matching for dispatches and rejecting
+  empty draws or invalid configurations. This regression is now GREEN on the native Windows test
+  executable.
 - A large finite dispatch split into base-workgroup tiles, proving every guest workgroup executes
   exactly once and `WorkgroupId`/`GlobalInvocationId` retain the unsplit values.
 - Storage/image writes shared across tiles, proving submission boundaries preserve the original
@@ -1044,3 +1070,53 @@ pipeline creation, while the real game layout creates its pipeline successfully;
 the difference is retained as an open probe-layout boundary. Eight source
 readbacks remain RGB zero with alpha 3, so this result does not claim the first
 nonzero frame.
+
+## DWORD pattern fills and sampled HTILE clear materialization
+
+Status: shared production fix and native synthetic GPU regression are GREEN; a
+current-tree game readback remains pending behind the separate unfinished wave-ballot path.
+
+Observed trigger: the compute-clear fast path recognized only the 16-byte `uint4`
+fill shape. A full 4-byte DWORD pattern dispatch targeting registered HTILE was
+therefore executed as an ordinary buffer shader without carrying its exact clear
+encoding into depth metadata. The initial unchanged regression failed with
+`complete dword-pattern HTile fill was not recognized`. Extending the fixture to
+sample the resulting native D32 exposed a second failure: consuming only the logical
+metadata state left stale raw guest metadata, and a repeated texture acquisition
+materialized the old clear.
+
+The shared correction now requires the exact descriptor, ten-user-SGPR pattern,
+64x1x1 wave geometry, full group coverage, repeated DWORD value, write-only resource,
+and absence of snapshots/images/samplers/DMA before replacing a dispatch. Rejected
+partial, non-uniform and snapshot-dependent variants preserve the caller outputs.
+An accepted metadata fill records its exact value and performs the same guest-memory
+buffer fill; registered HTILE then maps only canonical `0` and `0xfffffff0` encodings
+to native depth 0/1. Depth/stencil load clears use their respective HTILE bit fields,
+and unsupported encodings still reject closed. No title, shader hash or guest address
+is part of the mechanism.
+
+Validation at `b1a894f-dirty`:
+
+- RED log: `_Build/logs/pattern-htile-20260908/red.stderr.log`.
+- GREEN log: `_Build/logs/pattern-htile-20260908/final-green.stdout.log`; executable
+  SHA-256 `fc092c5ab176820803b25fa59b332e5f07879aa6c6ad4052c790f893e3198f97`.
+- `--sampled-htile-clear-only`, `--sampled-htile-array-clear-only`,
+  `--compute-meta-clear-only`, `--sampled-htile-admission-only`, and
+  `--native-htile-subset-only` all pass. The clear selector also passes with the
+  portable `VK_LAYER_KHRONOS_validation` loaded and GPU-assisted validation enabled.
+- The modified current-tree production/test translation units compile with clang-cl.
+  A normal full target remains blocked because neighboring dirty
+  `spirvEmitterProgram.cpp` references missing
+  `EmitterState::wave_ballot_word_variables`.
+- Two bounded test-only game runs with executable SHA-256
+  `57d425db107c4347fff58e1313da06b470d5879a9cab088ab9a41bc611bcaaeb`
+  (`yotei-pattern-htile-current-20260908-092819-bb437d` and warm-cache
+  `yotei-pattern-htile-current-warm-20260908-092936-fda3a1`) stopped at the prior
+  `b90e2024732c6111` driver breakpoint before guest VideoOut/readback. The executable
+  used only a temporary zero-initialized declaration to complete the unrelated dirty
+  build; that declaration was removed immediately afterward. These runs do not prove
+  the first frame or regress the HTILE synthetic result.
+
+Remaining validation: restore a normal current-tree build by completing the ballot
+change, repeat the bounded game run, and require at least one source readback with
+nonzero RGB. Menu and gameplay remain separate pending stages.

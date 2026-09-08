@@ -71,7 +71,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 			uses_gds |= kind == IR::ResourceKind::Gds;
 		}
 	}
-	if (uses_gds) {
+	if (uses_gds || IR::NeedsWave64BallotStorage(program)) {
 		Expect(Kind::Gds);
 	}
 	if (program.info.uses_dma) {
@@ -276,6 +276,10 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				}
 				if (program.stage != ShaderType::Compute && kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
+				}
+				if (kind == IR::ResourceKind::Lds &&
+				    IR::SharedComponentCount(inst.GetOpcode()) > 1u) {
+					requirements.shared_multiword_lds = true;
 				}
 				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicIAdd64 ||
 				    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {

@@ -603,7 +603,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	(void)m_texture_cache.ClearMeta(vaddr, value);
 	{
 		const auto region = m_texture_cache.QueryRegion(vaddr, size);
 		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {

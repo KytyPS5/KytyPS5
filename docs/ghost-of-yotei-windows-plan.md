@@ -3,6 +3,30 @@
 Обновлено **8 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Цикл **8 сентября 2026, 08:31–09:30 UTC** выборочно перенёс общий механизм из
+upstream PR #500: строгий recognizer полного DWORD pattern fill, сохранение точного
+HTILE fill value и его guest-memory side effect, а также materialization
+канонических `0`/`0xfffffff0` в native D32 при sampled-depth чтении. Синтетический
+RED сначала остановился на `complete dword-pattern HTile fill was not recognized`,
+а расширенный RED выявил stale raw metadata при повторном texture acquisition.
+Неизменённый selector после исправления проходит три фазы, включая
+`tracked-pattern-clear-one`; соседние array/admission/meta/subset selectors и тот
+же тест с реально загруженным GPUAV layer также GREEN. Логи сохранены в
+`_Build/logs/pattern-htile-20260908/`.
+
+Затронутые translation units текущего дерева компилируются native Windows, но
+полный target в исходном dirty tree отдельно остановлен незавершённым ballot
+изменением: `spirvEmitterProgram.cpp` обращается к отсутствующему
+`EmitterState::wave_ballot_word_variables`. Для bounded проверки был собран
+отдельный test-only executable с временной нулевой декларацией; после сборки она
+удалена, `spirvEmitterInternal.h` снова не отличается от исходного рабочего
+дерева. Два run этого binary —
+`yotei-pattern-htile-current-20260908-092819-bb437d` и прогретый
+`yotei-pattern-htile-current-warm-20260908-092936-fda3a1` — воспроизвели прежний
+driver breakpoint `0x80000003` при `b90e2024732c6111` до guest VideoOut. Поэтому
+игровой nonzero-RGB критерий этим циклом **не проверен и остаётся PENDING**;
+synthetic GREEN не объявляется первым кадром.
+
 Последний цикл **7 сентября 2026, 21:11–21:14 UTC** добавил общий lowering
 для доказанно инъективных split-wave64 LDS DWORD stores: адрес
 `(LaneId << 2) + offset` при одной полной host workgroup теперь использует
@@ -74,6 +98,29 @@ SPIR-V со 170 999 до 146 134 слов, `OpLoad` с 11 561 до 8 993 и `OpS
 3 408 до 1 410, но это не изменило GPU-время. Следующий уровень оптимизации —
 структура программного cooperative wave64 scheduler. Изображение осталось чёрным.
 
+Последующий readback/resource trace уточнил источник чёрного RGB. В capture
+`yotei-integrated-20260907-231606-784e0c` `CS 79b9dff52896199d` читает
+`0x5000920000` и записывает `0x50318b0000`; входной depth ресурс остаётся нулевым,
+а `PS 63971eb3488c4486` поэтому оставляет `0x5000860000` с RGB=0
+(формат A2R10G10B10, alpha=3). Все найденные draw states для
+`z_write_base_addr=0x5000920000` имеют `z_enable=false` и `z_write_enable=false`;
+подходящего clear или первого writer в capture не найдено. Это пока не доказывает
+ошибку depth path: depth attachment нельзя включать принудительно и нельзя подменять
+другим адресом без bounded RED-теста первого producer. Отдельный доказанный defect
+RenderTarget→VideoOut aliasing — потеря DCC/compression metadata — исправляется
+   shared merge в `textureCache.cpp`; новый readback уже показывает `compression=1`,
+   но сам по себе этот fix не создаёт upstream цветные пиксели. Синтетический
+   non-zero HTILE depth producer/readback теперь GREEN. Следующая обязательная
+   граница — завершить соседний ballot build/runtime path, затем повторить тот же
+   bounded game run и проверить source RGB без принудительного включения depth.
+
+8 сентября добавлено исправление GPU sync diagnostics: `DrawIndex` и `DrawIndexAuto`
+теперь трассируют любой непустой draw при валидной диагностике даже при заданных
+`KYTY_GPU_SYNC_MIN_WORKGROUPS`/`KYTY_GPU_SYNC_GROUPS`; эти фильтры применяются только
+к dispatch. RED/GREEN helper-тест пройден, а `graphicsRun.cpp` и compute-test harness
+скомпилированы native Windows. Это исправляет диагностику, но не доказывает первый
+ненулевой кадр: upstream `0x5000920000` по-прежнему требует отдельного producer-теста.
+
 Этот документ — текущая сводка, а не первоначальный план от 5 сентября.
 Ожидание загрузки файлов, первый запуск Windows-сборки и поиск начального
 MIMG/DPP8 препятствия уже пройдены. Исторические результаты вынесены ниже;
@@ -127,7 +174,7 @@ flowchart TD
 | № | Этап | Что происходит | Как подтверждаем | Текущий статус |
 | ---: | --- | --- | --- | --- |
 | 0 | Входные данные | Runner проверяет каталог игры, `eboot.bin` и выбранный executable. | Preflight без `-Run`, затем `run.json` с абсолютными путями и SHA-256 emulator. | **PASS** для `PPSA26344`, APP_VER `01.512.000`. Текущий `eboot.bin` локально и обратимо переведён с 3840×2160 на 480×270; оригинал сохранён отдельно. |
-| 1 | Сборка | CMake/Ninja собирают Release `kyty_emulator`, тесты и install tree с DLL/plugins. | Native Windows build, CTest, hash установленного executable. | **PASS для текущего рабочего дерева.** `shader_cfg_tests` и `kyty_emulator` собраны и install обновлён. Последняя полная стабильная серия CTest остаётся 48/48; новые regression-тесты временно записываются как техдолг. |
+| 1 | Сборка | CMake/Ninja собирают Release `kyty_emulator`, тесты и install tree с DLL/plugins. | Native Windows build, CTest, hash установленного executable. | **PARTIAL для активного dirty tree.** Все HTILE/DCC production и test translation units компилируются. Полный target отдельно падает на отсутствующем `EmitterState::wave_ballot_word_variables` в соседнем незавершённом ballot изменении. Test-only executable SHA-256 `57d425db107c4347fff58e1313da06b470d5879a9cab088ab9a41bc611bcaaeb` собран с временной нулевой декларацией, которая затем удалена; это не установленная release-сборка. Последняя полная стабильная серия CTest остаётся 48/48. |
 | 2 | Загрузка гостя | Loader читает executable и модули, разрешает импорты, создаёт память и стартовые потоки. | Отсутствие loader/import fatal; прогресс гостевого лога. | **PASS**. Игра многократно доходит до графической инициализации. |
 | 3 | Команды GPU | Guest записывает PM4/compute/draw команды; Kyty разбирает очереди и формирует renderer calls. | Логи `GraphicsRenderDispatchDirect`, draw/dispatch counters. | **PASS** для достигнутого пути. Выполнены сотни команд и повторяющиеся кадры. |
 | 4 | Поиск и декодирование shader | Hash и статическое состояние образуют ключ программы; RDNA2 инструкции декодируются, строится CFG. | Capture/audit каждого manifest, точная фаза ошибки. | **PASS для достигнутого пути.** `004abfcd1b5e8fc7` и последующие shader-варианты декодируются и доходят до runtime frontier `b90e2024732c6111`. |

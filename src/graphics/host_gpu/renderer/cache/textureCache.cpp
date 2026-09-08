@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -34,6 +35,21 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+void MergeRenderTargetMetadata(ImageMetadataInfo& current,
+                               const ImageMetadataInfo& render_target) {
+	const auto previous = current;
+	current             = render_target;
+	if (previous.kind == ImageMetadataKind::Dcc &&
+	    previous.compression != VideoOutCompression::Uncompressed &&
+	    render_target.compression == VideoOutCompression::Uncompressed) {
+		// Render-target registers publish the canonical native DCC range but do not
+		// carry the compressed VideoOut classification discovered by presentation.
+		current.compression        = previous.compression;
+		current.control            = previous.control;
+		current.stencil_compressed = previous.stencil_compressed;
+	}
+}
 
 [[nodiscard]] const char* BindingTypeName(TextureCache::BindingType type) {
 	switch (type) {
@@ -1265,12 +1281,12 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 		}
 		return result;
 	};
+	ImageId existing_native {};
 	{
 		std::scoped_lock lock {m_lock};
 		const auto existing = lookup();
 		if (existing && !m_slot_images[existing].sampled_htile_clear_import) {
-			TouchImage(m_slot_images[existing]);
-			return existing;
+			existing_native = existing;
 		}
 	}
 	TileSizeAlign stencil_size {}, htile_size {}, depth_size {};
@@ -1314,6 +1330,27 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 		     static_cast<uint32_t>(requested.metadata.compression), depth_size.size,
 		     htile_size.size, htile_size.align);
 	}
+	uint32_t clear                = 0;
+	bool     tracked_clear_known = layers <= 32;
+	for (uint32_t layer = 0; tracked_clear_known && layer < layers; layer++) {
+		uint32_t layer_fill       = 0;
+		bool     layer_fill_known = false;
+		if (!IsMetaCleared(metadata.address, layer, &layer_fill, &layer_fill_known) ||
+		    !layer_fill_known || (layer != 0 && layer_fill != clear)) {
+			tracked_clear_known = false;
+			break;
+		}
+		clear = layer_fill;
+	}
+	if (tracked_clear_known && clear != 0 && clear != 0xfffffff0u) {
+		EXIT("sampled HTile metadata fill does not encode a supported depth clear\n");
+	}
+	if (existing_native && !tracked_clear_known) {
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[existing_native];
+		TouchImage(image);
+		return existing_native;
+	}
 	if (QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
 	    m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
 		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
@@ -1322,25 +1359,28 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 	// image reference, or command-buffer reference may survive this call.
 	// ReadMemory widens its download window. A clean metadata range must not
 	// drain a disjoint writable binding whose GPU work is still to be recorded.
-	if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size)) {
-		m_buffer_cache.ReadMemory(metadata.address, metadata.size);
-	}
-	std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
-	if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size) ||
-	    QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
-	    !LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size)) {
-		EXIT("sampled HTile metadata is not coherent and readable\n");
-	}
-	// AMD PAL Gfx9Htile::GetClearValue: Z-only clear has ZMask=0 and min=max.
-	// TC depth clears support exact 0/1; mixed/other encodings need decompression.
-	const uint32_t clear = words.front();
-	if ((clear != 0 && clear != 0xfffffff0u) ||
-	    !std::all_of(words.begin(), words.end(), [clear](uint32_t word) { return word == clear; })) {
-		EXIT("sampled HTile metadata is not a uniform supported clear\n");
+	if (!tracked_clear_known) {
+		if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size)) {
+			m_buffer_cache.ReadMemory(metadata.address, metadata.size);
+		}
+		std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
+		if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size) ||
+		    QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
+		    !LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size)) {
+			EXIT("sampled HTile metadata is not coherent and readable\n");
+		}
+		// AMD PAL Gfx9Htile::GetClearValue: Z-only clear has ZMask=0 and min=max.
+		// TC depth clears support exact 0/1; mixed/other encodings need decompression.
+		clear = words.front();
+		if ((clear != 0 && clear != 0xfffffff0u) ||
+		    !std::all_of(words.begin(), words.end(),
+		                 [clear](uint32_t word) { return word == clear; })) {
+			EXIT("sampled HTile metadata is not a uniform supported clear\n");
+		}
 	}
 	std::scoped_lock lock {m_lock};
 	auto id = lookup();
-	if (id && !m_slot_images[id].sampled_htile_clear_import) {
+	if (id && !m_slot_images[id].sampled_htile_clear_import && !tracked_clear_known) {
 		TouchImage(m_slot_images[id]);
 		return id;
 	}
@@ -1361,6 +1401,16 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 	const vk::ClearDepthStencilValue value {clear == 0 ? 0.0f : 1.0f, 0};
 	command.clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                               &value, 1, &range);
+	if (tracked_clear_known) {
+		const auto tracked = m_surface_metas.find(metadata.address);
+		if (tracked == m_surface_metas.end() ||
+		    tracked->second.type != MetaDataInfo::Type::HTile) {
+			EXIT("sampled HTile clear state disappeared during materialization\n");
+		}
+		for (uint32_t layer = 0; layer < layers; layer++) {
+			tracked->second.clear_mask &= ~(1u << layer);
+		}
+	}
 	TrackImage(id);
 	CommitGpuWrite(image);
 	image.tick_accessed_last = m_scheduler.CurrentTick();
@@ -1494,6 +1544,26 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				EXIT("TextureCache: compressed video-out read requires clean native GPU "
 				     "contents\n");
 			}
+			if (image.info.metadata.kind != ImageMetadataKind::None &&
+			    image.info.metadata.kind != desc.info.metadata.kind) {
+				EXIT("TextureCache: compressed video-out metadata conflicts with the "
+				     "native image\n");
+			}
+			// A render target can be discovered before VideoOut describes the same
+			// allocation. SameBacking deliberately ignores presentation metadata, so
+			// carry the later compressed classification onto the reused native image.
+			// Otherwise presentation sees an uncompressed surface and loses the guest
+			// DCC contract even though the render target owns the current pixels.
+			// Keep an already registered native DCC range: the VideoOut pointer may
+			// identify a presentation-side metadata header rather than the address
+			// used by CB_COLOR*_DCC_BASE and deferred metadata clears.
+			if (image.info.metadata.kind == ImageMetadataKind::None) {
+				image.info.metadata = desc.info.metadata;
+			} else {
+				image.info.metadata.control             = desc.info.metadata.control;
+				image.info.metadata.compression         = desc.info.metadata.compression;
+				image.info.metadata.stencil_compressed  = desc.info.metadata.stencil_compressed;
+			}
 		}
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
@@ -1621,7 +1691,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	// matching the point where CMask/FMask will be registered. Preserve a PendingDcc entry
 	// because the metadata fill may have run before this bind.
 	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
-		image.info.metadata       = desc.info.metadata;
+		MergeRenderTargetMetadata(image.info.metadata, desc.info.metadata);
 		auto [metadata, inserted] = m_surface_metas.try_emplace(
 		    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
 		if (!inserted && metadata->second.type == MetaDataInfo::Type::PendingDcc) {
@@ -2008,8 +2078,11 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	if (image.depth_id) {
 		return false;
 	}
+	const bool force_debug_readback =
+	    std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK") != nullptr ||
+	    std::getenv("KYTY_RENDER_TARGET_READBACK_ADDRESS") != nullptr;
 	auto plan = BuildDownload(image);
-	if (!plan.valid || !SafeToDownload(image)) {
+	if (!plan.valid || (!force_debug_readback && !SafeToDownload(image))) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -2042,6 +2115,32 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
+		const char* path = std::getenv("KYTY_RENDER_TARGET_INPUT_READBACK_PATH");
+		if (path == nullptr || *path == '\0') {
+			path = std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK_PATH");
+		}
+		if (path != nullptr && *path != '\0') {
+			uint64_t nonzero = 0;
+			uint32_t minimum = UINT32_MAX;
+			uint32_t maximum = 0;
+			uint32_t first    = 0;
+			for (uint64_t index = 0; index < range.size; index++) {
+				const auto value = mapped[index];
+				nonzero += value != 0 ? 1 : 0;
+				minimum = std::min<uint32_t>(minimum, value);
+				maximum = std::max<uint32_t>(maximum, value);
+				if (index < sizeof(first)) {
+					first |= static_cast<uint32_t>(value) << (index * 8u);
+				}
+			}
+			if (auto* output = std::fopen(path, "ab"); output != nullptr) {
+				std::fprintf(output,
+				             "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				             " nonzero_bytes=%" PRIu64 " min=%u max=%u first=0x%08x\n",
+				             range.address, range.size, nonzero, minimum, maximum, first);
+				std::fclose(output);
+			}
+		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
@@ -2131,7 +2230,8 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end() && found->second.type != MetaDataInfo::Type::PendingDcc;
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value) {
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
+	                              bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
@@ -2140,6 +2240,9 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
+	}
+	if (fill_known != nullptr) {
+		*fill_known = found->second.fill_known;
 	}
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
@@ -2154,6 +2257,20 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_known = false;
+	return true;
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
+	    found->second.type == MetaDataInfo::Type::Dcc) {
+		return false;
+	}
+	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_value = fill_value;
+	found->second.fill_known = true;
 	return true;
 }
 
@@ -2186,19 +2303,22 @@ bool TextureCache::TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t f
 		m_surface_metas.emplace(address, MetaDataInfo {.type       = MetaDataInfo::Type::PendingDcc,
 		                                               .clear_mask = dcc_clear_mask,
 		                                               .fill_value = fill_value,
-		                                               .fill_size  = size});
+		                                               .fill_size  = size,
+		                                               .fill_known = true});
 		return false;
 	}
 	if (found->second.type == MetaDataInfo::Type::PendingDcc) {
 		found->second.clear_mask = dcc_clear_mask;
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
+		found->second.fill_known = true;
 		return false;
 	}
 	if (found->second.type == MetaDataInfo::Type::Dcc) {
 		found->second.clear_mask = dcc_clear_mask;
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
+		found->second.fill_known = true;
 		return true;
 	}
 	// The strict DCC path must not reinterpret a CMask/FMask/HTile allocation as DCC.

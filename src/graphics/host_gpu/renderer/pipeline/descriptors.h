@@ -49,6 +49,7 @@ struct PreparedBindings {
 	NativeDescriptors                             resources;
 	std::vector<std::pair<ShaderBufferResource, BufferId>> buffer_sources;
 	std::vector<uint32_t>                         shader_data;
+	uint64_t                                      wave_ballot_dwords = 2;
 };
 
 [[nodiscard]] vk::DescriptorType

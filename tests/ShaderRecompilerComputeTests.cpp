@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/gpuSyncDiagnostics.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
@@ -68,6 +69,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -364,6 +366,7 @@ struct TextureCacheTestAccess {
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
     metadata.clear_mask = 0;
+    metadata.fill_known = false;
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -372,8 +375,13 @@ struct TextureCacheTestAccess {
 struct RenderExecutorTestAccess {
   static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
                                          const ShaderComputeInputInfo &input,
-                                         const CommandBuffer &buffer) {
-    return executor.TryConsumeComputeMetaClear(input, buffer);
+                                         const CommandBuffer &buffer,
+                                         uint32_t group_x = 1,
+                                         uint32_t group_y = 1,
+                                         uint32_t group_z = 1,
+                                         uint32_t mode = 0x41u) {
+    return executor.TryConsumeComputeMetaClear(input, buffer, group_x, group_y,
+                                               group_z, mode);
   }
 
   static TextureBinding
@@ -968,6 +976,46 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+void CheckGpuSyncDiagnosticFilters() {
+  constexpr const char *name = "GpuSyncDiagnosticFilters";
+  GpuSyncDiagnosticConfig config {};
+  config.enabled        = true;
+  config.valid          = true;
+  config.min_workgroups = 4;
+
+  Require(name, "draw ignores dispatch minimum filter",
+          GpuSyncDiagnosticMatchesDraw(config, true),
+          "a non-empty draw must remain traceable when a dispatch minimum filter is set");
+  Require(name, "empty draw rejected", !GpuSyncDiagnosticMatchesDraw(config, false),
+          "zero-count draws must not add synchronization waits");
+
+  Require(name, "dispatch below minimum rejected",
+          !GpuSyncDiagnosticMatchesDispatch(config, 1, 1, 1),
+          "dispatches below the configured minimum must remain untraced");
+  Require(name, "dispatch at minimum accepted",
+          GpuSyncDiagnosticMatchesDispatch(config, 2, 2, 1),
+          "dispatches meeting the configured minimum must be traced");
+
+  config.exact_enabled = true;
+  config.exact_groups  = {2, 2, 1};
+  Require(name, "draw ignores dispatch exact filter",
+          GpuSyncDiagnosticMatchesDraw(config, true),
+          "a non-empty draw must remain traceable when an exact dispatch filter is set");
+  Require(name, "dispatch exact match accepted",
+          GpuSyncDiagnosticMatchesDispatch(config, 2, 2, 1),
+          "dispatches matching the exact filter must be traced");
+  Require(name, "dispatch exact mismatch rejected",
+          !GpuSyncDiagnosticMatchesDispatch(config, 2, 1, 2),
+          "dispatches outside the exact filter must remain untraced");
+
+  config.valid = false;
+  Require(name, "invalid configuration rejected",
+          !GpuSyncDiagnosticMatchesDraw(config, true) &&
+              !GpuSyncDiagnosticMatchesDispatch(config, 2, 2, 1),
+          "invalid diagnostic configuration must disable all tracing");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
@@ -1064,6 +1112,8 @@ struct CompiledShader {
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
   u32 wave_partition_factor = 1;
+  bool wave_ballot_storage = false;
+  u32 wave_ballot_dwords = 0;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1381,6 +1431,39 @@ CompiledShader CompileCase(
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
+  if (const auto *dump_path = std::getenv("KYTY_DUMP_COMPUTE_SPIRV");
+      dump_path != nullptr) {
+    std::fprintf(stderr, "KYTY_DUMP_COMPUTE_SPIRV test=%s path=%s\n", test.name, dump_path);
+    if (auto *file = std::fopen(dump_path, "wb"); file != nullptr) {
+      std::fwrite(result.spirv.data(), sizeof(u32), result.spirv.size(), file);
+      std::fclose(file);
+    } else {
+      std::fprintf(stderr, "KYTY_DUMP_COMPUTE_SPIRV fopen failed errno=%d\n", errno);
+    }
+    const std::string ir_path = std::string(dump_path) + ".ir.txt";
+    if (auto *ir_file = std::fopen(ir_path.c_str(), "wb"); ir_file != nullptr) {
+      std::fwrite(result.ir_dump.data(), 1, result.ir_dump.size(), ir_file);
+      std::fclose(ir_file);
+    } else {
+      std::fprintf(stderr, "KYTY_DUMP_COMPUTE_SPIRV ir fopen failed errno=%d\n", errno);
+    }
+    if (std::strcmp(test.name, "Wave64MultiWaveLdsAtomicReduction") == 0) {
+      std::fprintf(stderr, "KYTY_IR_BEGIN\n%sKYTY_IR_END\n", result.ir_dump.c_str());
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string text;
+      if (tools.Disassemble(result.spirv, &text)) {
+        std::fprintf(stderr, "KYTY_SPV_MEMORY_BEGIN\n");
+        std::istringstream stream(text);
+        for (std::string line; std::getline(stream, line);) {
+          if (line.find("Atomic") != std::string::npos ||
+              line.find("Workgroup") != std::string::npos) {
+            std::fprintf(stderr, "%s\n", line.c_str());
+          }
+        }
+        std::fprintf(stderr, "KYTY_SPV_MEMORY_END\n");
+      }
+    }
+  }
   CheckSpirvText(test, result.spirv);
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.bindings.user_data_registers) {
@@ -1411,8 +1494,27 @@ CompiledShader CompileCase(
   const auto execution = ShaderRecompiler::PlanComputeExecution(
       result.program, options.input_info, workgroup_limits);
   Require(test.name, "compute execution plan", execution.error.empty(), execution.error);
+  if (execution.IsSplitWave64() &&
+      ShaderRecompiler::IR::NeedsWave64BallotStorage(result.program) &&
+      !ShaderRecompiler::HasGuestGdsAccess(result.program)) {
+    uint64_t host_invocations = 1;
+    for (const auto size : execution.layout.host_size) {
+      Require(test.name, "compute execution plan", size != 0 &&
+                                                   host_invocations <= UINT64_MAX / size,
+              "split wave64 host workgroup size overflowed ballot scratch planning");
+      host_invocations *= size;
+    }
+    Require(test.name, "compute execution plan", host_invocations % 64u == 0,
+            "split wave64 host workgroup is not an integral ballot-wave count");
+    const auto wave_ballot_dwords =
+        static_cast<uint32_t>((host_invocations / 64u) * 2u);
+    return {std::move(result.spirv), std::move(result.program),
+            std::move(resources), std::move(packed_user_data),
+            execution.wave_partition_factor, true, wave_ballot_dwords};
+  }
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data), execution.wave_partition_factor};
+          std::move(resources), std::move(packed_user_data),
+          execution.wave_partition_factor, false, 0};
 }
 
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
@@ -4861,6 +4963,69 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
+      constexpr uint64_t depth_producer_offset = 0x27e0000;
+      constexpr uint32_t depth_producer_clear  = 0x3f400000u;
+      std::array<uint32_t, 4> depth_producer_guest{
+          0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+      std::memcpy(memory + depth_producer_offset, depth_producer_guest.data(),
+                  sizeof(depth_producer_guest));
+      auto depth_producer = MakeLinearDesc(
+          base + depth_producer_offset, sizeof(depth_producer_guest),
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 4, 1);
+      depth_producer.type = BindingType::DepthTarget;
+      depth_producer.view_info.format = vk::Format::eD32Sfloat;
+      depth_producer.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth_producer.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_producer_image =
+          texture_cache.FindImage(depth_producer);
+      Require(name, "depth producer registration",
+              depth_producer_image &&
+                  texture_cache.FindDepthTarget(depth_producer_image,
+                                                depth_producer) != nullptr,
+              "the synthetic non-zero depth producer could not be acquired");
+      Require(name, "depth producer write",
+              texture_cache.ClearImageFromBuffer(
+                  scheduler.Current(), depth_producer.info.data.address,
+                  depth_producer.info.data.size, depth_producer_clear),
+              "the synthetic depth producer did not record its GPU write");
+
+      auto sampled_depth_alias = depth_producer;
+      sampled_depth_alias.type = BindingType::Texture;
+      sampled_depth_alias.info.pixel_format = vk::Format::eR32Sfloat;
+      sampled_depth_alias.view_info.format = vk::Format::eR32Sfloat;
+      sampled_depth_alias.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      sampled_depth_alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto sampled_depth_alias_image =
+          texture_cache.FindImage(sampled_depth_alias);
+      Require(
+          name, "depth producer sampled alias",
+          sampled_depth_alias_image &&
+              sampled_depth_alias_image != depth_producer_image &&
+              texture_cache.GetImage(sampled_depth_alias_image).backing.format ==
+                  vk::Format::eR32Sfloat &&
+              texture_cache.GetImage(sampled_depth_alias_image).IsGpuModified() &&
+              texture_cache.FindTexture(sampled_depth_alias_image,
+                                        sampled_depth_alias) != nullptr,
+          "sampling a GPU-current depth allocation did not create a "
+          "GPU-current color alias");
+      Require(name, "depth producer sampled readback",
+              TextureCacheTestAccess::TryDownload(texture_cache,
+                                                  sampled_depth_alias_image),
+              "the sampled depth alias could not be downloaded");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      std::array<uint32_t, depth_producer_guest.size()> depth_producer_after{};
+      std::memcpy(depth_producer_after.data(), memory + depth_producer_offset,
+                  sizeof(depth_producer_after));
+      Require(name, "depth producer sampled contents",
+              std::ranges::all_of(depth_producer_after,
+                                  [](uint32_t value) {
+                                    return value == depth_producer_clear;
+                                  }),
+              "the sampled depth alias lost the non-zero producer contents");
+
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
       std::memcpy(memory + raw_d16_offset, raw_d16_values.data(),
@@ -5944,14 +6109,17 @@ public:
               "backing");
 
       const uint32_t compressed_value = 0x55667788u;
-      std::memcpy(memory + 0xc000, &compressed_value, sizeof(compressed_value));
+      constexpr uint64_t compressed_offset = 0x1a0000;
+      std::memcpy(memory + compressed_offset, &compressed_value,
+                  sizeof(compressed_value));
       auto compressed_desc = MakeLinearDesc(
-          base + 0xc000, sizeof(compressed_value), vk::Format::eR8G8B8A8Srgb,
+          base + compressed_offset, sizeof(compressed_value),
+          vk::Format::eR8G8B8A8Srgb,
           Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
           {1, 1, 1}, 1, 4, 1);
       compressed_desc.type = BindingType::RenderTarget;
       compressed_desc.info.metadata.kind = ImageMetadataKind::Dcc;
-      compressed_desc.info.metadata.range = {base + 0xd000, 0};
+      compressed_desc.info.metadata.range = {base + compressed_offset + 0x1000, 0};
       compressed_desc.info.metadata.compression =
           VideoOutCompression::Dcc256_256_0;
       compressed_desc.view_info.usage =
@@ -5959,7 +6127,7 @@ public:
       const auto compressed_image = texture_cache.FindImage(compressed_desc);
       (void)texture_cache.FindRenderTarget(compressed_image, compressed_desc);
       uint32_t compressed_cpu_read = 0;
-      std::memcpy(&compressed_cpu_read, memory + 0xc000,
+      std::memcpy(&compressed_cpu_read, memory + compressed_offset,
                   sizeof(compressed_cpu_read));
       Require(name, "compressed write-only read policy",
               compressed_cpu_read == compressed_value &&
@@ -5986,6 +6154,72 @@ public:
               !compressed_video_image.binding.needs_rebind &&
               !compressed_video_image.usage.video_out,
           "FindImage claimed caller-owned video-out usage or binding state");
+
+      constexpr uint64_t compressed_video_alias_offset = 0x1a4000;
+      auto render_target_video_alias = compressed_desc;
+      render_target_video_alias.info.data = {base + compressed_video_alias_offset,
+                                             sizeof(compressed_value)};
+      render_target_video_alias.info.metadata.compression =
+          VideoOutCompression::Uncompressed;
+      render_target_video_alias.info.metadata.control = 0;
+      const auto render_target_video_alias_image =
+          texture_cache.FindImage(render_target_video_alias);
+      (void)texture_cache.FindRenderTarget(render_target_video_alias_image,
+                                           render_target_video_alias);
+      auto compressed_video_alias = render_target_video_alias;
+      compressed_video_alias.type = BindingType::VideoOut;
+      compressed_video_alias.info.metadata.range =
+          {base + compressed_video_alias_offset + 0x1000, 0};
+      compressed_video_alias.info.metadata.compression =
+          VideoOutCompression::Dcc256_256_0;
+      compressed_video_alias.info.metadata.control = 0x00000048u;
+      compressed_video_alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto compressed_video_alias_image =
+          texture_cache.FindImage(compressed_video_alias);
+      const auto &compressed_video_alias_owner =
+          texture_cache.GetImage(compressed_video_alias_image);
+      Require(
+          name, "video-out metadata on render-target alias",
+          compressed_video_alias_image == render_target_video_alias_image &&
+              compressed_video_alias_owner.usage.render_target &&
+              compressed_video_alias_owner.info.metadata.range.address ==
+                  render_target_video_alias.info.metadata.range.address &&
+              compressed_video_alias_owner.info.metadata.compression ==
+                  VideoOutCompression::Dcc256_256_0 &&
+              compressed_video_alias_owner.info.metadata.control == 0x00000048u,
+          "a compressed video-out alias lost its metadata on a native render target");
+
+      (void)texture_cache.FindRenderTarget(render_target_video_alias_image,
+                                           render_target_video_alias);
+      const auto &rediscovered_render_target_owner =
+          texture_cache.GetImage(render_target_video_alias_image);
+      Require(
+          name, "render-target rediscovery preserves DCC metadata",
+          rediscovered_render_target_owner.info.metadata.kind ==
+                  ImageMetadataKind::Dcc &&
+              rediscovered_render_target_owner.info.metadata.range.address ==
+                  render_target_video_alias.info.metadata.range.address &&
+              rediscovered_render_target_owner.info.metadata.compression ==
+                  VideoOutCompression::Dcc256_256_0 &&
+              rediscovered_render_target_owner.info.metadata.control == 0x00000048u,
+          "render-target rediscovery erased compressed video-out metadata");
+
+      auto uncompressed_video_alias = compressed_video_alias;
+      uncompressed_video_alias.info.metadata = {};
+      const auto uncompressed_video_alias_image =
+          texture_cache.FindImage(uncompressed_video_alias);
+      const auto &uncompressed_video_alias_owner =
+          texture_cache.GetImage(uncompressed_video_alias_image);
+      Require(
+          name, "uncompressed video-out preserves native DCC metadata",
+          uncompressed_video_alias_image == render_target_video_alias_image &&
+              uncompressed_video_alias_owner.info.metadata.kind ==
+                  ImageMetadataKind::Dcc &&
+              uncompressed_video_alias_owner.info.metadata.range.address ==
+                  render_target_video_alias.info.metadata.range.address &&
+              uncompressed_video_alias_owner.info.metadata.compression ==
+                  VideoOutCompression::Dcc256_256_0,
+          "an uncompressed video-out alias erased native DCC metadata");
 
       constexpr uint64_t mixed_source_offset = 0x20000;
       constexpr uint64_t mixed_source_size = 0x1004;
@@ -9112,15 +9346,118 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
                 descriptor.MetaAddr() << 8u == metadata_address,
             "fixture accidentally acquired a prior depth/metadata owner");
 
+    const auto resolve_pattern_fill = [&](uint32_t value_to_write,
+                                          bool consume_metadata = false) {
+      constexpr uint32_t words_per_group = 64;
+      const uint32_t word_count = metadata_size / sizeof(uint32_t);
+      ShaderBufferResource pattern_descriptor{};
+      pattern_descriptor.UpdateAddress48(metadata_address);
+      pattern_descriptor.fields[1] |= sizeof(uint32_t) << 16u;
+      pattern_descriptor.fields[2] = word_count;
+      pattern_descriptor.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u);
+
+      ShaderRecompiler::IR::CompiledShaderInfo pattern_program{};
+      pattern_program.stage = ShaderType::Compute;
+      pattern_program.user_data_base = 0;
+      ShaderRecompiler::IR::BufferResource pattern_resource{};
+      pattern_resource.formatted = true;
+      pattern_resource.written = true;
+      pattern_resource.max_byte_extent = sizeof(uint32_t);
+      pattern_resource.packed_stride = pattern_descriptor.PackedStride();
+      pattern_program.info.buffers.push_back(pattern_resource);
+
+      ShaderRecompiler::IR::DescriptorValue raw{};
+      raw.dword_count = 4;
+      std::copy_n(pattern_descriptor.fields, raw.dword_count,
+                  raw.dwords.begin());
+      ShaderComputeInputInfo pattern{};
+      pattern.threads_num[0] = words_per_group;
+      pattern.threads_num[1] = 1;
+      pattern.threads_num[2] = 1;
+      pattern.group_id[0] = true;
+      pattern.thread_ids_num = 1;
+      pattern.wave_size = 64;
+      pattern.stage.program = &pattern_program;
+      pattern.stage.resources.buffers.push_back(raw);
+      auto& user_data = pattern.stage.resources.user_data;
+      user_data.resize(10);
+      std::copy_n(pattern_descriptor.fields, raw.dword_count,
+                  user_data.begin());
+      std::fill(user_data.begin() + 4, user_data.begin() + 8,
+                value_to_write);
+      user_data[8] = word_count;
+      user_data[9] = 4;
+
+      ShaderBufferResource resolved_descriptor{};
+      uint32_t resolved_clear = 0;
+      uint64_t resolved_size = 0;
+      const uint32_t group_count =
+          (word_count + words_per_group - 1) / words_per_group;
+      Require(name, "pattern HTile producer",
+              ResolveComputeImageClear(pattern, group_count, 1, 1, 0x41u,
+                                       resolved_descriptor, resolved_clear,
+                                       resolved_size) &&
+                  resolved_descriptor.Base48() == metadata_address &&
+                  resolved_clear == value_to_write &&
+                  resolved_size == metadata_size,
+              "complete dword-pattern HTile fill was not recognized");
+      const uint32_t accepted_clear = resolved_clear;
+      auto partial = pattern;
+      resolved_descriptor.fields[0] = 0x12345678u;
+      resolved_clear = 0x87654321u;
+      resolved_size = 0x123456789abcdef0ull;
+      Require(name, "partial pattern coverage",
+              !ResolveComputeImageClear(partial, group_count - 1, 1, 1, 0x41u,
+                                        resolved_descriptor, resolved_clear,
+                                        resolved_size) &&
+                  resolved_descriptor.fields[0] == 0x12345678u &&
+                  resolved_clear == 0x87654321u &&
+                  resolved_size == 0x123456789abcdef0ull,
+              "partial pattern dispatch was consumed or changed outputs");
+      auto nonuniform = pattern;
+      nonuniform.stage.resources.user_data[5] ^= 1u;
+      Require(name, "nonuniform pattern",
+              !ResolveComputeImageClear(nonuniform, group_count, 1, 1, 0x41u,
+                                        resolved_descriptor, resolved_clear,
+                                        resolved_size),
+              "nonuniform dword pattern was consumed as a clear");
+      auto snapshot = pattern;
+      snapshot.stage.resources.immutable_srt_ranges.push_back(
+          {metadata_address + metadata_size, sizeof(uint32_t)});
+      Require(name, "snapshot-dependent pattern",
+              !ResolveComputeImageClear(snapshot, group_count, 1, 1, 0x41u,
+                                        resolved_descriptor, resolved_clear,
+                                        resolved_size),
+              "snapshot-dependent pattern write was consumed as a clear");
+      if (consume_metadata) {
+        TextureCacheTestAccess::RegisterHtileMeta(cache, metadata_address);
+        Require(name, "consume pattern HTile producer",
+                RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+                    executor, pattern, scheduler.Current(), group_count, 1, 1,
+                    0x41u),
+                "recognized pattern fill did not publish logical HTile state");
+        uint32_t tracked_fill = 0;
+        bool tracked_fill_known = false;
+        Require(name, "tracked pattern HTile value",
+                cache.IsMetaCleared(metadata_address, 0, &tracked_fill,
+                                    &tracked_fill_known) &&
+                    tracked_fill_known && tracked_fill == value_to_write,
+                "consumed pattern fill lost its exact HTile value");
+      }
+      return accepted_clear;
+    };
     const auto gpu_metadata_fill = [&](uint32_t value_to_write,
                                        uint32_t stale_value) {
+      const uint32_t resolved_clear = resolve_pattern_fill(value_to_write);
       // Force actual native-buffer ownership. FillBuffer otherwise optimizes a
       // clean, unowned region into a CPU write, which would miss this regression.
       auto native = buffers.ObtainBuffer(metadata_address, metadata_size, true, false);
       Require(name, "GPU metadata owner", native.first != nullptr &&
                   buffers.HasGpuDirtyBytes(metadata_address, metadata_size),
               "metadata fixture did not establish GPU buffer ownership");
-      buffers.FillBuffer(metadata_address, metadata_size, value_to_write, false);
+      buffers.FillBuffer(metadata_address, metadata_size, resolved_clear, false);
       std::vector<uint32_t> backing(metadata_stale.size());
       Require(name, "stale metadata backing",
               buffers.HasGpuDirtyBytes(metadata_address, metadata_size) &&
@@ -9218,6 +9555,18 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
       std::_Exit(0);
     }
 
+    std::fill(metadata_stale.begin(), metadata_stale.end(), clear_zero);
+    Require(name, "opposite raw HTile before tracked clear",
+            Libs::LibKernel::Memory::TryWriteBacking(
+                metadata_address, metadata_stale.data(), metadata_size),
+            "could not establish opposite raw HTile backing");
+    (void)resolve_pattern_fill(clear_one, true);
+    (void)sample_clear("tracked-pattern-clear-one", 0.75f, 1.0f);
+    std::fill(metadata_stale.begin(), metadata_stale.end(), clear_one);
+    Require(name, "restore stale HTile backing",
+            Libs::LibKernel::Memory::TryWriteBacking(
+                metadata_address, metadata_stale.data(), metadata_size),
+            "could not restore stale HTile backing for the raw producer");
     gpu_metadata_fill(clear_zero, clear_one);
     (void)sample_clear("first-clear-zero", 0.125f, 0.0f);
     // No depth readback or CPU-depth write between acquisitions: the second
@@ -12348,6 +12697,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
+    auto packed_user_data = compiled.packed_user_data;
     vk::DescriptorBufferInfo flattened_info{};
     vk::DescriptorBufferInfo user_data_info{};
     vk::DescriptorBufferInfo gds_info{};
@@ -12421,10 +12771,23 @@ void CheckSampledHtileArrayClearDiscovery() {
       write.pBufferInfo = &flattened_info;
       writes.push_back(write);
     }
+    for (u32 i = 0; i < layout.memory_offset_count; i++) {
+      const auto offset = i < test.storage_buffer_offsets.size()
+                              ? test.storage_buffer_offsets[i]
+                              : 0u;
+      const auto range = test.storage_buffer_range_dwords != 0
+                             ? test.storage_buffer_range_dwords * sizeof(u32) + offset
+                             : buffer.size;
+      Require(test.name, "dispatch",
+              layout.memory_limit_dword + i < packed_user_data.size() &&
+                  range <= UINT32_MAX,
+              "shader-data memory limit does not fit the synthetic binding");
+      packed_user_data[layout.memory_limit_dword + i] =
+          static_cast<u32>(range);
+    }
     if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
       user_data_buffer =
-          CreateStorageBuffer(test.name, compiled.packed_user_data,
-                              compiled.packed_user_data.size());
+          CreateStorageBuffer(test.name, packed_user_data, packed_user_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -12560,7 +12923,6 @@ void CheckSampledHtileArrayClearDiscovery() {
       m_device.updateDescriptorSets(static_cast<u32>(writes.size()),
                                     writes.data(), 0, nullptr);
     }
-
     vk::CommandBuffer cmd = BeginCommands(test.name, "dispatch");
     if (uses_bda) {
       Require(test.name, "dispatch", buffer.device_address != 0,
@@ -12613,8 +12975,8 @@ void CheckSampledHtileArrayClearDiscovery() {
                            1, &descriptor_set, 0, nullptr);
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(compiled.packed_user_data.begin(),
-                compiled.packed_user_data.end(),
+      std::copy(packed_user_data.begin(),
+                packed_user_data.end(),
                 push_data.dwords.begin() + layout.push_data_start_dword);
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
@@ -14684,8 +15046,34 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   const bool needs_sampler = Has(Kind::Samplers);
   const bool needs_gds = Has(Kind::Gds);
   if (needs_gds) {
-    const auto gds_dwords = std::max<size_t>(
-        {test.gds_initial.size(), test.expected_gds.size(), 1u});
+    size_t gds_dwords =
+        std::max<size_t>({test.gds_initial.size(), test.expected_gds.size(), 1u});
+    if (compiled.wave_ballot_storage) {
+      Require(test.name, "GDS scratch allocation",
+              compiled.wave_partition_factor != 0 &&
+                  test.dispatch_x <=
+                      UINT32_MAX / compiled.wave_partition_factor,
+              "expanded compute dispatch overflowed ballot scratch planning");
+      uint64_t group_count = 1;
+      const std::array dispatch_groups{
+          test.dispatch_x * compiled.wave_partition_factor, test.dispatch_y, test.dispatch_z};
+      for (const auto groups : dispatch_groups) {
+        Require(test.name, "GDS scratch allocation", groups != 0 &&
+                                                     group_count <= UINT64_MAX / groups,
+                "split wave64 ballot dispatch scratch size overflowed");
+        group_count *= groups;
+      }
+      Require(test.name, "GDS scratch allocation",
+              compiled.wave_ballot_dwords != 0 &&
+                  group_count <=
+                      std::numeric_limits<size_t>::max() /
+                          compiled.wave_ballot_dwords,
+              "split wave64 ballot scratch size is not representable");
+      const auto ballot_dwords =
+          static_cast<size_t>(group_count) *
+          compiled.wave_ballot_dwords;
+      gds_dwords = std::max(gds_dwords, ballot_dwords);
+    }
     gds_buffer =
         vulkan->CreateStorageBuffer(test.name, test.gds_initial, gds_dwords);
   }
@@ -34271,6 +34659,10 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-sync-diagnostic-only") == 0) {
+    CheckGpuSyncDiagnosticFilters();
+    return 0;
+  }
   if (argc == 2 &&
       std::strcmp(argv[1], "--rt-tiled-sampled-format-only") == 0) {
     CheckRenderTargetTiledSampledFormatLayout();

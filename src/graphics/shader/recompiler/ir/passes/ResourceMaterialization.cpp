@@ -1096,7 +1096,8 @@ bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot&
 }
 
 bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot& materialized,
-                        ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                        const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                        ResourceSpecialization& specialization) {
 	std::vector<DescriptorValue> buffers;
 	specialization.bounded_srt_reads = materialized.bounded_srt_reads;
 	if (!program.bounded_srt_reads.empty() ||
@@ -1184,7 +1185,7 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 					descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
 				}
 			}
-			if (!CanonicalizeEnumeratedBufferDescriptor(descriptor)) {
+			if (!CanonicalizeEnumeratedBufferDescriptor(descriptor, runtime)) {
 				return SpecializationFail("enumerated buffer candidate has invalid descriptor width");
 			}
 			auto candidate = std::ranges::find_if(table.resources, [&](uint32_t resource) {

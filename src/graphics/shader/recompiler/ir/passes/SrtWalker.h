@@ -22,6 +22,9 @@ struct SrtRuntime {
 	// Actual guest dispatch counts before host wave partitioning. Absent for graphics
 	// and offline callers that cannot prove a dispatch-dependent snapshot's bound.
 	std::optional<std::array<uint32_t, 3>> compute_workgroups;
+	// Optional renderer address-space query. A zero result means the requested
+	// base cannot be bound; a nonzero result is the contiguous mapped prefix.
+	SrtMemoryRangeClamper clamp_memory_range = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

@@ -191,6 +191,10 @@ interval containing the dispatch and its resource preparation. Presentation can 
 submit work to the shared queue during that interval. A matching `after-complete`
 confirms that batch completed. This does not identify an individual failing GPU instruction.
 
+`KYTY_GPU_SYNC_MIN_WORKGROUPS` and `KYTY_GPU_SYNC_GROUPS` filter compute dispatches.
+Non-empty indexed and auto draws remain traceable while diagnostics are enabled because
+draws do not have a guest workgroup-count tuple to compare with those dispatch filters.
+
 The setting changes scheduling and can hide timing-dependent faults. Keep the normal
 asynchronous run as a separate check. Unset the variable after diagnosis; no extra waits
 are added by default. The waits do not replace Vulkan or shader validation.

@@ -813,6 +813,13 @@ void EmitProgram(EmitterState& state) {
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
+	for (const auto variable: state.wave_ballot_word_variables) {
+		if (variable != 0) {
+			state.builder.AddFunction(
+			    {OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)), variable,
+			     StorageClassFunction});
+		}
+	}
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -852,7 +859,7 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
-	if (state.gds_variable != 0) {
+	if (state.gds_variable != 0 && HasGuestGdsAccess(state.program)) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
 		                          state.gds_variable, 0);

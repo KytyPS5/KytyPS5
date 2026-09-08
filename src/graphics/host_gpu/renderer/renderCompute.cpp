@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -30,6 +31,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -51,7 +54,9 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+	                                                const CommandBuffer& buffer, uint32_t group_x,
+	                                                uint32_t group_y, uint32_t group_z,
+	                                                uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -69,12 +74,24 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		ShaderBufferResource fill_descriptor {};
+		uint32_t             fill_value = 0;
+		uint64_t             fill_size  = 0;
+		const bool uniform_fill = ResolveComputeImageClear(
+		    input, group_x, group_y, group_z, mode, fill_descriptor, fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const bool known =
+				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
+				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
+				          : cache.ClearMeta(descriptor.Base48())) {
+					if (known) {
+						buffer.GetContext().GetBufferCache().FillBuffer(
+						    fill_descriptor.Base48(), fill_size, fill_value, false);
+					}
 					return true;
 				}
 			}
@@ -407,6 +424,73 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch((*dispatch_groups)[0], (*dispatch_groups)[1], (*dispatch_groups)[2]);
+
+	if (const char* readback_address = std::getenv("KYTY_COMPUTE_READBACK_ADDRESS");
+	    readback_address != nullptr && *readback_address != '\0' &&
+	    std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK") != nullptr) {
+		char* end = nullptr;
+		const auto address = std::strtoull(readback_address, &end, 0);
+		static std::atomic<uint32_t> readback_count = 0;
+		if (end != readback_address && *end == '\0') {
+			for (const auto& binding: bindings.resources.images) {
+				if (binding.desc.type != TextureCache::BindingType::Storage ||
+				    binding.desc.info.data.address != address ||
+				    readback_count.fetch_add(1, std::memory_order_relaxed) >= 16) {
+					continue;
+				}
+				const bool scheduled =
+				    m_context.GetTextureCache().TryDownloadImage(binding.image_id);
+				LOGF("ComputeReadback: shader=0x%016" PRIx64 " addr=0x%016" PRIx64
+				     " scheduled=%d\n",
+				     input_info.stage.program->shader_hash, address, scheduled ? 1 : 0);
+				static std::atomic<uint32_t> input_readback_count = 0;
+				if (std::getenv("KYTY_COMPUTE_READBACK_INPUTS") != nullptr &&
+				    input_readback_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					for (uint32_t image_index = 0;
+					     image_index < bindings.resources.images.size(); image_index++) {
+						const auto& image = program.info.images[image_index];
+						if (image.resource_class !=
+						    ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+							continue;
+						}
+						const auto& input = bindings.resources.images[image_index];
+						const bool input_scheduled =
+						    m_context.GetTextureCache().TryDownloadImage(input.image_id);
+						LOGF("ComputeReadbackInput: shader=0x%016" PRIx64
+						     " index=%u addr=0x%016" PRIx64 " scheduled=%d\n",
+						     input_info.stage.program->shader_hash, image_index,
+						     input.desc.info.data.address, input_scheduled ? 1 : 0);
+						if (std::getenv("KYTY_COMPUTE_READBACK_STATE") != nullptr) {
+							const auto& native =
+							    m_context.GetTextureCache().GetImage(input.image_id);
+							LOGF(
+							    "ComputeReadbackInputState: shader=0x%016" PRIx64
+							    " index=%u image=%u fmt=%u guest_fmt=%u tile=%u"
+							    " depth=%d usage=t%d/s%d/r%d/d%d/v%d"
+							    " dirty=g%d/b%d/c%d backing_fmt=%u layout=%u\n",
+							    input_info.stage.program->shader_hash, image_index,
+							    input.image_id.index,
+							    static_cast<uint32_t>(native.info.pixel_format),
+							    static_cast<uint32_t>(native.info.guest_format),
+							    static_cast<uint32_t>(native.info.tile_mode),
+							    native.info.IsDepth() ? 1 : 0,
+							    native.usage.texture ? 1 : 0,
+							    native.usage.storage ? 1 : 0,
+							    native.usage.render_target ? 1 : 0,
+							    native.usage.depth_target ? 1 : 0,
+							    native.usage.video_out ? 1 : 0,
+							    native.IsGpuModified() ? 1 : 0,
+							    native.IsBufferModified() ? 1 : 0,
+							    native.IsCpuDirty() ? 1 : 0,
+							    static_cast<uint32_t>(native.backing.format),
+							    static_cast<uint32_t>(native.backing.state.layout));
+						}
+					}
+				}
+				break;
+			}
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

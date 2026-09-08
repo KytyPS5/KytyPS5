@@ -728,8 +728,50 @@ private:
 		return UINT32_MAX;
 	}
 
+	struct AffineOffset {
+		Value    root;
+		uint32_t scale = 0;
+		uint32_t bias  = 0;
+	};
+
+	static AffineOffset Affine(Value value, uint32_t depth = 0) {
+		value = value.Resolve();
+		if (value.IsImmediate() && value.GetType() == Type::U32) return {{}, 0, value.U32()};
+		const AffineOffset opaque {value, 1, 0};
+		const auto*        inst = value.TryInstruction();
+		if (!inst || depth >= 32) return opaque;
+		const auto op = inst->GetOpcode();
+		if (op != ValueOpcode::IAdd32 && op != ValueOpcode::ISub32 && op != ValueOpcode::IMul32 &&
+		    op != ValueOpcode::ShiftLeftLogical32)
+			return opaque;
+		auto lhs = Affine(inst->Arg(0), depth + 1);
+		auto rhs = Affine(inst->Arg(1), depth + 1);
+		if (op == ValueOpcode::IAdd32 || op == ValueOpcode::ISub32) {
+			if (!lhs.root.IsEmpty() && !rhs.root.IsEmpty() && lhs.root != rhs.root) return opaque;
+			return {lhs.root.IsEmpty() ? rhs.root : lhs.root,
+			        op == ValueOpcode::IAdd32 ? lhs.scale + rhs.scale : lhs.scale - rhs.scale,
+			        op == ValueOpcode::IAdd32 ? lhs.bias + rhs.bias : lhs.bias - rhs.bias};
+		}
+		if (op == ValueOpcode::IMul32 && !rhs.root.IsEmpty()) std::swap(lhs, rhs);
+		if (!rhs.root.IsEmpty()) return opaque;
+		const uint32_t factor = op == ValueOpcode::IMul32 ? rhs.bias : 1u << (rhs.bias & 31u);
+		return {lhs.root, lhs.scale * factor, lhs.bias * factor};
+	}
+
 	bool EvaluateInst(const Inst& inst, std::vector<uint32_t>& out) {
 		const auto op = inst.GetOpcode();
+		if (op == ValueOpcode::IAdd32 || op == ValueOpcode::ISub32) {
+			const auto affine = Affine(Value(const_cast<Inst*>(&inst)));
+			if (!affine.root.IsEmpty() && affine.root.TryInstruction() != &inst) {
+				// Both terms can depend on the same GPU index, e.g. (i << 7) + (i << 5).
+				// A Cartesian product of their domains invents offsets into other fields.
+				// Unsigned arithmetic retains the shader's 32-bit wrapping behavior.
+				if (!Evaluate(affine.root, out)) return false;
+				for (auto& value: out)
+					value = value * affine.scale + affine.bias;
+				return true;
+			}
+		}
 		if (op == ValueOpcode::BitFieldUExtract) {
 			std::vector<uint32_t> values, offsets, widths;
 			if (!Evaluate(inst.Arg(0), values) || !Evaluate(inst.Arg(1), offsets) ||

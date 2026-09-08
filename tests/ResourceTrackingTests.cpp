@@ -2127,7 +2127,7 @@ BoundedSrtFixture MakeBoundedSrtTrackingFixture(BoundedSrtScenario scenario) {
 
 void TestBoundedSrtTrackingProofBoundaries() {
   for (auto scenario : {BoundedSrtScenario::NonzeroStart, BoundedSrtScenario::NonunitStep,
-                        BoundedSrtScenario::SignedGuard, BoundedSrtScenario::UnknownBound,
+                        BoundedSrtScenario::UnknownBound,
                         BoundedSrtScenario::ReadBeforeGuard, BoundedSrtScenario::WrongSuccessEdge,
                         BoundedSrtScenario::NonlinearOffset, BoundedSrtScenario::DynamicPointer,
                         BoundedSrtScenario::GuardedPointerLoad, BoundedSrtScenario::MixedDescriptorColumns,
@@ -2141,9 +2141,10 @@ void TestBoundedSrtTrackingProofBoundaries() {
               fixture.fixture->program.descriptor_sources.empty(),
           "rejected scalar descriptor loop mutated the tracked resource plan");
   }
-  std::cout << "bounded SRT rejection boundaries passed: 11\n";
+  std::cout << "bounded SRT rejection boundaries passed: 10\n";
   for (auto scenario : {BoundedSrtScenario::Valid, BoundedSrtScenario::ReversedGuard,
-                        BoundedSrtScenario::WrappedOffset, BoundedSrtScenario::SparseBlockIds}) {
+                        BoundedSrtScenario::WrappedOffset, BoundedSrtScenario::SparseBlockIds,
+                        BoundedSrtScenario::SignedGuard}) {
     auto fixture = MakeBoundedSrtTrackingFixture(scenario);
     fixture.fixture->PlanAndTrack();
     const auto &program = fixture.fixture->program;
@@ -2167,6 +2168,204 @@ void TestBoundedSrtTrackingProofBoundaries() {
           }), "bounded raw reads were discarded with a planning_only shortcut");
   }
 
+}
+
+struct DispatcherSignedBufferLoopFixture {
+  std::unique_ptr<Fixture> fixture;
+  std::array<Value, 4> descriptor_words;
+  Value index;
+};
+
+DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
+    bool bypass_count_guard = false, uint32_t step = 1u) {
+  DispatcherSignedBufferLoopFixture result;
+  result.fixture = std::make_unique<Fixture>();
+  auto& fixture = *result.fixture;
+  fixture.program.dispatcher_fallback = true;
+
+  auto* entry = fixture.block;
+  auto* header = fixture.AddBlock();
+  auto* mask_guard = fixture.AddBlock();
+  auto* body = fixture.AddBlock();
+  auto* latch = fixture.AddBlock();
+  auto* exit = fixture.AddBlock();
+  const auto Branch = [&](uint32_t from, uint32_t to) {
+    fixture.program.blocks[from]->AddBranch(fixture.program.blocks[to]);
+    auto& term = fixture.program.block_info[from].terminator;
+    term.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
+    term.true_block = to;
+  };
+  if (bypass_count_guard) {
+    entry->AddBranch(header);
+    entry->AddBranch(body);
+    auto& term = fixture.program.block_info[0];
+    term.terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    term.terminator.true_block = 1u;
+    term.terminator.false_block = 3u;
+    term.condition = fixture.Emit(ValueOpcode::INotEqual32,
+                                  {fixture.UserData(7u), Value(0u)}, 0, entry);
+  } else {
+    Branch(0u, 1u);
+  }
+  header->AddBranch(exit);
+  header->AddBranch(mask_guard);
+  auto& header_info = fixture.program.block_info[1];
+  header_info.terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  header_info.terminator.true_block = 5u;
+  header_info.terminator.false_block = 2u;
+  mask_guard->AddBranch(latch);
+  mask_guard->AddBranch(body);
+  auto& mask_info = fixture.program.block_info[2];
+  mask_info.terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  mask_info.terminator.true_block = 4u;
+  mask_info.terminator.false_block = 3u;
+  Branch(3u, 4u);
+  Branch(4u, 1u);
+  fixture.program.block_info[5].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+
+  fixture.block = entry;
+  const std::array<Value, 4> table_descriptor{
+      fixture.UserData(0u), fixture.UserData(1u), fixture.UserData(2u),
+      fixture.UserData(3u)};
+  const auto count = fixture.UserData(4u);
+  const auto enabled_mask = fixture.UserData(5u);
+  auto& phi = header->AppendNewInst(ValueOpcode::Phi, {},
+                                    static_cast<uint64_t>(Type::U32));
+  result.index = Value(&phi);
+  const auto next = fixture.Emit(ValueOpcode::IAdd32,
+                                 {result.index, Value(step)}, 0, latch);
+  phi.AddPhiOperand(entry, Value(0u));
+  phi.AddPhiOperand(latch, next);
+  const auto compare = fixture.Emit(ValueOpcode::SLessThan32,
+                                    {result.index, count}, 0, header);
+  header_info.condition =
+      fixture.Emit(ValueOpcode::LogicalNot, {compare}, 0, header);
+  const auto bit_index = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                      {result.index, Value(31u)}, 0, header);
+  const auto bit = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                {Value(1u), bit_index}, 0, header);
+  const auto enabled = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                    {enabled_mask, bit}, 0, header);
+  const auto enabled_nonzero = fixture.Emit(ValueOpcode::INotEqual32,
+                                            {enabled, Value(0u)}, 0, mask_guard);
+  mask_info.condition =
+      fixture.Emit(ValueOpcode::LogicalNot, {enabled_nonzero}, 0, mask_guard);
+
+  fixture.block = body;
+  const auto table = fixture.Buffer(table_descriptor, 0x62d0u);
+  const auto row = fixture.Emit(ValueOpcode::IMul32,
+                                {result.index, Value(196u)});
+  for (uint32_t word = 0u; word < result.descriptor_words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = word * sizeof(uint32_t);
+    memory.component_count = 4u;
+    memory.component_index = word;
+    result.descriptor_words[word] = fixture.Emit(
+        ValueOpcode::ReadConstBuffer, {table, row},
+        fixture.AddMemory(memory, 0x62d0u + word * sizeof(uint32_t)));
+  }
+  const auto selected = fixture.Buffer(result.descriptor_words, 0x656cu);
+  MemoryInfo load;
+  load.kind = ResourceKind::Buffer;
+  load.idxen = true;
+  const auto value = fixture.Emit(
+      ValueOpcode::LoadBufferU16,
+      {selected, Value(0u), Value(0u), Value(0u), Value(true)},
+      fixture.AddMemory(load, 0x6574u));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::ConvertU32U16, {value})});
+  return result;
+}
+
+void TestDispatcherSignedBufferLoop() {
+  auto accepted = MakeDispatcherSignedBufferLoopFixture();
+  accepted.fixture->PlanAndTrack();
+  const auto& program = accepted.fixture->program;
+  Check(program.resource_tracking_complete && program.info.buffers.size() == 1u &&
+            program.bounded_srt_reads.size() == 4u && !program.info.uses_dma,
+        "dispatcher signed loop did not retain one bounded buffer table");
+  for (const auto word : accepted.descriptor_words) {
+    const auto* read = word.Resolve().TryInstruction();
+    Check(read != nullptr && read->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 &&
+              read->Arg(0).Resolve() == accepted.index,
+          "dispatcher signed loop discarded its live induction index");
+  }
+  Check(std::ranges::all_of(program.bounded_srt_reads,
+                            [](const BoundedSrtRead& read) {
+                              return read.count_signed && read.offset_scale == 196u;
+                            }),
+        "dispatcher signed loop lost its signed count or 196-byte stride");
+
+  const auto plan = ExtractResourcePlan(program);
+  LinearTestMemory table;
+  table.words.resize((2u * 196u + 16u) / sizeof(uint32_t));
+  for (uint32_t row = 0u; row < 2u; ++row) {
+    const std::array<uint32_t, 4> descriptor{
+        0x20000u + row * 0x100u, 4u << 16u, 4u, 0u};
+    for (uint32_t word = 0u; word < descriptor.size(); ++word)
+      table.words[(row * 196u) / sizeof(uint32_t) + word] = descriptor[word];
+  }
+  std::array<uint32_t, 6> user_data{
+      static_cast<uint32_t>(table.base), 0u,
+      static_cast<uint32_t>(table.words.size() * sizeof(uint32_t)), 0u, 2u,
+      0xffffffffu};
+  const auto Materialize = [&](uint32_t count, ResourceSnapshot& snapshot,
+                               ResourceSpecialization& specialization) {
+    user_data[4] = count;
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_memory = ReadLinearTestMemory,
+                             .userdata = &table,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const bool materialized = Materialize(2u, snapshot, specialization);
+  const bool two_rows = materialized && specialization.buffer_tables.size() == 1u &&
+                        specialization.buffer_tables[0].count == 2u &&
+                        snapshot.buffers.size() == 2u &&
+                        snapshot.flattened_srt.size() == 10u &&
+                        snapshot.buffers[0].dwords[0] == 0x20000u &&
+                        snapshot.buffers[1].dwords[0] == 0x20100u;
+  if (!two_rows) {
+    std::cerr << "dispatcher signed materialization: accepted=" << materialized
+              << " tables=" << specialization.buffer_tables.size()
+              << " table_count="
+              << (specialization.buffer_tables.empty()
+                      ? UINT32_MAX
+                      : specialization.buffer_tables[0].count)
+              << " buffers=" << snapshot.buffers.size()
+              << " flat=" << snapshot.flattened_srt.size() << '\n';
+  }
+  Check(two_rows,
+        "dispatcher signed buffer table did not materialize two 196-byte rows");
+  for (const auto count : {0u, 0xffffffffu}) {
+    snapshot = {};
+    specialization = {};
+    Check(Materialize(count, snapshot, specialization) &&
+              specialization.buffer_tables.size() == 1u &&
+              specialization.buffer_tables[0].count == 0u &&
+              snapshot.buffers.empty() && snapshot.flattened_srt.empty(),
+          "non-positive signed loop count did not materialize zero rows");
+  }
+
+  for (const auto [bypass_count_guard, step] :
+       {std::pair{true, 1u}, std::pair{false, 2u}}) {
+    auto rejected =
+        MakeDispatcherSignedBufferLoopFixture(bypass_count_guard, step);
+    BuildSrtPlan(rejected.fixture->program);
+    CheckFatal([&] { TrackResources(rejected.fixture->program); },
+               "not a valid runtime value",
+               "unsafe dispatcher descriptor loop was accepted");
+    Check(!rejected.fixture->program.resource_tracking_complete &&
+              rejected.fixture->program.info.buffers.empty(),
+          "rejected dispatcher loop partially changed resource tracking");
+  }
 }
 
 void TestPhiValidation() {
@@ -4026,6 +4225,11 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--dispatcher-signed-buffer-loop-only") == 0) {
+      TestDispatcherSignedBufferLoop();
+      std::cout << "KYTY_DISPATCHER_SIGNED_BUFFER_LOOP_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--inline-buffer-table-only") == 0) {
       TestInlineBufferDescriptorTable();
       std::cout << "KYTY_INLINE_BUFFER_TABLE_PASS\n";
@@ -4093,6 +4297,7 @@ int main(int argc, char** argv) {
     Run("inline full-width images", TestInlineFullWidthImages);
     Run("inline image address table", TestInlineImageAddressTable);
     Run("inline buffer descriptor table", TestInlineBufferDescriptorTable);
+    Run("dispatcher signed buffer loop", TestDispatcherSignedBufferLoop);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("raw fallback readability", TestSrtRawFallbackReadability);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

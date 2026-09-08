@@ -1267,7 +1267,10 @@ public:
 			trace_reject("offset");
 			return {};
 		}
-		if (m_program.dispatcher_fallback ? !BuildBlockIndex() : !BuildGraph()) return {};
+		// Dispatcher emission still preserves the complete guest CFG. Validate it
+		// here as well so the canonical Phi/guard proof below can be reused without
+		// assuming that the whole program was structurizable.
+		if (!BuildGraph()) return {};
 		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
 		if (m_program.dispatcher_fallback && workgroup) return {};
 		if (workgroup) {
@@ -1362,7 +1365,6 @@ public:
 			    .memory_offset = memory.offset,
 			    .workgroup_axis = workgroup ? offset.index->Arg(1).Resolve().U32() : UINT32_MAX};
 		}
-		if (m_program.dispatcher_fallback) return {};
 		const auto* phi = offset.index;
 		if (phi->GetOpcode() != ValueOpcode::Phi) return {};
 		const auto* header = phi->Parent();

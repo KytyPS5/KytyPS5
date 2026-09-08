@@ -836,8 +836,8 @@ Required tests:
 
 ## Guarded inline scalar-buffer descriptor tables
 
-Status: synthetic RED/GREEN, neighboring rejection boundaries and bounded native game retry pass;
-the first nonzero frame remains pending.
+Status: synthetic RED/GREEN for the constant guarded-selector shape; exact Yōtei applicability
+was disproved by a later captured variant.
 
 Observed trigger: compute shader `6cc64dee32dc7094` reads four correlated descriptor DWORDs
 with `S_BUFFER_LOAD_DWORDX4`, using one loop-carried `ReadFirstLane(Phi)` selector multiplied
@@ -853,15 +853,47 @@ Unguarded selectors and mismatched descriptor columns retain the prior closed fa
 `_Build/logs/inline-buffer-table-red-20260908-v2.txt`; the unchanged selector and its two
 negative boundaries are GREEN in `_Build/logs/inline-buffer-table-green-20260908-v2.txt`.
 
-Remaining validation:
+Validation correction:
 
-- Preserve the game result from `_Build/runs/yotei-integrated-20260908-131508-5d7cde`: frame 179,
-  shown 164, clean 300-second timeout and no former PC `0x656c` fatal. Its 55 source readbacks at
-  frames 110–164 remain RGB zero with alpha 3, so this does not claim a rendered frame.
+- `_Build/runs/yotei-integrated-20260908-131508-5d7cde` reached frame 179 but did not compile the
+  problematic `6cc64dee32dc7094` variant, so it cannot validate PC `0x656c`.
+- `_Build/runs/yotei-integrated-20260908-132617-aaa93b` later reproduced PC `0x656c`; the exact
+  variant uses a signed runtime Phi loop, stride 196 and an additional mask guard rather than the
+  constant guarded-selector shape. This mechanism remains neighboring coverage, not the game fix.
 - Add stride overflow/wrap, zero/OOB descriptors, unreadable/GPU-dirty backing, duplicate
   candidates, write-alias and 128-resource limit cases.
 - Repair the pre-existing full `resource_tracking_tests` failure in the invariant indirect-image
   wrapped-immediate boundary; it occurs before the inline-table cases and is not counted GREEN.
+
+## Dispatcher signed scalar-buffer descriptor loops
+
+Status: synthetic RED/GREEN, exact captured-manifest audit and bounded native game retry pass;
+the first nonzero frame remains pending.
+
+Observed trigger: dispatcher compute shader `6cc64dee32dc7094` reads four correlated descriptor
+DWORDs through an induction Phi starting at zero, unit increment, signed runtime count, an extra
+bit-mask guard and 196-byte table rows. The existing `BoundedReadProof` already defined strict
+signed-loop semantics, but the dispatcher path built only block indices and rejected the program
+before canonical Phi proof.
+
+The shared correction always builds the dispatcher graph and admits it to the same proof only
+after the full CFG validates. RED `_Build/logs/dispatcher-signed-buffer-loop-red-20260908.txt`
+failed at `GetBufferResource dword 0`; unchanged GREEN
+`_Build/logs/dispatcher-signed-buffer-loop-green-20260908.txt` covers the positive two-row table,
+zero and negative counts, bypassed count guard and non-unit increment. Exact audit
+`_Build/logs/6cc64dee-dispatcher-signed-green-20260908.stdout.txt` completes resource tracking.
+
+Bounded GPUAV run `_Build/runs/yotei-integrated-20260908-140320-cf909d` reaches frame 139, 124
+shown frames and passes PC `0x656c`. The next fatal is `indirect image table at pc 0x000007c4 has
+incompatible candidates`; it is a separate heterogeneous-image resource class and the next RED
+target. No source readback was recorded in that quiet run.
+
+Remaining validation:
+
+- Add signed-overflow/`INT32_MAX`, cyclic bound provenance, multiple latches and dirty-memory
+  transactional boundaries without weakening the current fail-closed proof.
+- Reproduce the exact PC `0x7c4` image candidates and evaluate PR #383 against the current
+  immutable/null/comparison/device-limit resource model.
 
 ## Signed integer storage images
 

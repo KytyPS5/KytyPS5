@@ -277,10 +277,10 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		                                           "memory invalidation");
 	    },
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
+		    m_gpu_modified_ranges.ForEachIntersection(address, bytes, [&](RangeSet::Range range) {
 			    copies.push_back(
 			        {&buffer, buffer.Offset(range.address), range.address, range.size});
-		    }
+		    });
 	    });
 	if (!copies.empty()) {
 		DownloadBufferMemory(copies);

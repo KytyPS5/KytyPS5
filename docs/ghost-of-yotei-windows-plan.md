@@ -3,6 +3,36 @@
 Обновлено **8 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Текущий performance/runtime checkpoint **8 сентября 2026, 20:04–20:12 UTC**
+проверил `f1776f0` на RTX 5060 Ti. Общая CFG-правка ограничивает semantic
+shared-tail cloning размером локального региона, а не размером всего shader.
+Exact `6cc64dee32dc7094` больше не падает в dispatcher fallback: structured CFG
+имеет 376 blocks, а полный audit этого manifest сократился примерно с 13,02 до
+3,45 с. Полный corpus `_Build/shader-audits/yotei-local-region-clone-20260908`
+дал **743/825 passed, 82 failed за 37,851 с** против 741/825 за 57,019 с; новых
+status regressions нет. Synthetic selector `--shared-merge-cfg-only`, exact
+manifest и патологический соседний manifest GREEN/bounded.
+
+Холодный GPUAV-lite run
+`_Build/runs/yotei-integrated-20260908-200400-74722b` завершился сам за 145 с
+на frame 133 / 119 shown вместо 1123 с у сопоставимого диагностического run:
+время до нового фронтира улучшилось примерно в **7,7 раза**. Кратковременно до
+тяжёлого участка наблюдалось около 2,73 FPS против прежних 0,062 FPS. Новый
+decoder fatal — compute shader `c8e8f554efbfadef`, MUBUF opcode `0x87`, raw
+`[0xe21c6000 0x8002000e]`, PC `0xc6c`. Прогретый GPUAV-lite run
+`_Build/runs/yotei-integrated-20260908-201027-d8c982` завершился сам за 120 с на
+frame 130 / 117 shown; 118 source readbacks 480x270 имеют `colored=0`, RGB=0 и
+alpha=3. Первый ненулевой кадр остаётся **PENDING**.
+
+Отключение GPUAV пока не является безопасным fast path. Два bounded запуска без
+GPUAV на frame 12/13 воспроизвели одинаковый Windows APPCRASH внутри
+`nvgpucomp64.dll` 32.0.16.1664 с exception `0x80000003`; это не emulator fatal.
+GPUAV и non-GPUAV driver cache сохранены отдельными файлами, смешивать их нельзя
+до отдельной cache-identity/driver regression. Для следующих correctness
+итераций остаётся GPUAV-lite с прогретым cache: дорогой 15-минутный stall уже
+устранён, а следующий обязательный шаг — RED/общая реализация MUBUF `0x87` и
+повторный source readback, а не ожидание дополнительных кадров.
+
 Текущий runtime checkpoint **8 сентября 2026, 17:19–17:50 UTC** проверил
 `672af1f` на RTX 5060 Ti с GPU-assisted validation lite и source readback.
 Процесс завершился сам, не по таймауту: exit code `321`, frame 222, 193 GPU

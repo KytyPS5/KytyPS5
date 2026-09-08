@@ -517,23 +517,30 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	const auto format = desc.info.pixel_format;
-	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
+	const auto key = static_cast<uint64_t>(desc.info.pixel_format) |
+	                 (static_cast<uint64_t>(desc.info.type) << 32u) |
+	                 (static_cast<uint64_t>(desc.info.samples) << 40u);
+	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = desc.info.type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
-	info.samples         = 1;
+	info.samples         = desc.info.samples;
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	// Null descriptors have no guest bytes to upload. Initialize their backing once
+	// so any valid speculative sample observes deterministic zero texels.
+	const auto aspect =
+	    info.IsDepth() ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+	ClearImage(m_scheduler.Current(), id, {aspect, 0, 1, 0, 1}, vk::ClearValue {});
+	m_null_images.emplace(key, id);
 	return id;
 }
 

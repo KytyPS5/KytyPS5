@@ -420,7 +420,8 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			break;
 		default: EXIT("null image has unsupported numeric class\n");
 	}
-	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+	desc.info.pixel_format    = resource.depth_compare ? vk::Format::eD32Sfloat
+	                                                  : VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
@@ -429,7 +430,39 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
-	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	// Null descriptors must retain the shader's dimension and multisample class.
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	switch (resource.dimension) {
+		case Dimension::Dim1D:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1D;
+			break;
+		case Dimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1DArray;
+			break;
+		case Dimension::Dim2DArray:
+			desc.info.type      = Prospero::ImageType::kColor2D;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		case Dimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case Dimension::Dim2DMsaa:
+			desc.info.type    = Prospero::ImageType::kColor2D;
+			desc.info.samples = 2;
+			break;
+		case Dimension::Dim2DMsaaArray:
+			desc.info.type      = Prospero::ImageType::kColor2D;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			desc.info.samples   = 2;
+			break;
+		case Dimension::Dim2D: break;
+		default: EXIT("null image has unsupported dimension\n");
+	}
+	desc.view_info.aspect =
+	    resource.depth_compare ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;

@@ -1250,6 +1250,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
+		// A release label permits the CPU and other queues to reuse preceding resources.
+		// Publishing it while that work is only recorded exposes incomplete GPU writes.
+		SynchronizeGpu();
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1300,6 +1303,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					SynchronizeGpu();
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1388,6 +1392,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			break;
 		case 0x04:
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
+				SynchronizeGpu();
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
 				std::memcpy(dst, &clock, sizeof(clock));
@@ -1581,6 +1586,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	SynchronizeGpu();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
@@ -1607,6 +1613,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	SynchronizeGpu();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,

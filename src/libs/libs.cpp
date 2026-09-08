@@ -18,6 +18,10 @@ namespace LibContentSearch {
 LIB_DEFINE(InitContentSearch_1);
 } // namespace LibContentSearch
 
+namespace Vdecsw {
+LIB_DEFINE(InitVdecsw_1);
+}
+
 namespace VideoDec2 {
 LIB_DEFINE(InitVideoDec2_1);
 } // namespace VideoDec2
@@ -135,6 +139,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LibUlt::InitUlt_1(s);
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
+	Vdecsw::InitVdecsw_1(s);
 	LibGen5::InitVideoOut_1(s);
 	InitWebBrowserDialog_1(s);
 }

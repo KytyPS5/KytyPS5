@@ -7,8 +7,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace Libs {
 
@@ -667,5 +671,345 @@ LIB_DEFINE(InitVideoDec2_1) {
 }
 
 } // namespace VideoDec2
+
+// The software video API shares the decoder configuration prefix and memory layout
+// with Videodec2, but extends its configuration to 80 bytes on this platform.
+namespace Vdecsw {
+
+LIB_VERSION("Vdecsw", 1, "Vdecsw", 1, 1);
+using namespace VideoDec2;
+constexpr size_t WorkspaceBytes = 256;
+constexpr size_t ConfigSize     = 80;
+
+constexpr int32_t OutputPending = static_cast<int32_t>(0x81510115u);
+// The input caller retries 0x114 after yielding to the output consumer.
+constexpr int32_t InputQueueFull = static_cast<int32_t>(0x81510114u);
+constexpr int32_t InputClosed    = static_cast<int32_t>(0x81510113u);
+constexpr int32_t InputDrained   = static_cast<int32_t>(0x81510116u);
+constexpr int32_t NoCompletion   = static_cast<int32_t>(0x81510117u);
+
+static int32_t SoftwareError(int32_t result) {
+	return result == OK
+	           ? OK
+	           : static_cast<int32_t>(0x81510000u | (static_cast<uint32_t>(result) & 0xffffu));
+}
+
+struct SoftwareFrameBuffer {
+	size_t this_size;
+	void*  frame_buffer;
+	size_t frame_buffer_size;
+};
+
+struct SoftwareOutput {
+	size_t   this_size;
+	bool     is_valid;
+	bool     is_end_of_stream;
+	bool     is_error_frame;
+	uint8_t  picture_count;
+	uint32_t codec_type;
+	uint32_t frame_width;
+	uint32_t frame_pitch;
+	uint32_t frame_height;
+	void*    frame_buffer;
+	size_t   frame_buffer_size;
+	uint32_t frame_format;
+	uint32_t frame_pitch_in_bytes;
+};
+
+struct SoftwareInputCompletion {
+	size_t   this_size;
+	uint64_t reserved;
+	uint32_t consumed_count;
+	uint32_t padding;
+};
+
+static_assert(sizeof(SoftwareFrameBuffer) == 24);
+static_assert(sizeof(SoftwareOutput) == 56 && offsetof(SoftwareOutput, picture_count) == 11);
+static_assert(sizeof(SoftwareInputCompletion) == 24 &&
+              offsetof(SoftwareInputCompletion, consumed_count) == 16);
+
+struct SoftwareInput {
+	Videodec2InputData   info;
+	std::vector<uint8_t> bytes;
+};
+
+struct SoftwareQueue {
+	uint32_t                        depth              = 1;
+	uint32_t                        consumed           = 0;
+	size_t                          queued_input_bytes = 0;
+	bool                            finishing          = false;
+	bool                            drained            = false;
+	int32_t                         error              = OK;
+	std::deque<SoftwareInput>       inputs;
+	std::deque<SoftwareFrameBuffer> buffers;
+	std::deque<Decoder::Output>     outputs;
+};
+
+static std::mutex                                          g_software_mutex;
+static std::unordered_map<Videodec2Decoder, SoftwareQueue> g_software_queues;
+
+// Run only with g_software_mutex held. An output reservation survives input AUs
+// that produce no frame (including decoder reordering delay).
+static void Pump(Decoder::Instance* decoder, SoftwareQueue& queue) {
+	while (queue.error == OK && !queue.drained && !queue.buffers.empty()) {
+		const auto&     buffer = queue.buffers.front();
+		Decoder::Output decoded {};
+		Decoder::Result result;
+		if (!queue.inputs.empty()) {
+			const auto& input = queue.inputs.front();
+			result = Decoder::Decode(decoder,
+			                         {input.bytes.data(), input.bytes.size(), input.info.pts_data,
+			                          input.info.dts_data, input.info.attached_data},
+			                         {buffer.frame_buffer, buffer.frame_buffer_size}, &decoded);
+			queue.queued_input_bytes -= input.bytes.size();
+			queue.inputs.pop_front();
+		} else if (queue.finishing) {
+			result =
+			    Decoder::Drain(decoder, {buffer.frame_buffer, buffer.frame_buffer_size}, &decoded);
+			if (result == Decoder::Result::Ok && !decoded.valid) queue.drained = true;
+		} else {
+			break;
+		}
+		queue.error = SoftwareError(MapDecoderResult(result));
+		if (decoded.valid) {
+			queue.drained |= decoded.end_of_stream;
+			queue.outputs.push_back(decoded);
+			queue.buffers.pop_front();
+		}
+	}
+}
+
+static int32_t KYTY_SYSV_ABI SetDecodeInput(Videodec2Decoder          decoder,
+                                            const Videodec2InputData* input) {
+	if (input == nullptr) return SoftwareError(VIDEODEC2_ERROR_ARGUMENT_POINTER);
+	if (input->this_size != sizeof(*input)) return SoftwareError(VIDEODEC2_ERROR_STRUCT_SIZE);
+	if (input->au_data == nullptr) return SoftwareError(VIDEODEC2_ERROR_ACCESS_UNIT_POINTER);
+	if (input->au_size == 0 || input->au_size > INT32_MAX)
+		return SoftwareError(VIDEODEC2_ERROR_ACCESS_UNIT_SIZE);
+	std::scoped_lock lock(g_software_mutex);
+	const auto       found = g_software_queues.find(decoder);
+	if (found == g_software_queues.end()) return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	auto& queue = found->second;
+	if (queue.finishing) return InputClosed;
+	// Queue depth limits guest inputs awaiting completion. Copied packets no
+	// longer borrow those inputs, and must not occupy their submission slots.
+	// Bound the private compressed-data backlog separately so paused output
+	// can exert backpressure without an unbounded allocation.
+	constexpr size_t MaxQueuedInputBytes = 64u * 1024u * 1024u;
+	if (queue.consumed >= queue.depth ||
+	    (!queue.inputs.empty() &&
+	     (queue.queued_input_bytes >= MaxQueuedInputBytes ||
+	      input->au_size > MaxQueuedInputBytes - queue.queued_input_bytes))) {
+		return InputQueueFull;
+	}
+	const auto* bytes = static_cast<const uint8_t*>(input->au_data);
+	queue.inputs.push_back({*input, std::vector<uint8_t>(bytes, bytes + input->au_size)});
+	queue.queued_input_bytes += input->au_size;
+	// The queue owns a copy, so the caller can reuse this input buffer immediately.
+	// Input completion must not wait for a frame buffer or decoder finalization.
+	++queue.consumed;
+	Pump(static_cast<Decoder::Instance*>(decoder), queue);
+	return queue.error;
+}
+
+static int32_t KYTY_SYSV_ABI SetDecodeOutput(Videodec2Decoder           decoder,
+                                             const SoftwareFrameBuffer* buffer) {
+	if (buffer == nullptr) return SoftwareError(VIDEODEC2_ERROR_ARGUMENT_POINTER);
+	if (buffer->this_size != sizeof(*buffer)) return SoftwareError(VIDEODEC2_ERROR_STRUCT_SIZE);
+	if (buffer->frame_buffer == nullptr) return SoftwareError(VIDEODEC2_ERROR_FRAME_BUFFER_POINTER);
+	if (buffer->frame_buffer_size == 0) return SoftwareError(VIDEODEC2_ERROR_FRAME_BUFFER_SIZE);
+	std::scoped_lock lock(g_software_mutex);
+	const auto       found = g_software_queues.find(decoder);
+	if (found == g_software_queues.end()) return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	auto& queue = found->second;
+	queue.buffers.push_back(*buffer);
+	Pump(static_cast<Decoder::Instance*>(decoder), queue);
+	return queue.error;
+}
+
+static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(Videodec2Decoder decoder, SoftwareOutput* output) {
+	if (output == nullptr) return SoftwareError(VIDEODEC2_ERROR_ARGUMENT_POINTER);
+	if (output->this_size != sizeof(*output)) return SoftwareError(VIDEODEC2_ERROR_STRUCT_SIZE);
+	std::scoped_lock lock(g_software_mutex);
+	const auto       found = g_software_queues.find(decoder);
+	if (found == g_software_queues.end()) return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	auto& queue = found->second;
+	*output     = {.this_size = sizeof(*output)};
+	Pump(static_cast<Decoder::Instance*>(decoder), queue);
+	if (queue.error != OK) return queue.error;
+	if (queue.outputs.empty()) return queue.drained ? NoCompletion : OutputPending;
+	const auto decoded = queue.outputs.front();
+	queue.outputs.pop_front();
+	*output = {.this_size            = sizeof(*output),
+	           .is_valid             = true,
+	           .is_end_of_stream     = decoded.end_of_stream,
+	           .is_error_frame       = decoded.error_frame,
+	           .picture_count        = 1,
+	           .codec_type           = decoded.codec_type,
+	           .frame_width          = decoded.width,
+	           .frame_pitch          = decoded.pitch,
+	           .frame_height         = decoded.height,
+	           .frame_buffer         = decoded.buffer,
+	           .frame_buffer_size    = decoded.buffer_size,
+	           .frame_pitch_in_bytes = decoded.pitch};
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI TrySyncDecodeInput(Videodec2Decoder         decoder,
+                                                SoftwareInputCompletion* completion) {
+	if (completion == nullptr) return SoftwareError(VIDEODEC2_ERROR_ARGUMENT_POINTER);
+	if (completion->this_size != sizeof(*completion))
+		return SoftwareError(VIDEODEC2_ERROR_STRUCT_SIZE);
+	std::scoped_lock lock(g_software_mutex);
+	const auto       found = g_software_queues.find(decoder);
+	if (found == g_software_queues.end()) return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	auto& queue = found->second;
+	Pump(static_cast<Decoder::Instance*>(decoder), queue);
+	*completion = {.this_size      = sizeof(*completion),
+	               .consumed_count = std::exchange(queue.consumed, 0u)};
+	if (queue.error != OK) return queue.error;
+	if (completion->consumed_count != 0) return OK;
+	// No guest input buffers remain borrowed, even when copied AUs still await
+	// decoding. Clients use this result to decide when to call FinalizeDecode.
+	return InputDrained;
+}
+
+static int32_t KYTY_SYSV_ABI FinalizeDecode(Videodec2Decoder decoder) {
+	std::scoped_lock lock(g_software_mutex);
+	const auto       found = g_software_queues.find(decoder);
+	if (found == g_software_queues.end()) return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	auto& queue     = found->second;
+	queue.finishing = true;
+	Pump(static_cast<Decoder::Instance*>(decoder), queue);
+	return queue.error;
+}
+
+static int32_t KYTY_SYSV_ABI GetAvcPictureInfo(const SoftwareOutput* output, void* first,
+                                               void* second) {
+	if (output == nullptr) return SoftwareError(VIDEODEC2_ERROR_ARGUMENT_POINTER);
+	if (output->this_size != sizeof(*output)) return SoftwareError(VIDEODEC2_ERROR_STRUCT_SIZE);
+	// Vdecsw adds stream completion before the error flag in its output prefix.
+	Videodec2OutputInfo common {};
+	std::memcpy(&common, output, sizeof(common));
+	common.picture_count      = output->picture_count;
+	common.is_error_frame     = output->is_error_frame;
+	common.is_discarded_frame = false;
+	return SoftwareError(VideoDec2::GetPictureInfo(&common, first, second));
+}
+
+static int32_t KYTY_SYSV_ABI DeleteSoftwareDecoder(Videodec2Decoder decoder) {
+	std::scoped_lock lock(g_software_mutex);
+	if (g_software_queues.erase(decoder) == 0)
+		return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	return SoftwareError(VideoDec2::DeleteDecoder(decoder));
+}
+
+static int32_t KYTY_SYSV_ABI ResetSoftwareDecoder(Videodec2Decoder decoder) {
+	std::scoped_lock lock(g_software_mutex);
+	const auto       found = g_software_queues.find(decoder);
+	if (found == g_software_queues.end()) return SoftwareError(VIDEODEC2_ERROR_DECODER_INSTANCE);
+	const auto depth = found->second.depth;
+	found->second    = {.depth = depth};
+	return SoftwareError(VideoDec2::Reset(decoder));
+}
+
+static int32_t ValidateConfig(const Videodec2DecoderConfigInfo* config, bool require_queue) {
+	// Vdecsw assigns flags to the two bytes that Videodec2 reserves at offsets 62/63.
+	// Validate the shared fields using a copy; do not reject those Vdecsw flags or
+	// modify the caller's larger configuration object.
+	auto common      = *config;
+	common.this_size = sizeof(common);
+	common.reserved0 = common.reserved1 = 0;
+	return ValidateDecoderConfig(&common, require_queue);
+}
+
+static int32_t KYTY_SYSV_ABI QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* info) {
+	if (info == nullptr) return VIDEODEC2_ERROR_ARGUMENT_POINTER;
+	if (info->this_size != sizeof(*info)) return VIDEODEC2_ERROR_STRUCT_SIZE;
+	// FFmpeg owns its decoding allocations. This guest reservation identifies the
+	// compute queue; no GPU compute work area is needed by the software backend.
+	info->cpu_gpu_memory_size = WorkspaceBytes;
+	info->cpu_gpu_memory      = nullptr;
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI AllocateComputeQueue(const Videodec2ComputeConfigInfo* config,
+                                                  const Videodec2ComputeMemoryInfo* memory,
+                                                  Videodec2ComputeQueue*            queue) {
+	if (config == nullptr || memory == nullptr || queue == nullptr)
+		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
+	if (config->this_size != sizeof(*config) || memory->this_size != sizeof(*memory))
+		return VIDEODEC2_ERROR_STRUCT_SIZE;
+	if (config->reserved0 != 0 || config->reserved1 != 0) return VIDEODEC2_ERROR_CONFIG_INFO;
+	if (config->compute_pipe_id > 4) return VIDEODEC2_ERROR_COMPUTE_PIPE_ID;
+	if (config->compute_queue_id > 7) return VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
+	if (memory->cpu_gpu_memory_size < WorkspaceBytes) return VIDEODEC2_ERROR_MEMORY_SIZE;
+	if (memory->cpu_gpu_memory == nullptr) return VIDEODEC2_ERROR_MEMORY_POINTER;
+	*queue = memory->cpu_gpu_memory;
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
+                                                    Videodec2DecoderMemoryInfo*       memory) {
+	if (config == nullptr || memory == nullptr) return VIDEODEC2_ERROR_ARGUMENT_POINTER;
+	if (config->this_size != ConfigSize || memory->this_size != sizeof(*memory))
+		return VIDEODEC2_ERROR_STRUCT_SIZE;
+	const auto validation = ValidateConfig(config, false);
+	if (validation != OK) return validation;
+	const uint64_t width  = config->max_frame_width > 0 ? config->max_frame_width : 4096u;
+	const uint64_t height = config->max_frame_height > 0 ? config->max_frame_height : 2160u;
+	const auto     pitch  = (width + 255u) & ~uint64_t {255};
+	*memory               = {.this_size              = sizeof(*memory),
+	                         .cpu_memory_size        = WorkspaceBytes,
+	                         .max_frame_buffer_size  = pitch * (height + (height + 1u) / 2u),
+	                         .frame_buffer_alignment = 256};
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* config,
+                                           const Videodec2DecoderMemoryInfo* memory,
+                                           Videodec2Decoder*                 decoder) {
+	if (config == nullptr || memory == nullptr || decoder == nullptr)
+		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
+	if (config->this_size != ConfigSize || memory->this_size != sizeof(*memory))
+		return VIDEODEC2_ERROR_STRUCT_SIZE;
+	const auto validation = ValidateConfig(config, true);
+	if (validation != OK) return validation;
+	if (memory->cpu_memory_size < WorkspaceBytes) return VIDEODEC2_ERROR_MEMORY_SIZE;
+	if (memory->cpu_memory == nullptr) return VIDEODEC2_ERROR_MEMORY_POINTER;
+	auto* state =
+	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height});
+	if (state == nullptr) return VIDEODEC2_ERROR_API_FAIL;
+	{
+		std::scoped_lock lock(g_decoder_mutex);
+		g_decoders.insert(state);
+	}
+	{
+		std::scoped_lock lock(g_software_mutex);
+		SoftwareQueue    queue;
+		queue.depth = config->decode_input_queue_depth;
+		g_software_queues.emplace(state, std::move(queue));
+	}
+	*decoder = state;
+	return OK;
+}
+
+LIB_DEFINE(InitVdecsw_1) {
+	LIB_FUNC("0moTubWCsTM", Vdecsw::QueryComputeMemoryInfo);
+	LIB_FUNC("hIgrg5h4V6s", Vdecsw::AllocateComputeQueue);
+	LIB_FUNC("A+2M7EivuOU", Vdecsw::QueryDecoderMemoryInfo);
+	LIB_FUNC("+L5ArV1tPGA", Vdecsw::CreateDecoder);
+	LIB_FUNC("ecUtPX+dBYk", Vdecsw::DeleteSoftwareDecoder);
+	LIB_FUNC("fX-zOOefbbs", VideoDec2::ReleaseComputeQueue);
+	LIB_FUNC("veb-YBrOqo0", Vdecsw::ResetSoftwareDecoder);
+	LIB_FUNC("aqMiF0AgUYI", Vdecsw::SetDecodeInput);
+	LIB_FUNC("rgtMCOpyBSc", Vdecsw::SetDecodeOutput);
+	LIB_FUNC("kMBw37oH8nI", Vdecsw::TrySyncDecodeOutput);
+	LIB_FUNC("l4sQYy5wPkc", Vdecsw::TrySyncDecodeInput);
+	LIB_FUNC("ihNT-uuEAr4", Vdecsw::GetAvcPictureInfo);
+	LIB_FUNC("5Y6nZqIZvBg", Vdecsw::FinalizeDecode);
+}
+
+} // namespace Vdecsw
 
 } // namespace Libs

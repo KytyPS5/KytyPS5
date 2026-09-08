@@ -283,7 +283,8 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i), handle.Parent());
+			descriptor.dwords[i] = LowerDescriptorPhi(
+			    ResolveResourcePhi(m_program, handle.Arg(i), pc), handle.Parent());
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);

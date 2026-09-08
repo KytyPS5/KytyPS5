@@ -21,6 +21,41 @@ void Replace(Inst& inst, Value value) {
 	inst.ReplaceUsesWith(value.Resolve());
 }
 
+bool FoldMaskedConstantShift(Inst& inst) {
+	for (size_t side = 0; side < 2; ++side) {
+		const auto  mask    = Arg(inst, side);
+		const auto* shifted = Arg(inst, 1 - side).TryInstruction();
+		if (!IsImmediate(mask, Type::U32)) continue;
+		if (mask.U32() == 0) {
+			Replace(inst, Value(0u));
+			return true;
+		}
+		if (shifted == nullptr) continue;
+		const auto op = shifted->GetOpcode();
+		if (op != ValueOpcode::ShiftRightLogical32 && op != ValueOpcode::ShiftLeftLogical32)
+			continue;
+		const auto source = Arg(*shifted, 0);
+		if (!IsImmediate(source, Type::U32)) continue;
+		const auto expected  = source.U32() & mask.U32();
+		bool       invariant = true;
+		for (uint32_t shift = 1; shift < 32; ++shift) {
+			const auto value = op == ValueOpcode::ShiftRightLogical32 ? source.U32() >> shift
+			                                                          : source.U32() << shift;
+			if ((value & mask.U32()) != expected) {
+				invariant = false;
+				break;
+			}
+		}
+		// Shift counts are masked to five bits. This proves the result for every
+		// lane, including execution-mask tests of (0xffffffff >> lane) & 1.
+		if (invariant) {
+			Replace(inst, Value(expected));
+			return true;
+		}
+	}
+	return false;
+}
+
 template <typename Function>
 bool FoldU32(Inst& inst, Function function) {
 	const auto lhs = Arg(inst, 0);
@@ -414,6 +449,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		}
 		case ValueOpcode::ShiftLeftLogical32:
 			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a << (b & 31u); })) {
+				if (Arg(inst, 0) == Value(0u)) {
+					Replace(inst, Value(0u));
+					return;
+				}
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 31u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -422,6 +461,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::ShiftRightLogical32:
 			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a >> (b & 31u); })) {
+				if (Arg(inst, 0) == Value(0u)) {
+					Replace(inst, Value(0u));
+					return;
+				}
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 31u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -455,7 +498,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) &&
+			    !FoldMaskedConstantShift(inst)) {
 				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
 			}
 			return;

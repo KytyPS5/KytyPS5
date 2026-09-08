@@ -1455,8 +1455,16 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 
 bool CloneExternallyEnteredLinearTail(Graph& graph, uint32_t header, uint32_t merge,
 	                                  const std::vector<uint32_t>& region) {
-	constexpr size_t kMaxSemanticCloneGraphBlocks = 192;
-	if (graph.blocks.size() > kMaxSemanticCloneGraphBlocks) {
+	// Bound the construct being rewritten rather than unrelated blocks in the module.
+	// SplitSharedMergeBlocks separately caps the number of clones.
+	constexpr size_t MaxSemanticCloneRegionBlocks = 32;
+	if (region.size() > MaxSemanticCloneRegionBlocks) {
+		return false;
+	}
+	if (std::ranges::any_of(graph.blocks, [](const BasicBlock& block) {
+		    return block.terminator.condition == BranchCondition::GotoVariable ||
+		           block.terminator.goto_variable != UINT32_MAX;
+	    })) {
 		return false;
 	}
 	std::vector<uint32_t> shared_blocks;

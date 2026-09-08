@@ -15532,6 +15532,19 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--shared-merge-cfg-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+    TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
+    TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst();
+    TestNewShaderRecompilerCfgLoopSharedRegion();
+    TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
+    TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
+    TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
+    std::puts("KYTY_SHARED_MERGE_CFG_PASS");
+    return 0;
+  }
+
   EnsureConfigInitialized();
   TestDriverPipelineCacheRevisionCompatibility();
   TestResourceDescriptorClassification();

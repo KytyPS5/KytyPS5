@@ -129,13 +129,6 @@ uint32_t SignExtendU32(uint32_t value, uint32_t bits) {
 	return (value ^ sign) - sign;
 }
 
-void MarkMemoryUnsupported(Instruction& inst, Family family, uint32_t opcode, const char* reason) {
-	inst.family    = family;
-	inst.opcode_id = opcode;
-	inst.opcode    = Opcode::UNSUPPORTED;
-	SetUnsupported(inst, family, opcode, reason);
-}
-
 void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 	if (info == nullptr) {
 		inst.opcode = Opcode::UNSUPPORTED;
@@ -240,7 +233,7 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
-		MarkMemoryUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
+		SetUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
 	}
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
@@ -274,7 +267,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
-		MarkMemoryUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
+		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
@@ -311,7 +304,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
-		MarkMemoryUnsupported(inst, Family::MTBUF, opcode, "MTBUF opcode is not implemented");
+		SetUnsupported(inst, Family::MTBUF, opcode, "MTBUF opcode is not implemented");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
@@ -352,7 +345,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {
-		MarkMemoryUnsupported(inst, Family::FLAT, opcode, "FLAT opcode is not implemented");
+		SetUnsupported(inst, Family::FLAT, opcode, "FLAT opcode is not implemented");
 		return;
 	}
 
@@ -389,7 +382,7 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
-		MarkMemoryUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
+		SetUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
 	}
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -30,6 +31,26 @@ BvhNodeId DecodeBvhNodeId(uint32_t id);
 // Encodes a (type, byte_offset) pair back into a packed node id. byte_offset must be a multiple
 // of 64; this exists mainly to build test fixtures without hand-computing the packed value.
 uint32_t EncodeBvhNodeId(BvhNodeType type, uint32_t byte_offset);
+
+enum class BvhWalkResult {
+Ok,                  // Walked the full reachable tree; only box32/triangle nodes were seen.
+UnsupportedNodeType, // Stopped early: reached a node type not yet handled (box16/instance/aabb).
+OutOfBounds,         // Stopped early: a node's decoded offset fell outside `node_pool`.
+TooManyNodes,        // Stopped early: visited more nodes than MaxBvhWalkNodes, likely a cycle.
+};
+
+// Safety limit on nodes visited per walk, guards against a cyclic or otherwise malformed tree
+// causing unbounded work rather than a clean, reportable failure.
+inline constexpr uint32_t MaxBvhWalkNodes = 1u << 16;
+
+// Walks a BVH starting at `root_id`, following box32 children (skipping slots equal to
+// BvhInvalidNodeId) and collecting every triangle node reached into `out_triangles`. `node_pool`
+// must span the full byte range the walk could reach, addressed by BvhNodeId::byte_offset.
+// Never crashes on bad input: stops and reports why via the return value instead, leaving
+// whatever was already collected in `out_triangles`. Iterative, not recursive, so a cyclic or
+// adversarial tree fails via TooManyNodes rather than a stack overflow.
+BvhWalkResult WalkBvhTriangles(std::span<const uint8_t> node_pool, BvhNodeId root_id,
+                                std::vector<BvhTriangleNode>& out_triangles);
 
 } // namespace Libs::Graphics
 

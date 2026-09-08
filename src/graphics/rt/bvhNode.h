@@ -48,6 +48,12 @@ BvhNodeType type;
 uint32_t    byte_offset;
 };
 
+// Sentinel value for an empty/absent child slot in a box node's children[] array. Confirmed in
+// Mesa RADV source as RADV_BVH_INVALID_NODE (src/amd/vulkan/bvh/bvh_defines.h), and confirmed as
+// what's actually written to unused box32/box16 child slots by the BVH build shaders
+// (src/amd/vulkan/bvh/encode.comp), not just a convention inferred from context.
+inline constexpr uint32_t BvhInvalidNodeId = 0xFFFFFFFFu;
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODE_H_ */

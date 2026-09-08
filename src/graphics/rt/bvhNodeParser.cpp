@@ -18,6 +18,12 @@ float ReadF32(std::span<const uint8_t> raw, size_t offset) {
 return std::bit_cast<float>(ReadU32(raw, offset));
 }
 
+// Widens byte_offset before adding node_size so a maliciously/accidentally huge decoded offset
+// (near UINT32_MAX) can't wrap back into range and defeat the bounds check.
+bool NodeFits(std::span<const uint8_t> node_pool, uint32_t byte_offset, uint32_t node_size) {
+return static_cast<uint64_t>(byte_offset) + node_size <= node_pool.size();
+}
+
 } // namespace
 
 BvhBox32Node ParseBvhBox32Node(std::span<const uint8_t> raw) {
@@ -67,6 +73,48 @@ return BvhNodeId {
 uint32_t EncodeBvhNodeId(BvhNodeType type, uint32_t byte_offset) {
 EXIT_IF((byte_offset & 0x3Fu) != 0u);
 return (byte_offset >> 3u) | static_cast<uint32_t>(type);
+}
+
+BvhWalkResult WalkBvhTriangles(std::span<const uint8_t> node_pool, BvhNodeId root_id,
+                                std::vector<BvhTriangleNode>& out_triangles) {
+std::vector<BvhNodeId> pending;
+pending.push_back(root_id);
+
+uint32_t visited = 0;
+while (!pending.empty()) {
+const auto current = pending.back();
+pending.pop_back();
+
+if (++visited > MaxBvhWalkNodes) {
+return BvhWalkResult::TooManyNodes;
+}
+
+if (current.type == BvhNodeType::Triangle) {
+if (!NodeFits(node_pool, current.byte_offset, BvhTriangleNodeByteSize)) {
+return BvhWalkResult::OutOfBounds;
+}
+out_triangles.push_back(ParseBvhTriangleNode(
+    node_pool.subspan(current.byte_offset, BvhTriangleNodeByteSize)));
+continue;
+}
+
+if (current.type != BvhNodeType::Box32) {
+return BvhWalkResult::UnsupportedNodeType;
+}
+
+if (!NodeFits(node_pool, current.byte_offset, BvhBox32NodeByteSize)) {
+return BvhWalkResult::OutOfBounds;
+}
+const auto box = ParseBvhBox32Node(
+    node_pool.subspan(current.byte_offset, BvhBox32NodeByteSize));
+for (const auto child_id: box.children) {
+if (child_id == BvhInvalidNodeId) {
+continue;
+}
+pending.push_back(DecodeBvhNodeId(child_id));
+}
+}
+return BvhWalkResult::Ok;
 }
 
 } // namespace Libs::Graphics

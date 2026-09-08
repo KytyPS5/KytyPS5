@@ -27,6 +27,20 @@ void WriteF32(std::vector<uint8_t>& buffer, size_t offset, float value) {
 WriteU32(buffer, offset, std::bit_cast<uint32_t>(value));
 }
 
+// Writes a minimal triangle node at `offset`, using `id` as its self-referential id field so
+// tests can tell collected triangles apart. Vertex/reserved/triangle_id/geometry_id fields are
+// left zeroed; they're already covered by TestParseBvhTriangleNodeExtractsVerticesAndIds.
+void PlaceTriangleNode(std::vector<uint8_t>& buffer, size_t offset, uint32_t id) {
+WriteU32(buffer, offset + 60u, id); // id field, per the triangle node layout
+}
+
+void PlaceBox32Node(std::vector<uint8_t>& buffer, size_t offset,
+                     const uint32_t (&children)[4]) {
+for (size_t i = 0; i < 4; i++) {
+WriteU32(buffer, offset + i * 4u, children[i]);
+}
+}
+
 void TestParseBvhBox32NodeExtractsChildrenAndBounds() {
 using namespace Libs::Graphics;
 
@@ -129,6 +143,117 @@ Check(decoded.byte_offset == offset,
 }
 }
 
+void TestWalkBvhTrianglesCollectsASingleTriangleRoot() {
+using namespace Libs::Graphics;
+
+std::vector<uint8_t> pool(256, 0);
+PlaceTriangleNode(pool, 0, 0x1111u);
+
+std::vector<BvhTriangleNode> triangles;
+const auto result = WalkBvhTriangles(pool, DecodeBvhNodeId(EncodeBvhNodeId(BvhNodeType::Triangle, 0)),
+                                      triangles);
+
+Check(result == BvhWalkResult::Ok, "single triangle root did not walk as Ok");
+Check(triangles.size() == 1, "single triangle root did not collect exactly one triangle");
+Check(triangles[0].id == 0x1111u, "single triangle root collected the wrong triangle");
+}
+
+void TestWalkBvhTrianglesSkipsInvalidChildSlots() {
+using namespace Libs::Graphics;
+
+std::vector<uint8_t> pool(256, 0);
+PlaceTriangleNode(pool, 64, 0xAAAAu);
+PlaceTriangleNode(pool, 128, 0xBBBBu);
+const uint32_t children[4] = {
+    EncodeBvhNodeId(BvhNodeType::Triangle, 64),
+    BvhInvalidNodeId,
+    EncodeBvhNodeId(BvhNodeType::Triangle, 128),
+    BvhInvalidNodeId,
+};
+PlaceBox32Node(pool, 0, children);
+
+std::vector<BvhTriangleNode> triangles;
+const auto result =
+    WalkBvhTriangles(pool, DecodeBvhNodeId(EncodeBvhNodeId(BvhNodeType::Box32, 0)), triangles);
+
+Check(result == BvhWalkResult::Ok, "box32 with invalid slots did not walk as Ok");
+Check(triangles.size() == 2, "box32 with invalid slots did not collect exactly two triangles");
+const bool has_aaaa = (triangles[0].id == 0xAAAAu || triangles[1].id == 0xAAAAu);
+const bool has_bbbb = (triangles[0].id == 0xBBBBu || triangles[1].id == 0xBBBBu);
+Check(has_aaaa && has_bbbb, "box32 with invalid slots did not collect the expected triangles");
+}
+
+void TestWalkBvhTrianglesRecursesThroughNestedBox32() {
+using namespace Libs::Graphics;
+
+std::vector<uint8_t> pool(512, 0);
+PlaceTriangleNode(pool, 256, 0xCCCCu);
+const uint32_t inner_children[4] = {
+    EncodeBvhNodeId(BvhNodeType::Triangle, 256),
+    BvhInvalidNodeId,
+    BvhInvalidNodeId,
+    BvhInvalidNodeId,
+};
+PlaceBox32Node(pool, 192, inner_children);
+const uint32_t root_children[4] = {
+    EncodeBvhNodeId(BvhNodeType::Box32, 192),
+    BvhInvalidNodeId,
+    BvhInvalidNodeId,
+    BvhInvalidNodeId,
+};
+PlaceBox32Node(pool, 0, root_children);
+
+std::vector<BvhTriangleNode> triangles;
+const auto result =
+    WalkBvhTriangles(pool, DecodeBvhNodeId(EncodeBvhNodeId(BvhNodeType::Box32, 0)), triangles);
+
+Check(result == BvhWalkResult::Ok, "nested box32 did not walk as Ok");
+Check(triangles.size() == 1, "nested box32 did not collect exactly one triangle");
+Check(triangles[0].id == 0xCCCCu, "nested box32 collected the wrong triangle");
+}
+
+void TestWalkBvhTrianglesReportsUnsupportedNodeType() {
+using namespace Libs::Graphics;
+
+std::vector<uint8_t>         pool(64, 0);
+std::vector<BvhTriangleNode> triangles;
+const auto result = WalkBvhTriangles(pool, BvhNodeId {BvhNodeType::Instance, 0}, triangles);
+
+Check(result == BvhWalkResult::UnsupportedNodeType,
+      "instance root did not report UnsupportedNodeType");
+Check(triangles.empty(), "instance root should not have collected any triangles");
+}
+
+void TestWalkBvhTrianglesReportsOutOfBounds() {
+using namespace Libs::Graphics;
+
+std::vector<uint8_t>         pool(64, 0);
+std::vector<BvhTriangleNode> triangles;
+const auto result = WalkBvhTriangles(pool, BvhNodeId {BvhNodeType::Box32, 1000u}, triangles);
+
+Check(result == BvhWalkResult::OutOfBounds, "out-of-range root did not report OutOfBounds");
+}
+
+void TestWalkBvhTrianglesReportsTooManyNodesOnACycle() {
+using namespace Libs::Graphics;
+
+std::vector<uint8_t> pool(256, 0);
+// A box32 node whose first child points back to itself.
+const uint32_t children[4] = {
+    EncodeBvhNodeId(BvhNodeType::Box32, 0),
+    BvhInvalidNodeId,
+    BvhInvalidNodeId,
+    BvhInvalidNodeId,
+};
+PlaceBox32Node(pool, 0, children);
+
+std::vector<BvhTriangleNode> triangles;
+const auto result =
+    WalkBvhTriangles(pool, DecodeBvhNodeId(EncodeBvhNodeId(BvhNodeType::Box32, 0)), triangles);
+
+Check(result == BvhWalkResult::TooManyNodes, "a self-referential cycle did not report TooManyNodes");
+}
+
 } // namespace
 
 namespace Common {
@@ -145,6 +270,12 @@ TestParseBvhBox32NodeExtractsChildrenAndBounds();
 TestParseBvhTriangleNodeExtractsVerticesAndIds();
 TestDecodeBvhNodeIdMatchesKnownRootPointer();
 TestBvhNodeIdRoundTripsForEveryTypeAndSeveralOffsets();
+TestWalkBvhTrianglesCollectsASingleTriangleRoot();
+TestWalkBvhTrianglesSkipsInvalidChildSlots();
+TestWalkBvhTrianglesRecursesThroughNestedBox32();
+TestWalkBvhTrianglesReportsUnsupportedNodeType();
+TestWalkBvhTrianglesReportsOutOfBounds();
+TestWalkBvhTrianglesReportsTooManyNodesOnACycle();
 std::puts("BvhNodeParserTests: all cases passed");
 return 0;
 }

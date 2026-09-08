@@ -151,7 +151,10 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		}
 		download.Commit();
 		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
+		// Keep the download batch and cache ownership stable until its backing writes
+		// are committed. Finish also runs deferred cache callbacks, which can reuse
+		// source buffers or the download stream while this batch still holds pointers.
+		m_scheduler.FlushAndWait();
 		m_scheduler.WaitPriorityOperations(completion_tick);
 		cursor = 0;
 		for (const auto& copy: batch) {

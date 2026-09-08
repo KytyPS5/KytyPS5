@@ -217,11 +217,11 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	}
 	const bool full = common && descriptor.fields[4] == field4_expected &&
 	                  descriptor.fields[5] == field5_expected;
-	if (!full || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0) ||
-	    (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()))) {
+	if (!full || (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()))) {
 		return false;
 	}
-	if (descriptor.fields[6] == 0) {
+	// The metadata address is inactive when compression/control bits are zero.
+	if ((descriptor.fields[6] & 0x00ffffffu) == 0) {
 		return true;
 	}
 	constexpr uint32_t htile_control = 0x00280000u;

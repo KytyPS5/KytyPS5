@@ -21,16 +21,16 @@ void Check(bool value, const char* text) {
 }
 
 void TestMultiOwnerAndExactErase() {
-	Table table;
+	OwnerTable table;
 	auto& owners = table.GetOrCreate(17);
 	owners.push_back(11);
 	owners.push_back(22);
 
 	Check(table.Find(17) != nullptr && table.Find(17)->size() == 2,
 	      "both page owners are retained");
-	Check(Libs::Graphics::EraseExact(owners, 11U), "registered owner is erased");
+	Check(owners.Erase(11U), "registered owner is erased");
 	Check(owners.size() == 1 && owners.front() == 22, "erasing one owner preserves its neighbor");
-	Check(!Libs::Graphics::EraseExact(owners, 33U), "missing owner is reported without mutation");
+	Check(!owners.Erase(33U), "missing owner is reported without mutation");
 }
 
 void TestCrossBucketRange() {

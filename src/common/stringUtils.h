@@ -316,10 +316,12 @@ inline std::string SafeCsv(std::string_view text) {
 	return std::string(text);
 }
 
-inline std::string Utf16ToUtf8(const char16_t* utf16) {
-	std::u16string                                                    input(utf16);
+inline std::string Utf16ToUtf8(std::u16string_view utf16) {
+	if (utf16.empty()) {
+		return {};
+	}
 	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
-	return convert.to_bytes(input);
+	return convert.to_bytes(utf16.data(), utf16.data() + utf16.size());
 }
 
 inline ByteBuffer HexToBin(std::string_view text) {

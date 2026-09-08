@@ -3,16 +3,16 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-IR::SpirvRequirements GetProgramRequirements(const IR::Program& program);
+void AnalyzeProgramRequirements(IR::Program& program);
 
-bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
-                 ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv, std::string* error);
+std::vector<uint32_t> EmitProgram(const IR::Program& program,
+                                  ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

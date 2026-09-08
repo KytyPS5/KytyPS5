@@ -2644,7 +2644,7 @@ static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) 
 
 } // namespace Ampr
 
-LIB_DEFINE(InitAmpr_1_Ampr) {
+LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("8aI7R7WaOlc", Ampr::CommandBufferConstructor);
 	LIB_FUNC("a8uLzYY--tM", Ampr::AprCommandBufferConstructor);
 	LIB_FUNC("Qs1xtplKo0U", Ampr::AprCommandBufferDestructor);
@@ -2665,6 +2665,7 @@ LIB_DEFINE(InitAmpr_1_Ampr) {
 	LIB_FUNC("dXPaz65HNmk", Ampr::CommandBufferPushMarker);
 	LIB_FUNC("mv0O8Zg0woU", Ampr::CommandBufferPopMarker);
 	LIB_FUNC("DLfoNxTFNVk", Ampr::CommandBufferWaitOnAddress);
+	LIB_FUNC("V7GQTEeUfhw", Ampr::CommandBufferWaitOnAddress);
 	LIB_FUNC("cQb8Zr8Q0Y0", Ampr::CommandBufferWaitOnCounter);
 	LIB_FUNC("j0+3uJMxYJY", Ampr::CommandBufferWriteAddress);
 	LIB_FUNC("sJXyWHjP-F8", Ampr::CommandBufferWriteAddressOnCompletion);
@@ -2740,9 +2741,5 @@ LIB_DEFINE(InitAmpr_1_Ampr) {
 }
 
 } // namespace LibAmpr
-
-LIB_DEFINE(InitAmpr_1) {
-	LibAmpr::InitAmpr_1_Ampr(s);
-}
 
 } // namespace Libs

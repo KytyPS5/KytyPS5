@@ -29,7 +29,7 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Libs::Graphics::Shutdown;
 };
 
-void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer);
+void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);
 
 namespace Gen5 {
 
@@ -66,17 +66,17 @@ int KYTY_SYSV_ABI AgcGetGsOversubscription(ShaderRegister* regs, const Shader* g
                                            float factor);
 int KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
                                               const Shader* ps);
+int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shader* gs,
+                                               const Shader* ps);
 int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type);
 int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd, int type);
 int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t address_or_offset);
-int KYTY_SYSV_ABI AgcUnknownJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
-                                               uint32_t size_in_dwords);
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
                                         uint32_t size_in_dwords);
 int KYTY_SYSV_ABI AgcSuspendPoint();
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation);
 uint64_t KYTY_SYSV_ABI  AgcDcbContextStateOpGetSize(uint32_t operation);
-uint64_t KYTY_SYSV_ABI  AgcGetIsTrinityMode();
+void KYTY_SYSV_ABI      AgcGetIsTrinityMode(uint8_t* result);
 
 uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner();
 uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength();
@@ -105,6 +105,9 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
                                                       const uint32_t* values, uint32_t num_values);
 uint32_t KYTY_SYSV_ABI  AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values);
 uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs);
+uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
                                                   const volatile ShaderRegister* regs,
                                                   uint32_t                       num_regs);
 uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,
@@ -166,6 +169,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndirectGetSize();
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
+                                                uint32_t             data_offset_in_bytes,
+                                                uint32_t             count_indirect,
+                                                uint32_t             max_count_or_count,
+                                                const volatile void* count_addr,
+                                                uint32_t stride_in_bytes, uint64_t modifier);
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier);
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
@@ -179,6 +188,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 uint32_t KYTY_SYSV_ABI  AgcDcbDispatchIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address);
+uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type);
 uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles);
@@ -192,10 +202,13 @@ uint32_t KYTY_SYSV_ABI  AgcAcbAcquireMemGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbCondExecGetSize();
+uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
+                                   const uint32_t* target, uint32_t size_in_dwords);
 uint32_t KYTY_SYSV_ABI  AgcAcbJumpGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles);
+uint64_t KYTY_SYSV_ABI  AgcAcbWaitOnAddressGetSize(uint8_t size);
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,
@@ -206,6 +219,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
                                        uint8_t write_confirm);
+uint64_t KYTY_SYSV_ABI  AgcAcbCopyDataGetSize();
 uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
                                                const volatile void* indirect_args,
                                                uint32_t             modifier);
@@ -221,6 +235,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
                                        uint8_t write_confirm);
+uint64_t KYTY_SYSV_ABI  AgcDcbCopyDataGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,
                                       uint8_t dst_cache_policy, uint64_t dst_address_or_offset,
                                       uint8_t src, uint8_t src_cache_policy,
@@ -266,7 +281,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint8_t op, uint8_t cache_policy,
                                          const volatile void* address, uint64_t reference,
                                          uint64_t mask, uint32_t poll_cycles);
-uint32_t KYTY_SYSV_ABI  AgcDcbWaitOnAddressGetSize(uint32_t size);
+uint64_t KYTY_SYSV_ABI  AgcDcbWaitOnAddressGetSize(uint32_t size);
+bool                    AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);
@@ -274,8 +290,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);
 int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address);
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference);
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t* cmd, const volatile Label* address);
-int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint32_t context_id,
-                                                   uint32_t data_sel, uint64_t data);
+int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data);
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
                                       int32_t display_buffer_index, uint32_t flip_mode,

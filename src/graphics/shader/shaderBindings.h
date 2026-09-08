@@ -157,6 +157,16 @@ struct ShaderSamplerResource {
 	[[nodiscard]] bool PointPreclamp() const { return ((fields[2] >> 28u) & 0x1u) == 1; }
 	[[nodiscard]] bool AnisoOverride() const { return ((fields[2] >> 29u) & 0x1u) == 1; }
 	[[nodiscard]] bool BlendZeroPrt() const { return ((fields[2] >> 30u) & 0x1u) == 1; }
+
+	void SetPointFiltering() {
+		const bool mipmapped = static_cast<Prospero::SamplerMipFilter>(MipFilter()) !=
+		                       Prospero::SamplerMipFilter::kNone;
+		fields[2] &= ~(0xffu << 20u);
+		fields[2] |= 1u << 24u;
+		if (mipmapped) {
+			fields[2] |= static_cast<uint32_t>(Prospero::SamplerMipFilter::kPoint) << 26u;
+		}
+	}
 };
 
 struct ShaderVertexInputBuffer {

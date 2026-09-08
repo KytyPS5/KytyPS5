@@ -1,52 +1,22 @@
-#include "SDL.h"
-#include "SDL_error.h"
-#include "SDL_events.h"
-#include "SDL_gamecontroller.h"
-#include "SDL_hints.h"
-#include "SDL_joystick.h"
-#include "SDL_keyboard.h"
-#include "SDL_keycode.h"
-#include "SDL_mouse.h"
-#include "SDL_pixels.h"
-#include "SDL_rwops.h"
-#include "SDL_stdinc.h"
-#include "SDL_surface.h"
-#include "SDL_thread.h"
-#include "SDL_touch.h"
-#include "SDL_video.h"
-#include "SDL_vulkan.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
-#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
-#include "common/systemInfo.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
-#include "libs/controller.h"
-#include "loader/systemContent.h"
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <deque>
-#include <fmt/format.h>
 #include <limits>
 #include <memory>
-#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -58,10 +28,10 @@
 namespace Libs::Graphics {
 
 struct Presenter::Frame {
-	VulkanImage                    image;
-	std::unique_ptr<CommandBuffer> present_commands;
-	bool                           busy         = false;
-	bool                           reusing_last = false;
+	VulkanImage image;
+	uint64_t    present_tick = 0;
+	bool        busy         = false;
+	bool        reusing_last = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -71,12 +41,11 @@ struct Presenter::Frame {
 
 class FramePool final {
 public:
-	explicit FramePool(WindowContext& window): m_window(window) {}
+	FramePool(WindowContext& window, CommandScheduler& scheduler)
+	    : m_window(window), m_scheduler(scheduler) {}
 	~FramePool() {
+		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
-			if (frame->present_commands != nullptr) {
-				frame->present_commands->WaitForFenceOnly();
-			}
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
 			}
@@ -188,15 +157,10 @@ public:
 	}
 
 private:
-	static void WaitForFrame(Presenter::Frame& frame) {
-		// The producer only waits here. Reset stays on the presentation thread that owns the
-		// allocating Vulkan command pool.
-		if (frame.present_commands != nullptr) {
-			frame.present_commands->WaitForFenceOnly();
-		}
-	}
+	void WaitForFrame(Presenter::Frame& frame) { m_scheduler.Wait(frame.present_tick); }
 
 	WindowContext&                                 m_window;
+	CommandScheduler&                              m_scheduler;
 	Common::Mutex                                  m_mutex;
 	Common::CondVar                                m_available;
 	std::vector<std::unique_ptr<Presenter::Frame>> m_frames;
@@ -328,9 +292,10 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
-	[[nodiscard]] bool   PrepareImeOverlay();
-	void RecordPresentCommands(CommandBuffer& command, VulkanImage& source, bool draw_ime_overlay);
-	void Submit(CommandBuffer& command);
+	[[nodiscard]] bool   PrepareSystemOverlay();
+	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
+	                                           bool draw_system_overlay);
+	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
@@ -340,7 +305,6 @@ public:
 
 private:
 	void Destroy();
-	void RefreshSurfaceSize();
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
@@ -350,7 +314,7 @@ private:
 	std::vector<vk::ImageView>  m_image_views;
 	std::vector<vk::Semaphore>  m_image_acquired;
 	std::vector<vk::Semaphore>  m_render_complete;
-	std::unique_ptr<ImeOverlay> m_ime_overlay;
+	std::unique_ptr<SystemOverlay> m_system_overlay;
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
 };
@@ -358,7 +322,7 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner) {
+	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
@@ -397,17 +361,17 @@ struct Presenter::Impl {
 	Swapchain             swapchain;
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
-	std::atomic<uint64_t> presented_ime_revision {0};
+	std::atomic<uint64_t> presented_overlay_revision {0};
 };
 
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
-	EXIT_IF(graphics.screen_width == 0);
-	EXIT_IF(graphics.screen_height == 0);
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
 
 	Common::LockGuard lock(m_window.mutex);
+	EXIT_IF(graphics.screen_width == 0);
+	EXIT_IF(graphics.screen_height == 0);
 	const auto&       surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
@@ -465,7 +429,21 @@ void Swapchain::Create() {
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
-	create_info.presentMode      = vk::PresentModeKHR::eFifo;
+	switch (Config::GetPresentMode()) {
+		case Config::PresentMode::Mailbox:
+			create_info.presentMode = vk::PresentModeKHR::eMailbox;
+			break;
+		case Config::PresentMode::Immediate:
+			create_info.presentMode = vk::PresentModeKHR::eImmediate;
+			break;
+		case Config::PresentMode::Fifo:
+		default: create_info.presentMode = vk::PresentModeKHR::eFifo; break;
+	}
+	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
+	              create_info.presentMode) == surface.present_modes.end()) {
+		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
+		create_info.presentMode = vk::PresentModeKHR::eFifo;
+	}
 	create_info.clipped          = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
@@ -526,8 +504,8 @@ void Swapchain::Destroy() {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
-	if (m_ime_overlay != nullptr) {
-		m_ime_overlay->ReleaseVulkan();
+	if (m_system_overlay != nullptr) {
+		m_system_overlay->ReleaseVulkan();
 	}
 
 	for (const auto semaphore: m_image_acquired) {
@@ -560,30 +538,18 @@ void Swapchain::Destroy() {
 	m_render_complete.clear();
 }
 
-void Swapchain::RefreshSurfaceSize() {
-	int width  = 0;
-	int height = 0;
-	SDL_Vulkan_GetDrawableSize(m_window.window, &width, &height);
-	if (width > 0 && height > 0) {
-		m_window.graphic_ctx.screen_width  = static_cast<uint32_t>(width);
-		m_window.graphic_ctx.screen_height = static_cast<uint32_t>(height);
-	}
-
-	m_window.RefreshSurfaceCapabilities();
-}
-
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
 		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
 		// window's view/layer and must run on the main thread on macOS.
-		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); }, true);
+		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); });
 #else
 		m_window.RecreateSurface();
 #endif
 	}
-	RefreshSurfaceSize();
+	m_window.RefreshSurfaceCapabilities();
 	Create();
 }
 
@@ -607,28 +573,27 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", VulkanToString(result).c_str());
+		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
 }
 
-bool Swapchain::PrepareImeOverlay() {
-	if (m_ime_overlay == nullptr) {
-		m_ime_overlay = std::make_unique<ImeOverlay>(m_window.graphic_ctx);
+bool Swapchain::PrepareSystemOverlay() {
+	if (m_system_overlay == nullptr) {
+		m_system_overlay = std::make_unique<SystemOverlay>(m_window.graphic_ctx);
 	}
-	return m_ime_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-                                      bool draw_ime_overlay) {
+                                      bool draw_system_overlay) {
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
 		     static_cast<void*>(source.image), static_cast<int>(source.state.layout));
 	}
 	EXIT_IF(m_image_index >= m_images.size());
 	auto vk_command = command.Handle();
-	command.Begin();
 
 	vk::ImageMemoryBarrier to_transfer {};
 	to_transfer.sType                           = vk::StructureType::eImageMemoryBarrier;
@@ -643,7 +608,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_transfer.subresourceRange.levelCount     = 1;
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+	// Match the acquire wait stage so the layout transition cannot precede acquisition.
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
@@ -669,12 +635,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType         = vk::StructureType::eImageMemoryBarrier;
 	to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	to_present.dstAccessMask = draw_ime_overlay ? vk::AccessFlagBits::eColorAttachmentRead |
-	                                                  vk::AccessFlagBits::eColorAttachmentWrite
-	                                            : vk::AccessFlagBits::eMemoryRead;
+	to_present.dstAccessMask = draw_system_overlay ? vk::AccessFlagBits::eColorAttachmentRead |
+	                                                     vk::AccessFlagBits::eColorAttachmentWrite
+	                                               : vk::AccessFlagBits::eMemoryRead;
 	to_present.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
-	to_present.newLayout     = draw_ime_overlay ? vk::ImageLayout::eColorAttachmentOptimal
-	                                            : vk::ImageLayout::ePresentSrcKHR;
+	to_present.newLayout     = draw_system_overlay ? vk::ImageLayout::eColorAttachmentOptimal
+	                                               : vk::ImageLayout::ePresentSrcKHR;
 	to_present.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_present.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_present.image                           = m_images[m_image_index];
@@ -683,13 +649,13 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                           draw_ime_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
-	                                            : vk::PipelineStageFlagBits::eAllCommands,
-	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
-	                           &to_present);
-	if (draw_ime_overlay) {
-		m_ime_overlay->Record(vk_command, m_image_views[m_image_index]);
+	vk_command.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eTransfer,
+	    draw_system_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+	                        : vk::PipelineStageFlagBits::eAllCommands,
+	    vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1, &to_present);
+	if (draw_system_overlay) {
+		m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
@@ -699,15 +665,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
 	}
-	command.End();
 }
 
-void Swapchain::Submit(CommandBuffer& command) {
+uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	command.Execute(submit);
+	return scheduler.Submit(submit);
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -737,7 +702,7 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
-		default: EXIT("vkQueuePresentKHR failed: %s\n", VulkanToString(result).c_str());
+		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 	return Status::Success;
@@ -782,15 +747,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
-		if (frame->present_commands == nullptr) {
-			frame->present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
-		}
-		auto& command = *frame->present_commands;
-		command.WaitForFenceAndReset();
-		command.Begin();
+		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
-		command.End();
-		command.Execute();
+		frame->present_tick = m_impl->present_scheduler.Submit();
 	}
 	return *frame;
 }
@@ -803,10 +762,10 @@ bool Presenter::IsGuestPaused() const noexcept {
 	return m_impl->window.loop.paused.load(std::memory_order_acquire);
 }
 
-bool Presenter::NeedsImeRefresh() const noexcept {
-	const auto visual = GetImeVisualState();
+bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
+	const auto visual = GetSystemOverlayVisualState();
 	return visual.active ||
-	       visual.revision != m_impl->presented_ime_revision.load(std::memory_order_acquire);
+	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
 }
 
 RenderContext& Presenter::Renderer() const noexcept {
@@ -817,30 +776,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
-	auto& window = m_impl->window;
-	if (window.window_hidden) {
-#if defined(__APPLE__)
-		// AppKit traps if a window is shown off the main thread; marshal and wait so the
-		// swapchain below is recreated against a visible window.
-		window.RunOnMainThread(
-		    [&window] {
-			    window.UpdateIcon();
-			    SDL_ShowWindow(window.window);
-			    SDL_RaiseWindow(window.window);
-		    },
-		    true);
-#else
-		window.UpdateIcon();
-
-		SDL_ShowWindow(window.window);
-		SDL_RaiseWindow(window.window);
-#endif
-
-		window.window_hidden = false;
-		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
-	}
-
-	const auto ime_visual = GetImeVisualState();
+	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
@@ -848,16 +784,13 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			m_impl->RecoverSwapchain(status);
 			continue;
 		}
-		if (frame.present_commands == nullptr) {
-			frame.present_commands = std::make_unique<CommandBuffer>(m_impl->present_scheduler);
-		}
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			frame.present_commands->WaitForFenceAndReset();
-			auto&      command          = *frame.present_commands;
-			const bool draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
-			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
-			swapchain.Submit(command);
+			auto&             command          = m_impl->present_scheduler.BeginCommand();
+			const bool        draw_system_overlay =
+			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
@@ -865,8 +798,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			continue;
 		}
 
-		m_impl->presented_ime_revision.store(ime_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		m_impl->presented_overlay_revision.store(overlay_visual.revision,
+		                                         std::memory_order_release);
+		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;
 	}

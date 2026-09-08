@@ -1,42 +1,51 @@
+#include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
-namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail {
+namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::TranslateU64MaskOperation(const IR::Instruction& inst) {
-	if (current_per_invocation_masks) {
-		return TranslatePerInvocationU64Mask(inst);
+void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
+	current_opcode = inst.opcode;
+	current_pc     = inst.pc;
+
+	switch (inst.opcode) {
+		case Decoder::Opcode::UNKNOWN:
+		case Decoder::Opcode::COUNT:
+			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
+		case Decoder::Opcode::UNSUPPORTED:
+			EXIT("unsupported decoded instruction: %s", Decoder::InstructionToString(inst).c_str());
+		default: break;
 	}
-	return inst.op == IR::Opcode::BitwiseAndU64 || inst.op == IR::Opcode::BitwiseOrU64
-	           ? TranslateSimpleInteger(inst)
-	           : TranslateComposedInteger(inst);
+
+	bool translated = false;
+	switch (inst.family) {
+		case Decoder::Family::SOP1:
+		case Decoder::Family::SOP2:
+		case Decoder::Family::SOPK:
+		case Decoder::Family::SOPC:
+		case Decoder::Family::SOPP: translated = EmitScalar(inst); break;
+		case Decoder::Family::VOP1:
+		case Decoder::Family::VOP2:
+		case Decoder::Family::VOP3:
+		case Decoder::Family::VOP3P:
+		case Decoder::Family::VOPC: translated = EmitVector(inst); break;
+		case Decoder::Family::SMEM:
+		case Decoder::Family::MUBUF:
+		case Decoder::Family::MTBUF:
+		case Decoder::Family::FLAT:
+		case Decoder::Family::DS:
+		case Decoder::Family::MIMG: translated = EmitMemory(inst); break;
+		case Decoder::Family::VINTRP: translated = EmitInterpolation(inst); break;
+		case Decoder::Family::EXP:
+			EXP(inst);
+			translated = true;
+			break;
+		default: break;
+	}
+
+	if (!translated) {
+		EXIT("opcode %s at pc 0x%08x has no IR translation",
+		     Decoder::InstructionToString(inst).c_str(), inst.pc);
+	}
 }
 
-bool Translator::TranslateInstruction(const IR::Instruction&          inst,
-                                      const BufferAddressValues*      address_snapshot,
-                                      const ScalarMemorySourceValues* scalar_source_snapshot) {
-	switch (IR::GetOpcodeInfo(inst.op).lowering_class) {
-		case IR::LoweringClass::Control: return TranslateControlOperation(inst);
-		case IR::LoweringClass::Move: return TranslateMove(inst);
-		case IR::LoweringClass::Lane: return TranslateLaneOperation(inst);
-		case IR::LoweringClass::State: return TranslateStateOperation(inst);
-		case IR::LoweringClass::Memory:
-			return TranslateMemoryOperation(inst, address_snapshot, scalar_source_snapshot);
-		case IR::LoweringClass::Attribute: return TranslateAttributeOperation(inst);
-		case IR::LoweringClass::IntegerCompare: return TranslateIntegerCompare(inst);
-		case IR::LoweringClass::Integer16Compare: return TranslateInteger16Compare(inst);
-		case IR::LoweringClass::FloatCompare: return TranslateFloatCompare(inst);
-		case IR::LoweringClass::Conversion: return TranslateConversion(inst);
-		case IR::LoweringClass::Integer16: return TranslateInteger16Operation(inst);
-		case IR::LoweringClass::PackedInteger16: return TranslatePackedInteger16(inst);
-		case IR::LoweringClass::PackedFloat16: return TranslatePackedFloat16(inst);
-		case IR::LoweringClass::Float16: return TranslateFloat16Operation(inst);
-		case IR::LoweringClass::Float: return TranslateFloatOperation(inst);
-		case IR::LoweringClass::U64Mask: return TranslateU64MaskOperation(inst);
-		case IR::LoweringClass::SimpleInteger: return TranslateSimpleInteger(inst);
-		case IR::LoweringClass::ComposedInteger: return TranslateComposedInteger(inst);
-		case IR::LoweringClass::ExtendedInteger: return TranslateExtendedInteger(inst);
-	}
-	return false;
-}
-
-} // namespace Libs::Graphics::ShaderRecompiler::Frontend::Detail
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

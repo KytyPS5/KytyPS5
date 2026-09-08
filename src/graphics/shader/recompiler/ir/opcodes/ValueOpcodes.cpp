@@ -34,6 +34,7 @@ constexpr Type U64             = Type::U64;
 constexpr Type F16             = Type::F16;
 constexpr Type F32             = Type::F32;
 constexpr Type U32x2           = Type::U32x2;
+constexpr Type U32x3           = Type::U32x3;
 constexpr Type U32x4           = Type::U32x4;
 constexpr Type F32x2           = Type::F32x2;
 constexpr Type SrtResource     = Type::SrtResource;
@@ -41,8 +42,6 @@ constexpr Type BufferResource  = Type::BufferResource;
 constexpr Type AddressResource = Type::AddressResource;
 constexpr Type ImageResource   = Type::ImageResource;
 constexpr Type SamplerResource = Type::SamplerResource;
-constexpr Type LdsResource     = Type::LdsResource;
-constexpr Type GdsResource     = Type::GdsResource;
 constexpr Type ImageAddress    = Type::ImageAddress;
 
 constexpr std::array<OpcodeMeta, static_cast<size_t>(ValueOpcode::Count)> MetaTable = {{
@@ -71,27 +70,96 @@ std::string_view ValueOpcodeName(ValueOpcode opcode) {
 }
 
 bool HasSideEffects(ValueOpcode opcode) {
+	const auto buffer_access = BufferAccessOf(opcode);
+	if (buffer_access == BufferAccess::Write || buffer_access == BufferAccess::Atomic) {
+		return true;
+	}
+	const auto shared_access = SharedAccessOf(opcode);
+	if (shared_access == SharedAccess::Write || shared_access == SharedAccess::Atomic ||
+	    shared_access == SharedAccess::Append || shared_access == SharedAccess::Consume) {
+		return true;
+	}
+	if (AddressOpcodeInfoOf(opcode).access == AddressAccess::Write) {
+		return true;
+	}
+	const auto image_info = ImageOpcodeInfoOf(opcode);
+	if (image_info.access == ImageAccess::Write || image_info.access == ImageAccess::Atomic) {
+		return true;
+	}
 	switch (opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
-		case ValueOpcode::Prologue:
-		case ValueOpcode::Epilogue:
-		case ValueOpcode::StoreAddressU8:
-		case ValueOpcode::StoreAddressU16:
-		case ValueOpcode::StoreAddressU32:
+		case ValueOpcode::SetAttribute:
+		case ValueOpcode::MeshAllocate:
+		case ValueOpcode::Barrier: return true;
+		default: return false;
+	}
+}
+
+BufferAccess BufferAccessOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::ReadConstBuffer:
+		case ValueOpcode::LoadBufferU8:
+		case ValueOpcode::LoadBufferU16:
+		case ValueOpcode::LoadBufferU32:
+		case ValueOpcode::LoadBufferU32x2:
+		case ValueOpcode::LoadBufferU32x3:
+		case ValueOpcode::LoadBufferU32x4: return BufferAccess::Read;
 		case ValueOpcode::StoreBufferU8:
 		case ValueOpcode::StoreBufferU16:
 		case ValueOpcode::StoreBufferU32:
+		case ValueOpcode::StoreBufferU32x2:
+		case ValueOpcode::StoreBufferU32x3:
+		case ValueOpcode::StoreBufferU32x4: return BufferAccess::Write;
+		case ValueOpcode::BufferAtomicSwap32:
+		case ValueOpcode::BufferAtomicCmpSwap32:
+		case ValueOpcode::BufferAtomicSwap64:
+		case ValueOpcode::BufferAtomicIAdd32:
+		case ValueOpcode::BufferAtomicISub32:
+		case ValueOpcode::BufferAtomicSMin32:
+		case ValueOpcode::BufferAtomicUMin32:
+		case ValueOpcode::BufferAtomicSMax32:
+		case ValueOpcode::BufferAtomicUMax32:
+		case ValueOpcode::BufferAtomicAnd32:
+		case ValueOpcode::BufferAtomicOr32:
+		case ValueOpcode::BufferAtomicOr64:
+		case ValueOpcode::BufferAtomicXor32:
+		case ValueOpcode::BufferAtomicFMin32:
+		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
+		default: return BufferAccess::None;
+	}
+}
+
+uint32_t BufferComponentCount(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::BufferAtomicSwap64:
+		case ValueOpcode::BufferAtomicOr64:
+		case ValueOpcode::LoadBufferU32x2:
+		case ValueOpcode::StoreBufferU32x2: return 2u;
+		case ValueOpcode::LoadBufferU32x3:
+		case ValueOpcode::StoreBufferU32x3: return 3u;
+		case ValueOpcode::LoadBufferU32x4:
+		case ValueOpcode::StoreBufferU32x4: return 4u;
+		default: return BufferAccessOf(opcode) == BufferAccess::None ? 0u : 1u;
+	}
+}
+
+SharedAccess SharedAccessOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadSharedU8:
+		case ValueOpcode::LoadSharedU16:
+		case ValueOpcode::LoadSharedU32:
+		case ValueOpcode::LoadSharedU32x2:
+		case ValueOpcode::LoadSharedU32x3:
+		case ValueOpcode::LoadSharedU32x4: return SharedAccess::Read;
 		case ValueOpcode::WriteSharedU8:
 		case ValueOpcode::WriteSharedU16:
 		case ValueOpcode::WriteSharedU32:
-		case ValueOpcode::WriteGdsU8:
-		case ValueOpcode::WriteGdsU16:
-		case ValueOpcode::WriteGdsU32:
+		case ValueOpcode::WriteSharedU32x2:
+		case ValueOpcode::WriteSharedU32x3:
+		case ValueOpcode::WriteSharedU32x4: return SharedAccess::Write;
 		case ValueOpcode::SharedAtomicFMin32:
 		case ValueOpcode::SharedAtomicFMax32:
-		case ValueOpcode::GdsAtomicFMin32:
-		case ValueOpcode::GdsAtomicFMax32:
 		case ValueOpcode::SharedAtomicSwap32:
 		case ValueOpcode::SharedAtomicIAdd32:
 		case ValueOpcode::SharedAtomicISub32:
@@ -101,43 +169,56 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicUMax32:
 		case ValueOpcode::SharedAtomicAnd32:
 		case ValueOpcode::SharedAtomicOr32:
-		case ValueOpcode::SharedAtomicXor32:
-		case ValueOpcode::GdsAtomicSwap32:
-		case ValueOpcode::GdsAtomicIAdd32:
-		case ValueOpcode::GdsAtomicISub32:
-		case ValueOpcode::GdsAtomicSMin32:
-		case ValueOpcode::GdsAtomicUMin32:
-		case ValueOpcode::GdsAtomicSMax32:
-		case ValueOpcode::GdsAtomicUMax32:
-		case ValueOpcode::GdsAtomicAnd32:
-		case ValueOpcode::GdsAtomicOr32:
-		case ValueOpcode::GdsAtomicXor32:
-		case ValueOpcode::BufferAtomicSwap32:
-		case ValueOpcode::BufferAtomicIAdd32:
-		case ValueOpcode::BufferAtomicISub32:
-		case ValueOpcode::BufferAtomicSMin32:
-		case ValueOpcode::BufferAtomicUMin32:
-		case ValueOpcode::BufferAtomicSMax32:
-		case ValueOpcode::BufferAtomicUMax32:
-		case ValueOpcode::BufferAtomicAnd32:
-		case ValueOpcode::BufferAtomicOr32:
-		case ValueOpcode::BufferAtomicXor32:
-		case ValueOpcode::BufferAtomicFMin32:
-		case ValueOpcode::BufferAtomicFMax32:
+		case ValueOpcode::SharedAtomicXor32: return SharedAccess::Atomic;
+		case ValueOpcode::DataAppend: return SharedAccess::Append;
+		case ValueOpcode::DataConsume: return SharedAccess::Consume;
+		default: return SharedAccess::None;
+	}
+}
+
+uint32_t SharedComponentCount(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadSharedU32x2:
+		case ValueOpcode::WriteSharedU32x2: return 2u;
+		case ValueOpcode::LoadSharedU32x3:
+		case ValueOpcode::WriteSharedU32x3: return 3u;
+		case ValueOpcode::LoadSharedU32x4:
+		case ValueOpcode::WriteSharedU32x4: return 4u;
+		default: return SharedAccessOf(opcode) == SharedAccess::None ? 0u : 1u;
+	}
+}
+
+AddressOpcodeInfo AddressOpcodeInfoOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::LoadAddressU8: return {AddressAccess::Read, 8u};
+		case ValueOpcode::LoadAddressU16: return {AddressAccess::Read, 16u};
+		case ValueOpcode::LoadAddressU32: return {AddressAccess::Read, 32u};
+		case ValueOpcode::StoreAddressU8: return {AddressAccess::Write, 8u};
+		case ValueOpcode::StoreAddressU16: return {AddressAccess::Write, 16u};
+		case ValueOpcode::StoreAddressU32: return {AddressAccess::Write, 32u};
+		default: return {};
+	}
+}
+
+ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::ImageQueryDimensions:
+		case ValueOpcode::ImageRead: return {ImageAccess::Read, ImageResourceClass::Sampled, false};
+		case ValueOpcode::ImageQueryLod:
+		case ValueOpcode::ImageSampleRaw:
+		case ValueOpcode::ImageGatherRaw:
+			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
+		case ValueOpcode::ImageWrite:
+			return {ImageAccess::Write, ImageResourceClass::Storage, false};
+		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicIAdd32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
-		case ValueOpcode::DataAppend:
-		case ValueOpcode::DataConsume:
-		case ValueOpcode::GdsDataAppend:
-		case ValueOpcode::GdsDataConsume:
-		case ValueOpcode::ImageWrite:
-		case ValueOpcode::SetAttribute:
-		case ValueOpcode::Barrier: return true;
-		default: return false;
+			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};
+		default: return {};
 	}
 }
 

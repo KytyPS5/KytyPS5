@@ -153,28 +153,38 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     SampleInfo(0x6fu, "image_sample_c_cd_cl_o",
                ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
                    ImageSampleFlagLodClamp | ImageSampleFlagOffset),
-    SampleInfo(0xa0u, "image_sample_a", 0),
-    SampleInfo(0xa1u, "image_sample_cl_a", ImageSampleFlagLodClamp),
-    SampleInfo(0xa5u, "image_sample_b_a", ImageSampleFlagBias),
-    SampleInfo(0xa6u, "image_sample_b_cl_a", ImageSampleFlagBias | ImageSampleFlagLodClamp),
-    SampleInfo(0xa8u, "image_sample_c_a", ImageSampleFlagCompare),
-    SampleInfo(0xa9u, "image_sample_c_cl_a", ImageSampleFlagCompare | ImageSampleFlagLodClamp),
-    SampleInfo(0xadu, "image_sample_c_b_a", ImageSampleFlagCompare | ImageSampleFlagBias),
+    SampleInfo(0xa0u, "image_sample_a", ImageSampleFlagAdjust),
+    SampleInfo(0xa1u, "image_sample_cl_a", ImageSampleFlagLodClamp | ImageSampleFlagAdjust),
+    SampleInfo(0xa5u, "image_sample_b_a", ImageSampleFlagBias | ImageSampleFlagAdjust),
+    SampleInfo(0xa6u, "image_sample_b_cl_a",
+               ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagAdjust),
+    SampleInfo(0xa8u, "image_sample_c_a", ImageSampleFlagCompare | ImageSampleFlagAdjust),
+    SampleInfo(0xa9u, "image_sample_c_cl_a",
+               ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagAdjust),
+    SampleInfo(0xadu, "image_sample_c_b_a",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagAdjust),
     SampleInfo(0xaeu, "image_sample_c_b_cl_a",
-               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp),
-    SampleInfo(0xb0u, "image_sample_o_a", ImageSampleFlagOffset),
-    SampleInfo(0xb1u, "image_sample_cl_o_a", ImageSampleFlagLodClamp | ImageSampleFlagOffset),
-    SampleInfo(0xb5u, "image_sample_b_o_a", ImageSampleFlagBias | ImageSampleFlagOffset),
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+                   ImageSampleFlagAdjust),
+    SampleInfo(0xb0u, "image_sample_o_a", ImageSampleFlagOffset | ImageSampleFlagAdjust),
+    SampleInfo(0xb1u, "image_sample_cl_o_a",
+               ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust),
+    SampleInfo(0xb5u, "image_sample_b_o_a",
+               ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust),
     SampleInfo(0xb6u, "image_sample_b_cl_o_a",
-               ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset),
-    SampleInfo(0xb8u, "image_sample_c_o_a", ImageSampleFlagCompare | ImageSampleFlagOffset),
+               ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+                   ImageSampleFlagAdjust),
+    SampleInfo(0xb8u, "image_sample_c_o_a",
+               ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust),
     SampleInfo(0xb9u, "image_sample_c_cl_o_a",
-               ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset),
+               ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+                   ImageSampleFlagAdjust),
     SampleInfo(0xbdu, "image_sample_c_b_o_a",
-               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset),
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset |
+                   ImageSampleFlagAdjust),
     SampleInfo(0xbeu, "image_sample_c_b_cl_o_a",
                ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
-                   ImageSampleFlagOffset),
+                   ImageSampleFlagOffset | ImageSampleFlagAdjust),
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
@@ -192,6 +202,7 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
+    {0x0fu, "image_atomic_swap", Opcode::IMAGE_ATOMIC_SWAP},
     {0x11u, "image_atomic_add", Opcode::IMAGE_ATOMIC_ADD},
     {0x15u, "image_atomic_umin", Opcode::IMAGE_ATOMIC_UMIN},
     {0x17u, "image_atomic_umax", Opcode::IMAGE_ATOMIC_UMAX},
@@ -263,6 +274,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
+		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
@@ -286,6 +298,36 @@ bool IsSingleDmaskBit(uint32_t dmask) {
 
 } // namespace
 
+ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component) {
+	const auto width = [flags](uint32_t index) {
+		if ((flags & ImageSampleFlagA16) == 0u) return 32u;
+		uint32_t cursor = 0;
+		if ((flags & ImageSampleFlagOffset) != 0u) {
+			if (index == cursor++) return 32u;
+		}
+		if ((flags & ImageSampleFlagBias) != 0u) {
+			if (index == cursor++) return 16u;
+		}
+		if ((flags & ImageSampleFlagCompare) != 0u && index == cursor) return 32u;
+		return 16u;
+	};
+	uint32_t offset = 0;
+	for (uint32_t index = 0; index < component; index++) {
+		const auto bits = width(index);
+		if (bits == 32u) offset = (offset + 31u) & ~31u;
+		offset += bits;
+	}
+	const auto bits = width(component);
+	if (bits == 32u) offset = (offset + 31u) & ~31u;
+	return {offset, bits};
+}
+
+uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {
+	if (components == 0u) return 0u;
+	const auto last = ImageAddressComponentLayout(flags, components - 1u);
+	return (last.bit_offset + last.bit_width + 31u) / 32u;
+}
+
 void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
 	const uint32_t word0      = code[word_index];
@@ -299,7 +341,9 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t vaddr  = word1 & 0xffu;
 	const uint32_t srsrc  = (word1 >> 16u) & 0x1fu;
 	const uint32_t ssamp  = (word1 >> 21u) & 0x1fu;
+	const bool     r128   = ((word0 >> 15u) & 0x1u) != 0u;
 	const bool     a16    = ((word1 >> 30u) & 0x1u) != 0u;
+	const bool     d16    = ((word1 >> 31u) & 0x1u) != 0u;
 	const auto*    sample = LookupSample(opcode);
 	const auto*    gather = LookupGather(opcode);
 	const auto*    atomic = LookupAtomic(opcode);
@@ -311,7 +355,9 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.opcode_id          = opcode;
 	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic);
 	inst.dmask              = (word0 >> 8u) & 0xfu;
-	inst.data_dwords        = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
+	inst.data_components    = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
+	inst.data_bits          = d16 ? 16u : 32u;
+	inst.data_dwords        = d16 ? (inst.data_components + 1u) / 2u : inst.data_components;
 	inst.glc                = ((word0 >> 13u) & 1u) != 0;
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
 	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
@@ -319,6 +365,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_sample_flags |= ImageSampleFlagA16;
 	}
 	inst.image_dimension  = dimension;
+	inst.image_r128       = r128;
 	inst.image_nsa_dwords = nsa_dwords;
 	for (uint32_t i = 0; i < nsa_dwords * 4u; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
@@ -334,11 +381,16 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "MIMG image gather requires exactly one dmask bit");
 	}
+	const bool supports_d16 = sample != nullptr || gather != nullptr || opcode == 0x00u ||
+	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
+	if (d16 && !supports_d16) {
+		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
+	}
 
 	DecodeVectorGpr(vdata, inst.dst);
 	DecodeVectorGpr(vaddr, inst.src0);
-	DecodeScalarSource(srsrc * 4u, pc, inst.src1, nullptr);
-	DecodeScalarSource(ssamp * 4u, pc, inst.src2, nullptr);
+	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
+	DecodeScalarSource(ssamp * 4u, pc, inst.src2);
 	inst.src_count = 3;
 }
 

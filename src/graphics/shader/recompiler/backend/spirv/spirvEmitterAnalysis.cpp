@@ -2,7 +2,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -32,22 +32,9 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsFlat(*state.input_info.pixel, attr);
 }
 
-void SetError(std::string* error, const char* message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-}
-
-void CollectRegister(std::vector<RegisterBinding>& registers, IR::Register reg) {
-	if (std::any_of(registers.begin(), registers.end(),
-	                [reg](const RegisterBinding& binding) { return binding.reg == reg; })) {
-		return;
-	}
-	registers.push_back({reg, 0});
-}
-
-bool IsInactiveWave32ExecHigh(const EmitterState& state, IR::Register reg) {
-	return state.wave_size == 32u && reg.file == IR::RegisterFile::Exec && reg.index == 1u;
+bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
+	return state.stage == ShaderType::Pixel &&
+	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind,
@@ -59,8 +46,8 @@ bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind ki
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program) {
 	for (const auto& input: program.info.inputs) {
-		state.inputs.push_back(
-		    {input.kind, input.location, input.component_count, 0, input.debug_name});
+		state.inputs.push_back({input.kind, input.location, input.component_count, 0,
+		                        input.debug_name, input.per_vertex});
 	}
 	for (const auto& output: program.info.outputs) {
 		if (HasOutput(state.outputs, output.kind, output.index)) {
@@ -71,7 +58,7 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 }
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
-	if (exp.kind == IR::ExportTargetKind::Position) {
+	if (exp.kind == IR::ExportTargetKind::Position && exp.index == 0) {
 		return state.per_vertex_variable;
 	}
 	if (exp.kind == IR::ExportTargetKind::MrtZ) {
@@ -88,15 +75,6 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 	return 0;
 }
 
-uint32_t PointerForRegister(const EmitterState& state, IR::Register reg) {
-	for (const auto& binding: state.registers) {
-		if (binding.reg == reg) {
-			return binding.pointer_id;
-		}
-	}
-	return 0;
-}
-
 uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
@@ -108,8 +86,8 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 	std::abort();
 }
 
-DescriptorResourceBinding ResourceForDescriptor(const EmitterState&       state,
-                                                IR::DescriptorBindingKind kind, uint32_t resource) {
+uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
+                               uint32_t resource) {
 	const auto* descriptor = IR::FindBinding(state.program.bindings, kind);
 	if (descriptor == nullptr) {
 		ExitDescriptorBindingFailure(state, kind, resource, "descriptor group was not allocated");
@@ -120,7 +98,7 @@ DescriptorResourceBinding ResourceForDescriptor(const EmitterState&       state,
 		ExitDescriptorBindingFailure(state, kind, resource,
 		                             "resource is absent from descriptor group");
 	}
-	return {descriptor, static_cast<uint32_t>(found - descriptor->resources.begin())};
+	return static_cast<uint32_t>(found - descriptor->resources.begin());
 }
 
 uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
@@ -136,183 +114,147 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
 	return pointer;
 }
 
-ImageViewKind ImageViewKindFromDimension(Decoder::ImageDimension dimension) {
-	switch (dimension) {
-		case Decoder::ImageDimension::Dim1D: return ImageViewKind::Dim1D;
-		case Decoder::ImageDimension::Dim1DArray: return ImageViewKind::Dim1DArray;
-		case Decoder::ImageDimension::Dim2DArray: return ImageViewKind::Dim2DArray;
-		case Decoder::ImageDimension::Dim3D: return ImageViewKind::Dim3D;
-		case Decoder::ImageDimension::Dim2DMsaa: return ImageViewKind::Dim2DMsaa;
-		case Decoder::ImageDimension::Dim2DMsaaArray: return ImageViewKind::Dim2DMsaaArray;
-		default: return ImageViewKind::Dim2D;
+const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension) {
+	for (const auto& info: ImageDimensions) {
+		if (info.dimension == dimension) {
+			return info;
+		}
 	}
+	EXIT("SPIR-V image dimension %u is invalid\n", static_cast<uint32_t>(dimension));
+	std::abort();
 }
 
-ImageViewKind SampledImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc) {
-	(void)state;
-	(void)use_pc;
-	return ImageViewKindFromDimension(mem.image_dimension);
-}
-
-ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   bool uint_image, uint32_t use_pc) {
-	(void)state;
-	(void)uint_image;
-	(void)use_pc;
-	return ImageViewKindFromDimension(mem.image_dimension);
-}
-
-uint32_t ImageViewCoordinateComponents(ImageViewKind view) {
-	switch (view) {
-		case ImageViewKind::Dim1D: return 1u;
-		case ImageViewKind::Dim1DArray:
-		case ImageViewKind::Dim2D: return 2u;
-		case ImageViewKind::Dim2DArray:
-		case ImageViewKind::Dim2DMsaaArray:
-		case ImageViewKind::Dim3D: return 3u;
-		case ImageViewKind::Dim2DMsaa: return 2u;
-		default: return 0u;
+uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class) {
+	switch (numeric_class) {
+		case Prospero::TextureNumericClass::Float: return TypeF32(state);
+		case Prospero::TextureNumericClass::Uint: return TypeU32(state);
+		case Prospero::TextureNumericClass::Sint: return TypeI32(state);
+		case Prospero::TextureNumericClass::Unsupported: break;
 	}
+	EXIT("invalid image numeric class");
 }
 
-uint32_t ImageViewSpatialComponents(ImageViewKind view) {
-	switch (view) {
-		case ImageViewKind::Dim1D:
-		case ImageViewKind::Dim1DArray: return 1u;
-		case ImageViewKind::Dim2D:
-		case ImageViewKind::Dim2DArray:
-		case ImageViewKind::Dim2DMsaa:
-		case ImageViewKind::Dim2DMsaaArray: return 2u;
-		case ImageViewKind::Dim3D: return 3u;
-		default: return 0u;
+uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass numeric_class,
+                         uint32_t components) {
+	return state.builder.Type(OpTypeVector, {ImageScalarType(state, numeric_class), components});
+}
+
+uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
+	uint32_t sampled = 0;
+	uint32_t format  = ImageFormatUnknown;
+	if (image.resource_class == IR::ImageResourceClass::Sampled) {
+		EXIT_IF(image.atomic);
+		sampled = 1;
+	} else if (image.resource_class == IR::ImageResourceClass::Storage) {
+		EXIT_IF(image.numeric_class == Prospero::TextureNumericClass::Sint ||
+		        image.numeric_class == Prospero::TextureNumericClass::Unsupported);
+		sampled = 2;
+		if (image.atomic) {
+			EXIT_IF(image.numeric_class != Prospero::TextureNumericClass::Uint);
+			format = ImageFormatR32ui;
+		}
+	} else {
+		EXIT("invalid image resource class");
 	}
+	const auto& info = ImageDimensionInfoFor(image.dimension);
+	return state.builder.Type(OpTypeImage,
+	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension,
+	                           image.depth_compare ? 1u : 0u,
+	                           info.arrayed, info.multisampled, sampled, format});
 }
 
-uint32_t ImageViewImageType(const EmitterState& state, ImageViewKind view, bool integer) {
-	return state.sampled_images[SampledImageIndex(integer, view)].image_type;
-}
-
-uint32_t ImageViewSampledImageType(const EmitterState& state, ImageViewKind view, bool integer) {
-	return state.sampled_images[SampledImageIndex(integer, view)].sampled_image_type;
-}
-
-uint32_t ImageViewSizeType(const EmitterState& state, ImageViewKind view) {
-	switch (ImageViewCoordinateComponents(view)) {
-		case 1u: return state.uint_type;
-		case 2u: return state.vec2_uint_type;
-		case 3u: return state.vec3_uint_type;
+uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
+	switch (ImageDimensionInfoFor(dimension).coordinate_components) {
+		case 1u: return TypeU32(state);
+		case 2u: return TypeU32Vector(state, 2);
+		case 3u: return TypeU32Vector(state, 3);
 		default: return 0;
 	}
 }
 
-uint32_t StorageImageType(const EmitterState& state, bool uint_image, ImageViewKind view) {
-	return state.storage_images[StorageImageIndex(uint_image, view)].image_type;
-}
-
-uint32_t StorageImagePointerType(const EmitterState& state, bool uint_image, ImageViewKind view) {
-	return state.storage_images[StorageImageIndex(uint_image, view)].pointer_type;
-}
-
-uint32_t StorageImageVariable(const EmitterState& state, bool uint_image, ImageViewKind view) {
-	return state.storage_images[StorageImageIndex(uint_image, view)].variable;
-}
-
-uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                                    ImageViewKind view) {
-	(void)use_pc;
-	const bool  integer     = mem.kind == IR::ResourceKind::ImageUint;
-	const auto  kind        = SampledBindingKind(integer, view);
-	const auto  binding     = ResourceForDescriptor(state, kind, mem.resource);
-	const auto& descriptors = state.sampled_images[SampledImageIndex(integer, view)];
-	const auto  pointer     = DescriptorElementPointer(
-	    state, descriptors.pointer_type, descriptors.variable, binding.array_index, kind,
-	    mem.resource, "sampled image descriptor array was not emitted");
+uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+	const auto kind = IR::DescriptorBindingForImage(image_resource);
+	EXIT_IF(!kind.has_value());
+	const auto array_index  = ResourceForDescriptor(state, *kind, resource);
+	const auto variable     = state.image_variables[IR::ImageBindingIndex(*kind)];
+	const auto pointer_type = state.builder.Type(
+	    OpTypePointer, {StorageClassUniformConstant, ImageType(state, image_resource)});
+	const auto pointer =
+	    DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
+	                             "sampled image descriptor array was not emitted");
 	const auto image = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, ImageViewImageType(state, view, integer), image, pointer});
+	state.builder.AddFunction({OpLoad, ImageType(state, image_resource), image, pointer});
 	return image;
 }
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t use_pc) {
-	(void)use_pc;
-	const auto binding = ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
+	const auto sampler_type = state.builder.Type(OpTypeSampler);
+	const auto pointer_type =
+	    state.builder.Type(OpTypePointer, {StorageClassUniformConstant, sampler_type});
 	const auto pointer = DescriptorElementPointer(
-	    state, state.ptr_uniform_sampler, state.sampler_variable, binding.array_index,
+	    state, pointer_type, state.sampler_variable, array_index,
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
 	const auto sampler_id = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, state.sampler_type, sampler_id, pointer});
+	state.builder.AddFunction({OpLoad, sampler_type, sampler_id, pointer});
 	return sampler_id;
 }
 
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                          ImageViewKind view) {
-	const auto image   = LoadSampledImageDescriptor(state, mem, use_pc, view);
-	const auto sampler = LoadSamplerDescriptor(state, mem.sampler, use_pc);
-	if (image == 0 || sampler == 0) {
-		ExitDescriptorBindingFailure(
-		    state, SampledBindingKind(mem.kind == IR::ResourceKind::ImageUint, view), mem.resource,
-		    "sampled image or sampler descriptor load failed");
-	}
-	const auto sampled_image = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpSampledImage,
-	     ImageViewSampledImageType(state, view, mem.kind == IR::ResourceKind::ImageUint),
-	     sampled_image, image, sampler});
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	const auto  image          = LoadSampledImageDescriptor(state, resource);
+	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
+	const auto  sampled_image = state.builder.AllocateId();
+	const auto  sampled_type  =
+	    state.builder.Type(OpTypeSampledImage, {ImageType(state, image_resource)});
+	state.builder.AddFunction({OpSampledImage, sampled_type, sampled_image, image, sampler_id});
 	return sampled_image;
 }
 
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                          ImageViewKind view, uint32_t image_resource) {
-	auto selected     = mem;
-	selected.resource = image_resource;
-	return MakeSampledImage(state, selected, use_pc, view);
-}
-
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, bool uint_image,
-                                       uint32_t use_pc, ImageViewKind view) {
-	(void)use_pc;
-	const auto kind     = StorageBindingKind(uint_image, view);
-	const auto binding  = ResourceForDescriptor(state, kind, resource);
-	const auto ptr_type = StorageImagePointerType(state, uint_image, view);
-	const auto variable = StorageImageVariable(state, uint_image, view);
-	return DescriptorElementPointer(state, ptr_type, variable, binding.array_index, kind, resource,
+uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource) {
+	const auto& image = state.program.info.images.at(resource);
+	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage);
+	const auto kind = IR::DescriptorBindingForImage(image);
+	EXIT_IF(!kind.has_value());
+	const auto array_index = ResourceForDescriptor(state, *kind, resource);
+	const auto pointer_type =
+	    state.builder.Type(OpTypePointer, {StorageClassUniformConstant, ImageType(state, image)});
+	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	return DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
 	                                "storage image descriptor array was not emitted");
 }
 
-uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool uint_image,
-                                    uint32_t use_pc, ImageViewKind view) {
-	const auto pointer = StorageImageDescriptorPointer(state, resource, uint_image, use_pc, view);
-	if (pointer == 0) {
-		ExitDescriptorBindingFailure(state, StorageBindingKind(uint_image, view), resource,
-		                             "storage image descriptor pointer creation failed");
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
+                           uint32_t texel) {
+	const auto& image = state.program.info.images.at(resource);
+	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage);
+	if (!image.atomic) {
+		state.builder.RequireCapability(CapabilityStorageImageWriteWithoutFormat);
 	}
-	const auto type  = StorageImageType(state, uint_image, view);
-	const auto image = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, type, image, pointer});
-	return image;
-}
-
-void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_image,
-                           ImageViewKind view, uint32_t mip_lod, uint32_t coord, uint32_t texel) {
-	const auto  kind    = StorageBindingKind(uint_image, view);
-	const auto  binding = ResourceForDescriptor(state, kind, resource);
-	const auto& image   = state.program.info.images.at(resource);
-	const auto  LoadAt  = [&](uint32_t array_index) {
-		const auto pointer = DescriptorElementPointer(
-		    state, StorageImagePointerType(state, uint_image, view),
-		    StorageImageVariable(state, uint_image, view), array_index, kind, resource,
-		    "storage image descriptor array was not emitted");
+	const auto kind = IR::DescriptorBindingForImage(image);
+	EXIT_IF(!kind.has_value());
+	const auto array_index = ResourceForDescriptor(state, *kind, resource);
+	const auto image_type  = ImageType(state, image);
+	const auto pointer_type =
+	    state.builder.Type(OpTypePointer, {StorageClassUniformConstant, image_type});
+	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	const auto LoadAt   = [&](uint32_t array_index) {
+		const auto pointer =
+		    DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
+		                             "storage image descriptor array was not emitted");
 		const auto descriptor = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {OpLoad, StorageImageType(state, uint_image, view), descriptor, pointer});
+		state.builder.AddFunction({OpLoad, image_type, descriptor, pointer});
 		return descriptor;
 	};
 	if (image.mip_mode != IR::ImageMipMode::DynamicStorage) {
-		state.builder.AddFunction({OpImageWrite, LoadAt(binding.array_index), coord, texel});
+		state.builder.AddFunction({OpImageWrite, LoadAt(array_index), coord, texel});
 		return;
 	}
 	if (image.mip_count == 0u) {
-		ExitDescriptorBindingFailure(state, kind, resource,
+		ExitDescriptorBindingFailure(state, *kind, resource,
 		                             "dynamic storage image has no mip descriptors");
 	}
 
@@ -327,16 +269,17 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_ima
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction(words);
 	for (uint32_t mip = 0; mip < image.mip_count; mip++) {
-		state.builder.AddFunction({OpLabel, labels[mip]});
-		state.builder.AddFunction({OpImageWrite, LoadAt(binding.array_index + mip), coord, texel});
+		EmitLabel(state, labels[mip]);
+		state.builder.AddFunction({OpImageWrite, LoadAt(array_index + mip), coord, texel});
 		state.builder.AddFunction({OpBranch, merge_label});
 	}
-	state.builder.AddFunction({OpLabel, merge_label});
+	EmitLabel(state, merge_label);
 }
 
 uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return ExecutionModelVertex;
+		case ShaderType::Mesh: return 5365u; // MeshEXT
 		case ShaderType::Pixel: return ExecutionModelFragment;
 		default: return ExecutionModelGLCompute;
 	}

@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -170,6 +172,10 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	}
 	const auto  component = index.U32();
 	const auto* producer  = composite.TryInstruction();
+	if (IsImmediate(composite, Type::U64)) {
+		Replace(inst, Value(static_cast<uint32_t>(composite.U64() >> (component * 32u))));
+		return true;
+	}
 	if (producer != nullptr && producer->GetOpcode() == construct) {
 		Replace(inst, producer->Arg(component));
 		return true;
@@ -185,18 +191,12 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 			return true;
 		}
 	}
-	if (component < 2u && producer != nullptr &&
-	    producer->GetOpcode() == ValueOpcode::UnpackUint2x32) {
-		const auto packed = producer->Arg(0).Resolve();
-		if (IsImmediate(packed, Type::U64)) {
-			Replace(inst, Value(static_cast<uint32_t>(packed.U64() >> (component * 32u))));
-			return true;
-		}
-	}
 	return false;
 }
 
-void FoldInstruction(Inst& inst) {
+void FoldInstruction(Block& block, Block::iterator instruction,
+                      std::unordered_set<Inst*>& lowered_ancillary) {
+	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
@@ -227,6 +227,29 @@ void FoldInstruction(Inst& inst) {
 			const auto value  = Arg(inst, 0);
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
+			auto* source = value.TryInstruction();
+			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
+			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
+			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
+				constexpr struct {
+					uint32_t       start;
+					uint32_t       end;
+					StageInputKind kind;
+				} fields[] = {{8u, 12u, StageInputKind::SampleId}, {16u, 27u, StageInputKind::Layer}};
+				for (const auto& field: fields) {
+					if (offset.U32() >= field.start && offset.U32() < field.end &&
+					    count.U32() <= field.end - offset.U32()) {
+						// Preserve extraction and sign extension while exposing only the used field.
+						const auto input = block.PrependNewInst(
+						    instruction, ValueOpcode::GetBuiltin,
+						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
+						inst.SetArg(0, Value(&*input));
+						inst.SetArg(1, Value(offset.U32() - field.start));
+						lowered_ancillary.insert(source);
+						return;
+					}
+				}
+			}
 			if (!IsImmediate(value, Type::U32) || !IsImmediate(offset, Type::U32) ||
 			    !IsImmediate(count, Type::U32) || offset.U32() > 32u ||
 			    count.U32() > 32u - offset.U32()) {
@@ -284,33 +307,24 @@ void FoldInstruction(Inst& inst) {
 			}
 			return;
 		}
+		case ValueOpcode::CompositeExtractU64:
+			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU64, 2);
+			return;
 		case ValueOpcode::CompositeExtractU32x2:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x2, 2);
+			return;
+		case ValueOpcode::CompositeExtractU32x3:
+			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x3, 3);
 			return;
 		case ValueOpcode::CompositeExtractU32x4:
 			FoldCompositeExtract(inst, ValueOpcode::CompositeConstructU32x4, 4);
 			return;
-		case ValueOpcode::PackUint2x32: {
-			const auto  value    = Arg(inst, 0);
-			const auto* producer = value.TryInstruction();
-			if (producer != nullptr && producer->GetOpcode() == ValueOpcode::UnpackUint2x32) {
-				Replace(inst, producer->Arg(0));
-			} else if (producer != nullptr &&
-			           producer->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-				const auto low  = producer->Arg(0).Resolve();
-				const auto high = producer->Arg(1).Resolve();
-				if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
-					Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
-					                    (static_cast<uint64_t>(high.U32()) << 32u)));
-				}
-			}
-			return;
-		}
-		case ValueOpcode::UnpackUint2x32: {
-			const auto  value    = Arg(inst, 0);
-			const auto* producer = value.TryInstruction();
-			if (producer != nullptr && producer->GetOpcode() == ValueOpcode::PackUint2x32) {
-				Replace(inst, producer->Arg(0));
+		case ValueOpcode::CompositeConstructU64: {
+			const auto low  = Arg(inst, 0);
+			const auto high = Arg(inst, 1);
+			if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
+				Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
+				                    (static_cast<uint64_t>(high.U32()) << 32u)));
 			}
 			return;
 		}
@@ -354,6 +368,21 @@ void FoldInstruction(Inst& inst) {
 				ReplaceBinaryIdentity(inst, Type::U64, 1u);
 			}
 			return;
+		case ValueOpcode::WqmU64: {
+			const auto value = Arg(inst, 0);
+			if (IsImmediate(value, Type::U64)) {
+				const auto expand = [](uint32_t word) {
+					auto quads = word | (word >> 1u);
+					quads |= quads >> 2u;
+					return (quads & 0x11111111u) * 0x0fu;
+				};
+				const auto low  = expand(static_cast<uint32_t>(value.U64()));
+				const auto high = expand(static_cast<uint32_t>(value.U64() >> 32u));
+				Replace(inst,
+				        Value(static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32u)));
+			}
+			return;
+		}
 		case ValueOpcode::UDiv32: {
 			const auto rhs = Arg(inst, 1);
 			if (IsImmediate(rhs, Type::U32) && rhs.U32() == 1u) {
@@ -443,11 +472,6 @@ void FoldInstruction(Inst& inst) {
 				ReplaceBinaryIdentity(inst, Type::U32, 0u);
 			}
 			return;
-		case ValueOpcode::BitwiseOr64:
-			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a | b; })) {
-				ReplaceBinaryIdentity(inst, Type::U64, 0u);
-			}
-			return;
 		case ValueOpcode::BitwiseNot32: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U32)) {
@@ -528,28 +552,12 @@ void FoldInstruction(Inst& inst) {
 		case ValueOpcode::ULessThan64:
 			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a < b; });
 			return;
-		case ValueOpcode::ULessThanEqual64:
-			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a <= b; });
-			return;
 		case ValueOpcode::UGreaterThan64:
 			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a > b; });
 			return;
-		case ValueOpcode::UGreaterThanEqual64:
-			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a >= b; });
-			return;
 		case ValueOpcode::SLessThan64:
-		case ValueOpcode::SLessThanEqual64:
-		case ValueOpcode::SGreaterThan64:
-		case ValueOpcode::SGreaterThanEqual64:
-			FoldU64Compare(inst, [opcode = inst.GetOpcode()](uint64_t a, uint64_t b) {
-				const auto lhs = std::bit_cast<int64_t>(a);
-				const auto rhs = std::bit_cast<int64_t>(b);
-				switch (opcode) {
-					case ValueOpcode::SLessThan64: return lhs < rhs;
-					case ValueOpcode::SLessThanEqual64: return lhs <= rhs;
-					case ValueOpcode::SGreaterThan64: return lhs > rhs;
-					default: return lhs >= rhs;
-				}
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) {
+				return std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);
 			});
 			return;
 		case ValueOpcode::LogicalAnd:
@@ -602,9 +610,25 @@ void FoldInstruction(Inst& inst) {
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks) {
+	std::unordered_set<Inst*> lowered_ancillary;
 	for (auto* block: blocks) {
-		for (auto& inst: block->Instructions()) {
-			FoldInstruction(inst);
+		for (auto inst = block->begin(); inst != block->end(); ++inst) {
+			FoldInstruction(*block, inst, lowered_ancillary);
+		}
+	}
+	// Normalize retained PHI/select values only after every supported field read has
+	// been lowered; direct raw consumers remain unsupported.
+	for (auto* source: lowered_ancillary) {
+		const bool retained_only = std::ranges::all_of(source->Uses(), [](const Use& use) {
+			const auto& user = *use.user;
+			if (!user.HasUses() && !user.MayHaveSideEffects()) {
+				return true;
+			}
+			return user.GetOpcode() == ValueOpcode::Phi ||
+			       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u);
+		});
+		if (retained_only) {
+			Replace(*source, Value(0u));
 		}
 	}
 }

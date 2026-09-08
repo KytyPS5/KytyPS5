@@ -26,6 +26,28 @@ struct BufferFormatInfo {
 	bool                   packed_bitfield         = false;
 };
 
+enum class FormattedSourceKind { Memory, Zero, One, Invalid };
+
+struct FormattedSource {
+	FormattedSourceKind kind      = FormattedSourceKind::Zero;
+	uint32_t            component = 0;
+};
+
+constexpr FormattedSource ResolveFormattedSource(const BufferFormatInfo& info, uint32_t selector) {
+	if (selector == 0u) return {};
+	if (selector == 1u) return {FormattedSourceKind::One, 0};
+	if (selector < 4u || selector > 7u || info.component_count == 0u) {
+		return {FormattedSourceKind::Invalid, 0};
+	}
+	// Formatted decoding expands source channels before applying the swizzle.
+	return {FormattedSourceKind::Memory, (selector - 4u) % info.component_count};
+}
+
+constexpr uint32_t FormattedConstantBits(const BufferFormatInfo& info, FormattedSourceKind kind) {
+	if (kind != FormattedSourceKind::One) return 0;
+	return info.type == ComponentType::Uint || info.type == ComponentType::Sint ? 1u : 0x3f800000u;
+}
+
 constexpr Prospero::BufferFormat DecodeTBufferFormat(uint32_t data_format, uint32_t number_format) {
 	return static_cast<Prospero::BufferFormat>(((number_format & 0x7u) << 4u) |
 	                                           (data_format & 0xfu));

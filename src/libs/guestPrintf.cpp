@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/stringUtils.h"
 #include "libs/vaContext.h"
 
 #include <cfloat>
@@ -431,12 +432,13 @@ static size_t _etoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 	return idx;
 }
 
-static inline unsigned int _strnlen_s(const char* str, size_t maxsize) {
-	const char* s = nullptr;
-	for (s = str; (*s != 0) && ((maxsize--) != 0u); ++s) {
-		;
+template <typename Char>
+static size_t _strnlen_s(const Char* str, size_t maxsize) {
+	size_t size = 0;
+	while (size < maxsize && str[size] != 0) {
+		++size;
 	}
-	return static_cast<unsigned int>(s - str);
+	return size;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -694,26 +696,37 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			}
 
 			case 's': {
-				// const char*  p = va_arg(va, char*);
-				const char*  p = VaArg_ptr<const char>(va_list);
-				unsigned int l =
-				    _strnlen_s(p, precision != 0u ? precision : static_cast<size_t>(-1));
-				// pre padding
-				if ((flags & FLAGS_PRECISION) != 0u) {
-					l = (l < precision ? l : precision);
+				const size_t limit = (flags & FLAGS_PRECISION) != 0u ? precision : maxlen;
+				const char* p = VaArg_ptr<const char>(va_list);
+				std::string converted;
+				if ((flags & FLAGS_LONG) != 0u) {
+					// The guest ABI uses a 16-bit code unit for wchar_t.
+					const auto* wide = reinterpret_cast<const char16_t*>(p);
+					std::u16string_view text(wide, _strnlen_s(wide, limit));
+					if (text.size() == limit && !text.empty() &&
+					    text.back() >= 0xd800 && text.back() <= 0xdbff) {
+						text.remove_suffix(1);
+					}
+					converted = Common::Utf16ToUtf8(text);
+					p = converted.c_str();
+				}
+				size_t length = _strnlen_s(p, limit);
+				if ((flags & FLAGS_LONG) != 0u && length < converted.size()) {
+					// A wide-string precision cannot split a multibyte character.
+					while (length != 0 && (static_cast<uint8_t>(p[length]) & 0xc0) == 0x80) {
+						--length;
+					}
 				}
 				if ((flags & FLAGS_LEFT) == 0u) {
-					while (l++ < width) {
+					for (size_t i = length; i < width; ++i) {
 						out(' ', &buffer, idx++, maxlen);
 					}
 				}
-				// string output
-				while ((*p != 0) && (((flags & FLAGS_PRECISION) == 0u) || ((precision--) != 0u))) {
-					out(*(p++), &buffer, idx++, maxlen);
+				for (size_t i = 0; i < length; ++i) {
+					out(p[i], &buffer, idx++, maxlen);
 				}
-				// post padding
 				if ((flags & FLAGS_LEFT) != 0u) {
-					while (l++ < width) {
+					for (size_t i = length; i < width; ++i) {
 						out(' ', &buffer, idx++, maxlen);
 					}
 				}

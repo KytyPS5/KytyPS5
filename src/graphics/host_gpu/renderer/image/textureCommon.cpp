@@ -119,13 +119,16 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
 	return components;
 }
 
-vk::Format TextureGetFormat(Prospero::BufferFormat format) {
-	const auto vk_format = VulkanFormat(format);
+SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+	const auto backing_format    = Prospero::RemapTextureFormat(format);
+	const auto vk_format         = VulkanFormat(backing_format);
+	const auto conversion_format =
+	    backing_format != format ? format : Prospero::BufferFormat::kInvalid;
 	if (vk_format != vk::Format::eUndefined) {
-		return vk_format;
+		return SurfaceFormatInfo(vk_format, conversion_format);
 	}
 	EXIT("unknown format: fmt = %u\n", static_cast<uint32_t>(format));
-	return vk::Format::eUndefined;
+	return SurfaceFormatInfo(vk::Format::eUndefined, Prospero::BufferFormat::kInvalid);
 }
 
 namespace {

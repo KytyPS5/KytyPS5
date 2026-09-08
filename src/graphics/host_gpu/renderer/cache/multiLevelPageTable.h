@@ -256,17 +256,6 @@ private:
 	size_type                              m_inline_size = 0;
 };
 
-// Removes only the requested owner. Other owners in the same page entry remain intact.
-template <typename Container, typename Value>
-[[nodiscard]] bool EraseExact(Container& owners, const Value& owner) {
-	const auto it = std::find(owners.begin(), owners.end(), owner);
-	if (it == owners.end()) {
-		return false;
-	}
-	owners.erase(it);
-	return true;
-}
-
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_

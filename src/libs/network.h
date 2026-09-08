@@ -40,6 +40,7 @@ int KYTY_SYSV_ABI NetTerm();
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
+int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
@@ -105,6 +106,8 @@ int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int 
 int KYTY_SYSV_ABI HttpDeleteConnection(int conn_id);
 int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
                                     uint64_t content_length);
+int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char* path,
+                                     uint64_t content_length);
 int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, const char* url,
                                             uint64_t content_length);
 int KYTY_SYSV_ABI HttpSetRequestContentLength(int request_id, uint64_t content_length);

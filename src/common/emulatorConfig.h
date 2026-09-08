@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -26,14 +27,28 @@ enum class ProfilerDirection { None, Network };
 
 enum class OutputDirection { Silent, Console, File };
 
+enum class PresentMode { Fifo, Mailbox, Immediate };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
+constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
+constexpr int32_t DEFAULT_USER_ID           = 1000;
+
+constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
+	constexpr int32_t USER_ID_EVERYONE = 0xfe;
+	constexpr int32_t USER_ID_SYSTEM   = 0xff;
+	return user_id >= 0 && user_id != USER_ID_EVERYONE && user_id != USER_ID_SYSTEM;
+}
 
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
+	std::string            user_name                   = "Kyty";
+	int32_t                user_id                     = DEFAULT_USER_ID;
+	PresentMode            present_mode                = PresentMode::Fifo;
+	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -55,7 +70,7 @@ struct ConfigOptions {
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
-	OutputDirection        printf_direction            = OutputDirection::Console;
+	OutputDirection        printf_direction            = OutputDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   spirv_debug_printf_enabled  = false;
@@ -73,6 +88,10 @@ void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
+const std::string& GetUserName();
+int32_t  GetUserId();
+PresentMode GetPresentMode();
+int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();

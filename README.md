@@ -220,17 +220,23 @@ cmake --install _Build/macos --prefix _Build/macos/install
 ```
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required.
+guest code; no manual signing step is required. When the launcher is built, the install
+also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
+A flat `kyty_emulator` is kept for CLI usage.
 
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` and ad-hoc sign it:
+`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
+(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
+# For the bundle (if present):
+codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
+codesign --force --sign - _Build/macos/install/KytyPS5.app
 ```
 
-Release archives already include a signed `libMoltenVK.dylib`.
+Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
 
 ### Regression tests
 
@@ -274,6 +280,10 @@ To use the graphical launcher:
 ./_Build/linux/install/launcher
 ```
 
+```bash
+open _Build/macos/install/KytyPS5.app  # or double-click in Finder
+```
+
 On first launch, add one or more game folders in the global settings. The launcher searches those
 folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
 from the game list.
@@ -288,12 +298,17 @@ The emulator can also be started directly with a legally obtained game directory
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
 ```
 
-On macOS, point SDL at the MoltenVK library explicitly; the hardened runtime prevents it from
-being picked up from the executable's directory:
+On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
+environment variable is required:
 
 ```bash
-cd _Build/macos/install
-SDL_VULKAN_LIBRARY="$PWD/libMoltenVK.dylib" ./kyty_emulator --game "/games/ExampleGame"
+./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
+```
+
+To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
+
+```bash
+SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
 ```
 
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and

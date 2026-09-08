@@ -116,9 +116,6 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
 
-	sampler_info.sType     = vk::StructureType::eSamplerCreateInfo;
-	sampler_info.pNext     = nullptr;
-	sampler_info.flags     = {};
 	sampler_info.magFilter = to_vk_filter(mag_filter);
 	sampler_info.minFilter = to_vk_filter(min_filter);
 	sampler_info.mipmapMode =

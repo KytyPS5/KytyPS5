@@ -3,13 +3,12 @@
 
 namespace Libs::Graphics {
 
+class RenderContext;
+
 void RenderDocInit();
 void RenderDocRequestCapture();
-void RenderDocStartCapture();
-void RenderDocEndCapture();
-
-[[nodiscard]] bool RenderDocCaptureRequested();
-[[nodiscard]] bool RenderDocCaptureInProgress();
+// Called by the presentation thread after releasing video-out locks.
+void RenderDocOnGuestFlip(RenderContext& renderer);
 
 } // namespace Libs::Graphics
 

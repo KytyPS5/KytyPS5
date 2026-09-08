@@ -1,8 +1,8 @@
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -20,6 +20,19 @@ void Check(bool condition, const char *message) {
   }
 }
 
+template <typename F>
+void CheckFatal(F &&function, std::string_view expected, const char *message) {
+  try {
+    function();
+  } catch (const std::runtime_error &error) {
+    Check(std::string_view(error.what()).find(expected) !=
+              std::string_view::npos,
+          message);
+    return;
+  }
+  Check(false, message);
+}
+
 struct Fixture {
   Program program;
 
@@ -27,16 +40,15 @@ struct Fixture {
     program.stage = ShaderType::Compute;
     program.shader_hash = 0x12345678u;
     program.user_data_base = 2;
-    program.values = std::make_shared<ValueProgram>();
     for (uint32_t index = 0; index < block_count; index++) {
-      program.values->block_storage.push_back(std::make_unique<Block>());
-      auto *block = program.values->block_storage.back().get();
-      program.values->blocks.push_back(block);
-      program.values->block_info.push_back({.id = index});
+      program.block_storage.push_back(std::make_unique<Block>());
+      auto *block = program.block_storage.back().get();
+      program.blocks.push_back(block);
+      program.block_info.push_back({.id = index});
     }
   }
 
-  Block &BlockAt(uint32_t index = 0) { return *program.values->blocks[index]; }
+  Block &BlockAt(uint32_t index = 0) { return *program.blocks[index]; }
 
   Value Emit(ValueOpcode opcode, std::initializer_list<Value> args = {},
              uint64_t flags = 0, uint32_t block = 0) {
@@ -55,14 +67,11 @@ struct Fixture {
     MemoryInfo info;
     info.kind = kind;
     info.offset = static_cast<uint32_t>(offset);
-    program.values->memory_info.push_back(info);
-    return static_cast<uint32_t>(program.values->memory_info.size() - 1u);
+    program.memory_info.push_back(info);
+    return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() {
-    std::string error;
-    Check(BuildSrtPlan(program, &error), error.c_str());
-  }
+  void Plan() { BuildSrtPlan(program); }
 };
 
 struct TestMemory {
@@ -103,18 +112,17 @@ void TestImmediateFlatteningAndGvn() {
                {first, second, Value(16u), Value(0u)});
 
   fixture.Plan();
-  Check(fixture.program.values->srt_reads.size() == 1,
+  Check(fixture.program.srt_reads.size() == 1,
         "equivalent typed scalar reads were not coalesced");
-  Check(fixture.program.values->dynamic_reads.empty(),
+  Check(fixture.program.dynamic_reads.empty(),
         "immediate scalar read was classified as dynamic");
-  Check(fixture.program.values->memory_info[memory].planning_only,
+  Check(fixture.program.memory_info[memory].planning_only,
         "flattened raw read was not kept as a planning-only root");
 
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
+  Check(WalkSrt(fixture.program, runtime, flat), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
 }
@@ -131,36 +139,30 @@ void TestRawScalarComponentAlignment() {
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
-  Check(flat == std::vector<uint32_t>{0x12345678u} &&
-            memory_image.reads == 1,
-        "raw scalar base, immediate, and offset were not aligned independently");
+  Check(WalkSrt(fixture.program, runtime, flat), "raw scalar SRT walk failed");
+  Check(
+      flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
+      "raw scalar base, immediate, and offset were not aligned independently");
 }
 
 void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
-  RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u),
-          raw_memory);
-  std::string error;
-  Check(!BuildSrtPlan(raw.program, &error) &&
-            error.find("incompatible scalar memory metadata") !=
-                std::string::npos,
-        "raw scalar load accepted descriptor-buffer metadata");
+  RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u), raw_memory);
+  CheckFatal([&] { BuildSrtPlan(raw.program); },
+             "incompatible scalar memory metadata",
+             "raw scalar load accepted descriptor-buffer metadata");
 
   Fixture buffer;
   const auto buffer_memory = buffer.AddMemory(ResourceKind::ScalarAddress);
-  const auto resource = buffer.Emit(ValueOpcode::GetBufferResource,
-                                    {Value(0x1000u), Value(0u), Value(16u),
-                                     Value(0u)});
-  buffer.EmitMemory(ValueOpcode::ReadConstBuffer,
-                    {resource, Value(0u)}, buffer_memory);
-  error.clear();
-  Check(!BuildSrtPlan(buffer.program, &error) &&
-            error.find("incompatible scalar memory metadata") !=
-                std::string::npos,
-        "descriptor scalar load accepted raw-address metadata");
+  const auto resource =
+      buffer.Emit(ValueOpcode::GetBufferResource,
+                  {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
+  buffer.EmitMemory(ValueOpcode::ReadConstBuffer, {resource, Value(0u)},
+                    buffer_memory);
+  CheckFatal([&] { BuildSrtPlan(buffer.program); },
+             "incompatible scalar memory metadata",
+             "descriptor scalar load accepted raw-address metadata");
 }
 
 void TestDynamicReadRemainsTyped() {
@@ -174,8 +176,8 @@ void TestDynamicReadRemainsTyped() {
                {read, Value(0u), Value(16u), Value(0u)});
 
   fixture.Plan();
-  Check(fixture.program.values->srt_reads.empty() &&
-            fixture.program.values->dynamic_reads == std::vector<Value>{read},
+  Check(fixture.program.srt_reads.empty() &&
+            fixture.program.dynamic_reads == std::vector<Value>{read},
         "dynamic scalar read received a fake flattened slot");
 }
 
@@ -193,8 +195,7 @@ void TestNestedSrtWalk() {
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error), error.c_str());
+  Check(WalkSrt(fixture.program, runtime, flat), "nested SRT walk failed");
   Check(flat == std::vector<uint32_t>({0x2000u, 0xabcdef01u}),
         "nested typed SRT reads were not evaluated in dependency order");
 }
@@ -202,26 +203,23 @@ void TestNestedSrtWalk() {
 void TestShaderBaseAndUserData() {
   Fixture fixture;
   const auto base = fixture.Emit(ValueOpcode::GetShaderBase);
-  const auto pair = fixture.Emit(ValueOpcode::UnpackUint2x32, {base});
   const auto low =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(0u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {base, Value(0u)});
   const auto high =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(1u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {base, Value(1u)});
   const auto user = fixture.Emit(ValueOpcode::GetUserData,
                                  {Value(static_cast<ScalarReg>(2))});
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {user, Value(4u)});
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, sum}, .dword_count = 3});
 
   const std::array user_data{0x20u};
   SrtRuntime runtime{.user_data = user_data,
                      .shader_base = 0x12345678abcdef00ull};
   DescriptorValue result;
-  std::string error;
-  Check(EvaluateDescriptorSource(fixture.program, 0, 0x90, runtime, result,
-                                 &error),
-        error.c_str());
+  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result),
+        "shader-relative descriptor evaluation failed");
   Check(result.dword_count == 3 && result.dwords[0] == 0xabcdef00u &&
             result.dwords[1] == 0x12345678u && result.dwords[2] == 0x24u,
         "shader-relative typed descriptor expression evaluated incorrectly");
@@ -241,13 +239,12 @@ void TestCarryAndBitFields() {
   const auto sign = fixture.Emit(ValueOpcode::BitFieldSExtract,
                                  {Value(0x000000f0u), Value(4u), Value(4u)});
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
   DescriptorValue result;
-  std::string error;
-  Check(EvaluateDescriptorSource(fixture.program, 0, 0, {}, result, &error),
-        error.c_str());
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result),
+        "carry and bit-field descriptor evaluation failed");
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
         "typed carry or bit-field runtime evaluation is incorrect");
@@ -264,23 +261,19 @@ void TestInvariantAndDivergentPhi() {
   divergent.AddPhiOperand(&fixture.BlockAt(0), Value(7u));
   divergent.AddPhiOperand(&fixture.BlockAt(1), Value(9u));
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&invariant)}, .dword_count = 1});
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
   DescriptorValue result;
-  std::string error;
-  Check(
-      EvaluateDescriptorSource(fixture.program, 0, 0x100, {}, result, &error) &&
-          result.dwords[0] == 7u,
-      "loop-invariant typed phi was rejected");
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+            result.dwords[0] == 7u,
+        "loop-invariant typed phi was rejected");
   result.dword_count = 4;
   result.dwords[0] = 0xdeadbeefu;
-  Check(!EvaluateDescriptorSource(fixture.program, 1, 0x104, {}, result,
-                                  &error) &&
-            result.dword_count == 4 && result.dwords[0] == 0xdeadbeefu &&
-            error.find("runtime-dependent") != std::string::npos,
+  Check(!EvaluateDescriptorSource(fixture.program, 1, {}, result) &&
+            result.dword_count == 4 && result.dwords[0] == 0xdeadbeefu,
         "divergent phi did not fail transactionally");
 }
 
@@ -295,10 +288,10 @@ void TestControlDependentStandaloneLoadStaysTyped() {
       RawRead(fixture, Address(fixture, Value(&base), Value(0u), 2), Value(0u),
               memory, 2);
   fixture.Plan();
-  Check(fixture.program.values->srt_reads.empty() &&
+  Check(fixture.program.srt_reads.empty() &&
             read.ResolveInstruction()->GetOpcode() ==
                 ValueOpcode::LoadAddressU32 &&
-            !fixture.program.values->memory_info[memory].planning_only,
+            !fixture.program.memory_info[memory].planning_only,
         "control-dependent standalone scalar load was flattened into a host "
         "snapshot");
 }
@@ -310,22 +303,141 @@ void TestRuntime64BitDescriptorOps() {
   const auto masked =
       fixture.Emit(ValueOpcode::BitwiseAnd64,
                    {shifted, Value(uint64_t{0x0000ffff00000000ull})});
-  const auto combined = fixture.Emit(ValueOpcode::BitwiseOr64,
-                                     {masked, Value(uint64_t{0xabcdu})});
-  const auto pair = fixture.Emit(ValueOpcode::UnpackUint2x32, {combined});
+  const auto combined = fixture.Emit(
+      ValueOpcode::IAdd64, {masked, Value(uint64_t{0x000000010000abcdull})});
   const auto low =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(0u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(0u)});
   const auto high =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {pair, Value(1u)});
+      fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(1u)});
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high}, .dword_count = 2});
 
   DescriptorValue result;
-  std::string error;
-  Check(EvaluateDescriptorSource(fixture.program, 0, 0, {}, result, &error) &&
-            result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1234u,
-        "64-bit typed descriptor shift/mask evaluation is incorrect");
+  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+            result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
+        "64-bit typed descriptor arithmetic evaluation is incorrect");
+}
+
+void TestUniformFirstLaneSamplerLod() {
+  Fixture fixture;
+  const auto active = fixture.Emit(
+      ValueOpcode::IEqual32, {fixture.Emit(ValueOpcode::LaneId), Value(0u)});
+  const auto stale = fixture.Emit(
+      ValueOpcode::GetVectorRegister, {Value(static_cast<VectorReg>(0))});
+  const auto write = [&](Value value, Value previous) {
+    return fixture.Emit(ValueOpcode::SelectU32, {active, value, previous});
+  };
+  const auto user = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(8))});
+  const auto as_float = fixture.Emit(ValueOpcode::ConvertF32U32, {user});
+  const auto initial = write(
+      fixture.Emit(ValueOpcode::BitCastU32F32, {as_float}), stale);
+  const auto initial_float =
+      fixture.Emit(ValueOpcode::BitCastF32U32, {initial});
+  const auto scaled = fixture.Emit(ValueOpcode::FPMul32,
+                                   {Value::F32(256.0f), initial_float});
+  const auto scaled_write = write(
+      fixture.Emit(ValueOpcode::BitCastU32F32, {scaled}), initial);
+  const auto scaled_float =
+      fixture.Emit(ValueOpcode::BitCastF32U32, {scaled_write});
+  const auto nan = fixture.Emit(ValueOpcode::FPIsNan32, {scaled_float});
+  const auto low = fixture.Emit(ValueOpcode::FPOrdLessThanEqual32,
+                                {scaled_float, Value::F32(0.0f)});
+  const auto high = fixture.Emit(ValueOpcode::FPOrdGreaterThanEqual32,
+                                 {scaled_float, Value::F32(4294967296.0f)});
+  const auto truncated = fixture.Emit(ValueOpcode::FPTrunc32, {scaled_float});
+  const auto safe_low = fixture.Emit(
+      ValueOpcode::SelectF32,
+      {fixture.Emit(ValueOpcode::LogicalOr, {nan, low}), Value::F32(0.0f),
+       truncated});
+  const auto safe = fixture.Emit(
+      ValueOpcode::SelectF32,
+      {high, Value::F32(4294967040.0f), safe_low});
+  const auto converted = fixture.Emit(ValueOpcode::ConvertU32F32, {safe});
+  const auto saturated = write(
+      fixture.Emit(ValueOpcode::SelectU32,
+                   {high, Value(UINT32_MAX), converted}),
+      scaled_write);
+  const auto lod = fixture.Emit(ValueOpcode::UMin32,
+                                {saturated, Value(0xfffu)});
+  const auto lod_write = write(lod, saturated);
+  const auto masked = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                   {lod_write, Value(0xfffu)});
+  const auto masked_write = write(masked, lod_write);
+  const auto packed = write(
+      fixture.Emit(
+          ValueOpcode::BitwiseOr32,
+          {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                        {masked_write, Value(12u)}),
+           masked_write}),
+      masked_write);
+  const auto first = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                  {packed, active});
+  const auto divergent = fixture.Emit(
+      ValueOpcode::ReadFirstLane, {stale, active});
+  fixture.Plan();
+
+  Check(ValidateRuntimeValue(fixture.program, first),
+        "uniform sampler LOD construction was rejected");
+  Check(!ValidateRuntimeValue(fixture.program, divergent),
+        "divergent first-lane value was accepted as uniform");
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {first}, .dword_count = 1});
+
+  std::array<uint32_t, 7> user_data{};
+  user_data[6] = 3u;
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue result;
+  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result) &&
+            result.dwords[0] == 0x00300300u,
+        "uniform sampler LOD evaluated incorrectly");
+  user_data[6] = 20u;
+  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result) &&
+            result.dwords[0] == 0x00ffffffu,
+        "uniform sampler LOD clamp evaluated incorrectly");
+}
+
+void TestSharedIntegerRuntimeDependencies() {
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto active =
+      fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  auto inactive = lane;
+  for (uint32_t level = 0; level < 36; level++) {
+    const auto left =
+        fixture.Emit(ValueOpcode::IAdd32, {inactive, Value(1u)});
+    const auto right =
+        fixture.Emit(ValueOpcode::IMul32, {inactive, Value(3u)});
+    inactive = fixture.Emit(ValueOpcode::BitwiseXor32, {left, right});
+  }
+  const auto selected = fixture.Emit(
+      ValueOpcode::SelectU32, {active, Value(42u), inactive});
+  const auto first =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {selected, active});
+  Check(ValidateRuntimeValue(fixture.program, first, RuntimeValueType::Integer),
+        "shared integer dependencies behind an inactive arm were rejected");
+
+  const auto uniform_use = fixture.Emit(ValueOpcode::IAdd32, {first, inactive});
+  Check(!ValidateRuntimeValue(fixture.program, uniform_use,
+                              RuntimeValueType::Integer),
+        "integer-only dependency acceptance was reused as uniform acceptance");
+
+  const auto other_active =
+      fixture.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+  const auto other_first =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {selected, other_active});
+  const auto both = fixture.Emit(ValueOpcode::IAdd32, {first, other_first});
+  Check(!ValidateRuntimeValue(fixture.program, both, RuntimeValueType::Integer),
+        "uniform acceptance was reused across different execution masks");
+
+  const auto floating =
+      fixture.Emit(ValueOpcode::BitCastU32F32, {Value::F32(1.f)});
+  const auto mixed =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {inactive, floating});
+  selected.ResolveInstruction()->SetArg(2, mixed);
+  Check(!ValidateRuntimeValue(fixture.program, first, RuntimeValueType::Integer),
+        "shared integer dependencies hid a floating-point sibling");
 }
 
 void TestConstantBufferBounds() {
@@ -343,10 +455,9 @@ void TestConstantBufferBounds() {
   TestMemory memory_image{{{0x300cu, 0xa5a5a5a5u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  std::string error;
-  Check(WalkSrt(fixture.program, runtime, flat, &error) &&
+  Check(WalkSrt(fixture.program, runtime, flat) &&
             flat == std::vector<uint32_t>{0xa5a5a5a5u},
-        error.c_str());
+        "constant-buffer SRT walk failed");
 
   Fixture overflow;
   const auto overflow_memory = overflow.AddMemory(ResourceKind::ScalarBuffer);
@@ -360,9 +471,8 @@ void TestConstantBufferBounds() {
                 {overflow_read, Value(0u), Value(16u), Value(0u)});
   overflow.Plan();
   flat = {0x55u};
-  Check(!WalkSrt(overflow.program, runtime, flat, &error) &&
-            flat == std::vector<uint32_t>{0x55u} &&
-            error.find("exceeds size") != std::string::npos,
+  Check(!WalkSrt(overflow.program, runtime, flat) &&
+            flat == std::vector<uint32_t>{0x55u},
         "out-of-bounds constant-buffer walk was not transactional");
 }
 
@@ -373,7 +483,7 @@ void TestReadLaneElimination() {
                                   {undef, Value(0xdeadbeefu), Value(5u)});
   const auto read = fixture.Emit(ValueOpcode::ReadLane, {write, Value(5u)});
   const auto use = fixture.Emit(ValueOpcode::IAdd32, {read, Value(1u)});
-  const auto stats = EliminateReadLane(*fixture.program.values, 64);
+  const auto stats = EliminateReadLane(fixture.program, 64);
   Check(stats.rewritten_reads == 1 &&
             use.ResolveInstruction()->Arg(0).Resolve() == Value(0xdeadbeefu),
         "fixed-lane typed read was not rewritten from its SSA write chain");
@@ -382,7 +492,7 @@ void TestReadLaneElimination() {
                                      {Value(static_cast<ScalarReg>(2))});
   const auto dynamic = fixture.Emit(ValueOpcode::ReadLane, {write, selector});
   fixture.Emit(ValueOpcode::IAdd32, {dynamic, Value(1u)});
-  Check(EliminateReadLane(*fixture.program.values, 64).rewritten_reads == 0,
+  Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 0,
         "dynamic-lane read was rewritten unsafely");
 }
 
@@ -393,9 +503,9 @@ void TestOptimizationPipeline() {
   fixture.Emit(ValueOpcode::ReferenceU32, {kept});
   fixture.Emit(ValueOpcode::IMul32, {Value(6u), Value(7u)});
 
-  ConstantPropagationPass(fixture.program.values->blocks);
-  RemoveIdentities(fixture.program.values->blocks);
-  EliminateDeadCode(fixture.program.values->blocks);
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
 
   const auto &instructions = fixture.BlockAt().Instructions();
   Check(instructions.size() == 1 &&
@@ -405,19 +515,54 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+void TestControlFlowValueSurvivesReadLaneFolding() {
+  Fixture fixture(3);
+  auto *entry = fixture.program.blocks[0];
+  auto *taken = fixture.program.blocks[1];
+  auto *other = fixture.program.blocks[2];
+  entry->AddBranch(taken);
+  entry->AddBranch(other);
+
+  auto &entry_info = fixture.program.block_info[0];
+  entry_info.terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  entry_info.terminator.true_block = 1;
+  entry_info.terminator.false_block = 2;
+  fixture.program.block_info[1].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  fixture.program.block_info[2].terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+
+  const auto undef = fixture.Emit(ValueOpcode::UndefU32);
+  const auto write =
+      fixture.Emit(ValueOpcode::WriteLane, {undef, Value(42u), Value(5u)});
+  const auto read = fixture.Emit(ValueOpcode::ReadLane, {write, Value(5u)});
+  entry_info.condition =
+      fixture.Emit(ValueOpcode::IEqual32, {read, Value(42u)});
+  fixture.Emit(ValueOpcode::Reference, {entry_info.condition});
+
+  Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 1,
+        "control-flow fixture did not eliminate its fixed-lane read");
+  ConstantPropagationPass(fixture.program.blocks);
+  ResolveControlFlowIdentities(fixture.program);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  Check(entry_info.condition == Value(true),
+        "folded branch condition did not survive identity removal");
+  ValidateProgram(fixture.program, true);
+}
+
 void TestUndefinedRuntimeValueFails() {
   Fixture fixture;
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
   fixture.Plan();
-  fixture.program.values->descriptor_sources.push_back(
+  fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
   result.dword_count = 3;
-  std::string error;
-  Check(!EvaluateDescriptorSource(fixture.program, 0, 0x200, {}, result,
-                                  &error) &&
-            result.dword_count == 3 &&
-            error.find("undefined typed runtime value") != std::string::npos,
+  Check(!EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+            result.dword_count == 3,
         "undefined typed descriptor source did not fail transactionally");
 }
 
@@ -426,6 +571,14 @@ void TestUndefinedRuntimeValueFails() {
 namespace Common {
 
 int DbgExitIfHandler(const char *, const char *, int) { return 1; }
+
+int DbgExitHandler(const char *, int, std::string_view text) {
+  throw std::runtime_error(std::string(text));
+}
+
+int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
+  throw std::runtime_error(std::string(text));
+}
 
 void DbgExit(int) { std::abort(); }
 
@@ -443,9 +596,12 @@ int main() {
     TestInvariantAndDivergentPhi();
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
+    TestUniformFirstLaneSamplerLod();
+    TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();
+    TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
@@ -458,9 +614,9 @@ int main() {
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.
 #include "../src/graphics/shader/recompiler/ir/Block.cpp"
-#include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
-#include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
+#include "../src/graphics/shader/recompiler/ir/Program.cpp"
 #include "../src/graphics/shader/recompiler/ir/Type.cpp"
 #include "../src/graphics/shader/recompiler/ir/Value.cpp"
 #include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
-#include "../src/graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
+#include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"

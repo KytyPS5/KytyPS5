@@ -4,12 +4,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
-#include <memory>
+#include <optional>
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -23,9 +25,6 @@ class Shader;
 struct GraphicContext;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
-struct CommandSlot;
-struct VulkanBuffer;
-struct VulkanDescriptorSet;
 struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
@@ -49,18 +48,29 @@ enum class CommandBufferDebugOp : uint32_t {
 	Unknown,
 };
 
-class FenceResourceRetainer {
-public:
-	FenceResourceRetainer() = default;
-	~FenceResourceRetainer();
-	KYTY_CLASS_NO_COPY(FenceResourceRetainer);
+enum class DrawOffsetSource : uint8_t {
+	DrawState,
+	IndirectArgs,
+};
 
-	void               Retain(std::shared_ptr<void> resource);
-	void               ReleaseAfterFence() noexcept;
-	[[nodiscard]] bool Empty() const noexcept { return m_resources.empty(); }
+struct DrawIndexArgs {
+	uint32_t         index_count                = 0;
+	const void*      index_addr                 = nullptr;
+	uint32_t         instance_count             = 0;
+	uint32_t         index_type_and_size        = 0;
+	int32_t          base_vertex                = 0;
+	uint32_t         first_instance             = 0;
+	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	uint32_t         render_target_slice_offset = 0;
+};
 
-private:
-	std::vector<std::shared_ptr<void>> m_resources;
+struct DrawAutoArgs {
+	uint32_t         vertex_count               = 0;
+	uint32_t         instance_count             = 0;
+	uint32_t         first_vertex               = 0;
+	uint32_t         first_instance             = 0;
+	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	uint32_t         render_target_slice_offset = 0;
 };
 
 struct SubmitInfo {
@@ -91,78 +101,52 @@ struct SubmitInfo {
 
 class CommandBuffer {
 public:
-	explicit CommandBuffer(CommandScheduler& scheduler);
-	~CommandBuffer();
+	~CommandBuffer() = default;
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
 
-	void Begin() const;
-	void End() const;
-	void Execute(const SubmitInfo& submit = {});
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
-	void WaitForFenceOnly();
-	void WaitForFence();
-	void WaitForFenceAndReset();
-	void RetireBufferAfterFence(std::unique_ptr<VulkanBuffer> buffer);
-	void RetainResourceUntilFence(std::shared_ptr<void> resource);
-	void RecycleDescriptorAfterFence(VulkanDescriptorSet& set);
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] bool              IsExecute() const { return m_execute; }
+	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
 
 private:
-	void Release();
-	void FinalizeFence(bool reset_recording);
-	void ReleaseResourcesAfterFence();
-	void DeleteBuffersAfterFence();
-	void RecycleDescriptorsAfterFence();
-
-	RenderContext&                             m_context;
-	CommandScheduler&                          m_scheduler;
-	GraphicContext&                            m_graphics;
-	CommandSlot*                               m_slot            = nullptr;
-	bool                                       m_execute         = false;
-	bool                                       m_fence_waited    = false;
-	uint64_t                                   m_submit_seq      = 0;
-	uint32_t                                   m_debug_op        = 0;
-	uint64_t                                   m_debug_submit_id = 0;
-	uint32_t                                   m_debug_arg0      = 0;
-	uint32_t                                   m_debug_arg1      = 0;
-	uint32_t                                   m_debug_arg2      = 0;
-	uint32_t                                   m_debug_arg3      = 0;
-	uint64_t                                   m_debug_arg4      = 0;
-	std::vector<std::unique_ptr<VulkanBuffer>> m_retired_buffers;
-	FenceResourceRetainer                      m_fence_resources;
-	std::vector<VulkanDescriptorSet*>          m_descriptor_sets_after_fence;
-	mutable RenderState                        m_render_state;
-	mutable bool                               m_rendering = false;
-};
-
-class RenderCommandBuffer final: public CommandBuffer {
-public:
-	explicit RenderCommandBuffer(CommandScheduler& scheduler): CommandBuffer(scheduler) {}
-
+	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
 	}
 
-	[[nodiscard]] HW::Context&    GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
+	void Begin();
+	void End() const;
 
-private:
-	HW::Context*    m_registers   = nullptr;
-	HW::UserConfig* m_user_config = nullptr;
-	HW::Shader*     m_shaders     = nullptr;
+	RenderContext&      m_context;
+	GraphicContext&     m_graphics;
+	vk::CommandBuffer   m_buffer          = nullptr;
+	uint32_t            m_debug_op        = 0;
+	uint64_t            m_debug_submit_id = 0;
+	uint32_t            m_debug_arg0      = 0;
+	uint32_t            m_debug_arg1      = 0;
+	uint32_t            m_debug_arg2      = 0;
+	uint32_t            m_debug_arg3      = 0;
+	uint64_t            m_debug_arg4      = 0;
+	mutable RenderState m_render_state;
+	mutable bool        m_rendering   = false;
+	HW::Context*        m_registers   = nullptr;
+	HW::UserConfig*     m_user_config = nullptr;
+	HW::Shader*         m_shaders     = nullptr;
+
+	friend class CommandScheduler;
 };
 
 class RenderExecutor {
@@ -170,72 +154,73 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
-	void DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t index_type_and_size,
-	               uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
-	               uint32_t instance_count = 1, uint32_t render_target_slice_offset = 0,
-	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0);
-	void DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t index_count,
-	              uint32_t flags, uint32_t render_target_slice_offset = 0,
-	              uint32_t instance_count = 1, uint32_t first_vertex = 0,
-	              uint32_t first_instance = 0);
-	void DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t thread_group_x,
+	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
-	[[nodiscard]] DescriptorCache::PreparedBindings
-	     PrepareBindings(CommandBuffer& buffer, const ShaderStageRuntime& runtime,
-	                     vk::ShaderStageFlags shader_stage, DescriptorCache::Stage stage);
-	void RebindBuffers(CommandBuffer& buffer, DescriptorCache::PreparedBindings& bindings);
-	void RebindImages(CommandBuffer& buffer, DescriptorCache::PreparedBindings& bindings);
+	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	void                           FindBuffers(PreparedBindings& bindings);
+	void                           RebindBuffers(PreparedBindings& bindings);
+	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
-	                    vk::PipelineLayout layout, DescriptorCache::PreparedBindings& bindings);
+	                    const PipelineCache::Pipeline&     pipeline,
+	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+
 	struct GraphicsBindings {
-		DescriptorCache::PreparedBindings                vertex;
-		std::optional<DescriptorCache::PreparedBindings> pixel;
+		PreparedBindings                vertex;
+		std::optional<PreparedBindings> pixel;
 	};
 
-	[[nodiscard]] DescriptorCache::TextureBinding
-	ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	               const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(CommandBuffer&            buffer,
-	                                                       const ShaderStageRuntime& vertex,
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
-	void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+	void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
 	                              RenderColorInfo& target, uint32_t render_target_slice_offset = 0,
 	                              uint32_t render_target_slot = UINT32_MAX,
 	                              bool ignore_target_mask = false, bool exact_format = false);
-	void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+	void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
 	                              RenderDepthInfo& target);
-	[[nodiscard]] bool PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuffer& buffer,
+	[[nodiscard]] bool PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          bool log_setup_phases, DrawRenderState& state);
-	void               ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer& buffer,
-	                                       const DrawCallInfo& draw, DrawRenderState& state,
-	                                       vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
-	                                       const DrawIndexBufferSource& index_source,
-	                                       bool primitive_restart_enable, bool log_pipeline_phase,
-	                                       bool set_bind_debug, bool set_auto_debug);
+	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	                         DrawRenderState& state, vk::PrimitiveTopology topology,
+	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
+	                         bool primitive_restart_enable, bool log_pipeline_phase,
+	                         bool set_bind_debug, bool set_auto_debug);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
-	                                               uint32_t color_count, RenderDepthInfo& depth);
-	[[nodiscard]] bool        ResolveColorTargets(uint64_t submit_id, RenderCommandBuffer& buffer,
+	                                               uint32_t color_count, RenderDepthInfo& depth,
+	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
+	[[nodiscard]] bool        ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const RenderCommandBuffer&    buffer);
+	                                                     const CommandBuffer&          buffer);
+	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
+	                                              CommandBuffer& command, uint32_t group_x,
+	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
-	RenderContext&                      m_context;
-	std::vector<std::shared_ptr<Image>> m_bound_images;
+	RenderContext&                        m_context;
+	std::vector<ImageId>                  m_bound_images;
+	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
+	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
+	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::vector<uint32_t>                 m_image_occurrences;
 
+	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
 
-[[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+[[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);

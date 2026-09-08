@@ -871,7 +871,7 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().QueryRegion(vaddr, size).gpu_image_bytes) {
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
 		}
 	}
@@ -2445,6 +2445,24 @@ int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, cons
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
+	PRINT_NAME();
+
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	auto vaddr = reinterpret_cast<uint64_t>(addr);
+
+	LOGF("\t addr = 0x%016" PRIx64 "\n"
+	     "\t len  = 0x%016" PRIx64 "\n",
+	     vaddr, len);
+
+	g_physical_memory->SetVirtualRangeName(vaddr, len, "");
+	g_flexible_memory->SetVirtualRangeName(vaddr, len, "");
+	g_virtual_ranges->Rename(vaddr, len, "");
+
+	return OK;
+}
+
 static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
 	       g_virtual_ranges->Remove(vaddr, size);
@@ -3804,8 +3822,8 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		LOGF("\t [%d] start = %p, offset = 0x%016" PRIx64 ", length = 0x%016" PRIx64
 		     ", prot = 0x%02" PRIx32 ", type = 0x%02" PRIx32 ", op = %d\n",
 		     i, entry->start, entry->offset, entry->length,
-		     static_cast<uint32_t>(static_cast<unsigned char>(entry->protection)),
-		     static_cast<uint32_t>(static_cast<unsigned char>(entry->type)), entry->operation);
+		     static_cast<uint32_t>(entry->protection), static_cast<uint32_t>(entry->type),
+		     entry->operation);
 
 		if (entry->length == 0 || entry->operation < MAP_OP_MAP_DIRECT ||
 		    entry->operation > MAP_OP_TYPE_PROTECT) {

@@ -6,10 +6,6 @@
 
 namespace Libs {
 
-namespace LibcInternal {
-LIB_DEFINE(InitLibcInternal_1);
-} // namespace LibcInternal
-
 namespace LibContentDelete {
 LIB_DEFINE(InitContentDelete_1);
 } // namespace LibContentDelete
@@ -46,15 +42,39 @@ namespace LibPsml {
 LIB_DEFINE(InitPsml_1);
 } // namespace LibPsml
 
+namespace LibC {
 LIB_DEFINE(InitLibC_1);
-LIB_DEFINE(InitAppContent_1);
+} // namespace LibC
+
+namespace LibAmpr {
 LIB_DEFINE(InitAmpr_1);
-LIB_DEFINE(InitAudio_1);
+} // namespace LibAmpr
+
+namespace Coredump {
 LIB_DEFINE(InitCoredump_1);
-LIB_DEFINE(InitDbgAddressSanitizer_1);
-LIB_DEFINE(InitDebug_1);
-LIB_DEFINE(InitDialog_1);
+} // namespace Coredump
+
+namespace LibRazorCpu {
+LIB_DEFINE(InitRazorCpu_1);
+} // namespace LibRazorCpu
+
+namespace Fiber {
 LIB_DEFINE(InitFiber_1);
+} // namespace Fiber
+
+namespace LibRtc {
+LIB_DEFINE(InitRtc_1);
+} // namespace LibRtc
+
+namespace LibGen5 {
+LIB_DEFINE(InitVideoOut_1);
+} // namespace LibGen5
+
+LIB_DEFINE(InitAppContent_1);
+LIB_DEFINE(InitAudio_1);
+LIB_DEFINE(InitConvertKeycode_1);
+LIB_DEFINE(InitDbgAddressSanitizer_1);
+LIB_DEFINE(InitDialog_1);
 LIB_DEFINE(InitFont_1);
 LIB_DEFINE(InitFontFt_1);
 LIB_DEFINE(InitAgcDriver_1);
@@ -65,52 +85,53 @@ LIB_DEFINE(InitPlayGo_1);
 LIB_DEFINE(InitPngDec_1);
 LIB_DEFINE(InitPlatform_1);
 LIB_DEFINE(InitRudp_1);
-LIB_DEFINE(InitRtc_1);
 LIB_DEFINE(InitSaveData_1);
 LIB_DEFINE(InitShare_1);
 LIB_DEFINE(InitSysmodule_1);
 LIB_DEFINE(InitSystemService_1);
 LIB_DEFINE(InitTextToSpeech2_1);
 LIB_DEFINE(InitUserService_1);
-LIB_DEFINE(InitVideoOut_1);
+LIB_DEFINE(InitWebBrowserDialog_1);
 
 void InitAll(Loader::SymbolDatabase* s) {
-	LIB_LOAD(InitAudio_1);
-	LIB_LOAD(InitAmpr_1);
-	LIB_LOAD(InitAppContent_1);
-	LIB_LOAD(InitCoredump_1);
-	LIB_LOAD(LibContentDelete::InitContentDelete_1);
-	LIB_LOAD(LibContentExport::InitContentExport_1);
-	LIB_LOAD(LibContentSearch::InitContentSearch_1);
-	LIB_LOAD(InitLibC_1);
-	LIB_LOAD(InitDbgAddressSanitizer_1);
-	LIB_LOAD(InitDebug_1);
-	LIB_LOAD(InitDialog_1);
-	LIB_LOAD(InitFiber_1);
-	LIB_LOAD(InitFont_1);
-	LIB_LOAD(InitFontFt_1);
-	LIB_LOAD(InitAgcDriver_1);
-	LIB_LOAD(InitLibKernel_1);
-	LIB_LOAD(LibMouse::InitMouse_1);
-	LIB_LOAD(LibKeyboard::InitKeyboard_1);
-	LIB_LOAD(Ime::InitPlatform_1_Ime);
-	LIB_LOAD(InitNet_1);
-	LIB_LOAD(InitPad_1);
-	LIB_LOAD(InitPlayGo_1);
-	LIB_LOAD(LibPsml::InitPsml_1);
-	LIB_LOAD(InitPngDec_1);
-	LIB_LOAD(InitPlatform_1);
-	LIB_LOAD(InitRudp_1);
-	LIB_LOAD(InitRtc_1);
-	LIB_LOAD(InitSaveData_1);
-	LIB_LOAD(InitShare_1);
-	LIB_LOAD(InitSysmodule_1);
-	LIB_LOAD(InitSystemService_1);
-	LIB_LOAD(InitTextToSpeech2_1);
-	LIB_LOAD(LibUlt::InitUlt_1);
-	LIB_LOAD(InitUserService_1);
-	LIB_LOAD(VideoDec2::InitVideoDec2_1);
-	LIB_LOAD(InitVideoOut_1);
+	InitAudio_1(s);
+	InitConvertKeycode_1(s);
+	LibAmpr::InitAmpr_1(s);
+	InitAppContent_1(s);
+	Coredump::InitCoredump_1(s);
+	LibContentDelete::InitContentDelete_1(s);
+	LibContentExport::InitContentExport_1(s);
+	LibContentSearch::InitContentSearch_1(s);
+	LibC::InitLibC_1(s);
+	InitDbgAddressSanitizer_1(s);
+	LibRazorCpu::InitRazorCpu_1(s);
+	InitDialog_1(s);
+	Fiber::InitFiber_1(s);
+	InitFont_1(s);
+	InitFontFt_1(s);
+	InitAgcDriver_1(s);
+	InitLibKernel_1(s);
+	LibMouse::InitMouse_1(s);
+	LibKeyboard::InitKeyboard_1(s);
+	Ime::InitPlatform_1_Ime(s);
+	InitNet_1(s);
+	InitPad_1(s);
+	InitPlayGo_1(s);
+	LibPsml::InitPsml_1(s);
+	InitPngDec_1(s);
+	InitPlatform_1(s);
+	InitRudp_1(s);
+	LibRtc::InitRtc_1(s);
+	InitSaveData_1(s);
+	InitShare_1(s);
+	InitSysmodule_1(s);
+	InitSystemService_1(s);
+	InitTextToSpeech2_1(s);
+	LibUlt::InitUlt_1(s);
+	InitUserService_1(s);
+	VideoDec2::InitVideoDec2_1(s);
+	LibGen5::InitVideoOut_1(s);
+	InitWebBrowserDialog_1(s);
 }
 
 namespace LibContentExport {

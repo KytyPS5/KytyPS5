@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -1060,6 +1061,12 @@ void PthreadDeleteStaticObjects(Loader::Program* program) {
 
 void PthreadInitSelfForMainThread() {
 	EXIT_IF(g_pthread_self != nullptr);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (!Common::HostException::InitializeThreadSignalStack()) {
+		EXIT("Failed to initialize the thread signal stack\n");
+	}
+#endif
 
 	g_pthread_self = new PthreadPrivate {};
 	PthreadAttrInit(&g_pthread_self->attr);
@@ -2573,6 +2580,11 @@ int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec) {
 	PRINT_NAME();
 
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
+
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -2585,6 +2597,11 @@ int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec) {
 	PRINT_NAME();
 
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
+
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -2596,6 +2613,11 @@ int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds
 
 int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 	PRINT_NAME();
+
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
 
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -3367,6 +3389,13 @@ static void CleanupThread(void* arg) {
 }
 
 static void* RunThread(void* arg) {
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (!Common::HostException::InitializeThreadSignalStack()) {
+		EXIT("Failed to initialize the thread signal stack\n");
+	}
+#endif
+
 	auto* thread = static_cast<Pthread>(arg);
 	void* ret    = nullptr;
 

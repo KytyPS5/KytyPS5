@@ -2,12 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
 #include "common/assert.h"
+#include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <compare>
 #include <limits>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -19,27 +19,11 @@ class Buffer;
 class CommandScheduler;
 struct ImageTestAccess;
 
-struct ImageId {
-	uint32_t index      = std::numeric_limits<uint32_t>::max();
-	uint32_t generation = 0;
-
-	[[nodiscard]] explicit operator bool() const noexcept {
-		return index != std::numeric_limits<uint32_t>::max();
-	}
-	auto operator<=>(const ImageId&) const = default;
-};
+using ImageId = Common::SlotId;
 
 struct CachedImageView {
 	ImageViewInfo info;
 	vk::ImageView view = nullptr;
-};
-
-struct ImageViewCache {
-	ImageViewCache() = default;
-	KYTY_CLASS_NO_COPY(ImageViewCache);
-
-	std::mutex                   mutex;
-	std::vector<CachedImageView> views;
 };
 
 struct ImageUsage {
@@ -51,11 +35,13 @@ struct ImageUsage {
 };
 
 struct ImageBinding {
-	bool is_bound      = false;
-	bool is_target     = false;
-	bool needs_rebind  = false;
-	bool force_general = false;
-	bool shader_write  = false;
+	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
+	vk::AccessFlags2 attachment_access;
+	bool             is_bound      = false;
+	bool             is_target     = false;
+	bool             needs_rebind  = false;
+	bool             force_general = false;
+	bool             shader_write  = false;
 };
 
 class Image final {
@@ -65,7 +51,6 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
-	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -143,9 +128,6 @@ public:
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
 		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
-	[[nodiscard]] bool GpuOverlaps(uint64_t address, uint64_t size) const noexcept {
-		return IsGpuModified() && Overlaps(address, size);
-	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
@@ -157,7 +139,7 @@ public:
 
 	ImageInfo        info;
 	VulkanImage      backing;
-	ImageViewCache   views;
+	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
@@ -177,8 +159,8 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext*   m_graphics         = nullptr;
-	CommandScheduler* m_scheduler        = nullptr;
+	GraphicContext&   m_graphics;
+	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

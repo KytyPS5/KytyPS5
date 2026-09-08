@@ -6,7 +6,6 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -36,27 +35,38 @@ enum : uint32_t {
 	ExecutionModeSignedZeroInfNanPreserve    = 4461,
 	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
 	AddressingModelLogical                   = 0,
+	AddressingModelPhysicalStorageBuffer64   = 5348,
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
+	CapabilityInt64                          = 11,
+	CapabilityInt64Atomics                   = 12,
 	CapabilityImageGatherExtended            = 25,
+	CapabilityClipDistance                   = 32,
+	CapabilityCullDistance                   = 33,
+	CapabilitySampleRateShading              = 35,
 	CapabilitySampled1D                      = 43,
 	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
-	CapabilityStorageImageReadWithoutFormat  = 55,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
+	CapabilityShaderLayer                    = 69,
+	CapabilityShaderViewportIndex            = 70,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
+	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
+	CapabilityPhysicalStorageBufferAddresses = 5347,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
 	StorageClassWorkgroup                    = 4,
+	StorageClassPrivate                      = 6,
 	StorageClassFunction                     = 7,
 	StorageClassPushConstant                 = 9,
 	StorageClassImage                        = 11,
 	StorageClassStorageBuffer                = 12,
+	StorageClassPhysicalStorageBuffer        = 5349,
 	FunctionControlNone                      = 0,
 	SelectionControlNone                     = 0,
 	LoopControlNone                          = 0,
@@ -67,17 +77,25 @@ enum : uint32_t {
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
+	DecorationAliased       = 20,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
 	DecorationDescriptorSet = 34,
 	DecorationOffset        = 35,
+	DecorationPerVertexKHR  = 5285,
 };
 
 enum : uint32_t {
 	BuiltInPosition                  = 0,
+	BuiltInPointSize                 = 1,
+	BuiltInClipDistance              = 3,
+	BuiltInCullDistance              = 4,
+	BuiltInLayer                     = 9,
+	BuiltInViewportIndex              = 10,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
+	BuiltInSampleId                  = 18,
 	BuiltInSampleMask                = 20,
 	BuiltInFragDepth                 = 22,
 	BuiltInWorkgroupId               = 26,
@@ -87,6 +105,8 @@ enum : uint32_t {
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
+	BuiltInBaryCoordKHR              = 5286,
+	BuiltInBaryCoordNoPerspKHR       = 5287,
 };
 
 enum : uint32_t {
@@ -115,6 +135,7 @@ enum : uint32_t {
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
 	MemorySemanticsWorkgroupMemory = 0x00000100u,
+	MemorySemanticsImageMemory     = 0x00000800u,
 };
 
 enum : uint32_t {
@@ -132,11 +153,15 @@ enum : uint32_t {
 	OpTypeStruct                   = 30,
 	OpTypePointer                  = 32,
 	OpTypeFunction                 = 33,
+	OpConstantTrue                 = 41,
+	OpConstantFalse                = 42,
 	OpConstant                     = 43,
 	OpConstantComposite            = 44,
 	OpUndef                        = 1,
 	OpFunction                     = 54,
+	OpFunctionParameter            = 55,
 	OpFunctionEnd                  = 56,
+	OpFunctionCall                 = 57,
 	OpVariable                     = 59,
 	OpImageTexelPointer            = 60,
 	OpLoad                         = 61,
@@ -166,6 +191,8 @@ enum : uint32_t {
 	OpConvertFToS                  = 110,
 	OpConvertSToF                  = 111,
 	OpConvertUToF                  = 112,
+	OpUConvert                     = 113,
+	OpConvertUToPtr                = 120,
 	OpBitcast                      = 124,
 	OpSNegate                      = 126,
 	OpFNegate                      = 127,
@@ -176,10 +203,13 @@ enum : uint32_t {
 	OpIMul                         = 132,
 	OpFMul                         = 133,
 	OpUDiv                         = 134,
+	OpUMod                         = 137,
 	OpFDiv                         = 136,
 	OpIAddCarry                    = 149,
 	OpUMulExtended                 = 151,
 	OpSMulExtended                 = 152,
+	OpAny                          = 154,
+	OpAll                          = 155,
 	OpLogicalNotEqual              = 165,
 	OpLogicalOr                    = 166,
 	OpLogicalAnd                   = 167,
@@ -242,40 +272,41 @@ enum : uint32_t {
 	OpSwitch                       = 251,
 	OpKill                         = 252,
 	OpReturn                       = 253,
+	OpReturnValue                  = 254,
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
 };
 
 enum : uint32_t {
-	GlslRoundEven      = 2,
-	GlslTrunc          = 3,
-	GlslFAbs           = 4,
-	GlslFloor          = 8,
-	GlslCeil           = 9,
-	GlslFract          = 10,
-	GlslSin            = 13,
-	GlslCos            = 14,
-	GlslExp2           = 29,
-	GlslLog2           = 30,
-	GlslSqrt           = 31,
-	GlslInverseSqrt    = 32,
-	GlslFMin           = 37,
-	GlslFMax           = 40,
-	GlslFClamp         = 43,
-	GlslLdexp          = 53,
-	GlslFma            = 50,
-	GlslPackSnorm2x16  = 56,
-	GlslPackUnorm2x16  = 57,
-	GlslPackHalf2x16   = 58,
-	GlslUnpackHalf2x16 = 62,
-	GlslFindILsb       = 73,
-	GlslFindUMsb       = 75,
+	MemoryAccessAlignedMask = 0x2,
 };
 
-struct RegisterBinding {
-	IR::Register reg;
-	uint32_t     pointer_id = 0;
+enum : uint32_t {
+	GlslRoundEven       = 2,
+	GlslTrunc           = 3,
+	GlslFAbs            = 4,
+	GlslFloor           = 8,
+	GlslCeil            = 9,
+	GlslFract           = 10,
+	GlslSin             = 13,
+	GlslCos             = 14,
+	GlslExp2            = 29,
+	GlslLog2            = 30,
+	GlslSqrt            = 31,
+	GlslInverseSqrt     = 32,
+	GlslFMin            = 37,
+	GlslFMax            = 40,
+	GlslFClamp          = 43,
+	GlslLdexp           = 53,
+	GlslFma             = 50,
+	GlslPackSnorm2x16   = 56,
+	GlslPackUnorm2x16   = 57,
+	GlslPackHalf2x16    = 58,
+	GlslUnpackUnorm2x16 = 61,
+	GlslUnpackHalf2x16  = 62,
+	GlslFindILsb        = 73,
+	GlslFindUMsb        = 75,
 };
 
 struct InputBinding {
@@ -284,6 +315,7 @@ struct InputBinding {
 	uint32_t           component_count = 1;
 	uint32_t           variable_id     = 0;
 	std::string        debug_name;
+	bool               per_vertex = false;
 };
 
 struct OutputBinding {
@@ -292,160 +324,128 @@ struct OutputBinding {
 	uint32_t            location    = 0;
 	uint32_t            variable_id = 0;
 	std::string         debug_name;
+	uint32_t            mesh_data_variable = 0;
 };
 
-struct DescriptorResourceBinding {
-	const IR::DescriptorBinding* descriptor  = nullptr;
-	uint32_t                     array_index = 0;
+using ImageDimension = Decoder::ImageDimension;
+
+struct ImageDimensionInfo {
+	ImageDimension dimension;
+	uint32_t       spirv_dimension;
+	uint32_t       coordinate_components;
+	uint32_t       spatial_components;
+	uint32_t       arrayed;
+	uint32_t       multisampled;
 };
 
-struct SampledImageDescriptors {
-	uint32_t image_type         = 0;
-	uint32_t sampled_image_type = 0;
-	uint32_t pointer_type       = 0;
-	uint32_t array_type         = 0;
-	uint32_t array_pointer_type = 0;
-	uint32_t variable           = 0;
-};
+constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
+    {ImageDimension::Dim1D, Dim1D, 1, 1, 0, 0},
+    {ImageDimension::Dim1DArray, Dim1D, 2, 1, 1, 0},
+    {ImageDimension::Dim2D, Dim2D, 2, 2, 0, 0},
+    {ImageDimension::Dim2DArray, Dim2D, 3, 2, 1, 0},
+    {ImageDimension::Dim3D, Dim3D, 3, 3, 0, 0},
+    {ImageDimension::Dim2DMsaa, Dim2D, 2, 2, 0, 1},
+    {ImageDimension::Dim2DMsaaArray, Dim2D, 3, 2, 1, 1},
+}};
 
-struct StorageImageDescriptors {
-	uint32_t image_type         = 0;
-	uint32_t pointer_type       = 0;
-	uint32_t array_type         = 0;
-	uint32_t array_pointer_type = 0;
-	uint32_t variable           = 0;
-};
+const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
-	             ShaderStageInputInfo input_info_)
-	    : program(program_), resources(resources_), input_info(input_info_) {}
+	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
+	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
+	      program(program_), input_info(input_info_), requirements(*program_.spirv_requirements) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
-	const IR::ResourceSnapshot&                      resources;
 	ShaderStageInputInfo                             input_info;
-	ShaderType                                       stage     = ShaderType::Unknown;
-	uint32_t                                         wave_size = 64;
-	bool                                             exact_subgroup_operations    = false;
-	bool                                             per_invocation_masks         = false;
-	uint32_t                                         void_type                    = 0;
-	uint32_t                                         bool_type                    = 0;
-	uint32_t                                         uint_type                    = 0;
-	uint32_t                                         uint_pair_type               = 0;
-	uint32_t                                         int_pair_type                = 0;
-	uint32_t                                         int_type                     = 0;
-	uint32_t                                         float_type                   = 0;
-	uint32_t                                         vec2_uint_type               = 0;
-	uint32_t                                         vec3_uint_type               = 0;
-	uint32_t                                         vec4_uint_type               = 0;
-	uint32_t                                         vec2_int_type                = 0;
-	uint32_t                                         vec3_int_type                = 0;
-	uint32_t                                         vec4_int_type                = 0;
-	uint32_t                                         vec2_float_type              = 0;
-	uint32_t                                         vec3_float_type              = 0;
-	uint32_t                                         vec4_float_type              = 0;
-	uint32_t                                         ptr_func_uint                = 0;
-	uint32_t                                         ptr_func_bool                = 0;
-	uint32_t                                         ptr_func_float               = 0;
-	uint32_t                                         ptr_func_uint_pair           = 0;
-	uint32_t                                         ptr_func_vec4_uint           = 0;
-	uint32_t                                         ptr_func_vec2_float          = 0;
-	uint32_t                                         ptr_input_float              = 0;
-	uint32_t                                         ptr_input_bool               = 0;
-	uint32_t                                         ptr_input_int                = 0;
-	uint32_t                                         ptr_input_uint               = 0;
-	uint32_t                                         ptr_input_vec2_float         = 0;
-	uint32_t                                         ptr_input_vec3_float         = 0;
-	uint32_t                                         ptr_input_vec2_int           = 0;
-	uint32_t                                         ptr_input_vec3_int           = 0;
-	uint32_t                                         ptr_input_vec4_int           = 0;
-	uint32_t                                         ptr_input_vec2_uint          = 0;
-	uint32_t                                         ptr_input_vec3_uint          = 0;
-	uint32_t                                         ptr_input_vec4_uint          = 0;
-	uint32_t                                         ptr_input_vec4_float         = 0;
-	uint32_t                                         sample_mask_array_type       = 0;
-	uint32_t                                         ptr_output_int               = 0;
-	uint32_t                                         ptr_output_sample_mask_array = 0;
-	uint32_t                                         ptr_output_float             = 0;
-	uint32_t                                         ptr_output_vec4_float        = 0;
-	uint32_t                                         per_vertex_type              = 0;
-	uint32_t                                         ptr_output_per_vertex        = 0;
-	uint32_t                                         storage_runtime_array_type   = 0;
-	uint32_t                                         storage_buffer_type          = 0;
-	uint32_t                                         ptr_storage_buffer           = 0;
-	uint32_t                                         ptr_storage_buffer_uint      = 0;
-	uint32_t                                         storage_buffer_array_type    = 0;
-	uint32_t                                         ptr_storage_buffer_array     = 0;
-	uint32_t                                         storage_buffer_variable      = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> storage_buffer_offsets {};
-	uint32_t                                         address_memory_array_type = 0;
-	uint32_t                                         ptr_address_memory_array  = 0;
-	uint32_t                                         address_memory_variable   = 0;
-	uint32_t                                         gds_variable              = 0;
-	uint32_t                                         push_constant_array_type  = 0;
-	uint32_t                                         push_constant_block_type  = 0;
-	uint32_t                                         ptr_push_constant_block   = 0;
-	uint32_t                                         ptr_push_constant_uint    = 0;
-	uint32_t                                         push_constant_variable    = 0;
-	uint32_t                                         vsharp_storage_variable   = 0;
-	uint32_t                                         flattened_srt_variable    = 0;
-	uint32_t                                         lds_array_type            = 0;
-	uint32_t                                         ptr_workgroup_array       = 0;
-	uint32_t                                         ptr_workgroup_uint        = 0;
-	uint32_t                                         lds_variable              = 0;
-	std::array<SampledImageDescriptors, 14>          sampled_images;
-	std::array<StorageImageDescriptors, 10>          storage_images;
-	uint32_t                                         sampler_type                          = 0;
-	uint32_t                                         sampler_array_type                    = 0;
-	uint32_t                                         ptr_uniform_sampler                   = 0;
-	uint32_t                                         ptr_uniform_sampler_array             = 0;
-	uint32_t                                         sampler_variable                      = 0;
-	uint32_t                                         ptr_image_uint                        = 0;
-	uint32_t                                         func_type                             = 0;
-	uint32_t                                         main_func                             = 0;
-	uint32_t                                         entry_label                           = 0;
-	uint32_t                                         pixel_valid_mask_variable             = 0;
-	bool                                             dispatcher_fallback                   = false;
-	uint32_t                                         dispatch_pc_variable                  = 0;
-	uint32_t                                         dispatch_header_label                 = 0;
-	uint32_t                                         dispatch_select_label                 = 0;
-	uint32_t                                         dispatch_default_label                = 0;
-	uint32_t                                         dispatch_after_switch_label           = 0;
-	uint32_t                                         dispatch_continue_label               = 0;
-	uint32_t                                         dispatch_merge_label                  = 0;
-	uint32_t                                         glsl_std450                           = 0;
-	uint32_t                                         subgroup_local_invocation_id_variable = 0;
-	uint32_t                                         per_vertex_variable                   = 0;
-	uint32_t                                         depth_variable                        = 0;
-	uint32_t                                         sample_mask_variable                  = 0;
-	bool                                             needs_subgroup_ballot                 = false;
-	bool                                             needs_subgroup_shuffle                = false;
-	bool                                             needs_subgroup_local_invocation_id    = false;
-	bool                                             needs_compute_derivatives             = false;
-	bool                                             needs_image_gather_extended           = false;
-	bool                                             needs_function_lds                    = false;
-	bool                                             needs_pixel_valid_mask                = false;
-	bool                                             unsupported_ir_instruction            = false;
-	IR::Opcode                                       unsupported_ir_opcode = IR::Opcode::Count;
-	uint32_t                                         unsupported_ir_pc     = 0;
-	std::vector<RegisterBinding>                     registers;
-	std::vector<InputBinding>                        inputs;
-	std::vector<OutputBinding>                       outputs;
-	std::vector<uint32_t>                            interface_variables;
-	std::vector<bool>                                reachable_blocks;
-	std::map<uint32_t, uint32_t>                     block_labels;
-	std::map<uint32_t, uint32_t>                     constants;
-	std::map<uint32_t, uint32_t>                     signed_constants;
-	std::map<uint32_t, uint32_t>                     float_constants;
+	const IR::SpirvRequirements&                     requirements;
+	ShaderType                                       stage                   = ShaderType::Unknown;
+	uint32_t                                         wave_size               = 64;
+	uint32_t                                         lane_count              = 1;
+	uint32_t                                         lane_half               = 0;
+	uint32_t                                         storage_buffer_variable = 0;
+	uint32_t                                         storage_buffer_u64_variable = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	uint32_t                                         bda_pagetable_variable  = 0;
+	uint32_t                                         fault_buffer_variable   = 0;
+	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         gds_length              = 0;
+	uint32_t                                         push_constant_variable  = 0;
+	uint32_t                                         shader_data_storage_variable = 0;
+	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         lds_variable            = 0;
+	std::array<uint32_t, 2>                          scratch_variable {};
+	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	uint32_t                   sampler_variable                      = 0;
+	uint32_t                   main_func                             = 0;
+	uint32_t                   mesh_guest_func                       = 0;
+	uint32_t                   mesh_allocation                       = 0;
+	uint32_t                   mesh_primitive_data                   = 0;
+	uint32_t                   mesh_primitives                       = 0;
+	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   entry_label                           = 0;
+	uint32_t                   current_label                         = 0;
+	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   per_vertex_variable                   = 0;
+	uint32_t                   point_size_variable                   = 0;
+	uint32_t                   clip_distance_variable                = 0;
+	uint32_t                   cull_distance_variable                = 0;
+	uint32_t                   layer_variable                        = 0;
+	uint32_t                   viewport_index_variable               = 0;
+	uint32_t                   clip_distance_count                   = 0;
+	uint32_t                   cull_distance_count                   = 0;
+	uint32_t                   depth_variable                        = 0;
+	uint32_t                   sample_mask_variable                  = 0;
+	std::vector<InputBinding>  inputs;
+	std::vector<OutputBinding> outputs;
+	std::vector<uint32_t>      interface_variables;
 };
 
+uint32_t TypeVoid(EmitterState& state);
+uint32_t TypeBool(EmitterState& state);
+uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
+uint32_t TypeU32(EmitterState& state);
+uint32_t TypeU64(EmitterState& state);
+uint32_t TypeDeviceAddress(EmitterState& state);
+uint32_t TypeScalarU64(EmitterState& state);
+uint32_t TypeU32Pair(EmitterState& state);
+uint32_t TypeI32(EmitterState& state);
+uint32_t TypeI32Pair(EmitterState& state);
+uint32_t TypeF32(EmitterState& state);
+uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
+
+uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
+uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
+uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
+uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t pointee);
+uint32_t TypeFunction(EmitterState& state);
+uint32_t TypeStorageBufferPointer(EmitterState& state);
+uint32_t TypeStorageBufferElementPointer(EmitterState& state);
+uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
+uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
+uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
+uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePushConstantElementPointer(EmitterState& state);
+uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
+uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
+
+inline void EmitLabel(EmitterState& state, uint32_t label) {
+	state.current_label = label;
+	state.builder.AddFunction({OpLabel, label});
+}
+
 struct ValueEmitContext {
-	ValueEmitContext(EmitterState& state_, const IR::ValueProgram& program_)
+	ValueEmitContext(EmitterState& state_, const IR::Program& program_)
 	    : state(state_), program(program_) {}
 
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
+	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
+	uint32_t              Ballot(IR::Value predicate);
+	uint32_t              FirstLane(uint32_t ballot);
+	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);
 	uint32_t              TypeId(IR::Type type) const;
 	uint32_t              Emit(const IR::Inst& inst, uint32_t opcode, IR::Type type,
@@ -456,19 +456,19 @@ struct ValueEmitContext {
 	const IR::MemoryInfo& Memory(const IR::Inst& inst) const;
 	const IR::ExportInfo& Export(const IR::Inst& inst) const;
 	uint32_t              Label(const IR::Block* block) const;
-	size_t                BlockIndex(const IR::Block* block) const;
-	void                  Fail(const IR::Inst& inst, const char* reason);
+	[[noreturn]] void     Fail(const char* reason) const;
+	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
 
-	EmitterState&                                  state;
-	const IR::ValueProgram&                        program;
-	std::unordered_map<const IR::Inst*, uint32_t>  definitions;
-	std::unordered_map<const IR::Block*, uint32_t> labels;
-	std::unordered_map<const IR::Inst*, uint32_t>  phi_variables;
-	std::unordered_map<const IR::Inst*, uint32_t>  dispatcher_variables;
-	const IR::Block*                               current_block        = nullptr;
-	uint32_t                                       scratch_u32_variable = 0;
-	bool                                           failed               = false;
-	std::string                                    error;
+	EmitterState&                                                      state;
+	const IR::Program&                                                 program;
+	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
+	std::unordered_map<const IR::Block*, uint32_t>                     labels;
+	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
+	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
+	const IR::Block*                                                   current_block = nullptr;
+	uint32_t                                                           scratch_u32_variable = 0;
+	ValueEmitContext*                                                  other_half = nullptr;
+	uint32_t                                                           half       = 0;
 };
 
 enum class VertexInputScalarKind { Float, Sint, Uint };
@@ -490,113 +490,10 @@ struct ImageSampleLayout {
 	uint32_t grad_y = NoImageComponent;
 };
 
-enum class ImageViewKind {
-	Dim1D,
-	Dim1DArray,
-	Dim2D,
-	Dim2DArray,
-	Dim3D,
-	Dim2DMsaa,
-	Dim2DMsaaArray,
-	Count,
-};
-
-constexpr uint32_t SampledImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
-constexpr uint32_t StorageImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Dim2DMsaa);
-
-constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? SampledImageViewKindCount : 0u);
-}
-
-constexpr uint32_t StorageImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? StorageImageViewKindCount : 0u);
-}
-
-constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
-	if (integer) {
-		switch (view) {
-			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::SampledUint1D;
-			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::SampledUint1DArray;
-			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::SampledUint2D;
-			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::SampledUint2DArray;
-			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::SampledUint3D;
-			case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::SampledUint2DMsaa;
-			case ImageViewKind::Dim2DMsaaArray:
-				return IR::DescriptorBindingKind::SampledUint2DMsaaArray;
-			default: break;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Sampled1D;
-		case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Sampled1DArray;
-		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Sampled2D;
-		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Sampled2DArray;
-		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Sampled3D;
-		case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::Sampled2DMsaa;
-		case ImageViewKind::Dim2DMsaaArray: return IR::DescriptorBindingKind::Sampled2DMsaaArray;
-		default: break;
-	}
-	return IR::DescriptorBindingKind::Count;
-}
-
-constexpr IR::DescriptorBindingKind StorageBindingKind(bool integer, ImageViewKind view) {
-	if (integer) {
-		switch (view) {
-			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageUint1D;
-			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::StorageUint1DArray;
-			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageUint2D;
-			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::StorageUint2DArray;
-			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
-			default: break;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Storage1D;
-		case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Storage1DArray;
-		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Storage2D;
-		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
-		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Storage3D;
-		default: break;
-	}
-	return IR::DescriptorBindingKind::Count;
-}
-
-constexpr uint32_t ImageSpirvDimension(ImageViewKind view) {
-	switch (view) {
-		case ImageViewKind::Dim1D:
-		case ImageViewKind::Dim1DArray: return Dim1D;
-		case ImageViewKind::Dim2D:
-		case ImageViewKind::Dim2DArray:
-		case ImageViewKind::Dim2DMsaa:
-		case ImageViewKind::Dim2DMsaaArray:
-		case ImageViewKind::Count: return Dim2D;
-		case ImageViewKind::Dim3D: return Dim3D;
-	}
-	return Dim2D;
-}
-
-constexpr uint32_t ImageSpirvArrayed(ImageViewKind view) {
-	return view == ImageViewKind::Dim1DArray || view == ImageViewKind::Dim2DArray ||
-	               view == ImageViewKind::Dim2DMsaaArray
-	           ? 1u
-	           : 0u;
-}
-
-constexpr uint32_t ImageSpirvMultisampled(ImageViewKind view) {
-	return view == ImageViewKind::Dim2DMsaa || view == ImageViewKind::Dim2DMsaaArray ? 1u : 0u;
-}
-
-struct AddCarryResult {
-	uint32_t sum   = 0;
-	uint32_t carry = 0;
-};
-
 struct F32Class {
-	uint32_t bits       = 0;
-	uint32_t nan        = 0;
-	uint32_t snan       = 0;
-	uint32_t zero       = 0;
-	uint32_t quiet_bits = 0;
+	uint32_t bits = 0;
+	uint32_t nan  = 0;
+	uint32_t zero = 0;
 };
 
 uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr);
@@ -605,33 +502,27 @@ uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
+bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
+
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
-uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input);
+uint32_t VertexParameterComponentCount(const InputBinding& input);
 
-uint32_t VertexParameterScalarType(const EmitterState& state, VertexInputScalarKind kind);
+uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-uint32_t VertexParameterScalarPointerType(const EmitterState& state, VertexInputScalarKind kind);
+uint32_t VertexParameterScalarPointerType(EmitterState& state, VertexInputScalarKind kind);
 
-uint32_t VertexParameterVectorOrScalarType(const EmitterState& state, VertexInputScalarKind kind,
+uint32_t VertexParameterVectorOrScalarType(EmitterState& state, VertexInputScalarKind kind,
                                            uint32_t components);
 
-uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputScalarKind kind,
+uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);
-
-void SetError(std::string* error, const char* message);
-
-void CollectRegister(std::vector<RegisterBinding>& registers, IR::Register reg);
-
-bool IsInactiveWave32ExecHigh(const EmitterState& state, IR::Register reg);
 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
-
-uint32_t PointerForRegister(const EmitterState& state, IR::Register reg);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -641,49 +532,33 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason);
 
-DescriptorResourceBinding ResourceForDescriptor(const EmitterState&       state,
-                                                IR::DescriptorBindingKind kind, uint32_t resource);
+uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
+                               uint32_t resource);
 
 uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
                                   const char* variable_name);
 
-ImageViewKind SampledImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc);
+uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class);
 
-uint32_t ImageViewCoordinateComponents(ImageViewKind view);
+uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass numeric_class,
+                         uint32_t components);
 
-uint32_t ImageViewSpatialComponents(ImageViewKind view);
+uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
-uint32_t ImageViewImageType(const EmitterState& state, ImageViewKind view, bool integer);
+uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t ImageViewSampledImageType(const EmitterState& state, ImageViewKind view, bool integer);
+uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 
-uint32_t ImageViewSizeType(const EmitterState& state, ImageViewKind view);
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
-uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                                    ImageViewKind view);
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t use_pc);
+uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                          ImageViewKind view);
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                          ImageViewKind view, uint32_t image_resource);
-
-ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   bool uint_image, uint32_t use_pc);
-
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, bool uint_image,
-                                       uint32_t      use_pc = UINT32_MAX,
-                                       ImageViewKind view   = ImageViewKind::Dim2D);
-
-uint32_t LoadStorageImageDescriptor(EmitterState& state, uint32_t resource, bool uint_image,
-                                    uint32_t use_pc, ImageViewKind view = ImageViewKind::Dim2D);
-
-void EmitStorageImageWrite(EmitterState& state, uint32_t resource, bool uint_image,
-                           ImageViewKind view, uint32_t mip_lod, uint32_t coord, uint32_t texel);
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
+                           uint32_t texel);
 
 uint32_t ExecutionModelForStage(ShaderType stage);
 
@@ -697,6 +572,14 @@ uint32_t FloatBits(float value);
 
 uint32_t ConstantF32Value(EmitterState& state, float value);
 
+uint32_t ConstantBool(EmitterState& state, bool value);
+
+uint32_t ConstantU64(EmitterState& state, uint64_t value);
+
+uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
+
+uint32_t GlslStd450(EmitterState& state);
+
 void AllocateInputVariables(EmitterState& state);
 
 void AllocateOutputVariables(EmitterState& state);
@@ -707,16 +590,17 @@ void AddInputAnnotationsAndNames(EmitterState& state);
 
 void AddOutputAnnotationsAndNames(EmitterState& state);
 
-void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name, uint32_t set,
-                        uint32_t binding);
+void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name,
+                        IR::DescriptorBindingKind kind);
 
 void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
-void EmitHeaderAndTypes(EmitterState& state);
-
-void AllocateRegisterVariables(EmitterState& state);
-
-void AllocateDescriptorVariables(EmitterState& state);
+void DefineModule(EmitterState& state);
+void     DefineMeshOutputs(EmitterState& state);
+void     EmitMeshEntryPoint(EmitterState& state);
+void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
+uint32_t MeshPrimitivePointer(EmitterState& state);
 
 uint32_t EmitTrueBool(EmitterState& state);
 
@@ -754,40 +638,42 @@ uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint3
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
-bool UserDataDwordIndex(const EmitterState& state, IR::Register reg, uint32_t& dword_index);
+uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
-uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc);
+Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
-Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
-                                           uint32_t use_pc);
-
-void EmitStorageBufferOffsets(EmitterState& state);
-
-DescriptorResourceBinding StorageBufferBindingForMemory(EmitterState&         state,
-                                                        const IR::MemoryInfo& mem, uint32_t use_pc);
-
-uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                        uint32_t use_pc);
-
-uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
-                                          uint32_t index, uint32_t use_pc);
-
-uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                         uint32_t index, uint32_t use_pc);
-
-uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index);
+void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
 
-uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index);
+struct MemoryResourceAccess {
+	IR::ResourceKind kind             = IR::ResourceKind::None;
+	uint32_t         object_pointer   = 0;
+	uint32_t         length           = 0;
+	uint32_t         index_offset     = 0;
+	uint32_t         byte_offset      = 0;
+	bool             add_index_offset = false;
+};
 
-uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index);
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
 
-uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index);
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
+                                                         const IR::MemoryInfo& mem,
+                                                         uint32_t variable,
+                                                         uint32_t pointer_type);
 
-uint32_t EmitMemoryElementPointer(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
-                                  uint32_t use_pc);
+uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t raw_index);
+
+uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                   uint32_t index);
+
+uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                  uint32_t index);
+
+uint32_t EmitStorageBufferElementPointer(EmitterState& state,
+                                         const MemoryResourceAccess& access, uint32_t index,
+                                         uint32_t pointer_type);
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value);
 
@@ -812,12 +698,13 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 
+uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                    bool max_value);
+
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control);
 
 uint32_t EmitSelectValueU32(EmitterState& state, uint32_t cond, uint32_t true_value,
                             uint32_t false_value);
-
-uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
 
 void EmitShiftLeftLogicalU64Values(EmitterState& state, uint32_t low, uint32_t high, uint32_t shift,
                                    uint32_t& out_low, uint32_t& out_high);
@@ -826,9 +713,6 @@ void EmitShiftRightLogicalU64Values(EmitterState& state, uint32_t low, uint32_t 
                                     uint32_t shift, uint32_t& out_low, uint32_t& out_high);
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
-
-AddCarryResult EmitAddCarryValues(EmitterState& state, uint32_t lhs, uint32_t rhs,
-                                  uint32_t carry_in);
 
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
 
@@ -878,8 +762,6 @@ uint32_t EmitFAbsValue(EmitterState& state, uint32_t value);
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 
-uint32_t InitialRegisterValue(const EmitterState& state, IR::Register reg);
-
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -888,47 +770,40 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
-bool EmitValueProgram(EmitterState& state, const IR::ValueProgram& program, std::string* error);
+void EmitProgram(EmitterState& state, const IR::Program& program);
+
+void DefineGetBdaPointer(EmitterState& state);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
-	if (condition == 0) {
-		fn();
-		return;
-	}
-
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, condition, then_label, merge_label});
-	state.builder.AddFunction({OpLabel, then_label});
+	EmitLabel(state, then_label);
 	fn();
 	state.builder.AddFunction({OpBranch, merge_label});
-	state.builder.AddFunction({OpLabel, merge_label});
+	EmitLabel(state, merge_label);
 }
 
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
-	if (condition == 0) {
-		return fn();
-	}
-
 	const auto then_label  = state.builder.AllocateId();
 	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, condition, then_label, else_label});
-	state.builder.AddFunction({OpLabel, then_label});
+	EmitLabel(state, then_label);
 	const auto then_value = fn();
 	state.builder.AddFunction({OpBranch, then_exit});
-	state.builder.AddFunction({OpLabel, then_exit});
+	EmitLabel(state, then_exit);
 	state.builder.AddFunction({OpBranch, merge_label});
-	state.builder.AddFunction({OpLabel, else_label});
+	EmitLabel(state, else_label);
 	state.builder.AddFunction({OpBranch, merge_label});
-	state.builder.AddFunction({OpLabel, merge_label});
+	EmitLabel(state, merge_label);
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpPhi, type, value, then_value, then_exit, default_value, else_label});
@@ -937,8 +812,49 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 
 template <typename Fn>
 uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
-	return EmitValueOrDefaultIfCondition(state, condition, state.uint_type, ConstantU32(state, 0),
+	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
+}
+
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	const auto scope = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+	const auto memory = [&] {
+		switch (kind) {
+			case IR::ResourceKind::Lds: return MemorySemanticsWorkgroupMemory;
+			case IR::ResourceKind::Image: return MemorySemanticsImageMemory;
+			default: return MemorySemanticsUniformMemory;
+		}
+	}();
+	const auto preheader = state.builder.AllocateId();
+	const auto header    = state.builder.AllocateId();
+	const auto cont      = state.builder.AllocateId();
+	const auto merge     = state.builder.AllocateId();
+	const auto initial   = state.builder.AllocateId();
+	const auto observed  = state.builder.AllocateId();
+	const auto exchanged = state.builder.AllocateId();
+	state.builder.AddFunction({OpBranch, preheader});
+	EmitLabel(state, preheader);
+	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
+	state.builder.AddFunction({OpBranch, header});
+	EmitLabel(state, header);
+	state.builder.AddFunction(
+	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
+	const auto next = desired(observed);
+	state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
+	                           ConstantU32(state, MemorySemanticsNone), next, observed});
+	const auto success = state.builder.AllocateId();
+	state.builder.AddFunction({OpIEqual, TypeBool(state), success, exchanged, observed});
+	state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
+	state.builder.AddFunction({OpBranchConditional, success, merge, cont});
+	EmitLabel(state, cont);
+	state.builder.AddFunction({OpBranch, header});
+	EmitLabel(state, merge);
+	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
+	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
+	return observed;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

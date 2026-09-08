@@ -6,35 +6,24 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace Libs::Graphics {
 
-class RenderCommandBuffer;
-
-enum class RenderColorType {
-	NoColorOutput,
-	RenderTexture,
-};
-
 struct RenderColorInfo {
-	RenderColorType                 type = RenderColorType::NoColorOutput;
+	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc         desc;
 	ImageId                         image_id;
-	vk::ImageView                   image_view       = nullptr;
-	vk::Format                      format           = vk::Format::eUndefined;
-	vk::Extent2D                    extent           = {};
-	uint32_t                        base_mip_level   = 0;
-	uint32_t                        base_array_layer = 0;
-	uint64_t                        base_addr        = 0;
-	uint64_t                        buffer_size      = 0;
 	uint32_t                        target_slot      = 0;
-	uint32_t                        samples          = 1;
+	uint32_t                        guest_mip_level   = 0;
+	uint32_t                        guest_array_layer = 0;
 	Prospero::ColorComponentMapping export_mapping;
-	bool                            color_clear_enable             = false;
-	bool                            metadata_clear_supported       = false;
-	bool                            metadata_fixed_clear_supported = false;
-	vk::ClearColorValue             color_clear_value {};
+
+	[[nodiscard]] vk::Extent2D Extent() const {
+		return {std::max(desc.info.extent.width >> guest_mip_level, 1u),
+		        std::max(desc.info.extent.height >> guest_mip_level, 1u)};
+	}
 };
 
 } // namespace Libs::Graphics

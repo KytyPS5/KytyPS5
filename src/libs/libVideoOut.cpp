@@ -47,8 +47,4 @@ LIB_DEFINE(InitVideoOut_1) {
 
 } // namespace LibGen5
 
-LIB_DEFINE(InitVideoOut_1) {
-	LibGen5::InitVideoOut_1(s);
-}
-
 } // namespace Libs

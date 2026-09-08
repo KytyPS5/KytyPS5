@@ -116,6 +116,7 @@ public:
 	[[nodiscard]] bool                    HasUses() const;
 	[[nodiscard]] size_t                  UseCount() const;
 	[[nodiscard]] size_t                  NumArgs() const;
+	[[nodiscard]] size_t                  NumPhiBlocks() const;
 	[[nodiscard]] Value                   Arg(size_t index) const;
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;

@@ -2,6 +2,7 @@
 #define LAUNCHER_INCLUDE_CONFIGURATION_H_
 
 #include "common.h"
+#include "common/emulatorConfig.h"
 
 #include <QByteArray>
 #include <QChar>
@@ -54,11 +55,16 @@ public:
 	enum class Resolution {
 		R1280X720,
 		R1920X1080,
+		R2560X1440,
+		R3840X2160,
 	};
 	Q_ENUM(Resolution)
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
+
+	enum class PresentMode { Fifo, Mailbox, Immediate };
+	Q_ENUM(PresentMode)
 
 	enum class ShaderLogDirection { Silent, Console, File };
 	Q_ENUM(ShaderLogDirection)
@@ -85,7 +91,12 @@ public:
 	QString    game_comment;
 
 	Resolution             screen_resolution           = Resolution::R1280X720;
+	QString                user_name                   = "Kyty";
+	int                    user_id                     = Config::DEFAULT_USER_ID;
+	PresentMode            present_mode                = PresentMode::Fifo;
+	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   readback_linear_images      = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -108,7 +119,12 @@ public:
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
 		screen_resolution           = other.screen_resolution;
+		user_name                   = other.user_name;
+		user_id                     = other.user_id;
+		present_mode                = other.present_mode;
+		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
+		readback_linear_images      = other.readback_linear_images;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -148,7 +164,12 @@ public:
 		KYTY_CFG_SET(game_path);
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
+		KYTY_CFG_SET(user_name);
+		KYTY_CFG_SET(user_id);
+		KYTY_CFG_SET(present_mode);
+		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
+		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -175,7 +196,19 @@ public:
 		KYTY_CFG_GET(game_path);
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);
+		user_name          = s->value("user_name", user_name).toString();
+		bool user_id_ok    = false;
+		auto saved_user_id = s->value("user_id", user_id).toInt(&user_id_ok);
+		user_id            = user_id_ok && Config::IsConfiguredUserIdValid(saved_user_id)
+		                         ? saved_user_id
+		                         : Config::DEFAULT_USER_ID;
+		KYTY_CFG_GET(present_mode);
+		gpu_index = s->value("gpu_index", -1).toInt();
+		if (EnumToText(present_mode).isEmpty()) {
+			present_mode = PresentMode::Fifo;
+		}
 		KYTY_CFG_GET(fullscreen_enabled);
+		KYTY_CFG_GET(readback_linear_images);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

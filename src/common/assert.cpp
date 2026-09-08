@@ -59,6 +59,7 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 }
 
 void DbgExit(int status) {
+	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	std::_Exit(status);
 }

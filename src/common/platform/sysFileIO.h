@@ -80,7 +80,7 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 // NOLINTNEXTLINE(google-runtime-references)
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out);
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
-bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst);
+bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
 
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

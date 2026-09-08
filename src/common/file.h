@@ -20,9 +20,6 @@
 #ifdef CopyFile
 #undef CopyFile
 #endif
-#ifdef MoveFile
-#undef MoveFile
-#endif
 #endif
 
 namespace Common {
@@ -107,7 +104,7 @@ public:
 	static std::vector<FindInfo> FindFiles(const std::filesystem::path& path);
 	static std::vector<DirEntry> GetDirEntries(const std::filesystem::path& path);
 	static bool CopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
-	static bool MoveFile(const std::filesystem::path& src, const std::filesystem::path& dst);
+	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static void RemoveReadonly(const std::filesystem::path& name);
 
 	KYTY_CLASS_NO_COPY(File);

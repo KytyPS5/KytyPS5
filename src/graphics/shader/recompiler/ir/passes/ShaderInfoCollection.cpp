@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "common/assert.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -8,15 +9,21 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+[[noreturn]] void Fail(std::string_view message) {
+	EXIT("shader info collection failed: %s", std::string(message).c_str());
+	std::abort();
+}
+
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
-              std::string name) {
+              std::string name, bool per_vertex = false) {
 	const auto input = std::find_if(info.inputs.begin(), info.inputs.end(), [=](const auto& value) {
 		return value.kind == kind && value.location == location;
 	});
 	if (input == info.inputs.end()) {
-		info.inputs.push_back({kind, location, components, std::move(name)});
+		info.inputs.push_back({kind, location, components, std::move(name), per_vertex});
 	} else {
 		input->component_count = std::max(input->component_count, components);
+		input->per_vertex      = input->per_vertex || per_vertex;
 	}
 }
 
@@ -33,39 +40,40 @@ void AddOutput(ShaderInfo& info, StageOutputKind kind, uint32_t index, uint32_t 
 	}
 }
 
-bool ValidateOptions(const Program& program, const ShaderInfoOptions& options, std::string* error) {
-	auto Fail = [&](const char* message) {
-		if (error != nullptr) {
-			*error = message;
-		}
-		return false;
-	};
+void ValidateOptions(const Program& program, const ShaderInfoOptions& options) {
 	switch (program.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Mesh:
+			if (options.vertex == nullptr) {
+				return Fail("vertex shader has no input metadata");
+			}
 			if (options.vertex->resources_num < 0 ||
 			    options.vertex->resources_num > ShaderVertexInputInfo::RES_MAX) {
 				return Fail("vertex resource count is out of range");
 			}
-			return true;
+			return;
 		case ShaderType::Pixel:
-			return options.pixel->input_num <= std::size(options.pixel->interpolator_settings) ||
-			       Fail("pixel input count is out of range");
+			if (options.pixel == nullptr) {
+				return Fail("pixel shader has no input metadata");
+			}
+			if (options.pixel->input_num > std::size(options.pixel->interpolator_settings)) {
+				return Fail("pixel input count is out of range");
+			}
+			return;
 		case ShaderType::Compute:
-			return (options.compute->thread_ids_num >= 0 && options.compute->thread_ids_num <= 3) ||
-			       Fail("compute thread ID count is out of range");
+			if (options.compute == nullptr) {
+				return Fail("compute shader has no input metadata");
+			}
+			if (options.compute->thread_ids_num < 0 || options.compute->thread_ids_num > 3) {
+				return Fail("compute thread ID count is out of range");
+			}
+			return;
 		default: return Fail("unsupported shader stage for info collection");
 	}
 }
 
-bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& options,
-                             std::string* error) {
-	const auto Fail = [&](const char* message) {
-		if (error != nullptr) {
-			*error = message;
-		}
-		return false;
-	};
-	for (const auto* block: program.values->blocks) {
+void ValidateValueReferences(const Program& program, const ShaderInfoOptions& options) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			switch (inst.GetOpcode()) {
 				case ValueOpcode::GetAttribute: {
@@ -79,6 +87,24 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					         static_cast<uint32_t>(options.vertex->resources_num))) {
 						return Fail("vertex input reference is out of range");
 					}
+					if (program.stage == ShaderType::Pixel &&
+					    (inst.Arg(1).U32() >= 4u ||
+					     inst.Arg(0).U32() >= options.pixel->input_num)) {
+						return Fail("pixel input reference is out of range");
+					}
+					break;
+				}
+				case ValueOpcode::GetInterpolationParameter: {
+					if (program.stage != ShaderType::Pixel || !inst.Arg(0).IsImmediate() ||
+					    inst.Arg(0).GetType() != Type::U32 || !inst.Arg(1).IsImmediate() ||
+					    inst.Arg(1).GetType() != Type::U32 || !inst.Arg(2).IsImmediate() ||
+					    inst.Arg(2).GetType() != Type::U32) {
+						return Fail("interpolation parameter reference is invalid");
+					}
+					if (inst.Arg(0).U32() >= options.pixel->input_num || inst.Arg(1).U32() >= 4u ||
+					    inst.Arg(2).U32() >= 3u) {
+						return Fail("interpolation parameter reference is out of range");
+					}
 					break;
 				}
 				case ValueOpcode::GetBuiltin: {
@@ -89,6 +115,14 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					const auto kind      = static_cast<StageInputKind>(inst.Arg(0).U32());
 					const auto component = inst.Arg(1).U32();
 					switch (kind) {
+						case StageInputKind::PackedAncillary:
+							return Fail("packed pixel ancillary input has an unsupported live use");
+						case StageInputKind::Layer:
+						case StageInputKind::SampleId:
+							if (program.stage != ShaderType::Pixel || component != 0u) {
+								return Fail("typed pixel scalar input is invalid");
+							}
+							break;
 						case StageInputKind::VertexIndex:
 						case StageInputKind::InstanceIndex:
 						case StageInputKind::FrontFacing:
@@ -100,6 +134,12 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 						case StageInputKind::FragCoord:
 							if (component >= 4u) {
 								return Fail("typed fragment-coordinate component is out of range");
+							}
+							break;
+						case StageInputKind::BaryCoordSmooth:
+						case StageInputKind::BaryCoordNoPerspective:
+							if (component >= 2u) {
+								return Fail("typed barycentric component is out of range");
 							}
 							break;
 						case StageInputKind::WorkgroupId:
@@ -115,7 +155,7 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					break;
 				}
 				case ValueOpcode::SetAttribute:
-					if (inst.Flags<ExportFlags>().index >= program.values->export_info.size()) {
+					if (inst.Flags<ExportFlags>().index >= program.export_info.size()) {
 						return Fail("typed export metadata index is out of range");
 					}
 					break;
@@ -123,7 +163,6 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 			}
 		}
 	}
-	return true;
 }
 
 void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* vertex,
@@ -131,7 +170,7 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 	AddInput(info, StageInputKind::VertexIndex, 0, 1, "gl_VertexIndex");
 	AddInput(info, StageInputKind::InstanceIndex, 0, 1, "gl_InstanceIndex");
 	uint32_t used_components[ShaderVertexInputInfo::RES_MAX] = {};
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
 				const auto attr       = inst.Arg(0).U32();
@@ -150,15 +189,40 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 	}
 }
 
-void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
+void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixel,
+                        ShaderInfo& info) {
 	if (pixel->HasPositionInput()) {
 		AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
 	}
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
+	std::array<bool, 32> per_vertex {};
+	std::array<bool, 32> interpolated {};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
+				interpolated[inst.Arg(0).U32()] = true;
+			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
+				const auto input = inst.Arg(0).U32();
+				const auto mode  = inst.Arg(2).U32();
+				per_vertex[input] =
+				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
+			}
+		}
+	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input));
+		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
+		         per_vertex[input]);
+	}
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		if (interpolated[input] && per_vertex[input]) {
+			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
+			                                           : StageInputKind::BaryCoordSmooth;
+			AddInput(info, kind, 0, 3,
+			         pixel->ps_no_perspective ? "gl_BaryCoordNoPerspKHR" : "gl_BaryCoordKHR");
+			break;
+		}
 	}
 }
 
@@ -178,7 +242,7 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 }
 
 void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
-	for (const auto* block: program.values->blocks) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::GetBuiltin) {
 				continue;
@@ -195,6 +259,14 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::FrontFacing:
 					AddInput(info, kind, 0, 1, "gl_FrontFacing");
 					break;
+				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
+				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
+				case StageInputKind::BaryCoordSmooth:
+					AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
+					break;
+				case StageInputKind::BaryCoordNoPerspective:
+					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+					break;
 				case StageInputKind::WorkgroupId:
 					AddInput(info, kind, 0, 3, "gl_WorkGroupID");
 					break;
@@ -207,19 +279,21 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::GlobalInvocationId:
 					AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 					break;
+				case StageInputKind::PackedAncillary:
 				case StageInputKind::Parameter: break;
 			}
 		}
 	}
 }
 
-void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
-	for (const auto* block: program.values->blocks) {
+void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
+                    const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
 				continue;
 			}
-			const auto& export_info = program.values->export_info[inst.Flags<ExportFlags>().index];
+			const auto& export_info = program.export_info[inst.Flags<ExportFlags>().index];
 			if (export_info.kind == ExportTargetKind::MrtZ) {
 				if (program.stage == ShaderType::Pixel && (export_info.en & 0x1u) != 0 &&
 				    pixel->ps_depth_export_enable) {
@@ -236,8 +310,37 @@ void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, S
 			}
 			switch (export_info.kind) {
 				case ExportTargetKind::Position:
-					AddOutput(info, StageOutputKind::Position, export_info.index, 0,
-					          "out_position");
+					if (export_info.index == 0) {
+						AddOutput(info, StageOutputKind::Position, 0, 0, "out_position");
+						break;
+					}
+					if (export_info.compr) {
+						return Fail("compressed auxiliary position export is unsupported");
+					}
+					for (uint32_t component = 0; component < 4; component++) {
+						if ((export_info.en & (1u << component)) == 0) {
+							continue;
+						}
+						const auto output = DecodePositionExportComponent(
+						    vertex->pa_cl_vs_out_cntl, export_info.index, component);
+						if (output.viewport) {
+							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0, "gl_ViewportIndex");
+						}
+						if (output.point_size) {
+							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");
+						}
+						if (output.layer) {
+							AddOutput(info, StageOutputKind::Layer, 0, 0, "gl_Layer");
+						}
+						if (output.clip_distance != UINT32_MAX) {
+							AddOutput(info, StageOutputKind::ClipDistance, output.clip_distance, 0,
+							          "gl_ClipDistance");
+						}
+						if (output.cull_distance != UINT32_MAX) {
+							AddOutput(info, StageOutputKind::CullDistance, output.cull_distance, 0,
+							          "gl_CullDistance");
+						}
+					}
 					break;
 				case ExportTargetKind::Parameter:
 					AddOutput(info, StageOutputKind::Parameter, export_info.index,
@@ -255,47 +358,34 @@ void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, S
 
 } // namespace
 
-bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::string* error) {
+void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
-		if (error != nullptr) {
-			*error = !program.resource_tracking_complete ? "shader resources were not tracked"
-			                                             : "shader info already collected";
-		}
-		return false;
+		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
+		                                                : "shader info already collected");
 	}
-	if (program.values == nullptr) {
-		if (error != nullptr) {
-			*error = "typed value program is not available";
-		}
-		return false;
-	}
-	if (!ValidateOptions(program, options, error)) {
-		return false;
-	}
-	if (!ValidateValueReferences(program, options, error)) {
-		return false;
-	}
+	ValidateOptions(program, options);
+	ValidateValueReferences(program, options);
 
 	auto next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
-	next.has_bitwise_xor = std::any_of(
-	    program.values->blocks.begin(), program.values->blocks.end(), [](const auto* block) {
+	next.has_bitwise_xor =
+	    std::any_of(program.blocks.begin(), program.blocks.end(), [](const auto* block) {
 		    return std::any_of(block->begin(), block->end(), [](const auto& inst) {
 			    return inst.GetOpcode() == ValueOpcode::BitwiseXor32;
 		    });
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
-		case ShaderType::Pixel: CollectPixelInputs(options.pixel, next); break;
+		case ShaderType::Mesh: break;
+		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
-		default: return false;
+		default: return Fail("unsupported shader stage for info collection");
 	}
 	CollectBuiltinInputs(program, next);
-	CollectOutputs(program, options.pixel, next);
+	CollectOutputs(program, options.vertex, options.pixel, next);
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

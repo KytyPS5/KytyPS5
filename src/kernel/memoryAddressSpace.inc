@@ -44,9 +44,9 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE,
-		                              static_cast<DWORD>(m_size >> 32u),
-		                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		m_handle = CreateFileMappingA(
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
@@ -659,7 +659,16 @@ public:
 #endif
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
-		EXIT_IF(!m_backing->IsAvailable());
+		if (!m_backing->IsAvailable()) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
+			     "this up front, so the paging file is usually what needs to be larger.\n",
+			     backing_size / (1024U * 1024U));
+#else
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",
+			     backing_size / (1024U * 1024U));
+#endif
+		}
 	}
 
 	~GuestAddressSpace() {

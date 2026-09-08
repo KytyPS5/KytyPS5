@@ -38,15 +38,19 @@ enum class Opcode {
 
 	S_MOV_B32,
 	S_MOV_B64,
+	S_CMOV_B64,
 	S_MOVK_I32,
 	S_ABS_I32,
+	S_ABSDIFF_I32,
 	S_BREV_B32,
 	S_BCNT1_I32_B32,
 	S_BCNT1_I32_B64,
 	S_FF1_I32_B32,
 	S_FF1_I32_B64,
+	S_FLBIT_I32_B32,
 	S_FLBIT_I32_B64,
 	S_BITREPLICATE_B64_B32,
+	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
 	S_AND_SAVEEXEC_B32,
@@ -67,6 +71,8 @@ enum class Opcode {
 	S_BITCMP1_B32,
 	S_BITSET0_B32,
 	S_BITSET1_B32,
+	S_BITSET0_B64,
+	S_BITSET1_B64,
 	S_MIN_I32,
 	S_MAX_I32,
 	S_MIN_U32,
@@ -106,6 +112,7 @@ enum class Opcode {
 	S_BFM_B64,
 	S_CSELECT_B32,
 	S_CSELECT_B64,
+	S_SETPRIO,
 	S_PACK_LL_B32_B16,
 	S_PACK_LH_B32_B16,
 	S_PACK_HH_B32_B16,
@@ -178,12 +185,15 @@ enum class Opcode {
 	V_CEIL_F16,
 	V_TRUNC_F16,
 	V_RNDNE_F16,
+	V_SIN_F16,
+	V_COS_F16,
 	V_SIN_F32,
 	V_COS_F32,
 	V_NOT_B32,
 	V_BFREV_B32,
 	V_FFBH_U32,
 	V_FFBL_B32,
+	V_FFBH_I32,
 	V_ADD_F32,
 	V_SUB_F32,
 	V_SUBREV_F32,
@@ -277,6 +287,7 @@ enum class Opcode {
 	V_MAD_MIXHI_F16,
 	V_ADD_NC_U32,
 	V_ADDC_U32,
+	V_SUB_CO_CI_U32,
 	V_SUBREV_CO_CI_U32,
 	V_SUB_NC_U32,
 	V_SUBREV_NC_U32,
@@ -298,6 +309,8 @@ enum class Opcode {
 	V_LSHRREV_B32,
 	V_ASHR_I32,
 	V_ASHRREV_I32,
+	V_LSHLREV_B64,
+	V_LSHRREV_B64,
 	V_LSHLREV_B16,
 	V_LSHRREV_B16,
 	V_ASHRREV_I16,
@@ -345,6 +358,7 @@ enum class Opcode {
 	V_CMP_GE_I32,
 	V_CMP_T_I32,
 	V_CMP_CLASS_F32,
+	V_CMPX_CLASS_F32,
 	V_CMP_LT_I16,
 	V_CMP_EQ_I16,
 	V_CMP_LE_I16,
@@ -363,6 +377,7 @@ enum class Opcode {
 	V_CMPX_LE_F16,
 	V_CMPX_GT_F16,
 	V_CMPX_GE_F16,
+	V_CMPX_NGT_F16,
 	V_CMPX_NEQ_F16,
 	V_CMPX_NLT_F16,
 	V_CMPX_LT_I32,
@@ -375,6 +390,7 @@ enum class Opcode {
 	V_CMP_EQ_U16,
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
+	V_CMPX_GT_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,
@@ -386,8 +402,12 @@ enum class Opcode {
 	V_CMP_GE_U32,
 	V_CMP_T_U32,
 	V_CMP_EQ_I64,
+	V_CMP_LT_U64,
+	V_CMP_EQ_U64,
 	V_CMP_GT_U64,
 	V_CMP_NE_U64,
+	V_CMPX_NE_I64,
+	V_CMPX_NE_U64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
 	V_CMPX_LE_U32,
@@ -436,6 +456,8 @@ enum class Opcode {
 	TBUFFER_STORE_FORMAT_XYZ,
 	TBUFFER_STORE_FORMAT_XYZW,
 	BUFFER_ATOMIC_SWAP,
+	BUFFER_ATOMIC_CMPSWAP,
+	BUFFER_ATOMIC_SWAP_X2,
 	BUFFER_ATOMIC_ADD,
 	BUFFER_ATOMIC_SUB,
 	BUFFER_ATOMIC_SMIN,
@@ -444,6 +466,7 @@ enum class Opcode {
 	BUFFER_ATOMIC_UMAX,
 	BUFFER_ATOMIC_AND,
 	BUFFER_ATOMIC_OR,
+	BUFFER_ATOMIC_OR_X2,
 	BUFFER_ATOMIC_XOR,
 	BUFFER_ATOMIC_FMIN,
 	BUFFER_ATOMIC_FMAX,
@@ -483,13 +506,17 @@ enum class Opcode {
 	DS_MIN_F32,
 	DS_MAX_F32,
 	DS_SWIZZLE_B32,
+	DS_BPERMUTE_B32,
 	DS_CONSUME,
 	DS_APPEND,
 	DS_READ_I8,
 	DS_READ_U8,
 	DS_READ_I16,
 	DS_READ_U16,
+	DS_READ_U16_D16,
+	DS_READ_U16_D16_HI,
 	DS_READ2_B32,
+	DS_READ2ST64_B32,
 	DS_READ_B32,
 	DS_READ_B64,
 	DS_READ2_B64,
@@ -498,6 +525,7 @@ enum class Opcode {
 	DS_READ_B128,
 	DS_WRITE_B8,
 	DS_WRITE_B16,
+	DS_WRITE_B16_D16_HI,
 	DS_WRITE2_B32,
 	DS_WRITE2ST64_B32,
 	DS_WRITE2_B64,
@@ -514,6 +542,7 @@ enum class Opcode {
 	IMAGE_LOAD_MIP,
 	IMAGE_STORE,
 	IMAGE_STORE_MIP,
+	IMAGE_ATOMIC_SWAP,
 	IMAGE_ATOMIC_ADD,
 	IMAGE_ATOMIC_UMIN,
 	IMAGE_ATOMIC_UMAX,
@@ -584,6 +613,7 @@ enum ImageSampleFlag : uint32_t {
 	ImageSampleFlagA16              = 1u << 7u,
 	ImageSampleFlagCd               = 1u << 8u,
 	ImageSampleFlagGatherHorizontal = 1u << 9u,
+	ImageSampleFlagAdjust           = 1u << 10u,
 };
 
 enum class ImageDimension : uint32_t {
@@ -614,6 +644,7 @@ struct Operand {
 	uint32_t dpp_ctrl           = 0;
 	uint32_t dpp_row_mask       = 0xf;
 	uint32_t dpp_bank_mask      = 0xf;
+	bool     explicit_sdwa_dst  = false;
 	bool     sdwa_sext          = false;
 	bool     dpp_fetch_inactive = false;
 	bool     dpp_bound_ctrl     = false;
@@ -645,6 +676,7 @@ struct Instruction {
 	uint32_t       offset                                       = 0;
 	uint32_t       secondary_offset                             = 0;
 	uint32_t       dmask                                        = 0;
+	uint32_t       data_components                              = 0;
 	uint32_t       data_dwords                                  = 1;
 	uint32_t       data_bits                                    = 32;
 	uint32_t       data_format                                  = 0;
@@ -663,6 +695,7 @@ struct Instruction {
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
+	bool           image_r128                                   = false;
 	int32_t        branch_offset                                = 0;
 	uint32_t       branch_target                                = 0;
 	struct {
@@ -683,12 +716,11 @@ struct Program {
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
-bool DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                       std::string* error);
-bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error);
+void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
+void DecodeProgram(std::span<const uint32_t> code, Program& program);
 
-bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
-bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
+void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
+void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeVectorGpr(uint32_t reg, Operand& operand);
 void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,

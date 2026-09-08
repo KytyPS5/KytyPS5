@@ -1,21 +1,25 @@
 #include "configurationEditDialog.h"
 
+#include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
+#include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QSettings>
 #include <QSpinBox>
 #include <QStyle>
@@ -23,6 +27,11 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#if QT_CONFIG(vulkan)
+#include <QVulkanInstance>
+#include <QVulkanWindow>
+#endif
 
 #include "ui_configuration_edit_dialog.h"
 
@@ -113,7 +122,10 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_printf_file->setEnabled(log == Configuration::LogDirection::File);
 	        });
 
-	layout()->setSizeConstraint(QLayout::SetFixedSize);
+	// Keep the controls at a usable minimum while allowing the settings window
+	// and its expanding fields to use any additional space the user gives them.
+	layout()->setSizeConstraint(QLayout::SetMinimumSize);
+	setSizeGripEnabled(true);
 
 	restoreGeometry(g_last_geometry);
 
@@ -152,8 +164,45 @@ static void ListInit(QComboBox* combo, T value) {
 }
 
 void ConfigurationEditDialog::Init(const Configuration& info) {
+	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
+	m_ui->lineEdit_user_name->setText(info.user_name);
+	m_ui->spinBox_user_id->setValue(info.user_id);
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	m_ui->comboBox_gpu->clear();
+	m_ui->comboBox_gpu->addItem(tr("Auto"));
+	// Keep Auto when Qt is built without Vulkan support.
+#if QT_CONFIG(vulkan)
+#if defined(__APPLE__)
+	if (!qEnvironmentVariableIsSet("QT_VULKAN_LIB")) {
+		const auto base    = QCoreApplication::applicationDirPath();
+		auto       library = base + "/libMoltenVK.dylib";
+		if (!QFileInfo::exists(library)) {
+			library = base + "/../Frameworks/libMoltenVK.dylib";
+		}
+		if (QFileInfo::exists(library)) {
+			qputenv("QT_VULKAN_LIB", library.toUtf8());
+		}
+	}
+#endif
+	QVulkanInstance instance;
+	instance.setApiVersion(QVersionNumber(1, 3, 0));
+#if !defined(__APPLE__)
+	instance.setFlags(QVulkanInstance::NoPortabilityDrivers);
+#endif
+	if (instance.create()) {
+		QVulkanWindow window;
+		window.setVulkanInstance(&instance);
+		for (const auto& device: window.availablePhysicalDevices()) {
+			m_ui->comboBox_gpu->addItem(QString::fromUtf8(device.deviceName));
+		}
+	}
+#endif
+	m_ui->comboBox_gpu->setCurrentIndex(
+	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
+	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
+	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -242,7 +291,8 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 
 	m_game_dirs_group->setVisible(true);
 	update_game_directory_buttons();
-	adjustSize();
+	layout()->activate();
+	resize(size().expandedTo(minimumSizeHint()));
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -282,10 +332,21 @@ void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
+void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
+	QDialog::resizeEvent(event);
+	g_last_geometry = saveGeometry();
+}
+
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
+	info.user_name = ui.lineEdit_user_name->text().trimmed();
+	info.user_id   = ui.spinBox_user_id->value();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
+	info.present_mode =
+	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
+	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
@@ -319,6 +380,19 @@ void ConfigurationEditDialog::adjust_size() {
 void ConfigurationEditDialog::save() {
 	if (MandatoryLineEdit::FindEmpty(this)) {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
+		return;
+	}
+
+	const auto user_name = m_ui->lineEdit_user_name->text().trimmed();
+	if (user_name.isEmpty() || user_name.toUtf8().size() > Config::MAX_USER_NAME_LENGTH) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("User name must contain 1-16 UTF-8 bytes"));
+		return;
+	}
+	m_ui->lineEdit_user_name->setText(user_name);
+	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
 		return;
 	}
 

@@ -110,7 +110,7 @@ private:
 };
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
+	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
 	}
 }
@@ -370,9 +370,5 @@ template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, Reg
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
-
-void PageManager::OnGpuMap(uint64_t, uint64_t) {}
-
-void PageManager::OnGpuUnmap(uint64_t, uint64_t) {}
 
 } // namespace Libs::Graphics

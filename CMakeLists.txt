@@ -126,7 +126,7 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.2.2)
+project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -254,7 +254,7 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.0 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -263,6 +263,22 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
+
+set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
+set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")
+set(fault_buffer_shader_header "${gpu_tiler_generated_dir}/fault_buffer_process_spv.h")
+add_custom_command(
+	OUTPUT "${fault_buffer_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
+	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fault_buffer_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -278,7 +294,7 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.0 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -371,7 +387,6 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
-add_kyty_full_emulator_test(shader_disk_cache_tests "${KYTY_TESTS_DIR}/ShaderDiskCacheTests.cpp")
 add_kyty_full_emulator_test(pm4_fuzz_tests "${KYTY_TESTS_DIR}/Pm4FuzzTests.cpp")
 add_kyty_full_emulator_test(diagnostics_tests "${KYTY_TESTS_DIR}/DiagnosticsTests.cpp")
 
@@ -431,21 +446,21 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
-add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/ShaderStageRuntimeTests.cpp"
+add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStageRuntime.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(shader_stage_runtime_tests fmt::fmt)
-target_include_directories(shader_stage_runtime_tests PRIVATE ${inc_headers})
+target_link_libraries(resource_materialization_tests fmt::fmt)
+target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -499,7 +514,7 @@ set(gpu_test_ms_depth_header
 add_custom_command(
 	OUTPUT "${gpu_test_ms_depth_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.0 -Os
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 	        -o "${gpu_test_ms_depth_spv}" "${gpu_test_ms_depth_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_ms_depth_spv}
 	        -DOUTPUT=${gpu_test_ms_depth_header} -DSYMBOL=GPU_TEST_MS_DEPTH_SPV
@@ -523,9 +538,18 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME emulator_user_name_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
+	add_test(NAME emulator_user_name_too_long
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 12345678901234567)
+	set_tests_properties(emulator_user_name_too_long PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_present_mode_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Immediate)
+	add_test(NAME emulator_present_mode_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
+	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
-	add_test(NAME shader_disk_cache COMMAND $<TARGET_FILE:shader_disk_cache_tests>)
 	add_test(NAME pm4_fuzz COMMAND $<TARGET_FILE:pm4_fuzz_tests>)
 	add_test(NAME diagnostics COMMAND $<TARGET_FILE:diagnostics_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -536,7 +560,7 @@ if(BUILD_TESTING)
 	add_test(NAME log_rate_limit COMMAND $<TARGET_FILE:log_rate_limit_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
-	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
+	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -568,6 +592,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME compute_meta_clear_classification
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 
@@ -590,7 +616,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		bit_array_tests
 		shader_vertex_metadata_tests
-		shader_stage_runtime_tests
+		resource_materialization_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

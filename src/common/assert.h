@@ -29,11 +29,7 @@ void DbgExit(int status);
 
 } // namespace Common
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #define EXIT_HALT() (Common::DbgExit(321), 1)
-#else
-#define EXIT_HALT() (std::_Exit(321), 1)
-#endif
 
 #ifndef KYTY_FINAL
 #define EXIT_IF(x)                                                                                 \

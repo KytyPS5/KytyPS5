@@ -23,9 +23,7 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::DB_STENCIL_CLEAR]             = HwCtxSetStencilClear;
 	g_hw_ctx_func[Pm4::DB_DEPTH_CLEAR]               = HwCtxSetDepthClear;
 	g_hw_ctx_func[Pm4::PA_SC_SCREEN_SCISSOR_TL]      = HwCtxSetScreenScissor;
-	g_hw_ctx_func[Pm4::DB_Z_INFO]                    = HwCtxSetDepthRenderTarget;
 	g_hw_ctx_func[Pm4::DB_STENCIL_INFO]              = HwCtxSetStencilInfo;
-	g_hw_ctx_func[Pm4::DB_HTILE_SURFACE]             = HwCtxSetDepthHtileSurface;
 	g_hw_ctx_func[Pm4::PA_SU_HARDWARE_SCREEN_OFFSET] = HwCtxSetHardwareScreenOffset;
 	g_hw_ctx_func[Pm4::PA_SC_WINDOW_OFFSET]          = HwCtxSetWindowOffset;
 	g_hw_ctx_func[Pm4::PA_SC_WINDOW_SCISSOR_TL]      = HwCtxSetWindowScissor;
@@ -35,7 +33,6 @@ constexpr auto MakeContextDispatchTable() {
 	}
 	g_hw_ctx_func[Pm4::CB_TARGET_MASK]                 = HwCtxSetRenderTargetMask;
 	g_hw_ctx_func[Pm4::PA_SC_GENERIC_SCISSOR_TL]       = HwCtxSetGenericScissor;
-	g_hw_ctx_func[Pm4::CB_BLEND_RED]                   = HwCtxSetBlendColor;
 	g_hw_ctx_func[Pm4::CB_DCC_CONTROL]                 = HwCtxSetCbDccControl;
 	g_hw_ctx_func[Pm4::DB_STENCIL_CONTROL]             = HwCtxSetStencilControl;
 	g_hw_ctx_func[Pm4::DB_STENCILREFMASK]              = HwCtxSetStencilMask;
@@ -76,16 +73,13 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_NGG_MODE_CNTL]                   = HwCtxSetPaScExtendedControl;
 	g_hw_ctx_func[Pm4::DB_ALPHA_TO_MASK]                      = HwCtxSetAlphaToMask;
 	g_hw_ctx_func[Pm4::VGT_DRAW_PAYLOAD_CNTL]                 = HwCtxSetDrawPayloadControl;
 	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
 	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;
 	g_hw_ctx_func[Pm4::VGT_SHADER_STAGES_EN]                  = HwCtxSetShaderStages;
-	g_hw_ctx_func[Pm4::PA_CL_GB_VERT_CLIP_ADJ]                = HwCtxSetGuardBands;
 
 	for (uint32_t slot = 0; slot < 8; slot++) {
-		g_hw_ctx_func[Pm4::CB_COLOR0_BASE + slot * 15] = HwCtxSetRenderTarget;
 		g_hw_ctx_func[Pm4::CB_COLOR0_INFO + slot * 15] = HwCtxSetColorInfo;
 
 		g_hw_ctx_func[Pm4::CB_BLEND0_CONTROL + slot * 1] = HwCtxSetBlendControl;
@@ -118,25 +112,21 @@ constexpr auto MakeShaderDispatchTable() {
 	}
 
 	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] = HwShSetPsUserAccumSgpr;
+		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] = HwShIgnoreUserAccumulator;
 	}
 
 	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] = HwShSetGsUserAccumSgpr;
+		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] = HwShIgnoreUserAccumulator;
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] = HwShSetHsUserAccumSgpr;
+		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] = HwShIgnoreUserAccumulator;
 	}
 
-	for (uint32_t slot = 0; Pm4::COMPUTE_USER_ACCUM_0 + slot < Pm4::COMPUTE_USER_DATA_0; slot++) {
-		g_hw_sh_func[Pm4::COMPUTE_USER_ACCUM_0 + slot] = HwShSetCsUserAccumSgpr;
+	for (uint32_t slot = 0; slot < 4; slot++) {
+		g_hw_sh_func[Pm4::COMPUTE_USER_ACCUM_0 + slot] = HwShIgnoreUserAccumulator;
 	}
 	g_hw_sh_func[Pm4::COMPUTE_PGM_LO]                  = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PGM_HI]                  = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_TBA_LO]                  = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_TBA_HI]                  = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_TMA_LO]                  = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_TMA_HI]                  = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC1]               = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC2]               = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_START_X]                 = HwShSetCsRegisters;
@@ -146,30 +136,16 @@ constexpr auto MakeShaderDispatchTable() {
 	g_hw_sh_func[Pm4::COMPUTE_NUM_THREAD_Y]            = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_NUM_THREAD_Z]            = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_RESOURCE_LIMITS]         = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_DESTINATION_EN_SE0]      = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_DESTINATION_EN_SE1]      = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_TMPRING_SIZE]            = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_DESTINATION_EN_SE2]      = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_DESTINATION_EN_SE3]      = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC3]               = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_SHADER_CHKSUM]           = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_DISPATCH_TUNNEL]         = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_TBA_LO_PS]            = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC3_PS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC4_PS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_TMA_LO_PS]            = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_TMA_HI_PS]            = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_REQ_CTRL_PS]          = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC3_GS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC4_GS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_REQ_CTRL_ESGS]        = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC3_HS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_PGM_RSRC4_HS]         = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShIgnoreRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_REQ_CTRL_LSHS]        = HwShIgnoreRegisters;
+	g_hw_sh_func[Pm4::COMPUTE_PACE_ID]                 = HwShSetCsRegisters;
+	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShSetRegisters;
 
 	return g_hw_sh_func;
 }
@@ -181,6 +157,7 @@ constexpr auto MakeUconfigDispatchTable() {
 	g_hw_uc_func[Pm4::VGT_INDEX_TYPE]            = HwUcSetIndexType;
 	g_hw_uc_func[Pm4::VGT_OBJECT_ID]             = HwUcSetObjectId;
 	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_FACTORS]  = HwUcSetTextureGradientFactors;
+	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_CONTROL]  = HwUcSetTextureGradientFactors;
 	g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM]        = HwUcSetIaMultiVgtParam;
 	g_hw_uc_func[Pm4::GE_MULTI_PRIM_IB_RESET_EN] = HwUcSetMultiPrimIbReset;
 	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR]        = HwUcSetBorderColorTableAddr;
@@ -217,6 +194,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_COND_EXEC]                 = CpOpCondExec;
 	g_cp_op_func[Pm4::IT_SET_PREDICATION]           = CpOpSetPredication;
 	g_cp_op_func[Pm4::IT_WRITE_DATA]                = CpOpWriteData;
+	g_cp_op_func[Pm4::IT_WAIT_REG_MEM]              = CpOpWaitRegMem32;
 	g_cp_op_func[Pm4::IT_INDIRECT_BUFFER]           = CpOpIndirectBuffer;
 	g_cp_op_func[Pm4::IT_COPY_DATA]                 = CpOpCopyData;
 	g_cp_op_func[Pm4::IT_EVENT_WRITE]               = CpOpEventWrite;
@@ -239,6 +217,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_WAIT_ON_CE_COUNTER]        = CpOpWaitOnCeCounter;
 	g_cp_op_func[Pm4::IT_WAIT_ON_DE_COUNTER_DIFF]   = CpOpWaitOnDeCounterDiff;
 	g_cp_op_func[Pm4::IT_GET_LOD_STATS]             = CpOpGetLodStats;
+	g_cp_op_func[Pm4::IT_WAIT_REG_MEM_64]           = CpOpWaitRegMem64;
 
 	return g_cp_op_func;
 }
@@ -247,12 +226,10 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func {};
 
 	g_cp_op_custom_func[Pm4::R_DISPATCH_RESET] = CpOpDispatchReset;
-	g_cp_op_custom_func[Pm4::R_WAIT_MEM_32]    = CpOpWaitRegMem32;
 	g_cp_op_custom_func[Pm4::R_WAIT_FLIP_DONE] = CpOpWaitFlipDone;
 	g_cp_op_custom_func[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
 	g_cp_op_custom_func[Pm4::R_POP_MARKER]     = CpOpPopMarker;
 	g_cp_op_custom_func[Pm4::R_ACQUIRE_MEM]    = CpOpAcquireMem;
-	g_cp_op_custom_func[Pm4::R_WAIT_MEM_64]    = CpOpWaitRegMem64;
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;

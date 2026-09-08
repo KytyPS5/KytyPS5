@@ -13,7 +13,7 @@ struct ShaderInfoOptions {
 
 // Completes the immutable shader interface after resource tracking. On failure Program::info and
 // all completion state remain unchanged.
-bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::string* error);
+void CollectShaderInfo(Program& program, const ShaderInfoOptions& options);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

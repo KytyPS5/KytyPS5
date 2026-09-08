@@ -802,7 +802,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
-	return false;
+	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
+	     " access=%u address=0x%016" PRIx64 "\n",
+	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
+	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {
@@ -1141,7 +1144,8 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
-	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0) {
+	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
+	    size >= Jit::Call9::GetSize()) {
 		// Replace:
 		//   66 66 66
 		//   mov <reg>, qword ptr fs:[0x00]
@@ -1149,7 +1153,8 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		//   call <handler>
 		//   mov <reg>,rax
 		//   nop ...
-		const uint8_t tls_pattern[5] = {0x64, 0x48, 0x8B, 0x00, 0x25};
+		const uint8_t tls_pattern[5]       = {0x64, 0x48, 0x8B, 0x00, 0x25};
+		const uint8_t zero_displacement[4] = {};
 
 		EXIT_IF(Jit::Call9::GetSize() != 9);
 
@@ -1164,7 +1169,6 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				prefix_count++;
 			}
 
-			const size_t inst_size = prefix_count + Jit::Call9::GetSize();
 			if (inst_ptr + Jit::Call9::GetSize() > start_ptr + size) {
 				break;
 			}
@@ -1172,21 +1176,20 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			const uint8_t modrm = inst_ptr[3];
 			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
 			    inst_ptr[4] == tls_pattern[4] &&
-			    *reinterpret_cast<const uint32_t*>(inst_ptr + 5) == 0) {
-				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(ptr));
+			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
+				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
 
 				const auto reg = (modrm >> 3u) & 7u;
 				EXIT_NOT_IMPLEMENTED(reg == 4u);
 
-				auto* code = new (ptr) Jit::Call9;
+				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
+				// overwrite it. Call9 starts with REX.W to neutralize genuine 0x66
+				// prefixes on AMD processors (before it could turn E8 into callw 16bit).
+				auto* code = new (inst_ptr) Jit::Call9;
 				code->SetFunc(reg == 0
 				                  ? program->tls.handler_vaddr
 				                  : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg));
-				if (inst_size > Jit::Call9::GetSize()) {
-					std::memset(ptr + Jit::Call9::GetSize(), 0x90,
-					            inst_size - Jit::Call9::GetSize());
-				}
-				ptr += inst_size - 1;
+				ptr += prefix_count + Jit::Call9::GetSize() - 1;
 			}
 		}
 	}
@@ -1287,6 +1290,9 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	Relocate(program);
+	if (!GamePatch::ApplyPending(program)) {
+		EXIT("Failed to apply pending game cheat\n");
+	}
 }
 
 void RuntimeLinker::UnloadProgram(Program* program) {
@@ -1412,7 +1418,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	RelocateAll();
 
 	if (!game_patch.empty()) {
-		GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front());
+		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
+		                      m_programs)) {
+			EXIT("Failed to apply game cheat\n");
+		}
 	}
 	StartAllModules();
 
@@ -1436,6 +1445,7 @@ void RuntimeLinker::Clear() {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
 	Common::LockGuard lock(m_mutex);
+	GamePatch::Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);

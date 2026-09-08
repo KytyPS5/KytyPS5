@@ -15,18 +15,6 @@
 
 namespace Libs::Graphics {
 
-struct GuestRange {
-	uint64_t address = 0;
-	uint64_t size    = 0;
-
-	[[nodiscard]] constexpr bool Empty() const noexcept { return address == 0 || size == 0; }
-	[[nodiscard]] constexpr bool Valid() const noexcept {
-		return !Empty() && address < TRACKER_ADDRESS_SIZE && size <= TRACKER_ADDRESS_SIZE - address;
-	}
-	[[nodiscard]] constexpr uint64_t End() const noexcept { return address + size; }
-	auto                             operator<=>(const GuestRange&) const = default;
-};
-
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
@@ -35,8 +23,11 @@ struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind               = ImageMetadataKind::None;
 	uint32_t            control            = 0;
+	uint32_t            dcc_clear_word           = 0;
 	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed = false;
+	bool                dcc_clear_register_valid = false;
+	bool                dcc_alpha_msb            = true;
 };
 
 struct ImageSubresources {
@@ -56,6 +47,7 @@ struct ImageSubresourceRange {
 struct ImageMipInfo {
 	uint64_t offset                                 = 0;
 	uint64_t size                                   = 0;
+	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
 	auto     operator<=>(const ImageMipInfo&) const = default;
@@ -443,6 +435,10 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
 	switch (format) {
+		// A single-plane float target carries its clear as raw float bits, the same encoding the
+		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
+		// contents.
+		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
 		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
 		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
 		case vk::Format::eR8G8B8A8Srgb:

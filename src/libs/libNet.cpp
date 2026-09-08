@@ -113,6 +113,10 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	return NET_CALL(Net::NetResolverCreate(name, memid, flags));
 }
 
+int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
+	return NET_CALL(Net::NetResolverDestroy(rid));
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	return NET_CALL(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
@@ -164,7 +168,7 @@ int KYTY_SYSV_ABI NetSocketClose(int s) {
 
 int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
                                 uint32_t optlen) {
-	return NET_CALL(Net::Setsockopt(s, level, optname, optval, optlen));
+	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
@@ -194,6 +198,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("dgJBaeJnGpo", LibNet::NetPoolCreate);
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
+	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
@@ -630,6 +635,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("P6A3ytpsiYc", Http::HttpDeleteConnection);
 	LIB_FUNC("tsGVru3hCe8", Http::HttpCreateRequest);
 	LIB_FUNC("Aeu5wVKkF9w", Http::HttpCreateRequest);
+	LIB_FUNC("rGNm+FjIXKk", Http::HttpCreateRequest2);
 	LIB_FUNC("Cnp77podkCU", Http::HttpCreateRequestWithURL2);
 	LIB_FUNC("qe7oZ+v4PWA", Http::HttpDeleteRequest);
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
@@ -1408,13 +1414,41 @@ namespace LibNpCommerce {
 
 LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
+constexpr int COMMERCE_STATUS_NONE        = 0;
+constexpr int COMMERCE_STATUS_INITIALIZED = 1;
+
+constexpr int COMMERCE_ERROR_NOT_INITIALIZED     = static_cast<int>(0x80B80003u);
+constexpr int COMMERCE_ERROR_ALREADY_INITIALIZED = static_cast<int>(0x80B80004u);
+
+static int g_commerce_status = COMMERCE_STATUS_NONE;
+
+static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+	PRINT_NAME();
+	if (g_commerce_status != COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_ALREADY_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_INITIALIZED;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+	PRINT_NAME();
+	if (g_commerce_status == COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_NOT_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_NONE;
+	return OK;
+}
+
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
-	return 0; // SCE_COMMON_DIALOG_STATUS_NONE
+	return g_commerce_status;
 }
 
 LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
+	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 

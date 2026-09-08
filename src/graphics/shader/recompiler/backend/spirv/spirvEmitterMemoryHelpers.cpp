@@ -2,21 +2,42 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
+	if (state.program.bindings.UsesPushData()) {
+		dword_index += state.program.bindings.push_data_start_dword;
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypePushConstantElementPointer(state), pointer,
+		                           state.push_constant_variable, ConstantU32(state, 0),
+		                           ConstantU32(state, dword_index)});
+		state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+		return value;
+	}
+	if (state.shader_data_storage_variable != 0) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                           state.shader_data_storage_variable, ConstantU32(state, 0),
+		                           ConstantU32(state, dword_index)});
+		state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+		return value;
+	}
+	return ConstantU32(state, 0);
+}
+
 uint32_t EmitAddU32(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpIAdd, state.uint_type, ret, lhs, rhs});
+	state.builder.AddFunction({OpIAdd, TypeU32(state), ret, lhs, rhs});
 	return ret;
 }
 
 uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, state.uint_type, ret, lhs, rhs});
+	state.builder.AddFunction({opcode, TypeU32(state), ret, lhs, rhs});
 	return ret;
 }
 
-uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc) {
-	(void)use_pc;
+uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer specialization is missing");
@@ -24,9 +45,7 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 	return state.program.info.buffers[mem.resource].packed_stride;
 }
 
-Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem,
-                                           uint32_t use_pc) {
-	(void)use_pc;
+Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer specialization is missing");
@@ -34,160 +53,170 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
-void EmitStorageBufferOffsets(EmitterState& state) {
-	for (uint32_t i = 0; i < state.program.bindings.buffer_offset_count; i++) {
+void EmitMemoryOffsets(EmitterState& state) {
+	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		const auto word =
-		    EmitShaderDataDwordLoad(state, state.program.bindings.buffer_offset_dword + i / 4u);
-		const auto shift                = ConstantU32(state, (i % 4u) * 8u + 2u);
-		state.storage_buffer_offsets[i] = EmitBinaryU32(
+		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
+		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
+		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
-		    ConstantU32(state, 0x3fu));
+		    ConstantU32(state, 0xffu));
 	}
-}
-
-bool IsAddressMemoryKind(IR::ResourceKind kind) {
-	return kind == IR::ResourceKind::ScalarAddress || kind == IR::ResourceKind::Flat ||
-	       kind == IR::ResourceKind::Global || kind == IR::ResourceKind::Scratch;
-}
-
-DescriptorResourceBinding
-StorageBufferBindingForMemory(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc) {
-	(void)use_pc;
-	const auto binding =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	if (state.storage_buffer_variable == 0) {
-		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
-		                             "storage buffer descriptor array was not emitted");
-	}
-	return binding;
-}
-
-uint32_t EmitStorageBufferIndex(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
-                                uint32_t use_pc) {
-	if (IsAddressMemoryKind(mem.kind)) {
-		return index;
-	}
-	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
-	return EmitAddU32(state, index, state.storage_buffer_offsets[binding.array_index]);
-}
-
-uint32_t EmitStorageBufferObjectPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                        uint32_t use_pc) {
-	if (IsAddressMemoryKind(mem.kind)) {
-		if (state.address_memory_variable == 0) {
-			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
-			                             mem.resource, "address memory binding was not emitted");
-		}
-		const auto binding =
-		    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer, pointer,
-		                           state.address_memory_variable,
-		                           ConstantU32(state, binding.array_index)});
-		return pointer;
-	}
-	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer, pointer,
-	                           state.storage_buffer_variable,
-	                           ConstantU32(state, binding.array_index)});
-	return pointer;
-}
-
-uint32_t EmitStorageBufferElementInBounds(EmitterState& state, const IR::MemoryInfo& mem,
-                                          uint32_t index, uint32_t use_pc) {
-	index                = EmitStorageBufferIndex(state, mem, index, use_pc);
-	const auto object    = EmitStorageBufferObjectPointer(state, mem, use_pc);
-	const auto length    = state.builder.AllocateId();
-	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction({OpArrayLength, state.uint_type, length, object, 0});
-	state.builder.AddFunction({OpULessThan, state.bool_type, in_bounds, index, length});
-	return in_bounds;
-}
-
-uint32_t EmitStorageBufferElementPointer(EmitterState& state, const IR::MemoryInfo& mem,
-                                         uint32_t index, uint32_t use_pc) {
-	index = EmitStorageBufferIndex(state, mem, index, use_pc);
-	if (IsAddressMemoryKind(mem.kind)) {
-		if (state.address_memory_variable == 0) {
-			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::AddressMemory,
-			                             mem.resource, "address memory binding was not emitted");
-		}
-		const auto binding =
-		    ResourceForDescriptor(state, IR::DescriptorBindingKind::AddressMemory, mem.resource);
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {OpAccessChain, state.ptr_storage_buffer_uint, pointer, state.address_memory_variable,
-		     ConstantU32(state, binding.array_index), ConstantU32(state, 0), index});
-		return pointer;
-	}
-	const auto binding = StorageBufferBindingForMemory(state, mem, use_pc);
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpAccessChain, state.ptr_storage_buffer_uint, pointer, state.storage_buffer_variable,
-	     ConstantU32(state, binding.array_index), ConstantU32(state, 0), index});
-	return pointer;
-}
-
-uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index) {
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpAccessChain, state.ptr_workgroup_uint, pointer, state.lds_variable, index});
-	return pointer;
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
-	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
+	const auto* workgroup = ShaderWorkgroupInput(state.stage, state.input_info);
+	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
-uint32_t EmitLdsElementInBounds(EmitterState& state, uint32_t index) {
-	const auto in_bounds = state.builder.AllocateId();
+static void EnsureLdsStorage(EmitterState& state) {
+	if (state.lds_variable != 0) {
+		return;
+	}
+	if (ShaderWorkgroupInput(state.stage, state.input_info) == nullptr) {
+		EXIT("function LDS was not prepared before SPIR-V function emission\n");
+	}
+	state.lds_variable = state.builder.DefineGlobalVariable(
+	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
+	    StorageClassWorkgroup);
+	state.builder.AddName(state.lds_variable, "lds_dwords");
+}
+
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
+                                                         const IR::MemoryInfo& mem,
+                                                         uint32_t variable,
+                                                         uint32_t pointer_type) {
+	if (variable == 0) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "storage buffer descriptor array was not emitted");
+	}
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	MemoryResourceAccess access {.kind = mem.kind};
+	access.object_pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
+	                           ConstantU32(state, array_index)});
+	access.byte_offset = state.memory_byte_offsets[array_index];
+	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpULessThan, state.bool_type, in_bounds, index, ConstantU32(state, LdsDwordCount(state))});
+	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	return access;
+}
+
+MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
+	MemoryResourceAccess access {.kind = mem.kind};
+	switch (mem.kind) {
+		case IR::ResourceKind::Lds:
+			EnsureLdsStorage(state);
+			access.object_pointer = state.lds_variable;
+			access.length         = ConstantU32(state, LdsDwordCount(state));
+			return access;
+		case IR::ResourceKind::Gds:
+			if (state.gds_variable == 0) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Gds, mem.resource,
+				                             "GDS binding was not emitted");
+			}
+			access.object_pointer = state.gds_variable;
+			if (state.gds_length == 0) {
+				EXIT("GDS length was not prepared at function entry\n");
+			}
+			access.length = state.gds_length;
+			return access;
+		case IR::ResourceKind::Scratch:
+			if (state.scratch_variable[state.lane_half] == 0) {
+				EXIT("scratch storage was not prepared before SPIR-V function emission\n");
+			}
+			access.object_pointer = state.scratch_variable[state.lane_half];
+			access.length         = ConstantU32(state, state.program.scratch_dwords);
+			return access;
+		case IR::ResourceKind::ScalarAddress:
+		case IR::ResourceKind::Flat:
+		case IR::ResourceKind::Global:
+			EXIT("physical address memory must use the BDA emitter\n");
+		case IR::ResourceKind::ScalarBuffer:
+		case IR::ResourceKind::Buffer: {
+			access = PrepareStorageBufferResourceAccess(
+			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			access.index_offset =
+			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
+			                  ConstantU32(state, 2u));
+			access.add_index_offset = true;
+			return access;
+		}
+		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
+	}
+	access.length = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	return access;
+}
+
+uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t raw_index) {
+	return access.add_index_offset ? EmitAddU32(state, raw_index, access.index_offset) : raw_index;
+}
+
+uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                   uint32_t index) {
+	const auto in_bounds = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThan, TypeBool(state), in_bounds, index, access.length});
 	return in_bounds;
 }
 
-uint32_t EmitMemoryElementPointer(EmitterState& state, const IR::MemoryInfo& mem, uint32_t index,
-                                  uint32_t use_pc) {
-	if (mem.kind == IR::ResourceKind::Lds) {
-		return EmitLdsElementPointer(state, index);
+uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                  uint32_t index) {
+	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		const auto pointer = state.builder.AllocateId();
+		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
+		                           : ShaderWorkgroupInput(state.stage, state.input_info) != nullptr
+		                               ? StorageClassWorkgroup
+		                               : StorageClassFunction;
+		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
+		                           pointer, access.object_pointer, index});
+		return pointer;
 	}
-	if (mem.kind == IR::ResourceKind::Gds) {
-		return EmitGdsElementPointer(state, index);
-	}
-	return EmitStorageBufferElementPointer(state, mem, index, use_pc);
+	return EmitStorageBufferElementPointer(state, access, index,
+	                                       TypeStorageBufferElementPointer(state));
+}
+
+uint32_t EmitStorageBufferElementPointer(EmitterState& state,
+                                         const MemoryResourceAccess& access, uint32_t index,
+                                         uint32_t pointer_type) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, pointer_type, pointer, access.object_pointer,
+	                           ConstantU32(state, 0), index});
+	return pointer;
 }
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.uint_type, ret, value});
+	state.builder.AddFunction({OpBitcast, TypeU32(state), ret, value});
 	return ret;
 }
 
 uint32_t EmitTBufferBitcastU32ToF32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.float_type, ret, value});
+	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, value});
 	return ret;
 }
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, state.int_type, ret, value});
+	state.builder.AddFunction({OpBitcast, TypeI32(state), ret, value});
 	return ret;
 }
 
 uint32_t EmitTBufferCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
                                        uint32_t constant) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, state.bool_type, ret, value, ConstantU32(state, constant)});
+	state.builder.AddFunction({opcode, TypeBool(state), ret, value, ConstantU32(state, constant)});
 	return ret;
 }
 
 uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t true_value,
                               uint32_t false_value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpSelect, state.float_type, ret, condition, true_value, false_value});
+	state.builder.AddFunction({OpSelect, TypeF32(state), ret, condition, true_value, false_value});
 	return ret;
 }
 
@@ -200,8 +229,8 @@ uint32_t EmitHalfToF32Bits(EmitterState& state, uint32_t raw) {
 	const auto unpacked = state.builder.AllocateId();
 	const auto value    = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpExtInst, state.vec2_float_type, unpacked, state.glsl_std450, GlslUnpackHalf2x16, raw});
-	state.builder.AddFunction({OpCompositeExtract, state.float_type, value, unpacked, 0});
+	    {OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), GlslUnpackHalf2x16, raw});
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), value, unpacked, 0});
 	return EmitTBufferBitcastF32ToU32(state, value);
 }
 
@@ -229,9 +258,9 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 
 	const auto mantissa_f32 = state.builder.AllocateId();
 	const auto subnormal    = state.builder.AllocateId();
-	state.builder.AddFunction({OpConvertUToF, state.float_type, mantissa_f32, mantissa});
+	state.builder.AddFunction({OpConvertUToF, TypeF32(state), mantissa_f32, mantissa});
 	state.builder.AddFunction(
-	    {OpFMul, state.float_type, subnormal, mantissa_f32,
+	    {OpFMul, TypeF32(state), subnormal, mantissa_f32,
 	     ConstantF32Value(state, std::ldexp(1.0f, 1 - 15 - static_cast<int>(mantissa_bits)))});
 
 	const auto zero_exp    = EmitTBufferCompareU32Constant(state, OpIEqual, exponent, 0);
@@ -249,22 +278,22 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 		case Format::ComponentType::Sint: return raw;
 		case Format::ComponentType::Uscaled: {
 			const auto value = state.builder.AllocateId();
-			state.builder.AddFunction({OpConvertUToF, state.float_type, value, raw});
+			state.builder.AddFunction({OpConvertUToF, TypeF32(state), value, raw});
 			return EmitTBufferBitcastF32ToU32(state, value);
 		}
 		case Format::ComponentType::Sscaled: {
 			const auto signed_raw = EmitTBufferBitcastU32ToI32(state, raw);
 			const auto value      = state.builder.AllocateId();
-			state.builder.AddFunction({OpConvertSToF, state.float_type, value, signed_raw});
+			state.builder.AddFunction({OpConvertSToF, TypeF32(state), value, signed_raw});
 			return EmitTBufferBitcastF32ToU32(state, value);
 		}
 		case Format::ComponentType::Unorm: {
 			const auto value      = state.builder.AllocateId();
 			const auto normalized = state.builder.AllocateId();
 			const auto max_value  = static_cast<float>((1u << bits) - 1u);
-			state.builder.AddFunction({OpConvertUToF, state.float_type, value, raw});
+			state.builder.AddFunction({OpConvertUToF, TypeF32(state), value, raw});
 			state.builder.AddFunction(
-			    {OpFDiv, state.float_type, normalized, value, ConstantF32Value(state, max_value)});
+			    {OpFDiv, TypeF32(state), normalized, value, ConstantF32Value(state, max_value)});
 			return EmitTBufferBitcastF32ToU32(state, normalized);
 		}
 		case Format::ComponentType::Snorm: {
@@ -273,10 +302,10 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 			const auto normalized = state.builder.AllocateId();
 			const auto clamped    = state.builder.AllocateId();
 			const auto max_value  = static_cast<float>((1u << (bits - 1u)) - 1u);
-			state.builder.AddFunction({OpConvertSToF, state.float_type, value, signed_raw});
+			state.builder.AddFunction({OpConvertSToF, TypeF32(state), value, signed_raw});
 			state.builder.AddFunction(
-			    {OpFDiv, state.float_type, normalized, value, ConstantF32Value(state, max_value)});
-			state.builder.AddFunction({OpExtInst, state.float_type, clamped, state.glsl_std450,
+			    {OpFDiv, TypeF32(state), normalized, value, ConstantF32Value(state, max_value)});
+			state.builder.AddFunction({OpExtInst, TypeF32(state), clamped, GlslStd450(state),
 			                           GlslFMax, normalized, ConstantF32Value(state, -1.0f)});
 			return EmitTBufferBitcastF32ToU32(state, clamped);
 		}
@@ -298,19 +327,37 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
 	    {OpMemoryBarrier, ConstantU32(state, ScopeDevice), ConstantU32(state, semantics)});
 }
 
-uint32_t EmitGdsElementInBounds(EmitterState& state, uint32_t index) {
-	const auto length    = state.builder.AllocateId();
-	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction({OpArrayLength, state.uint_type, length, state.gds_variable, 0});
-	state.builder.AddFunction({OpULessThan, state.bool_type, in_bounds, index, length});
-	return in_bounds;
-}
-
-uint32_t EmitGdsElementPointer(EmitterState& state, uint32_t index) {
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({OpAccessChain, state.ptr_storage_buffer_uint, pointer,
-	                           state.gds_variable, ConstantU32(state, 0), index});
-	return pointer;
+uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                    bool max_value) {
+	struct OrderedBits {
+		uint32_t nan;
+		uint32_t zero;
+		uint32_t key;
+	};
+	const auto classify = [&](uint32_t bits) {
+		const auto value = EmitBitcastU32ToF32(state, bits);
+		const auto cls   = EmitClassifyF32(state, value);
+		const auto negative = EmitCompareU32Constant(
+		    state, OpINotEqual, EmitAndConstant(state, bits, 0x80000000u), 0u);
+		const auto negative_key = state.builder.AllocateId();
+		state.builder.AddFunction({OpNot, TypeU32(state), negative_key, bits});
+		const auto positive_key = EmitBinaryU32(
+		    state, OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
+		return OrderedBits {
+		    cls.nan, cls.zero,
+		    EmitSelectValueU32(state, negative, negative_key, positive_key)};
+	};
+	const auto source_class = classify(source);
+	const auto old_class    = classify(old);
+	const auto unordered = EmitLogicalOrBool(
+	    state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
+	    EmitLogicalAndBool(state, source_class.zero, old_class.zero));
+	const auto compare = state.builder.AllocateId();
+	state.builder.AddFunction({max_value ? OpUGreaterThan : OpULessThan, TypeBool(state), compare,
+	                           source_class.key, old_class.key});
+	return EmitSelectValueU32(
+	    state, EmitLogicalAndBool(state, EmitLogicalNotBool(state, unordered), compare), source,
+	    old);
 }
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
@@ -336,16 +383,16 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 		const auto base   = state.builder.AllocateId();
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(
-		    {OpBitwiseAnd, state.uint_type, lane2, subid, ConstantU32(state, 3)});
+		    {OpBitwiseAnd, TypeU32(state), lane2, subid, ConstantU32(state, 3)});
 		state.builder.AddFunction(
-		    {OpShiftLeftLogical, state.uint_type, shift, lane2, ConstantU32(state, 1)});
+		    {OpShiftLeftLogical, TypeU32(state), shift, lane2, ConstantU32(state, 1)});
 		state.builder.AddFunction(
-		    {OpShiftRightLogical, state.uint_type, perm0, ConstantU32(state, control), shift});
+		    {OpShiftRightLogical, TypeU32(state), perm0, ConstantU32(state, control), shift});
 		state.builder.AddFunction(
-		    {OpBitwiseAnd, state.uint_type, perm, perm0, ConstantU32(state, 3)});
+		    {OpBitwiseAnd, TypeU32(state), perm, perm0, ConstantU32(state, 3)});
 		state.builder.AddFunction(
-		    {OpBitwiseAnd, state.uint_type, base, subid, ConstantU32(state, 0xfffffffcu)});
-		state.builder.AddFunction({OpBitwiseOr, state.uint_type, target, base, perm});
+		    {OpBitwiseAnd, TypeU32(state), base, subid, ConstantU32(state, 0xfffffffcu)});
+		state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, base, perm});
 		return target;
 	}
 
@@ -355,16 +402,16 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 	const auto xored  = state.builder.AllocateId();
 	const auto base   = state.builder.AllocateId();
 	const auto target = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitwiseAnd, state.uint_type, lane, subid, ConstantU32(state, 31)});
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 31)});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, masked, lane, ConstantU32(state, control & 0x1fu)});
+	    {OpBitwiseAnd, TypeU32(state), masked, lane, ConstantU32(state, control & 0x1fu)});
 	state.builder.AddFunction(
-	    {OpBitwiseOr, state.uint_type, ored, masked, ConstantU32(state, (control >> 5u) & 0x1fu)});
+	    {OpBitwiseOr, TypeU32(state), ored, masked, ConstantU32(state, (control >> 5u) & 0x1fu)});
 	state.builder.AddFunction(
-	    {OpBitwiseXor, state.uint_type, xored, ored, ConstantU32(state, (control >> 10u) & 0x1fu)});
+	    {OpBitwiseXor, TypeU32(state), xored, ored, ConstantU32(state, (control >> 10u) & 0x1fu)});
 	state.builder.AddFunction(
-	    {OpBitwiseAnd, state.uint_type, base, subid, ConstantU32(state, 0xffffffe0u)});
-	state.builder.AddFunction({OpBitwiseOr, state.uint_type, target, base, xored});
+	    {OpBitwiseAnd, TypeU32(state), base, subid, ConstantU32(state, 0xffffffe0u)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, base, xored});
 	return target;
 }
 

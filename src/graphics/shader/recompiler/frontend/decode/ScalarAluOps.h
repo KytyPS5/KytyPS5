@@ -5,14 +5,14 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
-bool DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
-bool DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
-bool DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
-bool DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                std::string* error);
+void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
+void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
+void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
+void DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                Instruction& inst);
 void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst);
 

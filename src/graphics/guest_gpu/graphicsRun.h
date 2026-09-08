@@ -13,8 +13,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <thread>
-#include <vector>
 
 namespace Libs::Graphics {
 
@@ -31,12 +31,12 @@ public:
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
-	void Submit(uint32_t* draw_commands, uint32_t draw_size_dw, uint32_t* constant_commands,
-	            uint32_t constant_size_dw, bool trigger_agc_interrupt_on_done = false);
-	void SubmitCompute(uint32_t queue, uint32_t* commands, uint32_t size_dw,
-	                   bool trigger_agc_interrupt_on_done = false);
-	void SubmitFlipPreparation(uint64_t request_id);
-	void Done();
+	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
+	void              Submit(std::span<const uint32_t> draw_commands,
+	                         std::span<const uint32_t> constant_commands);
+	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
+	void              SubmitFlipPreparation(uint64_t request_id);
+	void              Done();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -45,39 +45,24 @@ private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
+	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
-
-	class OwnedCmdBuffer {
-	public:
-		OwnedCmdBuffer() = default;
-		explicit OwnedCmdBuffer(const uint32_t* data, uint32_t count);
-
-		[[nodiscard]] bool     Empty() const noexcept { return m_words.empty(); }
-		[[nodiscard]] uint32_t Size() const noexcept {
-			return static_cast<uint32_t>(m_words.size());
-		}
-		[[nodiscard]] uint32_t* Data() noexcept { return m_words.data(); }
-
-	private:
-		std::vector<uint32_t> m_words;
-	};
 
 	enum class SubmissionType { Graphics, Compute, FlipPreparation };
 
 	struct Submission {
-		SubmissionType type     = SubmissionType::Graphics;
-		uint32_t       queue_id = 0;
-		OwnedCmdBuffer commands;
-		OwnedCmdBuffer constant_commands;
-		Pm4Execution   command_execution;
-		Pm4Execution   constant_execution;
-		bool           trigger_agc_interrupt_on_done = false;
-		bool           reset_processor               = false;
-		bool           started                       = false;
-		bool           command_complete              = false;
-		bool           constant_complete             = false;
-		bool           blocked                       = false;
-		uint64_t       flip_request_id               = 0;
+		SubmissionType            type     = SubmissionType::Graphics;
+		uint32_t                  queue_id = 0;
+		std::span<const uint32_t> commands;
+		std::span<const uint32_t> constant_commands;
+		Pm4Execution              command_execution;
+		Pm4Execution              constant_execution;
+		bool                      reset_processor   = false;
+		bool                      started           = false;
+		bool                      command_complete  = false;
+		bool                      constant_complete = false;
+		bool                      blocked           = false;
+		uint64_t                  flip_request_id   = 0;
 	};
 
 	void              Enqueue(Submission submission);

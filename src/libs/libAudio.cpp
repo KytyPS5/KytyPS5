@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "libs/ajm/aac_decoder.h"
 #include "libs/audio.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -6,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <memory>
 
 namespace Libs {
 
@@ -622,6 +624,7 @@ namespace LibAudiodec {
 
 LIB_VERSION("Audiodec", 1, "Audiodec", 1, 1);
 
+static constexpr int32_t AUDIODEC_ERROR_API_FAIL                = -2139160576; // 0x807F0000
 static constexpr int32_t AUDIODEC_ERROR_INVALID_TYPE             = -2139160575; // 0x807F0001
 static constexpr int32_t AUDIODEC_ERROR_ARG                      = -2139160574; // 0x807F0002
 static constexpr int32_t AUDIODEC_ERROR_INVALID_PARAM_SIZE       = -2139160572; // 0x807F0004
@@ -652,8 +655,9 @@ static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SIZE      = 2048;
 static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SAMPLES   = 256;
 static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SIZE      = 1441;
 static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SAMPLES   = 1152;
-static constexpr uint32_t AUDIODEC_M4AAC_MAX_FRAME_SIZE    = 4608;
-static constexpr uint32_t AUDIODEC_M4AAC_MAX_FRAME_SAMPLES = 2048;
+
+static constexpr int32_t AUDIODEC_M4AAC_RESULT_DECODE_ERROR      = -4;
+static constexpr int32_t AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA = -5;
 
 struct AudiodecAuInfo {
 	uint32_t uiSize;
@@ -719,6 +723,13 @@ struct AudiodecParamM4aac {
 	uint32_t uiEnableHeaac;
 };
 
+struct AudiodecParamM4aacEx {
+	AudiodecParamM4aac base;
+	uint32_t          uiEnableNondelayOutput;
+};
+
+static_assert(sizeof(AudiodecParamM4aacEx) == 28);
+
 struct AudiodecM4aacInfo {
 	uint32_t uiSize;
 	uint32_t uiSamplingFreq;
@@ -735,6 +746,7 @@ struct AudiodecDecoder {
 	uint32_t sample_rate   = 48000;
 	uint32_t frame_bytes   = AUDIODEC_MP3_MAX_FRAME_SIZE;
 	uint32_t frame_samples = AUDIODEC_MP3_MAX_FRAME_SAMPLES;
+	std::unique_ptr<Audio::Ajm::AjmAacDecoder> aac;
 };
 
 static Common::Mutex                   g_audiodec_mutex;
@@ -748,12 +760,6 @@ static bool audiodec_is_valid_type(uint32_t codec_type) {
 		case AUDIODEC_TYPE_M4AAC: return true;
 		default: return false;
 	}
-}
-
-static uint32_t audiodec_sample_rate_from_index(uint32_t index) {
-	static constexpr std::array<uint32_t, 12> rates = {96000, 88200, 64000, 48000, 44100, 32000,
-	                                                   24000, 22050, 16000, 12000, 11025, 8000};
-	return index < rates.size() ? rates[index] : 48000;
 }
 
 static int32_t audiodec_word_size_bytes(int32_t word_size) {
@@ -775,23 +781,25 @@ static int32_t audiodec_validate_ctrl(const AudiodecCtrl* ctrl, uint32_t codec_t
 	if (ctrl->pBsiInfo == nullptr) {
 		return AUDIODEC_ERROR_INVALID_BSI_INFO_POINTER;
 	}
-	if (ctrl->pAuInfo == nullptr) {
-		return AUDIODEC_ERROR_INVALID_AU_INFO_POINTER;
-	}
-	if (ctrl->pPcmItem == nullptr) {
-		return AUDIODEC_ERROR_INVALID_PCM_ITEM_POINTER;
-	}
-	if (ctrl->pAuInfo->uiSize != sizeof(AudiodecAuInfo)) {
-		return AUDIODEC_ERROR_INVALID_AU_INFO_SIZE;
-	}
-	if (ctrl->pPcmItem->uiSize != sizeof(AudiodecPcmItem)) {
-		return AUDIODEC_ERROR_INVALID_PCM_ITEM_SIZE;
-	}
-	if (decode && ctrl->pAuInfo->pAuAddr == nullptr) {
-		return AUDIODEC_ERROR_INVALID_AU_POINTER;
-	}
-	if (decode && ctrl->pPcmItem->pPcmAddr == nullptr) {
-		return AUDIODEC_ERROR_INVALID_PCM_POINTER;
+	if (decode) {
+		if (ctrl->pAuInfo == nullptr) {
+			return AUDIODEC_ERROR_INVALID_AU_INFO_POINTER;
+		}
+		if (ctrl->pPcmItem == nullptr) {
+			return AUDIODEC_ERROR_INVALID_PCM_ITEM_POINTER;
+		}
+		if (ctrl->pAuInfo->uiSize != sizeof(AudiodecAuInfo)) {
+			return AUDIODEC_ERROR_INVALID_AU_INFO_SIZE;
+		}
+		if (ctrl->pPcmItem->uiSize != sizeof(AudiodecPcmItem)) {
+			return AUDIODEC_ERROR_INVALID_PCM_ITEM_SIZE;
+		}
+		if (ctrl->pAuInfo->pAuAddr == nullptr) {
+			return AUDIODEC_ERROR_INVALID_AU_POINTER;
+		}
+		if (ctrl->pPcmItem->pPcmAddr == nullptr) {
+			return AUDIODEC_ERROR_INVALID_PCM_POINTER;
+		}
 	}
 
 	switch (codec_type) {
@@ -879,9 +887,10 @@ static void audiodec_fill_info(AudiodecCtrl* ctrl, const AudiodecDecoder& decode
 			break;
 		}
 		case AUDIODEC_TYPE_M4AAC: {
+			const auto format       = decoder.aac->GetFormat();
 			auto* info               = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
-			info->uiSamplingFreq     = decoder.sample_rate;
-			info->uiNumberOfChannels = decoder.channels;
+			info->uiSamplingFreq     = format.sampling_frequency;
+			info->uiNumberOfChannels = format.channel_num;
 			info->uiHeaac            = 0;
 			info->iResult            = 0;
 			break;
@@ -961,16 +970,28 @@ static int32_t KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t 
 					break;
 				}
 				case AUDIODEC_TYPE_M4AAC: {
-					auto* param       = static_cast<const AudiodecParamM4aac*>(ctrl->pParam);
-					decoder.word_size = param->iBwPcm;
-					decoder.channels  = param->uiMaxChannels == 0 ? 2 : param->uiMaxChannels;
-					if (decoder.channels > 8) {
-						decoder.channels = 8;
+					using namespace Audio::Ajm;
+					const auto* param = static_cast<const AudiodecParamM4aac*>(ctrl->pParam);
+					const auto channels =
+					    std::min(param->uiMaxChannels == 0 ? 2u : param->uiMaxChannels, 8u);
+					const auto encoding = param->iBwPcm == AUDIODEC_WORD_SZ_16BIT
+					                          ? AjmSampleEncoding::S16
+					                          : param->iBwPcm == AUDIODEC_WORD_SZ_FLOAT
+					                                ? AjmSampleEncoding::Float : AjmSampleEncoding::S32;
+					uint64_t flags = param->uiEnableHeaac != 0
+					                     ? AJM_INSTANCE_FLAG_DEC_M4AAC_ENABLE_SBR_DECODE : 0;
+					if (param->uiSize >= sizeof(AudiodecParamM4aacEx) &&
+					    static_cast<const AudiodecParamM4aacEx*>(ctrl->pParam)->uiEnableNondelayOutput != 0) {
+						flags |= AJM_INSTANCE_FLAG_DEC_M4AAC_ENABLE_NONDELAY_OUTPUT;
 					}
-					decoder.sample_rate =
-					    audiodec_sample_rate_from_index(param->uiSamplingFreqIndex);
-					decoder.frame_bytes   = AUDIODEC_M4AAC_MAX_FRAME_SIZE;
-					decoder.frame_samples = AUDIODEC_M4AAC_MAX_FRAME_SAMPLES;
+					decoder.aac = std::make_unique<AjmAacDecoder>(
+					    channels, decoder.sample_rate, encoding, flags);
+					const AjmDecM4aacInitializeParameters params {
+					    param->uiConfigNumber, param->uiSamplingFreqIndex};
+					if (decoder.aac->Initialize(&params, sizeof(params)).result != 0) {
+						decoder = {};
+						return AUDIODEC_ERROR_API_FAIL;
+					}
 					break;
 				}
 			}
@@ -1020,6 +1041,29 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 		return ret;
 	}
 
+	if (decoder.aac) {
+		using namespace Audio::Ajm;
+		const auto result = decoder.aac->Decode(
+		    ctrl->pAuInfo->pAuAddr, ctrl->pAuInfo->uiAuSize, ctrl->pPcmItem->pPcmAddr,
+		    ctrl->pPcmItem->uiPcmSize, false, nullptr);
+		ctrl->pAuInfo->uiAuSize   = static_cast<uint32_t>(result.input_consumed);
+		ctrl->pPcmItem->uiPcmSize = static_cast<uint32_t>(result.output_written);
+		audiodec_fill_info(ctrl, decoder);
+		auto* info = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
+		info->iResult = (result.result & AJM_RESULT_CODEC_ERROR) != 0
+		                    ? AUDIODEC_M4AAC_RESULT_DECODE_ERROR
+		                    : (result.result & AJM_RESULT_PARTIAL_INPUT) != 0
+		                          ? AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA : 0;
+		if ((result.result & AJM_RESULT_INVALID_PARAMETER) != 0) {
+			return AUDIODEC_ERROR_ARG;
+		}
+		if ((result.result & AJM_RESULT_FATAL) != 0) {
+			return AUDIODEC_ERROR_API_FAIL;
+		}
+		return (result.result & AJM_RESULT_NOT_ENOUGH_ROOM) != 0
+		           ? AUDIODEC_ERROR_INVALID_PCM_SIZE : 0;
+	}
+
 	const uint32_t word_bytes = static_cast<uint32_t>(audiodec_word_size_bytes(decoder.word_size));
 	const uint32_t wanted_pcm = decoder.frame_samples * decoder.channels * word_bytes;
 	const uint32_t produced_pcm =
@@ -1044,8 +1088,12 @@ static int32_t KYTY_SYSV_ABI AudiodecClearContext(int32_t handle) {
 	}
 
 	Common::LockGuard lock(g_audiodec_mutex);
-	if (!g_audiodec_decoders[static_cast<uint32_t>(handle - 1)].used) {
+	auto& decoder = g_audiodec_decoders[static_cast<uint32_t>(handle - 1)];
+	if (!decoder.used) {
 		return AUDIODEC_ERROR_INVALID_HANDLE;
+	}
+	if (decoder.aac) {
+		decoder.aac->Reset();
 	}
 
 	return 0;

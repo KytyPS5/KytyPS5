@@ -47,6 +47,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
+    {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
     {0x33u, Opcode::BUFFER_ATOMIC_SUB, 1, 32},
     {0x35u, Opcode::BUFFER_ATOMIC_SMIN, 1, 32},
@@ -58,6 +59,8 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x3bu, Opcode::BUFFER_ATOMIC_XOR, 1, 32},
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
+    {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
+    {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -96,14 +99,18 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x29u, Opcode::DS_AND_RTN_B32, 1, 32},      {0x2au, Opcode::DS_OR_RTN_B32, 1, 32},
     {0x2bu, Opcode::DS_XOR_RTN_B32, 1, 32},      {0x2du, Opcode::DS_WRXCHG_RTN_B32, 1, 32},
     {0x35u, Opcode::DS_SWIZZLE_B32, 1, 32},      {0x36u, Opcode::DS_READ_B32, 1, 32},
-    {0x37u, Opcode::DS_READ2_B32, 2, 32},        {0x38u, Opcode::DS_READ2_B32, 2, 32},
+    {0x37u, Opcode::DS_READ2_B32, 2, 32},        {0x38u, Opcode::DS_READ2ST64_B32, 2, 32},
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
     {0x3bu, Opcode::DS_READ_I16, 1, 16, true},   {0x3cu, Opcode::DS_READ_U16, 1, 16},
     {0x3du, Opcode::DS_CONSUME, 1, 32},          {0x3eu, Opcode::DS_APPEND, 1, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
+    {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
+    {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
+    {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
+    {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
     {0xdeu, Opcode::DS_WRITE_B96, 3, 32},        {0xdfu, Opcode::DS_WRITE_B128, 4, 32},
     {0xfeu, Opcode::DS_READ_B96, 3, 32},         {0xffu, Opcode::DS_READ_B128, 4, 32},
 };
@@ -146,6 +153,7 @@ bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
@@ -191,6 +199,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B64:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32: return 3u;
+		case Opcode::DS_BPERMUTE_B32: return 2u;
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
 		case Opcode::DS_APPEND: return 0u;
@@ -235,11 +244,11 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		MarkMemoryUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
 	}
 
-	DecodeScalarDestination(sdst, pc, inst.dst, nullptr);
+	DecodeScalarDestination(sdst, pc, inst.dst);
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
-	DecodeScalarSource(sbase * 2u, pc, inst.src0, nullptr);
-	DecodeScalarSource(soffset, pc, inst.src1, nullptr);
+	DecodeScalarSource(sbase * 2u, pc, inst.src0);
+	DecodeScalarSource(soffset, pc, inst.src1);
 	inst.src_count = 2;
 }
 
@@ -272,8 +281,8 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 	DecodeVectorGpr(vdata, inst.dst);
 	DecodeVectorGpr(vaddr, inst.src0);
-	DecodeScalarSource(srsrc * 4u, pc, inst.src1, nullptr);
-	DecodeScalarSource(soffset, pc, inst.src2, nullptr);
+	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
+	DecodeScalarSource(soffset, pc, inst.src2);
 	inst.src_count = 3;
 }
 
@@ -310,8 +319,8 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 	DecodeVectorGpr(vdata, inst.dst);
 	DecodeVectorGpr(vaddr, inst.src0);
-	DecodeScalarSource(srsrc * 4u, pc, inst.src1, nullptr);
-	DecodeScalarSource(soffset, pc, inst.src2, nullptr);
+	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
+	DecodeScalarSource(soffset, pc, inst.src2);
 	inst.src_count = 3;
 }
 
@@ -358,7 +367,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		DecodeVectorGpr(addr + 1u, inst.src1);
 		inst.src_count = 2;
 	} else {
-		DecodeScalarSource(saddr, pc, inst.src1, nullptr);
+		DecodeScalarSource(saddr, pc, inst.src1);
 		inst.src_count = 2;
 	}
 }
@@ -391,9 +400,10 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
 	}
 	if (inst.gds &&
-	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
+	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_BPERMUTE_B32 ||
+	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
 	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
-		SetUnsupported(inst, Family::DS, opcode, "DS swizzle/addtid is available only for LDS");
+		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
 	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
 		SetUnsupported(inst, Family::DS, opcode,
@@ -403,10 +413,11 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		SetUnsupported(inst, Family::DS, opcode,
 		               "DS read addtid data operands are not implemented");
 	}
-	if (inst.opcode == Opcode::DS_WRITE2_B32 || opcode == 0x37u) {
+	if (inst.opcode == Opcode::DS_WRITE2_B32 || inst.opcode == Opcode::DS_READ2_B32) {
 		inst.offset           = offset0 * 4u;
 		inst.secondary_offset = offset1 * 4u;
-	} else if (inst.opcode == Opcode::DS_WRITE2ST64_B32 || opcode == 0x38u) {
+	} else if (inst.opcode == Opcode::DS_WRITE2ST64_B32 ||
+	           inst.opcode == Opcode::DS_READ2ST64_B32) {
 		inst.offset           = offset0 * 256u;
 		inst.secondary_offset = offset1 * 256u;
 	} else if (inst.opcode == Opcode::DS_WRITE2_B64 || inst.opcode == Opcode::DS_READ2_B64) {
@@ -419,8 +430,17 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
+	if (inst.opcode == Opcode::DS_READ_U16_D16 ||
+	    inst.opcode == Opcode::DS_READ_U16_D16_HI) {
+		// Native D16 reads update only the selected destination half. Reuse the partial
+		// destination representation so typed IR translation preserves the other half.
+		inst.dst.sdwa_sel = inst.opcode == Opcode::DS_READ_U16_D16 ? 4u : 5u;
+	}
 	DecodeVectorGpr(addr, inst.src0);
 	DecodeVectorGpr(data0, inst.src1);
+	if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI) {
+		inst.src1.sdwa_sel = 5u;
+	}
 	DecodeVectorGpr(data1, inst.src2);
 	inst.src_count = DsSourceCount(inst.opcode);
 }

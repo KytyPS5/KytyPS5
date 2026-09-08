@@ -127,10 +127,12 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 	layout->setSpacing(6);
 
 	m_status_indicator = new QLabel(m_status_widget);
+	m_status_indicator->setObjectName(QStringLiteral("game_status_indicator"));
 	m_status_indicator->setFixedSize(QSize(12, 12));
 	layout->addWidget(m_status_indicator);
 
 	m_status_combo = new NoWheelComboBox(m_status_widget);
+	m_status_combo->setObjectName(QStringLiteral("game_status_editor"));
 	MakeTransparent(m_status_combo);
 	AddStatus(m_status_combo, Configuration::GameStatus::Unknown);
 	AddStatus(m_status_combo, Configuration::GameStatus::MainMenu);
@@ -139,26 +141,16 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 	AddStatus(m_status_combo, Configuration::GameStatus::DoesntBoot);
 	m_status_combo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
 	m_status_combo->setFixedWidth(125);
-	m_status_combo->setStyleSheet(QStringLiteral(
-	    "QComboBox { background: transparent; border: 0; color: #eef4ff; padding-left: 2px; }"
-	    "QComboBox:focus { background: rgba(255,255,255,35); border-radius: 3px; }"
-	    "QComboBox::drop-down { border: 0; }"
-	    "QComboBox QAbstractItemView { background: #181c24; color: #eef4ff; "
-	    "selection-background-color: #267bd8; }"));
 	layout->addWidget(m_status_combo);
 	layout->addStretch(1);
 
 	parent->setItemWidget(this, StatusColumn, m_status_widget);
 
 	m_comment_edit = new QLineEdit(parent);
+	m_comment_edit->setObjectName(QStringLiteral("game_comment_editor"));
 	MakeTransparent(m_comment_edit);
 	m_comment_edit->setClearButtonEnabled(true);
 	m_comment_edit->setFrame(false);
-	m_comment_edit->setStyleSheet(QStringLiteral(
-	    "QLineEdit { background: transparent; border: 0; color: #eef4ff; padding-left: 2px; "
-	    "selection-background-color: #267bd8; }"
-	    "QLineEdit:focus { background: rgba(255,255,255,35); "
-	    "border: 1px solid rgba(255,255,255,90); border-radius: 3px; }"));
 	parent->setItemWidget(this, CommentsColumn, m_comment_edit);
 
 	Update();
@@ -260,8 +252,6 @@ void ConfigurationItem::UpdateIcon() {
 
 void ConfigurationItem::UpdateStatusIndicator() {
 	m_status_indicator->setStyleSheet(
-	    QStringLiteral(
-	        "background-color: %1; border: 1px solid rgba(255, 255, 255, 90); border-radius: 6px;")
-	        .arg(GetStatusColor(m_info->game_status)));
+	    QStringLiteral("background-color: %1;").arg(GetStatusColor(m_info->game_status)));
 	m_status_indicator->setToolTip(GetStatusText(m_info->game_status));
 }

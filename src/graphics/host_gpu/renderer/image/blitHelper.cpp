@@ -23,7 +23,6 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 	texture_binding.stageFlags      = vk::ShaderStageFlagBits::eFragment;
 
 	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
-	descriptor_info.sType        = vk::StructureType::eDescriptorSetLayoutCreateInfo;
 	descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
 	descriptor_info.bindingCount = 1;
 	descriptor_info.pBindings    = &texture_binding;
@@ -32,7 +31,6 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 	                     "create BlitHelper descriptor layout");
 
 	vk::PipelineLayoutCreateInfo layout_info {};
-	layout_info.sType          = vk::StructureType::ePipelineLayoutCreateInfo;
 	layout_info.setLayoutCount = 1;
 	layout_info.pSetLayouts    = &m_descriptor_layout;
 	RequireVulkanSuccess(
@@ -65,7 +63,6 @@ BlitHelper::~BlitHelper() {
 vk::ShaderModule BlitHelper::CreateShader(const uint32_t* code, size_t words) const {
 	EXIT_IF(code == nullptr || words == 0);
 	vk::ShaderModuleCreateInfo create {};
-	create.sType            = vk::StructureType::eShaderModuleCreateInfo;
 	create.codeSize         = words * sizeof(uint32_t);
 	create.pCode            = code;
 	vk::ShaderModule module = nullptr;
@@ -84,51 +81,37 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	EXIT_IF(samples == vk::SampleCountFlagBits {} || key.format == vk::Format::eUndefined);
 
 	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
-	stages[0].sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
 	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
 	stages[0].module = m_vertex_shader;
 	stages[0].pName  = "main";
-	stages[1].sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
 	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
 	stages[1].module = m_fragment_shader;
 	stages[1].pName  = "main";
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input {};
-	vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
-	input_assembly.sType    = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
 	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
 	vk::PipelineViewportStateCreateInfo viewport {};
-	viewport.sType         = vk::StructureType::ePipelineViewportStateCreateInfo;
 	viewport.viewportCount = 1;
 	viewport.scissorCount  = 1;
 	vk::PipelineRasterizationStateCreateInfo rasterization {};
-	rasterization.sType       = vk::StructureType::ePipelineRasterizationStateCreateInfo;
-	rasterization.polygonMode = vk::PolygonMode::eFill;
-	rasterization.cullMode    = vk::CullModeFlagBits::eNone;
-	rasterization.lineWidth   = 1.0f;
+	rasterization.lineWidth = 1.0f;
 	vk::PipelineMultisampleStateCreateInfo multisample {};
-	multisample.sType                = vk::StructureType::ePipelineMultisampleStateCreateInfo;
 	multisample.rasterizationSamples = samples;
 	vk::PipelineDepthStencilStateCreateInfo depth {};
-	depth.sType            = vk::StructureType::ePipelineDepthStencilStateCreateInfo;
 	depth.depthTestEnable  = VK_TRUE;
 	depth.depthWriteEnable = VK_TRUE;
 	depth.depthCompareOp   = vk::CompareOp::eAlways;
 	vk::PipelineColorBlendStateCreateInfo color_blend {};
-	color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
 	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 	vk::PipelineDynamicStateCreateInfo dynamic {};
-	dynamic.sType             = vk::StructureType::ePipelineDynamicStateCreateInfo;
 	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
 	dynamic.pDynamicStates    = dynamic_states.data();
 
 	vk::PipelineRenderingCreateInfo rendering {};
-	rendering.sType                 = vk::StructureType::ePipelineRenderingCreateInfo;
 	rendering.depthAttachmentFormat = key.format;
 
 	vk::GraphicsPipelineCreateInfo create {};
-	create.sType               = vk::StructureType::eGraphicsPipelineCreateInfo;
 	create.pNext               = &rendering;
 	create.stageCount          = static_cast<uint32_t>(stages.size());
 	create.pStages             = stages.data();
@@ -186,7 +169,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                    command);
 
 	vk::RenderingAttachmentInfo depth_attachment {};
-	depth_attachment.sType                   = vk::StructureType::eRenderingAttachmentInfo;
 	depth_attachment.imageView               = destination_view;
 	depth_attachment.imageLayout             = ColorToMsDepthLayout;
 	depth_attachment.loadOp                  = vk::AttachmentLoadOp::eClear;
@@ -194,7 +176,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	depth_attachment.clearValue.depthStencil = {0.0f, 0};
 
 	vk::RenderingInfo rendering {};
-	rendering.sType             = vk::StructureType::eRenderingInfo;
 	rendering.renderArea.extent = {destination_info.extent.width, destination_info.extent.height};
 	rendering.layerCount        = 1;
 	rendering.pDepthAttachment  = &depth_attachment;
@@ -204,7 +185,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	descriptor_image.imageView   = source_view;
 	descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
 	vk::WriteDescriptorSet descriptor_write {};
-	descriptor_write.sType           = vk::StructureType::eWriteDescriptorSet;
 	descriptor_write.dstBinding      = 0;
 	descriptor_write.descriptorCount = 1;
 	descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;

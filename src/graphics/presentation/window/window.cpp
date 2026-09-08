@@ -3,6 +3,7 @@
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
+#include "SDL_filesystem.h"
 #include "SDL_gamecontroller.h"
 #include "SDL_hints.h"
 #include "SDL_joystick.h"
@@ -23,26 +24,23 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/vma.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
-#include <algorithm>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,8 +49,6 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
 #include "stb_image.h"
-
-#include <fmt/format.h>
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -79,7 +75,6 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
 		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
 		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_CONTROLLER_BUTTON_BACK: return Controller::PAD_BUTTON_TOUCH_PAD;
 		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
 		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
 		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
@@ -89,6 +84,7 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
 	}
 }
@@ -197,8 +193,6 @@ std::unique_ptr<WindowContext> g_window;
 } // namespace
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
-constexpr uint32_t    KYTY_SDL_WINDOW_FLAGS =
-    (static_cast<uint32_t>(SDL_WINDOW_HIDDEN) | static_cast<uint32_t>(SDL_WINDOW_VULKAN));
 constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
 static void SetPause(WindowLoopState& game, bool flag) {
@@ -247,7 +241,6 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_ESCAPE: game.need_exit = true; break;
 			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			case SDLK_F1:
 				if (!key.repeat) {
@@ -357,26 +350,26 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		auto* pad = SDL_GameControllerOpen(f.id);
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
-		Controller::ControllerConnect(id);
+		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		Controller::ControllerDisconnect(f.id);
+		Controller::Disconnect(f.id);
 		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
 	}
 
 	if (f.down || f.up) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
-			Controller::ControllerButton(f.id, button, f.down);
+			Controller::SetButton(f.id, button, f.down);
 		}
 	}
 
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::ControllerAxis(f.id, axis,
-			                           ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis,
+			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -407,6 +400,7 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	EXIT_IF(new_width == 0 || new_height == 0);
+	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;
 }
@@ -511,7 +505,14 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
-	if (ProcessImeInput(*event)) {
+	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
+	    event->key.keysym.sym == SDLK_F7) {
+		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+			HostInputToggleMouseToJoystick();
+		}
+		return;
+	}
+	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}
 
@@ -702,6 +703,16 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
+		case SDL_CONTROLLERTOUCHPADDOWN:
+		case SDL_CONTROLLERTOUCHPADMOTION:
+		case SDL_CONTROLLERTOUCHPADUP:
+			if (event->ctouchpad.touchpad == 0) {
+				Controller::SetTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
+				                        event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
+				                        event->ctouchpad.x, event->ctouchpad.y);
+			}
+			break;
+
 		case SDL_CONTROLLERDEVICEADDED:
 		case SDL_CONTROLLERDEVICEREMOVED:
 		case SDL_CONTROLLERDEVICEREMAPPED: {
@@ -728,8 +739,7 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
-#if defined(__APPLE__)
-void WindowContext::RunOnMainThread(std::function<void()> task, bool wait) {
+void WindowContext::RunOnMainThread(std::function<void()> task) {
 	if (Common::Thread::IsMainThread()) {
 		task();
 		return;
@@ -747,9 +757,6 @@ void WindowContext::RunOnMainThread(std::function<void()> task, bool wait) {
 	event.type = SDL_USEREVENT;
 	SDL_PushEvent(&event);
 
-	if (!wait) {
-		return;
-	}
 	Common::LockGuard lock(main_task_mutex);
 	while (main_tasks_run < ticket) {
 		main_task_done.Wait(&main_task_mutex);
@@ -772,7 +779,6 @@ void WindowContext::DrainMainThreadTasks() {
 	main_tasks_run += tasks.size();
 	main_task_done.SignalAll();
 }
-#endif
 
 void WindowContext::Run() {
 	Common::Timer timer;
@@ -783,9 +789,7 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
-#if defined(__APPLE__)
 		DrainMainThreadTasks();
-#endif
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -794,8 +798,8 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (SDL_WaitEvent(&loop.event) == 0) {
-			EXIT("%s\n", SDL_GetError());
+		if (!HostInputWaitEvent(&loop.event)) {
+			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
 	}
@@ -809,6 +813,8 @@ static void WindowCreate(WindowContext& context) {
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 #endif
@@ -817,15 +823,30 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
-	InitializeImeInput();
+	InitializeSystemOverlayInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
-	uint32_t window_flags = KYTY_SDL_WINDOW_FLAGS;
-	if (Config::FullscreenEnabled()) {
-		window_flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
-	}
+	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
 #if defined(__APPLE__)
+	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
+	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
+	// override, and fall back to SDL's normal loader search when no bundle is present.
+	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
+		if (char* base_path = SDL_GetBasePath(); base_path != nullptr) {
+			const std::string base_path_str = base_path;
+			SDL_free(base_path);
+			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
+			if (!Common::File::IsFileExisting(moltenvk_path)) {
+				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
+			}
+			if (Common::File::IsFileExisting(moltenvk_path) &&
+			    SDL_setenv("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
+				LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
+			}
+		}
+	}
+
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
 	// borderless window skips that machinery entirely.
@@ -836,13 +857,20 @@ static void WindowCreate(WindowContext& context) {
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
 	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
-	context.window_hidden = true;
-
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
 	SDL_SetWindowResizable(context.window, SDL_FALSE);
+	context.UpdateIcon();
+}
+
+uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN);
+	if (fullscreen) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	}
+	return flags;
 }
 
 Presenter& WindowInit(uint32_t width, uint32_t height) {
@@ -866,6 +894,7 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
+	g_window->render_context->GetPipelineCache().Save();
 }
 
 void WindowFlushCaches() {
@@ -876,6 +905,7 @@ void WindowFlushCaches() {
 
 void WindowShutdown() {
 	if (g_window != nullptr) {
+		Controller::EmergencyShutdown();
 		g_window.reset();
 	}
 }
@@ -965,6 +995,7 @@ void WindowContext::UpdateTitle() {
 	    Loader::SystemContentParamSfoGetString("TITLE_ID", title_id, sizeof(title_id));
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
+	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
 	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
 	static uint64_t frame_num   = 0;
 	static uint64_t fps_frames  = 0;
@@ -989,19 +1020,14 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
-	auto fps = fmt::format(
+	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-#if defined(__APPLE__)
-	// AppKit traps on title changes off the main thread; fire-and-forget keeps present pacing.
-	RunOnMainThread([this, fps = std::move(fps)] { SDL_SetWindowTitle(window, fps.c_str()); },
-	                false);
-#else
-	SDL_SetWindowTitle(window, fps.c_str());
-#endif
+	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }
 
 } // namespace Libs::Graphics

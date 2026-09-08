@@ -65,7 +65,6 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k5_6_5UNorm, vk::Format::eB5G6R5UnormPack16},
     {Prospero::BufferFormat::k5_5_5_1UNorm, vk::Format::eR5G5B5A1UnormPack16},
     {Prospero::BufferFormat::k4_4_4_4UNorm, vk::Format::eR4G4B4A4UnormPack16},
-    {Prospero::BufferFormat::kFmask8_S4_F4, vk::Format::eR32Sfloat},
     {Prospero::BufferFormat::kBc1UNorm, vk::Format::eBc1RgbaUnormBlock},
     {Prospero::BufferFormat::kBc1Srgb, vk::Format::eBc1RgbaSrgbBlock},
     {Prospero::BufferFormat::kBc2UNorm, vk::Format::eBc2UnormBlock},
@@ -96,22 +95,6 @@ constexpr auto kFormatLookup = MakeFormatLookup();
 
 } // namespace
 
-std::string VulkanToString(vk::Result value) {
-	return vk::to_string(value);
-}
-
-std::string VulkanToString(vk::Format value) {
-	return vk::to_string(value);
-}
-
-std::string VulkanToString(vk::ImageLayout value) {
-	return vk::to_string(value);
-}
-
-std::string VulkanToString(vk::QueueFlags value) {
-	return vk::to_string(value);
-}
-
 vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 	const auto index = static_cast<size_t>(guest_format);
 	return index < kFormatLookup.size() ? kFormatLookup[index] : vk::Format::eUndefined;
@@ -119,7 +102,7 @@ vk::Format VulkanFormat(Prospero::BufferFormat guest_format) {
 
 void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	if (result != vk::Result::eSuccess) {
-		EXIT("%s failed: %s (%d)\n", operation, VulkanToString(result).c_str(),
+		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}
 }

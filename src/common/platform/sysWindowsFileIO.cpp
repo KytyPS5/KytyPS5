@@ -565,7 +565,7 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 	return CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0;
 }
 
-bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto src_wide = src.wstring();
 	auto dst_wide = dst.wstring();
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;

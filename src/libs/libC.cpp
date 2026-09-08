@@ -327,25 +327,8 @@ static KYTY_SYSV_ABI int setenv(const char* name, const char* value, int overwri
 		return -1;
 	}
 
-	if (overwrite == 0 && std::getenv(name) != nullptr) {
-		return 0;
-	}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const auto ret = ::_putenv_s(name, value);
-	if (ret != 0) {
-		*Posix::GetErrorAddr() = ret;
-		return -1;
-	}
+	// Guest environment changes must not leak into emulator host libraries.
 	return 0;
-#else
-	const auto ret = ::setenv(name, value, overwrite);
-	if (ret != 0) {
-		*Posix::GetErrorAddr() = errno;
-		return -1;
-	}
-	return 0;
-#endif
 }
 
 static KYTY_SYSV_ABI int64_t libc_time(int64_t* timer) {
@@ -360,75 +343,110 @@ static KYTY_SYSV_ABI double libc_difftime(int64_t time1, int64_t time0) {
 	return std::difftime(static_cast<std::time_t>(time1), static_cast<std::time_t>(time0));
 }
 
-static KYTY_SYSV_ABI std::tm* libc_gmtime(const int64_t* timer) {
+struct GuestTm {
+	int tm_sec;
+	int tm_min;
+	int tm_hour;
+	int tm_mday;
+	int tm_mon;
+	int tm_year;
+	int tm_wday;
+	int tm_yday;
+	int tm_isdst;
+};
+
+static_assert(sizeof(GuestTm) == 36);
+
+static GuestTm ToGuestTm(const std::tm& time) {
+	return {time.tm_sec,  time.tm_min,  time.tm_hour, time.tm_mday, time.tm_mon,
+	        time.tm_year, time.tm_wday, time.tm_yday, time.tm_isdst};
+}
+
+static std::tm ToHostTm(const GuestTm& time) {
+	std::tm result {};
+	result.tm_sec   = time.tm_sec;
+	result.tm_min   = time.tm_min;
+	result.tm_hour  = time.tm_hour;
+	result.tm_mday  = time.tm_mday;
+	result.tm_mon   = time.tm_mon;
+	result.tm_year  = time.tm_year;
+	result.tm_wday  = time.tm_wday;
+	result.tm_yday  = time.tm_yday;
+	result.tm_isdst = time.tm_isdst;
+	return result;
+}
+
+static KYTY_SYSV_ABI GuestTm* libc_gmtime(const int64_t* timer) {
 	if (timer == nullptr) {
 		return nullptr;
 	}
 
-	thread_local std::tm result {};
+	thread_local GuestTm result {};
+	std::tm              host_result {};
 	const auto           t = static_cast<std::time_t>(*timer);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (_gmtime64_s(&result, &t) != 0) {
+	if (_gmtime64_s(&host_result, &t) != 0) {
 		return nullptr;
 	}
 #else
-	if (gmtime_r(&t, &result) == nullptr) {
+	if (gmtime_r(&t, &host_result) == nullptr) {
 		return nullptr;
 	}
 #endif
 
+	result = ToGuestTm(host_result);
 	return &result;
 }
 
-static KYTY_SYSV_ABI std::tm* libc_localtime(const int64_t* timer) {
+static KYTY_SYSV_ABI GuestTm* libc_localtime(const int64_t* timer) {
 	if (timer == nullptr) {
 		return nullptr;
 	}
 
-	thread_local std::tm result {};
+	thread_local GuestTm result {};
+	std::tm              host_result {};
 	const auto           t = static_cast<std::time_t>(*timer);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (_localtime64_s(&result, &t) != 0) {
+	if (_localtime64_s(&host_result, &t) != 0) {
 		return nullptr;
 	}
 #else
-	if (localtime_r(&t, &result) == nullptr) {
+	if (localtime_r(&t, &host_result) == nullptr) {
 		return nullptr;
 	}
 #endif
 
+	result = ToGuestTm(host_result);
 	return &result;
 }
 
-static KYTY_SYSV_ABI int64_t libc_mktime(std::tm* timeptr) {
+static KYTY_SYSV_ABI int64_t libc_mktime(GuestTm* timeptr) {
 	if (timeptr == nullptr) {
 		return -1;
 	}
 
+	auto host_time = ToHostTm(*timeptr);
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	return static_cast<int64_t>(_mktime64(timeptr));
+	const auto result = static_cast<int64_t>(_mktime64(&host_time));
 #else
-	return static_cast<int64_t>(std::mktime(timeptr));
+	const auto result = static_cast<int64_t>(std::mktime(&host_time));
 #endif
+
+	*timeptr = ToGuestTm(host_time);
+	return result;
 }
 
 static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* format,
-                                          const std::tm* timeptr) {
+                                          const GuestTm* timeptr) {
 	if (str == nullptr || format == nullptr || timeptr == nullptr) {
 		return 0;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	// Guest-created tm values do not initialize glibc's tm_zone pointer.
-	std::tm sanitized = *timeptr;
-	sanitized.tm_zone = nullptr;
-
-	return std::strftime(str, count, format, &sanitized);
-#else
-	return std::strftime(str, count, format, timeptr);
-#endif
+	const auto host_time = ToHostTm(*timeptr);
+	return std::strftime(str, count, format, &host_time);
 }
 
 static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
@@ -790,7 +808,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 
 } // namespace LibcInternal
 
-LIB_USING(LibC);
+namespace LibC {
 
 LIB_DEFINE(InitLibC_1) {
 	LibcInternal::InitLibcInternal_1(s);
@@ -816,5 +834,7 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 }
+
+} // namespace LibC
 
 } // namespace Libs

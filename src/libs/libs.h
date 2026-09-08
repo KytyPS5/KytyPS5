@@ -27,15 +27,6 @@
 	static constexpr int g_module_version_major = mv1;                                             \
 	static constexpr int g_module_version_minor = mv2;
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LIB_USING(n)                                                                               \
-	using n::g_library;                                                                            \
-	using n::g_library_version;                                                                    \
-	using n::g_module;                                                                             \
-	using n::g_module_version_major;                                                               \
-	using n::g_module_version_minor;
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LIB_LOAD(name) name(s)
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_ADD(n, f, t)                                                                           \
 	{                                                                                              \
 		Loader::SymbolResolve sr {};                                                               \

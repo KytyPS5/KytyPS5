@@ -24,10 +24,17 @@ static void PrintUsage() {
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
-	::printf(
-	    "  --game-patch <json>                  Validated patch plan to apply before entry.\n");
+	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
+	::printf(
+	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
+	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
+	         Config::DEFAULT_USER_ID);
+	::printf(
+	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Fifo.\n");
+	::printf(
+	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -103,6 +110,17 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = language;
+	return true;
+}
+
+static bool ParseUserId(const std::string& value, int32_t& out) {
+	int32_t user_id   = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), user_id);
+	if (error != std::errc {} || end != value.data() + value.size() ||
+	    !Config::IsConfiguredUserIdValid(user_id)) {
+		return false;
+	}
+	out = user_id;
 	return true;
 }
 
@@ -192,6 +210,25 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {
 			options.config.screen_height = static_cast<uint32_t>(Common::ToInt32(value));
+		} else if (arg == "--user-name") {
+			if (value.empty() || value.size() > Config::MAX_USER_NAME_LENGTH) {
+				::printf("invalid user name: must contain 1-%zu bytes\n",
+				         Config::MAX_USER_NAME_LENGTH);
+				return false;
+			}
+			options.config.user_name = value;
+		} else if (arg == "--user-id") {
+			if (!ParseUserId(value, options.config.user_id)) {
+				::printf("invalid user ID: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--present-mode") {
+			if (!ParseEnum(value, options.config.present_mode)) {
+				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu") {
+			options.config.gpu_index = Common::ToInt32(value);
 		} else if (arg == "--vblank-frequency") {
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =

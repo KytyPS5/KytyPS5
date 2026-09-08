@@ -3,6 +3,7 @@
 
 #include "common.h"
 
+#include <QObject>
 #include <QTreeWidgetItem>
 
 #include <memory>
@@ -14,7 +15,7 @@ class QTreeWidget;
 class QWidget;
 
 class Configuration;
-class ConfigurationItem: public QTreeWidgetItem {
+class ConfigurationItem: public QObject, public QTreeWidgetItem {
 public:
 	explicit ConfigurationItem(std::unique_ptr<Configuration> info, QTreeWidget* parent);
 	~ConfigurationItem() override;

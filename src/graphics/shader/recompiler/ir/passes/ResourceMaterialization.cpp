@@ -24,7 +24,32 @@ constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
 
 void SortUniqueOffsets(std::vector<uint32_t>& values) {
-	std::ranges::sort(values);
+	if (values.size() < 4096) {
+		std::ranges::sort(values);
+	} else {
+		// Large GPU index tables contain both repeated IDs and arbitrary integer
+		// bit patterns. Four byte passes give bounded linear sorting work.
+		std::vector<uint32_t> scratch(values.size());
+		auto*                 input  = &values;
+		auto*                 output = &scratch;
+		for (uint32_t shift = 0; shift < 32; shift += 8) {
+			std::array<size_t, 256> offsets {};
+			for (const auto word: *input)
+				++offsets[(word >> shift) & 255u];
+			if (std::ranges::any_of(offsets, [&](size_t count) { return count == input->size(); }))
+				continue;
+			size_t position = 0;
+			for (auto& count: offsets) {
+				const auto length = count;
+				count             = position;
+				position += length;
+			}
+			for (const auto word: *input)
+				(*output)[offsets[(word >> shift) & 255u]++] = word;
+			std::swap(input, output);
+		}
+		if (input != &values) values.swap(*input);
+	}
 	values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 

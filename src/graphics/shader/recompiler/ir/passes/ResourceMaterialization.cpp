@@ -85,6 +85,28 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
 	}
+	// DST_SEL encodings 2 and 3 are reserved. Speculative table candidates may
+	// point at non-image data and must not reach native image-view creation.
+	for (uint32_t channel = 0; channel < 4; ++channel) {
+		const auto select = (descriptor.dwords[3] >> (channel * 3u)) & 7u;
+		if (select == 2u || select == 3u) return false;
+	}
+	if (!r128) {
+		// RDNA2 ISA 8.2.6: word 4 has depth[12:0], pitch[13], and base_array[28:16].
+		// Reserved bits must be zero. Finite table enumeration can encounter adjacent
+		// non-image data; accepting its address bits here creates invalid host images.
+		if ((descriptor.dwords[4] & 0xe000c000u) != 0u ||
+		    (descriptor.dwords[6] & 0x00007800u) != 0u) {
+			return false;
+		}
+		const bool array = type == Prospero::ImageType::kColor1DArray ||
+		                   type == Prospero::ImageType::kColor2DArray ||
+		                   type == Prospero::ImageType::kColor2DMsaaArray ||
+		                   type == Prospero::ImageType::kCube;
+		if (array && ((descriptor.dwords[4] >> 16u) & 0x1fffu) > (descriptor.dwords[4] & 0x1fffu)) {
+			return false;
+		}
+	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
 	    type == Prospero::ImageType::kColor2DMsaaArray) {
 		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
@@ -93,7 +115,10 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
 		       (r128 || max_mip == fragments);
 	}
-	return true;
+	const auto base_level = (descriptor.dwords[3] >> 12u) & 15u;
+	const auto last_level = (descriptor.dwords[3] >> 16u) & 15u;
+	const auto max_mip    = (descriptor.dwords[5] >> 4u) & 15u;
+	return base_level <= last_level && (r128 || base_level <= max_mip);
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {

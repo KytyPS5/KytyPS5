@@ -241,9 +241,21 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 	});
 }
 
+uint32_t BufferSubwordOffset(EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), state.memory_byte_offsets[index],
+	              ConstantU32(state, 3u));
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		return BufferByteAddress(ctx, inst, mem);
+		const auto address =
+		    BufferByteAddress(ctx, inst, mem);
+		// The resource accessor adds the whole-word part of the binding offset.
+		// Preserve its low bytes here, before computing word indices and subword shifts.
+		return Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), address,
+		              BufferSubwordOffset(ctx.state, mem));
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
@@ -999,7 +1011,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
 		    const auto byte_address = Binary(state, spv::OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		                                     BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1),
+		                                                       ctx.Arg(inst, 2), ctx.Arg(inst, 3)),
+		                                     resource.byte_offset);
 		    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(
@@ -1140,9 +1154,11 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
 	auto& state        = ctx.state;
-	mem.kind           = IR::ResourceKind::ScalarBuffer;
-	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
-	                            ConstantU32(state, mem.offset));
+	mem.kind                    = IR::ResourceKind::ScalarBuffer;
+	const auto relative_address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+	                                     ConstantU32(state, mem.offset));
+	const auto address          = Binary(state, spv::OpIAdd, TypeU32(state), relative_address,
+	                                     BufferSubwordOffset(state, mem));
 	const auto index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 	const auto access    = PrepareMemoryResourceAccess(state, mem);

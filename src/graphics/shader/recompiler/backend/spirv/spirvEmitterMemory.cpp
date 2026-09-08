@@ -365,15 +365,14 @@ uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo
 	});
 }
 
-Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::Inst& inst,
-                                    const IR::MemoryInfo& mem) {
+Prospero::BufferFormat BufferFormat(const ValueEmitContext& ctx, const IR::MemoryInfo& mem) {
 	return mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
 	                 : StorageBufferFormat(ctx.state, mem);
 }
 
-IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, Prospero::BufferFormat format,
+IR::MemoryInfo RebaseFormattedComponent(IR::MemoryInfo mem, const Format::BufferFormatInfo& info,
                                         uint32_t component) {
-	mem.offset += Format::GetFormatComponentByteOffset(format, component);
+	mem.offset += Format::GetFormatComponentByteOffset(info, component);
 	mem.data_dwords     = 1u;
 	mem.component_index = component;
 	return mem;
@@ -414,7 +413,7 @@ uint32_t FormattedConstant(ValueEmitContext& ctx, const Format::BufferFormatInfo
 
 template <typename LoadWordFn, typename LoadSubwordFn>
 uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                Prospero::BufferFormat format, const Format::BufferFormatInfo& info,
+                                const Format::BufferFormatInfo& info,
                                 uint32_t output_component, LoadWordFn&& load_word,
                                 LoadSubwordFn&& load_subword) {
 	const auto source = ResolveFormattedSource(ctx, mem, info, output_component);
@@ -449,19 +448,18 @@ uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem
 uint32_t FormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
                                const IR::MemoryInfo& mem, uint32_t output_component,
                                const MemoryResourceAccess& resource) {
-	const auto format = BufferFormat(ctx, inst, mem);
-	if (!Format::IsKnownFormat(format)) {
+	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (info.type == Format::ComponentType::Unknown) {
 		return LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, output_component), resource);
 	}
-	const auto info = Format::GetFormatInfo(format);
 	return LoadFormattedComponent(
-	    ctx, mem, format, info, output_component,
+	    ctx, mem, info, output_component,
 	    [&](uint32_t component) {
-		    return LoadWordPrepared(ctx, inst, RebaseFormattedComponent(mem, format, component),
+		    return LoadWordPrepared(ctx, inst, RebaseFormattedComponent(mem, info, component),
 		                            resource);
 	    },
 	    [&](uint32_t component, uint32_t bits, bool sign_extend) {
-		    return LoadSubwordPrepared(ctx, inst, RebaseFormattedComponent(mem, format, component),
+		    return LoadSubwordPrepared(ctx, inst, RebaseFormattedComponent(mem, info, component),
 		                               resource, bits, sign_extend);
 	    });
 }
@@ -548,15 +546,14 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 void FormattedStorePrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                             uint32_t component, const MemoryResourceAccess& resource,
                             uint32_t data) {
-	const auto format = BufferFormat(ctx, inst, mem);
-	if (!Format::IsKnownFormat(format)) {
+	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (info.type == Format::ComponentType::Unknown) {
 		StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
 		return;
 	}
-	const auto info = Format::GetFormatInfo(format);
 	if (component >= info.component_count) return;
 	const auto bits          = info.component_bits[component];
-	const auto component_mem = RebaseFormattedComponent(mem, format, component);
+	const auto component_mem = RebaseFormattedComponent(mem, info, component);
 	if (bits == 8u || bits == 16u) {
 		StoreSubwordPrepared(ctx, inst, component_mem, resource, bits, data);
 	} else {
@@ -781,7 +778,6 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 }
 
 struct PreparedFormattedMemory {
-	Prospero::BufferFormat   format = Prospero::BufferFormat::kInvalid;
 	Format::BufferFormatInfo info;
 	MemoryResourceAccess     resource;
 	std::array<uint32_t, 4>  addresses {};
@@ -794,10 +790,10 @@ enum class FormattedAccess { Load, Store };
 PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::Inst& inst,
                                                const IR::MemoryInfo&       mem,
                                                const MemoryResourceAccess& resource,
+                                               const Format::BufferFormatInfo& info,
                                                uint32_t components, FormattedAccess access) {
 	PreparedFormattedMemory plan;
-	plan.format   = BufferFormat(ctx, inst, mem);
-	plan.info     = Format::GetFormatInfo(plan.format);
+	plan.info     = info;
 	plan.resource = resource;
 	std::array<bool, 4> required_components {};
 	if (access == FormattedAccess::Load) {
@@ -816,11 +812,11 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 	bool first_bound = true;
 	for (uint32_t component = 0; component < plan.info.component_count; component++) {
 		if (!required_components[component]) continue;
-		const auto byte_offset = Format::GetFormatComponentByteOffset(plan.format, component);
+		const auto byte_offset = Format::GetFormatComponentByteOffset(plan.info, component);
 		bool       reused      = false;
 		for (uint32_t previous = 0; previous < component; previous++) {
 			if (required_components[previous] &&
-			    Format::GetFormatComponentByteOffset(plan.format, previous) == byte_offset) {
+			    Format::GetFormatComponentByteOffset(plan.info, previous) == byte_offset) {
 				plan.addresses[component] = plan.addresses[previous];
 				plan.indices[component]   = plan.indices[previous];
 				reused                    = true;
@@ -828,7 +824,7 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 			}
 		}
 		if (reused) continue;
-		const auto component_mem  = RebaseFormattedComponent(mem, plan.format, component);
+		const auto component_mem  = RebaseFormattedComponent(mem, plan.info, component);
 		plan.addresses[component] = ByteAddress(ctx, inst, component_mem);
 		const auto raw_index      = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state),
 		                                   plan.addresses[component], ConstantU32(ctx.state, 2));
@@ -849,7 +845,7 @@ PreparedFormattedMemory PrepareFormattedMemory(ValueEmitContext& ctx, const IR::
 uint32_t LoadFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                const PreparedFormattedMemory& plan, uint32_t output_component) {
 	return LoadFormattedComponent(
-	    ctx, mem, plan.format, plan.info, output_component,
+	    ctx, mem, plan.info, output_component,
 	    [&](uint32_t component) {
 		    return LoadWordInBounds(ctx, plan.resource, plan.indices[component]);
 	    },
@@ -898,10 +894,10 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    const auto mem      = ctx.Memory(inst);
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
-		    const auto format =
-		        mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
-		    if (Format::IsKnownFormat(format)) {
-			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
+		    const auto info = Format::GetFormatInfo(
+		        mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+		    if (info.type != Format::ComponentType::Unknown) {
+			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                             FormattedAccess::Load);
 			    return EmitValueOrDefaultIfCondition(
 			        state, plan.in_bounds, TypeU32Composite(state, components),
@@ -928,10 +924,10 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		const auto mem       = ctx.Memory(inst);
 		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
-		const auto format =
-		    mem.formatted ? BufferFormat(ctx, inst, mem) : Prospero::BufferFormat::kInvalid;
-		if (Format::IsKnownFormat(format)) {
-			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, components,
+		const auto info = Format::GetFormatInfo(
+		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+		if (info.type != Format::ComponentType::Unknown) {
+			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                         FormattedAccess::Store);
 			EmitIfCondition(state, plan.in_bounds, [&]() {
 				for (uint32_t component = 0; component < components; component++) {

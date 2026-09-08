@@ -1116,14 +1116,23 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
-	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
-	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+	if ((mode & 1u) == 0u) {
 		return;
 	}
-	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	struct DispatchIndirectArgs {
+		uint32_t thread_group_x;
+		uint32_t thread_group_y;
+		uint32_t thread_group_z;
+	};
+
+	// Snapshot all dimensions after making GPU writes visible. A host pointer read
+	// only faults when its page is protected; it does not establish coherence for
+	// the entire argument range (which can also cross a page boundary).
+	DispatchIndirectArgs args {};
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &args, sizeof(args), true)) {
+		EXIT("cannot read indirect dispatch arguments at 0x%016" PRIx64 "\n", args_addr);
+	}
+	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {

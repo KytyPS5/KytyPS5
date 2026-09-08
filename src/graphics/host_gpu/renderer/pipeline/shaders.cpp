@@ -595,6 +595,15 @@ void CreatePipelineInternal(
 #if !defined(__APPLE__)
 	rasterizer.pNext = &clip_ext;
 #endif
+	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
+	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
+	                     !graphics.provoking_vertex_last_enabled);
+	if (graphics.provoking_vertex_last_enabled) {
+		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
+		    ? vk::ProvokingVertexModeEXT::eLastVertex : vk::ProvokingVertexModeEXT::eFirstVertex;
+		provoking_vertex.pNext = rasterizer.pNext;
+		rasterizer.pNext = &provoking_vertex;
+	}
 	rasterizer.cullMode  = cull_mode;
 	rasterizer.frontFace = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;

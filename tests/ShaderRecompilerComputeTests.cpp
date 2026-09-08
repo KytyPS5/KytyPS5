@@ -11534,7 +11534,8 @@ public:
       test.fragment_code.push_back(EncodeExp0(0x08, 0x1, false));
       test.fragment_code.push_back(EncodeExp1(1, 1, 1, 1));
     } else {
-      AppendVMovLiteral(&test.fragment_code, 0, 0x3f800000u);
+      test.pixel_interpolator_settings = {0x400u};
+      test.fragment_code.push_back(EncodeVintrp(0x02, 0, 0, 0, 2));
     }
     test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
     test.fragment_code.push_back(EncodeExp1(0, 0, 0, 0));
@@ -11583,8 +11584,8 @@ public:
     color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
     color.image_id = cache.FindImage(color.desc);
     std::array<float, 18> vertices{
-        -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 1, 1, 1, 1,
-        0.0f, 0.75f, 1, 1, 1, 1};
+        -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 0.5f, 1, 1, 1,
+        0.0f, 0.75f, 0.25f, 1, 1, 1};
     if (depth_feedback) {
       vertices = {-1, -1, 0, 0, 0, 1, 3, -1, 2, 0, 0, 1, -1, 3, 0, 2, 0, 1};
     }
@@ -11592,11 +11593,13 @@ public:
     std::memcpy(vertex_words.data(), vertices.data(), sizeof(vertices));
     auto buffer = CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
                                    vertex_words);
-    const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back) -> PipelineCache::Pipeline & {
+    const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back,
+                              bool provoking_last = false) -> PipelineCache::Pipeline & {
       HW::ModeControl mode{};
       mode.poly_mode = enabled;
       mode.polymode_front_ptype = front;
       mode.polymode_back_ptype = back;
+      mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
       return context.GetPipelineCache().CreateGraphicsPipeline(
           std::span{&color, 1u}, depth, vertex, scheduler.Current(), &pixel,
@@ -11686,6 +11689,19 @@ public:
                   line_pixels[interior] == 0 &&
                   std::ranges::any_of(line_pixels, [](u32 value) { return value == 0x3f800000u; }),
               "wireframe did not preserve triangle edges while leaving its interior empty");
+      auto &last_vertex = pipeline(true, 2, 2, true);
+      Require(name, "provoking vertex pipeline cache",
+              last_vertex.pipeline != filled.pipeline &&
+                  pipeline(true, 2, 2, true).pipeline == last_vertex.pipeline &&
+                  pipeline(true, 2, 2).pipeline == filled.pipeline,
+              "first and last provoking vertices did not keep distinct cached pipelines");
+      draw(last_vertex);
+      const auto last_pixels = read_color();
+      for (size_t i = 0; i < solid_pixels.size(); i++) {
+        Require(name, "flat provoking vertex output",
+                last_pixels[i] == (solid_pixels[i] == 0 ? 0 : 0x3e800000u),
+                "last-vertex flat shading changed coverage or did not use vertex two");
+      }
     }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
@@ -12997,6 +13013,7 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.attachment_feedback_loop_enabled = true;
+    m_runtime_context.provoking_vertex_last_enabled = true;
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr =
@@ -13109,9 +13126,11 @@ private:
     available_feedback_layout.pNext = &available_color_write;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
     available_feedback_dynamic.pNext = &available_feedback_layout;
+    vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
+    available_provoking_vertex.pNext = &available_feedback_dynamic;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_feedback_dynamic;
+    available_features2.pNext = &available_provoking_vertex;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -13143,7 +13162,8 @@ private:
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                available_feedback_dynamic.attachmentFeedbackLoopDynamicState,
+                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+                available_provoking_vertex.provokingVertexLast,
             "production rasterization features are not supported");
 
     float priority = 1.0f;
@@ -13191,7 +13211,10 @@ private:
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
     feedback_dynamic.pNext = &feedback_layout;
     feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-    device_info.pNext = &feedback_dynamic;
+    vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
+    provoking_vertex.pNext = &feedback_dynamic;
+    provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
+    device_info.pNext = &provoking_vertex;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -13207,7 +13230,8 @@ private:
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
         VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME};
+        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
+        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
     device_info.enabledExtensionCount = std::size(device_extensions);
     device_info.ppEnabledExtensionNames = device_extensions;
     RequireVk("VulkanHarness", "dispatch",

@@ -15,7 +15,6 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
-struct VulkanMemory;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -117,12 +116,6 @@ private:
 	    m_image_format_properties;
 };
 
-struct VulkanMemory {
-	vk::MemoryPropertyFlags property           = {};
-	vk::MemoryPropertyFlags preferred_property = {};
-	VmaAllocation           allocation         = nullptr;
-};
-
 struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
@@ -144,7 +137,7 @@ struct VulkanImage {
 	vk::Image                     image       = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
-	Graphics::VulkanMemory        memory;
+	VmaAllocation                allocation = nullptr;
 };
 
 

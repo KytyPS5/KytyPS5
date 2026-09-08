@@ -1762,6 +1762,73 @@ public:
     return Renderer();
   }
 
+  void CheckHostImageAllocation() {
+    constexpr const char *name = "HostImageAllocation";
+    auto &graphics = RuntimeContext();
+    VulkanImage image;
+    vk::ImageCreateInfo create{};
+    create.flags = vk::ImageCreateFlagBits::eMutableFormat;
+    create.imageType = vk::ImageType::e2D;
+    create.format = vk::Format::eR8G8B8A8Unorm;
+    create.extent = {16, 8, 1};
+    create.mipLevels = 3;
+    create.arrayLayers = 4;
+    create.samples = vk::SampleCountFlagBits::e1;
+    create.tiling = vk::ImageTiling::eOptimal;
+    create.usage = vk::ImageUsageFlagBits::eTransferSrc |
+                   vk::ImageUsageFlagBits::eTransferDst |
+                   vk::ImageUsageFlagBits::eSampled;
+    create.initialLayout = vk::ImageLayout::eUndefined;
+
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+      Require(name, "create", graphics.CreateImage(create, image),
+              "could not allocate native image");
+      Require(name, "allocation metadata",
+              image.image != nullptr && image.allocation != nullptr &&
+                  image.format == create.format &&
+                  image.image_type == create.imageType &&
+                  image.extent == create.extent &&
+                  image.layers == create.arrayLayers &&
+                  image.mip_levels == create.mipLevels &&
+                  image.samples == static_cast<uint32_t>(create.samples) &&
+                  image.usage == create.usage && image.flags == create.flags,
+              "native image metadata did not follow its creation descriptor");
+      Require(name, "fresh synchronization state",
+              image.state.layout == create.initialLayout &&
+                  image.state.access_mask == vk::AccessFlags2{} &&
+                  image.state.pl_stage == vk::PipelineStageFlagBits2::eAllCommands &&
+                  image.subresource_states.empty(),
+              "new allocation retained synchronization state from an old image");
+      VkMemoryPropertyFlags properties{};
+      vmaGetAllocationMemoryProperties(graphics.allocator, image.allocation,
+                                       &properties);
+      Require(name, "allocation policy",
+              (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+              "native image lost its device-local memory requirement");
+
+      // A reused presentation image may still describe its previous recording.
+      // No commands use this fixture; seed that bookkeeping before retirement.
+      image.state = {vk::PipelineStageFlagBits2::eTransfer,
+                     vk::AccessFlagBits2::eTransferWrite,
+                     vk::ImageLayout::eTransferDstOptimal};
+      image.subresource_states.assign(image.layers * image.mip_levels, image.state);
+      graphics.DeleteImage(image);
+      Require(name, "retirement",
+              image.image == nullptr && image.allocation == nullptr,
+              "retired native image retained an allocation handle");
+
+      create.flags = vk::ImageCreateFlagBits::e2DArrayCompatible;
+      create.imageType = vk::ImageType::e3D;
+      create.format = vk::Format::eR32Uint;
+      create.extent = {8, 4, 2};
+      create.mipLevels = 2;
+      create.arrayLayers = 1;
+      create.usage = vk::ImageUsageFlagBits::eTransferSrc |
+                     vk::ImageUsageFlagBits::eTransferDst;
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckDescriptorHeapLargeSet() {
     EnsureRuntimeContext();
     std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
@@ -28116,6 +28183,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSchedulerTimeline();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHostImageAllocation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
@@ -28428,6 +28500,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();

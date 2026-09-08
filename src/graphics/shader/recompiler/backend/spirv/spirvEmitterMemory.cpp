@@ -236,10 +236,21 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 	});
 }
 
+uint32_t BufferSubwordOffset(EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	return Binary(state, OpBitwiseAnd, TypeU32(state), state.memory_byte_offsets[index],
+	              ConstantU32(state, 3u));
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		return BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
-		                         ctx.Arg(inst, 3));
+		const auto address =
+		    BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3));
+		// The resource accessor adds the whole-word part of the binding offset.
+		// Preserve its low bytes here, before computing word indices and subword shifts.
+		return Binary(ctx.state, OpIAdd, TypeU32(ctx.state), address,
+		              BufferSubwordOffset(ctx.state, mem));
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
@@ -651,7 +662,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
 		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		                                     BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1),
+		                                                       ctx.Arg(inst, 2), ctx.Arg(inst, 3)),
+		                                     resource.byte_offset);
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(
@@ -1082,8 +1095,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ReadConstBuffer) {
 		auto mem = ctx.Memory(inst);
 		mem.kind = IR::ResourceKind::ScalarBuffer;
-		const auto address =
+		const auto relative_address =
 		    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
+		const auto address = Binary(state, OpIAdd, TypeU32(state), relative_address,
+		                            BufferSubwordOffset(state, mem));
 		const auto index =
 		    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 		const auto access    = PrepareMemoryResourceAccess(state, mem);

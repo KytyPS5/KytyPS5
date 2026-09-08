@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <functional>
 #include <span>
 #include <utility>
 
@@ -82,7 +83,9 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
+	explicit Tracker(Program& program, std::array<uint32_t, 3> local_size, uint32_t shared_bytes)
+	    : m_program(program), m_info(program.info), m_local_size(local_size),
+	      m_shared_bytes(shared_bytes) {
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -97,6 +100,7 @@ public:
 		if (!m_program.srt_plan_complete) {
 			Fail(0, "SRT plan is not ready");
 		}
+		ForwardPrivateSharedReads();
 		PlanIndirectImages();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -436,6 +440,150 @@ private:
 		});
 	}
 
+	void ForwardPrivateSharedReads() {
+		const uint64_t threads = uint64_t {m_local_size[0]} * m_local_size[1] * m_local_size[2];
+		if (m_program.stage != ShaderType::Compute || threads == 0 || threads > 1024 ||
+		    m_shared_bytes == 0 || m_program.dispatcher_fallback)
+			return;
+		using Terms  = std::array<uint64_t, 4>;
+		auto maximum = [&](const Terms& terms) {
+			uint64_t value = terms[0];
+			for (size_t axis = 0; axis < 3; ++axis)
+				value += terms[axis + 1] * (m_local_size[axis] - 1u);
+			return value;
+		};
+		std::function<std::optional<Terms>(Value, uint32_t)> affine =
+		    [&](Value value, uint32_t depth) -> std::optional<Terms> {
+			value = value.Resolve();
+			if (depth > 24 || value.GetType() != Type::U32) return {};
+			if (value.IsImmediate()) return Terms {value.U32(), 0, 0, 0};
+			const auto* inst = value.TryInstruction();
+			if (!inst) return {};
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::GetBuiltin &&
+			    inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)) &&
+			    inst->Arg(1).IsImmediate() && inst->Arg(1).U32() < 3) {
+				Terms terms {};
+				terms[inst->Arg(1).U32() + 1] = 1;
+				return terms;
+			}
+			if (op == ValueOpcode::BitFieldUExtract && inst->Arg(1).Resolve() == Value(0u)) {
+				const auto width = inst->Arg(2).Resolve();
+				auto       terms = affine(inst->Arg(0), depth + 1);
+				if (terms && width.IsImmediate() && width.U32() <= 32u &&
+				    maximum(*terms) < (uint64_t {1} << width.U32()))
+					return terms;
+				return {};
+			}
+			if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
+			    op != ValueOpcode::ShiftLeftLogical32)
+				return {};
+			auto lhs = affine(inst->Arg(0), depth + 1), rhs = affine(inst->Arg(1), depth + 1);
+			if (!lhs || !rhs) return {};
+			const auto constant = [](const Terms& terms) {
+				return terms[1] == 0 && terms[2] == 0 && terms[3] == 0;
+			};
+			if (op == ValueOpcode::IMul32 && !constant(*rhs) && constant(*lhs)) std::swap(lhs, rhs);
+			if (op != ValueOpcode::IAdd32 && !constant(*rhs)) return {};
+			if (op == ValueOpcode::ShiftLeftLogical32) {
+				if ((*rhs)[0] >= 32) return {};
+				(*rhs)[0] = uint64_t {1} << (*rhs)[0];
+			}
+			for (size_t i = 0; i < lhs->size(); ++i) {
+				(*lhs)[i] =
+				    op == ValueOpcode::IAdd32 ? (*lhs)[i] + (*rhs)[i] : (*lhs)[i] * (*rhs)[0];
+				if ((*lhs)[i] > UINT32_MAX) return {};
+			}
+			return maximum(*lhs) <= UINT32_MAX ? lhs : std::nullopt;
+		};
+		auto region = [&](const Inst& inst) -> std::optional<std::pair<uint32_t, uint32_t>> {
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) return {};
+			const auto& memory = m_program.memory_info[index];
+			const auto  terms  = affine(inst.Arg(0), 0);
+			if (!terms || memory.data_bits != 32 || memory.data_dwords != 1 ||
+			    memory.secondary_offset != 0)
+				return {};
+			uint32_t stride = 4;
+			for (size_t axis = 0; axis < 3; ++axis) {
+				if (m_local_size[axis] > 1 && (*terms)[axis + 1] != stride) return {};
+				stride *= m_local_size[axis];
+			}
+			const auto begin = (*terms)[0] + memory.offset;
+			const auto end   = begin + threads * 4u;
+			if (begin % 4 || end > m_shared_bytes) return {};
+			return std::pair {static_cast<uint32_t>(begin), static_cast<uint32_t>(end)};
+		};
+		struct Store {
+			Inst*                         inst;
+			Block*                        block;
+			std::pair<uint32_t, uint32_t> region;
+		};
+		std::vector<Store>                        stores;
+		std::unordered_map<const Inst*, uint32_t> positions;
+		for (auto* block: m_program.blocks) {
+			uint32_t position = 0;
+			for (auto& inst: *block) {
+				positions.emplace(&inst, position++);
+				const auto access = SharedAccessOf(inst.GetOpcode());
+				if (access == SharedAccess::None || access == SharedAccess::Read) continue;
+				if (inst.GetOpcode() != ValueOpcode::WriteSharedU32) return;
+				const auto span = region(inst);
+				if (!span) return;
+				stores.push_back({&inst, block, *span});
+			}
+		}
+		for (auto* block: m_program.blocks)
+			for (auto it = block->begin(); it != block->end(); ++it) {
+				auto& inst = *it;
+				if (inst.GetOpcode() != ValueOpcode::LoadSharedU32) continue;
+				const auto span = region(inst);
+				if (!span) continue;
+				const Store* writer = nullptr;
+				bool         unique = true;
+				for (const auto& store: stores) {
+					if (store.region.first >= span->second || store.region.second <= span->first)
+						continue;
+					if (writer || store.region != *span) {
+						unique = false;
+						break;
+					}
+					writer = &store;
+				}
+				if (!unique || !writer ||
+				    (writer->inst->Arg(2).Resolve() != inst.Arg(1).Resolve() &&
+				     writer->inst->Arg(2).Resolve() != Value(true)))
+					continue;
+				bool dominates = false;
+				if (writer->block == block) {
+					dominates = positions.at(writer->inst) < positions.at(&inst);
+				} else {
+					std::vector<Block*> pending {m_program.blocks.front()}, visited;
+					dominates = true;
+					while (!pending.empty()) {
+						auto* current = pending.back();
+						pending.pop_back();
+						if (current == writer->block ||
+						    std::ranges::find(visited, current) != visited.end())
+							continue;
+						if (current == block) {
+							dominates = false;
+							break;
+						}
+						visited.push_back(current);
+						for (auto* successor: current->ImmSuccessors())
+							pending.push_back(successor);
+					}
+				}
+				if (!dominates) continue;
+				// Every invocation owns one distinct word in this region, and the sole
+				// writer dominates the load. Preserve the masked load's zero result.
+				const auto replacement = block->PrependNewInst(
+				    it, ValueOpcode::SelectU32, {inst.Arg(1), writer->inst->Arg(1), Value(0u)});
+				inst.ReplaceUsesWith(Value(&*replacement));
+			}
+	}
+
 	void PlanIndirectImages() {
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -744,6 +892,8 @@ private:
 		}
 	}
 
+	std::array<uint32_t, 3> m_local_size;
+	uint32_t m_shared_bytes;
 	Program&                       m_program;
 	ShaderInfo                     m_info;
 	std::vector<DescriptorSource>  m_sources;
@@ -754,8 +904,8 @@ private:
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+void TrackResources(Program& program, std::array<uint32_t, 3> local_size, uint32_t shared_bytes) {
+	Tracker(program, local_size, shared_bytes).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -638,10 +638,8 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	}
 }
 
-template <typename Emit>
-uint32_t EmitIndirectImageValue(ValueEmitContext& ctx, const IR::Inst& inst,
-                                IR::Value image_arg, const IR::ImageResource& image,
-                                uint32_t result_type, Emit&& emit) {
+uint32_t EmitIndirectImageSelection(ValueEmitContext& ctx, const IR::Inst& inst,
+                                    IR::Value image_arg, const IR::ImageResource& image) {
 	auto& state = ctx.state;
 	const auto* handle = image_arg.ResolveInstruction();
 	const auto* source = image.source < ctx.program.descriptor_sources.size()
@@ -711,6 +709,18 @@ uint32_t EmitIndirectImageValue(ValueEmitContext& ctx, const IR::Inst& inst,
 		state.builder.AddFunction({OpSelect, TypeU32(state), next_high, take_lower, mid, high});
 		high = next_high;
 	}
+	return selected;
+}
+
+template <typename Emit>
+uint32_t EmitIndirectImageValue(ValueEmitContext& ctx, const IR::Inst& inst,
+                                IR::Value image_arg, const IR::ImageResource& image,
+                                uint32_t result_type, Emit&& emit) {
+	auto& state    = ctx.state;
+	const auto selected = EmitIndirectImageSelection(ctx, inst, image_arg, image);
+	if (selected == 0u) {
+		return 0u;
+	}
 
 	const auto default_label = state.builder.AllocateId();
 	const auto merge_label   = state.builder.AllocateId();
@@ -737,6 +747,37 @@ uint32_t EmitIndirectImageValue(ValueEmitContext& ctx, const IR::Inst& inst,
 	EmitLabel(state, merge_label);
 	state.builder.AddFunction(phi_words);
 	return phi_words[2];
+}
+
+template <typename Emit>
+void EmitIndirectImageAction(ValueEmitContext& ctx, const IR::Inst& inst,
+                             IR::Value image_arg, const IR::ImageResource& image,
+                             Emit&& emit) {
+	auto& state          = ctx.state;
+	const auto selected = EmitIndirectImageSelection(ctx, inst, image_arg, image);
+	if (selected == 0u) {
+		return;
+	}
+	const auto default_label = state.builder.AllocateId();
+	const auto merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
+	std::vector<uint32_t> switch_words {OpSwitch, selected, default_label};
+	for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); ++candidate) {
+		labels[candidate - 1u] = state.builder.AllocateId();
+		switch_words.push_back(candidate);
+		switch_words.push_back(labels[candidate - 1u]);
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction(switch_words);
+	EmitLabel(state, default_label);
+	emit(image.indirect_resources[0]);
+	state.builder.AddFunction({OpBranch, merge_label});
+	for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); ++candidate) {
+		EmitLabel(state, labels[candidate - 1u]);
+		emit(image.indirect_resources[candidate]);
+		state.builder.AddFunction({OpBranch, merge_label});
+	}
+	EmitLabel(state, merge_label);
 }
 
 } // namespace
@@ -830,15 +871,27 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageWrite) {
-		const auto dimension  = image.dimension;
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			const auto mip_lod =
-			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::DynamicStorage
-			        ? LodU32(ctx, mem, *address, dimension)
-			        : 0u;
-			const auto coord = CoordU32(ctx, mem, *address, dimension);
-			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), image.numeric_class);
-			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
+			const auto EmitWrite = [&](uint32_t resource) {
+				auto selected_mem            = mem;
+				selected_mem.resource         = resource;
+				const auto& selected_image    = state.program.info.images[resource];
+				selected_mem.image_dimension = selected_image.dimension;
+				const auto mip_lod = selected_image.mip_mode == IR::ImageMipMode::DynamicStorage
+				                         ? LodU32(ctx, selected_mem, *address,
+				                                  selected_image.dimension)
+				                         : 0u;
+				const auto coord =
+				    CoordU32(ctx, selected_mem, *address, selected_image.dimension);
+				const auto texel = StoreTexel(ctx, selected_mem, ctx.Arg(inst, 2),
+				                              selected_image.numeric_class);
+				EmitStorageImageWrite(state, resource, mip_lod, coord, texel);
+			};
+			if (image.indirect_root == mem.resource) {
+				EmitIndirectImageAction(ctx, inst, image_arg, image, EmitWrite);
+			} else {
+				EmitWrite(mem.resource);
+			}
 		});
 		return true;
 	}

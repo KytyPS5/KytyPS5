@@ -27877,6 +27877,111 @@ void CheckIndirectImageKeySwitch() {
           "mixed 2D/1D image key did not use a compact two-sample switch");
 }
 
+void CheckIndirectStorageImageWriteSwitch() {
+  constexpr const char *name = "IndirectStorageImageWriteSwitch";
+  constexpr uint32_t mapping_capacity = 1793u;
+  using namespace ShaderRecompiler::IR;
+
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = 0});
+
+  auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &image = block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(&key), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)});
+  image.SetFlags<uint32_t>(0u);
+  auto &address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  auto &data = block->AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+                                    {Value(1u), Value(2u), Value(3u), Value(4u)});
+  MemoryInfo memory{};
+  memory.kind = ResourceKind::Image;
+  memory.resource = 0;
+  memory.dmask = 0xf;
+  memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  memory.image_address_components = 2;
+  program.memory_info.push_back(memory);
+  const MemoryFlags memory_flags{0u, 0x78b8u};
+  uint64_t memory_flag_bits = 0;
+  std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
+  block->AppendNewInst(ValueOpcode::ImageWrite,
+                       {Value(&image), Value(&address), Value(&data), Value(true)},
+                       memory_flag_bits);
+
+  program.descriptor_sources.resize(1);
+  program.descriptor_sources[0].dword_count = 8;
+  program.descriptor_sources[0].indirect_image =
+      DescriptorSource::IndirectImage{0u, 0u, 224u, 12u, 0u};
+
+  ImageResource root{};
+  root.source = 0;
+  root.first_use_pc = 0x78b8u;
+  root.resource_class = ImageResourceClass::Storage;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
+  root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  root.shader_swizzle = DstSel(4, 1, 1, 1);
+  root.written = true;
+  root.indirect_root = 0;
+  root.indirect_mapping_offset = 0;
+  root.indirect_search_iterations = std::bit_width(mapping_capacity);
+  root.indirect_resources = {0u, 1u};
+  auto candidate = root;
+  candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+  candidate.shader_swizzle = DstSel(0, 0, 0, 0);
+  candidate.indirect_search_iterations = 0;
+  candidate.indirect_resources.clear();
+  program.info.images = {root, candidate};
+
+  AllocateBindings(program);
+  const auto root_binding = DescriptorBindingForImage(root);
+  const auto candidate_binding = DescriptorBindingForImage(candidate);
+  Require(name, "mixed binding layout",
+          root_binding.has_value() && candidate_binding.has_value() &&
+              FindBinding(program.bindings, *root_binding) != nullptr &&
+              FindBinding(program.bindings, *candidate_binding) != nullptr,
+          "mixed storage candidate bindings were not allocated");
+  ResourceSpecialization specialization;
+  for (const auto &resource : program.info.images) {
+    specialization.images.push_back(
+        {.numeric_class = resource.numeric_class,
+         .dimension = resource.dimension,
+         .mip_count = resource.mip_count,
+         .conversion_format = resource.conversion_format,
+         .shader_swizzle = resource.shader_swizzle,
+         .indirect_root = resource.indirect_root,
+         .indirect_mapping_offset = resource.indirect_mapping_offset,
+         .indirect_search_iterations = resource.indirect_search_iterations,
+         .indirect_sampler = resource.indirect_sampler,
+         .cube = resource.cube});
+  }
+  ShaderComputeInputInfo compute{};
+  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+  auto spirv = ShaderRecompiler::Spirv::EmitProgram(
+      program, {.compute = &compute}, {}, {}, specialization);
+  ValidateSpirv(name, spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect storage shader");
+  Require(name, "key switch",
+          text.find("OpSwitch") != std::string::npos &&
+              CountText(text, "OpImageWrite") == 2 &&
+              CountText(text, "OpIEqual") == 11,
+          "mixed 2D/1D storage key did not use a compact two-write switch");
+}
+
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -35276,6 +35381,7 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
     CheckIndirectImageKeySwitch();
+    CheckIndirectStorageImageWriteSwitch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
@@ -35364,6 +35470,7 @@ if (argc == 1) {
   CheckEmbeddedFetchLaneSpill();
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
+  CheckIndirectStorageImageWriteSwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckDescriptorHeapLargeSet();

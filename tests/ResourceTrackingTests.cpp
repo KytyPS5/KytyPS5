@@ -193,7 +193,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
-                         bool memory_backed_material = false) {
+                         bool memory_backed_material = false,
+                         bool storage_write = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -258,17 +259,25 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                       fixture->AddMemory(component, 0x10d8));
   }
   const auto image = fixture->Image(image_words, 0x10f0);
-  const auto sampler =
-      fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
-  const auto sampled_x =
-      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
-  fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  MemoryInfo access;
+  access.kind = ResourceKind::Image;
+  access.image_dimension = Decoder::ImageDimension::Dim2D;
+  if (storage_write) {
+    const auto data = fixture->Emit(ValueOpcode::CompositeConstructU32x4,
+                                    {Value(1u), Value(2u), Value(3u), Value(4u)});
+    fixture->Emit(ValueOpcode::ImageWrite,
+                  {image, fixture->ImageAddress(), data, Value(true)},
+                  fixture->AddMemory(access, 0x10f0));
+  } else {
+    const auto sampler =
+        fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
+    const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
+                                       {image, sampler, fixture->ImageAddress()},
+                                       fixture->AddMemory(access, 0x10f0));
+    const auto sampled_x =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  }
   return fixture;
 }
 
@@ -532,66 +541,84 @@ void TestHeterogeneousIndirectImageDimensions() {
 }
 
 void TestHeterogeneousIndirectImageViewSwizzles() {
-  auto fixture = MakeIndirectImageFixture(false);
-  fixture->PlanAndTrack();
+  for (const bool storage_write : {false, true}) {
+    auto fixture = MakeIndirectImageFixture(false, 0u, false, storage_write);
+    fixture->PlanAndTrack();
 
-  constexpr auto root_swizzle = Libs::Graphics::DstSel(4, 1, 1, 1);
-  fixture->program.info.images[0].shader_swizzle = root_swizzle;
-  fixture->program.info.images[0].indirect_root = 0u;
+    constexpr auto root_swizzle = Libs::Graphics::DstSel(4, 1, 1, 1);
+    fixture->program.info.images[0].shader_swizzle = root_swizzle;
+    fixture->program.info.images[0].indirect_root = 0u;
 
-  std::array<uint32_t, 8> direct_descriptor{};
-  direct_descriptor[0] = 0x40u;
-  direct_descriptor[1] = static_cast<uint32_t>(
-                             Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
-                         << 20u;
-  direct_descriptor[2] = 3u | (3u << 14u);
-  direct_descriptor[3] =
-      Libs::Graphics::DstSel(0, 0, 0, 0) |
-      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor1D)
-       << 28u);
-  DescriptorSource direct_source;
-  direct_source.dword_count = 8u;
-  for (uint32_t dword = 0; dword < direct_descriptor.size(); dword++) {
-    direct_source.dwords[dword] = Value(direct_descriptor[dword]);
+    std::array<uint32_t, 8> direct_descriptor{};
+    direct_descriptor[0] = 0x40u;
+    direct_descriptor[1] = static_cast<uint32_t>(
+                               Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                           << 20u;
+    direct_descriptor[2] = 3u | (3u << 14u);
+    direct_descriptor[3] =
+        Libs::Graphics::DstSel(0, 0, 0, 0) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor1D)
+         << 28u);
+    DescriptorSource direct_source;
+    direct_source.dword_count = 8u;
+    for (uint32_t dword = 0; dword < direct_descriptor.size(); dword++) {
+      direct_source.dwords[dword] = Value(direct_descriptor[dword]);
+    }
+    const auto direct_source_index =
+        static_cast<uint32_t>(fixture->program.descriptor_sources.size());
+    fixture->program.descriptor_sources.push_back(std::move(direct_source));
+
+    auto candidate = fixture->program.info.images[0];
+    candidate.source = direct_source_index;
+    candidate.dimension = Decoder::ImageDimension::Dim1D;
+    candidate.shader_swizzle = Libs::Graphics::DstSel(0, 0, 0, 0);
+    candidate.indirect_resources.clear();
+    fixture->program.info.images.push_back(candidate);
+
+    auto resource_plan = ExtractResourcePlan(fixture->program);
+    std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
+                                      16u << 16u, 4u,          0u, 7u};
+    LinearTestMemory memory;
+    auto table_descriptor = direct_descriptor;
+    table_descriptor[3] =
+        root_swizzle |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+         << 28u);
+    for (uint32_t dword = 0; dword < table_descriptor.size(); dword++) {
+      memory.words[(0x2000u - memory.base) / 4u + dword] = table_descriptor[dword];
+      memory.words[(0x2020u - memory.base) / 4u + dword] = direct_descriptor[dword];
+    }
+    memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+              specialization.images.size() >= 2u &&
+              specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
+              specialization.images[0].shader_swizzle == root_swizzle &&
+              specialization.images[1].dimension == Decoder::ImageDimension::Dim1D &&
+              specialization.images[1].shader_swizzle == Libs::Graphics::DstSel(0, 0, 0, 0),
+          storage_write ? "mixed storage image dimensions/swizzles were rejected"
+                        : "mixed sampled image-view swizzles were rejected");
+    if (storage_write) {
+      resource_plan.info.images[0].atomic = true;
+      resource_plan.info.images[1].atomic = true;
+      const auto atomic_format =
+          static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u;
+      resource_plan.descriptor_sources[direct_source_index].dwords[1] = Value(atomic_format);
+      memory.words[(0x2000u - memory.base) / 4u + 1u] = atomic_format;
+      memory.words[(0x2020u - memory.base) / 4u + 1u] = atomic_format;
+      const auto prior_snapshot = snapshot;
+      const auto prior_specialization = specialization;
+      Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+                SameResourceSnapshot(snapshot, prior_snapshot) &&
+                specialization == prior_specialization,
+            "heterogeneous atomic storage images were accepted or failed nontransactionally");
+    }
   }
-  const auto direct_source_index =
-      static_cast<uint32_t>(fixture->program.descriptor_sources.size());
-  fixture->program.descriptor_sources.push_back(std::move(direct_source));
-
-  auto candidate = fixture->program.info.images[0];
-  candidate.source = direct_source_index;
-  candidate.dimension = Decoder::ImageDimension::Dim1D;
-  candidate.shader_swizzle = Libs::Graphics::DstSel(0, 0, 0, 0);
-  candidate.indirect_resources.clear();
-  fixture->program.info.images.push_back(candidate);
-
-  const auto resource_plan = ExtractResourcePlan(fixture->program);
-  std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
-                                    16u << 16u, 4u,          0u, 7u};
-  LinearTestMemory memory;
-  auto table_descriptor = direct_descriptor;
-  table_descriptor[3] =
-      root_swizzle |
-      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
-       << 28u);
-  for (uint32_t dword = 0; dword < table_descriptor.size(); dword++) {
-    memory.words[(0x2000u - memory.base) / 4u + dword] = table_descriptor[dword];
-    memory.words[(0x2020u - memory.base) / 4u + dword] = direct_descriptor[dword];
-  }
-  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
-
-  SrtRuntime runtime{.user_data = user_data,
-                     .userdata = &memory,
-                     .read_specialization_memory = ReadLinearTestMemory};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
-            specialization.images.size() >= 2u &&
-            specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
-            specialization.images[0].shader_swizzle == root_swizzle &&
-            specialization.images[1].dimension == Decoder::ImageDimension::Dim1D &&
-            specialization.images[1].shader_swizzle == Libs::Graphics::DstSel(0, 0, 0, 0),
-        "mixed sampled image-view swizzles were rejected");
 }
 
 std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = false,

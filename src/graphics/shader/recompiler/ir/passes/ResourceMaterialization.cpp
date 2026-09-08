@@ -1638,6 +1638,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
 		const auto& image_class = next_specialization.images[exemplar];
+		const auto& root_info   = program.info.images[root_index];
 		for (uint32_t candidate = 0; candidate < next_specialization.images.size(); candidate++) {
 			auto& image = next_specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -1652,27 +1653,32 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				image.cube                       = image_class.cube;
 				image.needs_manual_depth_compare = image_class.needs_manual_depth_compare;
 			}
-			const bool heterogeneous_sampled_dimension =
+			const bool heterogeneous_storage_write =
+			    root_info.resource_class == ImageResourceClass::Storage && root_info.written &&
+			    !root_info.atomic;
+			const bool heterogeneous_dimension =
 			    image.dimension != image_class.dimension &&
-			    program.info.images[root_index].resource_class == ImageResourceClass::Sampled &&
-			    !program.info.images[root_index].depth_compare;
+			    ((root_info.resource_class == ImageResourceClass::Sampled &&
+			      !root_info.depth_compare) ||
+			     heterogeneous_storage_write);
 			// Ordinary sampled descriptors apply DstSel through each candidate's native
 			// image-view component mapping. Shader-converted and manual-comparison images
-			// instead consume shader_swizzle in SPIR-V and therefore still require one
-			// common permutation value.
-			const bool heterogeneous_sampled_view_swizzle =
+			// instead consume shader_swizzle in SPIR-V. Storage writes are emitted once per
+			// runtime candidate, so each branch applies its own inverse store swizzle.
+			const bool heterogeneous_view_swizzle =
 			    image.shader_swizzle != image_class.shader_swizzle &&
-			    program.info.images[root_index].resource_class == ImageResourceClass::Sampled &&
-			    !program.info.images[root_index].depth_compare &&
-			    image.conversion_format == Prospero::BufferFormat::kInvalid &&
-			    image_class.conversion_format == Prospero::BufferFormat::kInvalid &&
-			    !image.needs_manual_depth_compare && !image_class.needs_manual_depth_compare;
+			    ((root_info.resource_class == ImageResourceClass::Sampled &&
+			      !root_info.depth_compare &&
+			      image.conversion_format == Prospero::BufferFormat::kInvalid &&
+			      image_class.conversion_format == Prospero::BufferFormat::kInvalid &&
+			      !image.needs_manual_depth_compare && !image_class.needs_manual_depth_compare) ||
+			     heterogeneous_storage_write);
 			if (image.numeric_class != image_class.numeric_class ||
-			    (image.dimension != image_class.dimension && !heterogeneous_sampled_dimension) ||
+			    (image.dimension != image_class.dimension && !heterogeneous_dimension) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (image.shader_swizzle != image_class.shader_swizzle &&
-			     !heterogeneous_sampled_view_swizzle) ||
+			     !heterogeneous_view_swizzle) ||
 			    image.cube != image_class.cube ||
 			    image.needs_manual_depth_compare != image_class.needs_manual_depth_compare) {
 				return SpecializationFail(

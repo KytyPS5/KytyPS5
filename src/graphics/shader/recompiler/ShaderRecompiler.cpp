@@ -535,7 +535,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;
-	if (options.stage == ShaderType::Mesh) {
+	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
 	} else {
 		Decoder::DecodeProgram(code, decoded);

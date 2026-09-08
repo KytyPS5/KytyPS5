@@ -9117,6 +9117,8 @@ void TestMeshExportStorage() {
       EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
       EncodeSopp(0x01),
   };
+  std::vector<uint32_t> monolithic(std::begin(front), std::begin(front) + 2);
+  monolithic.insert(monolithic.end(), std::begin(back), std::end(back));
   ShaderVertexInputInfo input{};
   input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 18u);
   auto &mesh = input.mesh;
@@ -9136,16 +9138,23 @@ void TestMeshExportStorage() {
   ShaderRecompiler::CompileOptions options{};
   options.stage = ShaderType::Mesh;
   options.input_info.vertex = &input;
-  options.back_code = back;
   options.user_data = user_data;
-  for (const auto [subgroup_size, push_data_start] :
-       {std::pair{32u, PushData::MeshDrawDwordCount},
-        std::pair{64u, PushData::MeshDrawDwordCount},
-        std::pair{32u, PushData::DwordCount},
-        std::pair{64u, PushData::DwordCount}}) {
+  struct Case {
+    uint32_t subgroup_size, push_data_start;
+    bool split;
+  };
+  const Case cases[] = {
+      {32u, PushData::MeshDrawDwordCount, true}, {64u, PushData::MeshDrawDwordCount, true},
+      {32u, PushData::DwordCount, true}, {64u, PushData::DwordCount, true},
+      {32u, PushData::MeshDrawDwordCount, false}, {64u, PushData::MeshDrawDwordCount, false},
+      {32u, PushData::DwordCount, false}, {64u, PushData::DwordCount, false},
+  };
+  for (const auto [subgroup_size, push_data_start, split] : cases) {
     mesh.host_subgroup_size = subgroup_size;
-    const auto result =
-        RecompileForTest(front, options, nullptr, nullptr, push_data_start);
+    options.back_code = split ? std::span{back} : std::span<const uint32_t>{};
+    const auto result = RecompileForTest(
+        split ? std::span{front} : std::span<const uint32_t>{monolithic},
+        options, nullptr, nullptr, push_data_start);
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
     Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
@@ -9232,9 +9241,13 @@ void TestMergedShaderUserDataSnapshot() {
   const std::array<uint32_t, 4> front_data = {regs.gs_user_sgpr.value[0],
       regs.gs_user_sgpr.value[1], regs.gs_user_sgpr.value[2], regs.gs_user_sgpr.value[3]};
   ShaderMappedData mapped{};
+  mapped.type = Prospero::ShaderBinaryType::kGsFront;
   mapped.code_size_bytes = sizeof(front);
+  mapped.scratch_size_dwords = 3;
   ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  mapped.type = Prospero::ShaderBinaryType::kGsBack;
   mapped.code_size_bytes = sizeof(back);
+  mapped.scratch_size_dwords = 7;
   ShaderMapUserData(regs.gs_regs.data_addr, mapped);
   HW::Context context;
   context.SetShaderStages(0x20);
@@ -9255,8 +9268,9 @@ void TestMergedShaderUserDataSnapshot() {
             second.user_data[8] == front_data[0] + 1,
         "merged shader parameters did not snapshot ordinary user SGPRs at s8");
   Check(first.hash == second.hash &&
-            MakeStageStaticKey(first_input) == MakeStageStaticKey(second_input),
-        "a dynamic merged-shader user-data pointer changed shader identity");
+            MakeStageStaticKey(first_input) == MakeStageStaticKey(second_input) &&
+            first_input.mesh.scratch_size_dwords == 7,
+        "merged shader identity or maximum scratch size changed with dynamic user data");
   CompileOptions options{};
   options.stage = ShaderType::Mesh;
   options.user_data_base = 0;
@@ -9280,6 +9294,25 @@ void TestMergedShaderUserDataSnapshot() {
                          front_descriptor.dwords.begin()) &&
               std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
           "merged shader resource plan did not follow the current s0:s1 pointer and s8 data");
+  }
+  const uint32_t monolithic[] = {
+      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 1), EncodeSopp(0x01),
+  };
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(monolithic);
+  mapped.type = Prospero::ShaderBinaryType::kGs;
+  mapped.code_size_bytes = sizeof(monolithic);
+  mapped.scratch_size_dwords = 3;
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  for (const auto back_address : {regs.gs_regs.data_addr, uint64_t{0}}) {
+    regs.gs_regs.data_addr = back_address;
+    ShaderVertexInputInfo input{};
+    const auto params = PrepareProgram(regs, context, user_config, input);
+    Check(params.back_code.empty() && params.hash == XXH3_64bits(monolithic, sizeof(monolithic)) &&
+              input.mesh.scratch_size_dwords == 3 && params.user_data.size() == 12 &&
+              params.user_data[0] == 0 && params.user_data[1] == 0 &&
+              std::equal(second.user_data.begin() + 8, second.user_data.end(),
+                         params.user_data.begin() + 8),
+          "monolithic NGG shader used stale GS-back state or lost its s8 user data");
   }
 }
 
@@ -9418,6 +9451,14 @@ void TestMeshInputAssembly() {
        0x40000305, 1, 2, 3, 0, 15, false},
       {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
        0x40000305, 2, 1, 3, 0, 12, false},
+      {Prospero::PrimitiveType::kLineList, 5, 17, 3, 0, 0, 0, 11,
+       0x40000204, 0, 1, 0, 0, 23, false},
+      {Prospero::PrimitiveType::kLineList, 6, 17, 2, 4, 2, 0x1002, 11,
+       0x40000205, 8, 9, 0, 32, 0xabd8, true},
+      {Prospero::PrimitiveType::kLineList, 6, 17, 2, 5, 2, 0x1002, 0,
+       0x40000205, 10, 11, 0, 36, 0, false},
+      {Prospero::PrimitiveType::kLineList, 8, 180, 1, 64, 4, 0x1000, 0,
+       0x41000000, 128, 129, 0, 288, 0, false},
       {Prospero::PrimitiveType::kPointList, 12, 265, 22, 0, 2, 0x1002, 0,
        0x40000101, 0, 0, 0, 528, 0xabcd, true},
       {Prospero::PrimitiveType::kPointList, 12, 265, 22, 1, 2, 0x1002, 0,

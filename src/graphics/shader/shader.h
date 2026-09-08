@@ -80,10 +80,15 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t provoking_vertex     = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
-		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kPointList) ? 1u : 3u;
+		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
+			case Prospero::PrimitiveType::kPointList: return 1u;
+			case Prospero::PrimitiveType::kLineList: return 2u;
+			default: return 3u;
+		}
 	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveStep() const {
-		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriList) ? 3u : 1u;
+		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
+		           ? 1u : InputPrimitiveSize();
 	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveCount(uint32_t vertices) const {
 		const auto size = InputPrimitiveSize();
@@ -257,6 +262,7 @@ struct Shader {
 };
 
 struct ShaderMappedData {
+	Prospero::ShaderBinaryType type {};
 	ShaderUserData* user_data           = nullptr;
 	ShaderSemantic* input_semantics     = nullptr;
 	uint32_t        num_input_semantics = 0;

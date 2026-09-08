@@ -1109,7 +1109,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                        : u32(0);
 			const auto vertex = entry_ir.IMul(local, step);
 			const auto first  = entry_ir.IAdd(vertex, parity);
-			const auto second = mesh.InputPrimitiveSize() == 3u
+			const auto second = mesh.InputPrimitiveSize() >= 2u
 			                        ? entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity)
 			                        : u32(0);
 			const auto third = mesh.InputPrimitiveSize() == 3u

@@ -70,6 +70,8 @@ bool ShouldOptimizeShaderSpirvForTest(
 bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view git_hash, std::string_view git_revision,
     std::string_view worktree_fingerprint);
+bool IsDriverCacheSignatureCompatibleForTest(
+    std::string_view cached_signature, std::string_view expected_signature);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -147,6 +149,31 @@ void TestDriverPipelineCacheBuildIdentity() {
             !IsDriverCacheBuildIdentityUsableForTest(
                 "0123456-dirty", revision, "1234"),
         "driver cache accepted an incomplete build identity");
+}
+
+void TestDriverPipelineCacheRevisionCompatibility() {
+  constexpr std::string_view previous =
+      "KytyPC2:672af1f8c904418b8f592a0264b03bd845d48a3d:"
+      "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  constexpr std::string_view current =
+      "KytyPC2:9cb2a3e7e44b03880b17ee5ee618490ecb97c948:"
+      "a1279f6931abb9286c22cc53f97090a59e4cd093f6a072300e8b0b73c51a774e:"
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  constexpr std::string_view other_driver =
+      "KytyPC2:672af1f8c904418b8f592a0264b03bd845d48a3d:"
+      "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
+      "000010de:00002d04:9a200000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  constexpr std::string_view malformed_build =
+      "KytyPC2:not-a-revision:"
+      "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  Check(IsDriverCacheSignatureCompatibleForTest(previous, current),
+        "a same-driver pipeline cache from the previous emulator revision was rejected");
+  Check(!IsDriverCacheSignatureCompatibleForTest(other_driver, current),
+        "a pipeline cache from a different driver was accepted");
+  Check(!IsDriverCacheSignatureCompatibleForTest(malformed_build, current),
+        "a pipeline cache with malformed build identity was accepted");
 }
 
 void TestVideoOutVrrStatusLibraryContract() {
@@ -15498,7 +15525,15 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--pipeline-cache-revision-only") == 0) {
+    TestDriverPipelineCacheRevisionCompatibility();
+    std::puts("KYTY_PIPELINE_CACHE_REVISION_PASS");
+    return 0;
+  }
+
   EnsureConfigInitialized();
+  TestDriverPipelineCacheRevisionCompatibility();
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();

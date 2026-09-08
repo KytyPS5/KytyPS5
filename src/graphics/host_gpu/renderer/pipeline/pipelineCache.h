@@ -264,6 +264,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
                                              std::string_view git_revision,
                                              std::string_view worktree_fingerprint);
+bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
+                                             std::string_view expected_signature);
 
 } // namespace Libs::Graphics
 

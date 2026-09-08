@@ -61,6 +61,53 @@ bool IsDriverCacheBuildIdentityUsable(std::string_view git_hash,
 	       IsLowerHex(worktree_fingerprint, 64);
 }
 
+bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
+                                      std::string_view expected_signature) {
+	if (cached_signature == expected_signature) {
+		return true;
+	}
+
+	// Vulkan keys cached entries by the full pipeline state. Keep the build fields for
+	// provenance, but do not discard valid driver data merely because Kyty changed.
+	const auto implementation_identity = [](std::string_view signature)
+	    -> std::optional<std::string_view> {
+		constexpr std::string_view prefix = "KytyPC2:";
+		if (!signature.starts_with(prefix) || !signature.ends_with('\n')) {
+			return std::nullopt;
+		}
+		const auto revision_end = signature.find(':', prefix.size());
+		if (revision_end == std::string_view::npos ||
+		    !IsLowerHex(signature.substr(prefix.size(), revision_end - prefix.size()), 40)) {
+			return std::nullopt;
+		}
+		const auto fingerprint_begin = revision_end + 1;
+		const auto fingerprint_end   = signature.find(':', fingerprint_begin);
+		if (fingerprint_end == std::string_view::npos ||
+		    !IsLowerHex(signature.substr(fingerprint_begin,
+		                                 fingerprint_end - fingerprint_begin),
+		                64)) {
+			return std::nullopt;
+		}
+
+		const auto identity = signature.substr(fingerprint_end + 1);
+		constexpr size_t identity_size = 8 + 1 + 8 + 1 + 8 + 1 + 32 + 1;
+		if (identity.size() != identity_size || identity[8] != ':' ||
+		    identity[17] != ':' || identity[26] != ':' || identity.back() != '\n' ||
+		    !IsLowerHex(identity.substr(0, 8), 8) ||
+		    !IsLowerHex(identity.substr(9, 8), 8) ||
+		    !IsLowerHex(identity.substr(18, 8), 8) ||
+		    !IsLowerHex(identity.substr(27, 32), 32)) {
+			return std::nullopt;
+		}
+		return identity;
+	};
+
+	const auto cached_identity   = implementation_identity(cached_signature);
+	const auto expected_identity = implementation_identity(expected_signature);
+	return cached_identity.has_value() && expected_identity.has_value() &&
+	       *cached_identity == *expected_identity;
+}
+
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -690,6 +737,11 @@ bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
 	return IsDriverCacheBuildIdentityUsable(git_hash, git_revision, worktree_fingerprint);
 }
 
+bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
+                                             std::string_view expected_signature) {
+	return IsDriverCacheSignatureCompatible(cached_signature, expected_signature);
+}
+
 void PipelineCache::InitializeDriverCache() {
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
@@ -735,11 +787,12 @@ void PipelineCache::InitializeDriverCache() {
 			          &payload_read);
 			file.Close();
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
+			    payload_read != initial_data.size() ||
+			    !IsDriverCacheSignatureCompatible(cached_signature, signature) ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+				    "Vulkan pipeline cache: invalidating {} (driver, format, or data mismatch)",
 				    path);
 			}
 		} else {

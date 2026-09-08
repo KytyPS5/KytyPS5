@@ -489,6 +489,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> flat_slots;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -550,6 +551,7 @@ struct ResourcePlan {
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable uint32_t                       evaluation_depth       = 0;
 	mutable std::vector<uint8_t>            active_sources;
+	mutable std::vector<uint8_t>            active_flat_slots;
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;

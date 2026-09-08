@@ -1464,8 +1464,28 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
 				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				    fmt::format(
+				        "indirect image table at pc 0x{:08x} has incompatible candidates: "
+				        "exemplar={} candidate={} numeric={}/{} dimension={}/{} mip_count={}/{} "
+				        "conversion={}/{} swizzle=0x{:08x}/0x{:08x} cube={}/{} manual_compare={}/{} "
+				        "descriptor=[{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}]",
+				        program.info.images[root_index].first_use_pc, exemplar, candidate,
+				        static_cast<uint32_t>(image_class.numeric_class),
+				        static_cast<uint32_t>(image.numeric_class),
+				        static_cast<uint32_t>(image_class.dimension),
+				        static_cast<uint32_t>(image.dimension), image_class.mip_count, image.mip_count,
+				        static_cast<uint32_t>(image_class.conversion_format),
+				        static_cast<uint32_t>(image.conversion_format), image_class.shader_swizzle,
+				        image.shader_swizzle, image_class.cube, image.cube,
+				        image_class.needs_manual_depth_compare, image.needs_manual_depth_compare,
+				        next_snapshot.images[candidate].dwords[0],
+				        next_snapshot.images[candidate].dwords[1],
+				        next_snapshot.images[candidate].dwords[2],
+				        next_snapshot.images[candidate].dwords[3],
+				        next_snapshot.images[candidate].dwords[4],
+				        next_snapshot.images[candidate].dwords[5],
+				        next_snapshot.images[candidate].dwords[6],
+				        next_snapshot.images[candidate].dwords[7]));
 			}
 		}
 	}

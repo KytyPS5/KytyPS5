@@ -33973,6 +33973,7 @@ void CheckIndirectImageKeySwitch() {
 	root.indirect_search_iterations = std::bit_width(mapping_capacity);
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
+	candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
 	candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
@@ -33980,6 +33981,28 @@ void CheckIndirectImageKeySwitch() {
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
   AllocateBindings(program);
+  const auto root_binding = DescriptorBindingForImage(root);
+  const auto candidate_binding = DescriptorBindingForImage(candidate);
+  Require(name, "mixed binding layout",
+          root_binding.has_value() && candidate_binding.has_value() &&
+              FindBinding(program.bindings, *root_binding) != nullptr &&
+              FindBinding(program.bindings, *candidate_binding) != nullptr,
+          "mixed 2D/1D candidate bindings were not allocated");
+  ResourceSpecialization specialization;
+  for (const auto &resource : program.info.images) {
+    specialization.images.push_back(
+        {.numeric_class = resource.numeric_class,
+         .dimension = resource.dimension,
+         .mip_count = resource.mip_count,
+         .conversion_format = resource.conversion_format,
+         .shader_swizzle = resource.shader_swizzle,
+         .indirect_root = resource.indirect_root,
+         .indirect_mapping_offset = resource.indirect_mapping_offset,
+         .indirect_search_iterations = resource.indirect_search_iterations,
+         .indirect_sampler = resource.indirect_sampler,
+         .cube = resource.cube});
+  }
+  specialization.sampler_depth_compare_funcs.push_back(0u);
   ShaderComputeInputInfo compute{};
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     {.compute = &compute});

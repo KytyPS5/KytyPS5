@@ -4714,6 +4714,11 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--heterogeneous-indirect-images-only") == 0) {
+      TestHeterogeneousIndirectImageDimensions();
+      std::cout << "KYTY_HETEROGENEOUS_INDIRECT_IMAGES_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--dispatcher-signed-buffer-loop-only") == 0) {
       TestDispatcherSignedBufferLoop();
       std::cout << "KYTY_DISPATCHER_SIGNED_BUFFER_LOOP_PASS\n";

@@ -694,8 +694,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto  dimension      = image.dimension;
-		const auto& dimension_info = ImageDimensionInfoFor(dimension);
 		const auto  numeric_class  = image.numeric_class;
 		const auto  condition      = ctx.Arg(inst, 2);
 		const auto  result_type    = ImageVectorType(state, numeric_class, 4);

@@ -198,7 +198,7 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
-	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
+	constexpr uint32_t field1_reserved_mask = 0x20000000u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
@@ -207,6 +207,7 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                     (static_cast<uint32_t>(descriptor.MinLodWarn5()) << 8u) |
 	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
 	const bool         common          = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	                                     (descriptor.fields[2] & field2_reserved_mask) == 0 &&
@@ -490,6 +491,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
+	if (!storage) view.min_lod = static_cast<float>(view.base_level) + descriptor.MinLod() / 256.0f;
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid

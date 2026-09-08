@@ -101,6 +101,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		ForwardPrivateSharedReads();
+		FindSharedIndexRanges();
 		PlanIndirectImages();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -108,6 +109,13 @@ public:
 			}
 		}
 		LinkImageAliases();
+		for (const auto& [handle, source]: m_indirect_buffers) {
+			const auto& descriptor = m_sources[source];
+			handle->SetArg(0, descriptor.indirect_buffer->byte_offset);
+			handle->SetArg(1, descriptor.dwords[0]);
+			handle->SetArg(2, descriptor.dwords[1]);
+			handle->SetArg(3, Value(0u));
+		}
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -210,7 +218,8 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image != descriptor.indirect_image) {
+			    current.indirect_image != descriptor.indirect_image ||
+			    current.indirect_buffer != descriptor.indirect_buffer) {
 				continue;
 			}
 			bool same = true;
@@ -440,6 +449,85 @@ private:
 		});
 	}
 
+	void PlanIndirectImages() {
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+				    inst.NumArgs() == 0u) {
+					continue;
+				}
+				auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || FindIndirectImage(*handle) != nullptr) {
+					continue;
+				}
+				IndirectImagePlan plan;
+				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeDirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+					m_indirect_images.push_back(std::move(plan));
+				}
+			}
+		}
+	}
+
+	bool PredicateContains(Value predicate, bool truth, const Inst* comparison,
+	                       uint32_t depth = 0) const {
+		const auto* inst = predicate.Resolve().TryInstruction();
+		if (inst == comparison) {
+			return truth;
+		}
+		if (inst == nullptr || depth >= 64) {
+			return false;
+		}
+		if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+			return PredicateContains(inst->Arg(0), !truth, comparison, depth + 1);
+		}
+		if ((truth && inst->GetOpcode() == ValueOpcode::LogicalAnd) ||
+		    (!truth && inst->GetOpcode() == ValueOpcode::LogicalOr)) {
+			return PredicateContains(inst->Arg(0), truth, comparison, depth + 1) ||
+			       PredicateContains(inst->Arg(1), truth, comparison, depth + 1);
+		}
+		return false;
+	}
+
+	bool EdgeGuards(uint32_t from, uint32_t to, uint32_t pc) const {
+		if (m_program.block_info.empty()) {
+			return false;
+		}
+		std::vector<uint32_t> pending {m_program.block_info[0].id};
+		std::vector<uint32_t> visited;
+		while (!pending.empty()) {
+			const auto id = pending.back();
+			pending.pop_back();
+			if (std::ranges::find(visited, id) != visited.end()) {
+				continue;
+			}
+			visited.push_back(id);
+			const auto block = std::ranges::find(m_program.block_info, id, &BlockInfo::id);
+			if (block == m_program.block_info.end()) {
+				return false;
+			}
+			if (pc >= block->start_pc && pc < block->end_pc) {
+				return false;
+			}
+			const auto Add = [&](uint32_t next) {
+				if (next != UINT32_MAX && !(id == from && next == to)) {
+					pending.push_back(next);
+				}
+			};
+			const auto& term = block->terminator;
+			if (term.kind == CFG::TerminatorKind::Branch ||
+			    term.kind == CFG::TerminatorKind::ConditionalBranch) {
+				Add(term.true_block);
+				if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+					Add(term.false_block);
+				}
+			} else if (term.kind != CFG::TerminatorKind::Return) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	void ForwardPrivateSharedReads() {
 		const uint64_t threads = uint64_t {m_local_size[0]} * m_local_size[1] * m_local_size[2];
 		if (m_program.stage != ShaderType::Compute || threads == 0 || threads > 1024 ||
@@ -584,23 +672,518 @@ private:
 			}
 	}
 
-	void PlanIndirectImages() {
-		for (auto* block: m_program.blocks) {
+	void FindSharedIndexRanges() {
+		// Recognize append lists built from a strided traversal of input indices.
+		// Prove every writer and the consumer's counter guard before narrowing LDS
+		// values; runtime capacity checks keep the arrays and counters disjoint.
+		const uint64_t threads = uint64_t {m_local_size[0]} * m_local_size[1] * m_local_size[2];
+		if (m_program.stage != ShaderType::Compute || threads == 0 || threads > 1024 ||
+		    m_shared_bytes == 0 || m_program.dispatcher_fallback)
+			return;
+		std::unordered_map<const Inst*, Block*> owners;
+		for (auto* block: m_program.blocks)
+			for (const auto& inst: *block)
+				owners.emplace(&inst, block);
+		auto selected = [](Value value, Value predicate) {
+			for (uint32_t depth = 0; depth < 32; ++depth) {
+				value            = value.Resolve();
+				const auto* inst = value.TryInstruction();
+				if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
+				    inst->Arg(0).Resolve() != predicate.Resolve())
+					break;
+				value = inst->Arg(1);
+			}
+			return value.Resolve();
+		};
+		using Coefficients = std::array<uint64_t, 4>;
+		std::function<std::optional<Coefficients>(Value, uint32_t)> linear =
+		    [&](Value value, uint32_t depth) -> std::optional<Coefficients> {
+			value = value.Resolve();
+			if (depth > 16 || value.GetType() != Type::U32) return {};
+			if (value.IsImmediate()) return Coefficients {value.U32(), 0, 0, 0};
+			const auto* inst = value.TryInstruction();
+			if (!inst) return {};
+			if (inst->GetOpcode() == ValueOpcode::GetBuiltin &&
+			    inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)) &&
+			    inst->Arg(1).IsImmediate() && inst->Arg(1).U32() < 3) {
+				Coefficients result {};
+				result[inst->Arg(1).U32() + 1] = 1;
+				return result;
+			}
+			const auto op = inst->GetOpcode();
+			if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
+			    op != ValueOpcode::ShiftLeftLogical32)
+				return {};
+			auto lhs = linear(inst->Arg(0), depth + 1), rhs = linear(inst->Arg(1), depth + 1);
+			if (!lhs || !rhs) return {};
+			if (op != ValueOpcode::IAdd32) {
+				if ((*rhs)[1] || (*rhs)[2] || (*rhs)[3]) return {};
+				if (op == ValueOpcode::ShiftLeftLogical32) {
+					if ((*rhs)[0] >= 32) return {};
+					(*rhs)[0] = uint64_t {1} << (*rhs)[0];
+				}
+			}
+			for (size_t i = 0; i < lhs->size(); ++i) {
+				(*lhs)[i] =
+				    op == ValueOpcode::IAdd32 ? (*lhs)[i] + (*rhs)[i] : (*lhs)[i] * (*rhs)[0];
+				if ((*lhs)[i] > UINT32_MAX) return {};
+			}
+			return lhs;
+		};
+		auto local_index = [&](Value value) {
+			const auto terms = linear(value, 0);
+			if (!terms || (*terms)[0]) return false;
+			uint32_t stride = 1;
+			for (size_t axis = 0; axis < 3; ++axis) {
+				if (m_local_size[axis] > 1 && (*terms)[axis + 1] != stride) return false;
+				stride *= m_local_size[axis];
+			}
+			return true;
+		};
+		std::function<Value(Value, Value, bool, uint32_t)> guarded_bound =
+		    [&](Value index, Value predicate, bool truth, uint32_t depth) -> Value {
+			const auto* inst = predicate.Resolve().TryInstruction();
+			if (!inst || depth > 32) return {};
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::LogicalNot)
+				return guarded_bound(index, inst->Arg(0), !truth, depth + 1);
+			if ((truth && op == ValueOpcode::LogicalAnd) ||
+			    (!truth && op == ValueOpcode::LogicalOr)) {
+				auto bound = guarded_bound(index, inst->Arg(0), truth, depth + 1);
+				return bound.IsEmpty() ? guarded_bound(index, inst->Arg(1), truth, depth + 1)
+				                       : bound;
+			}
+			Value bound;
+			if (truth && op == ValueOpcode::ULessThan32 &&
+			    inst->Arg(0).Resolve() == index.Resolve())
+				bound = inst->Arg(1);
+			if (!truth && op == ValueOpcode::ULessThanEqual32 &&
+			    inst->Arg(1).Resolve() == index.Resolve())
+				bound = inst->Arg(0);
+			return !bound.IsEmpty() && ValidateRuntimeValue(m_program, bound) ? bound.Resolve()
+			                                                                  : Value {};
+		};
+		auto reachable = [](Block* start, Block* target, Block* forbidden, Block* edge_from,
+		                    Block* edge_to, bool nonempty) {
+			std::vector<Block*> pending, visited;
+			auto                add = [&](Block* from) {
+				for (auto* to: from->ImmSuccessors())
+					if (!(from == edge_from && to == edge_to)) pending.push_back(to);
+			};
+			if (nonempty)
+				add(start);
+			else
+				pending.push_back(start);
+			while (!pending.empty()) {
+				auto* block = pending.back();
+				pending.pop_back();
+				if (block == forbidden || std::ranges::find(visited, block) != visited.end())
+					continue;
+				if (block == target) return true;
+				visited.push_back(block);
+				add(block);
+			}
+			return false;
+		};
+		struct Initialization {
+			uint32_t begin, end, pc;
+			Block*   guard;
+		};
+		struct List {
+			const Inst* store;
+			const Inst* atomic;
+			Value       count;
+			uint32_t    offset, counter;
+		};
+		std::vector<Initialization> initializations;
+		std::vector<List>           lists;
+		std::vector<const Inst*>    atomics;
+		for (auto* block: m_program.blocks)
+			for (const auto& inst: *block) {
+				const auto access = SharedAccessOf(inst.GetOpcode());
+				if (access == SharedAccess::None || access == SharedAccess::Read) continue;
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) return;
+				const auto& memory = m_program.memory_info[flags.index];
+				if (memory.data_bits != 32 || memory.offset % 4 || memory.secondary_offset != 0)
+					return;
+				if (inst.GetOpcode() == ValueOpcode::SharedAtomicIAdd32) {
+					atomics.push_back(&inst);
+					continue;
+				}
+				if (access != SharedAccess::Write) return;
+				const auto components = SharedComponentCount(inst.GetOpcode());
+				const auto predicate  = inst.Arg(components + 1).Resolve();
+				const auto address    = selected(inst.Arg(0), predicate);
+				bool       zero       = true;
+				for (uint32_t i = 0; i < components; ++i)
+					zero &= selected(inst.Arg(i + 1), predicate) == Value(0u);
+				if (zero && address.IsImmediate()) {
+					const auto* comparison = predicate.TryInstruction();
+					if (!comparison || comparison->GetOpcode() != ValueOpcode::IEqual32 ||
+					    !((comparison->Arg(0) == Value(0u) && local_index(comparison->Arg(1))) ||
+					      (comparison->Arg(1) == Value(0u) && local_index(comparison->Arg(0)))))
+						return;
+					if (block->ImmPredecessors().size() != 1 || block->ImmSuccessors().size() != 1)
+						return;
+					auto*      guard = block->ImmPredecessors()[0];
+					const auto gi =
+					    std::ranges::find(m_program.blocks, guard) - m_program.blocks.begin();
+					const auto& info = m_program.block_info[gi];
+					const auto  bi =
+					    std::ranges::find(m_program.blocks, block) - m_program.blocks.begin();
+					const bool true_edge =
+					    info.terminator.true_block == m_program.block_info[bi].id;
+					if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+					    !PredicateContains(info.condition, true_edge, comparison))
+						return;
+					const auto begin = uint64_t {address.U32()} + memory.offset;
+					const auto end   = begin + components * 4u;
+					if (end > m_shared_bytes) return;
+					initializations.push_back({static_cast<uint32_t>(begin),
+					                           static_cast<uint32_t>(end), flags.pc, guard});
+					continue;
+				}
+				if (inst.GetOpcode() != ValueOpcode::WriteSharedU32) return;
+				const auto* shift = address.TryInstruction();
+				if (!shift || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+				    shift->Arg(1) != Value(2u))
+					return;
+				const auto* atomic = selected(shift->Arg(0), predicate).TryInstruction();
+				if (!atomic || atomic->GetOpcode() != ValueOpcode::SharedAtomicIAdd32 ||
+				    owners.at(atomic) != block || atomic->Arg(2).Resolve() != predicate ||
+				    selected(atomic->Arg(0), predicate) != Value(0u) ||
+				    selected(atomic->Arg(1), predicate) != Value(1u))
+					return;
+				const auto  count = guarded_bound(inst.Arg(1), predicate, true, 0);
+				const auto* sum   = inst.Arg(1).Resolve().TryInstruction();
+				if (count.IsEmpty() || !sum || sum->GetOpcode() != ValueOpcode::IAdd32) return;
+				const Inst* phi = nullptr;
+				for (size_t arg = 0; arg < 2; ++arg) {
+					const auto* candidate = sum->Arg(arg).Resolve().TryInstruction();
+					if (candidate && candidate->GetOpcode() == ValueOpcode::Phi &&
+					    local_index(sum->Arg(1 - arg)))
+						phi = candidate;
+				}
+				if (!phi || phi->NumArgs() != 2) return;
+				const size_t back      = phi->Arg(0).Resolve() == Value(0u) ? 1u : 0u;
+				const auto*  increment = phi->Arg(back).Resolve().TryInstruction();
+				if (phi->Arg(1 - back).Resolve() != Value(0u) || !increment ||
+				    increment->GetOpcode() != ValueOpcode::IAdd32 ||
+				    increment->Arg(0).Resolve() != Value(const_cast<Inst*>(phi)) ||
+				    increment->Arg(1) != Value(static_cast<uint32_t>(threads)))
+					return;
+				auto* header = owners.at(phi);
+				auto* tail   = phi->PhiBlock(back);
+				if (!tail || owners.at(increment) != tail ||
+				    reachable(header, header, nullptr, tail, header, true) ||
+				    reachable(block, block, nullptr, tail, header, true))
+					return;
+				bool bounded_loop = false;
+				for (const auto& info: m_program.block_info) {
+					if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) continue;
+					for (const bool truth: {false, true}) {
+						const auto bound =
+						    guarded_bound(Value(const_cast<Inst*>(phi)), info.condition, truth, 0);
+						bounded_loop |=
+						    bound == count && EdgeGuards(info.id,
+						                                 truth ? info.terminator.true_block
+						                                       : info.terminator.false_block,
+						                                 flags.pc);
+					}
+				}
+				if (!bounded_loop) return;
+				const auto atomic_flags = atomic->Flags<MemoryFlags>();
+				if (atomic_flags.index >= m_program.memory_info.size() ||
+				    atomic_flags.pc >= flags.pc)
+					return;
+				lists.push_back({&inst, atomic, count, memory.offset,
+				                 m_program.memory_info[atomic_flags.index].offset});
+			}
+		if (lists.empty() || atomics.size() != lists.size()) return;
+		std::ranges::sort(lists, {}, &List::offset);
+		std::vector<std::pair<Value, uint32_t>> limits;
+		for (size_t i = 0; i < lists.size(); ++i) {
+			const auto& list = lists[i];
+			if (std::ranges::count(lists, list.atomic, &List::atomic) != 1 ||
+			    std::ranges::count(lists, list.counter, &List::counter) != 1 ||
+			    list.counter + 4u > lists.front().offset)
+				return;
+			const auto end = i + 1 < lists.size() ? lists[i + 1].offset : m_shared_bytes;
+			if (list.offset >= end) return;
+			for (const auto& init: initializations)
+				if (init.end > lists.front().offset) return;
+			const auto initialized = std::ranges::any_of(initializations, [&](const auto& init) {
+				return init.begin <= list.counter && init.end >= list.counter + 4u &&
+				       init.pc < list.atomic->Flags<MemoryFlags>().pc &&
+				       !reachable(m_program.blocks.front(), owners.at(list.atomic), init.guard,
+				                  nullptr, nullptr, false);
+			});
+			if (!initialized) return;
+			limits.emplace_back(list.count, std::min((end - list.offset) / 4u, 65536u));
+		}
+		std::vector<DescriptorSource::IndexRange> ranges;
+		for (auto* block: m_program.blocks)
 			for (auto& inst: *block) {
-				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
-				    inst.NumArgs() == 0u) {
+				if (inst.GetOpcode() != ValueOpcode::LoadSharedU32) continue;
+				const auto  flags  = inst.Flags<MemoryFlags>();
+				const auto& memory = m_program.memory_info[flags.index];
+				const auto  list   = std::ranges::find(lists, memory.offset, &List::offset);
+				if (list == lists.end() || flags.pc <= list->store->Flags<MemoryFlags>().pc)
+					continue;
+				const auto* shift = inst.Arg(0).Resolve().TryInstruction();
+				if (!shift || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+				    shift->Arg(1) != Value(2u))
+					continue;
+				for (const auto& range: FindIndexRanges(inst.Arg(0), flags.pc)) {
+					if (range.value.Resolve() != shift->Arg(0).Resolve() ||
+					    range.begin != Value(0u))
+						continue;
+					const auto* count = range.end.Resolve().TryInstruction();
+					if (!count || count->GetOpcode() != ValueOpcode::LoadSharedU32 ||
+					    count->Arg(0).Resolve() != Value(0u))
+						continue;
+					const auto& counter_memory =
+					    m_program.memory_info[count->Flags<MemoryFlags>().index];
+					if (counter_memory.offset == list->counter &&
+					    counter_memory.secondary_offset == 0 && counter_memory.data_bits == 32 &&
+					    memory.secondary_offset == 0 && memory.data_bits == 32) {
+						ranges.push_back({Value(&inst), Value(0u), list->count, limits});
+					}
+				}
+			}
+		m_shared_ranges = std::move(ranges);
+	}
+
+	std::vector<DescriptorSource::IndexRange> FindIndexRanges(Value offset, uint32_t pc) const {
+		std::vector<DescriptorSource::IndexRange> result;
+		std::vector<Value>                        pending {offset};
+		std::vector<const Inst*>                  visited;
+		while (!pending.empty()) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* phi = value.TryInstruction();
+			if (phi == nullptr || std::ranges::find(visited, phi) != visited.end()) {
+				continue;
+			}
+			visited.push_back(phi);
+			if (const auto shared = std::ranges::find_if(
+			        m_shared_ranges,
+			        [&](const auto& range) { return range.value.Resolve() == value; });
+			    shared != m_shared_ranges.end()) {
+				result.push_back(*shared);
+				continue;
+			}
+			for (size_t arg = 0; arg < phi->NumArgs(); ++arg) {
+				pending.push_back(phi->Arg(arg));
+			}
+			if (phi->GetOpcode() != ValueOpcode::Phi || value.GetType() != Type::U32) {
+				continue;
+			}
+			bool unsigned_bound = false;
+			for (const auto& use: phi->Uses()) {
+				const auto* comparison = use.user;
+				if (comparison->GetOpcode() != ValueOpcode::ULessThan32 ||
+				    comparison->Arg(0).Resolve() != value)
+					continue;
+				for (const auto& block: m_program.block_info) {
+					if (block.terminator.kind != CFG::TerminatorKind::ConditionalBranch) continue;
+					for (const bool truth: {false, true}) {
+						const auto target =
+						    truth ? block.terminator.true_block : block.terminator.false_block;
+						unsigned_bound |= PredicateContains(block.condition, truth, comparison) &&
+						                  EdgeGuards(block.id, target, pc);
+					}
+				}
+				if (unsigned_bound) {
+					// A dominating unsigned comparison proves 0 <= index < bound
+					// independently of the loop's initial value or induction step.
+					result.push_back({value, Value(0u), comparison->Arg(1)});
+					break;
+				}
+			}
+			if (unsigned_bound || phi->NumArgs() != 2) continue;
+			uint32_t    start     = 0;
+			const Inst* increment = nullptr;
+			if (ImmediateU32(phi->Arg(0), start)) {
+				increment = phi->Arg(1).Resolve().TryInstruction();
+			} else if (ImmediateU32(phi->Arg(1), start)) {
+				increment = phi->Arg(0).Resolve().TryInstruction();
+			}
+			if (increment == nullptr || start >= INT32_MAX || increment->NumArgs() != 2 ||
+			    increment->Arg(0).Resolve() != value) {
+				continue;
+			}
+			const auto step = increment->Arg(1).Resolve();
+			const bool descending =
+			    (increment->GetOpcode() == ValueOpcode::ISub32 && step == Value(1u)) ||
+			    (increment->GetOpcode() == ValueOpcode::IAdd32 && step == Value(UINT32_MAX));
+			if (!descending &&
+			    !(increment->GetOpcode() == ValueOpcode::IAdd32 && step == Value(1u))) {
+				continue;
+			}
+			for (const auto& use: phi->Uses()) {
+				const auto* comparison = use.user;
+				const auto  expected =
+				    descending ? ValueOpcode::SGreaterThanEqual32 : ValueOpcode::SLessThan32;
+				const bool unsigned_ascending =
+				    !descending && comparison->GetOpcode() == ValueOpcode::ULessThan32;
+				if ((comparison->GetOpcode() != expected && !unsigned_ascending) ||
+				    comparison->Arg(0).Resolve() != value) {
 					continue;
 				}
-				auto* handle = inst.Arg(0).Resolve().TryInstruction();
-				if (handle == nullptr || FindIndirectImage(*handle) != nullptr) {
+				if (descending && comparison->Arg(1).Resolve() != Value(0u)) {
 					continue;
 				}
-				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
-					m_indirect_images.push_back(std::move(plan));
+				bool guarded = false;
+				for (const auto& block: m_program.block_info) {
+					if (block.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
+						continue;
+					}
+					for (const bool truth: {false, true}) {
+						const auto target =
+						    truth ? block.terminator.true_block : block.terminator.false_block;
+						guarded |= PredicateContains(block.condition, truth, comparison) &&
+						           EdgeGuards(block.id, target, pc);
+					}
+				}
+				if (guarded) {
+					result.push_back({value, descending ? Value(0u) : Value(start),
+					                  descending ? Value(start + 1u) : comparison->Arg(1)});
+					break;
 				}
 			}
 		}
+		return result;
+	}
+
+	bool TryMakeDirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		const Inst* table = nullptr;
+		Value       offset;
+		bool        raw_address = false;
+		uint32_t    immediate   = 0;
+		for (uint32_t dword = 0; dword < 8u; ++dword) {
+			const auto* read   = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t    index  = 0;
+			const auto* memory = read == nullptr ? nullptr : ScalarReadMemory(*read, index);
+			if (read != nullptr && read->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+			    read->Arg(3).Resolve() == Value(true)) {
+				index = read->Flags<MemoryFlags>().index;
+				if (index < m_program.memory_info.size()) {
+					const auto& candidate = m_program.memory_info[index];
+					if (candidate.kind == ResourceKind::ScalarAddress &&
+					    candidate.data_bits == 32u && candidate.data_dwords == 1u) {
+						memory = &candidate;
+					}
+				}
+			}
+			if (memory == nullptr || !MemoryIndexBelongsTo(index, *read)) {
+				return false;
+			}
+			if (dword == 0) immediate = memory->offset;
+			if (int64_t {static_cast<int32_t>(memory->offset)} !=
+			    int64_t {static_cast<int32_t>(immediate)} + dword * 4u)
+				return false;
+			const auto* base = read->Arg(0).Resolve().TryInstruction();
+			if (base == nullptr || (table != nullptr && table != base) ||
+			    !std::ranges::all_of(read->Uses(), [](const Use& use) {
+				    return use.user->GetOpcode() == ValueOpcode::GetImageResource;
+			    })) {
+				return false;
+			}
+			table = base;
+			if (dword == 0) {
+				offset      = read->Arg(1).Resolve();
+				raw_address = memory->kind == ResourceKind::ScalarAddress;
+			} else if (raw_address != (memory->kind == ResourceKind::ScalarAddress) ||
+			           !EquivalentValue(m_program, offset, read->Arg(1))) {
+				return false;
+			}
+			plan.memory[dword] = index;
+			plan.reads[dword]  = read;
+		}
+		DescriptorSource table_source;
+		uint32_t         source = 0;
+		if (raw_address) {
+			if (table->GetOpcode() != ValueOpcode::GetAddressResource) {
+				return false;
+			}
+			table_source.dword_count = 4;
+			table_source.dwords[0]   = table->Arg(0);
+			table_source.dwords[1]   = table->Arg(1);
+			table_source.dwords[2] = table_source.dwords[3] = Value(0u);
+			uint32_t bad                                    = 0;
+			if (!ValidateSource(table_source, bad)) {
+				return false;
+			}
+			source = InternSource(table_source);
+		} else if (!MakeRuntimeBufferSource(*table, pc, source, table_source)) {
+			return false;
+		}
+		DescriptorSource image_source;
+		image_source.dword_count = 8;
+		std::copy_n(table_source.dwords.begin(), 4, image_source.dwords.begin());
+		std::copy_n(table_source.dwords.begin(), 4, image_source.dwords.begin() + 4);
+		image_source.indirect_image =
+		    DescriptorSource::IndirectImage {source, source, 0, 0, 0, offset, raw_address};
+		image_source.indirect_image->immediate_offset = immediate;
+		image_source.indirect_image->index_ranges     = FindIndexRanges(offset, pc);
+		plan.handle                                   = &handle;
+		plan.source                                   = InternSource(image_source);
+		plan.key                                      = offset;
+		plan.roots                                    = image_source.dwords;
+		return true;
+	}
+
+	bool MakeIndirectBuffer(const Inst& handle, DescriptorSource& descriptor, uint32_t pc) const {
+		DescriptorSource candidate;
+		candidate.dword_count = 4;
+		candidate.dwords[2] = candidate.dwords[3] = Value(0u);
+		const Inst* address                       = nullptr;
+		Value       offset;
+		uint32_t    immediate = 0;
+		for (uint32_t dword = 0; dword < 4; ++dword) {
+			const auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			    read->Arg(3).Resolve() != Value(true)) {
+				return false;
+			}
+			const auto index = read->Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[index];
+			const auto* base   = read->Arg(0).Resolve().TryInstruction();
+			if (memory.kind != ResourceKind::ScalarAddress || memory.data_bits != 32u ||
+			    memory.data_dwords != 1u || base == nullptr ||
+			    base->GetOpcode() != ValueOpcode::GetAddressResource) {
+				return false;
+			}
+			if (dword == 0) {
+				address   = base;
+				offset    = read->Arg(1).Resolve();
+				immediate = memory.offset;
+			} else if (int64_t {static_cast<int32_t>(memory.offset)} !=
+			               int64_t {static_cast<int32_t>(immediate)} + dword * 4u ||
+			           !EquivalentValue(m_program, offset, read->Arg(1)) ||
+			           !EquivalentValue(m_program, address->Arg(0), base->Arg(0)) ||
+			           !EquivalentValue(m_program, address->Arg(1), base->Arg(1))) {
+				return false;
+			}
+		}
+		candidate.dwords[0] = address->Arg(0);
+		candidate.dwords[1] = address->Arg(1);
+		uint32_t bad_dword  = 0;
+		if (!ValidateSource(candidate, bad_dword)) {
+			return false;
+		}
+		candidate.indirect_buffer = DescriptorSource::IndirectBuffer {offset, immediate};
+		candidate.indirect_buffer->index_ranges = FindIndexRanges(offset, pc);
+		descriptor                              = std::move(candidate);
+		return true;
 	}
 
 	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
@@ -623,10 +1206,16 @@ private:
 			bad_dword = 0;
 		}
 		if (!ValidateSource(descriptor, bad_dword)) {
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			if (expected != ValueOpcode::GetBufferResource ||
+			    !MakeIndirectBuffer(*handle, descriptor, pc)) {
+				Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
+				                     ValueOpcodeName(expected), bad_dword));
+			}
 		}
 		source = InternSource(descriptor);
+		if (descriptor.indirect_buffer.has_value()) {
+			m_indirect_buffers.emplace_back(handle, source);
+		}
 	}
 
 	void ValidateAddressHandle(Value value, uint32_t pc) const {
@@ -870,7 +1459,8 @@ private:
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
+			    buffer_source->indirect_buffer.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
@@ -892,14 +1482,16 @@ private:
 		}
 	}
 
-	std::array<uint32_t, 3> m_local_size;
-	uint32_t m_shared_bytes;
 	Program&                       m_program;
 	ShaderInfo                     m_info;
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
 	std::vector<IndirectImagePlan> m_indirect_images;
+	std::vector<std::pair<Inst*, uint32_t>>   m_indirect_buffers;
+	std::array<uint32_t, 3>                   m_local_size;
+	uint32_t                                  m_shared_bytes;
+	std::vector<DescriptorSource::IndexRange> m_shared_ranges;
 };
 
 } // namespace

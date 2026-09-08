@@ -11,6 +11,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemoryRangeReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
+using SrtMemoryRangeValidator = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -18,6 +20,10 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	SrtMemoryRangeReader      read_specialization_range  = nullptr;
+	SrtMemoryRangeValidator   is_memory_mapped           = nullptr;
+	// Runtime dispatch extent; zero means the stage has no compute workgroups.
+	std::array<uint32_t, 3> workgroup_count {};
 };
 
 enum class RuntimeValueType { Any, Integer };

@@ -80,9 +80,13 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
-	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
+	    std::ranges::any_of(program.info.buffers,
+	                        [](const IR::BufferResource& buffer) {
+		                        return buffer.indirect_search_iterations != 0u;
+	                        }) ||
+	    std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
+		    return image.indirect_search_iterations != 0u;
+	    });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
@@ -218,9 +222,14 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
-					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						// ADD_TID uses the subgroup lane in graphics stages as well.
-
+					const auto& buffer = program.info.buffers[memory.resource];
+					if ((buffer.packed_stride & (1u << 20u)) != 0u ||
+					    std::ranges::any_of(buffer.indirect_resources, [&](uint32_t candidate) {
+						    return (program.info.buffers[candidate].packed_stride & (1u << 20u)) !=
+						           0u;
+					    })) {
+						// ADD_TID adds the lane within the wave, including in graphics
+						// stages. Its address calculation uses SubgroupLocalInvocationId.
 						requirements.subgroup_local_invocation_id = true;
 					}
 				}

@@ -1177,8 +1177,11 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 			continue;
 		}
 		if (address >= buffer_limit) {
-			return SpecializationFail(
-			    "bounded SRT buffer writer base exceeds the registered 40-bit address range");
+			return SpecializationFail(fmt::format(
+			    "bounded SRT buffer writer {} base 0x{:x} exceeds the registered 40-bit address range "
+			    "(origin={} first_use_pc=0x{:08x} size={} descriptor={:08x}:{:08x}:{:08x}:{:08x})",
+			    resource, address, specialization.buffer_origins[resource], metadata.first_use_pc, size,
+			    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]));
 		}
 		// Buffer descriptors may conservatively declare more records than the mapped VMA.
 		// NativeStorageBuffer clamps that requested footprint to the actual guest mapping.  The

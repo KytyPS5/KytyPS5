@@ -4716,6 +4716,7 @@ int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::strcmp(argv[1], "--heterogeneous-indirect-images-only") == 0) {
       TestHeterogeneousIndirectImageDimensions();
+      TestHeterogeneousIndirectImageViewSwizzles();
       std::cout << "KYTY_HETEROGENEOUS_INDIRECT_IMAGES_PASS\n";
       return 0;
     }

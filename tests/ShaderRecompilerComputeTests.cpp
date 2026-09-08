@@ -26745,6 +26745,39 @@ TestCase DsGdsSubdwordAndAtomicWrites() {
   return test;
 }
 
+TestCase DsGdsAtomicAddWave64CombinesNativeHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  // Derive logical lane 0..63 through the wave operations that require the
+  // native-subgroup32 split path, then have every lane atomically contribute
+  // lane+1 to one GDS DWORD. The result is independent of native scheduling.
+  AppendVMovU32(&code, 12, 0u);
+  code.push_back(EncodeVop2(0x23, 11, 193u, 12));
+  code.push_back(EncodeVop2(0x24, 13, 193u, 11));
+  code.push_back(EncodeVop2(0x25, 4, InlineU32(1), 13));
+  AppendVMovU32(&code, 3, 0u);
+  code.push_back(EncodeDs0(0x00, 0, true));
+  code.push_back(EncodeDs1(0, 4, 3));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsGdsAtomicAddWave64CombinesNativeHalves";
+  test.code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::V_MBCNT_LO_U32_B32,
+                  O::V_MBCNT_HI_U32_B32, O::V_ADD_NC_U32,
+                  O::DS_ADD_U32, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.gds_initial = {7u};
+  test.expected_gds = {7u + (64u * 65u) / 2u};
+  return test;
+}
+
 TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   using O = ShaderOpcode;
 
@@ -29853,6 +29886,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);
+  AddCase(DsGdsAtomicAddWave64CombinesNativeHalves);
   AddCase(DsReadWrite2Variants);
   AddCase(DsWideReadSnapshotsOverlappingAddress);
   AddCase(DsReadWrite2EqualOffsetsUseData0);

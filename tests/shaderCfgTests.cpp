@@ -11415,6 +11415,53 @@ void TestComputeExecutionSingleWaveLds() {
   }
 }
 
+void TestComputeExecutionSingleWaveGdsAtomic() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  enum class Scenario { WriteOnly, LiveReturn, Multiwave, SameMemoryRead };
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const auto scenario : {Scenario::WriteOnly, Scenario::LiveReturn,
+                              Scenario::Multiwave, Scenario::SameMemoryRead}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    auto& data = entry->AppendNewInst(O::IAdd32,{IR::Value(&lane),IR::Value(1u)});
+    IR::MemoryInfo memory{};
+    memory.kind = IR::ResourceKind::Gds;
+    memory.data_bits = 32u;
+    memory.data_dwords = 1u;
+    program.memory_info.push_back(memory);
+    auto& atomic = entry->AppendNewInst(
+        O::SharedAtomicIAdd32,{IR::Value(0u),IR::Value(&data),IR::Value(true)});
+    atomic.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x40u});
+    if (scenario == Scenario::LiveReturn)
+      entry->AppendNewInst(O::ReferenceU32,{IR::Value(&atomic)});
+    if (scenario == Scenario::SameMemoryRead) {
+      auto& read = entry->AppendNewInst(O::LoadSharedU32,{IR::Value(0u),IR::Value(true)});
+      read.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x44u});
+      entry->AppendNewInst(O::ReferenceU32,{IR::Value(&read)});
+    }
+    IR::ValidateProgram(program,true);
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = scenario == Scenario::Multiwave ? 128u : 64u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.wave_size = 64u;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    if (scenario == Scenario::WriteOnly) {
+      Check(plan.error.empty() && plan.IsSplitWave64() &&
+                !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u,
+            "acyclic write-only GDS atomic lost its single-wave64 execution plan");
+    } else {
+      Check(!plan.error.empty() && !plan.IsSplitWave64(),
+            "GDS atomic admission accepted a live return, multiwave use, or GDS read");
+    }
+  }
+}
+
 void TestComputeExecutionUnusedMemoryDeclarations() {
   using namespace ShaderRecompiler;
   IR::Program program;
@@ -15561,6 +15608,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_GDS_APPEND_ADMISSION_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--single-wave64-gds-atomic-admission-only") == 0) {
+    Libs::Graphics::TestComputeExecutionSingleWaveGdsAtomic();
+    std::puts("KYTY_SINGLE_WAVE64_GDS_ATOMIC_ADMISSION_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--unused-f64-emission-only") == 0) {
     Libs::Graphics::TestUnusedNativeF64EmissionHasCompleteRequirements();
     return 0;
@@ -15754,6 +15806,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64BufferCycleVisibility();
   TestCooperativeWave64AutomaticBufferCyclePromotion();
   TestComputeExecutionSingleWaveLds();
+  TestComputeExecutionSingleWaveGdsAtomic();
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();
   TestComputeExecutionDsLaneConvergence();

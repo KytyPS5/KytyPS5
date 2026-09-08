@@ -664,6 +664,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		}
 	}
 	std::vector<ResourceBlock> blocks(program.blocks.size());
+	std::vector<uint8_t>       predicate_may_be_written(blocks.size());
 	for (uint32_t i = 0; i < blocks.size(); i++) {
 		auto&                 block      = blocks[i];
 		const auto&           info       = program.block_info[i];
@@ -692,13 +693,21 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		}
 		for (const auto& inst: *program.blocks[i]) {
 			const auto op     = inst.GetOpcode();
+			if (op == ValueOpcode::ReadConst) {
+				const auto slot = inst.Arg(1).Resolve();
+				if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+				    slot.U32() < program.srt_reads.size()) {
+					block.flat_slots.push_back(slot.U32());
+				}
+			}
 			const auto buffer = BufferAccessOf(op);
 			const auto image  = ImageOpcodeInfoOf(op);
-			// Any shader write may alias a scalar predicate read, including on a later loop visit.
+			// Only predicates reachable after a shader write can observe its result.
+			// Earlier uniform branches still determine which descriptors are used.
 			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
 			    image.access == ImageAccess::Write || image.access == ImageAccess::Atomic ||
 			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
-				return {};
+				predicate_may_be_written[i] = 1u;
 			}
 			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
 				continue;
@@ -719,6 +728,23 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		std::ranges::sort(block.sources);
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
+	}
+	// Include back edges: a predicate before a write in the first iteration may
+	// depend on that write on a subsequent visit. Unknown predicates retain both edges.
+	std::vector<uint32_t> pending;
+	for (uint32_t i = 0; i < blocks.size(); ++i) {
+		if (predicate_may_be_written[i]) pending.push_back(i);
+	}
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		blocks[index].condition = {};
+		for (const auto successor: blocks[index].successors) {
+			if (!predicate_may_be_written[successor]) {
+				predicate_may_be_written[successor] = 1u;
+				pending.push_back(successor);
+			}
+		}
 	}
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {

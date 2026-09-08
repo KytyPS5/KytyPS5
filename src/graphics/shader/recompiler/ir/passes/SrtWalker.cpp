@@ -1006,13 +1006,18 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	Evaluator            clean_evaluator(program, clean_runtime);
 	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	std::vector<uint8_t> active;
+	std::vector<uint8_t> active_flat;
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
+		active_flat.assign(program.srt_reads.size(), 1u);
 	}
 	if (evaluate_flat && !program.control_flow.empty()) {
 		for (const auto& block: program.control_flow) {
 			for (const auto source: block.sources) {
 				active.at(source) = 0u;
+			}
+			for (const auto slot: block.flat_slots) {
+				active_flat.at(slot) = 0u;
 			}
 		}
 		std::vector<uint8_t>  visited(program.control_flow.size());
@@ -1027,6 +1032,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			const auto& block = program.control_flow[index];
 			for (const auto source: block.sources) {
 				active[source] = 1u;
+			}
+			for (const auto slot: block.flat_slots) {
+				active_flat[slot] = 1u;
 			}
 			uint32_t condition = 0;
 			// A missing clean reader must never fall through to the evaluator's raw-memory path.
@@ -1060,6 +1068,10 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
+			if (read.flat_offset >= flattened.size()) return false;
+			// Descriptor evaluation already follows reachable blocks. Apply the same
+			// reachability to shader constants, leaving unused slots at zero.
+			if (!active_flat[read.flat_offset]) continue;
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;

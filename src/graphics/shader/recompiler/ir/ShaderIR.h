@@ -485,6 +485,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> flat_slots;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.

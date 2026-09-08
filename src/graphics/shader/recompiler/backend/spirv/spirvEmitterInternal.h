@@ -220,6 +220,7 @@ enum : uint32_t {
 	OpSMulExtended                 = 152,
 	OpAny                          = 154,
 	OpAll                          = 155,
+	OpIsNan                        = 156,
 	OpLogicalNotEqual              = 165,
 	OpLogicalOr                    = 166,
 	OpLogicalAnd                   = 167,
@@ -313,8 +314,10 @@ enum : uint32_t {
 	GlslSqrt            = 31,
 	GlslInverseSqrt     = 32,
 	GlslFMin            = 37,
+	GlslUMin            = 38,
 	GlslFMax            = 40,
 	GlslFClamp          = 43,
+	GlslSClamp          = 45,
 	GlslLdexp           = 53,
 	GlslFma             = 50,
 	GlslPackSnorm2x16   = 56,
@@ -746,6 +749,9 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
+
+uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                             uint32_t component, uint32_t raw);
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 

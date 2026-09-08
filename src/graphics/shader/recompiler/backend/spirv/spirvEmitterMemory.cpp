@@ -425,6 +425,13 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 	return value;
 }
 
+uint32_t SignExtendSubword(EmitterState& state, uint32_t value, uint32_t bits) {
+	const auto left = Binary(state, OpShiftLeftLogical, TypeU32(state), value,
+	                         ConstantU32(state, 32u - bits));
+	return Binary(state, OpShiftRightArithmetic, TypeU32(state), left,
+	              ConstantU32(state, 32u - bits));
+}
+
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend) {
 	auto&      state = ctx.state;
@@ -448,10 +455,7 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	value = Binary(state, OpBitwiseAnd, TypeU32(state), value,
 	               ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	if (!sign_extend) return value;
-	const auto left = Binary(state, OpShiftLeftLogical, TypeU32(state), value,
-	                         ConstantU32(state, 32u - bits));
-	return Binary(state, OpShiftRightArithmetic, TypeU32(state), left,
-	              ConstantU32(state, 32u - bits));
+	return SignExtendSubword(state, value, bits);
 }
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
@@ -1243,6 +1247,56 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	}
 }
 
+void StoreFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
+                       const IR::MemoryInfo& mem, uint32_t packed_words) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto packed   = ctx.Arg(inst, inst.NumArgs() - 2);
+		const auto format   = BufferFormat(ctx, inst, mem);
+		if (!Format::IsKnownFormat(format)) {
+			for (uint32_t word = 0; word < packed_words; word++) {
+				uint32_t data = packed;
+				if (packed_words != 1u) {
+					data = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpCompositeExtract, TypeU32(state), data, packed, word});
+				}
+				StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, word), resource, data);
+			}
+			return;
+		}
+
+		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource,
+		                                         mem.component_count, FormattedAccess::Store);
+		EmitIfCondition(state, plan.in_bounds, [&]() {
+			const auto count = std::min(mem.component_count, plan.info.component_count);
+			for (uint32_t component = 0; component < count; component++) {
+				const auto word = component / 2u;
+				uint32_t data = packed;
+				if (packed_words != 1u) {
+					data = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpCompositeExtract, TypeU32(state), data, packed, word});
+				}
+				if ((component & 1u) != 0u) {
+					data = Binary(state, OpShiftRightLogical, TypeU32(state), data,
+					              ConstantU32(state, 16u));
+				}
+				data = Binary(state, OpBitwiseAnd, TypeU32(state), data,
+				              ConstantU32(state, 0xffffu));
+				if (plan.info.type == Format::ComponentType::Sint) {
+					data = SignExtendSubword(state, data, 16u);
+				} else if (plan.info.type != Format::ComponentType::Uint) {
+					data = EmitHalfToF32Bits(state, data);
+				}
+				data = PackFormatComponent(state, plan.info, component, data);
+				StoreFormattedInBounds(ctx, inst, mem, plan, component, data);
+			}
+		});
+	});
+}
+
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1279,8 +1333,12 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 
 void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	const auto mem = ctx.Memory(inst);
+	if (mem.formatted && mem.data_bits == 16u) {
+		StoreFormattedD16(ctx, inst, mem, components);
+		return;
+	}
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto mem       = ctx.Memory(inst);
 		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto format =
@@ -1644,7 +1702,8 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (store_address || store_buffer || store_shared) {
 		const auto mem = ctx.Memory(inst);
 		if (op == IR::ValueOpcode::StoreBufferU32 && mem.formatted)
-			FormattedStore(ctx, inst, mem);
+			mem.data_bits == 16u ? StoreFormattedD16(ctx, inst, mem, 1u)
+			                     : FormattedStore(ctx, inst, mem);
 		else if (op == IR::ValueOpcode::StoreAddressU8 || op == IR::ValueOpcode::StoreBufferU8 ||
 		         op == IR::ValueOpcode::WriteSharedU8)
 			StoreSubword(ctx, inst, mem, 8);

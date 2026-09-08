@@ -1896,6 +1896,7 @@ constexpr uint32_t EncodeSmem0(uint32_t opcode, uint32_t dst, uint32_t sbase) {
 constexpr uint32_t EncodeMubuf0(uint32_t opcode, uint32_t offset = 0,
                                 bool idxen = true, bool glc = false) {
   return (0x38u << 26u) | ((opcode & 0x7fu) << 18u) |
+         (((opcode >> 7u) & 1u) << 25u) |
          (idxen ? (1u << 13u) : 0u) | (glc ? (1u << 14u) : 0u) |
          (offset & 0xfffu);
 }
@@ -6846,6 +6847,83 @@ void TestNewShaderRecompilerMubufFormatTranslation() {
   Check(SpirvContainsOpcode(result.spirv, 62),
         "SPIR-V binary does not contain OpStore");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCapturedMubufStoreFormatD16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x84, 4), EncodeMubuf1(40, 0, 1), // packed x
+      EncodeMubuf0(0x85, 8), EncodeMubuf1(44, 0, 1), // packed xy
+      EncodeMubuf0(0x86, 12), EncodeMubuf1(48, 0, 1), // packed xyz
+      0xe21c6000u, 0x8002000eu, // captured packed xyzw: v[0:1], v14, s[8:11]
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 5u,
+        "captured D16 stores did not decode as four instructions plus endpgm");
+  const auto &captured = decoded.instructions[3];
+  Check(captured.family == Decoder::Family::MUBUF &&
+            captured.opcode != Decoder::Opcode::UNSUPPORTED &&
+            captured.opcode_id == 0x87u && captured.word_count == 2u &&
+            captured.raw_count == 2u && captured.raw[0] == 0xe21c6000u &&
+            captured.raw[1] == 0x8002000eu && captured.data_dwords == 2u &&
+            captured.data_bits == 16u && captured.data_components == 4u &&
+            captured.formatted && !captured.typed &&
+            captured.dst.kind == Decoder::OperandKind::Vgpr && captured.dst.reg == 0u &&
+            captured.src0.kind == Decoder::OperandKind::Vgpr && captured.src0.reg == 14u &&
+            captured.src1.kind == Decoder::OperandKind::Sgpr && captured.src1.reg == 8u,
+        "decoder rejected captured MUBUF BUFFER_STORE_FORMAT_D16_XYZW fields");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  std::array<uint32_t, 12> user_data{};
+  for (const uint32_t base : {0u, 8u}) {
+    user_data[base] = 0x10000u + base * 0x1000u;
+    user_data[base + 1u] = 8u << 16u;
+    user_data[base + 2u] = 16u;
+    user_data[base + 3u] =
+        static_cast<uint32_t>(base == 0u
+                                  ? Prospero::BufferFormat::k16_16_16_16UInt
+                                  : Prospero::BufferFormat::k16_16_16_16Float)
+        << 12u;
+  }
+  options.user_data = user_data;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_X") &&
+            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XY") &&
+            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XYZ") &&
+            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XYZW"),
+        "D16 formatted store family is incomplete in the decoded dump");
+  Check(CountSourceOccurrences(result.ir_dump, "StoreBufferU32 ") == 2u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x2 ") == 2u,
+        "D16 formatted stores did not retain packed one/two-dword IR widths");
+  Check(std::ranges::any_of(result.program.memory_info, [](const auto &memory) {
+          return memory.formatted && !memory.typed && memory.data_bits == 16u &&
+                 memory.data_dwords == 2u && memory.component_count == 4u;
+        }),
+        "D16 formatted stores lost packed component metadata");
+  Check(SpirvContainsOpcode(result.spirv, 230),
+        "D16 formatted stores emitted no race-safe sub-dword atomic update");
+  Check(SpirvContainsOpcode(result.spirv, 194) &&
+            SpirvContainsOpcode(result.spirv, 199),
+        "D16 formatted stores did not unpack high/low halves");
+  Check(SpirvContainsExtInst(result.spirv, 62) &&
+            SpirvContainsExtInst(result.spirv, 58),
+        "floating D16 formatted store did not unpack FP16 source and repack the "
+        "destination component");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t short_format_shader[] = {
+      EncodeMubuf0(0x87), EncodeMubuf1(0, 0, 0), EncodeSopp(0x01)};
+  auto short_user_data = user_data;
+  short_user_data[3] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k16Float) << 12u;
+  options.user_data = short_user_data;
+  auto short_format_result = RecompileForTest(short_format_shader, options);
+  CheckSpirvBinaryValidates(short_format_result.spirv);
 }
 
 void TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly() {
@@ -15525,6 +15603,14 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--mubuf-store-format-d16-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerMubufFormatTranslation();
+    TestNewShaderRecompilerCapturedMubufStoreFormatD16();
+    std::puts("KYTY_MUBUF_STORE_FORMAT_D16_PASS");
+    return 0;
+  }
+
   if (argc == 2 &&
       std::strcmp(argv[1], "--pipeline-cache-revision-only") == 0) {
     TestDriverPipelineCacheRevisionCompatibility();
@@ -15560,6 +15646,7 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestNewShaderRecompilerCapturedMubufStoreFormatD16();
   TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly();
   TestStorageBufferBoundsAvoidDynamicArrayLengthLowering();
   TestNewShaderRecompilerTypedBufferTranslation();

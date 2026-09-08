@@ -188,6 +188,8 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		const bool store_or_atomic =
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_X &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X &&
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -492,7 +494,20 @@ bool Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      data     = ReadU32(data_src);
 	IR::ValueOpcode opcode;
 	IR::Value       value;
-	switch (memory.data_bits) {
+	if (memory.formatted && memory.data_bits == 16u) {
+		switch (memory.data_dwords) {
+			case 1u:
+				opcode = IR::ValueOpcode::StoreBufferU32;
+				value  = data;
+				break;
+			case 2u:
+				opcode = IR::ValueOpcode::StoreBufferU32x2;
+				value  = ir.Emit(IR::ValueOpcode::CompositeConstructU32x2,
+				                 {data, ReadU32(OffsetOperand(data_src, 1u))});
+				break;
+			default: return false;
+		}
+	} else switch (memory.data_bits) {
 		case 8u:
 			opcode = IR::ValueOpcode::StoreBufferU8;
 			value  = NarrowSubdword(data, 8u);
@@ -958,6 +973,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:

@@ -11,6 +11,18 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
+uint32_t RebaseStorageBufferByteAddress(EmitterState& state, const IR::MemoryInfo& mem,
+                                        uint32_t address) {
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	const auto adjusted = Binary(state, OpIAdd, TypeU32(state), address,
+	                             state.memory_byte_offsets[array_index]);
+	const auto overflow = Binary(state, OpULessThan, TypeBool(state), adjusted, address);
+	// SSBO range is capped by the uint32 maxStorageBufferRange. UINT32_MAX's
+	// DWORD/u64 index is outside every complete element of such a range.
+	return Select(state, TypeU32(state), overflow, ConstantU32(state, UINT32_MAX), adjusted);
+}
+
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
 	if (state.lane_count == 2) {

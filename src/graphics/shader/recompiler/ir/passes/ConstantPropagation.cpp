@@ -655,11 +655,24 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 
 void ConstantPropagationPass(const BlockList& blocks) {
 	std::unordered_set<Inst*> lowered_ancillary;
-	for (auto* block: blocks) {
-		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			FoldInstruction(*block, inst, lowered_ancillary);
-		}
-	}
+	const auto                fold_to_fixed_point = [&] {
+		bool changed;
+		do {
+			changed = false;
+			for (auto* block: blocks) {
+				for (auto inst = block->begin(); inst != block->end(); ++inst) {
+					const auto opcode    = inst->GetOpcode();
+					const auto first_arg = inst->NumArgs() != 0 ? inst->Arg(0) : Value {};
+					FoldInstruction(*block, inst, lowered_ancillary);
+					changed |= inst->GetOpcode() != opcode ||
+					           (inst->NumArgs() != 0 && inst->Arg(0) != first_arg);
+				}
+			}
+		} while (changed);
+	};
+	// Backedges are visited after their PHIs. Revisit the dependent expressions
+	// when folding the backedge makes a previously varying value constant.
+	fold_to_fixed_point();
 	// Normalize retained PHI/select values only after every supported field read has
 	// been lowered; direct raw consumers remain unsupported.
 	for (auto* source: lowered_ancillary) {
@@ -674,6 +687,9 @@ void ConstantPropagationPass(const BlockList& blocks) {
 		if (retained_only) {
 			Replace(*source, Value(0u));
 		}
+	}
+	if (!lowered_ancillary.empty()) {
+		fold_to_fixed_point();
 	}
 }
 

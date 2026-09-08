@@ -169,6 +169,10 @@ bool ReadShaderGuestWord(void* userdata, uint64_t address, uint32_t* value) {
 	return true;
 }
 
+bool ReadShaderGuestRange(void*, uint64_t address, void* data, uint64_t size) {
+	const bool read = Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size, true);
+	return read;
+}
 
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) return false;
@@ -176,6 +180,14 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 		if (!ReadShaderGuestWord(userdata, address + i * sizeof(uint32_t), &values[i])) return false;
 	}
 	return true;
+}
+
+bool IsShaderMemoryMapped(void*, uint64_t address, uint64_t size) {
+	// Query backing mappings without synchronizing dirty contents. Mapped descriptors
+	// must still use the checked reader, which waits for preceding GPU writes.
+	std::array<uint8_t, 32> probe {};
+	return size != 0 && size <= probe.size() &&
+	       Libs::LibKernel::Memory::TryReadBacking(address, probe.data(), size);
 }
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -340,8 +352,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	                  std::array<uint32_t, 3> workgroup_count = {}) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -366,6 +378,9 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderGuestMemory,
 		    .userdata                   = &read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_specialization_range  = ReadShaderGuestRange,
+		    .is_memory_mapped           = IsShaderMemoryMapped,
+		    .workgroup_count            = workgroup_count,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -470,7 +485,7 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
-	ShaderGuestReadCache                                         read_cache;
+	ShaderGuestReadCache                                        read_cache;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -722,12 +737,22 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               std::array<uint32_t, 3>      dispatch_dimensions) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	if (input_info.dispatch_thread_dimensions) {
+		const std::array local {regs.cs_regs.num_thread_x, regs.cs_regs.num_thread_y,
+		                        regs.cs_regs.num_thread_z};
+		for (size_t axis = 0; axis < dispatch_dimensions.size(); ++axis) {
+			const auto divisor = std::max(local[axis], 1u);
+			dispatch_dimensions[axis] =
+			    dispatch_dimensions[axis] / divisor + (dispatch_dimensions[axis] % divisor != 0);
+		}
+	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	return m_program_cache->Get(params, input_info, push_data_cursor, dispatch_dimensions);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

@@ -266,7 +266,126 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst);
+
+// A GPU-indexed buffer binding resolves to one of several candidates only at runtime. Search the
+// flattened SRT mapping for the key the shader computed, then re-emit the access against the
+// candidate it selects. Returns true when the access was emitted here.
+bool EmitIndirectBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto op = inst.GetOpcode();
+	if (IR::BufferAccessOf(op) == IR::BufferAccess::None || ctx.memory_override != nullptr) {
+		return false;
+	}
+	auto&       state  = ctx.state;
+	const auto& memory = ctx.Memory(inst);
+	// Planning reads have no runtime buffer binding to look up.
+	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::ReadConstBuffer) &&
+	    memory.planning_only) {
+		return false;
+	}
+	const auto& buffer = state.program.info.buffers.at(memory.resource);
+	if (buffer.indirect_root != memory.resource) {
+		return false;
+	}
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr || state.flattened_srt_variable == 0 ||
+	    buffer.indirect_resources.size() < 2u || buffer.indirect_search_iterations == 0) {
+		ctx.Fail(inst, "has no indirect buffer runtime mapping");
+	}
+	const auto key = ctx.Def(handle->Arg(0));
+	// Load any spilled operands before splitting control flow so every case dominates its uses.
+	for (size_t arg = 1; arg < inst.NumArgs(); ++arg) {
+		ctx.Arg(inst, arg);
+	}
+	const auto LoadMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto mapping  = ConstantU32(state, buffer.indirect_mapping_offset);
+	auto       low      = ConstantU32(state, 0u);
+	auto       high     = LoadMapping(mapping);
+	auto       selected = ConstantU32(state, 0u);
+	for (uint32_t iteration = 0; iteration < buffer.indirect_search_iterations; ++iteration) {
+		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+		const auto mid    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                           Binary(state, spv::OpIAdd, TypeU32(state), low, high),
+		                           ConstantU32(state, 1u));
+		const auto probe  = Select(state, TypeU32(state), active, mid, ConstantU32(state, 0u));
+		const auto entry =
+		    Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+		           Binary(state, spv::OpIAdd, TypeU32(state),
+		                  Binary(state, spv::OpShiftLeftLogical, TypeU32(state), probe,
+		                         ConstantU32(state, 1u)),
+		                  ConstantU32(state, 1u)));
+		const auto mapped_key = LoadMapping(entry);
+		const auto candidate =
+		    LoadMapping(Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+		const auto equal = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+		selected = Select(state, TypeU32(state),
+		                  Binary(state, spv::OpLogicalAnd, TypeBool(state), active, equal), candidate,
+		                  selected);
+		const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+		low = Select(state, TypeU32(state), Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less),
+		             Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+		high = Select(state, TypeU32(state),
+		              Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
+		                     Unary(state, spv::OpLogicalNot, TypeBool(state), less)),
+		              mid, high);
+	}
+	const auto            merge = state.builder.AllocateId();
+	std::vector<uint32_t> labels(buffer.indirect_resources.size());
+	for (auto& label: labels) {
+		label = state.builder.AllocateId();
+	}
+	std::vector<uint32_t> branch {spv::OpSwitch, selected, labels[0]};
+	for (uint32_t candidate = 1; candidate < labels.size(); ++candidate) {
+		branch.push_back(candidate);
+		branch.push_back(labels[candidate]);
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(branch);
+	const bool            has_result = inst.GetType() != IR::Type::Void;
+	std::vector<uint32_t> phi;
+	if (has_result) {
+		phi = {spv::OpPhi, TypeId(state, inst.GetType()), state.builder.AllocateId()};
+	}
+	IR::Inst access(op, inst.Flags<uint64_t>());
+	for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+		access.SetArg(arg, inst.Arg(arg));
+	}
+	auto candidate_memory    = memory;
+	ctx.memory_override_inst = &access;
+	ctx.memory_override      = &candidate_memory;
+	for (uint32_t candidate = 0; candidate < labels.size(); ++candidate) {
+		EmitLabel(state, labels[candidate]);
+		candidate_memory.resource = buffer.indirect_resources[candidate];
+		EmitDirectInstruction(ctx, access);
+		if (has_result) {
+			phi.push_back(ctx.definitions.at(&access));
+			phi.push_back(state.current_label);
+			ctx.definitions.erase(&access);
+		}
+		state.builder.AddFunction(spv::OpBranch, merge);
+	}
+	ctx.memory_override      = nullptr;
+	ctx.memory_override_inst = nullptr;
+	EmitLabel(state, merge);
+	if (has_result) {
+		state.builder.AddFunction(phi);
+		ctx.Define(inst, phi[2]);
+	}
+	return true;
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (EmitIndirectBufferAccess(ctx, inst)) {
+		return;
+	}
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);

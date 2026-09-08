@@ -57,7 +57,9 @@ struct DeferredContinuePatch {
 
 struct StructuredFunctionState {
 	std::unordered_set<const IR::Block*>           dedicated_continues;
-	std::unordered_set<const IR::Block*>           guarded_loop_bodies;
+	std::unordered_map<const IR::Block*,
+	                   std::pair<const IR::Block*, const IR::Block*>>
+	    budgeted_loop_continues;
 	std::vector<DeferredContinuePatch>             deferred_continues;
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
@@ -217,6 +219,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			if (target == nullptr) {
 				EmitReturn(ctx);
 				return;
+			}
+			uint32_t         within = 0;
+			const IR::Block* merge  = nullptr;
+			if (const auto loop = structured.budgeted_loop_continues.find(block);
+			    loop != structured.budgeted_loop_continues.end() && target == loop->second.first) {
+				within = EmitGraphicsLoopWithinBudget(ctx);
+				merge  = loop->second.second;
 			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(target));
@@ -813,13 +822,6 @@ void EmitProgram(EmitterState& state) {
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
-	for (const auto variable: state.wave_ballot_word_variables) {
-		if (variable != 0) {
-			state.builder.AddFunction(
-			    {OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)), variable,
-			     StorageClassFunction});
-		}
-	}
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -859,7 +861,7 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
-	if (state.gds_variable != 0 && HasGuestGdsAccess(state.program)) {
+	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
 		                          state.gds_variable, 0);

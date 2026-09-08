@@ -3,6 +3,24 @@
 Обновлено **8 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Текущий цикл **8 сентября 2026, 11:40–12:17 UTC** восстановил два общих
+предусловия запуска и снял новый shader-validation blocker. Adjacent-module
+discovery теперь включает `fakelib`, поэтому установленные из раздачи
+`libScePlayGo.sprx` и `libSceAmpr.sprx` реально загружаются; PS5 PlayGo header
+`plgx` распознаётся и сообщает 35 chunks вместо пустой таблицы. Sampled depth,
+не находящийся в attachment feedback loop, планируется в `GENERAL`. Для
+partitioned graphics wave64 loop budget добавлен отдельный RED: минимальный
+do-while воспроизвёл точную ошибку post-dominance из PS
+`f8927c09f4b928c7`. Проверка бюджета перенесена с тела continue-конструкции на
+её back-edge, после чего неизменённый тест и захваченный игровой модуль проходят
+`spirv-val`. Установленный emulator SHA-256:
+`f6d4415238bcf971ea730067ed2a824a01c757d5113477fcdf579e548e683b37`.
+Последний bounded GPUAV run
+`_Build/runs/yotei-integrated-20260908-121310-464eda` завершён по timeout:
+target SPIR-V валиден, frame 131 / 118 flips / 117 shown, а source readback
+кадров 110–117 всё ещё RGB=0, alpha=3. Следующий шаг — более длинный прогретый
+run за прежнюю границу frame 158; первый ненулевой RGB остаётся **PENDING**.
+
 Цикл **8 сентября 2026, 08:31–09:30 UTC** выборочно перенёс общий механизм из
 upstream PR #500: строгий recognizer полного DWORD pattern fill, сохранение точного
 HTILE fill value и его guest-memory side effect, а также materialization
@@ -288,12 +306,12 @@ PC `0x530`; следующий blocker — runtime-происхождение DW
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; SHA-256 `c3088432abe5babdbe573b8f651a74f11976129b9dbb0a639e8789d7a254570c`. | `shader_cfg_tests --single-wave64-ballot-spirv-only` и zero-predicate regression PASS; полный CTest отложен как test debt. |
+| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; SHA-256 `f6d4415238bcf971ea730067ed2a824a01c757d5113477fcdf579e548e683b37`. | Новый `--partitioned-graphics-loop-only`, sampled-depth и PS5 PlayGo regressions PASS; полный CTest отложен как test debt. |
 | Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
 | Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
 | Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
 | CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | RTX 5060 Ti Diagnostic 1280×720: `_Build/runs/yotei-integrated-20260907-211101-9da340`, `b90e`/`a766` pipeline и dispatch завершены, запуск дошёл до frame 158 и 145 shown. | Первый ненулевой видимый кадр не достигнут: readback `_Build/analysis/yotei-present-readback-20260907-2112.txt` показывает RGB=0, alpha=3. |
+| Реальная игра | Максимум остаётся frame 158 / 145 shown в `_Build/runs/yotei-integrated-20260907-211101-9da340`. Текущий tree в `_Build/runs/yotei-integrated-20260908-121310-464eda` загрузил PlayGo 35 chunks и выпустил валидный `f8927c09f4b928c7`; 180-секундный GPUAV timeout остановил его на frame 131 / 117 shown. | Первый ненулевой видимый кадр не достигнут: новый readback `_Build/analysis/yotei-present-after-backedge-loopfix-gpuav-20260908.txt` для frames 110–117 показывает RGB=0, alpha=3. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -363,7 +381,7 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 | Пройденная byte-to-D16 граница | GFX10 MUBUF `0x20...0x23` декодируются как unsigned/signed byte-to-D16 low/high loads с сохранением соседней половины VDATA. `d7a83911714a58ee`: decode 55, structured CFG 4 blocks, Normalize/TrackResources 198, SPIR-V 6 537 слов, shader №172; dispatch 76×1×1 завершён за 63 618 мкс. |
 | Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят PC `0x530`; scalar-buffer image table с ключом `ReadFirstLane(Phi) << 5` также планируется через inline image path и проходит PC `0x4d64`. |
 | Предыдущая pipeline-граница | Screen Space Shadows `b90e2024732c6111` на RTX 5060 Ti: NVIDIA `nvgpucomp64.dll` падал с `0x80000003` во время компиляции. Collision-free LDS DWORD lowering сохранил atomics для конфликтующих адресов и в реальном run довёл `b90e` до успешного pipeline/dispatch. |
-| Текущая execution-граница | Прежний `a7661ff4ea282325` `ErrorDeviceLost` больше не воспроизвёлся в `_Build/runs/yotei-integrated-20260907-211101-9da340`; последняя граница — чёрный source readback, а не GPU completion. |
+| Текущая execution-граница | PS `f8927c09f4b928c7` больше не нарушает структурные правила SPIR-V: новый игровой dump проходит standalone `spirv-val`. Текущий 180-секундный GPUAV run закончился штатным timeout до прохождения прежнего frame-158 максимума; последняя correctness-граница остаётся чёрным source readback. |
 | Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260907-211101-9da340`; `vk_spv_probe.exe` на exact `b90e` artifact всё ещё получает `-2147483645`, тогда как game pipeline получает Success. Readback сохранён отдельно в `_Build/analysis/yotei-present-readback-20260907-2112.txt`. |
 | Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
 

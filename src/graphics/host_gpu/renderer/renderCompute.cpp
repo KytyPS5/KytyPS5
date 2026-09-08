@@ -446,6 +446,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				static std::atomic<uint32_t> input_readback_count = 0;
 				if (std::getenv("KYTY_COMPUTE_READBACK_INPUTS") != nullptr &&
 				    input_readback_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					const char* input_address_text =
+					    std::getenv("KYTY_COMPUTE_READBACK_INPUT_ADDRESS");
+					char*    input_address_end = nullptr;
+					uint64_t input_address     = 0;
+					if (input_address_text != nullptr && *input_address_text != '\0') {
+						input_address = std::strtoull(input_address_text, &input_address_end, 0);
+					}
 					for (uint32_t image_index = 0;
 					     image_index < bindings.resources.images.size(); image_index++) {
 						const auto& image = program.info.images[image_index];
@@ -454,6 +461,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 							continue;
 						}
 						const auto& input = bindings.resources.images[image_index];
+						if (input_address_text != nullptr &&
+						    (input_address_end == input_address_text || *input_address_end != '\0' ||
+						     input.desc.info.data.address != input_address)) {
+							continue;
+						}
 						const bool input_scheduled =
 						    m_context.GetTextureCache().TryDownloadImage(input.image_id);
 						LOGF("ComputeReadbackInput: shader=0x%016" PRIx64

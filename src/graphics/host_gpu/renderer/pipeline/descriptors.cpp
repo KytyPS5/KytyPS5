@@ -1199,14 +1199,6 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		pack_memory_offset(i, buffer_offset);
 		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
 	}
-	if (program.compute_wave_ballot_storage) {
-		EXIT_IF(prepared.wave_ballot_dwords == 0 ||
-		        prepared.wave_ballot_dwords >
-		            std::numeric_limits<size_t>::max() / sizeof(uint32_t));
-		std::vector<uint32_t> ballot_scratch(
-		    static_cast<size_t>(prepared.wave_ballot_dwords), 0u);
-		resources.gds = NativeUpload(m_context, ballot_scratch);
-	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);

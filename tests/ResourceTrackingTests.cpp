@@ -3549,7 +3549,9 @@ void TestBoundedMaterializationNullsForeignBufferSlots() {
                                                 0x0000af1eu, 0x3b32b6c8u};
   const std::array<uint32_t, 4> foreign_reserved{0x05500000u, 0x00000000u,
                                                  0x40000000u, 0x3f700000u};
-  const std::array descriptors{valid, foreign_address, foreign_reserved};
+  const std::array<uint32_t, 4> foreign_range{0x0000022au, 0x200000c0u,
+                                              0xf001d380u, 0x00000000u};
+  const std::array descriptors{valid, foreign_address, foreign_reserved, foreign_range};
   for (uint32_t index = 0; index < descriptors.size(); ++index) {
     const auto& descriptor = descriptors[index];
     for (uint32_t word = 0; word < descriptor.size(); ++word) {
@@ -3557,7 +3559,7 @@ void TestBoundedMaterializationNullsForeignBufferSlots() {
                                 descriptor[word]);
     }
   }
-  const std::array<uint32_t, 3> data{3u, 0x1000u, 0u};
+  const std::array<uint32_t, 3> data{4u, 0x1000u, 0u};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot,
@@ -3570,10 +3572,10 @@ void TestBoundedMaterializationNullsForeignBufferSlots() {
                                 [](uint32_t word) { return word == 0u; }),
         "foreign bounded buffer slot was not canonicalized to a distinct null candidate");
   const auto& table = specialization.buffer_tables[0];
-  Check(table.count == 3u && table.resources == std::vector<uint32_t>{0u, 1u} &&
+  Check(table.count == 4u && table.resources == std::vector<uint32_t>{0u, 1u} &&
             std::vector<uint32_t>(snapshot.flattened_srt.begin() + table.mapping_flat_offset,
                                   snapshot.flattened_srt.end()) ==
-                std::vector<uint32_t>{0u, 1u, 1u},
+                std::vector<uint32_t>{0u, 1u, 1u, 1u},
         "foreign bounded buffer slot lost its stable runtime mapping");
 }
 

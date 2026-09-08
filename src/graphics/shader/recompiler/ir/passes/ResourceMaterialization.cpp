@@ -245,7 +245,10 @@ bool CanonicalizeEnumeratedBufferDescriptor(DescriptorValue& value) {
 	// payload can otherwise resemble a small-address, very large buffer and
 	// reach native binding even though it is not a legal descriptor.
 	constexpr uint32_t reserved_word3_mask = 0x0e180000u;
-	if (descriptor.Base48() >= RegisteredBufferAddressLimit ||
+	const auto address = descriptor.Base48();
+	const auto size    = ScalarBufferSize(descriptor);
+	if (address >= RegisteredBufferAddressLimit ||
+	    size > RegisteredBufferAddressLimit - address ||
 	    (descriptor.fields[3] & reserved_word3_mask) != 0u) {
 		value.dwords.fill(0u);
 	}

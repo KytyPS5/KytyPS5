@@ -1255,3 +1255,80 @@ Full corpus audit
 - Keep the 84 remaining corpus failures as independent debt. Do not claim them
   fixed from this opcode result, and do not prioritize them over an earlier
   runtime frontier without separate evidence.
+
+## Local-region shared-tail CFG cloning and Yotei compile latency
+
+Status: synthetic neighbors, exact manifests, full CPU corpus and bounded native
+game timing are GREEN; first nonzero surface output remains pending.
+
+The captured `6cc64dee32dc7094` graph has 346 blocks and one safe shared linear
+tail in a two-block candidate region. The previous whole-graph cutoff rejected
+that local rewrite, forced dispatcher fallback and produced a 359,238-word
+SPIR-V module whose NVIDIA driver compile stalled for more than 15 minutes.
+Removing the whole-graph cutoff without a local bound made neighboring
+`ps_00051f2c.json` pathological because its candidate region contains 117/118
+blocks.
+
+Checkpoint `f1776f0` admits semantic cloning only while the local region has at
+most 32 blocks and before synthetic `GotoVariable` routing exists. Existing
+single-shared-block, straight-line, 16-instruction-tail and four-clone limits
+remain. `shader_cfg_tests --shared-merge-cfg-only` covers seven neighboring CFG
+shapes. Exact `6cc64dee…` is structured with 376 blocks and its full audit drops
+from about 13.02 to 3.45 seconds. `ps_00051f2c.json` remains bounded through its
+dispatcher path. Full corpus result is 743/825 in 37.851 seconds versus 741/825
+in 57.019 seconds, with no new status regression.
+
+Native GPUAV-lite run
+`_Build/runs/yotei-integrated-20260908-200400-74722b` naturally reaches frame
+133 in 145 seconds versus 1123 seconds for the prior comparable diagnostic run.
+Warm run `_Build/runs/yotei-integrated-20260908-201027-d8c982` naturally reaches
+frame 130 in 120 seconds. Its 118 source readbacks are still RGB zero/alpha 3.
+
+Remaining validation:
+
+- Keep pathological large-region and post-`GotoVariable` cases bounded while
+  adding future structurization rewrites.
+- Measure steady rendering FPS only after a nonzero frame exists; the current
+  figures are startup/compiler progress, not gameplay performance.
+
+## GPUAV-sensitive NVIDIA pipeline cache identity
+
+Status: runtime workaround documented; shared cache identity regression and fix
+remain pending.
+
+Two bounded runs using a cache warmed under GPUAV-lite but launching without
+GPUAV fail at frame 12/13 inside NVIDIA `nvgpucomp64.dll` 32.0.16.1664 with
+exception `0x80000003`. Windows Event Log attributes both APPCRASH events to the
+same module offset. The instrumented GPUAV-lite path continues to the later
+emulator frontiers. Driver cache blobs from GPUAV-lite and non-GPUAV attempts are
+therefore preserved under separate filenames and must not be mixed.
+
+Required tests:
+
+- Add a CPU cache-signature regression proving shader instrumentation/validation
+  mode participates in compatibility whenever the layer can change modules seen
+  by the driver.
+- Keep the native driver reproduction bounded and do not repeatedly crash the
+  compiler merely to test cache loading.
+- Re-enable a no-GPUAV fast profile only after the cache identity is separated
+  and a clean-cache run passes the early graphics pipeline.
+
+## GFX10 MUBUF opcode 0x87 runtime frontier
+
+Status: exact native runtime RED captured; decoder/lowering regression and fix
+pending.
+
+Run `_Build/runs/yotei-integrated-20260908-200400-74722b` naturally exits while
+building compute shader `c8e8f554efbfadef` at PC `0xc6c`. The decoded family is
+MUBUF opcode `0x87`, raw words `[0xe21c6000 0x8002000e]`; CFG construction rejects
+it as unimplemented. This is earlier and more actionable than speculative FPS
+ports because execution cannot pass the instruction.
+
+Required tests:
+
+- Identify opcode `0x87` from the GFX10 ISA tables and add an exact raw-word RED
+  covering operands, format/packing and destination footprint.
+- Implement the shared decoder/IR/backend semantics without title, hash, address
+  or install-path branches; keep unsupported neighboring formats fail-closed.
+- Run unchanged GREEN, neighboring opcode cases, the 825-manifest corpus and a
+  warm GPUAV-lite/source-readback game retry.

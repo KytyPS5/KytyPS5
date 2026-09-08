@@ -6,7 +6,8 @@
 [#470](https://github.com/KytyPS5/KytyPS5/pull/470) и
 [#497](https://github.com/KytyPS5/KytyPS5/pull/497). Сравнение выполнено с веткой
 `yotei-windows-bringup`: первоначальный обзор — на `b247c0f`, runtime-уточнения
-ниже — после `90fed2b`, selective image ports и runtime checkpoint `5aaf3b4`.
+ниже — после `90fed2b`, selective image ports и performance/runtime checkpoint
+`f1776f0`.
 
 Проверены метаданные, описания и состав diff всех 68 PR. Для shader/renderer,
 новых PR #493/#497/#500/#503/#504/#506/#508/#509 и кандидатов, пересекающихся
@@ -38,6 +39,15 @@ indirect storage writes и runtime specialization; целиком #383 влив�
 decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 закрывает его общим ISA lowering. Новый полный shader audit даёт **741/825**
 вместо 714/825; обе прежние группы `0xbd` (19 compact + 7 SDWA) исчезли.
+
+Последующий checkpoint `f1776f0` устранил измеренный compile-time blocker без
+переноса performance bundle: `6cc64dee…` теперь structured, exact audit занимает
+около 3,45 с вместо 13,02 с, а полный corpus — 37,851 с вместо 57,019 с.
+Сопоставимый GPUAV-lite game run дошёл до нового фронтира за 145 с вместо 1123 с
+(примерно 7,7x быстрее). Поэтому быстрый перенос #506 сейчас не нужен для
+главной паузы: его RELEASE_MEM/barrier/GC идеи относятся к scheduling overhead
+уже исполняющегося кадра. Следующий доказанный blocker — MUBUF `0x87`; первый
+ненулевой RGB по-прежнему не получен.
 
 Самые полезные следующие кандидаты:
 
@@ -190,23 +200,24 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#488 minimized window crash](https://github.com/KytyPS5/KytyPS5/pull/488) | **P2/separate:** полезный WSI fix, но не влияет на обычный не-minimized запуск. |
 | [#490 float image atomics](https://github.com/KytyPS5/KytyPS5/pull/490) | **covered:** production semantics уже в ветке; текущий PR head лишь другая актуализация того же класса. |
 | [#493 opt-in BVH stub](https://github.com/KytyPS5/KytyPS5/pull/493) | **diagnostic only:** decode/message полезны; always-miss не является реализацией ray tracing и не нужен Yōtei сейчас. |
-| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** наша рабочая ветка; локальный checkpoint `5aaf3b4` закрывает runtime `V_CMPX_NE_U16`, post-fix game retry pending. |
+| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** checkpoint `f1776f0` закрывает `V_CMPX_NE_U16` и главный `6cc64dee…` CFG compile stall; runtime дошёл до MUBUF `0x87`, nonzero RGB pending. |
 | [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **partly covered/do not merge whole:** часть уже перенесена; оставшиеся typed stores, indirect sync/dispatch, stencil upload и null handling брать только по отдельному RED. |
 | [#503 negative printf precision](https://github.com/KytyPS5/KytyPS5/pull/503) | **P2/separate:** корректный libc fix с хорошим focused coverage; не связан с renderer/shader failure. |
 | [#504 rejected-open descriptor leak](https://github.com/KytyPS5/KytyPS5/pull/504) | **P2/separate:** однострочный kernel cleanup с тестами; полезен глобально, не текущему run. |
-| [#506 GPU scheduling/cache FPS](https://github.com/KytyPS5/KytyPS5/pull/506) | **P1 performance, split first:** четыре полезных идеи, но разные correctness/race contracts; не cherry-pick одним блоком. |
+| [#506 GPU scheduling/cache FPS](https://github.com/KytyPS5/KytyPS5/pull/506) | **P1 performance after correctness, split first:** четыре полезных идеи, но они не устраняют измеренный shader-driver stall; разные correctness/race contracts, не cherry-pick одним блоком. |
 | [#508 Windows PEEK+WAITALL](https://github.com/KytyPS5/KytyPS5/pull/508) | **P2/separate:** чинит Windows test/socket compatibility; workaround не является полной WAITALL emulation. |
 | [#509 primitive restart/watcher/vertex](https://github.com/KytyPS5/KytyPS5/pull/509) | **P1 selective/do not merge whole:** custom restart и watcher lifecycle полезны; fallback invalid selectors в ноль неприемлем без доказательства. |
 
 ## Рекомендуемая очередь без конфликтов со вторым агентом
 
-1. Собрать и запустить `5aaf3b4`, подтвердить прохождение runtime
-   `c8e8f554efbfadef`/VOPC `0xbd` и получить следующий первый fatal либо nonzero RGB.
-2. Сохранять оставшиеся 84 corpus failures как независимый backlog; поднимать
+1. Добавить exact RED и общий decoder/lowering для runtime MUBUF `0x87`, затем
+   повторить прогретый GPUAV-lite/source-readback run `f1776f0`.
+2. Сохранять оставшиеся 82 corpus failures как независимый backlog; поднимать
    конкретную группу раньше runtime frontier только при доказанной общей
    correctness-зависимости.
-3. После correctness frontier измерить #461, #420, #484, #483 и четыре части #506
-   по отдельности. Оптимизации не объединять до измерений.
+3. После первого корректного изображения измерить #461, #420, #484, #483 и
+   четыре части #506 по отдельности. Главный compile stall уже закрыт локальным
+   CFG-механизмом; scheduling-порты не смешивать с opcode correctness.
 4. Для black-frame расследования сначала доказать потерю ownership/clear state.
    Если исчезает GPU-authored storage owner — #373; если capture показывает CMask
    fast clear — #429; если ни то ни другое, эти PR не применять «на удачу».

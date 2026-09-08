@@ -501,6 +501,10 @@ struct RenderExecutorTestAccess {
     executor.BindRenderTarget(id);
   }
 
+  static void BindImage(RenderExecutor &executor, ImageId id, bool storage) {
+    executor.BindImage(id, storage);
+  }
+
   static RenderState AcquireRenderTargets(RenderExecutor &executor,
                                           CommandBuffer &buffer,
                                           RenderColorInfo *colors,
@@ -1112,8 +1116,6 @@ struct CompiledShader {
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
   u32 wave_partition_factor = 1;
-  bool wave_ballot_storage = false;
-  u32 wave_ballot_dwords = 0;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1494,27 +1496,9 @@ CompiledShader CompileCase(
   const auto execution = ShaderRecompiler::PlanComputeExecution(
       result.program, options.input_info, workgroup_limits);
   Require(test.name, "compute execution plan", execution.error.empty(), execution.error);
-  if (execution.IsSplitWave64() &&
-      ShaderRecompiler::IR::NeedsWave64BallotStorage(result.program) &&
-      !ShaderRecompiler::HasGuestGdsAccess(result.program)) {
-    uint64_t host_invocations = 1;
-    for (const auto size : execution.layout.host_size) {
-      Require(test.name, "compute execution plan", size != 0 &&
-                                                   host_invocations <= UINT64_MAX / size,
-              "split wave64 host workgroup size overflowed ballot scratch planning");
-      host_invocations *= size;
-    }
-    Require(test.name, "compute execution plan", host_invocations % 64u == 0,
-            "split wave64 host workgroup is not an integral ballot-wave count");
-    const auto wave_ballot_dwords =
-        static_cast<uint32_t>((host_invocations / 64u) * 2u);
-    return {std::move(result.spirv), std::move(result.program),
-            std::move(resources), std::move(packed_user_data),
-            execution.wave_partition_factor, true, wave_ballot_dwords};
-  }
-  return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data),
-          execution.wave_partition_factor, false, 0};
+	return {std::move(result.spirv), std::move(result.program),
+	        std::move(resources), std::move(packed_user_data),
+	        execution.wave_partition_factor};
 }
 
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
@@ -11645,7 +11629,6 @@ void CheckSampledHtileArrayClearDiscovery() {
               sampled_depth_view != nullptr && normalized_depth_view,
           "uint T# did not retain its requested format while the concrete "
           "view followed the D32 backing");
-      RenderExecutorTestAccess::ResetBindings(executor);
 
       auto video_subresource =
           make_target_desc(base + 0x20000, target_mip_size, {1, 1, 1});
@@ -12228,6 +12211,141 @@ void CheckSampledHtileArrayClearDiscovery() {
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "descriptor discovery direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckSampledWritableDepthGeneralLayout() {
+    constexpr const char *name = "SampledWritableDepthGeneralLayout";
+    constexpr uintptr_t base = 0x0000000203900000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t depth_address = base + 0x10000;
+    constexpr uint64_t htile_address = base + 0x30000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "sampled depth direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "sampled depth fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      constexpr uint32_t captured_z_info = 0x22900983u;
+      constexpr uint32_t captured_stencil_info = 0x00100980u;
+      HW::DepthRenderTarget target{};
+      target.z_info = HW::DepthZInfo::Decode(captured_z_info);
+      target.stencil_info = HW::DepthStencilInfo::Decode(captured_stencil_info);
+      target.z_read_base_addr = depth_address;
+      target.z_write_base_addr = depth_address;
+      target.htile_data_base_addr = htile_address;
+      target.size = {63, 63, true};
+      registers.SetDepthRenderTarget(target);
+      HW::DepthControl depth_control{};
+      depth_control.z_enable = true;
+      depth_control.z_write_enable = true;
+      depth_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+      registers.SetDepthControl(depth_control);
+      HW::RenderControl render_control{};
+      render_control.depth_clear_enable = true;
+      registers.SetRenderControl(render_control);
+
+      RenderDepthInfo depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), depth);
+      Require(name, "writable depth fixture",
+              depth.image_id && depth.format == vk::Format::eD32Sfloat &&
+                  depth.depth_write_enable &&
+                  depth.AttachmentWriteAspects() ==
+                      vk::ImageAspectFlagBits::eDepth,
+              "depth fixture did not resolve a writable D32 attachment");
+
+      ShaderRecompiler::IR::ImageResource sampled_resource{};
+      sampled_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      sampled_resource.dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled_resource.read = true;
+      auto sampled_desc = depth.desc;
+      sampled_desc.type = TextureCache::BindingType::Texture;
+      sampled_desc.view_info.format = vk::Format::eD32Sfloat;
+      sampled_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto sampled_view =
+          texture_cache.FindTexture(depth.image_id, sampled_desc);
+      Require(name, "sampled depth fixture",
+              sampled_view != nullptr,
+              "sampled depth view creation failed for the depth attachment");
+
+      ShaderRecompiler::IR::Program ir{};
+      ir.stage = ShaderType::Vertex;
+      ir.resource_tracking_complete = true;
+      ir.info.images.push_back(sampled_resource);
+      ir.shader_info_complete = true;
+      ShaderRecompiler::IR::AllocateBindings(ir);
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ir.stage;
+      program.info = std::move(ir.info);
+      program.bindings = std::move(ir.bindings);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+      PreparedBindings bindings{};
+      bindings.program = &program;
+      bindings.snapshot = &snapshot;
+      bindings.resources.images.push_back(
+          {depth.image_id, sampled_view, sampled_desc});
+
+      RenderExecutorTestAccess::BindImage(executor, depth.image_id, false);
+      RenderColorInfo no_color{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth);
+      const auto pipeline = RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), bindings);
+      const auto &image = texture_cache.GetImage(depth.image_id);
+      Require(name, "sampled writable depth shared layout",
+              rendering.depth_stencil_attachment.image_layout ==
+                      vk::ImageLayout::eGeneral &&
+                  bindings.resources.images[0].layout ==
+                      vk::ImageLayout::eGeneral &&
+                  MakeImageInfo(bindings.resources.images[0]).imageLayout ==
+                      vk::ImageLayout::eGeneral &&
+                  image.backing.state.layout == vk::ImageLayout::eGeneral,
+              "a sampled depth image was transitioned away from its writable "
+              "attachment layout");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      const std::array pipelines{pipeline};
+      RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, pipelines);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "sampled depth direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "sampled depth direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -15046,34 +15164,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   const bool needs_sampler = Has(Kind::Samplers);
   const bool needs_gds = Has(Kind::Gds);
   if (needs_gds) {
-    size_t gds_dwords =
-        std::max<size_t>({test.gds_initial.size(), test.expected_gds.size(), 1u});
-    if (compiled.wave_ballot_storage) {
-      Require(test.name, "GDS scratch allocation",
-              compiled.wave_partition_factor != 0 &&
-                  test.dispatch_x <=
-                      UINT32_MAX / compiled.wave_partition_factor,
-              "expanded compute dispatch overflowed ballot scratch planning");
-      uint64_t group_count = 1;
-      const std::array dispatch_groups{
-          test.dispatch_x * compiled.wave_partition_factor, test.dispatch_y, test.dispatch_z};
-      for (const auto groups : dispatch_groups) {
-        Require(test.name, "GDS scratch allocation", groups != 0 &&
-                                                     group_count <= UINT64_MAX / groups,
-                "split wave64 ballot dispatch scratch size overflowed");
-        group_count *= groups;
-      }
-      Require(test.name, "GDS scratch allocation",
-              compiled.wave_ballot_dwords != 0 &&
-                  group_count <=
-                      std::numeric_limits<size_t>::max() /
-                          compiled.wave_ballot_dwords,
-              "split wave64 ballot scratch size is not representable");
-      const auto ballot_dwords =
-          static_cast<size_t>(group_count) *
-          compiled.wave_ballot_dwords;
-      gds_dwords = std::max(gds_dwords, ballot_dwords);
-    }
+	const auto gds_dwords = std::max<size_t>(
+	    {test.gds_initial.size(), test.expected_gds.size(), 1u});
     gds_buffer =
         vulkan->CreateStorageBuffer(test.name, test.gds_initial, gds_dwords);
   }
@@ -35134,6 +35226,12 @@ if (argc == 1) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
     CheckSampledDepthDescriptor(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--sampled-depth-target-layout-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledWritableDepthGeneralLayout();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {

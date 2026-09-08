@@ -454,21 +454,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	auto bindings = PrepareBindings(input_info.stage);
-	if (program.compute_wave_ballot_storage) {
-		uint64_t group_count = 1;
-		for (const auto groups: *dispatch_groups) {
-			if (groups == 0 || group_count > UINT64_MAX / groups) {
-				EXIT("wave64 ballot dispatch scratch size overflow\n");
-			}
-			group_count *= groups;
-		}
-		if (program.compute_wave_ballot_dwords == 0 ||
-		    group_count > UINT64_MAX / program.compute_wave_ballot_dwords) {
-			EXIT("wave64 ballot dispatch scratch size overflow\n");
-		}
-		bindings.wave_ballot_dwords =
-		    group_count * program.compute_wave_ballot_dwords;
-	}
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.GetGpuResources().PrepareBda();
@@ -518,6 +503,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				static std::atomic<uint32_t> input_readback_count = 0;
 				if (std::getenv("KYTY_COMPUTE_READBACK_INPUTS") != nullptr &&
 				    input_readback_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					const char* input_address_text =
+					    std::getenv("KYTY_COMPUTE_READBACK_INPUT_ADDRESS");
+					char*    input_address_end = nullptr;
+					uint64_t input_address     = 0;
+					if (input_address_text != nullptr && *input_address_text != '\0') {
+						input_address = std::strtoull(input_address_text, &input_address_end, 0);
+					}
 					for (uint32_t image_index = 0;
 					     image_index < bindings.resources.images.size(); image_index++) {
 						const auto& image = program.info.images[image_index];
@@ -526,6 +518,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 							continue;
 						}
 						const auto& input = bindings.resources.images[image_index];
+						if (input_address_text != nullptr &&
+						    (input_address_end == input_address_text || *input_address_end != '\0' ||
+						     input.desc.info.data.address != input_address)) {
+							continue;
+						}
 						const bool input_scheduled =
 						    m_context.GetTextureCache().TryDownloadImage(input.image_id);
 						LOGF("ComputeReadbackInput: shader=0x%016" PRIx64

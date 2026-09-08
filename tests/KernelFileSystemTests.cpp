@@ -5,12 +5,16 @@
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
+#include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <string_view>
 
@@ -76,6 +80,63 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void CheckAdjacentModuleDiscovery() {
+  TempDirectory temporary;
+  const auto &root = temporary.Path();
+  std::filesystem::create_directories(root / "sce_module");
+  std::filesystem::create_directories(root / "sce_modules");
+  std::filesystem::create_directories(root / "fakelib");
+
+  for (const auto &path : {root / "root.prx", root / "eboot.bin",
+                           root / "ignored.txt",
+                           root / "sce_module" / "module.sprx",
+                           root / "sce_modules" / "modules.prx",
+                           root / "fakelib" / "compat.sprx"}) {
+    std::ofstream(path).put('\0');
+  }
+
+  std::set<std::string> relative;
+  for (const auto &path : Loader::DiscoverAdjacentProgramFiles(root)) {
+    relative.insert(std::filesystem::relative(path, root).generic_string());
+  }
+
+  Check(relative.contains("root.prx"), "discover root PRX");
+  Check(relative.contains("sce_module/module.sprx"),
+        "discover sce_module SPRX");
+  Check(relative.contains("sce_modules/modules.prx"),
+        "discover sce_modules PRX");
+  Check(relative.contains("fakelib/compat.sprx"),
+        "discover compatibility SPRX");
+  Check(!relative.contains("eboot.bin"), "skip eboot");
+  Check(!relative.contains("ignored.txt"), "skip non-module file");
+}
+
+void CheckPs5PlayGoChunkCount() {
+  TempDirectory temporary;
+  const auto sce_sys = temporary.Path() / "sce_sys";
+  std::filesystem::create_directories(sce_sys);
+
+  {
+    std::ofstream param(sce_sys / "param.json", std::ios::binary);
+    param << "{}";
+  }
+  {
+    // PS5 PlayGo header ("plgx") with 35 chunks at the shared offset.
+    constexpr unsigned char header[] = {
+        0x70, 0x6c, 0x67, 0x78, 0x00, 0x10,
+        0x00, 0x00, 0x01, 0x00, 0x23, 0x00,
+    };
+    std::ofstream chunks(sce_sys / "playgo-chunk.dat", std::ios::binary);
+    chunks.write(reinterpret_cast<const char *>(header), sizeof(header));
+  }
+
+  Loader::SystemContentLoadParamSfo(sce_sys / "param.json");
+  uint32_t chunks_num = 0;
+  Check(Loader::SystemContentGetChunksNum(&chunks_num),
+        "open PS5 PlayGo chunk table");
+  Check(chunks_num == 35, "read PS5 PlayGo chunk count");
+}
+
 } // namespace
 
 int main() {
@@ -86,6 +147,9 @@ int main() {
   options.printf_direction = Config::OutputDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  CheckAdjacentModuleDiscovery();
+  CheckPs5PlayGoChunkCount();
 
   TempDirectory temporary;
   FileSystem::Initialize();

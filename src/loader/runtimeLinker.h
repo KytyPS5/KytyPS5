@@ -19,6 +19,9 @@ struct Elf64_Sym;
 struct Elf64_Rela;
 class RuntimeLinker;
 
+std::vector<std::filesystem::path> DiscoverAdjacentProgramFiles(
+	const std::filesystem::path& root);
+
 using module_func_t                          = KYTY_SYSV_ABI int (*)(size_t args, const void* argp);
 using application_heap_free_func_t           = KYTY_SYSV_ABI void (*)(void*);
 using application_heap_malloc_func_t         = KYTY_SYSV_ABI void* (*)(uint64_t);

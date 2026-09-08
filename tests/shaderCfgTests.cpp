@@ -7773,6 +7773,41 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestPartitionedGraphicsLoopBudgetSpirv() {
+  const uint32_t bounded_shader[] = {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 2),         // leave the loop when scc == 0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopp(0x02, 0xfffcu),   // backedge to the loop condition
+      EncodeSopp(0x01),            // s_endpgm
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.wave_size = 64;
+  options.compute_workgroup_limits.native_subgroup_size = 32;
+
+  auto bounded = RecompileForTest(bounded_shader, options);
+  Check(Common::ContainsStr(DisassembleSpirvBinary(bounded.spirv),
+                            "graphics_loop_counter"),
+        "partitioned graphics loop omitted its finite iteration budget");
+  CheckSpirvBinaryValidates(bounded.spirv);
+
+  const uint32_t stalled_shader[] = {
+      EncodeSMovB32(0, 128),        // s0 = 0
+      EncodeSop2(0x00, 0, 0, 129),  // loop: s_add_u32 s0, s0, 1
+      EncodeSopc(0x0a, 0, 130),     // s_cmp_lt_u32 s0, 2
+      EncodeSopp(0x05, 0xfffdu),    // do-while backedge
+      EncodeSopp(0x01),             // s_endpgm
+  };
+  auto stalled = RecompileForTest(stalled_shader, options);
+  Check(Common::ContainsStr(DisassembleSpirvBinary(stalled.spirv),
+                            "graphics_loop_counter"),
+        "stalled partitioned graphics loop omitted its finite budget");
+  CheckSpirvBinaryValidates(stalled.spirv);
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
@@ -15332,6 +15367,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_SPLIT_WAVE64_CYCLIC_IMAGE_SPIRV_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--partitioned-graphics-loop-only") == 0) {
+    Libs::Graphics::TestPartitionedGraphicsLoopBudgetSpirv();
+    std::puts("KYTY_PARTITIONED_GRAPHICS_LOOP_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-scalar-read-branch-only") == 0) {
     Libs::Graphics::TestCooperativeWave64ScalarReadBranchUniformity();
     return 0;
@@ -15435,6 +15475,7 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();
+  TestPartitionedGraphicsLoopBudgetSpirv();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();

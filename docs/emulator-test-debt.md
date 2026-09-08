@@ -1120,3 +1120,28 @@ Validation at `b1a894f-dirty`:
 Remaining validation: restore a normal current-tree build by completing the ballot
 change, repeat the bounded game run, and require at least one source readback with
 nonzero RGB. Menu and gameplay remain separate pending stages.
+
+## Partitioned graphics loop budget at the structured back-edge
+
+Status: the synthetic validator regression and the captured game SPIR-V are GREEN;
+the full native suite and nested-loop variants remain deferred.
+
+The previous finite pixel-loop guard emitted a kill selection at the first
+non-Phi instruction of the loop body. When that body was also the SPIR-V continue
+target, the selection was not structurally post-dominated by the back-edge block.
+A direct budget exit from the loop header avoided that error but introduced a new
+path to the merge that bypassed body definitions. The unchanged captured shader
+then failed dominance validation.
+
+The shared emitter now records the structured loop header, merge and continue
+blocks and applies the finite budget on the continue back-edge. The over-budget
+edge reaches the existing merge only after the body has executed, preserving
+dominance, while `OpLoopMerge` remains immediately adjacent to its branch.
+`shader_cfg_tests --partitioned-graphics-loop-only` covers conditional while and
+do-while back-edges; its original RED is retained at
+`_Build/logs/partitioned-graphics-loop-red-20260908-v3.txt` and GREEN at
+`_Build/logs/partitioned-graphics-loop-green-20260908-v2.txt`. The resulting game
+module `f8927c09f4b928c7` also passes standalone `spirv-val`.
+
+Remaining validation: run the complete native test suite and add explicit nested
+and multiple-loop cases, including distinct continue targets and merge blocks.

@@ -598,20 +598,6 @@ bool HasGuestLdsAccess(const IR::Program& program) {
 	return false;
 }
 
-bool HasGuestGdsAccess(const IR::Program& program) {
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) continue;
-			const auto index = inst.Flags<IR::MemoryFlags>().index;
-			if (index < program.memory_info.size() &&
-			    program.memory_info[index].kind == IR::ResourceKind::Gds) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
                                           ShaderStageInputInfo input_info,
                                           const ComputeWorkgroupLimits& limits) {
@@ -676,11 +662,7 @@ ComputeExecutionPlan PlanComputeExecution(const IR::Program& program,
 	const auto try_mode = [&](bool cooperative) {
 		auto candidate = plan;
 		const uint64_t wave_count = cooperative ? uint64_t{count} / 64u : 1u;
-		// Ballot aggregation uses a per-dispatch storage buffer unless the guest
-		// already consumes GDS, where the legacy Workgroup fallback remains the
-		// only non-aliasing option.
-		const uint64_t ballot_dwords =
-		    HasWaveBallot(program) && HasGuestGdsAccess(program) ? wave_count * 2u : 0u;
+		const uint64_t ballot_dwords = HasWaveBallot(program) ? wave_count * 2u : 0u;
 		const uint64_t collective_dwords =
 		    (cooperative ? uint64_t{count} : 64ull) + ballot_dwords;
 		const uint64_t shared_bytes = collective_dwords * sizeof(uint32_t) +

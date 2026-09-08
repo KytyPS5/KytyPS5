@@ -14,7 +14,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -206,10 +205,23 @@ void CaptureDispatchedShader(const ShaderParams& params,
 	}
 }
 
+bool ShouldDumpShaderSpirv(uint64_t shader_hash) {
+	if (Config::GraphicsDebugDumpEnabled() ||
+	    std::getenv("KYTY_DUMP_SPIRV_BEFORE_VALIDATE") != nullptr) {
+		return true;
+	}
+	const char* filter = std::getenv("KYTY_DUMP_SPIRV_HASH");
+	if (filter == nullptr || *filter == '\0') {
+		return false;
+	}
+	char*      end    = nullptr;
+	const auto parsed = std::strtoull(filter, &end, 0);
+	return end != filter && *end == '\0' && parsed == shader_hash;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled() &&
-	    std::getenv("KYTY_DUMP_SPIRV_BEFORE_VALIDATE") == nullptr) {
+	if (!ShouldDumpShaderSpirv(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -443,12 +455,10 @@ struct PipelineCache::ProgramCache {
 			            stage_name, options.shader_hash, original_words, result.spirv.size(), elapsed);
 			std::fflush(stdout);
 		}
-		if (std::getenv("KYTY_DUMP_SPIRV_BEFORE_VALIDATE") != nullptr) {
+		if (ShouldDumpShaderSpirv(options.shader_hash)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 		}
 		uint32_t wave_partition_factor = 1;
-		bool     wave_ballot_storage   = false;
-		uint32_t wave_ballot_dwords    = 0;
 		if constexpr (Stage == ShaderType::Compute) {
 			if (optimization_trace != nullptr && *optimization_trace != '\0') {
 				std::printf("ComputePlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
@@ -467,40 +477,6 @@ struct PipelineCache::ProgramCache {
 				EXIT("compute execution plan failed: %s\n", execution.error.c_str());
 			}
 			wave_partition_factor = execution.wave_partition_factor;
-			if (optimization_trace != nullptr && *optimization_trace != '\0') {
-				std::printf("BallotPlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
-				std::fflush(stdout);
-			}
-			const bool needs_wave_ballot_storage =
-			    ShaderRecompiler::IR::NeedsWave64BallotStorage(result.program);
-			const bool has_guest_gds = ShaderRecompiler::HasGuestGdsAccess(result.program);
-			wave_ballot_storage =
-			    execution.IsSplitWave64() && needs_wave_ballot_storage && !has_guest_gds;
-			if (optimization_trace != nullptr && *optimization_trace != '\0') {
-				std::printf("BallotPlanEnd: hash=0x%016" PRIx64 " split=%u needs=%u gds=%u\n",
-				            options.shader_hash, execution.IsSplitWave64(),
-				            needs_wave_ballot_storage, has_guest_gds);
-				std::fflush(stdout);
-			}
-			if (wave_ballot_storage) {
-				uint64_t host_invocations = 1;
-				for (const auto size: execution.layout.host_size) {
-					if (size == 0 || host_invocations > UINT64_MAX / size) {
-						EXIT("wave64 ballot host workgroup size overflow\n");
-					}
-					host_invocations *= size;
-				}
-				if (host_invocations == 0 || (host_invocations % 64u) != 0u ||
-				    host_invocations / 64u > UINT32_MAX / 2u) {
-					EXIT("wave64 ballot host workgroup has an invalid wave count\n");
-				}
-				wave_ballot_dwords =
-				    static_cast<uint32_t>((host_invocations / 64u) * 2u);
-			}
-			if (optimization_trace != nullptr && *optimization_trace != '\0') {
-				std::printf("ComputePlanPostBallot: hash=0x%016" PRIx64 "\n", options.shader_hash);
-				std::fflush(stdout);
-			}
 		}
 		if (optimization_trace != nullptr && *optimization_trace != '\0') {
 			std::printf("CompilePermutationPostPlan: hash=0x%016" PRIx64 "\n", options.shader_hash);
@@ -541,8 +517,6 @@ struct PipelineCache::ProgramCache {
 		}
 		auto compiled_info = std::move(result.program).TakeCompiledInfo();
 		compiled_info.compute_wave_partition_factor = wave_partition_factor;
-		compiled_info.compute_wave_ballot_storage = wave_ballot_storage;
-		compiled_info.compute_wave_ballot_dwords  = wave_ballot_dwords;
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(compiled_info),

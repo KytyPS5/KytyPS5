@@ -54,7 +54,9 @@ struct DeferredContinuePatch {
 
 struct StructuredFunctionState {
 	std::unordered_set<const IR::Block*>           dedicated_continues;
-	std::unordered_set<const IR::Block*>           guarded_loop_bodies;
+	std::unordered_map<const IR::Block*,
+	                   std::pair<const IR::Block*, const IR::Block*>>
+	    budgeted_loop_continues;
 	std::vector<DeferredContinuePatch>             deferred_continues;
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
@@ -212,7 +214,19 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& st
 				EmitReturn(ctx);
 				return;
 			}
+			uint32_t         within = 0;
+			const IR::Block* merge  = nullptr;
+			if (const auto loop = structured.budgeted_loop_continues.find(block);
+			    loop != structured.budgeted_loop_continues.end() && target == loop->second.first) {
+				within = EmitGraphicsLoopWithinBudget(ctx);
+				merge  = loop->second.second;
+			}
 			emit_merge();
+			if (within != 0) {
+				ctx.state.builder.AddFunction(
+				    {OpBranchConditional, within, ctx.Label(target), ctx.Label(merge)});
+				return;
+			}
 			ctx.state.builder.AddFunction({OpBranch, ctx.Label(target)});
 			return;
 		}
@@ -223,7 +237,27 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& st
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			auto condition = ctx.Def(info.condition);
+			if (const auto loop = structured.budgeted_loop_continues.find(block);
+			    loop != structured.budgeted_loop_continues.end()) {
+				const auto* header = loop->second.first;
+				const auto* merge  = loop->second.second;
+				const auto  within = EmitGraphicsLoopWithinBudget(ctx);
+				if (true_block == header && false_block == merge) {
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalAnd, TypeBool(ctx.state), guarded, condition, within});
+					condition = guarded;
+				} else if (true_block == merge && false_block == header) {
+					const auto outside = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalNot, TypeBool(ctx.state), outside, within});
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalOr, TypeBool(ctx.state), guarded, condition, outside});
+					condition = guarded;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
@@ -426,29 +460,18 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			structured.dedicated_continues.insert(body);
 		}
 		if (ctx.state.graphics_loop_counter_variable != 0 && info.terminator.loop_header) {
-			const auto* merge = TargetBlock(ctx.program, info.terminator.merge_block);
-			const IR::Block* body = nullptr;
-			if (info.terminator.kind == CFG::TerminatorKind::Branch) {
-				body = TargetBlock(ctx.program, info.terminator.true_block);
-			} else if (info.terminator.kind == CFG::TerminatorKind::ConditionalBranch) {
-				const auto* on_true  = TargetBlock(ctx.program, info.terminator.true_block);
-				const auto* on_false = TargetBlock(ctx.program, info.terminator.false_block);
-				body = on_true == merge ? on_false : on_false == merge ? on_true : nullptr;
-			}
-			if (body != nullptr && body != merge) {
-				structured.guarded_loop_bodies.insert(body);
+			const auto* header = ctx.program.blocks[index];
+			const auto* merge  = TargetBlock(ctx.program, info.terminator.merge_block);
+			const auto* cont   = TargetBlock(ctx.program, info.terminator.continue_block);
+			if (merge != nullptr && cont != nullptr) {
+				structured.budgeted_loop_continues.emplace(cont, std::pair {header, merge});
 			}
 		}
 	}
 	ctx.state.builder.AddFunction({OpBranch, ctx.Label(ctx.program.blocks.front())});
 	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
 		const auto* block = ctx.program.blocks[index];
-		bool        emit_loop_guard = structured.guarded_loop_bodies.contains(block);
 		EmitBlock(ctx, block, [&](const IR::Inst& inst) {
-			if (emit_loop_guard && inst.GetOpcode() != IR::ValueOpcode::Phi) {
-				EmitKillIfBoolFalse(ctx.state, EmitGraphicsLoopWithinBudget(ctx));
-				emit_loop_guard = false;
-			}
 			EmitStructuredInstruction(ctx, structured, inst);
 		});
 		if (structured.dedicated_continues.contains(block) &&
@@ -808,13 +831,6 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 	state.builder.AddFunction(
 	    {OpFunction, TypeVoid(state), state.main_func, FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
-	for (const auto variable: state.wave_ballot_word_variables) {
-		if (variable != 0) {
-			state.builder.AddFunction(
-			    {OpVariable, TypePointer(state, StorageClassFunction, TypeU32(state)), variable,
-			     StorageClassFunction});
-		}
-	}
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsDwordCount(state)),
@@ -853,7 +869,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		                           TypePointer(state, StorageClassFunction, TypeU32(state)),
 		                           ctx.scratch_u32_variable, StorageClassFunction});
 	}
-	if (state.gds_variable != 0 && HasGuestGdsAccess(state.program)) {
+	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpArrayLength, TypeU32(state), state.gds_length, state.gds_variable, 0});

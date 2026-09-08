@@ -634,9 +634,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
-		image.Transit(layout,
-		              vk::AccessFlagBits2::eColorAttachmentRead |
-		                  vk::AccessFlagBits2::eColorAttachmentWrite,
+		image.binding.attachment_layout = layout;
+		image.binding.attachment_access =
+		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
@@ -700,13 +701,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.samples);
 		}
-		const auto layout = depth_attachment_layout(depth);
+		auto       layout = depth_attachment_layout(depth);
 		const auto writes = depth.AttachmentWriteAspects();
 		auto       access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead};
 		if (writes) {
 			access |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		}
-		const auto& view = depth.desc.view_info;
+		if (writes && image.binding.is_bound) {
+			layout = vk::ImageLayout::eGeneral;
+		}
+		image.binding.attachment_layout = layout;
+		image.binding.attachment_access = access;
+		const auto& view                = depth.desc.view_info;
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},

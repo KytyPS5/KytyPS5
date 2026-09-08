@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
 #include <numeric>
 #include <unordered_set>
 
@@ -885,36 +886,101 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
-	std::unordered_map<const Inst*, Inst*> cloned;
-	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
+	// A table pointer can be defined only on paths reaching its scalar load. Resolve
+	// those PHIs for the load's PC in this CPU plan, preserving the original GPU SSA.
+	// Include the use PC in the cache key because different uses can select different edges.
+	std::map<std::pair<const Inst*, uint32_t>, Inst*> cloned;
+	std::map<std::pair<const Inst*, uint32_t>, bool>  contextual;
+	std::map<std::pair<const Inst*, uint32_t>, Value> resolved_phis;
+	const auto ResolvePhiAt = [&](const Inst* phi, uint32_t pc) {
+		const auto key = std::pair {phi, pc};
+		if (const auto found = resolved_phis.find(key); found != resolved_phis.end())
+			return found->second;
+		const auto value = ResolveResourcePhi(program, Value(const_cast<Inst*>(phi)), pc);
+		resolved_phis.emplace(key, value);
+		return value;
+	};
+	const auto NeedsContext = [&](const Inst* root, uint32_t pc) {
+		if (pc == UINT32_MAX) return false;
+		const auto key = std::pair {root, pc};
+		if (const auto found = contextual.find(key); found != contextual.end())
+			return found->second;
+		std::vector<const Inst*>        pending {root};
+		std::unordered_set<const Inst*> visited;
+		bool                            needed = false;
+		while (!pending.empty() && !needed) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!visited.insert(inst).second) continue;
+			if (const auto found = contextual.find({inst, pc}); found != contextual.end()) {
+				needed = found->second;
+				continue;
+			}
+			const auto op = inst->GetOpcode();
+			// Loads establish their own context; flattened reads refer to a separate SRT entry.
+			if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+			    op == ValueOpcode::ReadConst)
+				continue;
+			if (op == ValueOpcode::Phi &&
+			    ResolvePhiAt(inst, pc) != Value(const_cast<Inst*>(inst))) {
+				needed = true;
+				break;
+			}
+			for (size_t i = 0; i < inst->NumArgs(); ++i) {
+				if (const auto* arg = inst->Arg(i).Resolve().TryInstruction())
+					pending.push_back(arg);
+			}
+		}
+		if (!needed) {
+			for (const auto* inst: visited)
+				contextual.emplace(std::pair {inst, pc}, false);
+		}
+		contextual.emplace(key, needed);
+		return needed;
+	};
+	std::function<Value(Value, uint32_t)> CloneAt = [&](Value value, uint32_t pc) -> Value {
 		value              = value.Resolve();
 		const auto* source = value.TryInstruction();
 		if (source == nullptr) {
 			return value;
 		}
+		const auto op = source->GetOpcode();
+		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+			pc = source->Flags<MemoryFlags>().pc;
+		} else if (op == ValueOpcode::ReadConst || op == ValueOpcode::GetUserData ||
+		           op == ValueOpcode::GetShaderBase || op == ValueOpcode::GetSrtResource) {
+			pc = UINT32_MAX;
+		}
 		if (source->GetOpcode() == ValueOpcode::Phi) {
+			if (pc != UINT32_MAX) {
+				const auto guarded = ResolvePhiAt(source, pc);
+				if (guarded != value) return CloneAt(guarded, pc);
+			}
 			const auto invariant = ResolveInvariantPhi(program, value);
 			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
+				return CloneAt(invariant, pc);
 			}
 		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
+		// Preserve shared loop/index identities when no guarded PHI needs rewriting.
+		const auto key = std::pair {source, NeedsContext(source, pc) ? pc : UINT32_MAX};
+		if (const auto found = cloned.find(key); found != cloned.end()) {
 			return Value(found->second);
 		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
-		cloned.emplace(source, &target);
+		cloned.emplace(key, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
 			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
+				target.AddPhiOperand(nullptr, CloneAt(source->Arg(index), pc));
 			}
 		} else {
 			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.SetArg(index, Clone(source->Arg(index)));
+				target.SetArg(index, CloneAt(source->Arg(index), pc));
 			}
 		}
 		return Value(&target);
 	};
+	const auto Clone = [&](Value value) { return CloneAt(value, UINT32_MAX); };
 
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
 	for (const auto& source: program.descriptor_sources) {

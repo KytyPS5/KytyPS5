@@ -570,6 +570,7 @@ void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+Value ResolveResourcePhi(const Program& program, Value value, uint32_t pc, uint32_t depth = 0);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

@@ -176,7 +176,7 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = handle.Arg(i).Resolve();
+			descriptor.dwords[i] = ResolveResourcePhi(m_program, handle.Arg(i), pc);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);

@@ -714,57 +714,7 @@ void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	ReadLiteralOperands(code, word_index, inst);
 }
 
-using Vop1ModifierDecodeFn = void (*)(uint32_t pc, std::span<const uint32_t> code,
-                                      uint32_t word_index, uint32_t opcode, uint32_t vdst,
-                                      Instruction& inst);
-
-struct Vop1ModifierDecoder {
-	uint32_t             escape = 0;
-	Vop1ModifierDecodeFn decode = nullptr;
-};
-
-constexpr Vop1ModifierDecoder VOP1_MODIFIER_DECODERS[] = {
-    {249u, DecodeVop1Sdwa},
-    {250u, DecodeVop1Dpp},
-};
-
-bool TryDecodeVop1Modifier(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                           uint32_t src0, uint32_t opcode, uint32_t vdst, Instruction& inst) {
-	for (const auto& decoder: VOP1_MODIFIER_DECODERS) {
-		if (decoder.escape == src0) {
-			decoder.decode(pc, code, word_index, opcode, vdst, inst);
-			return true;
-		}
-	}
-	return false;
-}
-
-bool IsVop2FloatSourceOpcode(Opcode opcode) {
-	switch (opcode) {
-		case Opcode::V_ADD_F32:
-		case Opcode::V_SUB_F32:
-		case Opcode::V_SUBREV_F32:
-		case Opcode::V_MUL_F32:
-		case Opcode::V_MIN_F32:
-		case Opcode::V_MAX_F32:
-		case Opcode::V_MAC_F32:
-		case Opcode::V_MADMK_F32:
-		case Opcode::V_MADAK_F32:
-		case Opcode::V_CVT_PKRTZ_F16_F32:
-		case Opcode::V_ADD_F16:
-		case Opcode::V_SUB_F16:
-		case Opcode::V_SUBREV_F16:
-		case Opcode::V_MUL_F16:
-		case Opcode::V_FMAC_F16:
-		case Opcode::V_FMAMK_F16:
-		case Opcode::V_FMAAK_F16:
-		case Opcode::V_MAX_F16:
-		case Opcode::V_MIN_F16: return true;
-		default: return false;
-	}
-}
-
-bool IsVop2FloatResultOpcode(Opcode opcode) {
+bool IsVop2FloatOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_F32:
 		case Opcode::V_SUB_F32:
@@ -975,12 +925,12 @@ bool ValidateVop2Sdwa(Instruction& inst, uint32_t opcode, const Vop2SdwaFields& 
 		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 SDWA selector is invalid");
 		return false;
 	}
-	if ((fields.clamp != 0u || fields.omod != 0u) && !IsVop2FloatResultOpcode(inst.opcode)) {
+	if ((fields.clamp != 0u || fields.omod != 0u) && !IsVop2FloatOpcode(inst.opcode)) {
 		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 SDWA output modifiers are not supported");
 		return false;
 	}
 	if (IsFullWidthVop2Sdwa(fields)) {
-		if (!IsVop2FloatSourceOpcode(inst.opcode) && inst.opcode != Opcode::V_CNDMASK_B32 &&
+		if (!IsVop2FloatOpcode(inst.opcode) && inst.opcode != Opcode::V_CNDMASK_B32 &&
 		    (fields.src0_neg != 0u || fields.src0_abs != 0u || fields.src1_neg != 0u ||
 		     fields.src1_abs != 0u)) {
 			SetUnsupported(inst, Family::VOP2, opcode,
@@ -1098,39 +1048,13 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 		inst.src1.negate_hi = inst.src1.negate;
 	}
 
-	if (!IsVop2FloatSourceOpcode(inst.opcode) && !packed_fmac &&
+	if (!IsVop2FloatOpcode(inst.opcode) && !packed_fmac &&
 	    (inst.src0.negate || inst.src0.absolute || inst.src1.negate || inst.src1.absolute)) {
 		SetUnsupported(inst, Family::VOP2, opcode,
 		               "VOP2 DPP integer source modifiers are not supported");
 		return;
 	}
 	FinalizeVop2Instruction(code, word_index, inst);
-}
-
-using Vop2ModifierDecodeFn = void (*)(uint32_t pc, std::span<const uint32_t> code,
-                                      uint32_t word_index, uint32_t opcode, uint32_t vdst,
-                                      uint32_t vsrc1, Instruction& inst);
-
-struct Vop2ModifierDecoder {
-	uint32_t             escape = 0;
-	Vop2ModifierDecodeFn decode = nullptr;
-};
-
-constexpr Vop2ModifierDecoder VOP2_MODIFIER_DECODERS[] = {
-    {249u, DecodeVop2Sdwa},
-    {250u, DecodeVop2Dpp},
-};
-
-bool TryDecodeVop2Modifier(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
-                           uint32_t src0, uint32_t opcode, uint32_t vdst, uint32_t vsrc1,
-                           Instruction& inst) {
-	for (const auto& decoder: VOP2_MODIFIER_DECODERS) {
-		if (decoder.escape == src0) {
-			decoder.decode(pc, code, word_index, opcode, vdst, vsrc1, inst);
-			return true;
-		}
-	}
-	return false;
 }
 
 struct VopcSdwaFields {
@@ -1543,8 +1467,10 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 opcode is not implemented");
 		return;
 	}
-	if (TryDecodeVop2Modifier(pc, code, word_index, src0, opcode, vdst, vsrc1, inst)) {
-		return;
+	switch (src0) {
+		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		default: break;
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
@@ -1575,8 +1501,10 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.src_count = 0;
 		return;
 	}
-	if (TryDecodeVop1Modifier(pc, code, word_index, src0, opcode, vdst, inst)) {
-		return;
+	switch (src0) {
+		case 249u: DecodeVop1Sdwa(pc, code, word_index, opcode, vdst, inst); return;
+		case 250u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
+		default: break;
 	}
 	const bool scalar_dst = UsesScalarDestination(inst.opcode);
 	if (scalar_dst) {

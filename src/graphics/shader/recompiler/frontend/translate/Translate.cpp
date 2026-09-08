@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-Decoder::Operand Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
+const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
 		case 0: return inst.src0;
 		case 1: return inst.src1;
@@ -25,7 +25,7 @@ Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst
 		return destination;
 	}
 	for (uint32_t index = 0; index < std::min(inst.src_count, 3u); index++) {
-		const auto source = SourceAt(inst, index);
+		const auto& source = SourceAt(inst, index);
 		if (!source.dpp) {
 			continue;
 		}
@@ -440,10 +440,6 @@ void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
 	Write16Bits(operand, bits);
 }
 
-void Translator::WriteU16(const Decoder::Operand& operand, IR::U32 value) {
-	Write16Bits(operand, value);
-}
-
 IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 	return IR::U32(ReadOperand(operand, IR::Type::U32));
 }
@@ -602,10 +598,6 @@ IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
 	const auto bit  = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
 	return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), IR::U32(IR::Value(1u))),
 	                    IR::U32(IR::Value(0u)));
-}
-
-IR::U1 Translator::ReadCondition(const Decoder::Operand& operand) {
-	return IR::U1(ReadOperand(operand, IR::Type::U1));
 }
 
 IR::U32 Translator::ConditionBit(const Decoder::Operand& operand) {

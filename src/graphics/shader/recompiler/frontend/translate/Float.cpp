@@ -59,7 +59,7 @@ bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
 	result             = ApplyF32ResultModifiers(inst.dst, result);
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
-	WriteU16(DestinationOperand(inst), ir.Select(negative, invalid, bits));
+	Write16Bits(DestinationOperand(inst), ir.Select(negative, invalid, bits));
 	return true;
 }
 
@@ -95,7 +95,7 @@ bool Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 	result              = ApplyF32ResultModifiers(inst.dst, result);
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
-	WriteU16(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
+	Write16Bits(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
 	return true;
 }
 
@@ -111,7 +111,7 @@ bool Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
                                 bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
-		const auto operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
+		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
 	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
@@ -128,7 +128,7 @@ bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode o
                              bool reverse) {
 	std::array<IR::Value, 2> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
-		const auto operand = SourceAt(inst, reverse ? 1u - index : index);
+		const auto& operand = SourceAt(inst, reverse ? 1u - index : index);
 		args[index]        = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1]}));
@@ -139,7 +139,7 @@ bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode 
                               bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
-		const auto operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
+		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
 		const auto type    = IR::ArgTypeOf(opcode, index);
 		args[index]        = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
 		                                                  : ReadOperand(operand, type);
@@ -203,9 +203,6 @@ bool Translator::V_CUBEMA_F32(const Decoder::Instruction& inst) {
 }
 
 bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kind) {
-	const auto select_f32 = [&](IR::U1 condition, IR::F32 true_value, IR::F32 false_value) {
-		return IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {condition, true_value, false_value}));
-	};
 	const auto x  = ReadMixF32(inst.src0);
 	const auto y  = ReadMixF32(inst.src1);
 	const auto z  = ReadMixF32(inst.src2);
@@ -223,18 +220,18 @@ bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 	const auto y_neg = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {y, IR::Value::F32(0.0f)}));
 	const auto z_neg = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {z, IR::Value::F32(0.0f)}));
 	const auto select_face = [&](IR::F32 x_value, IR::F32 y_value, IR::F32 z_value) {
-		return select_f32(z_face, z_value, select_f32(y_face, y_value, x_value));
+		return SelectF32(z_face, z_value, SelectF32(y_face, y_value, x_value));
 	};
 	IR::F32 result;
 	switch (result_kind) {
 		case 0u:
 			result = select_face(
-			    select_f32(x_neg, IR::F32(IR::Value::F32(1.0f)), IR::F32(IR::Value::F32(0.0f))),
-			    select_f32(y_neg, IR::F32(IR::Value::F32(3.0f)), IR::F32(IR::Value::F32(2.0f))),
-			    select_f32(z_neg, IR::F32(IR::Value::F32(5.0f)), IR::F32(IR::Value::F32(4.0f))));
+			    SelectF32(x_neg, IR::F32(IR::Value::F32(1.0f)), IR::F32(IR::Value::F32(0.0f))),
+			    SelectF32(y_neg, IR::F32(IR::Value::F32(3.0f)), IR::F32(IR::Value::F32(2.0f))),
+			    SelectF32(z_neg, IR::F32(IR::Value::F32(5.0f)), IR::F32(IR::Value::F32(4.0f))));
 			break;
-		case 1u: result = select_face(select_f32(x_neg, z, nz), x, select_f32(z_neg, nx, x)); break;
-		case 2u: result = select_face(ny, select_f32(y_neg, nz, z), ny); break;
+		case 1u: result = select_face(SelectF32(x_neg, z, nz), x, SelectF32(z_neg, nx, x)); break;
+		case 2u: result = select_face(ny, SelectF32(y_neg, nz, z), ny); break;
 		case 3u: {
 			const auto two = IR::F32(IR::Value::F32(2.0f));
 			result         = select_face(IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {x, two})),

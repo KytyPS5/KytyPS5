@@ -7,6 +7,7 @@
 #include <iterator>
 #include <map>
 #include <set>
+#include <span>
 #include <stack>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -861,15 +862,15 @@ void ComputeNaturalLoops(Graph& graph) {
 		loop.header         = edge.to;
 		loop.latch          = edge.from;
 		loop.continue_block = edge.from;
-		loop.body_blocks    = body;
+		loop.body_blocks    = std::move(body);
 
-		for (auto block_id: body) {
+		for (auto block_id: loop.body_blocks) {
 			const auto* block = graph.FindBlock(block_id);
 			if (block == nullptr) {
 				continue;
 			}
 			for (auto succ: block->successors) {
-				if (!Contains(body, succ)) {
+				if (!Contains(loop.body_blocks, succ)) {
 					AddUnique(loop.exit_blocks, succ);
 				}
 			}
@@ -1749,7 +1750,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 		    inner_is_true ? outer->terminator.false_block : outer->terminator.true_block;
 		const auto* inner = graph.FindBlock(inner_id);
 		if (inner == nullptr || inner->inst_begin == inner->inst_end ||
-		    inner->predecessors != std::vector<uint32_t> {outer_id} ||
+		    inner->predecessors.size() != 1u || inner->predecessors.front() != outer_id ||
 		    inner->terminator.kind != TerminatorKind::ConditionalBranch ||
 		    IsInnermostLoopControlConditional(graph, *inner)) {
 			continue;
@@ -1941,9 +1942,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
-			const auto& target_pcs = target_info.indirect
-			                             ? target_info.target_pcs
-			                             : std::vector<uint32_t> {target_info.target};
+			const auto target_pcs = target_info.indirect
+			                            ? std::span<const uint32_t>(target_info.target_pcs)
+			                            : std::span<const uint32_t>(&target_info.target, 1);
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
 					ExitBuildFailure(
@@ -2103,11 +2104,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 	SortUnique(graph.code_table_load_pcs);
 
-	ComputeDominators(graph);
-	ComputePostDominators(graph);
-	ComputeBackEdges(graph);
-	ComputeNaturalLoops(graph);
-	ComputeComponents(graph);
+	RecomputeAnalyses(graph);
 
 	if (indirect_setpc) {
 		graph.irreducible  = true;

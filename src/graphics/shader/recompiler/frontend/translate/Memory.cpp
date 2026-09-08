@@ -71,16 +71,22 @@ ResourceKind FlatSegmentResourceKind(uint32_t segment) {
 	}
 }
 
+bool IsScalarAddressLoad(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16: return true;
+		default: return false;
+	}
+}
+
 ResourceKind MemoryKind(const Decoder::Instruction& decoded) {
 	switch (decoded.family) {
 		case Decoder::Family::SMEM:
-			return decoded.opcode == Decoder::Opcode::S_LOAD_DWORD ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX2 ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX4 ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX8 ||
-			               decoded.opcode == Decoder::Opcode::S_LOAD_DWORDX16
-			           ? ResourceKind::ScalarAddress
-			           : ResourceKind::ScalarBuffer;
+			return IsScalarAddressLoad(decoded.opcode) ? ResourceKind::ScalarAddress
+			                                          : ResourceKind::ScalarBuffer;
 		case Decoder::Family::MUBUF:
 		case Decoder::Family::MTBUF: return ResourceKind::Buffer;
 		case Decoder::Family::FLAT: return FlatSegmentResourceKind(decoded.memory_segment);
@@ -146,16 +152,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	return memory;
 }
 
-bool IsScalarAddressLoad(Decoder::Opcode opcode) {
-	switch (opcode) {
-		case Decoder::Opcode::S_LOAD_DWORD:
-		case Decoder::Opcode::S_LOAD_DWORDX2:
-		case Decoder::Opcode::S_LOAD_DWORDX4:
-		case Decoder::Opcode::S_LOAD_DWORDX8:
-		case Decoder::Opcode::S_LOAD_DWORDX16: return true;
-		default: return false;
-	}
-}
 
 bool IsScalarBufferLoad(Decoder::Opcode opcode) {
 	switch (opcode) {

@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -607,6 +608,117 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
     fixture->Emit(ValueOpcode::ReferenceU32, {repeated_x});
   }
   return fixture;
+}
+
+std::unique_ptr<Fixture> MakeInlineBufferDescriptorFixture(
+    bool guarded_selector = true, bool correlated_columns = true) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  auto fixture = std::make_unique<Fixture>();
+  const auto table = fixture->Buffer(
+      {fixture->UserData(0u), fixture->UserData(1u), fixture->UserData(2u),
+       fixture->UserData(3u)},
+      0x6200u);
+  auto *entry = fixture->block;
+  auto *header = fixture->AddBlock();
+  auto *body = fixture->AddBlock();
+  auto *exit = fixture->AddBlock();
+  entry->AddBranch(header);
+  fixture->program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+  fixture->program.block_info[0].terminator.true_block = 1u;
+  fixture->block = header;
+  auto &counter = header->AppendNewInst(ValueOpcode::Phi, {},
+                                        static_cast<uint64_t>(Type::U32));
+  const auto selector = fixture->Emit(ValueOpcode::ReadFirstLane,
+                                      {Value(&counter), Value(true)});
+  const auto guarded_value =
+      guarded_selector ? selector : fixture->UserData(5u);
+  const auto bounded = fixture->Emit(ValueOpcode::ULessThan32,
+                                     {guarded_value, Value(3u)});
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  fixture->program.block_info[1].terminator.kind =
+      CFG::TerminatorKind::ConditionalBranch;
+  fixture->program.block_info[1].terminator.true_block = 2u;
+  fixture->program.block_info[1].terminator.false_block = 3u;
+  fixture->program.block_info[1].condition = bounded;
+
+  fixture->block = body;
+  const auto next =
+      fixture->Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
+  counter.AddPhiOperand(entry, Value(0u));
+  counter.AddPhiOperand(body, next);
+  const auto offset =
+      fixture->Emit(ValueOpcode::IMul32, {selector, Value(16u)});
+  std::array<Value, 4> descriptor;
+  for (uint32_t word = 0; word < descriptor.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = word * sizeof(uint32_t);
+    if (!correlated_columns && word == 3u) memory.offset += sizeof(uint32_t);
+    memory.component_count = 4u;
+    memory.component_index = word;
+    descriptor[word] = fixture->Emit(
+        ValueOpcode::ReadConstBuffer, {table, offset},
+        fixture->AddMemory(memory, 0x62e8u));
+  }
+  const auto selected = fixture->Buffer(descriptor, 0x656cu);
+  MemoryInfo load;
+  load.kind = ResourceKind::Buffer;
+  const auto value = fixture->Emit(
+      ValueOpcode::LoadBufferU16,
+      {selected, Value(0u), Value(0u), Value(0u), Value(true)},
+      fixture->AddMemory(load, 0x656cu));
+  fixture->Emit(ValueOpcode::ReferenceU32, {value});
+  body->AddBranch(header);
+  fixture->program.block_info[2].terminator.kind = CFG::TerminatorKind::Branch;
+  fixture->program.block_info[2].terminator.true_block = 1u;
+  fixture->program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+  return fixture;
+}
+
+void TestInlineBufferDescriptorTable() {
+  for (const auto [guarded, correlated] :
+       {std::pair{false, true}, std::pair{true, false}}) {
+    auto rejected = MakeInlineBufferDescriptorFixture(guarded, correlated);
+    CheckFatal([&] { rejected->PlanAndTrack(); }, "not a valid runtime value",
+               "unbounded or uncorrelated inline buffer table was accepted");
+    Check(!rejected->program.resource_tracking_complete &&
+              rejected->program.info.buffers.empty(),
+          "rejected inline buffer table mutated the committed resource plan");
+  }
+  auto fixture = MakeInlineBufferDescriptorFixture();
+  fixture->PlanAndTrack();
+  Check(fixture->program.info.buffers.size() == 1u,
+        "inline buffer table did not retain one logical resource");
+  const auto &memory = fixture->program.memory_info.back();
+  Check(memory.buffer_table == 0u,
+        "inline buffer access was not routed through its logical table");
+
+  auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory table;
+  table.words.resize(12u);
+  table.words = {0x2000u, 0u, 16u, 0u, 0x3000u, 0u,
+                 32u,     0u, 0x4000u, 0u, 48u,     0u};
+  std::array<uint32_t, 5> user_data = {
+      static_cast<uint32_t>(table.base), 0u,
+      static_cast<uint32_t>(table.words.size() * sizeof(uint32_t)), 0u, 1u};
+  const SrtRuntime runtime{user_data, 0u, ReadLinearTestMemory, &table,
+                           ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "inline buffer table could not be materialized");
+  Check(specialization.buffer_tables.size() == 1u &&
+            specialization.buffer_tables[0].count == 3u &&
+            snapshot.buffers.size() == 3u &&
+            snapshot.flattened_srt.size() == 3u,
+        "inline buffer table lost its guarded three-candidate domain");
+  for (uint32_t candidate = 0; candidate < 3u; ++candidate) {
+    Check(snapshot.buffers[candidate].dword_count == 4u &&
+              snapshot.buffers[candidate].dwords[0] ==
+                  0x2000u + candidate * 0x1000u,
+          "inline buffer candidate descriptor was read from the wrong record");
+  }
 }
 
 uint32_t InlineCandidateForKey(const ResourceSnapshot &snapshot,
@@ -2713,7 +2825,8 @@ void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_t
   if (buffer_table) {
     Check(columns == 4u, "test descriptor table must have four columns");
     const auto source = AddBoundedSnapshotSource(fixture, {Value(0u),Value(0u),Value(0u),Value(0u)});
-    program.descriptor_sources[source].bounded_buffer = DescriptorSource::BoundedBuffer{{0u,1u,2u,3u},0u};
+    program.descriptor_sources[source].bounded_buffer =
+        DescriptorSource::BoundedBuffer{{0u, 1u, 2u, 3u}, {}, 0u};
     program.info.buffers.push_back({.source=source});
   }
 }
@@ -3913,6 +4026,11 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--inline-buffer-table-only") == 0) {
+      TestInlineBufferDescriptorTable();
+      std::cout << "KYTY_INLINE_BUFFER_TABLE_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-srt-proof-only") == 0) {
       TestFiniteSelectorSrtProof();
       std::cout << "KYTY_FINITE_SELECTOR_SRT_PROOF_PASS\n";
@@ -3974,6 +4092,7 @@ int main(int argc, char** argv) {
     Run("inline image resource limits", TestInlineImageResourceLimits);
     Run("inline full-width images", TestInlineFullWidthImages);
     Run("inline image address table", TestInlineImageAddressTable);
+    Run("inline buffer descriptor table", TestInlineBufferDescriptorTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("raw fallback readability", TestSrtRawFallbackReadability);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
@@ -4038,6 +4157,14 @@ int DbgNotImplementedHandler(const char *expression, const char *file,
 
 void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 } // namespace Common
+
+namespace Libs::Graphics {
+SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+  static_cast<void>(format);
+  return SurfaceFormatInfo(vk::Format::eR32Sfloat,
+                           Prospero::BufferFormat::kInvalid);
+}
+} // namespace Libs::Graphics
 
 // Keep this focused standalone target self-contained by amalgamating its small
 // typed-IR implementation set.

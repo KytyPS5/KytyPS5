@@ -46,6 +46,7 @@ struct IndirectImage {
 struct MaterializedSnapshot {
 	ResourceSnapshot           resources;
 	std::vector<IndirectImage> indirect_images;
+	std::vector<std::vector<DescriptorValue>> inline_buffers;
 	std::vector<BoundedSrtLayout> bounded_srt_reads;
 	std::vector<std::vector<DescriptorValue>> bounded_buffer_expressions;
 	std::vector<std::vector<DescriptorValue>> bounded_image_expressions;
@@ -521,6 +522,44 @@ bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
 		next.samplers.clear();
 	}
 	result = std::move(next);
+	return true;
+}
+
+bool MaterializeInlineBuffer(const DescriptorSource::InlineDescriptor& table,
+                             const DescriptorValue& table_value, uint32_t pc,
+                             const SrtRuntime& runtime,
+                             std::vector<DescriptorValue>& result) {
+	ShaderBufferResource buffer;
+	if (!DecodeBufferDescriptor(table_value, buffer) || table.selector_stride == 0u ||
+	    table.selector_limit == 0u || table.descriptor_dwords != 4u ||
+	    table.image_table.has_value() || table.descriptor_offset > UINT32_MAX - 12u) {
+		return SpecializationFail(fmt::format(
+		    "inline buffer table at pc 0x{:08x} has invalid metadata", pc));
+	}
+	if (buffer.Type() != 0u || table.selector_limit > MaxIndirectImageProbes) {
+		return SpecializationFail(fmt::format(
+		    "inline buffer table at pc 0x{:08x} has invalid scalar source or candidate count",
+		    pc));
+	}
+	std::vector<DescriptorValue> candidates;
+	candidates.reserve(table.selector_limit);
+	for (uint32_t selector = 0; selector < table.selector_limit; ++selector) {
+		const auto key = static_cast<uint32_t>(
+		    static_cast<uint64_t>(selector) * table.selector_stride);
+		DescriptorValue descriptor;
+		descriptor.dword_count = 4u;
+		for (uint32_t dword = 0; dword < descriptor.dword_count; ++dword) {
+			if (!ReadScalarBufferWord(buffer, key,
+			                          table.descriptor_offset + dword * sizeof(uint32_t),
+			                          runtime, descriptor.dwords[dword])) {
+				return SpecializationFail(fmt::format(
+				    "inline buffer table at pc 0x{:08x} cannot read candidate {}", pc,
+				    selector));
+			}
+		}
+		candidates.push_back(descriptor);
+	}
+	result = std::move(candidates);
 	return true;
 }
 
@@ -1004,28 +1043,48 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
                         ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	std::vector<DescriptorValue> buffers;
 	specialization.bounded_srt_reads = materialized.bounded_srt_reads;
-	if (!program.bounded_srt_reads.empty()) {
+	if (!program.bounded_srt_reads.empty() ||
+	    std::ranges::any_of(program.info.buffers, [&](const BufferResource& buffer) {
+		    const auto* source = Source(program, buffer.source);
+		    return source != nullptr && source->inline_descriptor.has_value();
+	    })) {
 		specialization.buffer_tables.resize(program.info.buffers.size());
 	}
 	for (uint32_t logical = 0; logical < program.info.buffers.size(); logical++) {
 		const auto* source = Source(program, program.info.buffers[logical].source);
-		if (source == nullptr || !source->bounded_buffer.has_value()) {
+		const bool inline_table = source != nullptr && source->inline_descriptor.has_value();
+		if (source == nullptr ||
+		    (!source->bounded_buffer.has_value() && !inline_table)) {
 			buffers.push_back(snapshot.buffers[logical]);
 			specialization.buffer_origins.push_back(logical);
 			continue;
 		}
-		const auto& bounded = *source->bounded_buffer;
-		if (source->dword_count != 4u || bounded.key_arg != 0u || program.bounded_srt_reads.empty()) {
-			return SpecializationFail("bounded buffer has invalid source metadata");
-		}
 		uint32_t count = 0;
 		uint32_t diagnostic_stride = 0;
-		if (bounded.expression) {
+		if (inline_table) {
+			const auto& inline_descriptor = *source->inline_descriptor;
+			if (source->dword_count != 4u || inline_descriptor.key_arg != 0u ||
+			    logical >= materialized.inline_buffers.size()) {
+				return SpecializationFail("inline buffer has invalid source metadata");
+			}
+			count = static_cast<uint32_t>(materialized.inline_buffers[logical].size());
+			diagnostic_stride = inline_descriptor.selector_stride;
+		} else if (source->bounded_buffer->expression) {
+			const auto& bounded = *source->bounded_buffer;
+			if (source->dword_count != 4u || bounded.key_arg != 0u ||
+			    program.bounded_srt_reads.empty()) {
+				return SpecializationFail("bounded buffer has invalid source metadata");
+			}
 			if (logical >= materialized.bounded_buffer_expressions.size()) {
 				return SpecializationFail("bounded buffer expression candidates are missing");
 			}
 			count = static_cast<uint32_t>(materialized.bounded_buffer_expressions[logical].size());
 		} else {
+			const auto& bounded = *source->bounded_buffer;
+			if (source->dword_count != 4u || bounded.key_arg != 0u ||
+			    program.bounded_srt_reads.empty()) {
+				return SpecializationFail("bounded buffer has invalid source metadata");
+			}
 			const auto first_read = bounded.reads[0];
 			if (first_read >= specialization.bounded_srt_reads.size()) {
 				return SpecializationFail("bounded buffer has an invalid read column");
@@ -1057,9 +1116,12 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 		table.mapping_flat_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
 		for (uint32_t index = 0; index < count; index++) {
 			DescriptorValue descriptor;
-			if (bounded.expression) {
+			if (inline_table) {
+				descriptor = materialized.inline_buffers[logical][index];
+			} else if (source->bounded_buffer->expression) {
 				descriptor = materialized.bounded_buffer_expressions[logical][index];
 			} else {
+				const auto& bounded = *source->bounded_buffer;
 				descriptor.dword_count = 4u;
 				for (uint32_t word = 0; word < 4u; word++) {
 					const auto& layout = specialization.bounded_srt_reads[bounded.reads[word]];
@@ -1157,9 +1219,22 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	auto& next   = snapshot.resources;
 	auto  cursor = values.begin();
 	next.buffers.resize(program.info.buffers.size());
+	snapshot.inline_buffers.resize(program.info.buffers.size());
 	for (uint32_t index = 0; index < program.info.buffers.size(); index++) {
 		const auto* source = Source(program, program.info.buffers[index].source);
-		if (source == nullptr || !source->bounded_buffer.has_value()) {
+		if (source != nullptr && source->inline_descriptor.has_value()) {
+			const std::array requests {source->inline_descriptor->buffer_source};
+			SrtRuntime clean_runtime = runtime;
+			clean_runtime.read_memory = runtime.read_specialization_memory;
+			std::vector<DescriptorValue> table_source;
+			if (!EvaluateDescriptorSources(program, requests, clean_runtime, table_source) ||
+			    table_source.size() != 1u ||
+			    !MaterializeInlineBuffer(*source->inline_descriptor, table_source[0],
+			                             program.info.buffers[index].first_use_pc, runtime,
+			                             snapshot.inline_buffers[index])) {
+				return SpecializationFail("inline buffer table materialization failed");
+			}
+		} else if (source == nullptr || !source->bounded_buffer.has_value()) {
 			if (cursor == values.end()) {
 				return SpecializationFail("buffer materialization source list is incomplete");
 			}
@@ -1749,7 +1824,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	                                     plan.info.samplers.size());
 	for (const auto& buffer: plan.info.buffers) {
 		const auto* source = Source(plan, buffer.source);
-		if (source != nullptr && source->bounded_buffer.has_value()) {
+		if (source != nullptr && (source->bounded_buffer.has_value() ||
+		                          source->inline_descriptor.has_value())) {
 			plan.requires_specialization_memory = true;
 		} else {
 			plan.materialization_sources.push_back(buffer.source);
@@ -1835,7 +1911,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		EXIT_IF(origin >= program.info.buffers.size());
 		buffers.push_back(program.info.buffers[origin]);
 		const auto* source = Source(program, buffers.back().source);
-		if (source == nullptr || !source->bounded_buffer.has_value()) {
+		if (source == nullptr || (!source->bounded_buffer.has_value() &&
+		                          !source->inline_descriptor.has_value())) {
 			EXIT_IF(buffer_remap[origin] != UINT32_MAX);
 			buffer_remap[origin] = static_cast<uint32_t>(index);
 		}

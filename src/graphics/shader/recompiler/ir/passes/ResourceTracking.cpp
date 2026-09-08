@@ -1187,8 +1187,10 @@ private:
 
 	bool TryMakeInlineDescriptor(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan,
 	                             bool compact_image = true) {
-		const bool image = handle.GetOpcode() == ValueOpcode::GetImageResource;
-		if ((!image && handle.GetOpcode() != ValueOpcode::GetSamplerResource) ||
+		const bool image           = handle.GetOpcode() == ValueOpcode::GetImageResource;
+		const bool buffer_resource = handle.GetOpcode() == ValueOpcode::GetBufferResource;
+		if ((!image && !buffer_resource &&
+		     handle.GetOpcode() != ValueOpcode::GetSamplerResource) ||
 		    handle.NumArgs() != (image ? 8u : 4u)) {
 			return false;
 		}
@@ -1248,8 +1250,14 @@ private:
 		source.inline_descriptor->descriptor_dwords = descriptor_dwords;
 		source.inline_descriptor->selector_limit =
 		    DominatingSelectorLimit(selector, handle.Parent());
+		// Buffer table lowering uses the selector as a dense mapping index. Unlike
+		// sampled-image key search, it therefore requires an exact guarded domain.
+		if (buffer_resource && source.inline_descriptor->selector_limit == 0u) {
+			return false;
+		}
 		plan.handle = &handle;
 		plan.source = InternSource(source);
+		if (buffer_resource) plan.key = selector;
 		plan.read_count = descriptor_dwords;
 		std::copy_n(buffer_source.dwords.begin(), 4u, plan.roots.begin());
 		return true;
@@ -1381,6 +1389,17 @@ private:
 	void PlanInlineDescriptors() {
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::None &&
+				    inst.NumArgs() != 0u) {
+					auto* handle = inst.Arg(0).Resolve().TryInstruction();
+					if (handle != nullptr && FindInlineDescriptor(*handle) == nullptr) {
+						InlineDescriptorPlan buffer_plan;
+						if (TryMakeInlineDescriptor(*handle, inst.Flags<MemoryFlags>().pc,
+						                            buffer_plan)) {
+							m_inline_descriptors.push_back(std::move(buffer_plan));
+						}
+					}
+				}
 				const auto image_info = ImageOpcodeInfoOf(inst.GetOpcode());
 				if (image_info.access == ImageAccess::None || inst.NumArgs() == 0u) {
 					continue;
@@ -1719,7 +1738,7 @@ private:
 						    selector_definition->NumArgs() > 0u) {
 							const auto* phi = selector_definition->Arg(0).Resolve().TryInstruction();
 							if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi) {
-								std::fprintf(stderr, "    selector phi args=%u", phi->NumArgs());
+								std::fprintf(stderr, "    selector phi args=%zu", phi->NumArgs());
 								for (uint32_t arg = 0; arg < phi->NumArgs(); ++arg) {
 									const auto* incoming = phi->Arg(arg).Resolve().TryInstruction();
 									std::fprintf(stderr, " %u:%s", arg,
@@ -1825,6 +1844,34 @@ private:
 					                     BoundedReadValue(Value(const_cast<Inst*>(definition))) != nullptr
 					                 ? "yes"
 					                 : "no");
+					if (definition != nullptr &&
+					    definition->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+						const auto flags = definition->Flags<MemoryFlags>();
+						const auto* buffer = definition->NumArgs() > 0u
+						                         ? definition->Arg(0).Resolve().TryInstruction()
+						                         : nullptr;
+						const auto offset = definition->NumArgs() > 1u ? definition->Arg(1).Resolve()
+						                                                : Value {};
+						std::fprintf(stderr,
+						             "    read memory=%u offset=%s buffer=%s args=%zu\n", flags.index,
+						             offset.IsImmediate()
+						                 ? fmt::format("0x{:08x}", offset.U32()).c_str()
+						                 : (offset.TryInstruction() == nullptr
+						                        ? "unknown"
+						                        : ValueOpcodeName(offset.TryInstruction()->GetOpcode()).data()),
+						             buffer == nullptr ? "none" : ValueOpcodeName(buffer->GetOpcode()).data(),
+						             buffer == nullptr ? 0u : buffer->NumArgs());
+						if (buffer != nullptr) {
+							for (uint32_t arg = 0; arg < buffer->NumArgs(); ++arg) {
+								const auto root = buffer->Arg(arg).Resolve();
+								const auto* root_inst = root.TryInstruction();
+								std::fprintf(stderr, "      descriptor arg=%u opcode=%s\n", arg,
+								             root_inst == nullptr
+								                 ? (root.IsImmediate() ? "immediate" : "unknown")
+								                 : ValueOpcodeName(root_inst->GetOpcode()).data());
+							}
+						}
+					}
 				}
 			}
 			if (expected == ValueOpcode::GetImageResource) {
@@ -2034,7 +2081,15 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
+			handle = inst.Arg(0).Resolve().TryInstruction();
+			const auto* inline_descriptor =
+			    handle != nullptr ? FindInlineDescriptor(*handle) : nullptr;
+			if (inline_descriptor != nullptr) {
+				source = inline_descriptor->source;
+			} else {
+				GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
+				          source);
+			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, fmt::format("buffer resource limit exceeded (required={} limit={})",
@@ -2042,7 +2097,10 @@ private:
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc,
-			               m_sources[source].bounded_buffer.has_value() ? resource : UINT32_MAX);
+			               (m_sources[source].bounded_buffer.has_value() ||
+			                m_sources[source].inline_descriptor.has_value())
+			                   ? resource
+			                   : UINT32_MAX);
 			return;
 		}
 		if (address_info.access != AddressAccess::None) {
@@ -2122,7 +2180,8 @@ private:
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
 			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
-			    buffer_source->bounded_buffer.has_value()) {
+			    buffer_source->bounded_buffer.has_value() ||
+			    buffer_source->inline_descriptor.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {

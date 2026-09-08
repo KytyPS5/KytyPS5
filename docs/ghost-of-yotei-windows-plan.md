@@ -1014,6 +1014,27 @@ VUID или совпавшего readback недостаточно. Соседн
 отказы и подтверждает останов worker. WQM_B32 selectors пока относятся к
 игнорируемому тестовому черновику, а не установленной программе.
 
+## Guarded inline buffer descriptor tables
+
+Status: shared synthetic regression GREEN; current-tree emulator builds; game retry pending.
+
+The next `6cc64dee32dc7094` failure at guest PC `0x656c` is the buffer analogue of the
+existing inline image-table path: `S_BUFFER_LOAD_DWORDX4` reads one 16-byte descriptor selected
+by a loop-carried `ReadFirstLane(Phi)`. Resource tracking now accepts that shape only when a
+dominating unsigned CFG guard proves the finite selector domain. Materialization snapshots the
+four correlated words for every candidate through the coherent specialization reader, emits one
+logical buffer table, and keeps the selector in the shader for runtime choice. There is no title,
+shader hash, guest address or install-path condition.
+
+The unchanged RED is `_Build/logs/inline-buffer-table-red-20260908-v2.txt`; GREEN including
+unguarded-selector and mismatched-column rejection boundaries is
+`_Build/logs/inline-buffer-table-green-20260908-v2.txt`. `kyty_emulator` and `launcher` build
+successfully. The complete focused suite currently stops earlier on the pre-existing invariant
+indirect-image wrapped-immediate expectation, so it is not reported as a full-suite pass.
+
+Next: install the current binary, run Yōtei with bounded source readback, and either record a
+nonzero RGB frame or isolate the next independent correctness blocker.
+
 ## Как поддерживать этот статус
 
 1. После завершённого запуска заменить карточку `LATEST-RUNTIME`: commit,

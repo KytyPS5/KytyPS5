@@ -4845,6 +4845,62 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   }
 }
 
+void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d7a40ffu, 0x00000001u, // v_cmpx_ne_u16 exec, 1, v32
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(shader, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode != Decoder::Opcode::UNSUPPORTED &&
+            decoded.opcode_id == 0xbdu && decoded.word_count == 2u &&
+            decoded.raw_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::LiteralConstant &&
+            decoded.src0.value == 1u &&
+            decoded.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src1.reg == 32u,
+        "decoder rejected captured VOPC V_CMPX_NE_U16 fields");
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.compute = &compute;
+  Decoder::DecodeProgram(shader, program);
+  graph = CFG::BuildGraph(program);
+  ir = Frontend::TranslateProgram(program, graph, translate_options);
+  uint32_t not_equal_compares = 0u;
+  uint32_t dynamic_exec_writes = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      not_equal_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::INotEqual32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        dynamic_exec_writes++;
+      }
+    }
+  }
+  Check(not_equal_compares >= 1u && dynamic_exec_writes == 1u,
+        "captured V_CMPX_NE_U16 did not lower to unsigned halfword compare plus EXEC update");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_NE_U16 exec_lo, 0x00000001, v32"),
+        "captured V_CMPX_NE_U16 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   using namespace ShaderRecompiler;
 
@@ -15435,6 +15491,13 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--vopc-cmpx-ne-u16-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCapturedVopcCmpxNeU16();
+    std::puts("KYTY_VOPC_CMPX_NE_U16_PASS");
+    return 0;
+  }
+
   EnsureConfigInitialized();
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
@@ -15460,6 +15523,7 @@ int main(int argc, char* argv[]) {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
+  TestNewShaderRecompilerCapturedVopcCmpxNeU16();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();

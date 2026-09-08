@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -393,6 +394,17 @@ bool ShouldOptimizeShaderSpirv(bool dispatcher_fallback,
 	return optimization != Config::ShaderOptimizationType::None && !dispatcher_fallback;
 }
 
+std::string ShaderModuleDebugName(ShaderType stage, uint64_t shader_hash) {
+	const char* stage_name = "unknown";
+	switch (stage) {
+		case ShaderType::Vertex: stage_name = "vs"; break;
+		case ShaderType::Pixel: stage_name = "ps"; break;
+		case ShaderType::Compute: stage_name = "cs"; break;
+		default: break;
+	}
+	return fmt::format("kyty_shader_{}_{:016x}", stage_name, shader_hash);
+}
+
 } // namespace
 
 // Test access to the exact production validation/configuration path. This does
@@ -410,6 +422,10 @@ std::vector<uint32_t> OptimizeShaderSpirvForTest(
 bool ShouldOptimizeShaderSpirvForTest(bool dispatcher_fallback,
                                       Config::ShaderOptimizationType optimization) {
 	return ShouldOptimizeShaderSpirv(dispatcher_fallback, optimization);
+}
+
+std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash) {
+	return ShaderModuleDebugName(stage, shader_hash);
 }
 
 struct PipelineCache::ProgramCache {
@@ -547,6 +563,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		SetVulkanObjectNameF(device, module, "{}", ShaderModuleDebugName(Stage, options.shader_hash));
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);

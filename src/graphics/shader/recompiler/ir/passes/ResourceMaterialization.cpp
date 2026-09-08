@@ -1534,6 +1534,52 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		        next_snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
+		// Runtime table order is not shader state. Keep candidate zero (the
+		// missing-key fallback) fixed, and order the remaining candidates by the
+		// properties consumed by SPIR-V. Remap every key with its descriptor.
+		std::vector<uint32_t> candidates;
+		for (uint32_t index = 0; index < next_specialization.images.size(); ++index) {
+			if (index != root_index &&
+			    next_specialization.images[index].indirect_root == root_index)
+				candidates.push_back(index);
+		}
+		std::vector<uint32_t> order(candidates.size());
+		std::iota(order.begin(), order.end(), 0u);
+		const auto class_key = [&](uint32_t ordinal) {
+			const auto  index = candidates[ordinal];
+			const auto& image = next_specialization.images[index];
+			return std::tuple {NullImageDescriptor(next_snapshot.images[index]),
+			                   image.numeric_class,
+			                   image.dimension,
+			                   image.mip_count,
+			                   image.conversion_format,
+			                   image.shader_swizzle,
+			                   image.cube,
+			                   image.fmask};
+		};
+		std::ranges::stable_sort(order, {}, class_key);
+		std::vector<uint32_t>                      remap(candidates.size() + 1u);
+		std::vector<ResourceSpecialization::Image> ordered_images;
+		std::vector<DescriptorValue>               ordered_descriptors;
+		ordered_images.reserve(order.size());
+		ordered_descriptors.reserve(order.size());
+		for (uint32_t ordinal = 0; ordinal < order.size(); ++ordinal) {
+			const auto source          = candidates[order[ordinal]];
+			remap[order[ordinal] + 1u] = ordinal + 1u;
+			ordered_images.push_back(next_specialization.images[source]);
+			ordered_descriptors.push_back(next_snapshot.images[source]);
+		}
+		for (uint32_t ordinal = 0; ordinal < candidates.size(); ++ordinal) {
+			next_specialization.images[candidates[ordinal]] = ordered_images[ordinal];
+			next_snapshot.images[candidates[ordinal]]       = ordered_descriptors[ordinal];
+		}
+		for (uint32_t key = 0; key < key_count; ++key) {
+			auto& candidate =
+			    next_snapshot.flattened_srt[root.indirect_mapping_offset + 2u + key * 2u];
+			if (candidate >= remap.size())
+				return SpecializationFail("indirect image candidate is out of bounds");
+			candidate = remap[candidate];
+		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
 		uint32_t resource_count = 0;
 		for (uint32_t resource = 0; resource < next_specialization.images.size(); resource++) {

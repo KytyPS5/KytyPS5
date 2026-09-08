@@ -604,6 +604,7 @@ void TestHeterogeneousIndirectImageViewSwizzles() {
           storage_write ? "mixed storage image dimensions/swizzles were rejected"
                         : "mixed sampled image-view swizzles were rejected");
     if (storage_write) {
+      ApplyResourceSpecialization(fixture->program, specialization);
       resource_plan.info.images[0].atomic = true;
       resource_plan.info.images[1].atomic = true;
       const auto atomic_format =

@@ -2087,7 +2087,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageRead);
+			        inst.GetOpcode() != ValueOpcode::ImageRead &&
+			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 		}
 	}
 	program.info.bounded_srt_reads = specialization.bounded_srt_reads;

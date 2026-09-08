@@ -698,6 +698,14 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	if (chain && commands.empty()) {
+		// An empty chain still terminates the calling stream after this packet.
+		auto& caller = g_current_execution->m_buffer_stack.back();
+		EXIT_IF(caller.offset_dw >= caller.commands.size());
+		const auto packet_words = KYTY_PM4_LEN(caller.commands[caller.offset_dw]);
+		EXIT_IF(packet_words > caller.commands.size() - caller.offset_dw);
+		caller.commands = caller.commands.first(caller.offset_dw + packet_words);
+	}
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }

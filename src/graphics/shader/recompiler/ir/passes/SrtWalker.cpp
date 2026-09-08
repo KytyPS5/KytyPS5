@@ -454,9 +454,10 @@ class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
-	          Value active_mask = {})
+	          Value active_mask = {}, uint32_t lane_depth = 0)
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_lane_depth(lane_depth) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -647,8 +648,10 @@ private:
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
+				// Bound recursive active-lane walks through loop-carried PHIs.
+				if (m_lane_depth >= 16u) return false;
 				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1));
+				                 inst.Arg(1), m_lane_depth + 1u);
 				return active.EvaluateWide(inst.Arg(0), result);
 			}
 			case ValueOpcode::BitCastU32F32:
@@ -962,6 +965,7 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
+	uint32_t                                  m_lane_depth = 0;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;

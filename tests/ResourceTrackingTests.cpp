@@ -200,7 +200,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
-                         bool memory_backed_material = false) {
+                         bool memory_backed_material = false,
+                         bool storage_write = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -268,17 +269,25 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                       fixture->AddMemory(component, 0x10d8));
   }
   const auto image = fixture->Image(image_words, 0x10f0);
-  const auto sampler =
-      fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
-  const auto sampled_x =
-      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
-  fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  MemoryInfo access;
+  access.kind = ResourceKind::Image;
+  access.image_dimension = Decoder::ImageDimension::Dim2D;
+  if (storage_write) {
+    const auto data = fixture->Emit(ValueOpcode::CompositeConstructU32x4,
+                                    {Value(1u), Value(2u), Value(3u), Value(4u)});
+    fixture->Emit(ValueOpcode::ImageWrite,
+                  {image, fixture->ImageAddress(), data, Value(true)},
+                  fixture->AddMemory(access, 0x10f0));
+  } else {
+    const auto sampler =
+        fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
+    const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
+                                       {image, sampler, fixture->ImageAddress()},
+                                       fixture->AddMemory(access, 0x10f0));
+    const auto sampled_x =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+    fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
+  }
   return fixture;
 }
 

@@ -9792,11 +9792,11 @@ void CheckSampledHtileArrayClearDiscovery() {
     constexpr uintptr_t base = 0x0000000205c00000ull;
     constexpr uint64_t allocation_size = 0x10000u;
     constexpr uint64_t allocation_alignment = 0x10000u;
-    const std::array<uint32_t, 3> offsets{unsupported_halfword ? 15u : 13u, 12u, 8u};
+    const std::array<uint32_t, 4> offsets{unsupported_halfword ? 15u : 13u, 12u, 8u, 3u};
     // New byte-offset admission ends on a complete native DWORD. Preserve the
     // original size4/range17 case separately: its last guest byte is not
     // representable by the current runtime uint-array length contract.
-    const std::array<uint32_t, 3> sizes{boundary ? 4u : 3u, 4u, 24u};
+    const std::array<uint32_t, 4> sizes{boundary ? 4u : 3u, 4u, 24u, 4u};
     EnsureRuntimeContext();
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
@@ -9839,14 +9839,16 @@ void CheckSampledHtileArrayClearDiscovery() {
       ShaderStageRuntime runtime{};
       for (uint32_t index = 0; index < offsets.size(); ++index) {
         BufferResource info{};
-        info.written = true;
+        info.written = index != 3u;
+        info.read = index == 3u;
         info.formatted = index == 0u;
+        info.scalar = index == 3u;
         // Synthetic input facts for this renderer-entry boundary. The separate
         // ResourceTracking regression derives the same fact from actual mixed IR.
         info.descriptor_formatted_only = index == 0u && !mixed_access;
         info.atomic = index == 2u;
         info.max_byte_extent = index == 0u ? (mixed_access ? 4u : unsupported_halfword ? 2u : 1u)
-                                           : index == 1u ? 4u : 8u;
+                                           : index == 1u ? 4u : index == 2u ? 8u : 4u;
         info.descriptor_format = index == 0u
             ? (unsupported_halfword ? Prospero::BufferFormat::k16UInt
                                     : Prospero::BufferFormat::k8UInt)
@@ -9893,13 +9895,16 @@ void CheckSampledHtileArrayClearDiscovery() {
         const uint64_t byte_offset = static_cast<uint64_t>(backing_offset) + offsets[index];
         const uint64_t aligned_offset = byte_offset - byte_offset % alignment;
         const uint64_t adjustment = byte_offset - aligned_offset;
+        const uint64_t byte_limit = sizes[index] + adjustment;
+        const uint64_t padding =
+            (sizeof(uint32_t) - byte_limit % sizeof(uint32_t)) % sizeof(uint32_t);
         Require(name, "representable adjustment", adjustment < 256u,
                 "fixture adjustment is wider than the packed ABI");
         const auto packed = prepared.shader_data.at(info.bindings.memory_offset_dword + index / 4u);
         const auto observed_adjustment = (packed >> ((index % 4u) * 8u)) & 0xffu;
         Require(name, "exact byte view",
                 view.buffer == backing_handle && view.offset == aligned_offset &&
-                    view.range == sizes[index] + adjustment &&
+                    view.range == byte_limit + padding &&
                     observed_adjustment == adjustment &&
                     prepared.buffer_sources[index].first.Base48() == base + offsets[index],
                 "renderer lost the low byte offset, changed the range, or applied the offset twice");
@@ -25629,6 +25634,21 @@ TestCase Wave64CooperativeScalarBufferLoadBranch() {
   return test;
 }
 
+TestCase Wave64CooperativeUnalignedScalarBufferLoadBranch() {
+  constexpr u32 scalar_value = 0x13579bdfu;
+  auto test = Wave64CooperativeScalarBufferLoadBranch();
+  test.name = "Wave64CooperativeUnalignedScalarBufferLoadBranch";
+  // The first tracked resource is the scalar descriptor. Its native view is
+  // aligned down by the renderer, so the shader must reconstruct one DWORD
+  // spanning byte offsets 3..6 without shifting the later output resource.
+  test.storage_buffer_offsets = {3u, 0u};
+  std::memcpy(reinterpret_cast<uint8_t*>(test.initial.data()) + 3u,
+              &scalar_value, sizeof(scalar_value));
+  std::memcpy(reinterpret_cast<uint8_t*>(test.expected.data()) + 3u,
+              &scalar_value, sizeof(scalar_value));
+  return test;
+}
+
 // Each wave reaches the same guest barrier after a different number of
 // collective-bearing iterations. Early arrival must preserve that wave's state
 // and allow the other waves to progress, then release all of them together.
@@ -29863,6 +29883,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64MultiWaveLdsDivergentBarrierSites);
   AddCase(Wave64CooperativeImageAtomicReturnToLds);
   AddCase(Wave64CooperativeScalarBufferLoadBranch);
+  AddCase(Wave64CooperativeUnalignedScalarBufferLoadBranch);
   AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
   AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
@@ -34972,6 +34993,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave64-cooperative-ssbo-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64CooperativeBufferProducerConsumer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--unaligned-scalar-buffer-load-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64CooperativeUnalignedScalarBufferLoadBranch());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-same-address-only") == 0) {

@@ -148,6 +148,11 @@ static bool SupportsSubwordStorageOffset(const ShaderBufferResource& descriptor,
 	return true;
 }
 
+static bool SupportsScalarStorageOffset(const ShaderRecompiler::IR::BufferResource& resource) {
+	return resource.scalar && resource.read && !resource.written && !resource.atomic &&
+	       !resource.formatted;
+}
+
 static BufferView NativeStorageBuffer(RenderContext&                              context,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -181,7 +186,8 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsSubwordStorageOffset(descriptor, resource)) ||
+	if ((byte_adjustment && !SupportsSubwordStorageOffset(descriptor, resource) &&
+	     !SupportsScalarStorageOffset(resource)) ||
 	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64
 		     " requested=0x%016" PRIx64 " size=0x%016" PRIx64 " backing_offset=0x%016" PRIx64

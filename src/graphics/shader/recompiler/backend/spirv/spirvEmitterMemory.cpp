@@ -30,6 +30,18 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
+uint32_t RebaseStorageBufferByteAddress(EmitterState& state, const IR::MemoryInfo& mem,
+                                        uint32_t address) {
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	const auto adjusted = Binary(state, OpIAdd, TypeU32(state), address,
+	                             state.memory_byte_offsets[array_index]);
+	const auto overflow = Binary(state, OpULessThan, TypeBool(state), adjusted, address);
+	// SSBO range is capped by the uint32 maxStorageBufferRange. UINT32_MAX's
+	// DWORD/u64 index is outside every complete element of such a range.
+	return Select(state, TypeU32(state), overflow, ConstantU32(state, UINT32_MAX), adjusted);
+}
+
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
 	if (state.compute_execution.IsSplitWave64()) {
@@ -116,14 +128,7 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 	// an aligned host view and must not wrap an out-of-range guest address into
 	// the beginning of that view. Each formatted/raw component reaches here
 	// after its guest offset is applied, before DWORD/byte decomposition.
-	const auto array_index =
-	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	const auto adjusted = Binary(state, OpIAdd, TypeU32(state), address,
-	                             state.memory_byte_offsets[array_index]);
-	const auto overflow = Binary(state, OpULessThan, TypeBool(state), adjusted, address);
-	// SSBO range is capped by the uint32 maxStorageBufferRange. UINT32_MAX's
-	// DWORD/u64 index is outside every complete element of such a range.
-	return Select(state, TypeU32(state), overflow, ConstantU32(state, UINT32_MAX), adjusted);
+	return RebaseStorageBufferByteAddress(state, mem, address);
 }
 
 uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t add_low,
@@ -441,19 +446,28 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	const auto shift =
 	    Binary(state, OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
 	auto value = Binary(state, OpShiftRightLogical, TypeU32(state), word, shift);
-	if (bits == 16u) {
-		const auto crosses = Binary(state, OpIEqual, TypeBool(state), byte, ConstantU32(state, 3));
+	if (bits == 16u || bits == 32u) {
+		const auto crosses = Binary(state, bits == 16u ? OpUGreaterThan : OpINotEqual,
+		                            TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
 		const auto next = EmitValueOrZeroIfCondition(state, crosses, [&]() {
 			return LoadWordInBounds(ctx, resource,
 			                        Binary(state, OpIAdd, TypeU32(state), index,
 			                               ConstantU32(state, 1)));
 		});
+		const auto upper_shift = Binary(
+		    state, OpShiftLeftLogical, TypeU32(state),
+		    Binary(state, OpBitwiseAnd, TypeU32(state),
+		           Binary(state, OpISub, TypeU32(state), ConstantU32(state, 4u), byte),
+		           ConstantU32(state, 3u)),
+		    ConstantU32(state, 3u));
 		value = Binary(
 		    state, OpBitwiseOr, TypeU32(state), value,
-		    Binary(state, OpShiftLeftLogical, TypeU32(state), next, ConstantU32(state, 8)));
+		    Binary(state, OpShiftLeftLogical, TypeU32(state), next, upper_shift));
 	}
-	value = Binary(state, OpBitwiseAnd, TypeU32(state), value,
-	               ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+	if (bits != 32u) {
+		value = Binary(state, OpBitwiseAnd, TypeU32(state), value,
+		               ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+	}
 	if (!sign_extend) return value;
 	return SignExtendSubword(state, value, bits);
 }
@@ -1643,19 +1657,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ReadConstBuffer) {
 		auto mem = ctx.Memory(inst);
 		mem.kind = IR::ResourceKind::ScalarBuffer;
-		const auto address =
+		auto address =
 		    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
-		const auto index =
-		    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-		const auto access    = PrepareMemoryResourceAccess(state, mem);
-		const auto element   = EmitMemoryElementIndex(state, access, index);
-		const auto condition = EmitMemoryElementInBounds(state, access, element);
+		const auto access = PrepareMemoryResourceAccess(state, mem);
+		address = RebaseStorageBufferByteAddress(state, mem, address);
+		const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), address,
+		                          ConstantU32(state, 2));
+		const auto condition = EmitMemoryByteRangeInBounds(state, access, address, sizeof(uint32_t));
 		auto value = EmitValueOrZeroIfCondition(state, condition, [&]() {
-			           const auto value = state.builder.AllocateId();
-			           state.builder.AddFunction(
-			               {OpLoad, TypeU32(state), value,
-			                EmitMemoryElementPointer(state, access, element)});
-			           return value;
+			           return LoadSubwordInBounds(ctx, access, address, index, 32u, false);
 		           });
 		if (state.compute_execution.IsSplitWave64() &&
 		    !state.compute_execution.IsCooperativeWave64()) {

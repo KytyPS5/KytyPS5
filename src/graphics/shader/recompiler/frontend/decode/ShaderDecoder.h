@@ -413,6 +413,7 @@ enum class Opcode {
 	V_CMPX_LT_U16,
 	V_CMPX_EQ_U16,
 	V_CMPX_GT_U16,
+	V_CMPX_NE_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,

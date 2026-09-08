@@ -473,6 +473,64 @@ void TestInvariantIndirectImageMaterialization() {
         "wrapped scalar immediate entered the invariant image proof");
 }
 
+void TestHeterogeneousIndirectImageDimensions() {
+  auto fixture = MakeIndirectImageFixture(false);
+  fixture->PlanAndTrack();
+  const auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+
+  std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
+                                    16u << 16u, 4u,          0u, 7u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+                      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                  << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] = descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] = descriptor[dword];
+  }
+  memory.words[(0x2020u - memory.base) / 4u] = 0x40u;
+  memory.words[(0x2020u - memory.base) / 4u + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor1D)
+       << 28u);
+  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2 && specialization.images.size() == 2 &&
+            specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
+            specialization.images[1].dimension == Decoder::ImageDimension::Dim1D,
+        "mixed 2D/1D indirect image table was rejected");
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  memory.words[(0x2020u - memory.base) / 4u + 1u] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)
+      << 20u;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "mixed numeric-class indirect image table was accepted or mutated the prior result");
+  ApplyResourceSpecialization(fixture->program, specialization);
+  Check(fixture->program.info.images.size() == 2 &&
+            fixture->program.info.images[0].indirect_root == 0u &&
+            fixture->program.info.images[0].indirect_resources.size() == 2u,
+        "mixed 2D/1D indirect image topology was not applied");
+}
+
 std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = false,
                                                     bool image_table = false,
                                                     bool full_width_images = false) {
@@ -4225,6 +4283,11 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--heterogeneous-indirect-images-only") == 0) {
+      TestHeterogeneousIndirectImageDimensions();
+      std::cout << "KYTY_HETEROGENEOUS_INDIRECT_IMAGES_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--dispatcher-signed-buffer-loop-only") == 0) {
       TestDispatcherSignedBufferLoop();
       std::cout << "KYTY_DISPATCHER_SIGNED_BUFFER_LOOP_PASS\n";
@@ -4291,6 +4354,7 @@ int main(int argc, char** argv) {
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("heterogeneous indirect images", TestHeterogeneousIndirectImageDimensions);
     Run("inline descriptor pairs", TestInlineDescriptorPairs);
     Run("inline image uniform samplers", TestInlineImageUniformSamplers);
     Run("inline image resource limits", TestInlineImageResourceLimits);

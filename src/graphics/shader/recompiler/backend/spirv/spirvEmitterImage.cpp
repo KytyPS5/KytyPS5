@@ -760,6 +760,14 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
+		if (image.indirect_root == mem.resource &&
+		    std::any_of(image.indirect_resources.begin(), image.indirect_resources.end(),
+		                [&](uint32_t resource) {
+			                return state.program.info.images[resource].dimension != image.dimension;
+		                })) {
+			ctx.Fail(inst, "does not support heterogeneous indirect image dimensions");
+			return true;
+		}
 		state.builder.RequireCapability(CapabilityImageQuery);
 		const auto dimension = image.dimension;
 		const auto sampled   = MakeSampledImage(state, mem.resource, mem.sampler);
@@ -781,8 +789,6 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto  dimension      = image.dimension;
-		const auto& dimension_info = ImageDimensionInfoFor(dimension);
 		const auto  numeric_class  = image.numeric_class;
 		const auto  condition      = ctx.Arg(inst, 2);
 		const auto  result_type    = ImageVectorType(state, numeric_class, 4);
@@ -792,19 +798,24 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
 			        const auto EmitRead = [&](uint32_t resource) {
+				        const auto candidate_dimension =
+				            state.program.info.images[resource].dimension;
+				        const auto& candidate_dimension_info =
+				            ImageDimensionInfoFor(candidate_dimension);
 				        const auto descriptor = LoadSampledImageDescriptor(state, resource);
 				        const auto color      = state.builder.AllocateId();
-				        const auto coord      = CoordU32(ctx, mem, *address, dimension);
-				        if (dimension_info.multisampled != 0u) {
+				        const auto coord = CoordU32(ctx, mem, *address, candidate_dimension);
+				        if (candidate_dimension_info.multisampled != 0u) {
 					        state.builder.AddFunction(
 					            {OpImageFetch, result_type, color, descriptor, coord,
 					             ImageOperandsSampleMask,
 					             AddressU32(ctx, mem, *address,
-					                        dimension_info.coordinate_components)});
+					                        candidate_dimension_info.coordinate_components)});
 				        } else {
 					        state.builder.AddFunction(
 					            {OpImageFetch, result_type, color, descriptor, coord,
-					             ImageOperandsLodMask, LodU32(ctx, mem, *address, dimension)});
+					             ImageOperandsLodMask,
+					             LodU32(ctx, mem, *address, candidate_dimension)});
 				        }
 				        return color;
 			        };
@@ -846,6 +857,14 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components);
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			if (image.indirect_root == mem.resource &&
+			    std::any_of(image.indirect_resources.begin(), image.indirect_resources.end(),
+			                [&](uint32_t resource) {
+				                return state.program.info.images[resource].dimension != image.dimension;
+			                })) {
+				ctx.Fail(inst, "does not support heterogeneous indirect image dimensions");
+				return true;
+			}
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
@@ -980,38 +999,52 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		uint32_t              operand_mask = 0;
-		std::vector<uint32_t> operands;
-		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
-			operand_mask |= ImageOperandsGradMask;
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components));
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components));
-		} else if (explicit_lod) {
-			operand_mask |= ImageOperandsLodMask;
-			auto lod = ZeroF32(state);
-			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
-				lod = AddressF32(ctx, mem, *address, layout.lod);
-			}
-			operands.push_back(lod);
-		} else if (layout.bias != NoImageComponent) {
-			operand_mask |= ImageOperandsBiasMask;
-			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
-		}
 		const auto EmitSample = [&](uint32_t resource) {
+			const auto candidate_dimension = state.program.info.images[resource].dimension;
+			const auto& candidate_dimension_info = ImageDimensionInfoFor(candidate_dimension);
+			const auto candidate_layout = Layout(mem, candidate_dimension);
+			const auto candidate_coord =
+			    CoordF32(ctx, mem, *address, candidate_layout.coord,
+			             candidate_dimension_info.coordinate_components);
+			uint32_t candidate_dref_value = 0;
+			if (dref) {
+				candidate_dref_value = candidate_layout.dref != NoImageComponent
+				                           ? AddressF32(ctx, mem, *address, candidate_layout.dref)
+				                           : ZeroF32(state);
+			}
+			uint32_t              candidate_operand_mask = 0;
+			std::vector<uint32_t> candidate_operands;
+			if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
+				candidate_operand_mask |= ImageOperandsGradMask;
+				candidate_operands.push_back(CoordF32(ctx, mem, *address, candidate_layout.grad_x,
+				                                           candidate_dimension_info.spatial_components));
+				candidate_operands.push_back(CoordF32(ctx, mem, *address, candidate_layout.grad_y,
+				                                           candidate_dimension_info.spatial_components));
+			} else if (explicit_lod) {
+				candidate_operand_mask |= ImageOperandsLodMask;
+				auto lod = ZeroF32(state);
+				if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+				    candidate_layout.lod != NoImageComponent) {
+					lod = AddressF32(ctx, mem, *address, candidate_layout.lod);
+				}
+				candidate_operands.push_back(lod);
+			} else if (candidate_layout.bias != NoImageComponent) {
+				candidate_operand_mask |= ImageOperandsBiasMask;
+				candidate_operands.push_back(
+				    AddressF32(ctx, mem, *address, candidate_layout.bias));
+			}
 			const auto candidate_sampler = state.program.info.images[resource].indirect_sampler;
 			const auto sampled = MakeSampledImage(state, resource,
 			    candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
+			std::vector<uint32_t> words {opcode, result_type, sample, sampled, candidate_coord};
 			// Only push dref_value for native depth-compare operations
 			if (dref && !use_manual_compare) {
-				words.push_back(dref_value);
+				words.push_back(candidate_dref_value);
 			}
-			if (operand_mask != 0u) {
-				words.push_back(operand_mask);
-				words.insert(words.end(), operands.begin(), operands.end());
+			if (candidate_operand_mask != 0u) {
+				words.push_back(candidate_operand_mask);
+				words.insert(words.end(), candidate_operands.begin(), candidate_operands.end());
 			}
 			state.builder.AddFunction(words);
 			return sample;

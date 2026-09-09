@@ -836,6 +836,19 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: {
 			m_predicate_skip = false;
 		} break;
+		case 0x01: {
+			// Z-pass (occlusion) predication: skip the following draws when a preceding
+			// occlusion query counted zero samples. Host occlusion queries are not implemented,
+			// so results are reported as always-visible -- never predicate the draw away.
+			// (graphics tutorial 10-agc_occlusion_queries reaches here.)
+			m_predicate_skip = false;
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 8) {
+				LOGF("\t z-pass predication treated as always-visible (addr=0x%016" PRIx64
+				     ", condition=%" PRIu32 ")\n",
+				     reinterpret_cast<uint64_t>(address), condition);
+			}
+		} break;
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 

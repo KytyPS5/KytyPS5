@@ -6,6 +6,7 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
+#include "loader/symbolDatabase.h"
 
 #include <array>
 
@@ -16,6 +17,10 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+
+namespace Libs::LibKernelApr {
+void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
 
 namespace {
 
@@ -77,6 +82,114 @@ void CheckSaveRename(const std::filesystem::path &root,
   Check(data.Size() == expected.size(), "renamed save size");
   Check(std::memcmp(data.GetData(), expected.data(), expected.size()) == 0,
         "renamed save contents");
+}
+
+void CheckMountRoot(const std::filesystem::path &root) {
+  Common::File cache;
+  Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
+  cache.Close();
+  FileSystem::Mount(root, "/app0");
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == root / "rpf.cache",
+        "resolve mount descendant");
+  Check(FileSystem::GetRealFilename("/app01/rpf.cache") == "/app01/rpf.cache",
+        "mount prefix must end at a path component");
+
+  for (const char *path : {"/app0", "/app0/"}) {
+    for (const int flags : {0, 0x00020000}) {
+      const int fd = FileSystem::KernelOpen(path, flags, 0);
+      Check(fd >= 3, "open mounted root with O_RDONLY or O_DIRECTORY");
+      std::array<char, 512> entries {};
+      const int size = FileSystem::KernelGetdents(fd, entries.data(), entries.size());
+      Check(size > 0 && size <= entries.size(), "enumerate mounted root");
+      bool found = false;
+      for (int offset = 0; offset < size;) {
+        // Directory record: inode, record length, type, name length, name.
+        Check(size - offset >= 8, "directory record header fits");
+        uint16_t length = 0;
+        std::memcpy(&length, entries.data() + offset + 4, sizeof(length));
+        const auto name_length = static_cast<uint8_t>(entries[offset + 7]);
+        Check(length >= 8 + name_length + 1 && length <= size - offset,
+              "directory record and name fit");
+        if (std::string_view(entries.data() + offset + 8, name_length) == "rpf.cache") {
+          Check(entries[offset + 6] == 8, "cache directory entry is a regular file");
+          found = true;
+        }
+        offset += length;
+      }
+      Check(found, "mounted root listing contains rpf.cache");
+      Check(FileSystem::KernelClose(fd) == OK, "close mounted root");
+    }
+  }
+  FileSystem::Umount("/app0");
+}
+
+void CheckAprPaths(const std::filesystem::path &root) {
+  Loader::SymbolDatabase symbols;
+  Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
+  const auto *resolve_symbol = symbols.FindByNid("w5fcCG+t31g", Loader::SymbolType::Func);
+  const auto *each_symbol = symbols.FindByNid("C+Khtbbx2g8", Loader::SymbolType::Func);
+  Check(resolve_symbol && each_symbol, "APR path exports are registered");
+  using Resolve = int (KYTY_SYSV_ABI *)(const char *, const char *const *, uint32_t,
+                                      uint32_t *, uint64_t *, uint32_t *);
+  using ResolveEach = int (KYTY_SYSV_ABI *)(const char *, const char *const *, uint32_t,
+                                          uint32_t *, uint64_t *, int *);
+  const auto resolve = reinterpret_cast<Resolve>(resolve_symbol->vaddr);
+  const auto resolve_each = reinterpret_cast<ResolveEach>(each_symbol->vaddr);
+  Common::File fixture;
+  Check(fixture.Create(root / "apr.dat"), "create APR fixture");
+  fixture.Write("APR", 3);
+  fixture.Close();
+  FileSystem::Mount(root, "/app0");
+
+  uint32_t expected_id = 0xffffffffu;
+  for (const auto &parts : {std::array{"", "/app0/apr.dat"},
+                           std::array{"/app0/", "apr.dat"},
+                           std::array{"/", "app0/apr.dat"},
+                           std::array{"/app", "0/apr.dat"}}) {
+    uint32_t id = 0xffffffffu, error_index = 0xffffffffu;
+    uint64_t size = 0;
+    Check(resolve(parts[0], &parts[1], 1, &id, &size, &error_index) == OK &&
+              id != 0xffffffffu && size == 3,
+          "APR concatenates empty, one-character and partial-component prefixes");
+    if (expected_id == 0xffffffffu) {
+      expected_id = id;
+    }
+    Check(id == expected_id, "equivalent APR paths return the same ID");
+  }
+
+  const char *paths[] = {"/app0/missing.dat", "/app0/apr.dat"};
+  uint32_t ids[2] = {}, error_index = 0xffffffffu;
+  uint64_t sizes[2] = {1, 1};
+  int results[2] = {};
+  Check(resolve_each("", paths, 2, ids, sizes, results) == 1 &&
+            results[0] == Libs::LibKernel::KERNEL_ERROR_ENOENT && results[1] == OK &&
+            ids[0] == 0xffffffffu && ids[1] == expected_id && sizes[0] == 0 && sizes[1] == 3,
+        "APR foreach reports a missing path and continues to the valid file");
+
+  // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
+  std::string longest = "/app0/";
+  for (int i = 0; i < 3; ++i) {
+    longest += std::string(254, 'a') + '/';
+  }
+  longest += std::string(1023 - longest.size(), 'b');
+  paths[0] = longest.c_str();
+  Check(resolve("", paths, 1, ids, sizes, &error_index) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOENT && error_index == 0,
+        "APR accepts a pathname whose final NUL is at PATH_MAX minus one");
+  Check(resolve("/", paths, 1, ids, sizes, &error_index) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
+        "APR rejects concatenated paths exceeding PATH_MAX");
+  std::array<char, 1024> unterminated;
+  unterminated.fill('/');
+  paths[0] = unterminated.data();
+  Check(resolve("", paths, 1, ids, sizes, &error_index) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
+        "APR rejects an unterminated pathname");
+  paths[0] = "apr.dat";
+  Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
+        "APR rejects an unterminated prefix");
+  FileSystem::Umount("/app0");
 }
 
 void CheckSocketWakeup() {
@@ -156,6 +269,8 @@ int main() {
 
   TempDirectory temporary;
   FileSystem::Initialize();
+  CheckMountRoot(temporary.Path());
+  CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

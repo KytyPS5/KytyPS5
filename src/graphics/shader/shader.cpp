@@ -593,7 +593,6 @@ static void ShaderGetStaticInputInfoPS(
 	}
 	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
 	ps_info.ps_pos_y                     = (active_inputs & 0x00000200u) != 0;
-	ps_info.ps_pos_xy                    = ps_info.ps_pos_x && ps_info.ps_pos_y;
 	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
 	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
 	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
@@ -756,19 +755,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		}
 		return params;
 	}
-	EXIT_IF(regs.gs_regs.data_addr == 0);
-	const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
-	const auto back_params =
-	    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
-	                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
-	params.back_code         = back_params.code;
-	// Merged shaders receive the GS-back user-data pointer in s0:s1, followed
-	// by the ordinary user SGPRs at s8. Keep both in the runtime register snapshot.
+	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
+	// its user-data pointer in s0:s1.
 	params.user_data.insert(params.user_data.begin(), 8u, 0u);
-	params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
-	params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
-	const uint64_t hashes[]  = {params.hash, back_params.hash};
-	params.hash              = XXH3_64bits(hashes, sizeof(hashes));
 	info                     = {};
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
@@ -777,11 +766,25 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
 	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
-	mesh.scratch_size_dwords = std::max(data.scratch_size_dwords, back.scratch_size_dwords);
+	mesh.scratch_size_dwords = data.scratch_size_dwords;
+	if (data.type == Prospero::ShaderBinaryType::kGsFront) {
+		EXIT_IF(regs.gs_regs.data_addr == 0);
+		const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
+		const auto back_params =
+		    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
+		                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
+		params.back_code = back_params.code;
+		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
+		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
+		const uint64_t hashes[] = {params.hash, back_params.hash};
+		params.hash = XXH3_64bits(hashes, sizeof(hashes));
+		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
+	}
 	EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
 	                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	const auto& group = user_config.GetGeControl();
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
+	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
 	    sh.m_vgtGsOutPrimType != 2u || sh.m_vgtGsMaxVertOut < 3u ||

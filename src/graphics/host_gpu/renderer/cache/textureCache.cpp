@@ -187,15 +187,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 TextureCache::~TextureCache() {
-	std::vector<ImageId> registered;
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
-			registered.push_back(id);
+			UnregisterImage(id);
 		}
 	});
-	for (const auto id: registered) {
-		UnregisterImage(id);
-	}
 }
 
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -1334,8 +1330,8 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
-	std::scoped_lock     lock {m_lock};
-	std::vector<ImageId> matches;
+	std::scoped_lock lock {m_lock};
+	ImageIds         matches;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || owner->info.data.address != address) {

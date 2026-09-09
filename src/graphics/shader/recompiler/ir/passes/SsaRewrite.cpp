@@ -123,46 +123,6 @@ struct DefTable {
 	std::unordered_map<uint32_t, ValueMap> goto_variables;
 };
 
-ValueOpcode UndefOpcode(ScalarReg) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(ThreadBitScalarReg) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(ScalarMaskTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(VectorReg) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(GotoVariable) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(SccTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(ExecTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(ExecLoTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(ExecHiTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(VccTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(VccLoTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(VccHiTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(M0Tag) {
-	return ValueOpcode::UndefU32;
-}
-
 Value InitialValue(ScalarReg) {
 	return Value(0u);
 }
@@ -248,7 +208,7 @@ public:
 						state.result = def;
 					} else if (!block->IsSsaSealed()) {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(TypeOf(UndefOpcode(variable)));
+						phi.SetFlags(InitialValue(variable).GetType());
 						incomplete_phis[block][Variable(variable)] = &phi;
 						state.result                               = Value(&phi);
 					} else if (const auto predecessors = block->ImmPredecessors();
@@ -258,7 +218,7 @@ public:
 						break;
 					} else {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(TypeOf(UndefOpcode(variable)));
+						phi.SetFlags(InitialValue(variable).GetType());
 						Write(variable, block, Value(&phi));
 						state.phi = &phi;
 						prepare_phi();

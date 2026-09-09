@@ -42,6 +42,10 @@ namespace LibPsml {
 LIB_DEFINE(InitPsml_1);
 } // namespace LibPsml
 
+namespace LibCes {
+LIB_DEFINE(InitCes_1);
+} // namespace LibCes
+
 namespace LibC {
 LIB_DEFINE(InitLibC_1);
 } // namespace LibC
@@ -103,6 +107,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LibContentExport::InitContentExport_1(s);
 	LibContentSearch::InitContentSearch_1(s);
 	LibC::InitLibC_1(s);
+	LibCes::InitCes_1(s);
 	InitDbgAddressSanitizer_1(s);
 	LibRazorCpu::InitRazorCpu_1(s);
 	InitDialog_1(s);

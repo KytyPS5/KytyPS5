@@ -15,7 +15,6 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
-struct VulkanMemory;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -32,6 +31,7 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -130,12 +130,6 @@ private:
 	    m_image_format_properties;
 };
 
-struct VulkanMemory {
-	vk::MemoryPropertyFlags property           = {};
-	vk::MemoryPropertyFlags preferred_property = {};
-	VmaAllocation           allocation         = nullptr;
-};
-
 struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
@@ -157,7 +151,7 @@ struct VulkanImage {
 	vk::Image                     image       = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
-	Graphics::VulkanMemory        memory;
+	VmaAllocation                allocation = nullptr;
 };
 
 

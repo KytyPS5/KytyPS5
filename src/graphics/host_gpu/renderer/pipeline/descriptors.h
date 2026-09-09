@@ -16,9 +16,7 @@
 
 namespace Libs::Graphics {
 
-namespace ShaderRecompiler::IR {
-struct ResourceSnapshot;
-}
+struct ShaderStageRuntime;
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -35,8 +33,8 @@ struct PreparedBindings {
 		BufferId id;
 	};
 
-	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
+	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
+	const ShaderStageRuntime* runtime = nullptr;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;

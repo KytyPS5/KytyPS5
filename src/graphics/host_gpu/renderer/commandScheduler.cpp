@@ -208,13 +208,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	PopPendingOperations(true);
-}
-
-void CommandScheduler::PopPendingOperations(bool refresh_gpu_tick) {
-	if (refresh_gpu_tick) {
-		m_master.Refresh();
-	}
+	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
 		{

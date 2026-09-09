@@ -101,109 +101,23 @@ static uint32_t ComputeFileId(const char* guest_path) {
 	return hash & static_cast<uint32_t>(std::numeric_limits<int32_t>::max());
 }
 
-static bool CopyStringToOutput(const std::string& str, char* out, size_t out_size) {
-	if (str.empty() || str.size() + 1 > out_size) {
-		return false;
+static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
+	if (addr == 0) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	std::memcpy(out, str.c_str(), str.size() + 1);
-	return true;
-}
-
-static bool ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
-	if (out == nullptr || out_size == 0 || addr == 0) {
-		return false;
-	}
-
-	const auto  max_len = static_cast<uint64_t>(out_size - 1);
-	const auto* src     = reinterpret_cast<const char*>(static_cast<uintptr_t>(addr));
-	for (uint64_t pos = 0; pos < max_len; pos++) {
+	const auto* src = reinterpret_cast<const char*>(addr);
+	for (size_t pos = 0; pos < out_size; pos++) {
 		if (addr > std::numeric_limits<uint64_t>::max() - pos) {
-			out[pos] = '\0';
-			return false;
+			return LibKernel::KERNEL_ERROR_EFAULT;
 		}
-
-		const auto ch = src[pos];
-		out[pos]      = ch;
-		if (ch == '\0') {
-			return pos != 0;
+		out[pos] = src[pos];
+		if (out[pos] == '\0') {
+			return OK;
 		}
 	}
 
-	out[max_len] = '\0';
-	return false;
-}
-
-static bool ReadGuestWideCString(uint64_t addr, char* out, size_t out_size) {
-	if (out == nullptr || out_size == 0 || addr == 0) {
-		return false;
-	}
-
-	std::array<char16_t, 1024> tmp {};
-	const auto                 max_len = std::min<uint64_t>(tmp.size() - 1, out_size - 1);
-	const auto*                src = reinterpret_cast<const char*>(static_cast<uintptr_t>(addr));
-	for (uint64_t pos = 0; pos < max_len; pos++) {
-		if (pos > (std::numeric_limits<uint64_t>::max() - addr) / sizeof(char16_t)) {
-			return false;
-		}
-
-		char16_t ch = 0;
-		std::memcpy(&ch, src + pos * sizeof(char16_t), sizeof(ch));
-		tmp[static_cast<size_t>(pos)] = ch;
-		if (ch == u'\0') {
-			return pos != 0 && CopyStringToOutput(Common::Utf16ToUtf8(tmp.data()), out, out_size);
-		}
-	}
-
-	return false;
-}
-
-static bool ReadGuestPathText(uint64_t addr, char* out, size_t out_size) {
-	std::array<char, 1024> narrow {};
-	if (ReadGuestCString(addr, narrow.data(), std::min(narrow.size(), out_size))) {
-		const auto narrow_len = std::strlen(narrow.data());
-		if (narrow_len > 1 || !ReadGuestWideCString(addr, out, out_size)) {
-			std::memcpy(out, narrow.data(), std::strlen(narrow.data()) + 1);
-		}
-		return true;
-	}
-
-	if (ReadGuestWideCString(addr, out, out_size)) {
-		return true;
-	}
-	return false;
-}
-
-static bool ReadPathPointer(uint64_t pointer_addr, char* out, size_t out_size) {
-	uint64_t path_addr = 0;
-	if (!ReadGuest(pointer_addr, &path_addr)) {
-		return false;
-	}
-	if (path_addr == 0) {
-		return false;
-	}
-	if (ReadGuestPathText(path_addr, out, out_size)) {
-		return true;
-	}
-	return false;
-}
-
-static bool ResolvePathFromList(uint64_t path_list, uint64_t index, char* out, size_t out_size) {
-	if (ReadPathPointer(path_list + index * sizeof(uint64_t), out, out_size)) {
-		return true;
-	}
-	if (index != 0) {
-		return false;
-	}
-	if (ReadGuestPathText(path_list, out, out_size)) {
-		return true;
-	}
-	for (uint64_t offset = 0; offset < 0x40; offset += sizeof(uint64_t)) {
-		if (ReadPathPointer(path_list + offset, out, out_size)) {
-			return true;
-		}
-	}
-	return false;
+	return LibKernel::KERNEL_ERROR_ENAMETOOLONG;
 }
 
 static void RegisterHostPathLocked(uint32_t file_id, const std::string& host_path,
@@ -280,36 +194,6 @@ static int GetHostPathStat(const std::string& host_path, LibKernel::FileSystem::
 	return OK;
 }
 
-static bool JoinPrefixPath(const char* prefix, const char* path, char* out, size_t out_size) {
-	if (path == nullptr || out == nullptr || out_size == 0) {
-		return false;
-	}
-
-	if (prefix == nullptr || prefix[0] == '\0') {
-		std::strncpy(out, path, out_size - 1);
-		out[out_size - 1] = '\0';
-		return true;
-	}
-
-	const auto prefix_len = std::strlen(prefix);
-	const auto path_len   = std::strlen(path);
-	const bool needs_sep  = prefix_len != 0 && path_len != 0 && prefix[prefix_len - 1] != '/' &&
-	                        prefix[prefix_len - 1] != '\\' && path[0] != '/' && path[0] != '\\';
-	const auto total_len  = prefix_len + (needs_sep ? 1u : 0u) + path_len;
-	if (total_len + 1u > out_size) {
-		return false;
-	}
-
-	std::memcpy(out, prefix, prefix_len);
-	auto pos = prefix_len;
-	if (needs_sep) {
-		out[pos++] = '/';
-	}
-	std::memcpy(out + pos, path, path_len);
-	out[total_len] = '\0';
-	return true;
-}
-
 static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) {
 	if (guest_path == nullptr || guest_path[0] == '\0') {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -381,8 +265,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	return OK;
 }
 
-static int ResolvePathsCommon(const void* path_list, uint64_t count, uint32_t* ids, uint64_t* sizes,
-                              uint32_t* error_index, const char* prefix, int* results) {
+static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint32_t* ids,
+                              uint64_t* sizes, uint32_t* error_index, const char* prefix, int* results) {
 	if (path_list == nullptr || count == 0 || count > 1024 ||
 	    (ids == nullptr && sizes == nullptr && results == nullptr)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -406,18 +290,27 @@ static int ResolvePathsCommon(const void* path_list, uint64_t count, uint32_t* i
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	const auto path_list_addr = reinterpret_cast<uint64_t>(path_list);
-	bool       any_error      = false;
-	int        first_error    = OK;
-	uint32_t   success_count  = 0;
-	for (uint64_t i = 0; i < count; i++) {
-		char guest_path[1024] {};
-		char resolved_path[2048] {};
-		int  result = OK;
-		if (!AprShared::ResolvePathFromList(path_list_addr, i, guest_path, sizeof(guest_path)) ||
-		    !JoinPrefixPath(prefix, guest_path, resolved_path, sizeof(resolved_path))) {
-			result = LibKernel::KERNEL_ERROR_EFAULT;
-		} else {
+	if (!IsValidGuestRange(reinterpret_cast<uint64_t>(path_list), count * sizeof(*path_list))) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	char prefix_buf[1024] {};
+	if (prefix != nullptr) {
+		const int result = ReadGuestCString(reinterpret_cast<uint64_t>(prefix), prefix_buf,
+		                                   sizeof(prefix_buf));
+		if (result != OK) {
+			return result;
+		}
+	}
+	const auto prefix_size   = std::strlen(prefix_buf);
+	uint32_t   success_count = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		char resolved_path[1024] {};
+		// Concatenate the prefix literally, including an empty prefix.
+		std::memcpy(resolved_path, prefix_buf, prefix_size);
+		int result = ReadGuestCString(reinterpret_cast<uint64_t>(path_list[i]),
+		                             resolved_path + prefix_size, sizeof(resolved_path) - prefix_size);
+		if (result == OK) {
 			result = ResolveOnePath(resolved_path, ids != nullptr ? &ids[i] : nullptr,
 			                        sizes != nullptr ? &sizes[i] : nullptr);
 		}
@@ -437,17 +330,13 @@ static int ResolvePathsCommon(const void* path_list, uint64_t count, uint32_t* i
 			if (error_index != nullptr) {
 				*error_index = static_cast<uint32_t>(i);
 			}
-			if (!any_error) {
-				any_error   = true;
-				first_error = result;
-			}
 			if (results == nullptr) {
 				return result;
 			}
 		}
 	}
 
-	return results != nullptr ? static_cast<int>(success_count) : (any_error ? first_error : OK);
+	return results != nullptr ? static_cast<int>(success_count) : OK;
 }
 
 static uint32_t AllocateSubmissionId(uint64_t command_buffer, uint64_t result) {
@@ -521,7 +410,7 @@ static int KernelSyscallResult(int result) {
 	return -1;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIds(const void* path_list, uint32_t count, uint32_t* ids,
+static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count, uint32_t* ids,
                                                uint32_t* error_index) {
 	PRINT_NAME();
 
@@ -582,7 +471,7 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const void* path_list, uint32_t count,
+static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list, uint32_t count,
                                                            uint32_t* ids, uint64_t* sizes,
                                                            uint32_t* error_index) {
 	PRINT_NAME();
@@ -591,37 +480,27 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const void* path_list
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, error_index, nullptr, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, const void* path_list,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, const char* const* path_list,
                                                          uint32_t count, uint32_t* ids,
                                                          uint32_t* error_index) {
 	PRINT_NAME();
 
-	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
-	                                                       prefix_buf, sizeof(prefix_buf))) {
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
-	}
 	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, nullptr,
-	                                                         error_index, prefix_buf, nullptr));
+	                                                         error_index, prefix, nullptr));
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix,
-                                                                     const void* path_list,
+                                                                     const char* const* path_list,
                                                                      uint32_t count, uint32_t* ids,
                                                                      uint64_t* sizes,
                                                                      uint32_t* error_index) {
 	PRINT_NAME();
 
-	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
-	                                                       prefix_buf, sizeof(prefix_buf))) {
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
-	}
 	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, sizes,
-	                                                         error_index, prefix_buf, nullptr));
+	                                                         error_index, prefix, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const void* path_list, uint32_t count,
+static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const char* const* path_list, uint32_t count,
                                                       uint32_t* ids, int* results) {
 	PRINT_NAME();
 
@@ -629,7 +508,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const void* path_list, uin
 	    AprShared::ResolvePathsCommon(path_list, count, ids, nullptr, nullptr, nullptr, results));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const void* path_list,
+static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const char* const* path_list,
                                                                   uint32_t count, uint32_t* ids,
                                                                   uint64_t* sizes, int* results) {
 	PRINT_NAME();
@@ -639,32 +518,22 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const void* pa
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* prefix,
-                                                                const void* path_list,
+                                                                const char* const* path_list,
                                                                 uint32_t count, uint32_t* ids,
                                                                 int* results) {
 	PRINT_NAME();
 
-	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
-	                                                       prefix_buf, sizeof(prefix_buf))) {
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
-	}
 	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, nullptr,
-	                                                         nullptr, prefix_buf, results));
+	                                                         nullptr, prefix, results));
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
-    const char* prefix, const void* path_list, uint32_t count, uint32_t* ids, uint64_t* sizes,
+    const char* prefix, const char* const* path_list, uint32_t count, uint32_t* ids, uint64_t* sizes,
     int* results) {
 	PRINT_NAME();
 
-	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
-	                                                       prefix_buf, sizeof(prefix_buf))) {
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
-	}
 	return KernelSyscallResult(
-	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, prefix_buf, results));
+	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, prefix, results));
 }
 
 static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffer, uint64_t,

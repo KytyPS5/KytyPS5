@@ -664,7 +664,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		feedback_layout.pNext  = &feedback_dynamic;
 		supported_features2.pNext = &feedback_layout;
 	}
+	const bool provoking_extension =
+	    HasExtension(device_extensions, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+	vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex {};
+	if (provoking_extension) {
+		provoking_vertex.pNext = supported_features2.pNext;
+		supported_features2.pNext = &provoking_vertex;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -792,9 +800,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	void* device_chain_root = graphics.attachment_feedback_loop_enabled
 	                              ? static_cast<void*>(&feedback_layout)
 	                              : feedback_dynamic.pNext;
+	if (graphics.provoking_vertex_last_enabled) {
+		provoking_vertex.pNext = device_chain_root;
+		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
+		device_chain_root                                          = &provoking_vertex;
+	}
 
 	// Pageable-memory wraps whatever the rest of the chain resolved to, so it
-	// stays composable with the feedback-loop/mesh-shader chaining above
+	// stays composable with the feedback-loop/mesh-shader/provoking-vertex chaining above
 	// regardless of which of those are active.
 	pageable_features.pNext = device_chain_root;
 	create_info.pNext       = enable_pageable ? static_cast<const void*>(&pageable_features)
@@ -1191,6 +1204,7 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {

@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <bit>
@@ -104,18 +105,14 @@ vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t s) {
 	return vk::ComponentSwizzle::eIdentity;
 }
 
-static uint32_t TextureGetDstSel(uint32_t swizzle, uint32_t channel) {
-	return (swizzle >> (channel * 3u)) & 0x7u;
-}
-
 } // namespace
 
 vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
 	vk::ComponentMapping components {};
-	components.r = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 0)));
-	components.g = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 1)));
-	components.b = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 2)));
-	components.a = TextureGetComponentSwizzle(static_cast<uint8_t>(TextureGetDstSel(swizzle, 3)));
+	components.r = TextureGetComponentSwizzle(GetDstSel(swizzle, 0));
+	components.g = TextureGetComponentSwizzle(GetDstSel(swizzle, 1));
+	components.b = TextureGetComponentSwizzle(GetDstSel(swizzle, 2));
+	components.a = TextureGetComponentSwizzle(GetDstSel(swizzle, 3));
 	return components;
 }
 

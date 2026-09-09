@@ -163,9 +163,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(allocator == nullptr || image.image != nullptr || image.memory.allocation != nullptr);
+	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	auto&                   memory = image.memory;
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory.property);
 	alloc_info.preferredFlags =
@@ -175,24 +174,34 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &memory.allocation, nullptr));
+	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;
 	}
 
+	image.format     = image_info.format;
+	image.image_type = image_info.imageType;
+	image.extent     = image_info.extent;
+	image.layers     = image_info.arrayLayers;
+	image.mip_levels = image_info.mipLevels;
+	image.samples    = static_cast<uint32_t>(image_info.samples);
+	image.usage      = image_info.usage;
+	image.flags      = image_info.flags;
+	image.state      = {.layout = image_info.initialLayout};
+	image.subresource_states.clear();
+
 	return true;
 }
 
 void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(allocator == nullptr || image.image == nullptr || image.memory.allocation == nullptr);
+	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	auto& memory = image.memory;
-	vmaDestroyImage(allocator, image.image, memory.allocation);
-	image.image            = nullptr;
-	memory.allocation      = nullptr;
+	vmaDestroyImage(allocator, image.image, image.allocation);
+	image.image      = nullptr;
+	image.allocation = nullptr;
 }
 
 } // namespace Libs::Graphics

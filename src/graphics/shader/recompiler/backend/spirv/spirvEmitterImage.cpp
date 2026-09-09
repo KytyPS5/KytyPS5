@@ -32,18 +32,6 @@ uint32_t ImageGatherComponent(uint32_t dmask) {
 	}
 }
 
-uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, value});
-	return result;
-}
-
-uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs, uint32_t rhs) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, lhs, rhs});
-	return result;
-}
-
 bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 	return (mem.image_sample_flags & flag) != 0u;
 }
@@ -768,8 +756,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
-		const auto* source = image.source < ctx.program.descriptor_sources.size()
-		                         ? &ctx.program.descriptor_sources[image.source]
+		const auto* source = image.source < state.program.descriptor_sources.size()
+		                         ? &state.program.descriptor_sources[image.source]
 		                         : nullptr;
 		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
 		    source->indirect_image->key_arg >= handle->NumArgs()) {

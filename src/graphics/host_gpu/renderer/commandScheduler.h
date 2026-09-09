@@ -81,7 +81,6 @@ private:
 	};
 
 	void BeginNext();
-	void PopPendingOperations(bool refresh_gpu_tick);
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 

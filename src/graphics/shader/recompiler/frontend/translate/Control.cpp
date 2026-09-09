@@ -210,8 +210,10 @@ void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 	WriteOperand(high, words[1]);
 }
 
-void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
-	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.src1));
+// S_CMOV is S_CSELECT whose false operand is the destination, so both share this.
+void Translator::ScalarSelect32(const Decoder::Instruction& inst,
+                                const Decoder::Operand& false_source) {
+	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(false_source));
 	WriteOperand(DestinationOperand(inst), result);
 }
 

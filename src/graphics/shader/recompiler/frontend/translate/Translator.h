@@ -229,7 +229,7 @@ private:
 	void S_TTRACEDATA();
 	void S_INST_PREFETCH();
 	void S_GETPC_B64(const Decoder::Instruction& inst);
-	void S_CSELECT_B32(const Decoder::Instruction& inst);
+	void ScalarSelect32(const Decoder::Instruction& inst, const Decoder::Operand& false_source);
 	void ScalarSelect64(const Decoder::Instruction& inst, const Decoder::Operand& false_source);
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);

@@ -127,12 +127,14 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 }
 
 bool RequiresPointSampler(const ImageResource& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
+	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 
 bool RequiresPointSampler(const ResourceSpecialization::Image& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
+	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 

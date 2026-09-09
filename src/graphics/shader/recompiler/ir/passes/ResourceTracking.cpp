@@ -657,9 +657,10 @@ private:
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
 			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset != 0u || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
+			indirect.selector_immediate = memory->offset;
 			Value selector;
 			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
 			                         indirect.selector_offset)) {

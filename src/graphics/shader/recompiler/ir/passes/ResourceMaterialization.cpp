@@ -310,7 +310,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	} else {
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-		    material.Stride() != indirect.selector_stride) {
+		    (material.Stride() != 0u && material.Stride() != indirect.selector_stride)) {
 			return false;
 		}
 		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
@@ -324,9 +324,10 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.reserve(static_cast<size_t>(probe_count) + 1u);
 		keys.push_back(0u);
 		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
-			uint32_t key = 0;
-			if (!ReadScalarTable(material.Base48(), material.GetSize(),
-			                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+			uint32_t   key   = 0;
+			const auto probe = std::min<uint64_t>(offset + indirect.selector_immediate, UINT32_MAX);
+			if (!ReadScalarTable(material.Base48(), material.GetSize(), static_cast<uint32_t>(probe),
+			                     runtime, {&key, 1})) {
 				return false;
 			}
 			keys.push_back(key);

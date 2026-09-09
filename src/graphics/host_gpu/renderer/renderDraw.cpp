@@ -534,6 +534,23 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
 	}
+	// A stale depth target from an earlier, smaller pass must not shrink the render area for a
+	// larger colour pass. Astro Bot's title screen keeps a 1920x1080 depth attachment bound on
+	// a 3840x2160 composite pass; the render area would clamp to the 1080p corner and leave the
+	// rest of the frame holding whatever was there before ("only a square is cleared"). The
+	// guest cannot actually pair mismatched attachment sizes, so treat the depth as unbound.
+	if (depth.image_id && color_count > 0 &&
+	    (depth.desc.info.extent.width < state.width ||
+	     depth.desc.info.extent.height < state.height)) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderState: depth target %ux%u smaller than colour %ux%u -- unbinding it for "
+			     "the draw\n",
+			     depth.desc.info.extent.width, depth.desc.info.extent.height, state.width,
+			     state.height);
+		}
+		depth.image_id = {};
+	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {

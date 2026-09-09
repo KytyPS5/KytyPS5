@@ -462,6 +462,12 @@ add_executable(bvh_node_parser_tests EXCLUDE_FROM_ALL
 target_link_libraries(bvh_node_parser_tests fmt::fmt)
 target_include_directories(bvh_node_parser_tests PRIVATE ${inc_headers})
 
+add_executable(bvh_accel_struct_device_tests EXCLUDE_FROM_ALL
+"${KYTY_TESTS_DIR}/BvhAccelStructDeviceTests.cpp"
+)
+target_link_libraries(bvh_accel_struct_device_tests Vulkan::Headers)
+target_include_directories(bvh_accel_struct_device_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"

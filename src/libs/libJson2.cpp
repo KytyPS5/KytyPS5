@@ -972,7 +972,11 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 
 	JsonValue parsed {};
 	JsonValueInit(&parsed);
-	auto json = nlohmann::json::parse(src, src + size, nullptr, false);
+	// allow_exceptions = false, ignore_comments = true. Retail PS5 JSON assets (Astro Bot room
+	// and material descriptors) carry `//` and `/* */` comments; strict parsing discards the
+	// whole document, after which every key reads back absent and the engine's checked-build
+	// type asserts (Module/Network/Json.cpp:272 / :399) trap.
+	auto json = nlohmann::json::parse(src, src + size, nullptr, false, true);
 	if (json.is_discarded() || !JsonValueFromNlohmann(&parsed, json)) {
 		JsonValueClear(&parsed);
 		return JSON_ERROR_PARSE_INVALID_CHAR;

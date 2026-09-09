@@ -226,26 +226,54 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 		}
 	}
 	std::unordered_set<const IR::Inst*> branch_conditions;
-	std::unordered_set<const IR::Inst*> cross_block_conditions;
+	std::unordered_map<const IR::Inst*, uint32_t> branch_condition_uses;
+	std::unordered_map<const IR::Inst*, uint32_t> positions;
+	std::unordered_map<const IR::Block*, std::pair<uint32_t, uint32_t>> block_ranges;
+	uint32_t position = 0;
+	for (const auto* block : ctx.program.blocks) {
+		const auto start = position;
+		for (const auto& inst : *block) positions.emplace(&inst, position++);
+		block_ranges.emplace(block, std::pair {start, position++});
+	}
 	for (size_t index = 0; index < ctx.program.block_info.size(); ++index) {
 		const auto& block = ctx.program.block_info[index];
 		if (const auto* condition = block.condition.Resolve().TryInstruction(); condition != nullptr) {
 			branch_conditions.insert(condition);
-			if (index >= ctx.program.blocks.size() || condition->Parent() != ctx.program.blocks[index]) {
-				cross_block_conditions.insert(condition);
+			if (index < ctx.program.blocks.size()) {
+				const auto use = block_ranges.at(ctx.program.blocks[index]).second;
+				auto [found, inserted] = branch_condition_uses.emplace(condition, use);
+				if (!inserted) found->second = std::max(found->second, use);
 			}
 		}
 	}
+	std::unordered_map<uint32_t, size_t> block_indices;
+	for (size_t index = 0; index < ctx.program.block_info.size(); ++index)
+		block_indices.emplace(ctx.program.block_info[index].id, index);
+	std::vector<std::pair<uint32_t, uint32_t>> backedge_ranges;
+	for (size_t index = 0; index < ctx.program.block_info.size() && index < ctx.program.blocks.size(); ++index) {
+		const auto& terminator = ctx.program.block_info[index].terminator;
+		const auto add_backedge = [&](uint32_t target) {
+			const auto found = block_indices.find(target);
+			if (found != block_indices.end() && found->second <= index)
+				backedge_ranges.emplace_back(
+				    block_ranges.at(ctx.program.blocks[found->second]).first,
+				    block_ranges.at(ctx.program.blocks[index]).second);
+		};
+		switch (terminator.kind) {
+			case CFG::TerminatorKind::Branch: add_backedge(terminator.true_block); break;
+			case CFG::TerminatorKind::ConditionalBranch:
+				add_backedge(terminator.true_block);
+				add_backedge(terminator.false_block);
+				break;
+			default: break;
+		}
+	}
 	struct ReusableSlot {
-		uint32_t        id = 0;
-		uint32_t        end = 0;
-		const IR::Block* block = nullptr;
+		uint32_t id = 0;
+		uint32_t end = 0;
 	};
 	std::unordered_map<IR::Type, std::vector<ReusableSlot>> reusable_slots;
 	for (const auto* block : ctx.program.blocks) {
-		std::unordered_map<const IR::Inst*, uint32_t> positions;
-		uint32_t position = 0;
-		for (const auto& inst : *block) positions.emplace(&inst, position++);
 		for (const auto& inst : *block) {
 			// Opaque resource/address recipes are compile-time structures. Runtime
 			// values need Function storage only when a scheduler phase, CFG edge, or
@@ -268,32 +296,40 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 
 			const auto start = positions.at(&inst);
 			auto       end = start;
-			bool reusable = inst.GetOpcode() != O::Phi && !cross_block_conditions.contains(&inst);
+			bool reusable = inst.GetOpcode() != O::Phi;
+			bool cross_block = false;
 			for (const auto& use : inst.Uses()) {
 				const auto found = positions.find(use.user);
-				if (use.user == nullptr || use.user->Parent() != block || found == positions.end() ||
-				    found->second < start) {
+				if (use.user == nullptr || found == positions.end() || found->second < start) {
 					reusable = false;
 					break;
 				}
+				cross_block |= use.user->Parent() != block;
 				end = std::max(end, found->second);
 			}
-			if (branch_conditions.contains(&inst)) end = position;
+			if (const auto found = branch_condition_uses.find(&inst);
+			    found != branch_condition_uses.end()) {
+				cross_block |= found->second != block_ranges.at(block).second;
+				if (found->second < start) reusable = false;
+				end = std::max(end, found->second);
+			}
+			if (reusable && cross_block && std::ranges::any_of(backedge_ranges, [&](const auto& range) {
+				    return start <= range.second && end >= range.first;
+			})) reusable = false;
 			if (!reusable) {
 				function.spills.emplace(&inst, ctx.state.builder.AllocateId());
 				continue;
 			}
 			auto& slots = reusable_slots[inst.GetType()];
 			const auto available = std::ranges::find_if(slots, [&](const ReusableSlot& slot) {
-				return slot.block != block || slot.end < start;
+				return slot.end < start;
 			});
 			if (available != slots.end()) {
-				available->block = block;
 				available->end = end;
 				function.spills.emplace(&inst, available->id);
 			} else {
 				const auto id = ctx.state.builder.AllocateId();
-				slots.push_back({id, end, block});
+				slots.push_back({id, end});
 				function.spills.emplace(&inst, id);
 			}
 		}

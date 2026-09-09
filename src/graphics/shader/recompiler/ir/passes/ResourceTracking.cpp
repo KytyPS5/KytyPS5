@@ -1517,7 +1517,66 @@ private:
 	std::string                                  m_indirect_reason;
 };
 
+// A value is "wave-mask scratch" if it is (transitively, through composite extracts / identity /
+// phi) a subgroup ballot or any-lane result -- i.e. a 64-bit lane mask, never real descriptor
+// data.
+bool TracesToWaveMask(Value value, std::unordered_set<const Inst*>& visited, uint32_t depth) {
+	if (depth > 32u) {
+		return false;
+	}
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr || !visited.insert(inst).second) {
+		return false;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::Ballot:
+		case ValueOpcode::AnyLane:
+			return true;
+		case ValueOpcode::Identity:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4:
+		case ValueOpcode::CompositeExtractU64:
+			return inst->NumArgs() >= 1 && TracesToWaveMask(inst->Arg(0), visited, depth + 1u);
+		case ValueOpcode::Phi: {
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				if (TracesToWaveMask(inst->Arg(i), visited, depth + 1u)) {
+					return true;
+				}
+			}
+			return false;
+		}
+		default:
+			return false;
+	}
+}
+
 } // namespace
+
+// PS5 shader compilers sometimes leave a sampler S#'s upper dwords holding a stale wave mask
+// (from an earlier S_AND_SAVEEXEC / V_CMP-to-SGPR) because the hardware sampler ignores those
+// anisotropy / LOD-clamp / border-index fields for the fetch in question. That mask is not a
+// runtime-evaluable value, so it would abort SRT planning. Sampler dwords 2-3 are exactly those
+// don't-care fields, so rewrite such a dword to zero before the plan is built -- dwords 0-1
+// (filter mode, address clamp, base LOD) stay untouched so a genuinely bad descriptor still
+// fails loudly.
+void CanonicalizeSamplerScratchDwords(Program& program) {
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::GetSamplerResource || inst.NumArgs() < 4) {
+				continue;
+			}
+			for (uint32_t dword = 2; dword < 4; dword++) {
+				if (inst.Arg(dword).Resolve().IsImmediate()) {
+					continue;
+				}
+				std::unordered_set<const Inst*> visited;
+				if (TracesToWaveMask(inst.Arg(dword), visited, 0u)) {
+					inst.SetArg(dword, Value(0u));
+				}
+			}
+		}
+	}
+}
 
 void TrackResources(Program& program) {
 	Tracker(program).Run();

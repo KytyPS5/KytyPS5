@@ -25845,6 +25845,49 @@ TestCase Wave64MultiWaveLdsDifferentIterationsBeforeBarrier() {
   return test;
 }
 
+// Every guest wave revisits the same static barrier a different number of
+// times. Each release is one hardware barrier generation: waves that have
+// finished no longer participate, while the surviving waves must continue
+// from their own loop-carried scalar state.
+TestCase Wave64MultiWaveCyclicGuestBarrier() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256u;
+  constexpr u32 total = 2u * local_count;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64MultiWaveCyclicGuestBarrier", local_count, 0u, 2u);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendVop3(&code, 0x360, 20, Vgpr(8), InlineU32(0));
+  code.push_back(EncodeSop2(0x00, 21, 20, InlineU32(1)));
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+  const size_t loop = code.size();
+  AppendMultiWaveGuestBarrier(&code);
+  code.push_back(EncodeSop2(0x00, 22, 22, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 22, 21));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  AppendStoreSgprAtLaneDwordOffset(&code, 22, 4, 4u);
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 4, 4u + total);
+  AppendEnd(&code);
+
+  for (u32 group = 0; group < 2u; ++group) {
+    for (u32 lane = 0; lane < local_count; ++lane) {
+      const u32 index = group * local_count + lane;
+      const u32 wave = lane / 64u;
+      test.expected[4u + index] = wave + 1u;
+      test.expected[4u + total + index] = wave;
+    }
+  }
+  test.opcodes = {O::V_READLANE_B32, O::S_MOV_B32, O::S_ADD_U32,
+                  O::S_WAITCNT, O::S_BARRIER, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"s_barrier", 1u}};
+  test.ir_counts = {{"Barrier", 1u}};
+  test.required_spirv = {"OpControlBarrier"};
+  return test;
+}
+
 // A bounded inter-wave publication test. GLC loads bypass the guest L0;
 // VSCNT, unlike ordinary S_WAITCNT, completes vector stores before publishing
 // the flag. Every observed payload is loaded with GLC as well. The producer's
@@ -30109,6 +30152,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64CooperativeScalarBufferLoadBranch);
   AddCase(Wave64CooperativeUnalignedScalarBufferLoadBranch);
   AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
+  AddCase(Wave64MultiWaveCyclicGuestBarrier);
   AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
@@ -35317,6 +35361,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Wave64CooperativeImageAtomicReturnToLds());
     RunCase(&vulkan, Wave64CooperativeScalarBufferLoadBranch());
     RunCase(&vulkan, Wave64MultiWaveLdsDifferentIterationsBeforeBarrier());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-cyclic-barrier-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64MultiWaveCyclicGuestBarrier());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-descriptor-neighbors-only") == 0) {

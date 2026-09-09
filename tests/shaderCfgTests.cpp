@@ -9626,18 +9626,25 @@ void TestCooperativeWave64BarrierOrderAndControl() {
     f.KeepWave(finish);
     f.RequireWholeGroup("early-terminated waves must satisfy the remaining guest barrier");
   }
-  // Cyclic barriers remain outside the proved scheduler contract.
+  // A barrier may be revisited. The scheduler must treat each release as one
+  // dynamic generation and keep loop-carried state separate for every wave.
   {
     F f;
     const auto body=f.AddBlock(),finish=f.AddBlock();
     f.Branch(0,body);
+    auto& phi=f.program.blocks[body]->AppendNewInst(O::Phi,{},
+        static_cast<uint64_t>(ShaderRecompiler::IR::Type::U32));
+    phi.AddPhiOperand(f.program.blocks[0],V(0u));
     f.Emit(body,O::Barrier);
-    f.Conditional(body,body,finish,f.FirstWave(body));
+    const auto next=f.Emit(body,O::IAdd32,{V(&phi),V(1u)});
+    phi.AddPhiOperand(f.program.blocks[body],next);
+    f.Conditional(body,body,finish,f.Emit(body,O::ULessThan32,{next,V(3u)}));
     f.program.block_info[body].terminator.loop_header=true;
     f.program.block_info[body].terminator.continue_block=f.program.block_info[body].id;
     f.program.block_info[body].terminator.merge_block=f.program.block_info[finish].id;
     f.KeepWave(finish);
-    Check(!f.Plan().error.empty(),"cooperative admission accepted a cyclic guest barrier");
+    f.RequireWholeGroup(
+        "a bounded cyclic guest barrier must preserve dynamic rendezvous generations");
   }
   {
     F f;

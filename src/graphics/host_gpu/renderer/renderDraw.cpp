@@ -1431,7 +1431,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer)) {
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		ResetBindings();
 		return;
 	}
@@ -1563,7 +1563,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer)) {
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		ResetBindings();
 		return;
 	}

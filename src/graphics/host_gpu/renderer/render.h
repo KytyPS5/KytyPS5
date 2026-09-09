@@ -185,6 +185,7 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
 	                              RenderDepthInfo& target);
+	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,

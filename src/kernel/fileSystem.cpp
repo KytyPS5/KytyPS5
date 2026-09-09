@@ -50,8 +50,7 @@ public:
 	void Mount(const std::filesystem::path& folder, const std::string& point);
 	void Umount(const std::string& folder_or_point);
 
-	[[nodiscard]] std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
-	[[nodiscard]] std::filesystem::path GetRealDirectory(const std::string& mounted_directory);
+	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
@@ -284,26 +283,24 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
-std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_file_name) {
+std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
-	auto mounted_path =
-	    Common::DirectoryWithoutFilename(Common::FixFilenameSlash(mounted_file_name));
-
+	// Match the entire guest path so a mount root works with or without a trailing slash.
+	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
 	const auto it = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
 	    [&mounted_path](const MountPair& p) { return Common::StartsWith(mounted_path, p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
-		auto        rel_path =
-		    Common::RemoveFirst(Common::FixFilenameSlash(mounted_file_name), p.point.size());
+		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
 		while (Common::StartsWith(rel_path, '/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
 			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
-			         mounted_file_name.c_str());
+			         mounted_name.c_str());
 		}
 		return p.dir / rel_path;
 #else
@@ -311,32 +308,7 @@ std::filesystem::path MountPoints::GetRealFilename(const std::string& mounted_fi
 #endif
 	}
 
-	return mounted_file_name;
-}
-
-std::filesystem::path MountPoints::GetRealDirectory(const std::string& mounted_directory) {
-	Common::LockGuard lock(m_mutex);
-
-	auto mounted_path = Common::FixDirectorySlash(mounted_directory);
-
-	const auto it = std::find_if(
-	    m_mount_pairs.begin(), m_mount_pairs.end(),
-	    [&mounted_path](const MountPair& p) { return Common::StartsWith(mounted_path, p.point); });
-	if (it != m_mount_pairs.end()) {
-		const auto& p = *it;
-		auto        rel_path =
-		    Common::RemoveFirst(Common::FixDirectorySlash(mounted_directory), p.point.size());
-		while (Common::StartsWith(rel_path, '/')) {
-			rel_path = Common::RemoveFirst(rel_path, 1);
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return p.dir / rel_path;
-#else
-		return ResolvePathIgnoringCase(p.dir / rel_path);
-#endif
-	}
-
-	return mounted_directory;
+	return mounted_name;
 }
 
 void Initialize() {
@@ -370,7 +342,7 @@ void Umount(const std::string& folder_or_point) {
 
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 
-	return g_mount_points->GetRealFilename(mounted_file_name);
+	return g_mount_points->ResolvePath(mounted_file_name);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -437,8 +409,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return descriptor;
 	}
 
-	file->real_name = (directory ? g_mount_points->GetRealDirectory(file->name)
-	                             : g_mount_points->GetRealFilename(file->name));
+	file->real_name = g_mount_points->ResolvePath(file->name);
 
 	if (trunc && rw_mode == Common::File::Mode::Read) {
 		return KERNEL_ERROR_EACCES;
@@ -852,12 +823,9 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	LOGF("\t KernelStat: %s\n", path);
 
-	std::string path_s         = std::string(path);
-	auto        real_file_name = g_mount_points->GetRealFilename(path_s);
-	auto        real_directory = g_mount_points->GetRealDirectory(path_s);
+	auto real_file_name = g_mount_points->ResolvePath(path);
 
-	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name) ||
-	               Common::File::IsDirectoryExisting(real_directory);
+	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
 	bool is_file = Common::File::IsFileExisting(real_file_name);
 
 	if (!is_dir && !is_file) {
@@ -1014,12 +982,9 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto path_s         = std::string(path);
-	auto real_file_name = g_mount_points->GetRealFilename(path_s);
-	auto real_directory = g_mount_points->GetRealDirectory(path_s);
+	auto real_file_name = g_mount_points->ResolvePath(path);
 
-	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name) ||
-	               Common::File::IsDirectoryExisting(real_directory);
+	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
 	bool is_file = Common::File::IsFileExisting(real_file_name);
 
 	if (is_dir) {
@@ -1053,8 +1018,8 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 
 	auto from_path = std::string(from);
 	auto to_path   = std::string(to);
-	auto real_from = g_mount_points->GetRealFilename(from_path);
-	auto real_to   = g_mount_points->GetRealFilename(to_path);
+	auto real_from = g_mount_points->ResolvePath(from_path);
+	auto real_to   = g_mount_points->ResolvePath(to_path);
 
 	if (!Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;
@@ -1220,7 +1185,7 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     "\t mode = %04" PRIx16 "\n",
 	     path, mode);
 
-	auto real_name = g_mount_points->GetRealDirectory(std::string(path));
+	auto real_name = g_mount_points->ResolvePath(std::string(path));
 
 	if (Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_EEXIST;
@@ -1246,7 +1211,7 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 
 	LOGF("\t path = %s\n", path);
 
-	auto real_name = g_mount_points->GetRealDirectory(std::string(path));
+	auto real_name = g_mount_points->ResolvePath(std::string(path));
 
 	if (!Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_ENOENT;
@@ -1278,7 +1243,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 		return OK;
 	}
 
-	auto real_name = g_mount_points->GetRealFilename(mounted_path);
+	auto real_name = g_mount_points->ResolvePath(mounted_path);
 
 	if (Common::File::IsFileExisting(real_name) || Common::File::IsDirectoryExisting(real_name)) {
 		return OK;

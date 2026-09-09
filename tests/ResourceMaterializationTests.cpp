@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -293,6 +294,14 @@ int DbgExitIfHandler(const char *, const char *, int) { return 1; }
 void DbgExit(int) { std::abort(); }
 
 } // namespace Common
+
+namespace Libs::Graphics {
+SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+  static_cast<void>(format);
+  return SurfaceFormatInfo(vk::Format::eR32Sfloat,
+                           Prospero::BufferFormat::kInvalid);
+}
+} // namespace Libs::Graphics
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();

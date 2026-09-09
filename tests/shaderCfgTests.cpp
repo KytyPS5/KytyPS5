@@ -4646,6 +4646,16 @@ void TestNewShaderDecoderArchitecture() {
   Check(GetInstructionFamily(EncodeDs0(0x36)) == Family::DS,
         "decoder did not classify DS directly");
 
+  const uint32_t orn2_saveexec_code[] = {0xbeea407eu};
+  Instruction orn2_saveexec;
+  ShaderRecompiler::Decoder::DecodeInstruction(orn2_saveexec_code, 0u, orn2_saveexec);
+  Check(orn2_saveexec.family == Family::SOP1 &&
+            orn2_saveexec.opcode == Opcode::S_ORN2_SAVEEXEC_B32 &&
+            orn2_saveexec.word_count == 1u && orn2_saveexec.src_count == 1u &&
+            orn2_saveexec.dst.kind == OperandKind::VccLo &&
+            orn2_saveexec.src0.kind == OperandKind::ExecLo,
+        "decoder rejected or misdecoded captured S_ORN2_SAVEEXEC_B32");
+
   const uint32_t offset_code[] = {0u, EncodeVop1(0x01, 2, 3)};
   Instruction direct;
   ShaderRecompiler::Decoder::DecodeInstruction(offset_code, 1u, direct);
@@ -4836,6 +4846,19 @@ void TestNewShaderDecoderArchitecture() {
   ShaderRecompiler::Decoder::DecodeInstruction(ds_code, 0u, ds);
   Check(ds.opcode == Opcode::DS_READ_B32 && ds.gds,
         "DS decoder lost the GFX10 opcode or GDS fields");
+
+  for (bool decrement : {false, true}) {
+    const uint32_t words[] = {decrement ? 0xd8920004u : 0xd88e0004u, 0x03000302u};
+    Instruction atomic;
+    ShaderRecompiler::Decoder::DecodeInstruction(words, 0u, atomic);
+    Check(atomic.family == Family::DS &&
+              atomic.opcode == (decrement ? Opcode::DS_DEC_RTN_U32 : Opcode::DS_INC_RTN_U32) &&
+              atomic.word_count == 2u && atomic.src_count == 2u &&
+              atomic.data_dwords == 1u && atomic.data_bits == 32u &&
+              atomic.gds && atomic.offset == 4u && atomic.dst.reg == 3u &&
+              atomic.src0.reg == 2u && atomic.src1.reg == 3u,
+          "DS decoder misdecoded bounded atomic return fields");
+  }
 
   const uint32_t boot_ds[] = {0xd8d4c480u, 0x45000045u};
   Instruction boot;
@@ -9783,11 +9806,11 @@ void TestCooperativeWave64OperationBoundaries() {
       f.Branch(0,finish);
     }
     f.KeepWave(finish);
-    if (scenario==Scenario::IntegerAtomic)
-      f.RequireWholeGroup("cooperative LDS integer atomics lost their whole-workgroup allocation");
+    if (scenario==Scenario::IntegerAtomic || scenario==Scenario::LiveAtomic)
+      f.RequireWholeGroup("cooperative LDS integer atomics lost their whole-workgroup allocation or return value");
     else
       Check(!f.Plan().error.empty(),
-            "cooperative LDS support bypassed GDS, scratch, live-atomic or within-wave convergence boundaries");
+            "cooperative LDS support bypassed GDS, scratch or within-wave convergence boundaries");
   }
 }
 

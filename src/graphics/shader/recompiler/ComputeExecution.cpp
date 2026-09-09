@@ -162,6 +162,7 @@ bool HasGuestBarrier(const IR::Program& program) {
 bool IsSupportedSharedAtomic(O op) {
 	switch (op) {
 		case O::SharedAtomicSwap32: case O::SharedAtomicIAdd32: case O::SharedAtomicISub32:
+		case O::SharedAtomicInc32: case O::SharedAtomicDec32:
 		case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
 		case O::SharedAtomicSMax32: case O::SharedAtomicUMax32:
 		case O::SharedAtomicFMin32: case O::SharedAtomicFMax32:
@@ -269,7 +270,26 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 	// A declaration alone cannot enable unrelated GDS loads, atomics or consume.
 	std::unordered_set<uint32_t> append_memory;
 	std::unordered_set<uint32_t> write_only_gds_atomic_memory;
+	std::unordered_set<uint32_t> cooperative_gds_atomic_memory;
 	std::vector<const IR::Inst*> appends;
+	if (cooperative) {
+		for (const auto* block : program.blocks) for (const auto& inst : *block) {
+			if (IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Atomic ||
+			    !IsSupportedSharedAtomic(inst.GetOpcode())) continue;
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index < program.memory_info.size() &&
+			    program.memory_info[index].kind == IR::ResourceKind::Gds &&
+			    program.memory_info[index].data_bits == 32u &&
+			    program.memory_info[index].data_dwords == 1u)
+				cooperative_gds_atomic_memory.insert(index);
+		}
+		for (const auto* block : program.blocks) for (const auto& inst : *block) {
+			if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) continue;
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Atomic)
+				cooperative_gds_atomic_memory.erase(index);
+		}
+	}
 	for (const auto* block : program.blocks) for (const auto& inst : *block) {
 		const auto op = inst.GetOpcode();
 		if (IR::SharedAccessOf(op) == IR::SharedAccess::Atomic &&
@@ -300,7 +320,8 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		const auto& memory = program.memory_info[index];
 		if ((memory.kind == IR::ResourceKind::Lds && partitions_guest_workgroup) ||
 		    (memory.kind == IR::ResourceKind::Gds && !append_memory.contains(index) &&
-		     !write_only_gds_atomic_memory.contains(index)) ||
+		     !write_only_gds_atomic_memory.contains(index) &&
+		     !cooperative_gds_atomic_memory.contains(index)) ||
 		    memory.kind == IR::ResourceKind::Scratch)
 			return "wave64 splitting does not support guest shared or scratch memory";
 	}
@@ -349,8 +370,13 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				    index < program.memory_info.size() &&
 				    write_only_gds_atomic_memory.contains(index) &&
 				    program.memory_info[index].kind == IR::ResourceKind::Gds;
+				const bool cooperative_gds =
+				    index < program.memory_info.size() &&
+				    cooperative_gds_atomic_memory.contains(index) &&
+				    program.memory_info[index].kind == IR::ResourceKind::Gds;
 				if (index >= program.memory_info.size() ||
-				    (!write_only_gds && program.memory_info[index].kind != IR::ResourceKind::Lds) ||
+				    (!write_only_gds && !cooperative_gds &&
+				     program.memory_info[index].kind != IR::ResourceKind::Lds) ||
 				    program.memory_info[index].data_bits != 32u ||
 				    program.memory_info[index].data_dwords != expected_dwords)
 					return "wave64 splitting requires matching shared atomic metadata";
@@ -417,8 +443,11 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				const bool write_only_gds_atomic =
 				    IR::SharedAccessOf(op) == IR::SharedAccess::Atomic &&
 				    write_only_gds_atomic_memory.contains(index);
+				const bool cooperative_gds_atomic =
+				    IR::SharedAccessOf(op) == IR::SharedAccess::Atomic &&
+				    cooperative_gds_atomic_memory.contains(index);
 				if (partitions_guest_workgroup || index >= program.memory_info.size() ||
-				    (!gds_append && !write_only_gds_atomic &&
+				    (!gds_append && !write_only_gds_atomic && !cooperative_gds_atomic &&
 				     program.memory_info[index].kind != IR::ResourceKind::Lds))
 					return "wave64 LDS access requires one complete guest wave and valid LDS metadata";
 			}
@@ -439,7 +468,10 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			    IR::BufferAccessOf(op) == IR::BufferAccess::Atomic;
 			const bool cooperative_image_atomic_return =
 			    cooperative && IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic;
+			const bool cooperative_shared_atomic_return =
+			    cooperative && IR::SharedAccessOf(op) == IR::SharedAccess::Atomic;
 			if (!direct_single_wave_buffer_atomic_return && !cooperative_image_atomic_return &&
+			    !cooperative_shared_atomic_return &&
 			    (IsGuestAtomic(op) || IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) && inst.HasUses())
 				return "wave64 splitting does not support live atomic return values";
 		}

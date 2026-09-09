@@ -489,6 +489,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_WQM_B64:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
+		case Opcode::S_ORN2_SAVEEXEC_B32:
 		case Opcode::S_ANDN1_SAVEEXEC_B32:
 		case Opcode::S_AND_SAVEEXEC_B64:
 		case Opcode::S_ORN2_SAVEEXEC_B64:
@@ -648,6 +649,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
 		case Opcode::DS_MAX_I32:

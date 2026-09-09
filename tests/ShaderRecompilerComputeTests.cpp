@@ -87,6 +87,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -493,6 +494,10 @@ struct RenderExecutorTestAccess {
                                        CommandBuffer &buffer,
                                        RenderDepthInfo &depth) {
     executor.ResolveRenderDepthTarget(submit_id, buffer, depth);
+  }
+
+  static bool DepthStencilCopy(RenderExecutor &executor, CommandBuffer &buffer) {
+    return executor.DepthStencilCopy(buffer);
   }
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
@@ -3562,33 +3567,80 @@ public:
                   resolved_left_offset != resolved_right_offset,
               "saved descriptor IDs did not resolve through the merged owner");
 
-      constexpr uint64_t stream_begin = base + 0x1800000;
       constexpr uint64_t stream_page = BufferCache::CACHING_PAGESIZE;
       constexpr uint64_t stream_leap = stream_page * 128;
-      const auto caught =
-          cache.FindBuffer(stream_begin - stream_leap / 2, stream_page);
-      const auto anchor = cache.FindBuffer(stream_begin, stream_page * 2);
-      cache.GetBuffer(anchor).IncreaseStreamScore(16);
-      const auto scored =
-          cache.FindBuffer(stream_begin + stream_page * 2 - 4, 8);
-      Require(name, "stream growth threshold",
-              cache.GetBuffer(scored).CpuAddress() == stream_begin &&
-                  cache.GetBuffer(scored).Size() == stream_page * 3 &&
-                  cache.GetBuffer(scored).StreamScore() == 17,
-              "buffer range grew before the shadPS4 stream threshold");
-      const auto grown =
-          cache.FindBuffer(stream_begin + stream_page * 3 - 4, 8);
-      const auto &grown_buffer = cache.GetBuffer(grown);
-      Require(name, "stream range leap",
-              grown_buffer.CpuAddress() == stream_begin - stream_leap &&
-                  grown_buffer.Size() == stream_leap + stream_page * 4 &&
-                  grown_buffer.StreamScore() == 0 &&
-                  cache.GetBuffer(caught).is_deleted &&
-                  cache.GetBuffer(scored).is_deleted &&
-                  BufferCacheTestAccess::PageOwner(
-                      cache, stream_begin - stream_leap / 2) == grown,
-              "buffer stream leap changed its direction, size, reset, or "
-              "overlap capture");
+      for (const bool forward : {true, false}) {
+        const char *stream_name =
+            forward ? "ForwardBufferStream" : "BackwardBufferStream";
+        const uint64_t stream_begin = base + (forward ? 0x1800000 : 0x2000000);
+        const uint64_t caught_address = forward
+                                            ? stream_begin + stream_leap / 2
+                                            : stream_begin - stream_leap / 2;
+        const uint64_t untouched_address = forward
+                                               ? stream_begin - stream_leap / 2
+                                               : stream_begin + stream_leap / 2;
+        const auto caught = cache.FindBuffer(caught_address, stream_page);
+        const auto untouched = cache.FindBuffer(untouched_address, stream_page);
+        auto grown = cache.FindBuffer(stream_begin, stream_page * 2);
+        constexpr uint32_t stream_value = 0x6a3b92d1u;
+        for (const auto address : {stream_begin, caught_address}) {
+          MarkGpuWrite(address, sizeof(stream_value));
+          cache.FillBuffer(address, sizeof(stream_value), stream_value, false);
+        }
+
+        uint64_t requested_begin = stream_begin;
+        uint64_t requested_end = stream_begin + stream_page * 2;
+        for (uint32_t step = 1; step <= 18; ++step) {
+          const auto address = (forward ? requested_end : requested_begin) - 4;
+          grown = cache.FindBuffer(address, 8);
+          if (forward) {
+            requested_end += stream_page;
+          } else {
+            requested_begin -= stream_page;
+          }
+          if (step < 18) {
+            const auto &owner = cache.GetBuffer(grown);
+            Require(stream_name, "growth before threshold",
+                    owner.CpuAddress() == requested_begin &&
+                        owner.Size() == requested_end - requested_begin &&
+                        owner.StreamScore() == static_cast<int>(step),
+                    "sequential requests grew beyond their consumed pages too "
+                    "early");
+          }
+        }
+        const auto &grown_buffer = cache.GetBuffer(grown);
+        Require(stream_name, "growth reserve",
+                grown_buffer.CpuAddress() ==
+                        (forward ? requested_begin
+                                 : requested_begin - stream_leap) &&
+                    grown_buffer.Size() ==
+                        requested_end - requested_begin + stream_leap &&
+                    grown_buffer.StreamScore() == 0 &&
+                    cache.GetBuffer(caught).is_deleted &&
+                    !cache.GetBuffer(untouched).is_deleted &&
+                    BufferCacheTestAccess::PageOwner(cache, caught_address) ==
+                        grown &&
+                    BufferCacheTestAccess::PageOwner(
+                        cache, untouched_address) == untouched,
+                "streaming did not reserve the next pages or retain correct "
+                "neighboring owners");
+        for (uint32_t step = 0; step < 128; ++step) {
+          const auto address = forward
+                                   ? requested_end + step * stream_page - 4
+                                   : requested_begin - step * stream_page - 4;
+          Require(stream_name, "reuse reserved pages",
+                  cache.FindBuffer(address, 8) == grown,
+                  "continued sequential requests replaced the buffer within "
+                  "its growth reserve");
+        }
+        for (const auto address : {stream_begin, caught_address}) {
+          Require(
+              stream_name, "preserve GPU contents",
+              ReadNativeValue(grown_buffer, grown_buffer.Offset(address)) ==
+                  stream_value,
+              "stream growth lost GPU-written contents from a merged owner");
+        }
+      }
 
       resources.UnmapMemory(index_begin, index_span);
       resources.UnmapMemory(base + recycled_offset, index_page);
@@ -10753,7 +10805,7 @@ void CheckSampledHtileArrayClearDiscovery() {
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x180000;
+    constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -11705,6 +11757,272 @@ void CheckSampledHtileArrayClearDiscovery() {
               sampled_depth_view != nullptr && normalized_depth_view,
           "uint T# did not retain its requested format while the concrete "
           "view followed the D32 backing");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      // DB override copies run with depth and stencil tests disabled.
+      constexpr uint64_t copy_source_depth = base + 0x180000;
+      constexpr uint64_t copy_source_stencil = base + 0x1a0000;
+      constexpr uint64_t copy_destination_depth = base + 0x1c0000;
+      constexpr uint64_t copy_destination_stencil = base + 0x1e0000;
+      constexpr uint32_t copy_side = 8;
+      constexpr uint32_t copy_layer_texels = copy_side * copy_side;
+      constexpr uint32_t copy_depth_bytes =
+          copy_layer_texels * 2 * sizeof(uint32_t);
+      constexpr uint32_t copy_readback_stride =
+          copy_depth_bytes + copy_layer_texels * 2;
+      HW::DepthRenderTarget copy_target{};
+      copy_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      copy_target.z_info.texture_compatibility =
+          Prospero::TextureCompatiblePlaneCompression::kEnable;
+      copy_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      copy_target.stencil_info.texture_compatibility =
+          Prospero::TextureCompatibleStencil::kEnable;
+      copy_target.stencil_info.htile_stencil_disabled = true;
+      copy_target.depth_view.slice_max = 1;
+      copy_target.size = {copy_side - 1, copy_side - 1, true};
+      HW::DepthControl copy_seed_control{};
+      copy_seed_control.z_enable = true;
+      copy_seed_control.z_write_enable = true;
+      copy_seed_control.stencil_enable = true;
+      registers.SetDepthControl(copy_seed_control);
+      registers.SetRenderControl({});
+      const auto make_copy_target = [&](uint64_t depth, uint64_t stencil) {
+        auto target = copy_target;
+        target.z_read_base_addr = depth;
+        target.z_write_base_addr = depth;
+        target.stencil_read_base_addr = stencil;
+        target.stencil_write_base_addr = stencil;
+        registers.SetDepthRenderTarget(target);
+        RenderDepthInfo resolved{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, 1, scheduler.Current(), resolved);
+        (void)texture_cache.FindDepthTarget(resolved.image_id, resolved.desc);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        return resolved;
+      };
+      const auto copy_source =
+          make_copy_target(copy_source_depth, copy_source_stencil);
+      const auto copy_destination =
+          make_copy_target(copy_destination_depth, copy_destination_stencil);
+      const auto clear_copy_target = [&](ImageId id, bool source) {
+        auto &image = texture_cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        for (uint32_t layer = 0; layer < 2; ++layer) {
+          const vk::ClearDepthStencilValue clear{
+              source ? (layer == 0 ? 0.75f : 0.25f)
+                     : (layer == 0 ? 0.875f : 0.625f),
+              source ? (layer == 0 ? 0xa3u : 0x5au)
+                     : (layer == 0 ? 0x31u : 0xc4u)};
+          const vk::ImageSubresourceRange range{
+              vk::ImageAspectFlagBits::eDepth |
+                  vk::ImageAspectFlagBits::eStencil,
+              0, 1, layer, 1};
+          scheduler.Current().Handle().clearDepthStencilImage(
+              image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear,
+              1, &range);
+        }
+        texture_cache.MarkGpuWritten(id);
+      };
+      struct CopyCase {
+        const char *label;
+        HW::DepthRenderOverride override;
+        uint32_t color_mode;
+        bool depth;
+        bool stencil;
+      };
+      constexpr std::array copy_cases{
+          CopyCase{"no override", {}, 0, false, false},
+          CopyCase{
+              "depth valid only", {true, false, false, false}, 0, false, false},
+          CopyCase{
+              "depth dirty only", {false, true, false, false}, 0, false, false},
+          CopyCase{"stencil valid only",
+                   {false, false, true, false},
+                   0,
+                   false,
+                   false},
+          CopyCase{"stencil dirty only",
+                   {false, false, false, true},
+                   0,
+                   false,
+                   false},
+          CopyCase{
+              "unpaired aspects", {true, false, false, true}, 0, false, false},
+          CopyCase{"color enabled", {true, true, true, true}, 1, false, false},
+          CopyCase{"depth only", {true, true, false, false}, 0, true, false},
+          CopyCase{"stencil only", {false, false, true, true}, 0, false, true},
+          CopyCase{
+              "depth and stencil", {true, true, true, true}, 0, true, true}};
+      auto copy_readback =
+          CreateHostBuffer(name, copy_cases.size() * copy_readback_stride,
+                           vk::BufferUsageFlagBits::eTransferDst, {});
+      copy_target.z_read_base_addr = copy_source_depth;
+      copy_target.z_write_base_addr = copy_destination_depth;
+      copy_target.stencil_read_base_addr = copy_source_stencil;
+      copy_target.stencil_write_base_addr = copy_destination_stencil;
+      copy_target.depth_view.slice_start = 1;
+      registers.SetDepthRenderTarget(copy_target);
+      registers.SetDepthControl({});
+      RenderDepthInfo copy_disabled_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), copy_disabled_depth);
+      Require(name, "copy without attachment tests",
+              !copy_disabled_depth.image_id,
+              "disabled depth/stencil tests acquired a regular attachment");
+      for (size_t index = 0; index < copy_cases.size(); ++index) {
+        const auto &test = copy_cases[index];
+        clear_copy_target(copy_source.image_id, true);
+        clear_copy_target(copy_destination.image_id, false);
+        registers.SetDepthRenderOverride(test.override);
+        auto color_control = registers.GetColorControl();
+        color_control.mode = test.color_mode;
+        registers.SetColorControl(color_control);
+        Require(name, test.label,
+                RenderExecutorTestAccess::DepthStencilCopy(
+                    executor, scheduler.Current()) ==
+                    (test.depth || test.stencil),
+                "DB override copy did not honor paired flags and disabled "
+                "color output");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const auto offset = index * copy_readback_stride;
+        const std::array<vk::BufferImageCopy, 2> copies{
+            {{offset,
+              0,
+              0,
+              {vk::ImageAspectFlagBits::eDepth, 0, 0, 2},
+              {},
+              copy_destination.desc.info.extent},
+             {offset + copy_depth_bytes,
+              0,
+              0,
+              {vk::ImageAspectFlagBits::eStencil, 0, 0, 2},
+              {},
+              copy_destination.desc.info.extent}}};
+        texture_cache.GetImage(copy_destination.image_id)
+            .Download(copies, copy_readback.buffer, 0, copy_readback.size);
+      }
+      vk::MemoryBarrier2 copy_host_barrier{};
+      copy_host_barrier.sType = vk::StructureType::eMemoryBarrier2;
+      copy_host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+      copy_host_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      copy_host_barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      copy_host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      vk::DependencyInfo copy_dependency{};
+      copy_dependency.sType = vk::StructureType::eDependencyInfo;
+      copy_dependency.memoryBarrierCount = 1;
+      copy_dependency.pMemoryBarriers = &copy_host_barrier;
+      scheduler.Current().Handle().pipelineBarrier2(copy_dependency);
+      scheduler.Finish();
+      const auto copy_result = ReadBuffer(
+          name, copy_readback,
+          copy_cases.size() * copy_readback_stride / sizeof(uint32_t));
+      for (size_t index = 0; index < copy_cases.size(); ++index) {
+        const auto &test = copy_cases[index];
+        const auto *depth = copy_result.data() +
+                            index * copy_readback_stride / sizeof(uint32_t);
+        const auto *stencil =
+            reinterpret_cast<const uint8_t *>(depth) + copy_depth_bytes;
+        for (uint32_t layer = 0; layer < 2; ++layer) {
+          const auto expected_depth =
+              std::bit_cast<uint32_t>(layer == 0   ? 0.875f
+                                      : test.depth ? 0.25f
+                                                   : 0.625f);
+          const auto expected_stencil = layer == 0     ? 0x31u
+                                        : test.stencil ? 0x5au
+                                                       : 0xc4u;
+          for (uint32_t texel = 0; texel < copy_layer_texels; ++texel) {
+            const auto position = layer * copy_layer_texels + texel;
+            Require(name, test.label,
+                    depth[position] == expected_depth &&
+                        stencil[position] == expected_stencil,
+                    "DB override copy changed an unselected layer/aspect or "
+                    "missed copied texels");
+          }
+        }
+      }
+      DestroyBuffer(&copy_readback);
+
+      ShaderTextureResource copy_sample_descriptor{};
+      copy_sample_descriptor.fields[0] =
+          static_cast<uint32_t>(copy_destination_depth >> 8u);
+      copy_sample_descriptor.fields[1] =
+          static_cast<uint32_t>(copy_destination_depth >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (((copy_side - 1u) & 3u) << 30u);
+      copy_sample_descriptor.fields[2] =
+          ((copy_side - 1u) >> 2u) | ((copy_side - 1u) << 14u);
+      copy_sample_descriptor.fields[3] =
+          DstSel(4, 4, 4, 4) |
+          (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+      copy_sample_descriptor.fields[4] = 1;
+      copy_sample_descriptor.fields[5] = 0x00700000u;
+      TestCase copy_sample_test;
+      copy_sample_test.name = "DepthOverrideR32Sampling";
+      copy_sample_test.has_user_data = true;
+      copy_sample_test.image_descriptor_swizzle =
+          copy_sample_descriptor.DstSelXYZW();
+      std::copy_n(copy_sample_descriptor.fields, 8,
+                  copy_sample_test.user_data.begin());
+      copy_sample_test.user_data[50] = 2 * sizeof(uint32_t);
+      copy_sample_test.opcodes = {
+          ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+          ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      copy_sample_test.required_spirv = {"OpImageSampleExplicitLod"};
+      for (uint32_t layer = 0; layer < 2; ++layer) {
+        AppendVMovLiteral(&copy_sample_test.code, 20,
+                          std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&copy_sample_test.code, 21,
+                          std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&copy_sample_test.code, 22,
+                          std::bit_cast<uint32_t>(static_cast<float>(layer)));
+        copy_sample_test.code.push_back(EncodeMimg0(0x20, 1, 0, false, 5));
+        copy_sample_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+        AppendStoreVgpr(&copy_sample_test.code, 0, layer);
+        copy_sample_test.expected.push_back(
+            std::bit_cast<uint32_t>(layer == 0 ? 0.875f : 0.25f));
+      }
+      AppendEnd(&copy_sample_test.code);
+      const auto copy_sample_program =
+          CompileCase(copy_sample_test, WorkgroupLimits());
+      ShaderRecompiler::IR::DescriptorValue copy_sample_value{};
+      copy_sample_value.dword_count = 8;
+      std::copy_n(copy_sample_descriptor.fields, 8,
+                  copy_sample_value.dwords.begin());
+      const auto copy_sample_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, copy_sample_program.program.info.images[0],
+          copy_sample_value);
+      const auto copy_sample_view = texture_cache.FindTexture(
+          copy_sample_binding.image_id, copy_sample_binding.desc);
+      Require(
+          name, "copied depth sampled owner",
+          copy_sample_binding.image_id == copy_destination.image_id &&
+              copy_sample_binding.desc.info.pixel_format ==
+                  vk::Format::eR32Sfloat,
+          "R32 sampling did not reuse the GPU-written depth-copy destination");
+      auto &copy_sample_image = texture_cache.GetImage(copy_destination.image_id);
+      copy_sample_image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                                vk::AccessFlagBits2::eShaderRead, {},
+                                scheduler.Current().Handle());
+      Image copied_depth_sample;
+      copied_depth_sample.view = copy_sample_view;
+      copied_depth_sample.layout = copy_sample_image.backing.state.layout;
+      scheduler.Finish();
+      auto copy_sample_output = CreateStorageBuffer(name, {}, 2);
+      const auto copy_sampler = CreateNearestSampler(name);
+      Dispatch(copy_sample_test, copy_sample_program, copy_sample_output,
+               nullptr, &copied_depth_sample, nullptr, nullptr, copy_sampler);
+      Require(
+          name, "copied depth R32 samples",
+          ReadBuffer(name, copy_sample_output, 2) == copy_sample_test.expected,
+          "R32 post-effect sampling saw stale depth after the override copy");
+      m_device.destroySampler(copy_sampler);
+      DestroyBuffer(&copy_sample_output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetDepthRenderOverride({});
+      registers.SetColorControl({});
 
       auto video_subresource =
           make_target_desc(base + 0x20000, target_mip_size, {1, 1, 1});
@@ -14540,7 +14858,6 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
@@ -15603,6 +15920,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_ADD_RTN_U32:
   case Opcode::DS_SUB_U32:
   case Opcode::DS_SUB_RTN_U32:
+  case Opcode::DS_INC_RTN_U32:
+  case Opcode::DS_DEC_RTN_U32:
   case Opcode::DS_MIN_I32:
   case Opcode::DS_MIN_RTN_I32:
   case Opcode::DS_MAX_I32:
@@ -16558,6 +16877,89 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
           {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
           {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
+  using O = ShaderOpcode;
+  constexpr u32 exec_hi = 0xa5a55a5au;
+  constexpr u32 vcc_hi = 0x13579bdfu;
+  struct Case {
+    u32 exec_lo, source, destination, result;
+  };
+  constexpr Case cases[] = {
+      {0x8000000cu, 126, 106, 0xffffffffu}, // Captured vcc_lo, exec_lo.
+      {0x0000000fu, 6, 6, 0xfffffff3u},    // Aliased SGPR source/destination.
+      {0xffffffffu, 128, 8, 0},            // SCC ignores the nonzero high half.
+      {0xffffffffu, 107, 8, vcc_hi},
+      {0xffffffffu, 127, 8, exec_hi},
+      {0xffffffffu, 253, 8, 1},            // SCC is a scalar value, not a mask.
+      {0xffffffffu, 251, 8, 0},            // VCCZ summarizes the whole mask.
+      {0x00000001u, 252, 8, 0xfffffffeu},  // EXECZ is uniform across lanes.
+  };
+  TestCase test;
+  test.name = wave_size == 64 ? "ScalarOrn2SaveexecB32Wave64"
+              : threads == 32 ? "ScalarOrn2SaveexecB32Wave32"
+                              : "ScalarOrn2SaveexecB32PartialWave";
+  auto &code = test.code;
+  // Zero flags ignore high bits only in wave32 and include inactive low bits.
+  constexpr u32 masks[][2] = {{0, 0}, {0x80000000u, 0}, {0, 0x80000000u}};
+  for (const auto &mask : masks) {
+    AppendSMovLiteral(&code, 106, mask[0]);
+    AppendSMovLiteral(&code, 107, mask[1]);
+    AppendSMovLiteral(&code, 126, mask[0]);
+    AppendSMovLiteral(&code, 127, mask[1]);
+    code.push_back(EncodeSMovB32(20, 251));
+    code.push_back(EncodeSMovB32(21, 252));
+    code.push_back(EncodeSop1(0x04, 126, 193u));
+    const u32 zero = mask[0] == 0 && (wave_size == 32 || mask[1] == 0);
+    for (u32 reg = 20; reg <= 21; ++reg) {
+      AppendStoreSgprAtLaneDwordOffset(&code, reg, 0,
+                                      static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), threads, zero);
+    }
+  }
+  for (const auto &item : cases) {
+    AppendVMovU32(&code, 2, 0);
+    AppendSMovLiteral(&code, 126, item.exec_lo);
+    AppendSMovLiteral(&code, 127, exec_hi);
+    AppendSMovLiteral(&code, 106, 1);
+    AppendSMovLiteral(&code, 107, vcc_hi);
+    AppendSMovLiteral(&code, 6, 3);
+    code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(0)));
+    code.push_back(item.source == 126 ? 0xbeea407eu
+                                     : EncodeSop1(0x40, item.destination, item.source));
+    const u32 snapshots[] = {item.destination, 126, 127, 107, 253};
+    for (u32 i = 0; i < std::size(snapshots); ++i) {
+      code.push_back(EncodeSMovB32(20 + i, snapshots[i]));
+    }
+    AppendVMovU32(&code, 2, 1);
+    code.push_back(EncodeSop1(0x04, 126, 193u)); // Restore EXEC for readback.
+    const u32 expected[] = {item.exec_lo, item.result, exec_hi, vcc_hi,
+                            item.result != 0 ? 1u : 0u};
+    for (u32 i = 0; i < std::size(expected); ++i) {
+      AppendStoreSgprAtLaneDwordOffset(&code, 20 + i, 0,
+                                      static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), threads, expected[i]);
+    }
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0,
+                                    static_cast<u32>(test.expected.size()));
+    for (u32 lane = 0; lane < threads; ++lane) {
+      const u32 mask = lane < 32 ? item.result : exec_hi;
+      test.expected.push_back((mask >> (lane % 32)) & 1u);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32,
+                  O::S_ORN2_SAVEEXEC_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_ORN2_SAVEEXEC_B32 vcc_lo, exec_lo", 1}};
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase ScalarGetpcWritesNextInstructionPc() {
@@ -25008,6 +25410,213 @@ TestCase Wave64DispatcherExternalSelectionEntry() {
   return test;
 }
 
+TestCase DsBoundedAtomicBoundaries(bool decrement, bool gds) {
+  using O = ShaderOpcode;
+  constexpr u32 guard = 0x13579bdfu;
+  struct Boundary {
+    u32 before, limit, incremented, decremented;
+  };
+  constexpr Boundary boundaries[] = {
+      {4, 5, 5, 3},
+      {5, 5, 0, 4},
+      {6, 5, 0, 5},
+      {0, 5, 1, 5},
+      {0, 0, 0, 0},
+      {1, 0, 0, 0},
+      {0xffffffffu, 0xffffffffu, 0, 0xfffffffeu},
+      {0xfffffffeu, 0xffffffffu, 0xffffffffu, 0xfffffffdu},
+      {0, 0xffffffffu, 1, 0xffffffffu},
+      {0x80000000u, 0x7fffffffu, 0, 0x7fffffffu},
+      {0x7fffffffu, 0x80000000u, 0x80000000u, 0x7ffffffeu},
+      {0xffffffffu, 0x80000000u, 0, 0x80000000u}};
+  constexpr u32 count = static_cast<u32>(std::size(boundaries));
+  const u32 opcode = decrement ? 0x24u : 0x23u;
+  TestCase test;
+  test.name =
+      decrement
+          ? (gds ? "DsDecReturnGdsBoundaries" : "DsDecReturnLdsBoundaries")
+          : (gds ? "DsIncReturnGdsBoundaries" : "DsIncReturnLdsBoundaries");
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 0);
+  std::vector<u32> memory(68, guard);
+  for (u32 i = 0; i < count; ++i)
+    memory[i + 1] = boundaries[i].before;
+  if (!gds) {
+    for (u32 i = 0; i < memory.size(); ++i) {
+      AppendVMovLiteral(&code, 3, memory[i]);
+      code.push_back(EncodeDs0(0x0d, i * 4));
+      code.push_back(EncodeDs1(0, 3, 2));
+    }
+  }
+  auto StoreResult = [&](u32 vgpr, u32 expected) {
+    AppendStoreVgpr(&code, vgpr, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  for (u32 i = 0; i < count; ++i) {
+    AppendVMovU32(&code, 2, i * 4);
+    AppendVMovLiteral(&code, 3, boundaries[i].limit);
+    // Preserve the captured DATA0/VDST alias and exact increment words in GDS.
+    code.push_back(decrement ? EncodeDs0(opcode, 4, gds)
+                             : (gds ? 0xd88e0004u : 0xd88c0004u));
+    code.push_back(0x03000302u);
+    StoreResult(3, boundaries[i].before);
+    code.push_back(EncodeDs0(0x36, 4, gds));
+    code.push_back(EncodeDs1(4, 0, 2));
+    StoreResult(4, decrement ? boundaries[i].decremented
+                             : boundaries[i].incremented);
+  }
+
+  // EXEC=0 preserves memory and the aliased destination register.
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.push_back(EncodeDs0(opcode, 4, gds));
+  code.push_back(0x03000302u);
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  StoreResult(3, 0x12345678u);
+
+  // Use both offset bytes and alias VDST with ADDR instead of DATA0.
+  AppendVMovU32(&code, 2, 4);
+  AppendVMovLiteral(&code, 3, 0xffffffffu);
+  code.push_back(EncodeDs0(opcode, 0x104, gds));
+  code.push_back(EncodeDs1(2, 3, 2));
+  StoreResult(2, guard);
+
+  // Overwriting an unused return must not let DCE discard the atomic update.
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeDs0(opcode, 0x108, gds));
+  code.push_back(EncodeDs1(4, 3, 2));
+  AppendVMovU32(&code, 4, 0);
+
+  // An active access just outside the resource returns zero.
+  AppendVMovU32(&code, 2, static_cast<u32>(memory.size() * 4 - 4));
+  code.push_back(EncodeDs0(opcode, 4, gds));
+  code.push_back(0x03000302u);
+  StoreResult(3, 0);
+
+  // Read back all words, including guards around both address ranges.
+  AppendVMovU32(&code, 2, 0);
+  for (u32 i = 0; i < memory.size(); ++i) {
+    u32 expected = memory[i];
+    if (i >= 1 && i <= count) {
+      expected = decrement ? boundaries[i - 1].decremented
+                           : boundaries[i - 1].incremented;
+    } else if (i == 66) {
+      expected = decrement ? guard - 2 : guard + 2;
+    }
+    code.push_back(EncodeDs0(0x36, i * 4, gds));
+    code.push_back(EncodeDs1(4, 0, 2));
+    StoreResult(4, expected);
+    if (gds)
+      test.expected_gds.push_back(expected);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.compute_info.lds_size_dwords = static_cast<u32>(memory.size());
+  test.opcodes = {
+      O::S_MOV_B64,          O::V_MOV_B32,
+      O::DS_READ_B32,        decrement ? O::DS_DEC_RTN_U32 : O::DS_INC_RTN_U32,
+      O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange",
+                         "OpLoopMerge"};
+  if (gds)
+    test.gds_initial = memory;
+  else
+    test.opcodes.push_back(O::DS_WRITE_B32);
+  return test;
+}
+
+TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 guard = 0x13579bdfu;
+  constexpr u32 limit = 15;
+  TestCase test;
+  if (wave_size == 32) {
+    test.name = decrement ? (gds ? "DsDecReturnGdsContentionWave32"
+                                 : "DsDecReturnLdsContentionWave32")
+                          : (gds ? "DsIncReturnGdsContentionWave32"
+                                 : "DsIncReturnLdsContentionWave32");
+  } else {
+    test.name = decrement ? (gds ? "DsDecReturnGdsContentionWave64"
+                                 : "DsDecReturnLdsContentionWave64")
+                          : (gds ? "DsIncReturnGdsContentionWave64"
+                                 : "DsIncReturnLdsContentionWave64");
+  }
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 3, limit);
+  AppendVMovU32(&code, 5, 1);
+  AppendVMovLiteral(&code, 6, guard);
+  if (!gds) {
+    // One lane initializes LDS before every wave in the workgroup uses it.
+    code.push_back(EncodeSop1(0x04, 10, 126));
+    code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
+    code.push_back(EncodeSop1(0x04, 126, 106));
+    code.push_back(EncodeDs0(0x0d, 4));
+    code.push_back(EncodeDs1(0, 2, 2));
+    code.push_back(EncodeSop1(0x04, 126, 10));
+    code.push_back(EncodeSopp(0x0a, 0));
+  }
+  // Distinct masks in the wave64 halves also check inactive return
+  // preservation.
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  AppendSMovLiteral(&code, 126, 0x55555555u);
+  AppendSMovLiteral(&code, 127, 0xaaaaaaaau);
+  code.push_back(EncodeDs0(decrement ? 0x24 : 0x23, 4, gds));
+  code.push_back(EncodeDs1(6, 3, 2));
+  // Returned old values form a histogram; no lane ordering is assumed.
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));
+  AppendBufferStoreOpcode(&code, 0x32, 5, 7);
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  AppendVMovLiteral(&code, 7, guard);
+  code.push_back(EncodeVopc(0xc2, Vgpr(7), 6));
+  code.push_back(EncodeVop2(0x01, 8, InlineU32(0), 5));
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 16);
+  code.push_back(EncodeSopp(0x0a, 0));
+  // S_BARRIER orders LDS; use atomic add-zero to read GDS consistently.
+  code.push_back(EncodeDs0(gds ? 0x20 : 0x36, 4, gds));
+  code.push_back(EncodeDs1(9, 2, 2));
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 144);
+  AppendEnd(&code);
+  test.expected.assign(16, 4); // 64 active lanes, four complete wraps.
+  for (u32 lane = 0; lane < 128; ++lane) {
+    const uint64_t mask = 0xaaaaaaaa55555555ull;
+    test.expected.push_back(
+        (mask & (uint64_t{1} << (lane % wave_size))) == 0 ? 1 : 0);
+  }
+  test.expected.resize(272, 0);
+  test.initial.resize(test.expected.size());
+  test.compute_info.threads_num[0] = 128;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.lds_size_dwords = 3;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_MOV_B32,
+                  O::S_MOV_B64,
+                  O::S_BARRIER,
+                  O::V_MOV_B32,
+                  O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,
+                  O::V_CMP_EQ_U32,
+                  O::V_CNDMASK_B32,
+                  decrement ? O::DS_DEC_RTN_U32 : O::DS_INC_RTN_U32,
+                  gds ? O::DS_ADD_RTN_U32 : O::DS_READ_B32,
+                  O::BUFFER_ATOMIC_ADD,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange",
+                         "OpLoopMerge"};
+  if (gds) {
+    test.gds_initial = {guard, 0, guard};
+    test.expected_gds = test.gds_initial;
+  } else
+    test.opcodes.push_back(O::DS_WRITE_B32);
+  return test;
+}
+
 TestCase DsMiscVariants() {
   using O = ShaderOpcode;
 
@@ -30036,6 +30645,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarFlbitI32B32Gpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
+  cases.push_back(ScalarOrn2SaveexecB32(32, 32));
+  cases.push_back(ScalarOrn2SaveexecB32(64, 64));
+  cases.push_back(ScalarOrn2SaveexecB32(32, 4));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
   AddCase(ScalarBrevB32PreservesScc);
@@ -30298,6 +30910,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64SingleWaveCyclicDsOrB64ImplicitCompletion);
   AddCase(Wave64SingleWaveCyclicBufferFeedback);
   AddCase(Wave64DispatcherExternalSelectionEntry);
+  for (bool decrement : {false, true}) {
+    for (bool gds : {false, true}) {
+      cases.push_back(DsBoundedAtomicBoundaries(decrement, gds));
+      for (u32 wave_size : {32u, 64u}) {
+        cases.push_back(DsBoundedAtomicContention(decrement, gds, wave_size));
+      }
+    }
+  }
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
@@ -34190,6 +34810,49 @@ void CheckPm4DepthControlHighBits(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4DepthControlHighBits");
 }
 
+void CheckPm4DepthRenderOverride(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DepthRenderOverride";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  struct Case {
+    uint32_t value;
+    HW::DepthRenderOverride expected;
+  };
+  constexpr std::array cases{Case{0x28000000u, {true, true, false, false}},
+                             Case{0x50000000u, {false, false, true, true}},
+                             Case{0x18000000u, {false, true, false, true}},
+                             Case{0x60000000u, {true, false, true, false}},
+                             Case{0xf8000000u, {true, true, true, true}},
+                             Case{0x82001a0fu, {false, false, false, false}}};
+  for (const bool indirect : {false, true}) {
+    for (const auto &test : cases) {
+      std::array<uint32_t, 2> registers{Pm4::DB_RENDER_OVERRIDE, test.value};
+      const auto address = reinterpret_cast<uint64_t>(registers.data());
+      const std::array<uint32_t, 3> direct_packet{
+          KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+          Pm4::DB_RENDER_OVERRIDE, test.value};
+      const std::array<uint32_t, 5> indirect_packet{
+          KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::R_ZERO),
+          static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+          0x80000000u, 1u};
+      Pm4Execution execution;
+      const auto result = processor.Process(
+          execution, indirect ? std::span<const uint32_t>{indirect_packet}
+                              : std::span<const uint32_t>{direct_packet});
+      const auto &actual = processor.GetCtx().GetDepthRenderOverride();
+      Require(
+          name, indirect ? "indirect register" : "direct register",
+          result == Pm4ProcessResult::Complete &&
+              actual.force_z_valid == test.expected.force_z_valid &&
+              actual.force_z_dirty == test.expected.force_z_dirty &&
+              actual.force_stencil_valid == test.expected.force_stencil_valid &&
+              actual.force_stencil_dirty == test.expected.force_stencil_dirty,
+          "DB_RENDER_OVERRIDE lost, exchanged, or retained force flags");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct AgcCommandBufferLayout {
   using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
                                           void *);
@@ -35743,6 +36406,16 @@ if (argc == 1) {
     RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      if (std::string_view(test.name).starts_with("Ds") ||
+          std::string_view(test.name).starts_with("BufferAtomic")) {
+        RunCase(&vulkan, test);
+      }
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuMappedRangeLifecycle();
@@ -35806,6 +36479,7 @@ if (argc == 1) {
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+    CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -36045,6 +36719,7 @@ if (argc == 1) {
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+  CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());

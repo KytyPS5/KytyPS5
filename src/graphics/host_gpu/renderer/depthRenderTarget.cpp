@@ -96,6 +96,134 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	return vk::Format::eUndefined;
 }
 
+static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
+                                                   const HW::DepthRenderTarget& z,
+                                                   bool write_buffer = false) {
+	const bool has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const auto depth_address = write_buffer ? z.z_write_base_addr : z.z_read_base_addr;
+	const auto stencil_address =
+	    write_buffer ? z.stencil_write_base_addr : z.stencil_read_base_addr;
+	if (!z.z_info.HasValidTextureCompatibility() ||
+	    !z.stencil_info.HasValidTextureCompatibility()) {
+		DepthFatal("invalid PS5 depth texture-compatibility encoding");
+	}
+	const bool has_htile = z.z_info.htile_acceleration;
+	const bool unsupported_shading_rate_encoding =
+	    z.shading_rate_encoding > 1 || (z.shading_rate_encoding != 0 && !has_htile);
+	const auto samples = render_sample_count(z.z_info.num_samples);
+	if (samples == 0) {
+		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
+	}
+	const bool htile_stencil_compat = depth_htile_stencil_acceleration_compatible(
+	    has_stencil, has_htile, z.stencil_info.htile_stencil_disabled);
+	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
+	switch (view.type) {
+		case TargetViewType::Image2D:
+		case TargetViewType::Image2DArray: break;
+		case TargetViewType::Unsupported:
+			DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
+			           z.depth_view.slice_max);
+	}
+	if (z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.max_mip_level != 0 || z.depth_view.current_mip_level != 0 ||
+	    unsupported_shading_rate_encoding || depth_address == 0 ||
+	    (depth_address & 0xffffu) != 0) {
+		DepthFatal("unsupported depth register state");
+	}
+	if (has_stencil) {
+		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt ||
+		    !htile_stencil_compat || stencil_address == 0 ||
+		    (stencil_address & 0xffffu) != 0) {
+			DepthFatal("unsupported stencil attachment state");
+		}
+	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
+		DepthFatal("stencil state without an active stencil attachment");
+	}
+	if (has_htile) {
+		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
+			DepthFatal("invalid HTile metadata address");
+		}
+		if (z.depth_view.slice_max >= 32) {
+			DepthFatal("HTile clear tracking supports at most 32 slices");
+		}
+	}
+	if (!z.size.valid) {
+		DepthFatal("missing depth extent");
+	}
+	const uint32_t width  = static_cast<uint32_t>(z.size.x_max) + 1u;
+	const uint32_t height = static_cast<uint32_t>(z.size.y_max) + 1u;
+	if (width > 16384 || height > 16384) {
+		DepthFatal("invalid depth extent");
+	}
+	const auto* policy = FindDepthFormatPolicy(z.z_info.format);
+	if (policy == nullptr) {
+		DepthFatal("unsupported depth/stencil format pair");
+	}
+	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
+	const auto format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
+	if (format == vk::Format::eUndefined) {
+		DepthFatal("no host depth/stencil format supports required usage for %s",
+		           VulkanToString(ideal_format).c_str());
+	}
+	const auto     guest_format = policy->guest_format;
+	const uint32_t bytes        = policy->bytes_per_element;
+	const auto     pitch        = TileGetDepthPitch(width, bytes, z.z_info.num_samples);
+	TileSizeAlign depth_size {};
+	TileSizeAlign stencil_size {};
+	TileSizeAlign htile_size {};
+	if (!TileGetDepthSize(width, height, 0, z.z_info.format, z.stencil_info.format, has_htile,
+	                      stencil_size, htile_size, depth_size, z.z_info.num_samples) ||
+	    depth_size.align != 65536 || depth_size.size == 0 ||
+	    (has_stencil != (stencil_size.align == 65536 && stencil_size.size != 0)) ||
+	    (has_htile != (htile_size.align == 32768 && htile_size.size != 0))) {
+		DepthFatal("unsupported depth/stencil/HTile footprint");
+	}
+	if (depth_size.size > UINT64_MAX / view.image_layers ||
+	    stencil_size.size > UINT64_MAX / view.image_layers ||
+	    htile_size.size > UINT64_MAX / view.image_layers) {
+		DepthFatal("layered depth footprint overflow");
+	}
+	const auto depth_backing_size   = depth_size.size * view.image_layers;
+	const auto stencil_backing_size = stencil_size.size * view.image_layers;
+	const auto htile_backing_size   = htile_size.size * view.image_layers;
+	if (!GuestRange {depth_address, depth_backing_size}.Valid() ||
+	    (has_stencil && !GuestRange {stencil_address, stencil_backing_size}.Valid()) ||
+	    (has_htile && !GuestRange {z.htile_data_base_addr, htile_backing_size}.Valid())) {
+		DepthFatal("layered depth backing range is invalid");
+	}
+	TextureCache::ImageDesc desc {};
+	desc.type                 = TextureCache::BindingType::DepthTarget;
+	desc.info.data            = {depth_address, depth_backing_size};
+	desc.info.stencil =
+	    has_stencil ? GuestRange {stencil_address, stencil_backing_size} : GuestRange {};
+	desc.info.pixel_format    = format;
+	desc.info.guest_format    = guest_format;
+	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.extent          = {width, height, 1};
+	desc.info.resources       = {1, view.image_layers};
+	desc.info.pitch           = pitch;
+	desc.info.bytes_per_block = bytes;
+	desc.info.samples         = samples;
+	desc.info.tile_mode       = Prospero::TileMode::kDepth;
+	desc.info.mip_layout[0]   = {0, depth_backing_size, pitch, height};
+	desc.info.metadata.range =
+	    has_htile ? GuestRange {z.htile_data_base_addr, htile_backing_size} : GuestRange {};
+	desc.info.metadata.kind = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;
+	desc.info.metadata.stencil_compressed =
+	    has_stencil && has_htile && !z.stencil_info.htile_stencil_disabled;
+	desc.view_info.format = format;
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	desc.view_info.aspect      = ImageViewOps::DepthAspectMask(format);
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer  = view.base_layer;
+	desc.view_info.layer_count = view.layer_count;
+	desc.view_info.usage       = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	return desc;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
                                               RenderDepthInfo& r) {
@@ -333,6 +461,67 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	r.image_id                 = cache.FindImage(r.desc);
 	r.image_view               = nullptr;
 	BindRenderTarget(r.image_id);
+}
+
+bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
+	const auto& hw       = buffer.GetRegisters();
+	const auto& z        = hw.GetDepthRenderTarget();
+	const auto& override = hw.GetDepthRenderOverride();
+	if (hw.GetColorControl().mode != 0) {
+		return false;
+	}
+	const bool depth_copy = override.force_z_dirty && override.force_z_valid &&
+	                        z.z_info.format != Prospero::DepthFormat::kInvalid &&
+	                        z.z_read_base_addr != 0 && z.z_write_base_addr != 0 &&
+	                        z.z_read_base_addr != z.z_write_base_addr;
+	const bool stencil_copy = override.force_stencil_dirty && override.force_stencil_valid &&
+	                          z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	                          z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	                          z.stencil_read_base_addr != z.stencil_write_base_addr;
+	if (!depth_copy && !stencil_copy) {
+		return false;
+	}
+
+	auto  read_desc  = MakeDepthTargetDesc(buffer, z);
+	auto  write_desc = MakeDepthTargetDesc(buffer, z, true);
+	auto& cache      = m_context.GetTextureCache();
+	const auto read_id = cache.FindImage(read_desc);
+	BindRenderTarget(read_id);
+	const auto write_id = cache.FindImage(write_desc);
+	BindRenderTarget(write_id);
+	cache.UpdateImage(read_id);
+	cache.UpdateImage(write_id);
+	cache.MarkGpuWritten(write_id);
+	auto& source      = cache.GetImage(read_id);
+	auto& destination = cache.GetImage(write_id);
+	EXIT_IF(read_id == write_id || source.backing.format != destination.backing.format);
+
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.EndRendering();
+	const auto command = scheduler.Current().Handle();
+	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
+	                                  read_desc.view_info.base_layer,
+	                                  read_desc.view_info.layer_count};
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               range, command);
+	destination.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                    range, command);
+	std::array<vk::ImageCopy, 2> regions {};
+	uint32_t                     count = 0;
+	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {
+		if ((aspect == vk::ImageAspectFlagBits::eDepth && !depth_copy) ||
+		    (aspect == vk::ImageAspectFlagBits::eStencil && !stencil_copy)) {
+			continue;
+		}
+		auto& region = regions[count++];
+		region.srcSubresource = {aspect, range.base_level, range.base_layer, range.layer_count};
+		region.dstSubresource = region.srcSubresource;
+		region.extent         = write_desc.info.extent;
+	}
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal, count,
+	                  regions.data());
+	return true;
 }
 
 vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {

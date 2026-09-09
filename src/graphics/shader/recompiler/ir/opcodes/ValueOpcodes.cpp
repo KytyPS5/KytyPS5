@@ -163,6 +163,8 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicSwap32:
 		case ValueOpcode::SharedAtomicIAdd32:
 		case ValueOpcode::SharedAtomicISub32:
+		case ValueOpcode::SharedAtomicInc32:
+		case ValueOpcode::SharedAtomicDec32:
 		case ValueOpcode::SharedAtomicSMin32:
 		case ValueOpcode::SharedAtomicUMin32:
 		case ValueOpcode::SharedAtomicSMax32:

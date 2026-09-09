@@ -90,6 +90,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeConstructU32x4:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
@@ -365,6 +367,16 @@ private:
 			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
 				return finish(false);
 			}
+		} else if (op == ValueOpcode::CompositeExtractU32x4) {
+			// A 4-dword descriptor (V#/S#) the shader assembles in registers and then indexes,
+			// e.g. Team Asobi compute shaders building a sampler from CompositeConstructU32x4.
+			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
+			    index.U32() >= 4u ||
+			    source->GetOpcode() != ValueOpcode::CompositeConstructU32x4) {
+				return finish(false);
+			}
 		}
 		if (IsDescriptorHandle(op)) {
 			size_t expected = 4u;
@@ -621,7 +633,9 @@ private:
 			return false;
 		}
 		const auto component = index.U32();
-		if (component >= 2u) {
+		const auto max_component =
+		    inst.GetOpcode() == ValueOpcode::CompositeExtractU32x4 ? 4u : 2u;
+		if (component >= max_component) {
 			return false;
 		}
 		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
@@ -636,7 +650,8 @@ private:
 		if (source == nullptr) {
 			return false;
 		}
-		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2 ||
+		    source->GetOpcode() == ValueOpcode::CompositeConstructU32x4) {
 			return EvaluateWide(source->Arg(component), result);
 		}
 		if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
@@ -740,7 +755,8 @@ private:
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 			case ValueOpcode::CompositeExtractU64:
-			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+			case ValueOpcode::CompositeExtractU32x2:
+			case ValueOpcode::CompositeExtractU32x4: return EvaluateExtract(inst, result);
 			case ValueOpcode::CompositeConstructU64:
 				if (!binary()) {
 					return false;

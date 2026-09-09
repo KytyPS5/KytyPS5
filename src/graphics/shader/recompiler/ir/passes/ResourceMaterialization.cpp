@@ -1713,6 +1713,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			const bool heterogeneous_storage_write =
 			    root_info.resource_class == ImageResourceClass::Storage && root_info.written &&
 			    !root_info.atomic;
+			const bool heterogeneous_numeric =
+			    image.numeric_class != image_class.numeric_class &&
+			    root_info.heterogeneous_numeric_compatible &&
+			    ((root_info.resource_class == ImageResourceClass::Sampled &&
+			      !root_info.depth_compare) ||
+			     heterogeneous_storage_write);
 			const bool heterogeneous_dimension =
 			    image.dimension != image_class.dimension &&
 			    ((root_info.resource_class == ImageResourceClass::Sampled &&
@@ -1730,7 +1736,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			      image_class.conversion_format == Prospero::BufferFormat::kInvalid &&
 			      !image.needs_manual_depth_compare && !image_class.needs_manual_depth_compare) ||
 			     heterogeneous_storage_write);
-			if (image.numeric_class != image_class.numeric_class ||
+			if ((image.numeric_class != image_class.numeric_class && !heterogeneous_numeric) ||
 			    (image.dimension != image_class.dimension && !heterogeneous_dimension) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||

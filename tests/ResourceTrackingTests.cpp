@@ -194,7 +194,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                          bool memory_backed_material = false,
-                         bool storage_write = false) {
+                         bool storage_write = false,
+                         ValueOpcode sampled_opcode = ValueOpcode::ImageSampleRaw) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -271,7 +272,7 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   } else {
     const auto sampler =
         fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-    const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
+    const auto sampled = fixture->Emit(sampled_opcode,
                                        {image, sampler, fixture->ImageAddress()},
                                        fixture->AddMemory(access, 0x10f0));
     const auto sampled_x =
@@ -485,7 +486,7 @@ void TestInvariantIndirectImageMaterialization() {
 void TestHeterogeneousIndirectImageDimensions() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
-  const auto resource_plan = ExtractResourcePlan(fixture->program);
+  auto resource_plan = ExtractResourcePlan(fixture->program);
   EliminateDeadCode(fixture->program.blocks);
   ValidateProgram(fixture->program, true);
 
@@ -523,16 +524,30 @@ void TestHeterogeneousIndirectImageDimensions() {
             specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
             specialization.images[1].dimension == Decoder::ImageDimension::Dim1D,
         "mixed 2D/1D indirect image table was rejected");
-  const auto prior_snapshot = snapshot;
-  const auto prior_specialization = specialization;
   memory.words[(0x2020u - memory.base) / 4u + 1u] =
       static_cast<uint32_t>(
           Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)
       << 20u;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2 && specialization.images.size() == 2 &&
+            specialization.images[0].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Float &&
+            specialization.images[1].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Uint,
+        "mixed Float/Uint sampled indirect image table was rejected");
+  const auto heterogeneous_snapshot = snapshot;
+  const auto heterogeneous_specialization = specialization;
+  resource_plan.info.images[0].heterogeneous_numeric_compatible = false;
   Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "mixed numeric-class indirect image table was accepted or mutated the prior result");
+            SameResourceSnapshot(snapshot, heterogeneous_snapshot) &&
+            specialization == heterogeneous_specialization,
+        "mixed numeric classes bypassed the tracked opcode compatibility proof");
+  resource_plan.info.images[0].heterogeneous_numeric_compatible = true;
+  auto gather_fixture = MakeIndirectImageFixture(false, 0u, false, false,
+                                                 ValueOpcode::ImageGatherRaw);
+  gather_fixture->PlanAndTrack();
+  Check(!gather_fixture->program.info.images[0].heterogeneous_numeric_compatible,
+        "indirect gather was marked compatible with mixed numeric classes");
   ApplyResourceSpecialization(fixture->program, specialization);
   Check(fixture->program.info.images.size() == 2 &&
             fixture->program.info.images[0].indirect_root == 0u &&

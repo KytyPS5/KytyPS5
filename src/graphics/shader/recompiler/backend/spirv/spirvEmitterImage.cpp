@@ -830,19 +830,22 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto  numeric_class  = image.numeric_class;
-		const auto  condition      = ctx.Arg(inst, 2);
-		const auto  result_type    = ImageVectorType(state, numeric_class, 4);
+		const auto condition = ctx.Arg(inst, 2);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
 			        const auto EmitRead = [&](uint32_t resource) {
-				        const auto candidate_dimension =
-				            state.program.info.images[resource].dimension;
+				        auto selected_mem             = mem;
+				        selected_mem.resource          = resource;
+				        const auto& selected_image     = state.program.info.images[resource];
+				        const auto candidate_dimension = selected_image.dimension;
+				        selected_mem.image_dimension   = candidate_dimension;
 				        const auto& candidate_dimension_info =
 				            ImageDimensionInfoFor(candidate_dimension);
+				        const auto result_type =
+				            ImageVectorType(state, selected_image.numeric_class, 4);
 				        const auto descriptor = LoadSampledImageDescriptor(state, resource);
 				        const auto color      = state.builder.AllocateId();
 				        const auto coord = CoordU32(ctx, mem, *address, candidate_dimension);
@@ -858,15 +861,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					             ImageOperandsLodMask,
 					             LodU32(ctx, mem, *address, candidate_dimension)});
 				        }
-				        return color;
+				        return ResultVector(
+				            ctx, UnpackImageTexel(ctx, selected_mem, color),
+				            selected_image.numeric_class, false, selected_mem);
 			        };
 			        const auto color = image.indirect_root == mem.resource
 			                               ? EmitIndirectImageValue(ctx, inst, image_arg, image,
-			                                                        result_type, EmitRead)
+			                                                        TypeU32Vector(state, 4), EmitRead)
 			                               : EmitRead(mem.resource);
 			        if (color == 0u) return ConstantU32CompositeZero(state, 4);
-			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
-			                            false, mem);
+			        return color;
 		        }));
 		return true;
 	}
@@ -1031,6 +1035,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		
 		// For manual depth-compare emulation, use regular sample operation
 		const bool use_manual_compare = dref && manual_compare;
+		const bool heterogeneous_numeric =
+		    image.indirect_root == mem.resource &&
+		    std::any_of(image.indirect_resources.begin(), image.indirect_resources.end(),
+		                [&](uint32_t resource) {
+			                return state.program.info.images[resource].numeric_class != numeric_class;
+		                });
+		if (heterogeneous_numeric && dref) {
+			ctx.Fail(inst, "does not support heterogeneous numeric depth comparisons");
+			return true;
+		}
 		uint32_t opcode = OpImageSampleImplicitLod;
 		if (explicit_lod) {
 			opcode = (dref && !use_manual_compare) ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod;
@@ -1053,7 +1067,8 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto candidate_dimension = state.program.info.images[resource].dimension;
+			const auto& selected_image = state.program.info.images[resource];
+			const auto candidate_dimension = selected_image.dimension;
 			const auto& candidate_dimension_info = ImageDimensionInfoFor(candidate_dimension);
 			const auto candidate_layout = Layout(mem, candidate_dimension);
 			const auto candidate_coord =
@@ -1089,8 +1104,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto candidate_sampler = state.program.info.images[resource].indirect_sampler;
 			const auto sampled = MakeSampledImage(state, resource,
 			    candidate_sampler != UINT32_MAX ? candidate_sampler : mem.sampler);
+			const auto candidate_result_type =
+			    dref && !use_manual_compare
+			        ? TypeF32(state)
+			        : ImageVectorType(state, selected_image.numeric_class, 4);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words {opcode, result_type, sample, sampled, candidate_coord};
+			std::vector<uint32_t> words {opcode, candidate_result_type, sample, sampled,
+			                             candidate_coord};
 			// Only push dref_value for native depth-compare operations
 			if (dref && !use_manual_compare) {
 				words.push_back(candidate_dref_value);
@@ -1100,6 +1120,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.insert(words.end(), candidate_operands.begin(), candidate_operands.end());
 			}
 			state.builder.AddFunction(words);
+			if (heterogeneous_numeric) {
+				auto selected_mem             = mem;
+				selected_mem.resource          = resource;
+				selected_mem.image_dimension   = selected_image.dimension;
+				return ResultVector(ctx, UnpackImageTexel(ctx, selected_mem, sample),
+				                    selected_image.numeric_class, false, selected_mem);
+			}
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {
@@ -1210,7 +1237,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 		state.builder.AddFunction(switch_words);
-		std::vector<uint32_t> phi_words {OpPhi, result_type, state.builder.AllocateId()};
+		const auto phi_type =
+		    heterogeneous_numeric ? TypeU32Vector(state, 4) : result_type;
+		std::vector<uint32_t> phi_words {OpPhi, phi_type, state.builder.AllocateId()};
 		EmitLabel(state, default_label);
 		phi_words.push_back(EmitSample(image.indirect_resources[0]));
 		phi_words.push_back(default_label);
@@ -1224,6 +1253,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
 		auto result = phi_words[2];
+		if (heterogeneous_numeric) {
+			ctx.Define(inst, result);
+			return true;
+		}
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		} else if (use_manual_compare) {

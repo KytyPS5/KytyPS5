@@ -1979,6 +1979,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.heterogeneous_numeric_compatible = true;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -1992,6 +1993,10 @@ private:
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.heterogeneous_numeric_compatible =
+		    image.heterogeneous_numeric_compatible &&
+		    (op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageRead ||
+		     op == ValueOpcode::ImageWrite);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

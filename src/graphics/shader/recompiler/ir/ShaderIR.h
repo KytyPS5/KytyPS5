@@ -134,6 +134,9 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	// Positive proof: every use can normalize a runtime candidate's numeric type
+	// to or from the guest's raw U32x4 image value at the indirect switch boundary.
+	bool                          heterogeneous_numeric_compatible = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;

@@ -508,12 +508,14 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+		virtual_memory_allocation_tests)
+	if(KYTY_CLANG_CL)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	else()
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
-	endforeach()
-endif()
+	endif()
+endforeach()
 
 if(BUILD_TESTING)
 	add_test(NAME emulator_user_name_cli

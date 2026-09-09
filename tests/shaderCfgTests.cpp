@@ -10005,6 +10005,8 @@ void TestCooperativeWave64CrossBlockSpillReuse() {
   const auto compiled = ShaderRecompiler::CompileProgram(
       std::move(translated), options, {}, 0u);
   CheckSpirvBinaryValidates(compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 247u) == 6u,
+        "simple cooperative segments retained separate instruction and transition guards");
   const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
   Check(variable_count == 7u,
         "sequential cross-block cooperative values did not share a spill slot");

@@ -520,8 +520,7 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 	for (const auto& segment : segments) {
 		ctx.current_block = segment.block;
 		EmitLabel(state, segment.label);
-		EmitSegmentInstructions(ctx, function, segment, active);
-		Guard(state, active, [&] {
+		const auto emit_transition = [&] {
 			if (segment.barrier_successor != Finished) {
 				state.builder.AddFunction({OpStore, function.pc_variable,
 				                           ConstantU32(state, Waiting | segment.barrier_successor)});
@@ -555,7 +554,38 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 					state.builder.AddFunction({OpStore, function.pc_variable, finished}); break;
 				default: ctx.Fail("cooperative execution requires direct guest control flow");
 			}
-		});
+		};
+		uint32_t simple_phase = 0;
+		bool fuse_guard = true;
+		for (const auto* inst : segment.instructions) {
+			if (inst->GetOpcode() == O::Phi) continue;
+			if (IsRuntimeScalarRead(ctx, *inst) || IsCollective(inst->GetOpcode()) ||
+			    IsLds(ctx.program, *inst)) {
+				fuse_guard = false;
+				break;
+			}
+			const auto phase = function.phases.at(inst);
+			if (simple_phase == 0) simple_phase = phase;
+			if (simple_phase != phase) {
+				fuse_guard = false;
+				break;
+			}
+		}
+		if (fuse_guard) {
+			ctx.cooperative_phase = simple_phase;
+			Guard(state, active, [&] {
+				for (const auto* inst : segment.instructions) {
+					if (inst->GetOpcode() == O::Phi) continue;
+					EmitDirectValueInstruction(ctx, *inst);
+					StoreResult(ctx, function, *inst);
+				}
+				emit_transition();
+			});
+			ctx.cooperative_phase = 0;
+		} else {
+			EmitSegmentInstructions(ctx, function, segment, active);
+			Guard(state, active, emit_transition);
+		}
 		state.builder.AddFunction({OpBranch, after_switch});
 	}
 	EmitLabel(state, after_switch);

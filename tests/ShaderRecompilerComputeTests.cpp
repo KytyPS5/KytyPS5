@@ -27985,6 +27985,14 @@ void CheckIndirectImageKeySwitch(
   program.info.images = {root, candidate};
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+  const bool mixed_numeric =
+      candidate_numeric_class != Prospero::TextureNumericClass::Float;
+  if (mixed_numeric) {
+    auto point_sampler = program.info.samplers[0];
+    point_sampler.force_point_filtering = true;
+    program.info.samplers.push_back(point_sampler);
+    program.info.sampled_pairs.push_back({1u, 1u, 0x10f0u});
+  }
 
   AllocateBindings(program);
   const auto root_binding = DescriptorBindingForImage(root);
@@ -28008,7 +28016,7 @@ void CheckIndirectImageKeySwitch(
          .indirect_sampler = resource.indirect_sampler,
          .cube = resource.cube});
   }
-  specialization.sampler_depth_compare_funcs.push_back(0u);
+  specialization.sampler_depth_compare_funcs.resize(program.info.samplers.size());
   ShaderComputeInputInfo compute{};
   ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(
@@ -28024,6 +28032,26 @@ void CheckIndirectImageKeySwitch(
               CountText(text, "OpImageSampleExplicitLod") == 2 &&
               CountText(text, "OpIEqual") == 11,
           "mixed 2D/1D image key did not use a compact two-sample switch");
+  if (mixed_numeric) {
+    const auto HasSamplerIndex = [&](std::string_view index) {
+      for (size_t begin = 0; begin < text.size();) {
+        const auto end = text.find('\n', begin);
+        const std::string_view line(text.data() + begin,
+                                    (end == std::string::npos ? text.size() : end) - begin);
+        if (line.find("OpAccessChain") != std::string_view::npos &&
+            line.find("%samplers") != std::string_view::npos &&
+            line.find(index) != std::string_view::npos) {
+          return true;
+        }
+        if (end == std::string::npos) break;
+        begin = end + 1u;
+      }
+      return false;
+    };
+    Require(name, "candidate sampler selection",
+            HasSamplerIndex("%uint_0") && HasSamplerIndex("%uint_1"),
+            "the Uint indirect candidate retained the Float candidate's linear sampler");
+  }
 }
 
 void CheckIndirectImageNumericClassSwitch() {

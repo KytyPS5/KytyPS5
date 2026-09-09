@@ -205,8 +205,41 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 	return sampler_id;
 }
 
+static bool RequiresPointSampler(const IR::ImageResource& image) {
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
+	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	       image.conversion_format != Prospero::BufferFormat::kInvalid;
+}
+
+static uint32_t CompatibleSamplerForImage(const EmitterState& state, uint32_t resource,
+                                          uint32_t sampler) {
+	const auto& image = state.program.info.images.at(resource);
+	if (!RequiresPointSampler(image)) {
+		return sampler;
+	}
+	const auto& samplers = state.program.info.samplers;
+	EXIT_IF(sampler >= samplers.size());
+	const auto& base = samplers[sampler];
+	if (base.force_point_filtering) {
+		return sampler;
+	}
+	for (const auto& pair: state.program.info.sampled_pairs) {
+		if (pair.image >= state.program.info.images.size() || pair.image != resource ||
+		    pair.sampler >= samplers.size()) {
+			continue;
+		}
+		const auto& candidate = samplers[pair.sampler];
+		if (candidate.force_point_filtering && candidate.source == base.source &&
+		    candidate.depth_compare_func == base.depth_compare_func) {
+			return pair.sampler;
+		}
+	}
+	EXIT("point-only sampled image has no compatible sampler variant");
+}
+
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler) {
 	const auto& image_resource = state.program.info.images.at(resource);
+	sampler                    = CompatibleSamplerForImage(state, resource, sampler);
 	const auto  image          = LoadSampledImageDescriptor(state, resource);
 	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
 	const auto  sampled_image = state.builder.AllocateId();

@@ -4,6 +4,26 @@ This file records regression coverage deferred during fast launch bring-up. Each
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
 
+## Full-suite failures retained after upstream sync
+
+Status: Windows CI-equivalent tests pass; extended local CTest is 46/51 after
+merge `a309653` (`upstream/main` at `0b4e78c`).
+
+The remaining failures are outside the three-test Windows CI gate and were not
+hidden or disabled during conflict resolution:
+
+- `shader_cfg`: exact `wide-buffer` SPIR-V budget is stale (actual 831 words / 216
+  instructions versus 807 / 211).
+- `scalar_provenance`: out-of-bounds constant-buffer walk is not transactional.
+- `resource_tracking`: invariant indirect-image proof admits a wrapped scalar
+  immediate; this is the pre-existing debt already tracked below.
+- `shader_recompiler_compute` and `texture_cache_image_overlap`: ordinary sampled
+  aliases do not consistently retain/rebind the live comparison-depth owner.
+
+Resolve these as separate regression-first mechanisms. They are not evidence
+against the newly merged DS bounded atomics, DB render override, APR, CES or
+buffer-cache changes, whose focused tests pass.
+
 ## Cooperative wave64 read-only LDS phase batching
 
 Status: CPU regression added and Vulkan neighboring coverage complete; large-module

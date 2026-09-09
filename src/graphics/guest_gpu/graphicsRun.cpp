@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -31,7 +30,6 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -336,53 +334,6 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
-namespace {
-
-// Soft ladder (PPSA21564). A WAIT_REG_MEM whose label a skipped GPU op (a dropped
-// un-materialisable GI compute dispatch) was supposed to write never advances -- the CP loop
-// re-suspends on it every ~100 ms forever, and the graphics EOP eventually device-loses.
-// Astro Bot wedges exactly here: the graphics CP waits on compute-progress labels the dropped
-// compute dispatches never write. After this long with a value that has NEVER moved, give up on
-// the wait so the queue can drain: the caller advances past the packet instead of suspending.
-// Any change to the value restarts the clock, so a genuinely slow-but-live fence is never
-// forced. Real fix: resolve the bindless GI descriptors so nothing gets dropped.
-bool WaitRegMemShouldBail(uint64_t cpu_addr, uint64_t actual) {
-	constexpr uint64_t kBailNs = 4ULL * 1000000000ULL;
-
-	struct Tracker {
-		uint64_t first_ts  = 0;
-		uint64_t last_seen = 0;
-		bool     bailed    = false;
-	};
-	static std::mutex                            mutex;
-	static std::unordered_map<uint64_t, Tracker> tracked;
-
-	const auto ts = static_cast<uint64_t>(
-	    std::chrono::steady_clock::now().time_since_epoch().count());
-
-	std::scoped_lock lock(mutex);
-	auto&            tr = tracked[cpu_addr];
-	if (tr.first_ts == 0) {
-		tr.first_ts  = ts;
-		tr.last_seen = actual;
-	}
-	if (tr.last_seen != actual) {
-		tr.last_seen = actual;
-		tr.first_ts  = ts;
-		tr.bailed    = false;
-		return false;
-	}
-	if (!tr.bailed && (ts - tr.first_ts) >= kBailNs) {
-		tr.bailed = true;
-		LOGF("CP wait_reg_mem: giving up on addr=0x%016" PRIx64 " (frozen at 0x%016" PRIx64
-		     " for >4s) -- advancing the queue past it\n",
-		     cpu_addr, actual);
-	}
-	return tr.bailed;
-}
-
-} // namespace
-
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -393,12 +344,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		if (!WaitRegMemShouldBail(reinterpret_cast<uint64_t>(addr),
-		                          static_cast<uint64_t>(*addr))) {
-			SuspendPm4();
-		}
-		// Otherwise: the label has been frozen for seconds (its producer was skipped or is
-		// deadlocked). Fall through without suspending so the CP advances past this WAIT_REG_MEM.
+		SuspendPm4();
 	}
 }
 

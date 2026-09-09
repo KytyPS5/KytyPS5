@@ -1,13 +1,20 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
+#include <ranges>
 #include <set>
 #include <stack>
+#include <string>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -788,7 +795,9 @@ void ComputePostDominators(Graph& graph) {
 	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (auto& block: graph.blocks) {
+		// Post-dominance flows from successors, so a reverse sweep converges in a few passes.
+		for (auto it = graph.blocks.rbegin(); it != graph.blocks.rend(); ++it) {
+			auto&                 block = *it;
 			std::vector<uint32_t> next;
 			if (block.successors.empty()) {
 				next = {block.id};
@@ -1087,6 +1096,41 @@ uint32_t AppendSyntheticBranchBlock(Graph& graph, uint32_t target) {
 	return graph.blocks.back().id;
 }
 
+uint32_t AppendClonedSemanticBlock(Graph& graph, uint32_t source_id) {
+	const auto* source = graph.FindBlock(source_id);
+	if (source == nullptr) {
+		return UINT32_MAX;
+	}
+	BasicBlock block           = *source;
+	block.id                   = static_cast<uint32_t>(graph.blocks.size());
+	block.predecessors.clear();
+	block.dominators.clear();
+	block.post_dominators.clear();
+	block.terminator.loop_header    = false;
+	block.terminator.merge_block    = UINT32_MAX;
+	block.terminator.continue_block = UINT32_MAX;
+	graph.blocks.push_back(std::move(block));
+	return graph.blocks.back().id;
+}
+
+bool IsLoopHeaderOrContinue(const Graph& graph, uint32_t block_id) {
+	return std::ranges::any_of(graph.natural_loops, [&](const auto& loop) {
+		return block_id == loop.header || block_id == loop.continue_block;
+	});
+}
+
+bool FeedsLoopHeader(const Graph& graph, uint32_t block_id) {
+	const auto* block = graph.FindBlock(block_id);
+	if (block == nullptr) {
+		return false;
+	}
+	return std::ranges::any_of(block->successors, [&](uint32_t succ) {
+		return std::ranges::any_of(graph.natural_loops, [&](const auto& loop) {
+			return loop.header == succ;
+		});
+	});
+}
+
 bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
 	const auto* header = graph.FindBlock(old_header);
 	if (header == nullptr || header->inst_begin == header->inst_end) {
@@ -1120,6 +1164,25 @@ const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t bloc
 		}
 	}
 	return innermost;
+}
+
+std::string BlockLoopRole(const Graph& graph, uint32_t block_id) {
+	std::string roles;
+	for (const auto& loop: graph.natural_loops) {
+		if (block_id == loop.header) {
+			roles += fmt::format(" header#{}", loop.header);
+		}
+		if (block_id == loop.continue_block) {
+			roles += fmt::format(" continue#{}", loop.header);
+		}
+		if (block_id == loop.merge) {
+			roles += fmt::format(" merge#{}", loop.header);
+		}
+	}
+	const auto* inner = FindInnermostContainingLoop(graph, block_id);
+	return fmt::format("inner={} roles=[{}]",
+	                   inner != nullptr ? fmt::format("{}", inner->header) : std::string("none"),
+	                   roles.empty() ? " none" : roles);
 }
 
 bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
@@ -1198,6 +1261,51 @@ bool CanReachBefore(const Graph& graph, uint32_t start, uint32_t target, uint32_
 	return false;
 }
 
+std::vector<bool> ReachableFrom(const Graph& graph, uint32_t start) {
+	std::vector<bool>     seen(graph.blocks.size(), false);
+	std::vector<uint32_t> pending = {start};
+	while (!pending.empty()) {
+		const auto block_id = pending.back();
+		pending.pop_back();
+		if (block_id >= seen.size() || seen[block_id]) {
+			continue;
+		}
+		seen[block_id]    = true;
+		const auto* block = graph.FindBlock(block_id);
+		if (block != nullptr) {
+			pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+		}
+	}
+	return seen;
+}
+
+uint32_t FindSharedContinueJoin(const Graph& graph, uint32_t header, uint32_t true_target,
+                                uint32_t false_target) {
+	// Both arms can return and also fall through to a later join. Returns do not
+	// post-dominate, so nearest-common-post-dominator is empty; SPIR-V still allows
+	// OpReturn inside a selection whose merge is that continue join.
+	const auto from_true  = ReachableFrom(graph, true_target);
+	const auto from_false = ReachableFrom(graph, false_target);
+	std::vector<uint32_t> candidates;
+	for (const auto& block: graph.blocks) {
+		if (block.id == header || block.successors.empty() ||
+		    block.id >= from_true.size() || block.id >= from_false.size() ||
+		    !from_true[block.id] || !from_false[block.id] ||
+		    !graph.Dominates(header, block.id) || IsLoopHeaderOrContinue(graph, block.id)) {
+			continue;
+		}
+		candidates.push_back(block.id);
+	}
+	for (const auto candidate: candidates) {
+		if (std::ranges::all_of(candidates, [&](uint32_t other) {
+			    return other == candidate || graph.Dominates(candidate, other);
+		    })) {
+			return candidate;
+		}
+	}
+	return UINT32_MAX;
+}
+
 uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 	const auto  global_merge = graph.FindNearestCommonPostDominator(block.terminator.true_block,
 	                                                                block.terminator.false_block);
@@ -1225,13 +1333,18 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 				}
 				// A return can leave a selection without reaching its merge. Keep the
 				// continuing arm as the merge instead of joining live state with a return.
-				if (graph.Dominates(block.id, false_target) &&
-				    HasLinearPathToTerminal(graph, true_target)) {
+				// The continue arm need not be dominated yet: a shared tail is split
+				// into a private merge by SplitSharedMergeBlock.
+				if (HasLinearPathToTerminal(graph, true_target)) {
 					return false_target;
 				}
-				if (graph.Dominates(block.id, true_target) &&
-				    HasLinearPathToTerminal(graph, false_target)) {
+				if (HasLinearPathToTerminal(graph, false_target)) {
 					return true_target;
+				}
+				const auto continue_join =
+				    FindSharedContinueJoin(graph, block.id, true_target, false_target);
+				if (continue_join != UINT32_MAX) {
+					return continue_join;
 				}
 			}
 		}
@@ -1408,6 +1521,12 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	if (construct_predecessors.empty() || (!force_split && external_predecessors.empty())) {
 		return false;
 	}
+	// Force-splitting an already-empty gateway just wraps the same join forever.
+	if (force_split && external_predecessors.empty() &&
+	    merge_block->inst_begin == merge_block->inst_end &&
+	    merge_block->terminator.kind == TerminatorKind::Branch) {
+		return false;
+	}
 	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
 	auto*      synthetic_block = graph.FindBlock(synthetic_merge);
 	if (synthetic_block != nullptr) {
@@ -1474,7 +1593,186 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
-bool SplitOneSelectionMerge(Graph& graph) {
+bool SelectionArmReaches(const Graph& graph, uint32_t arm, uint32_t target, uint32_t merge) {
+	return arm == target || CanReachBefore(graph, arm, target, merge);
+}
+
+void LogCloneDecision(const Graph& graph, uint32_t header_id, uint32_t merge, uint32_t member_id,
+                      const std::vector<uint32_t>& region, const char* decision,
+                      const char* reason) {
+	const auto* header = graph.FindBlock(header_id);
+	const auto* member = graph.FindBlock(member_id);
+	std::string preds;
+	if (member != nullptr) {
+		for (size_t i = 0; i < member->predecessors.size(); i++) {
+			const auto pred      = member->predecessors[i];
+			const bool internal  = pred == header_id || Contains(region, pred);
+			if (i != 0) {
+				preds += ' ';
+			}
+			preds += fmt::format("{}:{}({})", pred, internal ? "in" : "ext",
+			                     BlockLoopRole(graph, pred));
+		}
+	}
+	LOGF("ShaderCFG clone %s: header=%u member=%u merge=%u true=%u false=%u "
+	     "member_loop=(%s) reason=%s preds=[%s]\n",
+	     decision, header_id, member_id, merge,
+	     header != nullptr ? header->terminator.true_block : UINT32_MAX,
+	     header != nullptr ? header->terminator.false_block : UINT32_MAX,
+	     BlockLoopRole(graph, member_id).c_str(), reason, preds.c_str());
+}
+
+bool SplitExternalSelectionEntry(Graph& graph, uint32_t header_id, uint32_t merge,
+                                 const std::vector<uint32_t>& region, uint32_t member_id,
+                                 bool log_clone) {
+	const auto* header = graph.FindBlock(header_id);
+	const auto* member = graph.FindBlock(member_id);
+	if (header == nullptr || member == nullptr) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse", "missing_block");
+		}
+		return false;
+	}
+
+	const auto header_loop = std::find_if(
+	    graph.natural_loops.begin(), graph.natural_loops.end(),
+	    [&](const auto& loop) { return loop.header == member_id; });
+	if (header_loop != graph.natural_loops.end()) {
+		// Cloned selection copies can share one nested loop. Unify extra preheaders
+		// instead of cloning the loop header (that would duplicate the back-edge).
+		std::vector<uint32_t> non_latch;
+		for (auto pred: member->predecessors) {
+			if (pred != header_loop->continue_block && pred != header_loop->latch) {
+				AddUnique(non_latch, pred);
+			}
+		}
+		if (non_latch.size() >= 2u) {
+			const auto preheader = AppendSyntheticBranchBlock(graph, member_id);
+			for (auto pred: non_latch) {
+				auto* block = graph.FindBlock(pred);
+				if (block == nullptr) {
+					continue;
+				}
+				ReplaceValue(block->successors, member_id, preheader);
+				ReplaceTerminatorTarget(block->terminator, member_id, preheader);
+			}
+			MoveBlockBefore(graph, preheader, member_id);
+			if (log_clone) {
+				LogCloneDecision(graph, header_id, merge, member_id, region, "preheader",
+				                 "loop_multi_preheader");
+			}
+			return true;
+		}
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 "loop_header_or_continue");
+		}
+		return false;
+	}
+	if (IsLoopHeaderOrContinue(graph, member_id)) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 "loop_header_or_continue");
+		}
+		return false;
+	}
+	if (FeedsLoopHeader(graph, member_id)) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 "loop_preheader");
+		}
+		return false;
+	}
+	// Cloning a selection/switch duplicates every nested loop it feeds and then
+	// never converges (shared merge split wraps the same join forever). Only
+	// linear tails — returns and single-successor blocks — are safe to copy.
+	if (member->terminator.kind != TerminatorKind::Branch &&
+	    member->terminator.kind != TerminatorKind::Return) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 "non_linear_member");
+		}
+		return false;
+	}
+
+	const auto* member_loop = FindInnermostContainingLoop(graph, member_id);
+	std::vector<uint32_t> internal_predecessors;
+	std::vector<uint32_t> external_predecessors;
+	for (auto pred: member->predecessors) {
+		if (pred == header_id || Contains(region, pred)) {
+			AddUnique(internal_predecessors, pred);
+		} else {
+			AddUnique(external_predecessors, pred);
+		}
+	}
+	if (internal_predecessors.empty() || external_predecessors.empty()) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 internal_predecessors.empty() ? "no_internal_preds"
+			                                               : "no_external_preds");
+		}
+		return false;
+	}
+	const bool member_is_loop_merge =
+	    member_loop != nullptr && member_id == member_loop->merge;
+	if (!member_is_loop_merge && member_loop != nullptr &&
+	    std::ranges::any_of(external_predecessors, [&](uint32_t pred) {
+		    return FindInnermostContainingLoop(graph, pred) != member_loop;
+	    })) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 "nonlocal_loop_entry");
+		}
+		return false;
+	}
+
+	const bool both_arms =
+	    SelectionArmReaches(graph, header->terminator.true_block, member_id, merge) &&
+	    SelectionArmReaches(graph, header->terminator.false_block, member_id, merge);
+	if (both_arms) {
+		const auto construct_blocks = DominatedBlocks(graph, header_id, member_id);
+		const auto force_split      = MergeLeavesContainingLoop(graph, header_id, member_id);
+		if (SplitSharedMergeBlock(graph, member_id, construct_blocks, force_split)) {
+			if (log_clone) {
+				LogCloneDecision(graph, header_id, merge, member_id, region, "split_merge",
+				                 "shared_merge_split");
+			}
+			return true;
+		}
+	}
+
+	const auto clone_id = AppendClonedSemanticBlock(graph, member_id);
+	if (clone_id == UINT32_MAX) {
+		if (log_clone) {
+			LogCloneDecision(graph, header_id, merge, member_id, region, "refuse",
+			                 "clone_append_failed");
+		}
+		return false;
+	}
+	for (auto pred: internal_predecessors) {
+		auto* block = graph.FindBlock(pred);
+		if (block == nullptr) {
+			continue;
+		}
+		ReplaceValue(block->successors, member_id, clone_id);
+		ReplaceTerminatorTarget(block->terminator, member_id, clone_id);
+	}
+	MoveBlockBefore(graph, clone_id, member_id);
+	if (log_clone) {
+		std::string internal;
+		for (size_t i = 0; i < internal_predecessors.size(); i++) {
+			if (i != 0) {
+				internal += ',';
+			}
+			internal += fmt::format("{}", internal_predecessors[i]);
+		}
+		LOGF("ShaderCFG clone ok: header=%u member=%u clone=%u merge=%u internal=[%s]\n", header_id,
+		     member_id, clone_id, merge, internal.c_str());
+	}
+	return true;
+}
+
+bool SplitOneSelectionMerge(Graph& graph, bool allow_clone) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
 	for (const auto& loop: graph.natural_loops) {
@@ -1518,12 +1816,43 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			       });
 		});
 		if (external != region.end()) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, block_id,
-			    fmt::format("selection header block {} has externally entered region block {}; "
-			                "semantic block cloning is disabled",
-			                block_id, *external));
-			return false;
+			if (allow_clone &&
+			    SplitExternalSelectionEntry(graph, block_id, merge, region, *external, true)) {
+				return true;
+			}
+			const auto* external_block = graph.FindBlock(*external);
+			const bool skippable_external =
+			    IsLoopHeaderOrContinue(graph, *external) || FeedsLoopHeader(graph, *external) ||
+			    (allow_clone && external_block != nullptr &&
+			     external_block->terminator.kind != TerminatorKind::Branch &&
+			     external_block->terminator.kind != TerminatorKind::Return);
+			if (!skippable_external) {
+				const auto* member = graph.FindBlock(*external);
+				std::string preds;
+				if (member != nullptr) {
+					for (size_t i = 0; i < member->predecessors.size(); i++) {
+						if (i != 0) {
+							preds += ',';
+						}
+						preds += fmt::format("{}", member->predecessors[i]);
+					}
+				}
+				SetFailure(
+				    graph, FailureKind::StructuredControlFlow, block_id,
+				    fmt::format("selection header block {} has externally entered region block {} "
+				                "preds=[{}] merge={} true={} false={}",
+				                block_id, *external, preds, merge, block->terminator.true_block,
+				                block->terminator.false_block));
+				return false;
+			}
+			// A nested loop in this region is shared with another path. Force-splitting
+			// the merge wraps the same join forever; isolate mixed preds only, then
+			// leave this header for preheader unification on a later pass.
+			const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
+			if (SplitSharedMergeBlock(graph, merge, construct_blocks, false)) {
+				return true;
+			}
+			continue;
 		}
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
 		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);
@@ -1534,11 +1863,11 @@ bool SplitOneSelectionMerge(Graph& graph) {
 	return false;
 }
 
-bool SplitSharedMergeBlocks(Graph& graph) {
+bool SplitSharedMergeBlocks(Graph& graph, bool allow_clone) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
+		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph, allow_clone)) {
 			return !graph.unsupported;
 		}
 		RebuildPredecessors(graph);
@@ -1550,6 +1879,341 @@ bool SplitSharedMergeBlocks(Graph& graph) {
 	                       original_block_count, static_cast<uint64_t>(graph.blocks.size()),
 	                       split_budget));
 	return false;
+}
+
+uint32_t AppendEmptyDispatchBlock(Graph& graph) {
+	BasicBlock block;
+	block.id                  = static_cast<uint32_t>(graph.blocks.size());
+	block.terminator.kind     = TerminatorKind::Branch;
+	block.terminator.condition = BranchCondition::Always;
+	graph.blocks.push_back(std::move(block));
+	return graph.blocks.back().id;
+}
+
+uint32_t AppendDispatchSetter(Graph& graph, uint32_t next_state, uint32_t continue_block) {
+	const auto id = AppendEmptyDispatchBlock(graph);
+	auto*      block = graph.FindBlock(id);
+	block->terminator.kind          = TerminatorKind::Branch;
+	block->terminator.dispatch_next = next_state;
+	block->terminator.true_block    = continue_block;
+	block->successors               = {continue_block};
+	return id;
+}
+
+uint32_t AppendDispatchJoin(Graph& graph, uint32_t target) {
+	return AppendDispatchSetter(graph, UINT32_MAX, target);
+}
+
+void RetargetDispatchBranch(Graph& graph, uint32_t block_id, uint32_t target) {
+	auto* block = graph.FindBlock(block_id);
+	block->terminator.true_block = target;
+	block->successors            = {target};
+}
+
+void RemapTerminatorIds(Terminator& terminator, const std::vector<uint32_t>& id_map) {
+	terminator.true_block     = RemapId(terminator.true_block, id_map);
+	terminator.false_block    = RemapId(terminator.false_block, id_map);
+	terminator.merge_block    = RemapId(terminator.merge_block, id_map);
+	terminator.continue_block = RemapId(terminator.continue_block, id_map);
+	terminator.dispatch_next  = RemapId(terminator.dispatch_next, id_map);
+	for (auto& target: terminator.indirect_targets) {
+		target = RemapId(target, id_map);
+	}
+	for (auto& target: terminator.indirect_selector_targets) {
+		target = RemapId(target, id_map);
+	}
+	if (terminator.kind == TerminatorKind::DispatchSwitch) {
+		for (auto& value: terminator.indirect_selector_values) {
+			value = RemapId(value, id_map);
+		}
+	}
+}
+
+void CompactBlocksInOrder(Graph& graph, const std::vector<uint32_t>& order) {
+	std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
+	std::vector<BasicBlock> new_blocks;
+	new_blocks.reserve(order.size());
+	for (auto old_id: order) {
+		if (old_id >= old_blocks.size()) {
+			continue;
+		}
+		new_blocks.push_back(std::move(old_blocks[old_id]));
+	}
+
+	std::vector<uint32_t> id_map(old_blocks.size(), UINT32_MAX);
+	for (uint32_t i = 0; i < new_blocks.size(); i++) {
+		id_map[new_blocks[i].id] = i;
+	}
+
+	graph.blocks        = std::move(new_blocks);
+	graph.entry_block   = RemapId(graph.entry_block, id_map);
+	graph.failure_block = RemapId(graph.failure_block, id_map);
+	for (auto& block: graph.blocks) {
+		block.id = RemapId(block.id, id_map);
+		block.predecessors.clear();
+		block.dominators.clear();
+		block.post_dominators.clear();
+		RemapTerminatorIds(block.terminator, id_map);
+	}
+}
+
+void RebuildSuccessorsFromTerminators(Graph& graph) {
+	for (auto& block: graph.blocks) {
+		block.successors.clear();
+		switch (block.terminator.kind) {
+			case TerminatorKind::Branch:
+				AddUnique(block.successors, block.terminator.true_block);
+				break;
+			case TerminatorKind::ConditionalBranch:
+				AddUnique(block.successors, block.terminator.true_block);
+				AddUnique(block.successors, block.terminator.false_block);
+				break;
+			case TerminatorKind::IndirectBranch:
+			case TerminatorKind::DispatchSwitch:
+				for (auto target: block.terminator.indirect_targets) {
+					AddUnique(block.successors, target);
+				}
+				if (block.terminator.kind == TerminatorKind::DispatchSwitch &&
+				    block.terminator.true_block != UINT32_MAX) {
+					AddUnique(block.successors, block.terminator.true_block);
+				}
+				break;
+			case TerminatorKind::Return:
+			case TerminatorKind::Unsupported: break;
+		}
+	}
+}
+
+void ClearGraphFailure(Graph& graph) {
+	graph.unsupported        = false;
+	graph.irreducible        = false;
+	graph.failure_kind       = FailureKind::None;
+	graph.failure_block      = UINT32_MAX;
+	graph.unsupported_reason.clear();
+}
+
+void ClearStructuredTerminators(Graph& graph);
+
+bool RunDispatcherFull(Graph& graph, const StructurizeOptions& options, StructurizeStats& stats) {
+	if (graph.blocks.empty() || graph.entry_block == UINT32_MAX ||
+	    graph.FindBlock(graph.entry_block) == nullptr) {
+		SetFailure(graph, FailureKind::InvalidInput, graph.entry_block,
+		           "CFG dispatcher lowering received an empty graph");
+		return false;
+	}
+
+	const auto original_entry = graph.entry_block;
+	const auto semantic_count = static_cast<uint32_t>(graph.blocks.size());
+	stats.original_blocks     = semantic_count;
+
+	ClearGraphFailure(graph);
+	ClearStructuredTerminators(graph);
+	graph.blocks.reserve(semantic_count * 4u + 16u);
+
+	const auto loop_header    = AppendEmptyDispatchBlock(graph);
+	const auto switch_block   = AppendEmptyDispatchBlock(graph);
+	const auto after_switch   = AppendEmptyDispatchBlock(graph);
+	const auto continue_block = AppendEmptyDispatchBlock(graph);
+	const auto exit_block     = AppendEmptyDispatchBlock(graph);
+	const auto entry_init     = AppendEmptyDispatchBlock(graph);
+
+	for (uint32_t id = 0; id < semantic_count; id++) {
+		auto* block = graph.FindBlock(id);
+		if (block == nullptr) {
+			SetFailure(graph, FailureKind::InvalidInput, id,
+			           "CFG dispatcher lowering lost a semantic block");
+			return false;
+		}
+		const auto original = block->terminator;
+		block->terminator.loop_header    = false;
+		block->terminator.merge_block    = UINT32_MAX;
+		block->terminator.continue_block = UINT32_MAX;
+		block->successors.clear();
+
+		switch (original.kind) {
+			case TerminatorKind::Return:
+			case TerminatorKind::Unsupported:
+				block->terminator.kind          = TerminatorKind::Branch;
+				block->terminator.condition     = BranchCondition::Always;
+				block->terminator.dispatch_next = kDispatchHaltState;
+				block->terminator.true_block    = after_switch;
+				block->successors               = {after_switch};
+				break;
+			case TerminatorKind::Branch:
+				block->terminator.kind          = TerminatorKind::Branch;
+				block->terminator.condition     = BranchCondition::Always;
+				block->terminator.dispatch_next = original.true_block;
+				block->terminator.true_block    = after_switch;
+				block->successors               = {after_switch};
+				break;
+			case TerminatorKind::ConditionalBranch: {
+				const auto true_setter  =
+				    AppendDispatchSetter(graph, original.true_block, after_switch);
+				const auto false_setter =
+				    AppendDispatchSetter(graph, original.false_block, after_switch);
+				const auto join = AppendDispatchJoin(graph, after_switch);
+				RetargetDispatchBranch(graph, true_setter, join);
+				RetargetDispatchBranch(graph, false_setter, join);
+				block                               = graph.FindBlock(id);
+				block->terminator.kind              = TerminatorKind::ConditionalBranch;
+				block->terminator.condition         = original.condition;
+				block->terminator.true_block        = true_setter;
+				block->terminator.false_block       = false_setter;
+				block->terminator.merge_block       = join;
+				block->terminator.goto_variable     = original.goto_variable;
+				block->terminator.goto_value        = original.goto_value;
+				block->successors                   = {true_setter, false_setter};
+				break;
+			}
+			case TerminatorKind::IndirectBranch: {
+				const auto& source_targets =
+				    !original.indirect_selector_targets.empty() &&
+				            original.indirect_selector_targets.size() ==
+				                original.indirect_selector_values.size()
+				        ? original.indirect_selector_targets
+				        : original.indirect_targets;
+				std::vector<uint32_t> mapped_targets;
+				mapped_targets.reserve(source_targets.size());
+				for (auto target: source_targets) {
+					mapped_targets.push_back(AppendDispatchSetter(graph, target, after_switch));
+				}
+				const auto join = AppendDispatchJoin(graph, after_switch);
+				for (auto target: mapped_targets) {
+					RetargetDispatchBranch(graph, target, join);
+				}
+				block                                  = graph.FindBlock(id);
+				block->terminator                      = original;
+				block->terminator.loop_header          = false;
+				block->terminator.continue_block       = UINT32_MAX;
+				block->terminator.merge_block          = join;
+				block->terminator.indirect_targets     = mapped_targets;
+				block->successors                      = mapped_targets;
+				if (!original.indirect_selector_values.empty() &&
+				    original.indirect_selector_values.size() == source_targets.size()) {
+					block->terminator.indirect_selector_targets = mapped_targets;
+					block->terminator.indirect_selector_values  = original.indirect_selector_values;
+				} else {
+					block->terminator.indirect_selector_targets.clear();
+					block->terminator.indirect_selector_values.clear();
+				}
+				break;
+			}
+			case TerminatorKind::DispatchSwitch:
+				SetFailure(graph, FailureKind::StructuredControlFlow, id,
+				           "CFG dispatcher lowering cannot wrap an already-dispatched graph");
+				return false;
+		}
+	}
+
+	{
+		auto* block = graph.FindBlock(entry_init);
+		block->terminator.kind          = TerminatorKind::Branch;
+		block->terminator.dispatch_next = original_entry;
+		block->terminator.true_block    = loop_header;
+		block->successors               = {loop_header};
+	}
+	{
+		auto* block = graph.FindBlock(loop_header);
+		block->terminator.kind           = TerminatorKind::ConditionalBranch;
+		block->terminator.condition      = BranchCondition::DispatchDone;
+		block->terminator.true_block     = exit_block;
+		block->terminator.false_block    = switch_block;
+		block->terminator.loop_header    = true;
+		block->terminator.merge_block    = exit_block;
+		block->terminator.continue_block = continue_block;
+		block->successors                = {exit_block, switch_block};
+	}
+	{
+		auto* block = graph.FindBlock(switch_block);
+		block->terminator.kind        = TerminatorKind::DispatchSwitch;
+		block->terminator.true_block  = after_switch;
+		block->terminator.merge_block = after_switch;
+		block->terminator.indirect_selector_values.clear();
+		block->terminator.indirect_selector_targets.clear();
+		block->terminator.indirect_targets.clear();
+		for (uint32_t id = 0; id < semantic_count; id++) {
+			block->terminator.indirect_selector_values.push_back(id);
+			block->terminator.indirect_selector_targets.push_back(id);
+			block->terminator.indirect_targets.push_back(id);
+		}
+		block->successors = block->terminator.indirect_targets;
+		AddUnique(block->successors, after_switch);
+	}
+	{
+		auto* block = graph.FindBlock(after_switch);
+		block->terminator.kind       = TerminatorKind::Branch;
+		block->terminator.true_block = continue_block;
+		block->successors            = {continue_block};
+	}
+	{
+		auto* block = graph.FindBlock(continue_block);
+		block->terminator.kind       = TerminatorKind::Branch;
+		block->terminator.true_block = loop_header;
+		block->successors            = {loop_header};
+	}
+	{
+		auto* block                  = graph.FindBlock(exit_block);
+		block->terminator.kind       = TerminatorKind::Return;
+		block->terminator.true_block = UINT32_MAX;
+		block->successors.clear();
+	}
+
+	std::vector<uint32_t> layout;
+	layout.reserve(graph.blocks.size());
+	layout.push_back(entry_init);
+	layout.push_back(loop_header);
+	layout.push_back(switch_block);
+	for (uint32_t id = 0; id < static_cast<uint32_t>(graph.blocks.size()); id++) {
+		if (id != entry_init && id != loop_header && id != switch_block && id != after_switch &&
+		    id != continue_block && id != exit_block) {
+			layout.push_back(id);
+		}
+	}
+	layout.push_back(after_switch);
+	layout.push_back(continue_block);
+	layout.push_back(exit_block);
+
+	std::vector<char> seen(graph.blocks.size(), 0);
+	for (auto id: layout) {
+		if (id >= seen.size() || seen[id]) {
+			SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+			           "CFG dispatcher layout is not a permutation of block ids");
+			return false;
+		}
+		seen[id] = 1;
+	}
+	if (layout.size() != graph.blocks.size()) {
+		SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+		           fmt::format("CFG dispatcher layout size mismatch: layout={} blocks={}",
+		                       static_cast<uint64_t>(layout.size()),
+		                       static_cast<uint64_t>(graph.blocks.size())));
+		return false;
+	}
+
+	graph.entry_block = entry_init;
+	CompactBlocksInOrder(graph, layout);
+	RebuildSuccessorsFromTerminators(graph);
+	RebuildPredecessors(graph);
+	RecomputeAnalyses(graph);
+
+	const auto growth_limit =
+	    semantic_count + std::max<uint32_t>(16u, (semantic_count * options.max_block_growth_percent) /
+	                                                 100u);
+	if (graph.blocks.size() > growth_limit) {
+		SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
+		           fmt::format("CFG dispatcher lowering exceeded growth limit: original={} "
+		                       "current={} limit={}",
+		                       semantic_count, static_cast<uint64_t>(graph.blocks.size()),
+		                       growth_limit));
+		return false;
+	}
+
+	stats.final_blocks           = static_cast<uint32_t>(graph.blocks.size());
+	stats.synthetic_blocks       = stats.final_blocks - semantic_count;
+	stats.dispatcher_cases       = semantic_count;
+	stats.cloned_semantic_blocks = 0;
+	stats.rewrites               = 1;
+	return true;
 }
 
 void ClearStructuredTerminators(Graph& graph) {
@@ -2086,8 +2750,13 @@ Graph BuildGraph(const Decoder::Program& program) {
 				AddUnique(block.successors, block.terminator.false_block);
 				break;
 			case TerminatorKind::IndirectBranch:
+			case TerminatorKind::DispatchSwitch:
 				for (const auto target: block.terminator.indirect_targets) {
 					AddUnique(block.successors, target);
+				}
+				if (block.terminator.kind == TerminatorKind::DispatchSwitch &&
+				    block.terminator.true_block != UINT32_MAX) {
+					AddUnique(block.successors, block.terminator.true_block);
 				}
 				break;
 			case TerminatorKind::Return:
@@ -2149,7 +2818,81 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 namespace {
 
-bool StructurizeImpl(Graph& graph) {
+// After merges are assigned, verify no block leaves an enclosing construct except through
+// its merge (or a break/continue of an enclosing loop). StructurizeImpl gives every
+// selection a merge block but never checks the interior edges against it, so a fall-through
+// that branches to an *outer* construct's merge is accepted here yet rejected later by
+// spirv-val ("block X exits the selection headed by Y, but not via a structured exit"),
+// producing a module the driver miscompiles into a GPU hang. Flag it so the auto strategy
+// falls back to the dispatcher structurizer for this shader.
+bool ValidateStructuredExits(Graph& graph) {
+	struct Construct {
+		uint32_t              header  = UINT32_MAX;
+		uint32_t              merge   = UINT32_MAX;
+		uint32_t              cont    = UINT32_MAX;
+		bool                  is_loop = false;
+		std::vector<uint32_t> region; // sorted; includes header, excludes merge
+	};
+
+	std::vector<Construct> constructs;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.merge_block == UINT32_MAX) {
+			continue;
+		}
+		Construct c;
+		c.header  = block.id;
+		c.merge   = block.terminator.merge_block;
+		c.is_loop = block.terminator.loop_header;
+		c.cont    = c.is_loop ? block.terminator.continue_block : UINT32_MAX;
+		c.region  = DominatedBlocks(graph, block.id, c.merge);
+		if (!c.region.empty()) {
+			constructs.push_back(std::move(c));
+		}
+	}
+
+	const auto region_has = [](const Construct& c, uint32_t id) {
+		return std::binary_search(c.region.begin(), c.region.end(), id);
+	};
+
+	for (const auto& c: constructs) {
+		for (const auto member_id: c.region) {
+			const auto* member = graph.FindBlock(member_id);
+			if (member == nullptr) {
+				continue;
+			}
+			for (const auto succ: member->successors) {
+				if (succ == c.merge || region_has(c, succ)) {
+					continue; // stays inside, or structured exit to own merge
+				}
+				if (c.is_loop && succ == c.cont) {
+					continue; // continue of this loop
+				}
+				// Leaving c is only structured as a break/continue of an enclosing loop.
+				bool structured = false;
+				for (const auto& outer: constructs) {
+					if (outer.header == c.header || !outer.is_loop) {
+						continue;
+					}
+					if ((succ == outer.merge || succ == outer.cont) &&
+					    region_has(outer, c.header)) {
+						structured = true;
+						break;
+					}
+				}
+				if (!structured) {
+					SetFailure(graph, FailureKind::StructuredControlFlow, member_id,
+					           fmt::format("block {} exits the construct headed by {} to {} "
+					                       "without a structured exit (merge {})",
+					                       member_id, c.header, succ, c.merge));
+					return false;
+				}
+			}
+		}
+	}
+	return true;
+}
+
+bool StructurizeImpl(Graph& graph, bool allow_clone = false) {
 	if (graph.unsupported || graph.irreducible) {
 		if (graph.unsupported_reason.empty()) {
 			graph.unsupported_reason = "unsupported CFG";
@@ -2160,7 +2903,7 @@ bool StructurizeImpl(Graph& graph) {
 	if (!CanonicalizeNaturalLoops(graph)) {
 		return false;
 	}
-	if (!SplitSharedMergeBlocks(graph)) {
+	if (!SplitSharedMergeBlocks(graph, allow_clone)) {
 		return false;
 	}
 	if (!IsolateSemanticLoopHeaders(graph)) {
@@ -2227,22 +2970,18 @@ bool StructurizeImpl(Graph& graph) {
 		block.terminator.merge_block = merge;
 	}
 
-	return true;
+	return ValidateStructuredExits(graph);
 }
 
-} // namespace
-
-bool Structurize(Graph& graph) {
+bool StructurizeLegacy(Graph& graph) {
 	Graph original = graph;
 	if (StructurizeImpl(graph)) {
 		return true;
 	}
 
 	Graph failed_graph      = std::move(graph);
-	graph                   = std::move(original);
+	graph                   = original;
 	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
-	// Apply one route at a time and retry. Eagerly routing every matching diamond can
-	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
 		if (!RouteSharedSelectionArm(graph, route_variable)) {
 			break;
@@ -2253,8 +2992,142 @@ bool Structurize(Graph& graph) {
 			return true;
 		}
 	}
-	graph = std::move(failed_graph);
+
+	Graph clone_retry = original;
+	if (StructurizeImpl(clone_retry, true)) {
+		graph = std::move(clone_retry);
+		return true;
+	}
+
+	LOGF("ShaderCFG clone retry failed: blocks=%" PRIu64 " loops=%" PRIu64
+	     " failure=%s block=%" PRIu32 " reason=%s (first_pass=%s)\n",
+	     static_cast<uint64_t>(clone_retry.blocks.size()),
+	     static_cast<uint64_t>(clone_retry.natural_loops.size()),
+	     FailureKindToString(clone_retry.failure_kind).c_str(), clone_retry.failure_block,
+	     clone_retry.unsupported_reason.c_str(), failed_graph.unsupported_reason.c_str());
+	graph = std::move(clone_retry);
 	return false;
+}
+
+bool IsStructuralPathology(const Graph& graph) {
+	return graph.failure_kind == FailureKind::StructuredControlFlow;
+}
+
+void FillStructurizeStats(const Graph& graph, StructurizeStats& stats, uint32_t original_blocks,
+                          std::chrono::steady_clock::time_point started) {
+	stats.final_blocks = static_cast<uint32_t>(graph.blocks.size());
+	if (stats.original_blocks == 0) {
+		stats.original_blocks = original_blocks;
+	}
+	if (stats.kind == StructurizerKind::LegacySplit && stats.final_blocks >= stats.original_blocks &&
+	    stats.synthetic_blocks == 0) {
+		stats.synthetic_blocks = stats.final_blocks - stats.original_blocks;
+	}
+	stats.success        = !graph.unsupported && graph.failure_kind == FailureKind::None;
+	stats.failure_reason = graph.unsupported_reason;
+	stats.elapsed_us     = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+	                                                            started)
+            .count());
+	if (stats.success) {
+		LOGF("[CFG-STRUCT] strategy=%s original_blocks=%u final_blocks=%u synthetic=%u "
+		     "clones=%u dispatch_cases=%u elapsed_us=%" PRIu64 " success=1\n",
+		     StructurizerKindToString(stats.kind).c_str(), stats.original_blocks,
+		     stats.final_blocks, stats.synthetic_blocks, stats.cloned_semantic_blocks,
+		     stats.dispatcher_cases, stats.elapsed_us);
+	} else {
+		LOGF("[CFG-STRUCT-FAIL] strategy=%s original_blocks=%u current_blocks=%u reason=%s "
+		     "elapsed_us=%" PRIu64 "\n",
+		     StructurizerKindToString(stats.kind).c_str(), stats.original_blocks, stats.final_blocks,
+		     stats.failure_reason.c_str(), stats.elapsed_us);
+	}
+}
+
+} // namespace
+
+std::string StructurizerKindToString(StructurizerKind kind) {
+	switch (kind) {
+		case StructurizerKind::Auto: return "auto";
+		case StructurizerKind::LegacySplit: return "legacy";
+		case StructurizerKind::DispatcherFull: return "dispatch";
+		default: return "unknown";
+	}
+}
+
+StructurizeOptions ReadStructurizeOptions() {
+	StructurizeOptions options;
+	if (const char* env = std::getenv("KYTY_SHADER_CFG_STRATEGY")) {
+		std::string value(env);
+		for (auto& ch: value) {
+			ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		}
+		if (value == "legacy") {
+			options.kind = StructurizerKind::LegacySplit;
+		} else if (value == "dispatch" || value == "dispatch-full") {
+			options.kind = StructurizerKind::DispatcherFull;
+		} else if (value == "auto") {
+			options.kind = StructurizerKind::Auto;
+		}
+	}
+	if (const char* env = std::getenv("KYTY_SHADER_CFG_DUMP")) {
+		options.dump_graph_on_failure = env[0] != '0';
+	}
+	if (const char* env = std::getenv("KYTY_SHADER_CFG_MAX_GROWTH")) {
+		char*      end    = nullptr;
+		const auto parsed = std::strtoul(env, &end, 10);
+		if (end != env) {
+			options.max_block_growth_percent = static_cast<uint32_t>(parsed);
+		}
+	}
+	return options;
+}
+
+bool StructurizeWithStrategy(Graph& graph, const StructurizeOptions& options,
+                             StructurizeStats* out_stats) {
+	const auto started         = std::chrono::steady_clock::now();
+	const auto original_blocks = static_cast<uint32_t>(graph.blocks.size());
+	Graph      original        = graph;
+
+	auto run = [&](StructurizerKind kind, StructurizeStats& stats) -> bool {
+		graph                 = original;
+		stats                 = {};
+		stats.kind            = kind;
+		stats.original_blocks = original_blocks;
+		bool success          = false;
+		switch (kind) {
+			case StructurizerKind::LegacySplit: success = StructurizeLegacy(graph); break;
+			case StructurizerKind::DispatcherFull:
+				success = RunDispatcherFull(graph, options, stats);
+				break;
+			case StructurizerKind::Auto:
+			default: success = false; break;
+		}
+		FillStructurizeStats(graph, stats, original_blocks, started);
+		return success;
+	};
+
+	StructurizeStats stats;
+	bool             success = false;
+	if (options.kind == StructurizerKind::Auto) {
+		success = run(StructurizerKind::LegacySplit, stats);
+		if (!success && IsStructuralPathology(graph)) {
+			StructurizeStats dispatch_stats;
+			success             = run(StructurizerKind::DispatcherFull, dispatch_stats);
+			dispatch_stats.kind = StructurizerKind::Auto;
+			stats               = std::move(dispatch_stats);
+		}
+	} else {
+		success = run(options.kind, stats);
+	}
+
+	if (out_stats != nullptr) {
+		*out_stats = stats;
+	}
+	return success;
+}
+
+bool Structurize(Graph& graph) {
+	return StructurizeWithStrategy(graph, ReadStructurizeOptions(), nullptr);
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
@@ -2267,6 +3140,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
 		case BranchCondition::GotoVariable: return "goto_variable";
+		case BranchCondition::DispatchDone: return "dispatch_done";
 		default: return "unknown";
 	}
 }
@@ -2309,7 +3183,7 @@ std::string GraphToString(const Graph& graph) {
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "
-		    "goto_variable={} goto_value={}\n",
+		    "goto_variable={} goto_value={} dispatch_next={}\n",
 		    static_cast<uint32_t>(block.terminator.kind),
 		    BranchConditionToString(block.terminator.condition).c_str(),
 		    block.terminator.true_block, block.terminator.false_block, block.terminator.merge_block,
@@ -2317,7 +3191,8 @@ std::string GraphToString(const Graph& graph) {
 		    block.terminator.indirect_pc_sgpr, block.terminator.indirect_selector_code,
 		    VectorToString(block.terminator.indirect_targets).c_str(),
 		    VectorToString(block.terminator.indirect_selector_values).c_str(),
-		    block.terminator.goto_variable, block.terminator.goto_value);
+		    block.terminator.goto_variable, block.terminator.goto_value,
+		    block.terminator.dispatch_next);
 	}
 
 	for (const auto& edge: graph.back_edges) {

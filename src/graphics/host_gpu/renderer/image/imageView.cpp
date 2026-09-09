@@ -4,6 +4,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <algorithm>
+#include <cstdint>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -65,6 +68,20 @@ namespace {
 				default: return false;
 			}
 		default: return false;
+	}
+}
+
+[[nodiscard]] vk::ImageAspectFlags ViewAspectMask(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eX8D24UnormPack32:
+		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
+		case vk::Format::eS8Uint: return vk::ImageAspectFlagBits::eStencil;
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		default: return vk::ImageAspectFlagBits::eColor;
 	}
 }
 
@@ -304,6 +321,260 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 	return view_class != None && (base_class & view_class) == view_class;
 }
 
+enum class TexelEncoding : uint8_t {
+	None,
+	Normalized,
+	Integer,
+	Float,
+	PackedFloat,
+	Depth,
+	Block,
+};
+
+[[nodiscard]] TexelEncoding FormatEncoding(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eE5B9G9R9UfloatPack32: return TexelEncoding::PackedFloat;
+
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR16G16B16Sfloat:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eR64Sfloat:
+		case vk::Format::eR64G64Sfloat:
+		case vk::Format::eR64G64B64Sfloat:
+		case vk::Format::eR64G64B64A64Sfloat: return TexelEncoding::Float;
+
+		case vk::Format::eR4G4UnormPack8:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8Snorm:
+		case vk::Format::eR8Srgb:
+		case vk::Format::eR8Uscaled:
+		case vk::Format::eR8Sscaled:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8G8Snorm:
+		case vk::Format::eR8G8Srgb:
+		case vk::Format::eR8G8Uscaled:
+		case vk::Format::eR8G8Sscaled:
+		case vk::Format::eR8G8B8Unorm:
+		case vk::Format::eR8G8B8Snorm:
+		case vk::Format::eR8G8B8Srgb:
+		case vk::Format::eR8G8B8Uscaled:
+		case vk::Format::eR8G8B8Sscaled:
+		case vk::Format::eB8G8R8Unorm:
+		case vk::Format::eB8G8R8Snorm:
+		case vk::Format::eB8G8R8Srgb:
+		case vk::Format::eB8G8R8Uscaled:
+		case vk::Format::eB8G8R8Sscaled:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Snorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eR8G8B8A8Uscaled:
+		case vk::Format::eR8G8B8A8Sscaled:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Snorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eB8G8R8A8Uscaled:
+		case vk::Format::eB8G8R8A8Sscaled:
+		case vk::Format::eA8B8G8R8UnormPack32:
+		case vk::Format::eA8B8G8R8SnormPack32:
+		case vk::Format::eA8B8G8R8SrgbPack32:
+		case vk::Format::eA8B8G8R8UscaledPack32:
+		case vk::Format::eA8B8G8R8SscaledPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA2R10G10B10SnormPack32:
+		case vk::Format::eA2R10G10B10UscaledPack32:
+		case vk::Format::eA2R10G10B10SscaledPack32:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2B10G10R10SnormPack32:
+		case vk::Format::eA2B10G10R10UscaledPack32:
+		case vk::Format::eA2B10G10R10SscaledPack32:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16Snorm:
+		case vk::Format::eR16Uscaled:
+		case vk::Format::eR16Sscaled:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR16G16Snorm:
+		case vk::Format::eR16G16Uscaled:
+		case vk::Format::eR16G16Sscaled:
+		case vk::Format::eR16G16B16Unorm:
+		case vk::Format::eR16G16B16Snorm:
+		case vk::Format::eR16G16B16Uscaled:
+		case vk::Format::eR16G16B16Sscaled:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16G16B16A16Snorm:
+		case vk::Format::eR16G16B16A16Uscaled:
+		case vk::Format::eR16G16B16A16Sscaled:
+		case vk::Format::eR4G4B4A4UnormPack16:
+		case vk::Format::eB4G4R4A4UnormPack16:
+		case vk::Format::eA4R4G4B4UnormPack16:
+		case vk::Format::eA4B4G4R4UnormPack16:
+		case vk::Format::eR5G6B5UnormPack16:
+		case vk::Format::eB5G6R5UnormPack16:
+		case vk::Format::eR5G5B5A1UnormPack16:
+		case vk::Format::eB5G5R5A1UnormPack16:
+		case vk::Format::eA1R5G5B5UnormPack16:
+		case vk::Format::eR10X6UnormPack16:
+		case vk::Format::eR12X4UnormPack16:
+		case vk::Format::eR10X6G10X6Unorm2Pack16:
+		case vk::Format::eR12X4G12X4Unorm2Pack16: return TexelEncoding::Normalized;
+
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8B8Uint:
+		case vk::Format::eR8G8B8Sint:
+		case vk::Format::eB8G8R8Uint:
+		case vk::Format::eB8G8R8Sint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eB8G8R8A8Uint:
+		case vk::Format::eB8G8R8A8Sint:
+		case vk::Format::eA8B8G8R8UintPack32:
+		case vk::Format::eA8B8G8R8SintPack32:
+		case vk::Format::eA2R10G10B10UintPack32:
+		case vk::Format::eA2R10G10B10SintPack32:
+		case vk::Format::eA2B10G10R10UintPack32:
+		case vk::Format::eA2B10G10R10SintPack32:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16B16Uint:
+		case vk::Format::eR16G16B16Sint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32B32Uint:
+		case vk::Format::eR32G32B32Sint:
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint:
+		case vk::Format::eR64Uint:
+		case vk::Format::eR64Sint:
+		case vk::Format::eR64G64Uint:
+		case vk::Format::eR64G64Sint:
+		case vk::Format::eR64G64B64Uint:
+		case vk::Format::eR64G64B64Sint:
+		case vk::Format::eR64G64B64A64Uint:
+		case vk::Format::eR64G64B64A64Sint: return TexelEncoding::Integer;
+
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eX8D24UnormPack32:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
+		case vk::Format::eS8Uint: return TexelEncoding::Depth;
+
+		case vk::Format::eBc1RgbUnormBlock:
+		case vk::Format::eBc1RgbSrgbBlock:
+		case vk::Format::eBc1RgbaUnormBlock:
+		case vk::Format::eBc1RgbaSrgbBlock:
+		case vk::Format::eBc2UnormBlock:
+		case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc3UnormBlock:
+		case vk::Format::eBc3SrgbBlock:
+		case vk::Format::eBc4UnormBlock:
+		case vk::Format::eBc4SnormBlock:
+		case vk::Format::eBc5UnormBlock:
+		case vk::Format::eBc5SnormBlock:
+		case vk::Format::eBc6HUfloatBlock:
+		case vk::Format::eBc6HSfloatBlock:
+		case vk::Format::eBc7UnormBlock:
+		case vk::Format::eBc7SrgbBlock: return TexelEncoding::Block;
+
+		default: return TexelEncoding::None;
+	}
+}
+
+bool ViewEncodingCompatible(vk::Format base, vk::Format view) noexcept {
+	if (base == view) {
+		return true;
+	}
+	const auto base_encoding = FormatEncoding(base);
+	const auto view_encoding = FormatEncoding(view);
+	if (base_encoding == TexelEncoding::None || view_encoding == TexelEncoding::None) {
+		return true;
+	}
+	if (base_encoding == TexelEncoding::PackedFloat ||
+	    view_encoding == TexelEncoding::PackedFloat) {
+		return base_encoding == view_encoding;
+	}
+	if ((base_encoding == TexelEncoding::Float && view_encoding == TexelEncoding::Normalized) ||
+	    (base_encoding == TexelEncoding::Normalized && view_encoding == TexelEncoding::Float)) {
+		return false;
+	}
+	return true;
+}
+
+bool ViewCompatible(const VulkanImage& image, ImageViewInfo view) noexcept {
+	if (image.image == nullptr) {
+		return false;
+	}
+	const bool is_storage = static_cast<bool>(view.usage & vk::ImageUsageFlagBits::eStorage);
+	const auto image_aspect = ViewAspectMask(image.format);
+	if (image_aspect & vk::ImageAspectFlagBits::eDepth && IsFormatDepthCompatible(view.format)) {
+		view.format = image.format;
+		view.aspect = vk::ImageAspectFlagBits::eDepth;
+	}
+	if (image_aspect & vk::ImageAspectFlagBits::eStencil && IsStencilViewFormat(view.format)) {
+		view.format = image.format;
+		view.aspect = vk::ImageAspectFlagBits::eStencil;
+	}
+	view.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	if (view.format == vk::Format::eUndefined || !FormatsCompatible(image.format, view.format)) {
+		return false;
+	}
+	const bool slice_view =
+	    image.image_type == vk::ImageType::e3D &&
+	    (view.type == vk::ImageViewType::e2D || view.type == vk::ImageViewType::e2DArray);
+	const bool levels_valid = view.level_count != 0 && view.base_level < image.mip_levels &&
+	                          view.level_count <= image.mip_levels - view.base_level;
+	const auto view_layers = slice_view && levels_valid
+	                             ? std::max(image.extent.depth >> view.base_level, 1u)
+	                             : image.layers;
+	const bool ranges_valid = levels_valid && view.layer_count != 0 &&
+	                          view.base_layer < view_layers &&
+	                          view.layer_count <= view_layers - view.base_layer;
+	const bool mapping_valid = IsComponentSwizzle(view.mapping.r) &&
+	                           IsComponentSwizzle(view.mapping.g) &&
+	                           IsComponentSwizzle(view.mapping.b) &&
+	                           IsComponentSwizzle(view.mapping.a);
+	return ranges_valid && mapping_valid && IsValidViewType(image, view) &&
+	       IsValidAspect(image, view.aspect);
+}
+
+bool CopyableTypeChange(const VulkanImage& source, const ImageInfo& destination) noexcept {
+	if (source.image == nullptr || destination.samples != source.samples ||
+	    !FormatsCompatible(source.format, destination.pixel_format)) {
+		return false;
+	}
+	const auto destination_type =
+	    destination.type == Prospero::ImageType::kColor1D   ? vk::ImageType::e1D
+	    : destination.type == Prospero::ImageType::kColor3D ? vk::ImageType::e3D
+	                                                        : vk::ImageType::e2D;
+	if (source.image_type == destination_type) {
+		return true;
+	}
+	const bool source_row = source.image_type == vk::ImageType::e2D && source.extent.height == 1 &&
+	                        source.layers == 1 && source.extent.depth == 1;
+	const bool destination_row = destination_type == vk::ImageType::e1D &&
+	                             destination.extent.height == 1 && destination.resources.layers == 1;
+	const bool source_1d = source.image_type == vk::ImageType::e1D && source.layers == 1;
+	const bool destination_2d_row = destination_type == vk::ImageType::e2D &&
+	                                destination.extent.height == 1 &&
+	                                destination.resources.layers == 1;
+	return (source_row && destination_row) || (source_1d && destination_2d_row);
+}
+
 } // namespace ImageViewOps
 
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
@@ -341,14 +612,14 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
-		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		EXIT("invalid image view: image_format=%d view_format=%d image_type=%d type=%d aspect=0x%x "
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u extent=%ux%ux%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
-		     static_cast<int>(normalized.type),
+		     static_cast<int>(image.image_type), static_cast<int>(normalized.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		     image.layers, image.extent.width, image.extent.height, image.extent.depth);
 	}
 
 	for (const auto& cached: views) {

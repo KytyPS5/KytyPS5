@@ -13,6 +13,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -133,6 +134,20 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 }
 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	{
+		static std::atomic<uint32_t> calls {0};
+		uint64_t                     total = 0;
+		for (const auto& c: copies) {
+			total += c.size;
+		}
+		const auto n = calls.fetch_add(1, std::memory_order_relaxed);
+		if (n < 64 || (n % 64) == 0) {
+			LOGF("BufferDownload #%u: copies=%zu bytes=%" PRIu64 " first_addr=0x%016" PRIx64
+			     " size=%" PRIu64 "\n",
+			     n, copies.size(), total, copies.empty() ? 0 : copies.front().address,
+			     copies.empty() ? 0 : copies.front().size);
+		}
+	}
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
 	uint64_t                  packed_size = 0;
@@ -151,7 +166,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		}
 		download.Commit();
 		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
+		m_scheduler.Finish("buffer-download");
 		m_scheduler.WaitPriorityOperations(completion_tick);
 		cursor = 0;
 		for (const auto& copy: batch) {
@@ -187,6 +202,86 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 	for (const auto& copy: copies) {
 		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+	}
+}
+
+void BufferCache::AppendSmallDirtyDownloads(std::vector<DownloadCopy>& copies) {
+	// Frostbite touches dozens of tiny GPU-written counters per frame. Fold every
+	// remaining small dirty range into this drain. Tracker GPU-dirty bits are
+	// 4 KiB pages: unmarking a 4-byte copy would clear the whole page and leave
+	// sibling GPU intervals orphaned, so expand onto those pages and download
+	// every dirty interval that lives on them.
+	constexpr uint64_t kMaxBytes = 64 * 1024;
+	constexpr uint64_t kBudget   = 4 * 1024 * 1024;
+	constexpr uint64_t kPage       = TRACKER_PAGE_SIZE;
+
+	RangeSet queued;
+	for (const auto& copy: copies) {
+		if (copy.size != 0) {
+			queued.Add(copy.address, copy.size);
+		}
+	}
+
+	uint64_t extra = 0;
+	const auto add_interval = [&](uint64_t begin, uint64_t size) {
+		if (size == 0 || extra >= kBudget || queued.Contains(begin, size)) {
+			return;
+		}
+		const auto* owner = m_page_table.Find(begin >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			return;
+		}
+		auto* buffer = m_slot_buffers.try_get(*owner);
+		if (buffer == nullptr || buffer->is_deleted) {
+			return;
+		}
+		const auto clip_begin = std::max(begin, buffer->CpuAddress());
+		const auto clip_end   = std::min(begin + size, buffer->CpuAddress() + buffer->Size());
+		if (clip_begin >= clip_end) {
+			return;
+		}
+		const auto clip_size = clip_end - clip_begin;
+		if (queued.Contains(clip_begin, clip_size) || extra + clip_size > kBudget) {
+			return;
+		}
+		copies.push_back({buffer, buffer->Offset(clip_begin), clip_begin, clip_size});
+		queued.Add(clip_begin, clip_size);
+		extra += clip_size;
+	};
+
+	std::vector<std::pair<uint64_t, uint64_t>> seeds;
+	m_gpu_modified_ranges.ForEach([&](uint64_t begin, uint64_t end) {
+		if (end <= begin) {
+			return;
+		}
+		const auto size = end - begin;
+		if (size > kMaxBytes || queued.Contains(begin, size)) {
+			return;
+		}
+		seeds.emplace_back(begin, end);
+	});
+	for (const auto [begin, end]: seeds) {
+		if (extra >= kBudget) {
+			break;
+		}
+		add_interval(begin, end - begin);
+	}
+
+	// Fold every remaining GPU interval on pages we already plan to download so
+	// those pages can be unmarked without orphaning siblings.
+	const size_t expand_until = copies.size();
+	for (size_t i = 0; i < expand_until && extra < kBudget; ++i) {
+		const auto begin = copies[i].address;
+		const auto end   = copies[i].address + copies[i].size;
+		if (end <= begin) {
+			continue;
+		}
+		const auto page_begin = begin & ~(kPage - 1);
+		const auto page_end   = (end + kPage - 1) & ~(kPage - 1);
+		m_gpu_modified_ranges.ForEachIntersection(
+		    page_begin, page_end - page_begin, [&](RangeSet::Range range) {
+			    add_interval(range.address, range.size);
+		    });
 	}
 }
 
@@ -262,7 +357,8 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-	// Widen nearby CPU reads so they share one GPU drain.
+	// Widen nearby CPU reads so they share one GPU drain, then fold other small
+	// dirty ranges into the same Finish so later faults in this frame are free.
 	constexpr uint64_t WindowSize   = 512 * 1024;
 	const auto         buffer_begin = buffer.CpuAddress();
 	const auto         buffer_end   = buffer_begin + buffer.Size();
@@ -283,9 +379,29 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		    }
 	    });
 	if (!copies.empty()) {
+		AppendSmallDirtyDownloads(copies);
 		DownloadBufferMemory(copies);
-		// The enumeration covered whole dirty pages and every exact interval on them.
-		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		// Tracker bits are 4 KiB pages. Release a page only when no GPU-dirty
+		// bytes remain on it: a 4-byte unmark would clear siblings and trip GC,
+		// and a copy that straddles the 512 KiB window must still release the
+		// pages it fully drained.
+		const auto unmark_clean_pages = [this](uint64_t begin, uint64_t end) {
+			if (end <= begin) {
+				return;
+			}
+			const auto page_begin = begin & ~(TRACKER_PAGE_SIZE - 1);
+			const auto page_end =
+			    (end + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			for (auto page = page_begin; page < page_end; page += TRACKER_PAGE_SIZE) {
+				if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+				}
+			}
+		};
+		unmark_clean_pages(window_begin, window_end);
+		for (const auto& copy: copies) {
+			unmark_clean_pages(copy.address, copy.address + copy.size);
+		}
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -635,24 +751,19 @@ void BufferCache::RunGarbageCollector() {
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
-		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
+		const bool tracker_dirty =
+		    m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
+		const bool range_dirty =
+		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size());
+		if ((tracker_dirty || range_dirty) && !aggressive) {
 			return false;
 		}
-		if (dirty) {
-			m_memory_tracker.ForEachDownloadRange<false>(
-			    buffer.CpuAddress(), buffer.Size(),
-			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-				    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, dirty_address,
-				                                           dirty_size, "garbage collection");
-			    },
-			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-				    m_gpu_modified_ranges.ForEachIntersection(
-				        dirty_address, dirty_size, [&](RangeSet::Range range) {
-					    copies.push_back({&buffer, range.address - buffer.CpuAddress(),
-					                      range.address, range.size});
-				        });
-				});
+		if (tracker_dirty || range_dirty) {
+			m_gpu_modified_ranges.ForEachIntersection(
+			    buffer.CpuAddress(), buffer.Size(), [&](RangeSet::Range range) {
+				    copies.push_back({&buffer, range.address - buffer.CpuAddress(), range.address,
+				                      range.size});
+			    });
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
@@ -664,8 +775,9 @@ void BufferCache::RunGarbageCollector() {
 		return;
 	}
 
-	EXIT_IF(copies.empty());
-	DownloadBufferMemory(copies);
+	if (!copies.empty()) {
+		DownloadBufferMemory(copies);
+	}
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());

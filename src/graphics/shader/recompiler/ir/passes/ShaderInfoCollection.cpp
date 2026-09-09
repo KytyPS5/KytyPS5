@@ -1,9 +1,12 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -87,10 +90,31 @@ void ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					         static_cast<uint32_t>(options.vertex->resources_num))) {
 						return Fail("vertex input reference is out of range");
 					}
+					if (program.stage == ShaderType::Pixel && inst.Arg(1).U32() < 4u &&
+					    inst.Arg(0).U32() >= options.pixel->input_num &&
+					    inst.Arg(0).U32() < std::size(options.pixel->interpolator_settings)) {
+						// DIAGNOSTIC (not a real fix): some UFC 5 pixel shaders reference a
+						// parameter slot past SPI_PS_IN_CONTROL.NUM_INTERP. Aborting here kills
+						// the frame; allow it instead (EmitAttribute yields 0 for an unbound
+						// slot) and log the mismatch a bounded number of times.
+						static std::atomic<uint32_t> logged {0};
+						if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+							LOGF("ShaderInfoCollection: PS param past NUM_INTERP (diagnostic, "
+							     "allowing): hash=0x%016" PRIx64 " attr=%u component=%u "
+							     "input_num=%u\n",
+							     program.shader_hash, inst.Arg(0).U32(), inst.Arg(1).U32(),
+							     options.pixel->input_num);
+						}
+						break;
+					}
 					if (program.stage == ShaderType::Pixel &&
 					    (inst.Arg(1).U32() >= 4u ||
 					     inst.Arg(0).U32() >= options.pixel->input_num)) {
-						return Fail("pixel input reference is out of range");
+						return Fail(fmt::format(
+						    "pixel input reference is out of range hash=0x{:016x} attr={} "
+						    "component={} input_num={}",
+						    program.shader_hash, inst.Arg(0).U32(), inst.Arg(1).U32(),
+						    options.pixel->input_num));
 					}
 					break;
 				}
@@ -101,9 +125,27 @@ void ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					    inst.Arg(2).GetType() != Type::U32) {
 						return Fail("interpolation parameter reference is invalid");
 					}
+					if (inst.Arg(1).U32() < 4u && inst.Arg(2).U32() < 3u &&
+					    inst.Arg(0).U32() >= options.pixel->input_num &&
+					    inst.Arg(0).U32() < std::size(options.pixel->interpolator_settings)) {
+						// DIAGNOSTIC (not a real fix): mirror of the GetAttribute case above.
+						static std::atomic<uint32_t> logged {0};
+						if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+							LOGF("ShaderInfoCollection: PS interp past NUM_INTERP (diagnostic, "
+							     "allowing): hash=0x%016" PRIx64 " input=%u component=%u mode=%u "
+							     "input_num=%u\n",
+							     program.shader_hash, inst.Arg(0).U32(), inst.Arg(1).U32(),
+							     inst.Arg(2).U32(), options.pixel->input_num);
+						}
+						break;
+					}
 					if (inst.Arg(0).U32() >= options.pixel->input_num || inst.Arg(1).U32() >= 4u ||
 					    inst.Arg(2).U32() >= 3u) {
-						return Fail("interpolation parameter reference is out of range");
+						return Fail(fmt::format(
+						    "interpolation parameter reference is out of range hash=0x{:016x} "
+						    "input={} component={} mode={} input_num={}",
+						    program.shader_hash, inst.Arg(0).U32(), inst.Arg(1).U32(),
+						    inst.Arg(2).U32(), options.pixel->input_num));
 					}
 					break;
 				}

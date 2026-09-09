@@ -63,6 +63,7 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	void BlitColor(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);

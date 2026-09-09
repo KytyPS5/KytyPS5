@@ -28,7 +28,7 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
-	void           Finish();
+	void           Finish(const char* reason = "other");
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -38,6 +38,7 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	void                      SyncDeferredOperations();
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;

@@ -595,6 +595,24 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 }
 
 IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
+	// A compile-time-constant mask resolves the same for every lane. An all-ones mask
+	// (e.g. `s_mov_b64 exec, -1` restoring full occupancy after a v_cmpx region) is
+	// active for all lanes: folding it to immediate true lets the Select(exec, new, old)
+	// predication on downstream writes collapse via constant propagation instead of
+	// leaving an OpSelect plus a dead old-value load per masked write. An all-zero mask
+	// is inactive for all lanes.
+	const bool lo_imm = mask[0].IsImmediate();
+	const bool hi_imm = current_wave_size != 64u || mask[1].IsImmediate();
+	if (lo_imm && hi_imm) {
+		const uint32_t lo = mask[0].U32();
+		const uint32_t hi = current_wave_size == 64u ? mask[1].U32() : 0xFFFFFFFFu;
+		if (lo == 0xFFFFFFFFu && hi == 0xFFFFFFFFu) {
+			return IR::U1(IR::Value(true));
+		}
+		if (lo == 0u && (current_wave_size != 64u || hi == 0u)) {
+			return IR::U1(IR::Value(false));
+		}
+	}
 	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto word = current_wave_size == 64u
 	                      ? ir.Select(ir.ULessThan(lane, IR::U32(IR::Value(32u))), mask[0], mask[1])
@@ -729,12 +747,20 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 }
 
 void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info) {
+	if (source.terminator.dispatch_next != UINT32_MAX) {
+		ir.SetDispatchState(IR::U32(IR::Value(source.terminator.dispatch_next)));
+	}
 	if (source.terminator.goto_value >= 0) {
 		if (source.terminator.goto_variable == UINT32_MAX) {
 			EXIT("block %u sets an invalid goto variable", source.id);
 		}
 		ir.SetGotoVariable(source.terminator.goto_variable,
 		                   IR::U1(IR::Value(source.terminator.goto_value != 0)));
+	}
+	if (source.terminator.kind == CFG::TerminatorKind::DispatchSwitch) {
+		info.indirect_target = ir.GetDispatchState();
+		ir.Emit(IR::ValueOpcode::ReferenceU32, {info.indirect_target});
+		return;
 	}
 	if (source.terminator.kind == CFG::TerminatorKind::IndirectBranch) {
 		if (source.terminator.indirect_selector_code != UINT32_MAX) {
@@ -767,6 +793,10 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 				EXIT("block %u reads an invalid goto variable", source.id);
 			}
 			condition = ir.GetGotoVariable(source.terminator.goto_variable);
+			break;
+		case CFG::BranchCondition::DispatchDone:
+			condition = ir.IEqual(ir.GetDispatchState(),
+			                      IR::U32(IR::Value(CFG::kDispatchHaltState)));
 			break;
 		case CFG::BranchCondition::Unknown:
 			EXIT("block %u has an unknown branch condition", source.id);
@@ -971,11 +1001,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	CFG::Terminator terminator;
 	terminator.kind       = CFG::TerminatorKind::Branch;
-	terminator.true_block = cfg.blocks.front().id;
+	terminator.true_block = cfg.entry_block;
 	result.block_storage.push_back(std::make_unique<IR::Block>());
 	result.blocks.push_back(result.block_storage.back().get());
-	result.block_info.push_back({max_id + 1u, cfg.blocks.front().start_pc,
-	                             cfg.blocks.front().start_pc, std::move(terminator)});
+	const auto* entry_cfg = cfg.FindBlock(cfg.entry_block);
+	result.block_info.push_back(
+	    {max_id + 1u, entry_cfg != nullptr ? entry_cfg->start_pc : 0u,
+	     entry_cfg != nullptr ? entry_cfg->start_pc : 0u, std::move(terminator)});
 
 	std::unordered_map<uint32_t, size_t> block_indices;
 	block_indices.reserve(cfg.blocks.size());
@@ -999,7 +1031,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 	}
 	{
-		result.blocks.front()->AddBranch(result.blocks.at(block_indices.at(cfg.blocks.front().id)));
+		result.blocks.front()->AddBranch(result.blocks.at(block_indices.at(cfg.entry_block)));
 		IR::IREmitter entry_ir(result.blocks.front());
 		const auto    builtin = [&](IR::StageInputKind kind, uint32_t component = 0u) {
 			return IR::U32(

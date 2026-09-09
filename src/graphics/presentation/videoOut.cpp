@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <list>
 #include <thread>
 #include <vector>
@@ -1519,17 +1520,20 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 
 	DriverState().GetFlipQueue().GetFlipStatus(*ctx, *status);
 
-	LOGF("\t count = %" PRIu64 "\n"
-	     "\t processTime = %" PRIu64 "\n"
-	     "\t processTimeCounter = %" PRIu64 "\n"
-	     "\t submitProcessTimeCounter = %" PRIu64 "\n"
-	     "\t flipArg = %" PRId64 "\n"
-	     "\t gcQueueNum = %d\n"
-	     "\t flipPendingNum = %d\n"
-	     "\t currentBuffer = %d\n",
-	     status->count, status->processTime, status->processTimeCounter,
-	     status->submitProcessTimeCounter, status->flipArg, status->gcQueueNum,
-	     status->flipPendingNum, status->currentBuffer);
+	static std::atomic<uint32_t> flip_status_logs = 0;
+	if (flip_status_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("\t count = %" PRIu64 "\n"
+		     "\t processTime = %" PRIu64 "\n"
+		     "\t processTimeCounter = %" PRIu64 "\n"
+		     "\t submitProcessTimeCounter = %" PRIu64 "\n"
+		     "\t flipArg = %" PRId64 "\n"
+		     "\t gcQueueNum = %d\n"
+		     "\t flipPendingNum = %d\n"
+		     "\t currentBuffer = %d\n",
+		     status->count, status->processTime, status->processTimeCounter,
+		     status->submitProcessTimeCounter, status->flipArg, status->gcQueueNum,
+		     status->flipPendingNum, status->currentBuffer);
+	}
 
 	return OK;
 }
@@ -1545,7 +1549,10 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 	VideoOutFlipStatus status {};
 	DriverState().GetFlipQueue().GetFlipStatus(*ctx, status);
 
-	LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
+	static std::atomic<uint32_t> pending_logs = 0;
+	if (pending_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
+	}
 
 	return status.flipPendingNum;
 }
@@ -1566,10 +1573,13 @@ KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* stat
 	*status = ctx->vblank_status;
 	ctx->mutex.Unlock();
 
-	LOGF("\t count = %" PRIu64 "\n"
-	     "\t processTime = %" PRIu64 "\n"
-	     "\t processTimeCounter = %" PRIu64 "\n",
-	     status->count, status->processTime, status->processTimeCounter);
+	static std::atomic<uint32_t> vblank_status_logs = 0;
+	if (vblank_status_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("\t count = %" PRIu64 "\n"
+		     "\t processTime = %" PRIu64 "\n"
+		     "\t processTimeCounter = %" PRIu64 "\n",
+		     status->count, status->processTime, status->processTimeCounter);
+	}
 
 	return OK;
 }

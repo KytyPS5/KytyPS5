@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1013,6 +1014,44 @@ void hw_print(const CommandBuffer& buffer) {
 		EqaaPrint("EqaaControl:", eqaa);
 		AaPrint("AaSampleControl:", aa, ac);
 	}
+}
+
+namespace {
+
+constexpr size_t kFrameWorkKindCount = 5;
+
+std::atomic<uint32_t> g_frame_work_count[kFrameWorkKindCount] {};
+std::atomic<uint64_t> g_frame_work_us[kFrameWorkKindCount] {};
+
+} // namespace
+
+FrameWorkScope::FrameWorkScope(FrameWorkKind kind)
+    : kind_(kind), start_(Common::Timer::QueryPerformanceCounter()) {}
+
+FrameWorkScope::~FrameWorkScope() {
+	const auto now  = Common::Timer::QueryPerformanceCounter();
+	const auto freq = Common::Timer::QueryPerformanceFrequency();
+	const auto us   = freq == 0 ? 0 : (now - start_) * 1000000ull / freq;
+	const auto index = static_cast<size_t>(kind_);
+	g_frame_work_count[index].fetch_add(1, std::memory_order_relaxed);
+	g_frame_work_us[index].fetch_add(us, std::memory_order_relaxed);
+}
+
+FrameWorkPulse ConsumeFrameWorkPulse() {
+	FrameWorkPulse pulse;
+	const auto take = [](FrameWorkKind kind, uint32_t& count, double& ms) {
+		const auto index = static_cast<size_t>(kind);
+		count = g_frame_work_count[index].exchange(0, std::memory_order_relaxed);
+		ms    = static_cast<double>(
+                 g_frame_work_us[index].exchange(0, std::memory_order_relaxed)) /
+		     1000.0;
+	};
+	take(FrameWorkKind::Draw, pulse.draws, pulse.draw_ms);
+	take(FrameWorkKind::Dispatch, pulse.dispatches, pulse.dispatch_ms);
+	take(FrameWorkKind::Submit, pulse.submits, pulse.submit_ms);
+	take(FrameWorkKind::Finish, pulse.finishes, pulse.finish_ms);
+	take(FrameWorkKind::Present, pulse.presents, pulse.present_ms);
+	return pulse;
 }
 
 } // namespace Libs::Graphics

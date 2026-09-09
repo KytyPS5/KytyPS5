@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -35,6 +36,36 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+namespace {
+
+std::atomic<uint32_t> g_shader_compile_count {0};
+std::atomic<uint64_t> g_shader_compile_us {0};
+std::atomic<uint32_t> g_pipeline_create_count {0};
+std::atomic<uint64_t> g_pipeline_create_us {0};
+
+uint64_t NoteCompileTime(std::atomic<uint32_t>& count, std::atomic<uint64_t>& total_us,
+                         uint64_t start) {
+	const auto now  = Common::Timer::QueryPerformanceCounter();
+	const auto freq = Common::Timer::QueryPerformanceFrequency();
+	const auto us   = freq == 0 ? 0 : (now - start) * 1000000ull / freq;
+	count.fetch_add(1, std::memory_order_relaxed);
+	total_us.fetch_add(us, std::memory_order_relaxed);
+	return us;
+}
+
+} // namespace
+
+ShaderCompilePulse ConsumeShaderCompilePulse() {
+	ShaderCompilePulse pulse;
+	pulse.shader_count   = g_shader_compile_count.exchange(0, std::memory_order_relaxed);
+	pulse.pipeline_count = g_pipeline_create_count.exchange(0, std::memory_order_relaxed);
+	pulse.shader_ms =
+	    static_cast<double>(g_shader_compile_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+	pulse.pipeline_ms =
+	    static_cast<double>(g_pipeline_create_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+	return pulse;
+}
 
 namespace {
 
@@ -100,6 +131,12 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
+
+bool ReadShaderGuestMemoryBlock(void*, uint64_t address, uint32_t* words, uint32_t word_count) {
+	return words != nullptr && word_count != 0 &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+	           address, words, uint64_t {word_count} * sizeof(uint32_t));
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -268,7 +305,10 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id     = ++next_shader_id,
+		                       .module = module,
+		                       .hash   = params.hash,
+		                       .addr   = params.Base()},
 		};
 	}
 
@@ -297,6 +337,7 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_specialization_block  = ReadShaderGuestMemoryBlock,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -353,6 +394,7 @@ struct PipelineCache::ProgramCache {
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
 		}
+		const auto compile_start = Common::Timer::QueryPerformanceCounter();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
@@ -362,6 +404,8 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		const auto compile_us = NoteCompileTime(g_shader_compile_count, g_shader_compile_us,
+		                                        compile_start);
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -370,12 +414,23 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
+		const char* stage_tag = "??";
+		switch (stage) {
+			case ShaderType::Vertex: stage_tag = "VS"; break;
+			case ShaderType::Mesh: stage_tag = "GS"; break;
+			case ShaderType::Pixel: stage_tag = "PS"; break;
+			case ShaderType::Compute: stage_tag = "CS"; break;
+			default: break;
+		}
 		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)]);
+		PipelineCacheLog(
+		    "ShaderCompile: {} id={} hash=0x{:016x} addr=0x{:016x} words={} ms={:.1f} | "
+		    "VS {} | PS {} | CS {} | GS {}",
+		    stage_tag, permutation.handle.id, params.hash, params.Base(), params.code.size(),
+		    compile_us / 1000.0, counts[static_cast<size_t>(ShaderType::Vertex)],
+		    counts[static_cast<size_t>(ShaderType::Pixel)],
+		    counts[static_cast<size_t>(ShaderType::Compute)],
+		    counts[static_cast<size_t>(ShaderType::Mesh)]);
 		return permutation.handle;
 	}
 
@@ -433,10 +488,6 @@ void PipelineCache::InitializeDriverCache() {
 	const std::string_view git_revision = KYTY_GIT_REVISION;
 	if (git_hash == "unknown" || git_revision == "unknown") {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
 
@@ -787,10 +838,24 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto pipeline_start = Common::Timer::QueryPerformanceCounter();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
 	                       vertex_program, ps_input_info, pixel_program, static_params,
 	                       m_driver_cache);
+	const auto pipeline_us =
+	    NoteCompileTime(g_pipeline_create_count, g_pipeline_create_us, pipeline_start);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	const auto vs_hash = vs_input_info.stage.program != nullptr
+	                         ? vs_input_info.stage.program->shader_hash
+	                         : vertex_program.hash;
+	const auto ps_hash = ps_active && ps_input_info->stage.program != nullptr
+	                         ? ps_input_info->stage.program->shader_hash
+	                         : pixel_program.hash;
+	PipelineCacheLog(
+	    "GfxPipeline: vs_id={} ps_id={} vs_hash=0x{:016x} vs_addr=0x{:016x} "
+	    "ps_hash=0x{:016x} ps_addr=0x{:016x} colors={} samples={} ms={:.1f}",
+	    vs_id, ps_id, vs_hash, vertex_program.addr, ps_hash, pixel_program.addr, color_count,
+	    attachment_samples, pipeline_us / 1000.0);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -820,7 +885,14 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	const auto pipeline_start = Common::Timer::QueryPerformanceCounter();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	const auto pipeline_us =
+	    NoteCompileTime(g_pipeline_create_count, g_pipeline_create_us, pipeline_start);
+	const auto cs_hash = input_info.stage.program != nullptr ? input_info.stage.program->shader_hash
+	                                                         : compute_program.hash;
+	PipelineCacheLog("CsPipeline: id={} hash=0x{:016x} addr=0x{:016x} ms={:.1f}",
+	                 compute_program.id, cs_hash, compute_program.addr, pipeline_us / 1000.0);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

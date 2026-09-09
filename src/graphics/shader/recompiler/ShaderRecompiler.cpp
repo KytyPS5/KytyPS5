@@ -1,7 +1,11 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
+#include "common/magicEnum.h"
+#include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -19,11 +23,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <map>
 #include <span>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -69,6 +79,330 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), reason.c_str());
+}
+
+void DumpFailedStructurizeShader(const CompileOptions& options, std::span<const uint32_t> code,
+                                 const CFG::Graph& cfg) {
+	// Tiny unit-test fixtures are not useful captures. The UFC pixel shaders are thousands of
+	// words; keep those so the CFG can be replayed without running the match.
+	constexpr uint64_t kMinDumpWords = 2048;
+	if (code.size() < kMinDumpWords) {
+		return;
+	}
+
+	const auto dir  = Config::GetShaderLogFolder() / "cfg_fail";
+	Common::File::CreateDirectories(dir);
+	auto bin_path = dir / fmt::format("{}_{:016x}.bin", StageName(options.stage), options.shader_hash);
+	auto txt_path = dir / fmt::format("{}_{:016x}.cfg.txt", StageName(options.stage),
+	                                  options.shader_hash);
+
+	{
+		Common::File file(bin_path);
+		if (file.IsInvalid()) {
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create CFG-fail dump: %s\n",
+			           Common::PathToString(bin_path).c_str());
+		} else {
+			file.Write(code.data(), static_cast<uint32_t>(code.size_bytes()));
+			LOGF("%s CFG fail dump: %s words=%" PRIu64 "\n", GetDumpLabel(options),
+			     Common::PathToString(bin_path).c_str(), static_cast<uint64_t>(code.size()));
+		}
+	}
+	{
+		const auto text = fmt::format("stage={} hash=0x{:016x} words={} blocks={} loops={}\n"
+		                              "reason={}\n\n{}",
+		                              StageName(options.stage), options.shader_hash, code.size(),
+		                              cfg.blocks.size(), cfg.natural_loops.size(),
+		                              cfg.unsupported_reason, CFG::GraphToString(cfg));
+		Common::File file(txt_path);
+		if (!file.IsInvalid()) {
+			file.Write(text.data(), static_cast<uint32_t>(text.size()));
+		}
+	}
+}
+
+constexpr uint64_t kUfcHangCsHash = 0xea0aceac518ec52dull;
+
+bool EmbeddedFetchHasBranch(Decoder::Opcode opcode);
+
+bool ParseHexU64(const char* text, uint64_t* out) {
+	if (text == nullptr || out == nullptr) {
+		return false;
+	}
+	while (*text == ' ' || *text == '\t') {
+		++text;
+	}
+	if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+		text += 2;
+	}
+	if (*text == '\0') {
+		return false;
+	}
+	errno                            = 0;
+	char*                    end     = nullptr;
+	const unsigned long long value   = std::strtoull(text, &end, 16);
+	if (end == text || errno == ERANGE) {
+		return false;
+	}
+	*out = static_cast<uint64_t>(value);
+	return true;
+}
+
+bool EnvListContainsHash(const char* env_name, uint64_t hash) {
+	const char* env = std::getenv(env_name);
+	if (env == nullptr || env[0] == '\0') {
+		return false;
+	}
+	const char* cursor = env;
+	while (*cursor != '\0') {
+		while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
+			++cursor;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		const char* start = cursor;
+		while (*cursor != '\0' && *cursor != ',') {
+			++cursor;
+		}
+		std::string token(start, static_cast<size_t>(cursor - start));
+		while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
+			token.pop_back();
+		}
+		uint64_t parsed = 0;
+		if (ParseHexU64(token.c_str(), &parsed) && parsed == hash) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool ShouldDumpShader(const CompileOptions& options) {
+	return options.shader_hash == kUfcHangCsHash ||
+	       EnvListContainsHash("KYTY_DUMP_SHADER_HASH", options.shader_hash);
+}
+
+std::filesystem::path ShaderHangDumpDir() {
+	if (const char* env = std::getenv("KYTY_SHADER_DUMP_DIR"); env != nullptr && env[0] != '\0') {
+		return env;
+	}
+	return Config::GetShaderLogFolder() / "hang_cs";
+}
+
+void WriteDumpBytes(const std::filesystem::path& path, const void* data, size_t size) {
+	Common::File::CreateDirectories(path.parent_path());
+	Common::File file(path);
+	if (file.IsInvalid()) {
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create shader dump: %s\n",
+		           Common::PathToString(path).c_str());
+		return;
+	}
+	if (size != 0) {
+		file.Write(data, static_cast<uint32_t>(size));
+	}
+	LOGF("shader dump: %s bytes=%" PRIu64 "\n", Common::PathToString(path).c_str(),
+	     static_cast<uint64_t>(size));
+}
+
+void WriteDumpText(const std::filesystem::path& path, std::string_view text) {
+	WriteDumpBytes(path, text.data(), text.size());
+}
+
+std::filesystem::path SuspectDumpBase(const CompileOptions& options) {
+	return ShaderHangDumpDir() /
+	       fmt::format("{}_{:016x}", StageName(options.stage), options.shader_hash);
+}
+
+void LogDecodedOpcodeSummary(const CompileOptions& options, const Decoder::Program& decoded) {
+	std::array<uint32_t, static_cast<size_t>(Decoder::Family::EXP) + 1u> family {};
+	std::map<Decoder::Opcode, uint32_t>                                  opcodes;
+	uint32_t ds = 0;
+	uint32_t ds_gds = 0;
+	uint32_t ds_inc = 0;
+	uint32_t ds_atomic_rtn = 0;
+	uint32_t branches = 0;
+	uint32_t barriers = 0;
+	uint32_t waitcnt = 0;
+	uint32_t buffer_atomic = 0;
+	uint32_t image_atomic = 0;
+	uint32_t unsupported = 0;
+	for (const auto& inst: decoded.instructions) {
+		const auto family_index = static_cast<size_t>(inst.family);
+		if (family_index < family.size()) {
+			family[family_index]++;
+		}
+		opcodes[inst.opcode]++;
+		if (inst.family == Decoder::Family::DS) {
+			++ds;
+			if (inst.gds) {
+				++ds_gds;
+			}
+			switch (inst.opcode) {
+				case Decoder::Opcode::DS_INC_U32:
+				case Decoder::Opcode::DS_INC_RTN_U32:
+				case Decoder::Opcode::DS_DEC_U32:
+				case Decoder::Opcode::DS_DEC_RTN_U32:
+				case Decoder::Opcode::DS_RSUB_U32:
+				case Decoder::Opcode::DS_RSUB_RTN_U32: ++ds_inc; break;
+				default: break;
+			}
+			switch (inst.opcode) {
+				case Decoder::Opcode::DS_ADD_RTN_U32:
+				case Decoder::Opcode::DS_SUB_RTN_U32:
+				case Decoder::Opcode::DS_RSUB_RTN_U32:
+				case Decoder::Opcode::DS_INC_RTN_U32:
+				case Decoder::Opcode::DS_DEC_RTN_U32: ++ds_atomic_rtn; break;
+				default: break;
+			}
+		}
+		if (EmbeddedFetchHasBranch(inst.opcode)) {
+			++branches;
+		}
+		if (inst.opcode == Decoder::Opcode::S_BARRIER) {
+			++barriers;
+		}
+		if (inst.opcode == Decoder::Opcode::S_WAITCNT ||
+		    inst.opcode == Decoder::Opcode::S_WAITCNT_DEPCTR) {
+			++waitcnt;
+		}
+		if (inst.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
+		    inst.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX) {
+			++buffer_atomic;
+		}
+		switch (inst.opcode) {
+			case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
+			case Decoder::Opcode::IMAGE_ATOMIC_ADD:
+			case Decoder::Opcode::IMAGE_ATOMIC_UMIN:
+			case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
+			case Decoder::Opcode::IMAGE_ATOMIC_AND:
+			case Decoder::Opcode::IMAGE_ATOMIC_OR:
+			case Decoder::Opcode::IMAGE_ATOMIC_XOR: ++image_atomic; break;
+			case Decoder::Opcode::UNSUPPORTED: ++unsupported; break;
+			default: break;
+		}
+	}
+	LOGF("%s dump summary: stage=%s hash=0x%016" PRIx64
+	     " insts=%" PRIu64 " ds=%u gds=%u wrap_inc_dec_rsub=%u ds_rtn=%u "
+	     "branches=%u barriers=%u waitcnt=%u buffer_atomic=%u image_atomic=%u unsupported=%u "
+	     "wave=%u scratch=%u\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(decoded.instructions.size()), ds, ds_gds, ds_inc, ds_atomic_rtn,
+	     branches, barriers, waitcnt, buffer_atomic, image_atomic, unsupported, options.wave_size,
+	     options.scratch_dwords);
+	if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr) {
+		const auto& cs = *options.input_info.compute;
+		LOGF("%s compute input: local=%ux%ux%u wave=%u lds_dwords=%u tg_size_en=%s "
+		     "workgroup_sgpr=%d\n",
+		     GetDumpLabel(options), cs.threads_num[0], cs.threads_num[1], cs.threads_num[2],
+		     cs.wave_size, cs.lds_size_dwords, cs.tg_size_en ? "true" : "false",
+		     cs.workgroup_register);
+	}
+	for (size_t i = 0; i < family.size(); ++i) {
+		if (family[i] == 0) {
+			continue;
+		}
+		LOGF("%s family %s: %u\n", GetDumpLabel(options),
+		     std::string(magic_enum::enum_name(static_cast<Decoder::Family>(i))).c_str(),
+		     family[i]);
+	}
+	for (const auto& [opcode, count]: opcodes) {
+		if (count == 0) {
+			continue;
+		}
+		const auto name = magic_enum::enum_name(opcode);
+		if (count < 4 && !(opcode >= Decoder::Opcode::DS_ADD_U32 &&
+		                    opcode <= Decoder::Opcode::DS_WRXCHG_RTN_B32) &&
+		    opcode != Decoder::Opcode::S_BARRIER) {
+			continue;
+		}
+		LOGF("%s opcode %s: %u\n", GetDumpLabel(options), std::string(name).c_str(), count);
+	}
+}
+
+std::filesystem::path WithDumpSuffix(std::filesystem::path base, const char* suffix) {
+	base += suffix;
+	return base;
+}
+
+void DumpSuspectDecoded(const CompileOptions& options, std::span<const uint32_t> code,
+                        const Decoder::Program& decoded, std::string_view decoded_dump) {
+	const auto base = SuspectDumpBase(options);
+	WriteDumpBytes(WithDumpSuffix(base, ".bin"), code.data(), code.size_bytes());
+	WriteDumpText(WithDumpSuffix(base, ".rdna2"), decoded_dump);
+	LogDecodedOpcodeSummary(options, decoded);
+}
+
+void DumpSuspectCfg(const CompileOptions& options, const CFG::Graph& cfg) {
+	LOGF("%s cfg loops=%" PRIu64 " back_edges=%" PRIu64 " blocks=%" PRIu64 " entry=%u\n",
+	     GetDumpLabel(options), static_cast<uint64_t>(cfg.natural_loops.size()),
+	     static_cast<uint64_t>(cfg.back_edges.size()), static_cast<uint64_t>(cfg.blocks.size()),
+	     cfg.entry_block);
+	for (uint32_t i = 0; i < cfg.natural_loops.size(); ++i) {
+		const auto& loop = cfg.natural_loops[i];
+		const auto* header = cfg.FindBlock(loop.header);
+		const auto* latch  = cfg.FindBlock(loop.latch);
+		LOGF("%s loop[%u]: header=%u pc=0x%08x latch=%u pc=0x%08x body=%" PRIu64
+		     " exits=%" PRIu64 " merge=%u continue=%u\n",
+		     GetDumpLabel(options), i, loop.header, header != nullptr ? header->start_pc : 0u,
+		     loop.latch, latch != nullptr ? latch->start_pc : 0u,
+		     static_cast<uint64_t>(loop.body_blocks.size()),
+		     static_cast<uint64_t>(loop.exit_blocks.size()), loop.merge, loop.continue_block);
+	}
+	WriteDumpText(WithDumpSuffix(SuspectDumpBase(options), ".cfg.txt"), CFG::GraphToString(cfg));
+}
+
+void DumpSuspectIrAndSpirv(const CompileOptions& options, const IR::Program& ir,
+                           std::span<const uint32_t> spirv, std::string_view ir_dump) {
+	std::array<uint32_t, static_cast<size_t>(IR::ValueOpcode::Count)> counts {};
+	uint32_t insts = 0;
+	uint32_t shared_atomic = 0;
+	uint32_t buffer_atomic = 0;
+	uint32_t image_atomic = 0;
+	uint32_t barriers = 0;
+	for (const auto* block: ir.blocks) {
+		for (const auto& inst: *block) {
+			++insts;
+			const auto opcode = inst.GetOpcode();
+			const auto index  = static_cast<size_t>(opcode);
+			if (index < counts.size()) {
+				counts[index]++;
+			}
+			if (IR::SharedAccessOf(opcode) == IR::SharedAccess::Atomic) {
+				++shared_atomic;
+			}
+			if (IR::BufferAccessOf(opcode) == IR::BufferAccess::Atomic) {
+				++buffer_atomic;
+			}
+			if (IR::ImageOpcodeInfoOf(opcode).access == IR::ImageAccess::Atomic) {
+				++image_atomic;
+			}
+			if (opcode == IR::ValueOpcode::Barrier) {
+				++barriers;
+			}
+		}
+	}
+	LOGF("%s ir summary: blocks=%" PRIu64 " insts=%u shared_atomic=%u buffer_atomic=%u "
+	     "image_atomic=%u barriers=%u spirv_words=%" PRIu64 " dma=%s xor=%s\n",
+	     GetDumpLabel(options), static_cast<uint64_t>(ir.blocks.size()), insts, shared_atomic,
+	     buffer_atomic, image_atomic, barriers, static_cast<uint64_t>(spirv.size()),
+	     ir.info.uses_dma ? "true" : "false", ir.info.has_bitwise_xor ? "true" : "false");
+	for (size_t i = 0; i < counts.size(); ++i) {
+		if (counts[i] == 0) {
+			continue;
+		}
+		const auto opcode = static_cast<IR::ValueOpcode>(i);
+		if (counts[i] < 8 && IR::SharedAccessOf(opcode) == IR::SharedAccess::None &&
+		    IR::BufferAccessOf(opcode) != IR::BufferAccess::Atomic &&
+		    IR::ImageOpcodeInfoOf(opcode).access != IR::ImageAccess::Atomic &&
+		    opcode != IR::ValueOpcode::Barrier) {
+			continue;
+		}
+		LOGF("%s ir opcode %s: %u\n", GetDumpLabel(options),
+		     std::string(IR::ValueOpcodeName(opcode)).c_str(), counts[i]);
+	}
+	const auto base = SuspectDumpBase(options);
+	WriteDumpText(WithDumpSuffix(base, ".ir.txt"), ir_dump);
+	WriteDumpBytes(WithDumpSuffix(base, ".spv"), spirv.data(),
+	               spirv.size() * sizeof(uint32_t));
 }
 
 enum class EmbeddedFetchValueType {
@@ -551,12 +885,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
+	const bool dump_suspect = ShouldDumpShader(options);
 	std::string decoded_dump;
-	if (options.dump_ir) {
+	if (options.dump_ir || dump_suspect) {
 		decoded_dump = Decoder::ProgramToString(decoded);
 		if (options.early_dump) {
 			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options), decoded_dump.c_str());
 		}
+	}
+	if (dump_suspect) {
+		DumpSuspectDecoded(options, code, decoded, decoded_dump);
 	}
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
@@ -569,12 +907,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
 	bool        dispatcher_fallback = false;
 	std::string dispatcher_reason;
+	CFG::Graph  unstructured_cfg;
 	if (cfg.irreducible) {
 		dispatcher_fallback = true;
 		dispatcher_reason   = cfg.unsupported_reason;
 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
 	} else {
-		const auto unstructured_cfg = cfg;
+		unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		if (!CFG::Structurize(cfg)) {
@@ -583,6 +922,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			const auto failure_kind  = cfg.failure_kind;
 			const auto failure_block = cfg.failure_block;
 			LogDispatcherFallback(options, cfg, "structurize", dispatcher_reason);
+			DumpFailedStructurizeShader(options, code, cfg);
 			cfg                    = unstructured_cfg;
 			cfg.unsupported        = true;
 			cfg.failure_kind       = failure_kind;
@@ -597,6 +937,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     static_cast<uint64_t>(cfg.blocks.size()),
 		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
+	}
+	if (dump_suspect) {
+		DumpSuspectCfg(options, cfg);
 	}
 
 	const ShaderVertexInputInfo*  vertex  = nullptr;
@@ -639,31 +982,65 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .compute             = compute,
 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
-	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
-	IR::RewriteToSsa(ir.blocks);
-	IR::ConstantPropagationPass(ir.blocks);
-	IR::ResolveControlFlowIdentities(ir);
-	IR::RemoveIdentities(ir.blocks);
-	IR::EliminateDeadCode(ir.blocks);
-	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
-	if (read_lane_stats.rewritten_reads != 0) {
-		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
-		     read_lane_stats.rewritten_reads);
+	const auto finish_value_ir = [&](IR::Program& ir) {
+		IR::RewriteToSsa(ir.blocks);
 		IR::ConstantPropagationPass(ir.blocks);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
+		const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+		if (read_lane_stats.rewritten_reads != 0) {
+			LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
+			     read_lane_stats.rewritten_reads);
+			IR::ConstantPropagationPass(ir.blocks);
+			IR::ResolveControlFlowIdentities(ir);
+			IR::RemoveIdentities(ir.blocks);
+			IR::EliminateDeadCode(ir.blocks);
+		}
+	};
+	bool uses_dispatch_structurize = false;
+	if (!dispatcher_fallback) {
+		for (const auto& block: cfg.blocks) {
+			if (block.terminator.kind == CFG::TerminatorKind::DispatchSwitch) {
+				uses_dispatch_structurize = true;
+				break;
+			}
+		}
 	}
-	IR::BuildSrtPlan(ir);
-	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
-	IR::EliminateDeadCode(ir.blocks);
+	if (uses_dispatch_structurize) {
+		LOGF("%s using DispatcherFull resource import: stage=%s hash=0x%016" PRIx64
+		     " blocks=%" PRIu64 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		     static_cast<uint64_t>(cfg.blocks.size()));
+	}
+
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	IR::Program ir;
+	if (uses_dispatch_structurize) {
+		// DispatcherFull merges every guest block at one loop join, so SGPR descriptor
+		// dwords are no longer invariant. Track on the original CFG and import the plan.
+		auto track_ir =
+		    Frontend::TranslateProgram(decoded, unstructured_cfg, translate_options);
+		finish_value_ir(track_ir);
+		IR::BuildSrtPlan(track_ir);
+		IR::TrackResources(track_ir);
+		ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+		finish_value_ir(ir);
+		IR::ImportTrackedResources(ir, track_ir);
+		IR::EliminateDeadCode(ir.blocks);
+	} else {
+		ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+		finish_value_ir(ir);
+		IR::BuildSrtPlan(ir);
+		IR::EliminateDeadCode(ir.blocks);
+		IR::TrackResources(ir);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr   = embedded_fetch.vertex_offset_sgpr;
 		ir.info.instance_offset_sgpr = embedded_fetch.instance_offset_sgpr;
@@ -671,7 +1048,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 	TranslateResult result;
 	result.program = std::move(ir);
-	if (options.dump_ir) {
+	if (options.dump_ir || dump_suspect) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.cfg_dump     = CFG::GraphToString(cfg);
 	}
@@ -706,7 +1083,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::AllocateBindings(ir, push_data_start_dword);
 	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
-	if (options.dump_ir) {
+	const bool dump_suspect = ShouldDumpShader(options);
+	if (options.dump_ir || dump_suspect) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
 		if (options.early_dump) {
 			LOGF("%s native IR and bindings (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
@@ -723,6 +1101,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
+	if (dump_suspect) {
+		DumpSuspectIrAndSpirv(options, ir, spirv, ir_dump);
+	}
 	CompileResult result;
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);

@@ -102,6 +102,8 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	uint64_t         hash   = 0;
+	uint64_t         addr   = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -217,6 +219,15 @@ private:
 
 	void InitializeDriverCache();
 };
+
+struct ShaderCompilePulse {
+	uint32_t shader_count   = 0;
+	uint32_t pipeline_count = 0;
+	double   shader_ms      = 0.0;
+	double   pipeline_ms    = 0.0;
+};
+
+[[nodiscard]] ShaderCompilePulse ConsumeShaderCompilePulse();
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(

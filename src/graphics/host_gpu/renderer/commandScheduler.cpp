@@ -3,9 +3,12 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -179,15 +182,48 @@ void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
+	WaitPriorityOperations(tick);
+	PopPendingOperations();
 }
 
-void CommandScheduler::Finish() {
+void CommandScheduler::Finish(const char* reason) {
+	FrameWorkScope frame_work(FrameWorkKind::Finish);
+	// DIAGNOSTIC: attribute the per-frame GPU-idle stalls (FrameProfile finish_ms) to
+	// their source. Counts reset each time the breakdown is logged (~every 200 stalls).
+	{
+		static std::atomic<uint32_t> n_bufdl {0}, n_gdsprobe {0}, n_gdschunk {0}, n_unmap {0},
+		    n_other {0}, total {0};
+		std::atomic<uint32_t>* c = &n_other;
+		if (reason != nullptr) {
+			if (std::strcmp(reason, "buffer-download") == 0) {
+				c = &n_bufdl;
+			} else if (std::strcmp(reason, "gds-probe") == 0) {
+				c = &n_gdsprobe;
+			} else if (std::strcmp(reason, "gds-chunk") == 0) {
+				c = &n_gdschunk;
+			} else if (std::strcmp(reason, "unmap") == 0) {
+				c = &n_unmap;
+			}
+		}
+		c->fetch_add(1, std::memory_order_relaxed);
+		if ((total.fetch_add(1, std::memory_order_relaxed) % 200) == 199) {
+			LOGF("SchedFinish per ~200 stalls: buffer-download=%u gds-probe=%u gds-chunk=%u "
+			     "unmap=%u other=%u\n",
+			     n_bufdl.exchange(0, std::memory_order_relaxed),
+			     n_gdsprobe.exchange(0, std::memory_order_relaxed),
+			     n_gdschunk.exchange(0, std::memory_order_relaxed),
+			     n_unmap.exchange(0, std::memory_order_relaxed),
+			     n_other.exchange(0, std::memory_order_relaxed));
+		}
+	}
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
-	m_master.Wait(CurrentTick() - 1);
+	const auto completed_tick = CurrentTick() - 1;
+	m_master.Wait(completed_tick);
 	BeginNext();
+	WaitPriorityOperations(completed_tick);
 	PopPendingOperations();
 }
 
@@ -318,6 +354,19 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	});
 }
 
+void CommandScheduler::SyncDeferredOperations() {
+	CheckActive();
+	// Never wait on CurrentTick(): that tick is not submitted yet, so a
+	// priority callback doing MasterSemaphore::Wait(CurrentTick()) deadlocks
+	// against this GPU-thread unmap. Only drain work the GPU has already
+	// signaled, then release any deferred slot erases that are already free.
+	const auto current = CurrentTick();
+	if (current > 1) {
+		WaitPriorityOperations(current - 1);
+	}
+	PopPendingOperations();
+}
+
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	auto* previous                = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
@@ -350,6 +399,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	FrameWorkScope frame_work(FrameWorkKind::Submit);
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);

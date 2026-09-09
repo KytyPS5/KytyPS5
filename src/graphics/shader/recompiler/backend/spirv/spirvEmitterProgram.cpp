@@ -3,9 +3,11 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <functional>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -40,6 +42,43 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
 	const auto value_type = ctx.TypeId(type);
 	return value_type == 0 ? 0 : TypePointer(ctx.state, StorageClassFunction, value_type);
+}
+
+// Phis wider than this become function variables. DispatcherFull joins every guest
+// block at one continue edge; native OpPhi for those joins dominates binary size.
+constexpr size_t kWidePhiSpillThreshold = 8;
+
+bool IsWidePhi(const IR::Inst& inst) {
+	return inst.GetOpcode() == IR::ValueOpcode::Phi &&
+	       inst.NumArgs() >= kWidePhiSpillThreshold;
+}
+
+bool IsLoopCarriedCopy(const IR::Inst& spilled, const IR::Inst& incoming) {
+	if (incoming.GetOpcode() != IR::ValueOpcode::Phi || incoming.NumArgs() != 2u) {
+		return false;
+	}
+	bool saw_spilled = false;
+	bool saw_other   = false;
+	for (size_t index = 0; index < incoming.NumArgs(); index++) {
+		if (incoming.Arg(index).Resolve().TryInstruction() == &spilled) {
+			saw_spilled = true;
+		} else {
+			saw_other = true;
+		}
+	}
+	return saw_spilled && saw_other;
+}
+
+bool ShouldStoreWidePhiIncoming(const IR::Inst& phi, IR::Value arg) {
+	arg              = arg.Resolve();
+	const auto* inst = arg.TryInstruction();
+	if (inst == nullptr) {
+		return true;
+	}
+	if (inst == &phi || IsLoopCarriedCopy(phi, *inst)) {
+		return false;
+	}
+	return true;
 }
 
 struct DeferredPhiPatch {
@@ -81,6 +120,57 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 	}
 }
 
+void StoreWidePhiIncoming(ValueEmitContext& ctx, const IR::Inst& phi, IR::Value arg) {
+	if (ctx.dispatcher_spills == nullptr) {
+		return;
+	}
+	const auto found = ctx.dispatcher_spills->find(&phi);
+	if (found == ctx.dispatcher_spills->end()) {
+		return;
+	}
+	ctx.state.builder.AddFunction({OpStore, found->second, ctx.Def(arg)});
+}
+
+void StoreWidePhiEdges(ValueEmitContext& ctx, const IR::Block* from) {
+	if (ctx.dispatcher_spills == nullptr || from == nullptr) {
+		return;
+	}
+	for (const auto* to: from->ImmSuccessors()) {
+		for (const auto& phi: *to) {
+			if (phi.GetOpcode() != IR::ValueOpcode::Phi) {
+				break;
+			}
+			if (!ctx.dispatcher_spills->contains(&phi)) {
+				continue;
+			}
+			for (size_t index = 0; index < phi.NumArgs(); index++) {
+				if (phi.PhiBlock(index) != from) {
+					continue;
+				}
+				if (ShouldStoreWidePhiIncoming(phi, phi.Arg(index))) {
+					StoreWidePhiIncoming(ctx, phi, phi.Arg(index));
+				}
+				break;
+			}
+		}
+	}
+	for (const auto& inst: *from) {
+		if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
+			break;
+		}
+		for (const auto& [phi, unused]: *ctx.dispatcher_spills) {
+			(void)unused;
+			for (size_t index = 0; index < phi->NumArgs(); index++) {
+				if (phi->Arg(index).Resolve().TryInstruction() == &inst &&
+				    IsLoopCarriedCopy(*phi, inst)) {
+					StoreWidePhiIncoming(ctx, *phi, IR::Value(const_cast<IR::Inst*>(&inst)));
+					break;
+				}
+			}
+		}
+	}
+}
+
 const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 	const auto found = std::ranges::find_if(
 	    program.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
@@ -97,7 +187,8 @@ void EmitReturn(ValueEmitContext& ctx) {
 
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	if (ctx.other_half == nullptr ||
-	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
+	    info.terminator.condition == CFG::BranchCondition::GotoVariable ||
+	    info.terminator.condition == CFG::BranchCondition::DispatchDone) {
 		return ctx.Def(info.condition);
 	}
 	const auto ballot = ctx.Ballot(info.condition);
@@ -133,6 +224,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				ctx.state.builder.AddFunction(
 				    {OpSelectionMerge, ctx.Label(merge), SelectionControlNone});
 			}
+		} else if ((term.kind == CFG::TerminatorKind::IndirectBranch ||
+		            term.kind == CFG::TerminatorKind::DispatchSwitch) &&
+		           term.merge_block != UINT32_MAX) {
+			if (const auto* merge = TargetBlock(ctx.program, term.merge_block); merge != nullptr) {
+				ctx.state.builder.AddFunction(
+				    {OpSelectionMerge, ctx.Label(merge), SelectionControlNone});
+			}
 		}
 	};
 
@@ -158,6 +256,37 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
+			return;
+		}
+		case CFG::TerminatorKind::IndirectBranch:
+		case CFG::TerminatorKind::DispatchSwitch: {
+			const auto* default_block = TargetBlock(ctx.program, term.true_block);
+			if (info.indirect_target.IsEmpty()) {
+				EmitReturn(ctx);
+				return;
+			}
+			if (default_block == nullptr) {
+				default_block = TargetBlock(ctx.program, term.merge_block);
+			}
+			emit_merge();
+			std::vector<uint32_t> words {OpSwitch, ctx.Def(info.indirect_target),
+			                             default_block != nullptr ? ctx.Label(default_block)
+			                                                     : ctx.Label(block)};
+			const auto& values  = !term.indirect_selector_values.empty()
+			                          ? term.indirect_selector_values
+			                          : term.indirect_target_pcs;
+			const auto& targets = !term.indirect_selector_targets.empty()
+			                          ? term.indirect_selector_targets
+			                          : term.indirect_targets;
+			for (size_t index = 0; index < std::min(values.size(), targets.size()); index++) {
+				const auto* target = TargetBlock(ctx.program, targets[index]);
+				if (target == nullptr) {
+					continue;
+				}
+				words.push_back(values[index]);
+				words.push_back(ctx.Label(target));
+			}
+			ctx.state.builder.AddFunction(words);
 			return;
 		}
 		default: EmitReturn(ctx); return;
@@ -236,6 +365,11 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		const auto type = ctx.TypeId(inst.GetType());
 		if (type == 0 || inst.NumArgs() == 0) {
 			ctx.Fail(inst, "has no native SPIR-V representation");
+		}
+		if (ctx.dispatcher_spills != nullptr && ctx.dispatcher_spills->contains(&inst)) {
+			ctx.state.builder.AddFunction(
+			    {OpLoad, type, ctx.Result(inst), ctx.dispatcher_spills->at(&inst)});
+			return;
 		}
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			const auto* predecessor = inst.PhiBlock(index);
@@ -322,6 +456,10 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		StoreWidePhiEdges(ctx, block);
+		if (ctx.other_half != nullptr) {
+			StoreWidePhiEdges(*ctx.other_half, block);
+		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, ctx.program.block_info[index]);
 	}
@@ -423,8 +561,12 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	if (inst == nullptr) {
 		Fail("direct SPIR-V emitter received a non-value argument");
 	}
-	if (dispatcher_spills != nullptr && current_block != nullptr &&
-	    inst->Parent() != current_block) {
+	// Structured wide-phi spills reuse this map for OpStore/OpLoad at the
+	// join. Reloading here would emit OpLoad while PatchStructuredPhis runs
+	// after the last terminator ("Load must appear in a block"). The
+	// disconnected dispatcher CFG still needs a reload per consumer block.
+	if (program.dispatcher_fallback && dispatcher_spills != nullptr &&
+	    current_block != nullptr && inst->Parent() != current_block) {
 		if (const auto found = dispatcher_spills->find(inst); found != dispatcher_spills->end()) {
 			if (const auto loaded = dispatcher_block_loads.find(inst);
 			    loaded != dispatcher_block_loads.end() &&
@@ -604,6 +746,7 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 		high.half       = 1;
 	}
 	std::optional<DispatcherFunctionState> dispatcher;
+	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> wide_phi_spills;
 	if (state.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
@@ -667,6 +810,29 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
+	} else {
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				if (!IsWidePhi(inst)) {
+					continue;
+				}
+				if (SpillPointerType(ctx, inst.GetType()) == 0) {
+					ctx.Fail(inst, "cannot be stored as a wide structured phi");
+					break;
+				}
+				wide_phi_spills[0].emplace(&inst, state.builder.AllocateId());
+			}
+		}
+		if (!wide_phi_spills[0].empty()) {
+			ctx.dispatcher_spills = &wide_phi_spills[0];
+			if (state.lane_count == 2) {
+				for (const auto& [inst, id]: wide_phi_spills[0]) {
+					(void)id;
+					wide_phi_spills[1].emplace(inst, state.builder.AllocateId());
+				}
+				high.dispatcher_spills = &wide_phi_spills[1];
+			}
+		}
 	}
 	DefineGetBdaPointer(state);
 	for (const auto* block: program.blocks) {
@@ -716,6 +882,11 @@ void EmitProgram(EmitterState& state, const IR::Program& program) {
 						                           found->second, StorageClassFunction});
 					}
 				}
+			}
+		} else {
+			for (const auto& [inst, id]: wide_phi_spills[half]) {
+				state.builder.AddFunction({OpVariable, SpillPointerType(lane, inst->GetType()),
+				                           id, StorageClassFunction});
 			}
 		}
 		if (lane.scratch_u32_variable != 0) {

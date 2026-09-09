@@ -2,11 +2,14 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <ranges>
 #include <span>
+#include <unordered_map>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -691,7 +694,8 @@ private:
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
+			Fail(flags.pc, fmt::format("image resource limit exceeded ({}/{})",
+			                           m_info.images.size(), ShaderInfo::MaxImages));
 		}
 		AddHandlePatch(handle, resource, flags.pc);
 		uint32_t sampler = 0;
@@ -756,6 +760,162 @@ private:
 
 void TrackResources(Program& program) {
 	Tracker(program).Run();
+}
+
+void ImportTrackedResources(Program& dest, const Program& src) {
+	if (dest.resource_tracking_complete) {
+		EXIT("shader resource import: hash=0x%016" PRIx64 " resources already tracked",
+		     dest.shader_hash);
+	}
+	if (!src.resource_tracking_complete || !src.srt_plan_complete) {
+		EXIT("shader resource import: hash=0x%016" PRIx64 " source tracking is incomplete",
+		     dest.shader_hash);
+	}
+
+	auto plan = ExtractResourcePlan(src);
+	const auto interned_memory_base = static_cast<uint32_t>(dest.memory_info.size());
+	dest.memory_info.insert(dest.memory_info.end(), plan.memory_info.begin(),
+	                        plan.memory_info.end());
+	dest.value_storage                  = std::move(plan.value_storage);
+	for (auto& inst: dest.value_storage) {
+		const auto op = inst.GetOpcode();
+		if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
+		    BufferAccessOf(op) == BufferAccess::None &&
+		    AddressOpcodeInfoOf(op).access == AddressAccess::None &&
+		    ImageOpcodeInfoOf(op).access == ImageAccess::None) {
+			continue;
+		}
+		auto flags = inst.Flags<MemoryFlags>();
+		flags.index += interned_memory_base;
+		inst.SetFlags(flags);
+	}
+	dest.descriptor_sources             = std::move(plan.descriptor_sources);
+	dest.srt_reads                      = std::move(plan.srt_reads);
+	dest.info                           = std::move(plan.info);
+	dest.dynamic_reads.clear();
+	dest.clean_flat_slots               = std::move(plan.clean_flat_slots);
+	dest.uniform_fill                   = std::move(plan.uniform_fill);
+	dest.materialization_sources        = std::move(plan.materialization_sources);
+	dest.requires_specialization_memory = plan.requires_specialization_memory;
+	dest.srt_plan_complete              = true;
+	dest.resource_tracking_complete     = true;
+
+	struct MemoryUse {
+		uint32_t pc    = 0;
+		Inst*    inst  = nullptr;
+		uint32_t index = 0;
+	};
+	const auto collect_uses = [](Program& program) {
+		std::vector<MemoryUse> uses;
+		for (auto* block: program.blocks) {
+			for (auto& inst: *block) {
+				const auto buffer = BufferAccessOf(inst.GetOpcode());
+				const auto image  = ImageOpcodeInfoOf(inst.GetOpcode());
+				const auto addr   = AddressOpcodeInfoOf(inst.GetOpcode());
+				if (buffer == BufferAccess::None && image.access == ImageAccess::None &&
+				    addr.access == AddressAccess::None) {
+					continue;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				uses.push_back({flags.pc, &inst, flags.index});
+			}
+		}
+		return uses;
+	};
+
+	std::unordered_map<uint32_t, MemoryUse> src_uses;
+	for (auto& use: collect_uses(const_cast<Program&>(src))) {
+		src_uses.emplace(use.pc, use);
+	}
+	for (auto& use: collect_uses(dest)) {
+		const auto found = src_uses.find(use.pc);
+		if (found == src_uses.end()) {
+			const auto buffer = BufferAccessOf(use.inst->GetOpcode());
+			const auto image  = ImageOpcodeInfoOf(use.inst->GetOpcode()).access;
+			if (buffer != BufferAccess::None || image != ImageAccess::None) {
+				EXIT("shader resource import: hash=0x%016" PRIx64
+				     " dest memory pc=0x%08x has no original-CFG match",
+				     dest.shader_hash, use.pc);
+			}
+			continue;
+		}
+		if (use.index >= dest.memory_info.size() || found->second.index >= src.memory_info.size()) {
+			EXIT("shader resource import: hash=0x%016" PRIx64 " memory index out of range at pc=0x%08x",
+			     dest.shader_hash, use.pc);
+		}
+		auto&       dest_memory = dest.memory_info[use.index];
+		const auto& src_memory  = src.memory_info[found->second.index];
+		dest_memory.resource      = src_memory.resource;
+		dest_memory.sampler       = src_memory.sampler;
+		dest_memory.planning_only = src_memory.planning_only;
+
+		const auto copy_handle = [](Inst& dest_inst, Inst& src_inst, size_t arg) {
+			if (dest_inst.NumArgs() <= arg || src_inst.NumArgs() <= arg) {
+				return;
+			}
+			auto* dest_handle = dest_inst.Arg(arg).Resolve().TryInstruction();
+			auto* src_handle  = src_inst.Arg(arg).Resolve().TryInstruction();
+			if (dest_handle == nullptr || src_handle == nullptr ||
+			    dest_handle->GetOpcode() != src_handle->GetOpcode()) {
+				return;
+			}
+			dest_handle->SetFlags(src_handle->Flags<uint32_t>());
+		};
+		copy_handle(*use.inst, *found->second.inst, 0);
+		copy_handle(*use.inst, *found->second.inst, 1);
+	}
+
+	std::unordered_map<uint32_t, uint32_t> srt_slots;
+	for (auto* block: src.blocks) {
+		const Inst* pending_read = nullptr;
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetSrtResource) {
+				continue;
+			}
+			if (inst.GetOpcode() == ValueOpcode::ReadConst) {
+				pending_read = &inst;
+				continue;
+			}
+			if (pending_read != nullptr &&
+			    (inst.GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			     inst.GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+				const auto slot = pending_read->Arg(1).Resolve();
+				if (slot.IsImmediate() && slot.GetType() == Type::U32) {
+					srt_slots.emplace(inst.Flags<MemoryFlags>().pc, slot.U32());
+				}
+			}
+			pending_read = nullptr;
+		}
+	}
+
+	std::vector<Inst*> dest_reads;
+	for (auto* block: dest.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			    inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
+				dest_reads.push_back(&inst);
+			}
+		}
+	}
+	for (auto* inst: dest_reads) {
+		const auto found = srt_slots.find(inst->Flags<MemoryFlags>().pc);
+		if (found == srt_slots.end()) {
+			continue;
+		}
+		auto* block = inst->Parent();
+		auto& list  = block->Instructions();
+		auto  where =
+		    std::ranges::find_if(list, [&](const Inst& value) { return &value == inst; });
+		const auto resource =
+		    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
+		const auto flat = Value(&*block->PrependNewInst(
+		    where, ValueOpcode::ReadConst, {resource, Value(found->second)}));
+		inst->ReplaceUsesWith(flat);
+		const auto memory = inst->Flags<MemoryFlags>().index;
+		if (memory < dest.memory_info.size()) {
+			dest.memory_info[memory].planning_only = true;
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

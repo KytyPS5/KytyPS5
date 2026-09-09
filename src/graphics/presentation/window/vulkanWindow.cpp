@@ -907,8 +907,12 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
+		// DIAGNOSTIC: do not abort on validation errors. Log them loudly and keep
+		// running so the full sequence of errors leading up to a device-lost is
+		// captured instead of dying on the first one.
+		LOGF_COLOR(severity_style, "[Vulkan][%s][%u][VALIDATION-ERROR]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		skip = true;
 	}
 
 	if (!skip) {

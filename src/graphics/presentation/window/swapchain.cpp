@@ -4,7 +4,11 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -14,9 +18,18 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -26,6 +39,369 @@
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
+
+std::atomic<uint32_t> g_gpu_dump_requested {0};
+
+void RequestGpuImageDump() {
+	g_gpu_dump_requested.store(1, std::memory_order_release);
+}
+
+namespace {
+
+[[nodiscard]] uint8_t Unorm10To8(uint32_t value) {
+	return static_cast<uint8_t>((value * 255u + 511u) / 1023u);
+}
+
+[[nodiscard]] uint8_t Saturate8(float value) {
+	if (value <= 0.0f) {
+		return 0;
+	}
+	if (value >= 1.0f) {
+		return 255;
+	}
+	return static_cast<uint8_t>(value * 255.0f + 0.5f);
+}
+
+[[nodiscard]] float DecodeUnsignedFloat(uint32_t packed, uint32_t mantissa_bits,
+                                        uint32_t exponent_bits) {
+	const uint32_t mantissa_mask = (1u << mantissa_bits) - 1u;
+	const uint32_t exponent_mask = (1u << exponent_bits) - 1u;
+	const auto     mantissa      = packed & mantissa_mask;
+	const auto     exponent      = (packed >> mantissa_bits) & exponent_mask;
+	const int      bias          = static_cast<int>(exponent_mask >> 1u) - 1;
+	if (exponent == 0) {
+		return std::ldexp(static_cast<float>(mantissa), 1 - bias - static_cast<int>(mantissa_bits));
+	}
+	return std::ldexp(1.0f + static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits),
+	                  static_cast<int>(exponent) - bias);
+}
+
+void WriteBmpBgra(const std::filesystem::path& path, uint32_t width, uint32_t height,
+                  const std::vector<uint8_t>& bgra) {
+	const uint32_t pixel_bytes = width * height * 4u;
+	const uint32_t file_size   = 54u + pixel_bytes;
+	std::ofstream  out(path, std::ios::binary);
+	if (!out) {
+		LOGF("VideoOut dump: failed to write %s\n", path.string().c_str());
+		return;
+	}
+	const uint8_t header[54] = {
+	    'B',
+	    'M',
+	    static_cast<uint8_t>(file_size),
+	    static_cast<uint8_t>(file_size >> 8),
+	    static_cast<uint8_t>(file_size >> 16),
+	    static_cast<uint8_t>(file_size >> 24),
+	    0,
+	    0,
+	    0,
+	    0,
+	    54,
+	    0,
+	    0,
+	    0,
+	    40,
+	    0,
+	    0,
+	    0,
+	    static_cast<uint8_t>(width),
+	    static_cast<uint8_t>(width >> 8),
+	    static_cast<uint8_t>(width >> 16),
+	    static_cast<uint8_t>(width >> 24),
+	    static_cast<uint8_t>(height),
+	    static_cast<uint8_t>(height >> 8),
+	    static_cast<uint8_t>(height >> 16),
+	    static_cast<uint8_t>(height >> 24),
+	    1,
+	    0,
+	    32,
+	    0,
+	};
+	out.write(reinterpret_cast<const char*>(header), sizeof(header));
+	// BMP is bottom-up.
+	for (uint32_t y = height; y-- > 0;) {
+		out.write(reinterpret_cast<const char*>(bgra.data() + static_cast<size_t>(y) * width * 4u),
+		          static_cast<std::streamsize>(width * 4u));
+	}
+}
+
+[[nodiscard]] float HalfToFloat(uint16_t value) {
+	const uint32_t sign     = static_cast<uint32_t>(value >> 15) << 31;
+	const uint32_t exponent = (value >> 10) & 0x1fu;
+	const uint32_t mantissa = value & 0x3ffu;
+	uint32_t       bits     = 0;
+	if (exponent == 0) {
+		if (mantissa == 0) {
+			bits = sign;
+		} else {
+			uint32_t m = mantissa;
+			uint32_t e = 1;
+			while ((m & 0x400u) == 0) {
+				m <<= 1;
+				e--;
+			}
+			m &= 0x3ffu;
+			bits = sign | ((e + 127u - 15u) << 23) | (m << 13);
+		}
+	} else if (exponent == 31) {
+		bits = sign | 0x7f800000u | (mantissa << 13);
+	} else {
+		bits = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
+	}
+	float decoded = 0.0f;
+	std::memcpy(&decoded, &bits, sizeof(decoded));
+	return decoded;
+}
+
+void ConvertPackedToBgra(vk::Format format, uint32_t width, uint32_t height,
+                         const uint8_t* packed, std::vector<uint8_t>& bgra, uint64_t& nonzero,
+                         uint32_t& max_channel) {
+	bgra.resize(static_cast<size_t>(width) * height * 4u);
+	nonzero     = 0;
+	max_channel = 0;
+	const uint32_t count = width * height;
+	auto           put   = [&](size_t i, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        bgra[i * 4 + 0] = b;
+        bgra[i * 4 + 1] = g;
+        bgra[i * 4 + 2] = r;
+        bgra[i * 4 + 3] = a;
+        const uint8_t peak = std::max({r, g, b});
+        max_channel        = std::max(max_channel, static_cast<uint32_t>(peak));
+        if (r | g | b) {
+            nonzero++;
+        }
+	};
+	const auto* words = reinterpret_cast<const uint32_t*>(packed);
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+			for (uint32_t i = 0; i < count; i++) {
+				put(i, packed[i * 4 + 0], packed[i * 4 + 1], packed[i * 4 + 2], packed[i * 4 + 3]);
+			}
+			return;
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+			for (uint32_t i = 0; i < count; i++) {
+				put(i, packed[i * 4 + 2], packed[i * 4 + 1], packed[i * 4 + 0], packed[i * 4 + 3]);
+			}
+			return;
+		case vk::Format::eA2R10G10B10UnormPack32:
+			for (uint32_t i = 0; i < count; i++) {
+				const uint32_t p = words[i];
+				put(i, Unorm10To8((p >> 20) & 0x3ffu), Unorm10To8((p >> 10) & 0x3ffu),
+				    Unorm10To8(p & 0x3ffu), static_cast<uint8_t>(((p >> 30) & 0x3u) * 85u));
+			}
+			return;
+		case vk::Format::eA2B10G10R10UnormPack32:
+			for (uint32_t i = 0; i < count; i++) {
+				const uint32_t p = words[i];
+				put(i, Unorm10To8(p & 0x3ffu), Unorm10To8((p >> 10) & 0x3ffu),
+				    Unorm10To8((p >> 20) & 0x3ffu),
+				    static_cast<uint8_t>(((p >> 30) & 0x3u) * 85u));
+			}
+			return;
+		case vk::Format::eB10G11R11UfloatPack32:
+			for (uint32_t i = 0; i < count; i++) {
+				const uint32_t p = words[i];
+				const float    r = DecodeUnsignedFloat(p & 0x7ffu, 6, 5);
+				const float    g = DecodeUnsignedFloat((p >> 11) & 0x7ffu, 6, 5);
+				const float    b = DecodeUnsignedFloat((p >> 22) & 0x3ffu, 5, 5);
+				put(i, Saturate8(r), Saturate8(g), Saturate8(b), 255);
+			}
+			return;
+		case vk::Format::eR16G16B16A16Sfloat: {
+			const auto* halfs = reinterpret_cast<const uint16_t*>(packed);
+			for (uint32_t i = 0; i < count; i++) {
+				put(i, Saturate8(HalfToFloat(halfs[i * 4 + 0])),
+				    Saturate8(HalfToFloat(halfs[i * 4 + 1])),
+				    Saturate8(HalfToFloat(halfs[i * 4 + 2])),
+				    Saturate8(HalfToFloat(halfs[i * 4 + 3])));
+			}
+			return;
+		}
+		case vk::Format::eR16G16B16A16Unorm: {
+			const auto* halfs = reinterpret_cast<const uint16_t*>(packed);
+			for (uint32_t i = 0; i < count; i++) {
+				put(i, static_cast<uint8_t>(halfs[i * 4 + 0] >> 8),
+				    static_cast<uint8_t>(halfs[i * 4 + 1] >> 8),
+				    static_cast<uint8_t>(halfs[i * 4 + 2] >> 8),
+				    static_cast<uint8_t>(halfs[i * 4 + 3] >> 8));
+			}
+			return;
+		}
+		case vk::Format::eR32G32B32A32Sfloat: {
+			const auto* floats = reinterpret_cast<const float*>(packed);
+			for (uint32_t i = 0; i < count; i++) {
+				put(i, Saturate8(floats[i * 4 + 0]), Saturate8(floats[i * 4 + 1]),
+				    Saturate8(floats[i * 4 + 2]), Saturate8(floats[i * 4 + 3]));
+			}
+			return;
+		}
+		default:
+			for (uint32_t i = 0; i < count; i++) {
+				const uint32_t p = words[i];
+				put(i, static_cast<uint8_t>(p), static_cast<uint8_t>(p >> 8),
+				    static_cast<uint8_t>(p >> 16), static_cast<uint8_t>(p >> 24));
+			}
+			return;
+	}
+}
+
+[[nodiscard]] uint32_t DumpBytesPerPixel(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16G16B16A16Snorm: return 8;
+		case vk::Format::eR32G32B32A32Sfloat: return 16;
+		default: return 4;
+	}
+}
+
+[[nodiscard]] bool DumpFormatSupported(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR32G32B32A32Sfloat: return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] bool ShouldDumpGpuImage(int frame_num) {
+	if (g_gpu_dump_requested.exchange(0, std::memory_order_acq_rel) != 0) {
+		return true;
+	}
+	switch (frame_num) {
+		case 1:
+		case 30:
+		case 90:
+		case 180:
+		case 360:
+		case 720:
+		case 1500: return true;
+		default: break;
+	}
+	std::error_code ec;
+	if (std::filesystem::exists("D:/PS5/dumps/DUMP_NOW", ec)) {
+		std::filesystem::remove("D:/PS5/dumps/DUMP_NOW", ec);
+		return true;
+	}
+	return false;
+}
+
+void DumpGpuImage(CommandBuffer& command, RenderContext& renderer, Image& image, const char* tag,
+                  uint64_t address, bool dump) {
+	if (!dump || command.IsInvalid() || image.backing.image == nullptr || !image.IsGpuModified()) {
+		return;
+	}
+	const auto width  = image.backing.extent.width;
+	const auto height = image.backing.extent.height;
+	if (!DumpFormatSupported(image.backing.format)) {
+		return;
+	}
+	if (width == 0 || height == 0 || image.backing.extent.depth != 1) {
+		return;
+	}
+	const auto frame_num = renderer.GetGpu().GetFrameNum();
+
+	const uint64_t byte_size =
+	    static_cast<uint64_t>(width) * height * DumpBytesPerPixel(image.backing.format);
+	auto&          scheduler = renderer.GetCommandScheduler();
+	auto&          download  = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto [mapped, offset]    = download.Map(byte_size, 256);
+	if (mapped == nullptr) {
+		LOGF("VideoOut dump: failed to map download buffer for %s\n", tag);
+		return;
+	}
+
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	              vk_command);
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset                    = offset;
+	copy.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	copy.imageSubresource.mipLevel       = 0;
+	copy.imageSubresource.baseArrayLayer = 0;
+	copy.imageSubresource.layerCount     = 1;
+	copy.imageExtent                     = {width, height, 1};
+	vk::BufferMemoryBarrier2 to_copy {};
+	to_copy.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	to_copy.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	to_copy.dstStageMask        = vk::PipelineStageFlagBits2::eCopy;
+	to_copy.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_copy.buffer              = download.Handle();
+	to_copy.offset              = offset;
+	to_copy.size                = byte_size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &to_copy;
+	vk_command.pipelineBarrier2(dependency);
+	vk_command.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                             download.Handle(), 1, &copy);
+	to_copy.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	to_copy.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	to_copy.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	to_copy.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk_command.pipelineBarrier2(dependency);
+	download.Commit();
+
+	const auto      format   = image.backing.format;
+	const std::string tag_copy = tag;
+	scheduler.DeferPriorityOperation(
+	    [&download, mapped, offset, byte_size, width, height, format, frame_num, tag_copy,
+	     address] {
+		    download.Invalidate(offset, byte_size);
+		    std::vector<uint8_t> packed(mapped, mapped + byte_size);
+		    std::vector<uint8_t> bgra;
+		    uint64_t             nonzero     = 0;
+		    uint32_t             max_channel = 0;
+		    ConvertPackedToBgra(format, width, height, packed.data(), bgra, nonzero, max_channel);
+		    std::error_code ec;
+		    std::filesystem::create_directories("D:/PS5/dumps", ec);
+		    const auto path = std::filesystem::path("D:/PS5/dumps") /
+		                      (tag_copy + "-f" + std::to_string(frame_num) + ".bmp");
+		    WriteBmpBgra(path, width, height, bgra);
+		    LOGF("VideoOut dump: %s frame=%d fmt=%d addr=0x%016" PRIx64
+		         " extent=%ux%u nonzero=%" PRIu64 "/%u max8=%u file=%s\n",
+		         tag_copy.c_str(), frame_num, static_cast<int>(format), address, width, height,
+		         nonzero, width * height, max_channel, path.string().c_str());
+	    });
+}
+
+void DumpUfcSurfaces(CommandBuffer& command, RenderContext& renderer, TextureCache& cache,
+                     Image& scanout, Image& presented, uint64_t scanout_address) {
+	const bool dump = ShouldDumpGpuImage(renderer.GetGpu().GetFrameNum());
+	if (!dump) {
+		return;
+	}
+	DumpGpuImage(command, renderer, scanout, "display", scanout_address, true);
+	DumpGpuImage(command, renderer, presented, "present", presented.info.data.address, true);
+	static constexpr uint64_t kSurfaces[] = {
+	    0x0000001162c00000ull, 0x0000001163470000ull, 0x0000001167150000ull,
+	    0x0000001169860000ull, 0x0000001168270000ull, 0x0000001168260000ull,
+	    0x0000001164240000ull, 0x0000001164e50000ull, 0x00000011592b0000ull,
+	};
+	for (const auto address: kSurfaces) {
+		auto id = cache.FindImageFromRange(address, 0x0000000002000000ull, false);
+		if (!id) {
+			continue;
+		}
+		char tag[32];
+		std::snprintf(tag, sizeof(tag), "rt%08x", static_cast<uint32_t>(address));
+		DumpGpuImage(command, renderer, cache.GetImage(id), tag, address, true);
+	}
+}
+
+} // namespace
 
 struct Presenter::Frame {
 	VulkanImage image;
@@ -176,7 +552,8 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
 	const auto required =
-	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
+	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst |
+	    vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
 	    vk::FormatFeatureFlagBits::eTransferSrc | vk::FormatFeatureFlagBits::eTransferDst;
 	if ((features & required) != required) {
 		EXIT("prepared presentation format lacks optimal blit support: format=%d features=0x%x\n",
@@ -261,14 +638,29 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
-	vk::ImageCopy copy {};
-	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
-	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
-	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
-	                       std::min(source.backing.extent.height, image.extent.height), 1};
-	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	const auto width  = std::min(source.backing.extent.width, image.extent.width);
+	const auto height = std::min(source.backing.extent.height, image.extent.height);
+	const auto layers = std::min(source.backing.layers, image.layers);
+	EXIT_IF(layers == 0);
+	// copyImage requires identical formats. VideoOut 10:10:10:2 and shader storage images can
+	// disagree on A2R vs A2B packing while still sharing one texture-cache backing, so blit
+	// when the present image was allocated with a different host format.
+	if (source.backing.format == image.format) {
+		vk::ImageCopy copy {};
+		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		copy.extent         = {width, height, 1};
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, copy);
+	} else {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		blit.srcOffsets[1]  = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+		blit.dstOffsets[1]  = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+		command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+	}
 	Transit(command, vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 }
 
@@ -717,20 +1109,89 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	EXIT_IF(buffer.IsInvalid());
 	auto*             frame = m_impl->frames.Acquire();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-	auto&             image = m_impl->ResolveSurface(info);
+	auto&             scanout = m_impl->ResolveSurface(info);
+	if (scanout.backing.format == vk::Format::eUndefined) {
+		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&scanout));
+	}
+
+	auto&  cache  = m_impl->renderer.GetTextureCache();
+	Image* source = &scanout;
+	auto try_present = [&](ImageId id, const char* tag) {
+		if (!id || source != &scanout) {
+			return;
+		}
+		auto& candidate = cache.GetImage(id);
+		if (candidate.info.data.address == info.data.address ||
+		    candidate.info.data.address == 0x000000111a800000ull ||
+		    candidate.info.data.address == 0x000000111b800000ull) {
+			return;
+		}
+		if (!candidate.IsGpuModified() || candidate.backing.image == nullptr ||
+		    candidate.backing.extent.width < 1280u || candidate.backing.extent.height < 720u) {
+			return;
+		}
+		source = &candidate;
+		static std::atomic<uint32_t> ufc_present_logs = 0;
+		if (ufc_present_logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+			LOGF("UFC 5 present %s: fmt=%d gpu=%d rt=%d storage=%d extent=%ux%u "
+			     "addr=0x%016" PRIx64 " scanout=0x%016" PRIx64 "\n",
+			     tag, static_cast<int>(candidate.backing.format),
+			     candidate.IsGpuModified() ? 1 : 0, candidate.usage.render_target ? 1 : 0,
+			     candidate.usage.storage ? 1 : 0, candidate.backing.extent.width,
+			     candidate.backing.extent.height, candidate.info.data.address,
+			     info.data.address);
+		}
+	};
+	// Prefer the last large GPU-written color target so 3D/post-process shows after
+	// the title compositor at 0x1162c00000 stops being the current frame.
+	try_present(cache.FindLastPresentableColor(), "last color");
+	try_present(cache.FindImageFromRange(0x0000001162c00000ull, 0x0000000000870000ull, false),
+	            "compositor color");
+	auto& image = *source;
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
-	auto frame_format = info.pixel_format;
+	auto frame_format = image.backing.format;
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
 		default: break;
 	}
+	if (info.pixel_format != image.backing.format) {
+		static std::atomic<uint32_t> mismatch_logs = 0;
+		if (mismatch_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("VideoOut present format mismatch: attribute=%d backing=%d extent=%ux%u "
+			     "addr=0x%016" PRIx64 "\n",
+			     static_cast<int>(info.pixel_format), static_cast<int>(image.backing.format),
+			     image.backing.extent.width, image.backing.extent.height, info.data.address);
+		}
+	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
-	frame->CopyFrom(buffer, image);
+	{
+		static std::atomic<uint32_t> present_logs = 0;
+		if (present_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("VideoOut present: addr=0x%016" PRIx64 " attr=%d backing=%d gpu_mod=%d cpu=%d "
+			     "maybe=%d buf=%d rt=%d storage=%d vo=%d extent=%ux%u\n",
+			     info.data.address, static_cast<int>(info.pixel_format),
+			     static_cast<int>(image.backing.format), image.IsGpuModified() ? 1 : 0,
+			     image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+			     image.IsBufferModified() ? 1 : 0, image.usage.render_target ? 1 : 0,
+			     image.usage.storage ? 1 : 0, image.usage.video_out ? 1 : 0,
+			     image.backing.extent.width, image.backing.extent.height);
+		}
+	}
+	if (!image.IsGpuModified()) {
+		vk::ClearColorValue marker {};
+		marker.float32[0] = 1.0f;
+		marker.float32[2] = 1.0f;
+		marker.float32[3] = 1.0f;
+		frame->Clear(buffer, marker);
+	} else {
+		frame->CopyFrom(buffer, image);
+	}
+	DumpUfcSurfaces(buffer, m_impl->renderer, cache, scanout, image, info.data.address);
 	return *frame;
 }
 
@@ -779,23 +1240,26 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
-		if (status != Swapchain::Status::Success) {
-			m_impl->RecoverSwapchain(status);
-			continue;
-		}
 		{
-			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			auto&             command          = m_impl->present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
-			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
-		}
-		status = swapchain.Present();
-		if (status != Swapchain::Status::Success) {
-			m_impl->RecoverSwapchain(status);
-			continue;
+			FrameWorkScope present_work(FrameWorkKind::Present);
+			auto status = swapchain.AcquireNextImage();
+			if (status != Swapchain::Status::Success) {
+				m_impl->RecoverSwapchain(status);
+				continue;
+			}
+			{
+				Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+				auto&             command          = m_impl->present_scheduler.BeginCommand();
+				const bool        draw_system_overlay =
+				    overlay_visual.active && swapchain.PrepareSystemOverlay();
+				swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+				frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			}
+			status = swapchain.Present();
+			if (status != Swapchain::Status::Success) {
+				m_impl->RecoverSwapchain(status);
+				continue;
+			}
 		}
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,

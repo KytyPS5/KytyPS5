@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -18,10 +19,20 @@ enum class BranchCondition {
 	ExecZero,
 	ExecNonZero,
 	GotoVariable,
+	DispatchDone,
 	Unknown
 };
 
-enum class TerminatorKind { Branch, ConditionalBranch, IndirectBranch, Return, Unsupported };
+inline constexpr uint32_t kDispatchHaltState = 0xFFFFFFFEu;
+
+enum class TerminatorKind {
+	Branch,
+	ConditionalBranch,
+	IndirectBranch,
+	DispatchSwitch,
+	Return,
+	Unsupported
+};
 
 enum class FailureKind {
 	None,
@@ -49,6 +60,7 @@ struct Terminator {
 	std::vector<uint32_t> indirect_selector_targets;
 	uint32_t              goto_variable = UINT32_MAX;
 	int32_t               goto_value    = -1;
+	uint32_t              dispatch_next = UINT32_MAX;
 	bool                  loop_header   = false;
 };
 
@@ -108,11 +120,47 @@ struct Graph {
 	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
-Graph       BuildGraph(const Decoder::Program& program);
-bool        Structurize(Graph& graph);
-std::string BranchConditionToString(BranchCondition condition);
-std::string FailureKindToString(FailureKind kind);
-std::string GraphToString(const Graph& graph);
+enum class StructurizerKind {
+	Auto,
+	LegacySplit,
+	DispatcherFull,
+};
+
+struct StructurizeOptions {
+	StructurizerKind kind                      = StructurizerKind::Auto;
+	uint32_t         max_block_growth_percent  = 200;
+	uint32_t         max_rewrites              = 0;
+	bool             validate_after_each_phase = false;
+	bool             dump_graph_on_failure     = true;
+	bool             collect_stats             = true;
+};
+
+struct StructurizeStats {
+	StructurizerKind kind                     = StructurizerKind::LegacySplit;
+	uint32_t         original_blocks          = 0;
+	uint32_t         final_blocks             = 0;
+	uint32_t         synthetic_blocks         = 0;
+	uint32_t         cloned_semantic_blocks   = 0;
+	uint32_t         rewrites                 = 0;
+	uint32_t         loop_repairs             = 0;
+	uint32_t         selection_repairs        = 0;
+	uint32_t         route_blocks             = 0;
+	uint32_t         dispatcher_cases         = 0;
+	uint32_t         unresolved_illegal_edges = 0;
+	uint64_t         elapsed_us               = 0;
+	bool             success                  = false;
+	std::string      failure_reason;
+};
+
+Graph              BuildGraph(const Decoder::Program& program);
+bool               Structurize(Graph& graph);
+StructurizeOptions ReadStructurizeOptions();
+bool               StructurizeWithStrategy(Graph& graph, const StructurizeOptions& options,
+                                          StructurizeStats* stats);
+std::string        StructurizerKindToString(StructurizerKind kind);
+std::string        BranchConditionToString(BranchCondition condition);
+std::string        FailureKindToString(FailureKind kind);
+std::string        GraphToString(const Graph& graph);
 
 } // namespace Libs::Graphics::ShaderRecompiler::CFG
 

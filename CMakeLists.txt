@@ -387,6 +387,9 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+file(TO_CMAKE_PATH "${KYTY_TESTS_DIR}/shaders" KYTY_SHADER_FIXTURE_DIR)
+target_compile_definitions(shader_cfg_tests PRIVATE
+	KYTY_SHADER_FIXTURE_DIR="${KYTY_SHADER_FIXTURE_DIR}")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

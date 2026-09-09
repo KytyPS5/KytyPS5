@@ -35,6 +35,8 @@ public:
 	void SetVectorReg(VectorReg reg, U32 value);
 	U1   GetGotoVariable(uint32_t id);
 	void SetGotoVariable(uint32_t id, U1 value);
+	U32  GetDispatchState();
+	void SetDispatchState(U32 value);
 	U1   GetScc();
 	void SetScc(U1 value);
 	U1   GetExec();

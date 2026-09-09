@@ -37,6 +37,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <iterator>
 #include <span>
@@ -60,6 +62,14 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+void SetShaderCfgStrategyEnv(const char *value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _putenv_s("KYTY_SHADER_CFG_STRATEGY", value);
+#else
+  ::setenv("KYTY_SHADER_CFG_STRATEGY", value, 1);
+#endif
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -112,6 +122,14 @@ bool ReadHostTestMemory(void *, uint64_t address, uint32_t *value) {
     return false;
   }
   std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  return true;
+}
+
+bool ReadZeroTestMemory(void *, uint64_t, uint32_t *value) {
+  if (value == nullptr) {
+    return false;
+  }
+  *value = 0;
   return true;
 }
 
@@ -183,6 +201,52 @@ CfgInstructionCoverage(const ShaderRecompiler::CFG::Graph &graph,
     }
   }
   return coverage;
+}
+
+#ifndef KYTY_SHADER_FIXTURE_DIR
+#define KYTY_SHADER_FIXTURE_DIR ""
+#endif
+
+std::vector<uint32_t> LoadU32BinaryFile(const std::filesystem::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return {};
+  }
+  in.seekg(0, std::ios::end);
+  const auto bytes = static_cast<size_t>(in.tellg());
+  if (bytes == 0 || (bytes % sizeof(uint32_t)) != 0) {
+    return {};
+  }
+  in.seekg(0, std::ios::beg);
+  std::vector<uint32_t> words(bytes / sizeof(uint32_t));
+  in.read(reinterpret_cast<char *>(words.data()),
+          static_cast<std::streamsize>(bytes));
+  return in ? words : std::vector<uint32_t>{};
+}
+
+std::vector<uint32_t> LoadShaderFixture(const char *filename) {
+  std::vector<std::filesystem::path> dirs;
+  if (const char *env = std::getenv("KYTY_SHADER_DUMP_DIR")) {
+    dirs.emplace_back(env);
+  }
+  const char *fixture_dir = KYTY_SHADER_FIXTURE_DIR;
+  if (fixture_dir[0] != '\0') {
+    dirs.emplace_back(fixture_dir);
+  }
+  dirs.emplace_back(std::filesystem::current_path() / "_Shaders" / "cfg_fail");
+  dirs.emplace_back(std::filesystem::path("D:/PS5/Emulators/KytyPS5-Bin") /
+                    "_Shaders" / "cfg_fail");
+
+  for (const auto &dir : dirs) {
+    const auto path = dir / filename;
+    auto words = LoadU32BinaryFile(path);
+    if (!words.empty()) {
+      std::fprintf(stderr, "ShaderCfgTests: loaded %s (%zu words)\n",
+                   path.string().c_str(), words.size());
+      return words;
+    }
+  }
+  return {};
 }
 
 void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
@@ -1214,11 +1278,24 @@ void TestNormalizedImageContracts() {
 
   Check(ImageViewOps::FormatsCompatible(vk::Format::eR8G8B8A8Unorm,
                                         vk::Format::eR8G8B8A8Uint) &&
+            ImageViewOps::FormatsCompatible(vk::Format::eR16G16B16A16Sfloat,
+                                            vk::Format::eR16G16B16A16Uint) &&
             !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat,
                                              vk::Format::eR32Sfloat) &&
             ImageViewOps::FormatsCompatible(vk::Format::eBc3UnormBlock,
                                             vk::Format::eR32G32B32A32Uint),
         "Vulkan image-view compatibility classes diverged from production");
+  Check(ImageViewOps::ViewEncodingCompatible(vk::Format::eR8G8B8A8Unorm,
+                                            vk::Format::eR8G8B8A8Uint) &&
+            ImageViewOps::ViewEncodingCompatible(vk::Format::eA2R10G10B10UnormPack32,
+                                                 vk::Format::eA2B10G10R10UnormPack32) &&
+            !ImageViewOps::ViewEncodingCompatible(vk::Format::eR8G8B8A8Unorm,
+                                                  vk::Format::eB10G11R11UfloatPack32) &&
+            !ImageViewOps::ViewEncodingCompatible(vk::Format::eB10G11R11UfloatPack32,
+                                                  vk::Format::eR8G8B8A8Unorm) &&
+            !ImageViewOps::ViewEncodingCompatible(vk::Format::eR16G16B16A16Sfloat,
+                                                  vk::Format::eR16G16B16A16Unorm),
+        "packed-float and unorm encodings were treated as interchangeable views");
 }
 
 void TestSpirvRequirementsAnalysis() {
@@ -1355,14 +1432,6 @@ void SetImageTestFormat(std::array<uint32_t, 64> *data, uint32_t srsrc,
   Check(data != nullptr && format_dword < data->size(),
         "invalid image test descriptor source");
   (*data)[format_dword] = static_cast<uint32_t>(format) << 20u;
-}
-
-bool ReadZeroTestMemory(void *, uint64_t, uint32_t *value) {
-  if (value == nullptr) {
-    return false;
-  }
-  *value = 0;
-  return true;
 }
 
 constexpr uint32_t EncodeVop2(uint32_t opcode, uint32_t dst, uint32_t src0,
@@ -4224,6 +4293,17 @@ void TestNewShaderDecoderArchitecture() {
   Check(ds.opcode == Opcode::DS_READ_B32 && ds.gds,
         "DS decoder lost the GFX10 opcode or GDS fields");
 
+  const uint32_t ufc_inc_rtn[] = {0xd88e0004u, 0x03000302u};
+  Instruction ufc_inc;
+  ShaderRecompiler::Decoder::DecodeInstruction(ufc_inc_rtn, 0u, ufc_inc);
+  Check(ufc_inc.family == Family::DS &&
+            ufc_inc.opcode == Opcode::DS_INC_RTN_U32 &&
+            ufc_inc.opcode_id == 0x23u && ufc_inc.gds &&
+            ufc_inc.offset == 4u && ufc_inc.src_count == 2u &&
+            ufc_inc.dst.reg == 3u && ufc_inc.src0.reg == 2u &&
+            ufc_inc.src1.reg == 3u && ufc_inc.unsupported_reason.empty(),
+        "DS decoder rejected captured UFC DS_INC_RTN_U32");
+
   const uint32_t boot_ds[] = {0xd8d4c480u, 0x45000045u};
   Instruction boot;
   ShaderRecompiler::Decoder::DecodeInstruction(boot_ds, 0u, boot);
@@ -7081,6 +7161,70 @@ void TestNewShaderRecompilerDsWideAndAtomicTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerDsIncDecRsubTranslation() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x02), EncodeDs1(0, 2, 1),       // ds_rsub_u32
+      EncodeDs0(0x03), EncodeDs1(0, 3, 1),       // ds_inc_u32
+      EncodeDs0(0x04), EncodeDs1(0, 4, 1),       // ds_dec_u32
+      EncodeDs0(0x22), EncodeDs1(10, 2, 1),      // ds_rsub_rtn_u32
+      EncodeDs0(0x23), EncodeDs1(11, 3, 1),      // ds_inc_rtn_u32
+      EncodeDs0(0x24), EncodeDs1(12, 4, 1),      // ds_dec_rtn_u32
+      0xd88e0004u, 0x03000302u,                  // captured UFC ds_inc_rtn_u32 v3, v2, v3 offset:4 gds
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::CFG::Graph graph;
+  ShaderRecompiler::IR::Program typed;
+  ShaderComputeInputInfo compute{};
+  ShaderRecompiler::Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.compute = &compute;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  typed = ShaderRecompiler::Frontend::TranslateProgram(decoded, graph,
+                                                       translate_options);
+
+  uint32_t inc_count = 0;
+  uint32_t dec_count = 0;
+  uint32_t rsub_count = 0;
+  for (const auto *block : typed.blocks) {
+    for (const auto &inst : *block) {
+      using ShaderRecompiler::IR::ValueOpcode;
+      if (inst.GetOpcode() == ValueOpcode::SharedAtomicInc32)
+        inc_count++;
+      if (inst.GetOpcode() == ValueOpcode::SharedAtomicDec32)
+        dec_count++;
+      if (inst.GetOpcode() == ValueOpcode::SharedAtomicIRsub32)
+        rsub_count++;
+    }
+  }
+  Check(inc_count == 3u && dec_count == 2u && rsub_count == 2u,
+        "DS wrap/rsub atomics did not lower to shared CAS IR");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "DS_INC_RTN_U32"),
+        "new decoder did not decode DS_INC_RTN_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_DEC_RTN_U32"),
+        "new decoder did not decode DS_DEC_RTN_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_RSUB_RTN_U32"),
+        "new decoder did not decode DS_RSUB_RTN_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "DS_INC_U32"),
+        "new decoder did not decode DS_INC_U32");
+  Check(Common::ContainsStr(result.ir_dump, "SharedAtomicInc32"),
+        "DS_INC did not lower to SharedAtomicInc32");
+  Check(Common::ContainsStr(result.ir_dump, "SharedAtomicDec32"),
+        "DS_DEC did not lower to SharedAtomicDec32");
+  Check(Common::ContainsStr(result.ir_dump, "SharedAtomicIRsub32"),
+        "DS_RSUB did not lower to SharedAtomicIRsub32");
+  Check(SpirvContainsOpcode(result.spirv, 230),
+        "SPIR-V binary does not contain OpAtomicCompareExchange for DS wrap atomics");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerDsSwizzleTranslation() {
   const uint32_t shader[] = {
       EncodeDs0(0x35, 0x001f),
@@ -8389,6 +8533,317 @@ void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
             SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "shared-region/early-break routing lost structured loop control");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgExternalSelectionTailStructured() {
+  // UFC 5 pixel shaders fail here: a selection's then-arm joins a tail that a
+  // path around the selection also enters. Structurize used to dispatcher-fallback.
+  //
+  //   entry --scc1--> sel --scc1--> else ----+
+  //     |              |                     |
+  //     +--> external  +--> then --> tail ---+--> merge
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0: entry
+      EncodeSopp(0x05, 2),    // 0 -> sel (4) or external (2)
+      EncodeSMovB32(6, 129),  // 2: external
+      EncodeSopp(0x02, 6),    // 2 -> tail (10)
+      EncodeSopc(0x06, 1, 1), // 4: selection header
+      EncodeSopp(0x05, 2),    // 4 -> else (8) or then (6)
+      EncodeSMovB32(2, 129),  // 6: then
+      EncodeSopp(0x02, 2),    // 6 -> tail (10)
+      EncodeSMovB32(3, 130),  // 8: else
+      EncodeSopp(0x02, 2),    // 8 -> merge (12)
+      EncodeSMovB32(4, 131),  // 10: shared tail
+      EncodeSopp(0x02, 0),    // 10 -> merge (12)
+      EncodeSMovB32(5, 132),  // 12: merge
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(!graph.irreducible && graph.natural_loops.empty(),
+        "external selection-tail fixture should be a reducible acyclic CFG");
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 247) != 0u &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "external selection tail still selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgDirectSharedTailStructured() {
+  // Header branches to merge vs a tail that is also entered from outside.
+  // Matches UFC PS block 16: true=177, false=17, merge=17, tail preds include 16.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0: entry
+      EncodeSopp(0x05, 2),    // 0 -> sel (4) or external (2)
+      EncodeSMovB32(6, 129),  // 2: external
+      EncodeSopp(0x02, 2),    // 2 -> tail (6)
+      EncodeSopc(0x06, 1, 1), // 4: selection
+      EncodeSopp(0x05, 2),    // 4 -> merge (8) or tail (6)
+      EncodeSMovB32(4, 131),  // 6: shared tail
+      EncodeSopp(0x02, 0),    // 6 -> merge (8)
+      EncodeSMovB32(5, 132),  // 8: merge
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "direct shared tail still selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgLoopedDirectSharedTailStructured() {
+  // DirectSharedTail, but the merge latches back to entry. Both the selection
+  // header and the external pred sit in the same loop; clone should still win.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0: entry / loop
+      EncodeSopp(0x05, 2),    // 0 -> sel (4) or external (2)
+      EncodeSMovB32(6, 129),  // 2: external
+      EncodeSopp(0x02, 2),    // 2 -> tail (6)
+      EncodeSopc(0x06, 1, 1), // 4: selection
+      EncodeSopp(0x05, 2),    // 4 -> merge (8) or tail (6)
+      EncodeSMovB32(4, 131),  // 6: shared tail
+      EncodeSopp(0x02, 0),    // 6 -> merge (8)
+      EncodeSMovB32(5, 132),  // 8: merge
+      EncodeSopc(0x06, 7, 7), // 10: latch
+      EncodeSopp(0x05, 0xfff5u), // 10 -> entry (simm = -11)
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(graph.natural_loops.size() == 1u,
+        "looped shared-tail fixture should contain one natural loop");
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "looped shared tail still selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCfgDualArmReturnContinueJoin() {
+  // UFC PS block 11: both arms can return or fall through to the same join.
+  // Merge finding used to fail because neither arm is a linear return.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // 0: header
+      EncodeSopp(0x05, 4),    // 0 -> armB (6) or armA (2)
+      EncodeSopc(0x06, 1, 1), // 2: armA
+      EncodeSopp(0x05, 10),   // 2 -> ret (14) or armA body (4)
+      EncodeSMovB32(2, 129),  // 4: armA continue
+      EncodeSopp(0x02, 4),    // 4 -> join (10)
+      EncodeSopc(0x06, 2, 2), // 6: armB
+      EncodeSopp(0x05, 6),    // 6 -> ret (14) or armB body (8)
+      EncodeSMovB32(3, 130),  // 8: armB continue
+      EncodeSopp(0x02, 0),    // 8 -> join (10)
+      EncodeSMovB32(4, 131),  // 10: join
+      EncodeSopp(0x02, 0),    // 10 -> after (12)
+      EncodeSMovB32(5, 132),  // 12: after
+      0xbf810000u,            // 13: after return
+      0xbf810000u,            // 14: early return
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  Check(structured, graph.unsupported_reason.c_str());
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            Common::ContainsStr(result.ir_dump, "mode=structured") &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "dual-arm return/continue join still selected dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestUfc5Ps1bcc68ffb7b0469eFixture() {
+  auto code = LoadShaderFixture("PS_1bcc68ffb7b0469e.bin");
+  if (code.empty()) {
+    std::fprintf(stderr,
+                 "ShaderCfgTests: skip UFC PS 0x1bcc68ffb7b0469e fixture "
+                 "(run the match once; copy _Shaders/cfg_fail/"
+                 "PS_1bcc68ffb7b0469e.bin into tests/shaders)\n");
+    return;
+  }
+  Check(code.size() == 5432u, "UFC PS fixture has unexpected word count");
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(!graph.irreducible && graph.blocks.size() == 161u &&
+            graph.natural_loops.size() == 12u,
+        "UFC PS fixture does not match the captured CFG");
+
+  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
+  std::fprintf(stderr,
+               "UFC PS 0x1bcc68ffb7b0469e structurize=%d blocks=%zu reason=%s\n",
+               structured ? 1 : 0, graph.blocks.size(),
+               graph.unsupported_reason.c_str());
+  if (!structured) {
+    const auto dump_path =
+        std::filesystem::path("D:/PS5/ufc_ps_structurize_fail.cfg.txt");
+    std::ofstream dump(dump_path);
+    dump << graph.unsupported_reason << '\n'
+         << ShaderRecompiler::CFG::GraphToString(graph);
+  }
+  Check(structured, graph.unsupported_reason.c_str());
+  Check(std::ranges::none_of(graph.blocks,
+                             [](const auto &block) {
+                               return block.terminator.kind ==
+                                      ShaderRecompiler::CFG::TerminatorKind::
+                                          IndirectBranch;
+                             }),
+        "UFC PS fixture kept an indirect dispatcher branch");
+}
+
+void TestCfgDispatcherFullTinyShader() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(2, 129),
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_blocks = graph.blocks.size();
+
+  ShaderRecompiler::CFG::StructurizeOptions options;
+  options.kind = ShaderRecompiler::CFG::StructurizerKind::DispatcherFull;
+  ShaderRecompiler::CFG::StructurizeStats stats;
+  const bool structured = ShaderRecompiler::CFG::StructurizeWithStrategy(graph, options, &stats);
+  Check(structured, stats.failure_reason.c_str());
+  Check(stats.success && stats.dispatcher_cases == original_blocks &&
+            stats.cloned_semantic_blocks == 0u &&
+            graph.blocks.size() > original_blocks,
+        "tiny dispatcher lowering did not wrap the guest CFG");
+  Check(std::ranges::any_of(graph.blocks,
+                            [](const auto &block) {
+                              return block.terminator.kind ==
+                                     ShaderRecompiler::CFG::TerminatorKind::
+                                         DispatchSwitch;
+                            }),
+        "tiny dispatcher lowering has no dispatch switch");
+
+  auto compile = MakeCompileOptions(ShaderType::Pixel);
+  compile.dump_ir = true;
+  SetShaderCfgStrategyEnv("dispatch");
+  auto result = RecompileForTest(shader, compile);
+  SetShaderCfgStrategyEnv("legacy");
+	Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) != 0u,
+        "tiny dispatcher lowering still used the spill dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestUfc5PsDispatcherFullOracle() {
+  auto code = LoadShaderFixture("PS_1bcc68ffb7b0469e.bin");
+  if (code.empty()) {
+    std::fprintf(stderr, "ShaderCfgTests: skip UFC dispatcher oracle\n");
+    return;
+  }
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+  auto legacy_graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  ShaderRecompiler::CFG::StructurizeOptions legacy_options;
+  legacy_options.kind = ShaderRecompiler::CFG::StructurizerKind::LegacySplit;
+  ShaderRecompiler::CFG::StructurizeStats legacy_stats;
+  const bool legacy_ok = ShaderRecompiler::CFG::StructurizeWithStrategy(
+      legacy_graph, legacy_options, &legacy_stats);
+
+  auto dispatch_graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  ShaderRecompiler::CFG::StructurizeOptions dispatch_options;
+  dispatch_options.kind = ShaderRecompiler::CFG::StructurizerKind::DispatcherFull;
+  ShaderRecompiler::CFG::StructurizeStats dispatch_stats;
+  const bool dispatch_ok = ShaderRecompiler::CFG::StructurizeWithStrategy(
+      dispatch_graph, dispatch_options, &dispatch_stats);
+
+  std::fprintf(stderr,
+               "UFC PS strategy compare: legacy=%d blocks=%u reason=%s | "
+               "dispatch=%d blocks=%u cases=%u synthetic=%u\n",
+               legacy_ok ? 1 : 0, legacy_stats.final_blocks,
+               legacy_stats.failure_reason.c_str(), dispatch_ok ? 1 : 0,
+               dispatch_stats.final_blocks, dispatch_stats.dispatcher_cases,
+               dispatch_stats.synthetic_blocks);
+  std::fflush(stderr);
+
+  Check(dispatch_ok, dispatch_graph.unsupported_reason.c_str());
+  Check(dispatch_stats.dispatcher_cases == 161u &&
+            dispatch_stats.cloned_semantic_blocks == 0u &&
+            dispatch_stats.final_blocks < 161u * 3u,
+        "UFC dispatcher lowering cloned or exploded the guest CFG");
+  Check(std::ranges::count_if(dispatch_graph.blocks,
+                              [](const auto &block) {
+                                return block.terminator.kind ==
+                                       ShaderRecompiler::CFG::TerminatorKind::
+                                           DispatchSwitch;
+                              }) == 1,
+        "UFC dispatcher lowering should contain one dispatch switch");
+
+  ShaderPixelInputInfo pixel;
+  pixel.input_num = 32;
+  SetIdentityInterpolatorSettings(&pixel);
+
+  auto compile = MakeCompileOptions(ShaderType::Pixel);
+  compile.shader_hash = 0x1bcc68ffb7b0469eull;
+  compile.input_info.pixel = &pixel;
+  SetShaderCfgStrategyEnv("dispatch");
+  auto translated = ShaderRecompiler::TranslateProgram(code, compile);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = compile.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = ReadZeroTestMemory,
+      .userdata = nullptr,
+      .read_specialization_memory = ReadZeroTestMemory,
+  };
+  Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                   specialization),
+        "UFC dispatcher oracle resources did not materialize");
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated),
+                                                   compile, specialization);
+  SetShaderCfgStrategyEnv("legacy");
+  std::fprintf(stderr, "UFC PS dispatch recompile spirv_words=%zu phis=%u fallback=%d\n",
+               compiled.spirv.size(),
+               SpirvInstructionOpcodeCount(compiled.spirv, 245u),
+               compiled.program.dispatcher_fallback ? 1 : 0);
+  std::fflush(stderr);
+  Check(!compiled.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(compiled.spirv, 251) != 0u,
+        "UFC dispatcher oracle still used the spill dispatcher");
+  Check(compiled.spirv.size() < 200000u,
+        "wide dispatch phis were not lowered to function variables");
+  CheckSpirvBinaryValidates(compiled.spirv);
+  (void)legacy_ok;
 }
 
 void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
@@ -12689,6 +13144,7 @@ int main() {
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
+  TestNewShaderRecompilerDsIncDecRsubTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized SPIR-V are exercised by
@@ -12740,6 +13196,13 @@ int main() {
   TestNewShaderRecompilerCfgAlternatingSharedReturns();
   TestNewShaderRecompilerCfgLoopSharedRegion();
   TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
+  TestNewShaderRecompilerCfgExternalSelectionTailStructured();
+  TestNewShaderRecompilerCfgDirectSharedTailStructured();
+  TestNewShaderRecompilerCfgLoopedDirectSharedTailStructured();
+  TestNewShaderRecompilerCfgDualArmReturnContinueJoin();
+  TestUfc5Ps1bcc68ffb7b0469eFixture();
+  TestCfgDispatcherFullTinyShader();
+  TestUfc5PsDispatcherFullOracle();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();

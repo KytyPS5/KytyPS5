@@ -60,6 +60,14 @@ void IREmitter::SetGotoVariable(uint32_t id, U1 value) {
 	Emit(ValueOpcode::SetGotoVariable, {Value(id), value});
 }
 
+U32 IREmitter::GetDispatchState() {
+	return U32(Emit(ValueOpcode::GetDispatchState));
+}
+
+void IREmitter::SetDispatchState(U32 value) {
+	Emit(ValueOpcode::SetDispatchState, {value});
+}
+
 U1 IREmitter::GetScc() {
 	return U1(Emit(ValueOpcode::GetScc));
 }

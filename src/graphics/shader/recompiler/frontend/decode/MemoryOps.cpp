@@ -86,6 +86,8 @@ constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x00u, Opcode::DS_ADD_U32, 1, 32},          {0x01u, Opcode::DS_SUB_U32, 1, 32},
+    {0x02u, Opcode::DS_RSUB_U32, 1, 32},         {0x03u, Opcode::DS_INC_U32, 1, 32},
+    {0x04u, Opcode::DS_DEC_U32, 1, 32},
     {0x05u, Opcode::DS_MIN_I32, 1, 32},          {0x06u, Opcode::DS_MAX_I32, 1, 32},
     {0x07u, Opcode::DS_MIN_U32, 1, 32},          {0x08u, Opcode::DS_MAX_U32, 1, 32},
     {0x09u, Opcode::DS_AND_B32, 1, 32},          {0x0au, Opcode::DS_OR_B32, 1, 32},
@@ -94,6 +96,8 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x12u, Opcode::DS_MIN_F32, 1, 32},          {0x13u, Opcode::DS_MAX_F32, 1, 32},
     {0x1eu, Opcode::DS_WRITE_B8, 1, 8},          {0x1fu, Opcode::DS_WRITE_B16, 1, 16},
     {0x20u, Opcode::DS_ADD_RTN_U32, 1, 32},      {0x21u, Opcode::DS_SUB_RTN_U32, 1, 32},
+    {0x22u, Opcode::DS_RSUB_RTN_U32, 1, 32},     {0x23u, Opcode::DS_INC_RTN_U32, 1, 32},
+    {0x24u, Opcode::DS_DEC_RTN_U32, 1, 32},
     {0x25u, Opcode::DS_MIN_RTN_I32, 1, 32},      {0x26u, Opcode::DS_MAX_RTN_I32, 1, 32},
     {0x27u, Opcode::DS_MIN_RTN_U32, 1, 32},      {0x28u, Opcode::DS_MAX_RTN_U32, 1, 32},
     {0x29u, Opcode::DS_AND_RTN_B32, 1, 32},      {0x2au, Opcode::DS_OR_RTN_B32, 1, 32},
@@ -172,6 +176,12 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_RSUB_U32:
+		case Opcode::DS_RSUB_RTN_U32:
+		case Opcode::DS_INC_U32:
+		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_U32:
+		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
 		case Opcode::DS_MAX_I32:

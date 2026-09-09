@@ -274,6 +274,15 @@ IR::MemoryFlags Translator::AddMemoryInfo(const IR::MemoryInfo& memory, uint32_t
 	return {.index = index, .pc = pc};
 }
 
+IR::U32 Translator::ApplyGdsWindow(const IR::MemoryInfo& memory, IR::U32 address) {
+	if (memory.kind != IR::ResourceKind::Gds) {
+		return address;
+	}
+	// RDNA2 GDS aperture: M0[31:16] = byte base, M0[15:0] = size. Regular DS ops add the base
+	// onto VGPR+OFFSET. Size-only windows (UFC 0xC000) leave the address unchanged.
+	return ir.IAdd(ir.ShiftRightLogical(ir.GetM0(), IR::U32(IR::Value(16u))), address);
+}
+
 IR::U32 Translator::GetResourceDword(uint32_t index, uint32_t dword) {
 	return ReadScalarCode(index * 4u + dword);
 }
@@ -566,7 +575,7 @@ bool Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 bool Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto address = ApplyGdsWindow(memory, ReadU32(MemorySourceAt(inst, 1)));
 	const auto result  = ir.Emit(opcode, {address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
 	                             AddMemoryInfo(memory, inst.pc));
 	if (returns_value) {
@@ -759,7 +768,7 @@ void Translator::WriteSharedU32(uint32_t width, IR::U32 address,
 
 bool Translator::DS_READ(const Decoder::Instruction& inst) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 0));
+	const auto address = ApplyGdsWindow(memory, ReadU32(MemorySourceAt(inst, 0)));
 	if (memory.data_bits == 32u) {
 		const auto width  = memory.data_dwords;
 		const auto loaded = LoadSharedU32(width, address, memory, inst.pc);
@@ -778,7 +787,7 @@ bool Translator::DS_READ(const Decoder::Instruction& inst) {
 bool Translator::DS_READ2(const Decoder::Instruction& inst) {
 	const auto memory       = MemoryInfoFromDecoded(inst);
 	const auto width        = memory.data_dwords / 2u;
-	const auto address      = ReadU32(MemorySourceAt(inst, 0));
+	const auto address      = ApplyGdsWindow(memory, ReadU32(MemorySourceAt(inst, 0)));
 	auto       first        = memory;
 	first.data_dwords       = width;
 	first.component_count   = width;
@@ -805,7 +814,7 @@ bool Translator::DS_WRITE(const Decoder::Instruction& inst) {
 	for (uint32_t index = 0; index < width; index++) {
 		values[index] = ReadU32(OffsetOperand(data_operand, index));
 	}
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto address = ApplyGdsWindow(memory, ReadU32(MemorySourceAt(inst, 1)));
 	if (memory.data_bits == 32u) {
 		WriteSharedU32(width, address, values, memory, inst.pc);
 		return true;
@@ -820,7 +829,8 @@ bool Translator::DS_WRITE(const Decoder::Instruction& inst) {
 bool Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 	const auto               memory      = MemoryInfoFromDecoded(inst);
 	const auto               width       = memory.data_dwords / 2u;
-	const auto               address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto               address =
+	    ApplyGdsWindow(memory, ReadU32(MemorySourceAt(inst, 1)));
 	const auto               first_data  = MemorySourceAt(inst, 0);
 	const auto               second_data = MemorySourceAt(inst, 2);
 	std::array<IR::Value, 4> first_values {};
@@ -844,8 +854,8 @@ bool Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 bool Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	ir.Emit(opcode,
-	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
-	         ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
+	        {ApplyGdsWindow(memory, ReadU32(MemorySourceAt(inst, 1))),
+	         ReadU32(MemorySourceAt(inst, 0)), ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
 	return true;
 }
@@ -974,6 +984,18 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, false);
 		case Decoder::Opcode::DS_SUB_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, true);
+		case Decoder::Opcode::DS_RSUB_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIRsub32, false);
+		case Decoder::Opcode::DS_RSUB_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIRsub32, true);
+		case Decoder::Opcode::DS_INC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, false);
+		case Decoder::Opcode::DS_INC_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, true);
+		case Decoder::Opcode::DS_DEC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, false);
+		case Decoder::Opcode::DS_DEC_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, true);
 		case Decoder::Opcode::DS_MIN_I32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSMin32, false);
 		case Decoder::Opcode::DS_MIN_RTN_I32:

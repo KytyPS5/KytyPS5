@@ -141,9 +141,9 @@ public:
 				}
 			}
 
-			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_SPACE ||
-			                      binding.key == SDLK_F1 || binding.key == SDLK_F7 ||
-			                      binding.key == SDLK_F11;
+			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
+			                      binding.key == SDLK_F7 || binding.key == SDLK_F8 ||
+			                      binding.key == SDLK_F9 || binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -214,6 +214,7 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDLK_SPACE:
 		case SDLK_j: return Controller::PAD_BUTTON_CROSS;
 		case SDLK_i: return Controller::PAD_BUTTON_TRIANGLE;
 		case SDLK_k: return Controller::PAD_BUTTON_SQUARE;

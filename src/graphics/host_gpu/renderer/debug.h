@@ -41,6 +41,35 @@ void                     LogDrawPhase(const char* draw_name, const char* phase);
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
                                vk::Extent2D extent, uint32_t viewport_index);
 
+enum class FrameWorkKind : uint8_t { Draw, Dispatch, Submit, Finish, Present };
+
+struct FrameWorkPulse {
+	uint32_t draws       = 0;
+	uint32_t dispatches  = 0;
+	uint32_t submits     = 0;
+	uint32_t finishes    = 0;
+	uint32_t presents    = 0;
+	double   draw_ms     = 0.0;
+	double   dispatch_ms = 0.0;
+	double   submit_ms   = 0.0;
+	double   finish_ms   = 0.0;
+	double   present_ms  = 0.0;
+};
+
+[[nodiscard]] FrameWorkPulse ConsumeFrameWorkPulse();
+
+class FrameWorkScope {
+public:
+	explicit FrameWorkScope(FrameWorkKind kind);
+	~FrameWorkScope();
+	FrameWorkScope(const FrameWorkScope&)            = delete;
+	FrameWorkScope& operator=(const FrameWorkScope&) = delete;
+
+private:
+	FrameWorkKind kind_;
+	uint64_t      start_;
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEBUG_H_

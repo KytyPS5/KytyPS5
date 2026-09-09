@@ -77,19 +77,37 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  EndOfPipeWriteAction action, int interrupt_event_id = 0,
                                  uint32_t context_id = 0) {
 	EXIT_IF(destination == 0);
-	(void)buffer.Handle();
+	auto& scheduler = buffer.GetContext().GetCommandScheduler();
+	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
 
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
 	const auto value_high = static_cast<uint32_t>(value >> 32u);
 	const auto operation  = static_cast<uint32_t>(DebugOperation(action));
-	if (TriggersInterrupt(action)) {
+	const bool interrupt  = TriggersInterrupt(action);
+	if (interrupt) {
 		buffer.SetDebugInfo(operation, submit_id, width, context_id, value_low, value_high,
 		                    destination);
-		TriggerEopEventAtEndOfPipe(buffer, interrupt_event_id, context_id);
 	} else {
 		buffer.SetDebugInfo(operation, submit_id, width, value_low, value_high, 0, destination);
 	}
+
+	auto* renderer = &buffer.GetContext();
+	auto  commit   = [destination, value, size, interrupt, interrupt_event_id, context_id,
+	                  renderer] {
+		if (size == EndOfPipeWriteSize::Dword) {
+			const auto data = static_cast<uint32_t>(value);
+			std::memcpy(reinterpret_cast<void*>(destination), &data, sizeof(data));
+		} else {
+			std::memcpy(reinterpret_cast<void*>(destination), &value, sizeof(value));
+		}
+		if (interrupt) {
+			renderer->TriggerInterrupt(interrupt_event_id, context_id);
+		}
+	};
+	// Priority so the guest write is visible as soon as the GPU completes, even if the
+	// command processor is idle waiting for the CPU to observe the fence.
+	scheduler.DeferPriorityOperation(std::move(commit));
 }
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -114,7 +132,7 @@ void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst
 
 void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
                                   uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -124,7 +142,7 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
 
 void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
                                                uint64_t* dst_gpu_addr, uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -210,7 +228,8 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
+	scheduler.DeferPriorityOperation([&renderer, event_id, request_id, dst_gpu_addr, value] {
+		std::memcpy(dst_gpu_addr, &value, sizeof(value));
 		renderer.GetVideoOut().CompleteFlip(request_id);
 		renderer.TriggerInterrupt(event_id, 0);
 	});
@@ -228,8 +247,10 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation(
-	    [&renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
+	scheduler.DeferPriorityOperation([&renderer, request_id, dst_gpu_addr, value] {
+		std::memcpy(dst_gpu_addr, &value, sizeof(value));
+		renderer.GetVideoOut().CompleteFlip(request_id);
+	});
 }
 
 void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int handle, int index,

@@ -2767,10 +2767,11 @@ public:
         [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+    gpu.SendCommandSync([&] { scheduler.Finish(); });
     Require("GpuCommandLane", "unmap native completion",
             normal_completed.load() &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size),
-            "unmap returned before an earlier native guest-memory callback");
+            "deferred guest-memory callback did not run after the unmap tick");
 
     std::binary_semaphore priority_entered{0};
     std::binary_semaphore release_priority{0};
@@ -3670,44 +3671,68 @@ public:
           window_owner_offset + window_size - sizeof(uint32_t);
       constexpr uint64_t window_outside_offset =
           window_owner_offset + window_size;
+      constexpr uint64_t large_skip_offset = 0x1a00000;
+      constexpr uint64_t large_skip_size = 0x12000;
       constexpr uint32_t window_stale = 0x13579bdfu;
       constexpr uint32_t window_value = 0x2468ace0u;
+      constexpr uint32_t coalesce_large_stale = 0x11111111u;
+      constexpr uint32_t coalesce_large_value = 0x22222222u;
       constexpr std::array window_offsets{
           window_fault_offset, window_inside_offset, window_outside_offset};
       static_assert((base + window_owner_offset) % window_size ==
                     window_size / 2);
+      static_assert(large_skip_size > 64 * 1024);
       for (const auto offset : window_offsets) {
         Libs::LibKernel::Memory::WriteBacking(base + offset, &window_stale,
                                               sizeof(window_stale));
       }
+      Libs::LibKernel::Memory::WriteBacking(base + large_skip_offset,
+                                            &coalesce_large_stale,
+                                            sizeof(coalesce_large_stale));
       (void)cache.FindBuffer(base + window_owner_offset, window_owner_size);
       for (const auto offset : window_offsets) {
         MarkGpuWrite(base + offset, sizeof(window_value));
         cache.FillBuffer(base + offset, sizeof(window_value), window_value,
                          false);
       }
+      MarkGpuWrite(base + large_skip_offset, large_skip_size);
+      cache.FillBuffer(base + large_skip_offset, large_skip_size,
+                       coalesce_large_value, false);
       cache.ReadMemory(base + window_fault_offset, sizeof(window_value));
       uint32_t window_inside_backing = 0;
       uint32_t window_outside_backing = 0;
+      uint32_t large_skip_backing = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + window_inside_offset,
                                               &window_inside_backing,
                                               sizeof(window_inside_backing));
       Libs::LibKernel::Memory::TryReadBacking(base + window_outside_offset,
                                               &window_outside_backing,
                                               sizeof(window_outside_backing));
-      Require(name, "widened-window boundary",
+      Libs::LibKernel::Memory::TryReadBacking(base + large_skip_offset,
+                                              &large_skip_backing,
+                                              sizeof(large_skip_backing));
+      Require(name, "coalesce-small-outside-window",
               window_inside_backing == window_value &&
-                  window_outside_backing == window_stale &&
+                  window_outside_backing == window_value &&
                   !cache.HasGpuDirtyBytes(base + window_inside_offset,
                                           sizeof(window_value)) &&
-                  cache.HasGpuDirtyBytes(base + window_outside_offset,
-                                         sizeof(window_value)) &&
+                  !cache.HasGpuDirtyBytes(base + window_outside_offset,
+                                          sizeof(window_value)) &&
                   !cache.IsRegionGpuModified(base + window_inside_offset,
                                              sizeof(window_value)) &&
-                  cache.IsRegionGpuModified(base + window_outside_offset,
-                                            sizeof(window_value)),
-              "readback did not honor the clamped half-open 512 KiB window");
+                  !cache.IsRegionGpuModified(base + window_outside_offset,
+                                             sizeof(window_value)),
+              "readback did not coalesce the small dirty range outside the "
+              "512 KiB window");
+      Require(name, "skip-large-unrelated-download",
+              large_skip_backing == coalesce_large_stale &&
+                  cache.HasGpuDirtyBytes(base + large_skip_offset,
+                                         large_skip_size) &&
+                  cache.IsRegionGpuModified(base + large_skip_offset,
+                                            large_skip_size),
+              "readback eagerly downloaded a large unrelated dirty range");
       cache.ReadMemory(base + window_outside_offset, sizeof(window_value));
+      cache.ReadMemory(base + large_skip_offset, sizeof(coalesce_large_value));
 
       Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
                                             sizeof(first_stale));
@@ -13876,6 +13901,12 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_ADD_RTN_U32:
   case Opcode::DS_SUB_U32:
   case Opcode::DS_SUB_RTN_U32:
+  case Opcode::DS_RSUB_U32:
+  case Opcode::DS_RSUB_RTN_U32:
+  case Opcode::DS_INC_U32:
+  case Opcode::DS_INC_RTN_U32:
+  case Opcode::DS_DEC_U32:
+  case Opcode::DS_DEC_RTN_U32:
   case Opcode::DS_MIN_I32:
   case Opcode::DS_MIN_RTN_I32:
   case Opcode::DS_MAX_I32:
@@ -21082,6 +21113,167 @@ TestCase DsAtomicReturnVariants() {
        O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase DsIncDecRsubLdsVariants() {
+  using O = ShaderOpcode;
+
+  // RDNA2 wrap-inc/dec and reverse-sub. Slot layout:
+  // 0 INC_RTN 10 vs 20 -> ret 10, mem 11
+  // 1 INC_RTN 20 vs 20 -> ret 20, mem 0  (tmp >= DATA wraps)
+  // 2 INC_RTN 21 vs 20 -> ret 21, mem 0
+  // 3 DEC_RTN 10 vs 20 -> ret 10, mem 9
+  // 4 DEC_RTN 0 vs 20  -> ret 0,  mem 20 (tmp == 0 wraps)
+  // 5 DEC_RTN 21 vs 20 -> ret 21, mem 20 (tmp > DATA wraps)
+  // 6 RSUB_RTN 5 vs 20 -> ret 5,  mem 15
+  // 7 INC no-return 7 vs 100 -> mem 8
+  // 8 DEC no-return 0 vs 3   -> mem 3
+  // 9 RSUB no-return 8 vs 10 -> mem 2
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  const u32 initial[] = {10, 20, 21, 10, 0, 21, 5, 7, 0, 8};
+  const u32 values[]  = {20, 20, 20, 20, 20, 20, 20, 100, 3, 10};
+  const u32 ops[]     = {0x23, 0x23, 0x23, 0x24, 0x24, 0x24, 0x22, 0x03, 0x04, 0x02};
+  for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
+    AppendVMovLiteral(&code, 2, initial[i]);
+    code.push_back(EncodeDs0(0x0d, i * 4u));
+    code.push_back(EncodeDs1(0, 2, 1));
+    AppendVMovLiteral(&code, 3, values[i]);
+    code.push_back(EncodeDs0(ops[i], i * 4u));
+    code.push_back(EncodeDs1(10u + i, 3, 1));
+    code.push_back(EncodeDs0(0x36, i * 4u));
+    code.push_back(EncodeDs1(20u + i, 0, 1));
+  }
+  // Overlapping vdst==data0, matching the UFC encoding (without GDS).
+  AppendVMovLiteral(&code, 2, 10);
+  code.push_back(EncodeDs0(0x0d, 40));
+  code.push_back(EncodeDs1(0, 2, 1));
+  AppendVMovLiteral(&code, 3, 100);
+  code.push_back(EncodeDs0(0x23, 40));
+  code.push_back(EncodeDs1(3, 3, 1));
+  code.push_back(EncodeDs0(0x36, 40));
+  code.push_back(EncodeDs1(4, 0, 1));
+
+  for (u32 i = 0; i < 7; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  for (u32 i = 0; i < 10; i++) {
+    AppendStoreVgpr(&code, 20u + i, 7u + i);
+  }
+  AppendStoreVgpr(&code, 3, 17);
+  AppendStoreVgpr(&code, 4, 18);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsIncDecRsubLdsVariants";
+  test.code = code;
+  test.initial = std::vector<u32>(19, 0);
+  test.expected = {10, 20, 21, 10, 0, 21, 5, 11, 0, 0, 9, 20, 20, 15, 8, 3, 2,
+                   10, 11};
+  test.opcodes = {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_INC_U32, O::DS_INC_RTN_U32,
+                  O::DS_DEC_U32, O::DS_DEC_RTN_U32, O::DS_RSUB_U32,
+                  O::DS_RSUB_RTN_U32, O::DS_READ_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsIncRtnGdsCapturedOverlap() {
+  using O = ShaderOpcode;
+
+  // Captured UFC encoding: ds_inc_rtn_u32 v3, v2, v3 offset:4 gds
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 124, 0x0000C000u); // UFC s_bfm_b32 m0, 2, 14 (size window, base 0)
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 100);
+  code.push_back(0xd88e0004u);
+  code.push_back(0x03000302u);
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsIncRtnGdsCapturedOverlap";
+  test.code = code;
+  test.initial = std::vector<u32>(1, 0);
+  test.expected = {10};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::DS_INC_RTN_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.gds_initial = {0, 10};
+  test.expected_gds = {0, 11};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsIncRtnGdsUsesM0Base() {
+  using O = ShaderOpcode;
+
+  // M0[31:16] is the GDS byte base. base=8, offset=0 -> dword 2.
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 124, 0x00080000u);
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 100);
+  code.push_back(EncodeDs0(0x23, 0, true));
+  code.push_back(EncodeDs1(3, 3, 2));
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsIncRtnGdsUsesM0Base";
+  test.code = code;
+  test.initial = std::vector<u32>(1, 0);
+  test.expected = {10};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::DS_INC_RTN_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.gds_initial = {0, 0, 10};
+  test.expected_gds = {0, 0, 11};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsIncRtnGdsContendedWorkgroups() {
+  using O = ShaderOpcode;
+
+  // UFC hang CS: 144 groups, 256 threads, only local thread 0 wrap-incs
+  // GDS[1] (DATA=-1) then s_barrier. 256x1x1 keeps v0 as the linear id so
+  // v0==0 is exactly one lane per group (UFC uses v21=(v1<<4)+v0).
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 124, 0x0000C000u);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0)); // vcc = (v0 == 0)
+  code.push_back(EncodeSop1(0x04, 126, 106));        // exec = vcc
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 0xffffffffu);
+  code.push_back(0xd88e0004u);
+  code.push_back(0x03000302u);
+  code.push_back(EncodeSop1(0x04, 126, 193u)); // exec = -1
+  code.push_back(EncodeSopp(0x0a, 0));         // s_barrier
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsIncRtnGdsContendedWorkgroups";
+  test.code = code;
+  test.initial = std::vector<u32>(1, 0);
+  test.expected = {0};
+  test.opcodes = {O::S_MOV_B32, O::V_CMP_EQ_U32, O::S_MOV_B64, O::V_MOV_B32,
+                  O::DS_INC_RTN_U32, O::S_BARRIER, O::S_ENDPGM};
+  test.gds_initial = {0, 0};
+  test.expected_gds = {0, 144};
+  test.compute_info.threads_num[0] = 256;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.dispatch_x = 144;
+  return test;
+}
+
 TestCase DsMiscVariants() {
   using O = ShaderOpcode;
 
@@ -23850,6 +24042,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsWideGdsPartialBounds);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
+  AddCase(DsIncDecRsubLdsVariants);
+  AddCase(DsIncRtnGdsCapturedOverlap);
+  AddCase(DsIncRtnGdsUsesM0Base);
+  AddCase(DsIncRtnGdsContendedWorkgroups);
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
@@ -28349,6 +28545,14 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-inc-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsIncDecRsubLdsVariants());
+    RunCase(&vulkan, DsIncRtnGdsCapturedOverlap());
+    RunCase(&vulkan, DsIncRtnGdsUsesM0Base());
+    RunCase(&vulkan, DsIncRtnGdsContendedWorkgroups());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-only") == 0) {

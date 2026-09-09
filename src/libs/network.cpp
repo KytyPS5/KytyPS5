@@ -1269,6 +1269,21 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+	PRINT_NAME();
+
+	LOGF("\t rid   = %d\n"
+	     "\t flags = %d\n",
+	     rid, flags);
+
+	EXIT_IF(g_net == nullptr);
+	if (!g_net->ResolverValid(rid)) {
+		return NET_ERROR_EBADF;
+	}
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	PRINT_NAME();

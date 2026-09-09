@@ -58,10 +58,12 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// Do not Finish()/idle-wait the GPU. Waiting on the current tick deadlocked
+		// boot (priority callbacks wait for a tick this thread would have to
+		// submit). Drain only already-signaled ticks. GPU-dirty bytes still wait
+		// inside InvalidateMemory's buffer-download path.
 		if (m_scheduler.Active()) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Finish();
-			m_scheduler.WaitPriorityOperations(tick);
+			m_scheduler.SyncDeferredOperations();
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

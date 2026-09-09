@@ -8,10 +8,15 @@
 
 namespace Libs::Graphics {
 
+struct VulkanImage;
+
 namespace ImageViewOps {
 
 [[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
 [[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
+[[nodiscard]] bool ViewEncodingCompatible(vk::Format base, vk::Format view) noexcept;
+[[nodiscard]] bool ViewCompatible(const VulkanImage& image, ImageViewInfo view) noexcept;
+[[nodiscard]] bool CopyableTypeChange(const VulkanImage& source, const ImageInfo& destination) noexcept;
 
 [[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {
 	switch (format) {
@@ -66,8 +71,17 @@ namespace ImageViewOps {
 [[nodiscard]] inline bool IsSupportedSampledColorView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {
-	return IsValidImageSwizzle(swizzle) &&
-	       ImageViewOps::FormatsCompatible(image_format, view_format);
+	if (!IsValidImageSwizzle(swizzle)) {
+		return false;
+	}
+	if (ImageViewOps::FormatsCompatible(image_format, view_format)) {
+		return true;
+	}
+	// UFC 5 samples GPU-written images with packed-float descriptors. Same-size
+	// encodings (RGBA8 vs 11-11-10) remap the Vulkan view to the backing format.
+	// Different-size encodings (R16 vs B10G11R11) are converted in FindImage.
+	return image_format != vk::Format::eUndefined && view_format != vk::Format::eUndefined &&
+	       !ImageViewOps::ViewEncodingCompatible(image_format, view_format);
 }
 
 [[nodiscard]] inline uint32_t

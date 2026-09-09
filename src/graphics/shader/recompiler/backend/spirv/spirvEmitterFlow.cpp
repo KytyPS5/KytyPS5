@@ -212,7 +212,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
                                     uint32_t mode) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
-	if (!input->per_vertex) {
+	if (input == nullptr || !input->per_vertex) {
 		return EmitAttribute(ctx, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {

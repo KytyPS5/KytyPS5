@@ -1007,6 +1007,54 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (length < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto path_s         = std::string(path);
+	auto real_file_name = g_mount_points->GetRealFilename(path_s);
+
+	if (Common::File::IsDirectoryExisting(real_file_name)) {
+		return KERNEL_ERROR_EISDIR;
+	}
+
+	if (!Common::File::IsFileExisting(real_file_name)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	auto* open_file = g_files->GetFile(real_file_name);
+	if (open_file != nullptr && open_file->opened) {
+		if (open_file->directory || open_file->special != SpecialFile::None) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (!open_file->writable) {
+			return KERNEL_ERROR_EACCES;
+		}
+		Common::LockGuard lock(open_file->mutex);
+		if (open_file->f.IsInvalid() || !open_file->f.Truncate(static_cast<uint64_t>(length))) {
+			return KERNEL_ERROR_EIO;
+		}
+		LOGF("\tTruncate (size = %" PRId64 ") open file: %s\n", length, path);
+		return OK;
+	}
+
+	Common::File file;
+	if (!file.Open(real_file_name, Common::File::Mode::ReadWrite) ||
+	    !file.Truncate(static_cast<uint64_t>(length))) {
+		return KERNEL_ERROR_EACCES;
+	}
+
+	LOGF("\tTruncate (size = %" PRId64 ") file: %s\n", length, path);
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	PRINT_NAME();
 

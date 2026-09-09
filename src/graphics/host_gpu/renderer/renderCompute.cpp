@@ -15,9 +15,13 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -27,15 +31,123 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+constexpr uint64_t kUfcHangCsHash = 0xea0aceac518ec52dull;
+
+bool ParseHexU64(const char* text, uint64_t* out) {
+	if (text == nullptr || out == nullptr) {
+		return false;
+	}
+	while (*text == ' ' || *text == '\t') {
+		++text;
+	}
+	if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+		text += 2;
+	}
+	if (*text == '\0') {
+		return false;
+	}
+	char*                    end   = nullptr;
+	const unsigned long long value = std::strtoull(text, &end, 16);
+	if (end == text) {
+		return false;
+	}
+	*out = static_cast<uint64_t>(value);
+	return true;
+}
+
+bool EnvListContainsHash(const char* env_name, uint64_t hash) {
+	const char* env = std::getenv(env_name);
+	if (env == nullptr || env[0] == '\0') {
+		return false;
+	}
+	if ((env[0] == '*' && env[1] == '\0') || (env[0] == '1' && env[1] == '\0')) {
+		return hash == kUfcHangCsHash;
+	}
+	const char* cursor = env;
+	while (*cursor != '\0') {
+		while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
+			++cursor;
+		}
+		if (*cursor == '\0') {
+			break;
+		}
+		const char* start = cursor;
+		while (*cursor != '\0' && *cursor != ',') {
+			++cursor;
+		}
+		std::string token(start, static_cast<size_t>(cursor - start));
+		while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
+			token.pop_back();
+		}
+		uint64_t parsed = 0;
+		if (ParseHexU64(token.c_str(), &parsed) && parsed == hash) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool ShouldSkipComputeHash(uint64_t hash) {
+	return EnvListContainsHash("KYTY_SKIP_CS_HASH", hash);
+}
+
+static bool TryParseEnvU32(const char* name, uint32_t& out) {
+	const char* env = std::getenv(name);
+	if (env == nullptr || env[0] == '\0') {
+		return false;
+	}
+	char*              end   = nullptr;
+	const unsigned long value = std::strtoul(env, &end, 0);
+	if (end == env || value > std::numeric_limits<uint32_t>::max()) {
+		return false;
+	}
+	out = static_cast<uint32_t>(value);
+	return true;
+}
+
+static bool ReadGdsDwords(RenderContext& context, std::array<uint32_t, 8>& words) {
+	auto* gds = context.GetBufferCache().GetGdsBuffer();
+	if (gds == nullptr || gds->Handle() == nullptr) {
+		return false;
+	}
+	constexpr uint32_t kProbeDwords = 8;
+	const uint64_t     probe_bytes  = kProbeDwords * sizeof(uint32_t);
+	auto&              download     = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	auto&              scheduler    = context.GetCommandScheduler();
+	const auto [mapped, offset]     = download.Map(probe_bytes, 4);
+	if (mapped == nullptr) {
+		return false;
+	}
+	download.CopyFrom(scheduler.Current(), *gds, 0, offset, probe_bytes,
+	                  vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+	                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	                  vk::AccessFlagBits::eHostRead);
+	download.Commit();
+	scheduler.Finish("gds-probe");
+	download.Invalidate(offset, probe_bytes);
+	std::memcpy(words.data(), mapped, static_cast<size_t>(probe_bytes));
+	return true;
+}
+
+static void FillGdsDword(Buffer* gds, uint32_t dword_index, uint32_t value) {
+	if (gds == nullptr || gds->Handle() == nullptr) {
+		return;
+	}
+	gds->Fill(static_cast<uint64_t>(dword_index) * sizeof(uint32_t), sizeof(uint32_t), value);
+}
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -221,6 +333,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	FrameWorkScope    frame_work(FrameWorkKind::Dispatch);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -283,20 +396,68 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 	    });
 	const bool                   has_sampler = !program.info.samplers.empty();
+	const bool                   fullscreen_cs =
+	    thread_group_x >= 200 && thread_group_y >= 100 && thread_group_z <= 1;
+	const uint64_t shader_hash = program.shader_hash;
+	const bool     skip_cs     = ShouldSkipComputeHash(shader_hash);
+	const bool     watch_cs =
+	    shader_hash == kUfcHangCsHash || skip_cs ||
+	    EnvListContainsHash("KYTY_DUMP_SHADER_HASH", shader_hash);
 	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+	static std::atomic<uint32_t> fullscreen_log_count {0};
+	std::array<uint32_t, 8> gds_words {};
+	bool                    have_gds_words = false;
+	if (shader_hash == kUfcHangCsHash && !skip_cs) {
+		have_gds_words = ReadGdsDwords(m_context, gds_words);
+		static std::atomic<uint32_t> gds_probe_count {0};
+		if (gds_probe_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			if (!have_gds_words) {
+				LOGF("GraphicsRenderDispatchDirect: GDS probe hash=0x%016" PRIx64
+				     " buffer missing or download map failed\n",
+				     shader_hash);
+			} else {
+				LOGF("GraphicsRenderDispatchDirect: GDS probe hash=0x%016" PRIx64
+				     " limit[0]=0x%08" PRIx32 " counter[1]=0x%08" PRIx32
+				     " dw=[0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32
+				     ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 "]\n",
+				     shader_hash, gds_words[0], gds_words[1], gds_words[0], gds_words[1],
+				     gds_words[2], gds_words[3], gds_words[4], gds_words[5], gds_words[6],
+				     gds_words[7]);
+			}
+		}
+	}
+	uint32_t       work_limit     = have_gds_words ? gds_words[0] : 0;
+	const uint32_t original_limit = work_limit;
+	uint32_t       work_counter   = have_gds_words ? gds_words[1] : 0;
+	uint32_t       limit_cap      = 0;
+	if (!skip_cs && shader_hash == kUfcHangCsHash && TryParseEnvU32("KYTY_GDS_LIMIT_CAP", limit_cap) &&
+	    limit_cap > 0) {
+		if (work_limit == 0 || limit_cap < work_limit) {
+			work_limit = limit_cap;
+		}
+		LOGF("GraphicsRenderDispatchDirect: GDS limit cap hash=0x%016" PRIx64
+		     " limit[0]=%u original=%u\n",
+		     shader_hash, work_limit, original_limit);
+	}
+	uint32_t gds_chunk = shader_hash == kUfcHangCsHash ? 4u : 0u;
+	if (shader_hash == kUfcHangCsHash) {
+		TryParseEnvU32("KYTY_GDS_CHUNK", gds_chunk);
+	}
+	if (watch_cs || ((large_workgroup || has_sampler) &&
+	                 dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) ||
+	    (fullscreen_cs && fullscreen_log_count.fetch_add(1, std::memory_order_relaxed) < 32)) {
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
-		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
-		     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
-		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(),
+		     " hash=0x%016" PRIx64 " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u%s\n",
+		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, shader_hash, thread_group_x,
+		     thread_group_y, thread_group_z, mode, input_info.threads_num[0],
+		     input_info.threads_num[1], input_info.threads_num[2], program.info.buffers.size(),
+		     program.info.images.size(), sampled_images,
+		     program.info.images.size() - sampled_images, program.info.samplers.size(),
 		     program.bindings.UsesPushData()
 		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
-		         : 0u);
+		         : 0u,
+		     skip_cs ? " skip=1" : "");
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& buffer = program.info.buffers[i];
 			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -372,21 +533,55 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	if (skip_cs) {
+		// Rather than dropping the dispatch outright (which leaves the occlusion-cull
+		// shader's Hi-Z / software-depth outputs holding stale data, so every GPU-driven
+		// draw is culled and the scene renders black), stub it to "nothing occludes":
+		// clear its read-write images to zero. Zero is what the real shader stores into a
+		// tile with no occluder (IMAGE_STORE v=0 at tile setup), and with Frostbite's
+		// reverse-Z that is the far plane, so downstream visibility tests pass everything.
+		auto&    cache        = buffer.GetContext().GetTextureCache();
+		uint32_t cleared      = 0;
+		for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+			const auto& resource = program.info.images[i];
+			if (!resource.written) {
+				continue;
+			}
+			const auto binding = ResolveTexture(resource, resources.images[i]);
+			if (!binding.image_id) {
+				continue;
+			}
+			std::scoped_lock lock {cache.m_lock};
+			const auto&      image = cache.GetImage(binding.image_id);
+			if (image.backing.image == nullptr || image.depth_id ||
+			    image.info.resources.levels == 0) {
+				continue;
+			}
+			const bool is_depth = image.info.IsDepth();
+			const vk::ImageSubresourceRange range {
+			    is_depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, 0,
+			    image.info.resources.levels, 0, image.backing.layers};
+			vk::ClearValue clear {};
+			if (is_depth) {
+				clear.depthStencil = vk::ClearDepthStencilValue {0.0f, 0};
+			} else {
+				clear.color = vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+			}
+			cache.ClearImage(buffer, binding.image_id, range, clear);
+			cleared++;
+		}
+		LOGF("GraphicsRenderDispatchDirect: stubbing watched compute shader hash=0x%016" PRIx64
+		     " addr=0x%016" PRIx64 " groups=%ux%ux%u local=%ux%ux%u cleared_images=%u\n",
+		     shader_hash, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
+		     thread_group_z, input_info.threads_num[0], input_info.threads_num[1],
+		     input_info.threads_num[2], cleared);
+		ResetBindings();
+		return;
+	}
+
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
-	auto bindings = PrepareBindings(input_info.stage);
-	FindBuffers(bindings);
-	if (program.info.uses_dma) {
-		m_context.GetGpuResources().PrepareBda();
-	}
-	RebindBuffers(bindings);
-	RebindImages(bindings);
-
-	auto              vk_buffer        = buffer.Handle();
-	PreparedBindings* descriptor_stage = &bindings;
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -396,17 +591,80 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	const bool uses_gds =
+	    ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr;
+	// Read-only dispatches need ordering, but no memory visibility operation.
+	const bool writes_memory =
+	    has_storage_writes || program.info.uses_dma || uses_gds ||
+	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                [](const auto& resource) { return resource.written || resource.atomic; }) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& resource) { return resource.written || resource.atomic; });
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	ResetBindings();
+	auto record_dispatch = [&]() {
+		auto bindings = PrepareBindings(input_info.stage);
+		FindBuffers(bindings);
+		if (program.info.uses_dma) {
+			m_context.GetGpuResources().PrepareBda();
+		}
+		RebindBuffers(bindings);
+		RebindImages(bindings);
+		auto              vk_buffer        = buffer.Handle();
+		PreparedBindings* descriptor_stage = &bindings;
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+		               std::span {&descriptor_stage, 1u});
+		if (has_storage_writes) {
+			// A host fence used to serialize every dispatch. Preserve its read-before-write
+			// ordering while allowing the queue to execute asynchronously.
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
+		ResetBindings();
+	};
+
+	auto*      gds         = m_context.GetBufferCache().GetGdsBuffer();
+	const bool chunk_queue = shader_hash == kUfcHangCsHash && gds_chunk > 0 &&
+	                         work_limit > gds_chunk && gds != nullptr && gds->Handle() != nullptr;
+	if (chunk_queue) {
+		uint32_t start = work_counter < work_limit ? work_counter : 0;
+		const uint32_t chunk_count =
+		    (work_limit - start + gds_chunk - 1u) / gds_chunk;
+		LOGF("GraphicsRenderDispatchDirect: GDS chunk begin hash=0x%016" PRIx64
+		     " items=%u start=%u chunk=%u submits=%u original_limit=%u\n",
+		     shader_hash, work_limit, start, gds_chunk, chunk_count, original_limit);
+		uint32_t chunk_index = 0;
+		while (start < work_limit) {
+			const uint32_t end = std::min(start + gds_chunk, work_limit);
+			FillGdsDword(gds, 0, end);
+			FillGdsDword(gds, 1, start);
+			const auto chunk_t0 = std::chrono::steady_clock::now();
+			record_dispatch();
+			m_context.GetCommandScheduler().Finish("gds-chunk");
+			const double chunk_ms = std::chrono::duration<double, std::milli>(
+			                            std::chrono::steady_clock::now() - chunk_t0)
+			                            .count();
+			++chunk_index;
+			if (chunk_index <= 8 || chunk_index == chunk_count || (chunk_index % 32u) == 0) {
+				LOGF("GraphicsRenderDispatchDirect: GDS chunk %u/%u processed [%u,%u) "
+				     "ms=%.1f\n",
+				     chunk_index, chunk_count, start, end, chunk_ms);
+			}
+			start = end;
+		}
+		FillGdsDword(gds, 0, original_limit != 0 ? original_limit : work_limit);
+		FillGdsDword(gds, 1, work_limit);
+		LOGF("GraphicsRenderDispatchDirect: GDS chunk done hash=0x%016" PRIx64
+		     " chunks=%u items=%u\n",
+		     shader_hash, chunk_index, work_limit);
+	} else {
+		if (limit_cap > 0) {
+			FillGdsDword(gds, 0, work_limit);
+		}
+		record_dispatch();
+	}
 }
 
 } // namespace Libs::Graphics

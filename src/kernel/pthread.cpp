@@ -4079,13 +4079,20 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	LOGF("\tnanosleep: %" PRIu64 "\n", nanos);
+	static std::atomic<uint32_t> nanosleep_logs = 0;
+	const bool                   log_sleep =
+	    nanosleep_logs.fetch_add(1, std::memory_order_relaxed) < 16;
+	if (log_sleep) {
+		LOGF("\tnanosleep: %" PRIu64 "\n", nanos);
+	}
 
 	Common::Timer t;
 	t.Start();
 	SleepNanoWithSignalPoll(nanos);
 	double ts = t.GetTimeS();
-	LOGF("\tactual: %g nanoseconds\n", ts * 1000000000.0);
+	if (log_sleep) {
+		LOGF("\tactual: %g nanoseconds\n", ts * 1000000000.0);
+	}
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;

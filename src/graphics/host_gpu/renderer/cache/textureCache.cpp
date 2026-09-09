@@ -17,8 +17,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -31,6 +33,29 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+[[nodiscard]] bool SameTexelBlockSize(vk::Format a, vk::Format b) noexcept {
+	if (a == vk::Format::eUndefined || b == vk::Format::eUndefined) {
+		return false;
+	}
+	return vk::blockSize(a) == vk::blockSize(b);
+}
+
+[[nodiscard]] bool IsPresentableColorFormat(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR32G32B32A32Sfloat: return true;
+		default: return false;
+	}
+}
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
                                   uint32_t fill, vk::ClearColorValue& clear) {
@@ -174,15 +199,24 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		ConfigureGarbageCollectionBudget(m_graphics.GetTotalMemoryBudget());
+	}
+}
+
+void TextureCache::ConfigureGarbageCollectionBudget(uint64_t available_budget) {
+	constexpr int64_t GiB = 1024ll * 1024 * 1024;
+	const auto budget = static_cast<int64_t>(std::min<uint64_t>(available_budget, INT64_MAX));
+	const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+	m_pressure_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	m_critical_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	// Keep reusable images resident until memory is actually under pressure.
+	m_trigger_gc_memory = m_pressure_gc_memory;
+	if (const auto* legacy = std::getenv("KYTY_TEXTURE_CACHE_EARLY_GC");
+	    legacy != nullptr && std::strcmp(legacy, "1") == 0) {
+		m_trigger_gc_memory =
+		    static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
 }
 
@@ -198,8 +232,7 @@ TextureCache::~TextureCache() {
 	}
 }
 
-bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
-                               bool exact_format) {
+bool TextureCache::SameGuestLayout(const ImageInfo& cached, const ImageInfo& requested) {
 	if (cached.data.address != requested.data.address) {
 		return false;
 	}
@@ -218,8 +251,15 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.tile_mode != requested.tile_mode) {
 		return false;
 	}
-	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
+	return cached.type == requested.type || requested.extent == vk::Extent3D {1, 1, 1};
+}
+
+bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
+                               bool exact_format) {
+	if (!SameGuestLayout(cached, requested)) {
+		return false;
+	}
+	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format)) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -523,12 +563,20 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	const auto format = desc.info.pixel_format;
 	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
-		return found->second;
+		auto* image = m_slot_images.try_get(found->second);
+		if (image != nullptr && ImageViewOps::ViewCompatible(image->backing, desc.view_info)) {
+			return found->second;
+		}
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = Prospero::ImageType::kColor2D;
+	info.type            = desc.info.type == Prospero::ImageType::kColor1D ||
+	                    desc.info.type == Prospero::ImageType::kColor1DArray
+	                        ? Prospero::ImageType::kColor1D
+	                    : desc.info.type == Prospero::ImageType::kColor3D
+	                        ? Prospero::ImageType::kColor3D
+	                        : Prospero::ImageType::kColor2D;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
@@ -537,7 +585,9 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
-	m_null_images.emplace(format, id);
+	if (info.type == Prospero::ImageType::kColor2D) {
+		m_null_images[format] = id;
+	}
 	return id;
 }
 
@@ -673,15 +723,28 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	const bool direct_copy =
 	    source.backing.format == destination.backing.format ||
 	    (!source_depth && !dest_depth &&
-	     vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format));
+	     SameTexelBlockSize(source.backing.format, destination.backing.format));
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
-		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
-		destination.CopyImageWithBuffer(source, copy_buffer);
+		if (!source_depth && !dest_depth &&
+		    !SameTexelBlockSize(source.backing.format, destination.backing.format)) {
+			static std::atomic<uint32_t> blit_logs = 0;
+			if (blit_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("TextureCache: blit-converting image format %d -> %d addr=0x%016" PRIx64
+				     " extent=%ux%u\n",
+				     static_cast<int>(source.backing.format),
+				     static_cast<int>(destination.backing.format), destination.info.data.address,
+				     destination.backing.extent.width, destination.backing.extent.height);
+			}
+			destination.BlitColor(source);
+		} else {
+			auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+			destination.CopyImageWithBuffer(source, copy_buffer);
+		}
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
@@ -824,6 +887,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    requested_block != cached_block) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
+			} else {
+				static std::atomic<uint32_t> bpp_logs = 0;
+				if (bpp_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("TextureCache: keeping distinct images at 0x%016" PRIx64
+					     " bpp %u vs %u (not a typeless alias)\n",
+					     requested.data.address, cached.info.bytes_per_block,
+					     requested.bytes_per_block);
+				}
 			}
 			return {merged_id};
 		}
@@ -1255,6 +1326,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 
 	ImageId result {};
+	ImageId encoding_written {};
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
@@ -1262,9 +1334,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
+			const bool same_layout = SameGuestLayout(image.info, desc.info);
+			// Same-address format aliases are only valid when texel size matches
+			// (RGBA8 vs 11-11-10). R16 vs B10G11R11 is not a GCN typeless view.
+			const bool format_alias =
+			    image.info.data.address == desc.info.data.address &&
+			    image.info.extent == desc.info.extent &&
+			    image.info.bytes_per_block == desc.info.bytes_per_block &&
+			    image.info.samples == desc.info.samples;
+			if (!same_layout && !format_alias) {
+				continue;
+			}
+			if (desc.type == BindingType::Texture && image.IsGpuModified() &&
+			    image.backing.format != vk::Format::eUndefined &&
+			    image.info.bytes_per_block == desc.info.bytes_per_block &&
+			    SameTexelBlockSize(image.backing.format, desc.view_info.format) &&
+			    !ImageViewOps::ViewEncodingCompatible(image.backing.format, desc.view_info.format)) {
+				encoding_written = id;
+			}
+			if (!same_layout) {
+				continue;
+			}
+			if (SameBacking(image.info, desc.info, exact_format) &&
+			    ImageViewOps::ViewCompatible(image.backing, desc.view_info)) {
 				result = id;
 			}
+		}
+
+		if (!exact_format && desc.type == BindingType::Texture && encoding_written) {
+			if (result != encoding_written) {
+				static std::atomic<uint32_t> alias_logs = 0;
+				if (alias_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+					const auto& written = m_slot_images[encoding_written];
+					LOGF("TextureCache: sampling GPU-written alias fmt=%d instead of req_fmt=%d "
+					     "addr=0x%016" PRIx64 "\n",
+					     static_cast<int>(written.backing.format),
+					     static_cast<int>(desc.info.pixel_format), desc.info.data.address);
+				}
+			}
+			result = encoding_written;
 		}
 
 		int32_t view_mip   = -1;
@@ -1285,22 +1393,88 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		if (result) {
 			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+			if (desc.type == BindingType::RenderTarget &&
+			    (resolved.info.IsDepth() || resolved.depth_id)) {
+				// The guest is reusing a depth/stencil surface's memory as a color target.
+				// A depth-associated image cannot be acquired as color (FindRenderTarget
+				// rejects it), so start a fresh color image for this address instead of
+				// crashing on rediscovery.
+				static std::atomic<uint32_t> depth_as_color_logs = 0;
+				if (depth_as_color_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("TextureCache: color target aliases depth surface addr=0x%016" PRIx64
+					     " - creating fresh color image\n",
+					     desc.info.data.address);
+				}
+				result = {};
+			} else if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
 				FreeImage(result);
 				result = {};
+			} else if (!ImageViewOps::ViewCompatible(resolved.backing, desc.view_info)) {
+				const bool encoding_mismatch =
+				    desc.type == BindingType::Texture &&
+				    !ImageViewOps::ViewEncodingCompatible(resolved.backing.format,
+				                                          desc.view_info.format);
+				const bool same_block =
+				    SameTexelBlockSize(resolved.backing.format, desc.view_info.format);
+				if (encoding_mismatch && same_block) {
+					// Sample the GPU-written encoding instead of expanding into a bitcast
+					// packed-float image. UFC 5 draws the title as RGBA8 and composites with
+					// an 11-11-10 descriptor at the same address.
+				} else if (encoding_mismatch && !same_block) {
+					static std::atomic<uint32_t> bpp_mismatch_logs = 0;
+					if (bpp_mismatch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+						LOGF("TextureCache: distinct sampled image for bpp mismatch %d -> %d "
+						     "addr=0x%016" PRIx64 " bpp=%u/%u\n",
+						     static_cast<int>(resolved.backing.format),
+						     static_cast<int>(desc.view_info.format), desc.info.data.address,
+						     resolved.info.bytes_per_block, desc.info.bytes_per_block);
+					}
+					result = {};
+				} else if (ImageViewOps::CopyableTypeChange(resolved.backing, desc.info) &&
+				    (resolved.IsGpuModified() || resolved.usage.render_target ||
+				     resolved.usage.storage)) {
+					LOGF("TextureCache: retargeting image type %u -> %u format %d -> %d "
+					     "addr=0x%016" PRIx64 "\n",
+					     static_cast<uint32_t>(resolved.info.type),
+					     static_cast<uint32_t>(desc.info.type),
+					     static_cast<int>(resolved.backing.format),
+					     static_cast<int>(desc.info.pixel_format), desc.info.data.address);
+					result = ExpandImage(desc.info, result);
+				} else {
+					result = {};
+				}
 			}
 		}
+		bool inserted = false;
 		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
+			result   = InsertImage(desc.info);
+			inserted = true;
+			auto& created = m_slot_images[result];
+			if (m_buffer_cache.HasGpuDirtyBytes(created.info.data.address,
+			                                    created.info.data.size)) {
+				created.MarkBufferModified();
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (desc.info.data.address == 0x000000111a800000ull ||
+		    desc.info.data.address == 0x000000111b800000ull ||
+		    desc.info.data.address == 0x0000001162c00000ull) {
+			static std::atomic<uint32_t> find_logs = 0;
+			if (find_logs.fetch_add(1, std::memory_order_relaxed) < 48) {
+				LOGF("FindImage: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " req_fmt=%d got_fmt=%d type=%u exact=%d candidates=%zu gpu=%d cpu=%d "
+				     "inserted=%d bind=%d\n",
+				     desc.info.data.address, desc.info.data.size,
+				     static_cast<int>(desc.info.pixel_format),
+				     static_cast<int>(image.info.pixel_format),
+				     static_cast<uint32_t>(desc.info.type), exact_format ? 1 : 0,
+				     candidates.size(), image.IsGpuModified() ? 1 : 0,
+				     image.IsDefinitelyCpuDirty() ? 1 : 0, inserted ? 1 : 0,
+				     static_cast<int>(desc.type));
+			}
+		}
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
@@ -1350,15 +1524,29 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		matches.push_back(id);
 	}
 	ImageId selected {};
-	if (matches.size() == 1) {
-		selected = matches.front();
-	} else {
-		for (const auto id: matches) {
-			const auto& image = m_slot_images[id];
-			if (image.info.data.size == size) {
-				selected = id;
-				break;
-			}
+	int     best_score = -1;
+	for (const auto id: matches) {
+		const auto& image = m_slot_images[id];
+		int         score = 0;
+		if (image.info.data.size == size) {
+			score += 4;
+		}
+		if (image.IsGpuModified()) {
+			score += 8;
+		}
+		if (image.usage.render_target) {
+			score += 16;
+		}
+		switch (image.backing.format) {
+			case vk::Format::eR8G8B8A8Unorm:
+			case vk::Format::eR8G8B8A8Srgb:
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb: score += 32; break;
+			default: break;
+		}
+		if (score > best_score) {
+			best_score = score;
+			selected   = id;
 		}
 	}
 	if (selected && ensure_valid) {
@@ -1368,6 +1556,40 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		}
 	}
 	return selected;
+}
+
+void TextureCache::NotePresentableColor(const Image& image) {
+	if (image.info.IsDepth() || image.usage.depth_target || image.usage.video_out ||
+	    !image.usage.render_target || image.backing.image == nullptr) {
+		return;
+	}
+	const auto address = image.info.data.address;
+	if (address == 0x000000111a800000ull || address == 0x000000111b800000ull) {
+		return;
+	}
+	if (image.backing.extent.width < 1280u || image.backing.extent.height < 720u) {
+		return;
+	}
+	if (!IsPresentableColorFormat(image.backing.format) || address == 0 ||
+	    image.info.data.size == 0) {
+		return;
+	}
+	m_presentable_address = address;
+	m_presentable_size    = image.info.data.size;
+}
+
+ImageId TextureCache::FindLastPresentableColor() {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		address = m_presentable_address;
+		size    = m_presentable_size;
+	}
+	if (address == 0 || size == 0) {
+		return {};
+	}
+	return FindImageFromRange(address, size, false);
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
@@ -1399,8 +1621,22 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
+	auto view_info = desc.view_info;
+	if (desc.type == BindingType::Texture && image.backing.format != vk::Format::eUndefined &&
+	    view_info.format != vk::Format::eUndefined &&
+	    !ImageViewOps::ViewEncodingCompatible(image.backing.format, view_info.format) &&
+	    SameTexelBlockSize(image.backing.format, view_info.format)) {
+		static std::atomic<uint32_t> encoding_logs = 0;
+		if (encoding_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+			LOGF("TextureCache: sampling backing format %d instead of descriptor format %d "
+			     "addr=0x%016" PRIx64 "\n",
+			     static_cast<int>(image.backing.format), static_cast<int>(view_info.format),
+			     image.info.data.address);
+		}
+		view_info.format = image.backing.format;
+	}
+	const auto view = image.FindView(view_info);
+	NameImageBinding(m_graphics, image, view, desc.type, view_info);
 	return view;
 }
 
@@ -1411,11 +1647,19 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
+		EXIT("TextureCache: color target requires rediscovery before final acquisition "
+		     "(registered=%d depth_id=%d needs_rebind=%d) addr=0x%016" PRIx64
+		     " size=0x%" PRIx64 " format=%u tile=%u type=%u empty=%d\n",
+		     image.registered ? 1 : 0, image.depth_id ? 1 : 0,
+		     image.binding.needs_rebind ? 1 : 0, image.info.data.address, image.info.data.size,
+		     static_cast<uint32_t>(image.info.pixel_format),
+		     static_cast<uint32_t>(image.info.tile_mode), static_cast<uint32_t>(image.info.type),
+		     image.info.data.Empty() ? 1 : 0);
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
+	NotePresentableColor(image);
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
 	CommitGpuWrite(image);

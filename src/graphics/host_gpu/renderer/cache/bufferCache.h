@@ -56,6 +56,7 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
@@ -107,6 +108,7 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	void AppendSmallDirtyDownloads(std::vector<DownloadCopy>& copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 
 	GraphicContext&                                   m_graphics;

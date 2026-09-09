@@ -17,6 +17,13 @@ namespace Libs::Graphics {
 
 namespace {
 
+constexpr vk::AccessFlags2 kRestoredImageAccess =
+    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
+    vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+    vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferRead |
+    vk::AccessFlagBits2::eTransferWrite;
+
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
 		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
@@ -340,11 +347,25 @@ void Image::CopyImage(Image& source) {
 		if (source.backing.image_type == backing.image_type) {
 			if (source.backing.image_type == vk::ImageType::e3D) {
 				copy.extent = {width, height, depth};
+			} else if (source.backing.image_type == vk::ImageType::e1D) {
+				copy.srcSubresource.layerCount = std::min(source_layers, destination_layers);
+				copy.dstSubresource.layerCount = copy.srcSubresource.layerCount;
+				copy.extent                    = {width, 1, 1};
 			} else {
 				copy.srcSubresource.layerCount = std::min(source_layers, destination_layers);
 				copy.dstSubresource.layerCount = copy.srcSubresource.layerCount;
 				copy.extent                    = {width, height, 1};
 			}
+		} else if (source.backing.image_type == vk::ImageType::e2D &&
+		           backing.image_type == vk::ImageType::e1D) {
+			copy.srcSubresource.layerCount = 1;
+			copy.dstSubresource.layerCount = 1;
+			copy.extent                    = {std::min(width, backing.extent.width), 1, 1};
+		} else if (source.backing.image_type == vk::ImageType::e1D &&
+		           backing.image_type == vk::ImageType::e2D) {
+			copy.srcSubresource.layerCount = 1;
+			copy.dstSubresource.layerCount = 1;
+			copy.extent                    = {std::min(width, backing.extent.width), 1, 1};
 		} else if (source.backing.image_type == vk::ImageType::e2D) {
 			copy.srcSubresource.layerCount = source_layers;
 			copy.extent                    = {width, height, source_layers};
@@ -364,8 +385,48 @@ void Image::CopyImage(Image& source) {
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
 	                  copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	source.Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
+	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
+}
+
+void Image::BlitColor(Image& source) {
+	EXIT_IF(source.backing.samples != 1 || backing.samples != 1);
+	EXIT_IF(source.backing.image == nullptr || backing.image == nullptr);
+	EXIT_IF(source.backing.image_type != vk::ImageType::e2D ||
+	        backing.image_type != vk::ImageType::e2D);
+	const auto source_properties = m_graphics.GetFormatProperties(source.backing.format);
+	const auto destination_properties = m_graphics.GetFormatProperties(backing.format);
+	EXIT_IF(!HasFormatFeature(source_properties, vk::FormatFeatureFlagBits::eBlitSrc) ||
+	        !HasFormatFeature(destination_properties, vk::FormatFeatureFlagBits::eBlitDst));
+	m_scheduler.EndRendering();
+	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
+	const uint32_t layers = std::min(source.backing.layers, backing.layers);
+	EXIT_IF(levels == 0 || layers == 0);
+	std::vector<vk::ImageBlit> blits;
+	blits.reserve(levels);
+	for (uint32_t level = 0; level < levels; level++) {
+		const auto source_width  = std::max(source.backing.extent.width >> level, 1u);
+		const auto source_height = std::max(source.backing.extent.height >> level, 1u);
+		const auto dest_width    = std::max(backing.extent.width >> level, 1u);
+		const auto dest_height   = std::max(backing.extent.height >> level, 1u);
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, layers};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, layers};
+		blit.srcOffsets[1]  = {static_cast<int32_t>(source_width),
+		                       static_cast<int32_t>(source_height), 1};
+		blit.dstOffsets[1]  = {static_cast<int32_t>(dest_width), static_cast<int32_t>(dest_height),
+		                       1};
+		blits.push_back(blit);
+	}
+	auto command = m_scheduler.Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(blits.size()),
+	                  blits.data(), vk::Filter::eNearest);
+	source.Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
+	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
 }
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
@@ -425,6 +486,8 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
+	source.Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, resolved_source_range, command);
+	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, resolved_destination_range, command);
 }
 
 uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) noexcept {
@@ -521,8 +584,8 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 			}
 		}
 	}
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	source.Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
+	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
@@ -554,8 +617,8 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	               command);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	source.Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
+	Transit(vk::ImageLayout::eGeneral, kRestoredImageAccess, {}, command);
 }
 
 namespace ImageOps {
@@ -664,6 +727,10 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.format      = info.pixel_format;
 	backing.image_type  = HostImageType(info.type);
 	backing.extent      = info.extent;
+	if (backing.image_type == vk::ImageType::e1D) {
+		backing.extent.height = 1;
+		backing.extent.depth  = 1;
+	}
 	backing.layers      = info.IsVolume() ? 1u : info.resources.layers;
 	backing.mip_levels  = info.resources.levels;
 	backing.samples     = info.samples;

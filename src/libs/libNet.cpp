@@ -117,6 +117,10 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return NET_CALL(Net::NetResolverDestroy(rid));
 }
 
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+	return NET_CALL(Net::NetResolverAbort(rid, flags));
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	return NET_CALL(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
@@ -199,6 +203,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
+	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
@@ -1631,6 +1636,40 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 }
 
 } // namespace LibNpEntitlementAccess
+
+namespace LibNpEntitlementAccessPft {
+
+LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
+
+constexpr int NP_ERROR_SIGNED_OUT = -2141913082; /* 0x80550006 */
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPftUnavailable() {
+	PRINT_NAME();
+	return NP_ERROR_SIGNED_OUT;
+}
+
+LIB_DEFINE(InitNet_1_NpEntitlementAccessPft) {
+	LIB_FUNC("eDXKe9FndlE", NpEntitlementAccessPftUnavailable);
+}
+
+} // namespace LibNpEntitlementAccessPft
+
+namespace LibNpPartner001 {
+
+LIB_VERSION("NpPartner001", 1, "NpPartner001", 1, 1);
+
+constexpr int NP_ERROR_SIGNED_OUT = -2141913082; /* 0x80550006 */
+
+static int KYTY_SYSV_ABI NpPartner001Unavailable() {
+	PRINT_NAME();
+	return NP_ERROR_SIGNED_OUT;
+}
+
+LIB_DEFINE(InitNet_1_NpPartner001) {
+	LIB_FUNC("7CxI50-xlCk", NpPartner001Unavailable);
+}
+
+} // namespace LibNpPartner001
 
 namespace LibNpAuth {
 
@@ -3989,6 +4028,8 @@ LIB_DEFINE(InitNet_1) {
 	LibNpManager::InitNet_1_NpManager(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
+	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);
+	LibNpPartner001::InitNet_1_NpPartner001(s);
 	LibNpAuth::InitNet_1_NpAuth(s);
 	LibNpTrophy2::InitNet_1_NpTrophy2(s);
 	LibNpUniversalDataSystem::InitNet_1_NpUniversalDataSystem(s);

@@ -342,8 +342,16 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	// SharpEmu (GpuWaitRegistry / SubmitOrderedGuestAction) does not treat the
+	// wait as already satisfied at parse time. The EOP/RELEASE_MEM label is
+	// written only after the GPU work recorded before it completes. If this
+	// wait is in the same command list as that label, flush-and-wait so the
+	// deferred write is visible; otherwise suspend until a later submit.
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+		BufferFlushAndWait();
+		if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+			SuspendPm4();
+		}
 	}
 }
 
@@ -1211,7 +1219,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1261,7 +1268,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1351,7 +1357,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
-				std::memcpy(dst, &clock, sizeof(clock));
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -1542,7 +1547,6 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1568,7 +1572,6 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);

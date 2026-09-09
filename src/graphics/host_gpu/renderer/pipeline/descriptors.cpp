@@ -426,16 +426,24 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
                                                TextureCache::BindingType                  binding) {
 	const auto              spec = NullTextureSpec(resource);
 	TextureCache::ImageDesc desc {};
+	const bool              is_1d =
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D;
 	desc.info.pixel_format    = spec.format;
 	desc.info.guest_format    = spec.guest_format;
-	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.type            = is_1d   ? Prospero::ImageType::kColor1D
+	                            : is_3d ? Prospero::ImageType::kColor3D
+	                                    : Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = 4;
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	desc.view_info.type       = is_1d   ? vk::ImageViewType::e1D
+	                            : is_3d ? vk::ImageViewType::e3D
+	                                    : vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -658,7 +666,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
-	desc.info.extent       = {width, height, volume ? depth : 1u};
+	desc.info.extent       = {width, desc.info.type == Prospero::ImageType::kColor1D ? 1u : height,
+	                          volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
 	desc.info.pitch        = pitch;
 	desc.info.bytes_per_block =
@@ -698,6 +707,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		if (!ImageViewOps::FormatsCompatible(image->info.pixel_format, pixel_format)) {
+			static std::atomic<uint32_t> sampled_view_logs = 0;
+			if (sampled_view_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("sampled color view remap: image=%d view=%d addr=0x%016" PRIx64 "\n",
+				     static_cast<int>(image->info.pixel_format), static_cast<int>(pixel_format),
+				     address);
+			}
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}

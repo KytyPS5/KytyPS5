@@ -69,6 +69,8 @@ struct WindowContext {
 	uint64_t                           main_tasks_run    = 0; // guarded by main_task_mutex
 };
 
+void RequestGpuImageDump();
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_

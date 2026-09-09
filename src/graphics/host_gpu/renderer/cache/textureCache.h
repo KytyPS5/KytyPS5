@@ -46,6 +46,7 @@ public:
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
+	[[nodiscard]] ImageId       FindLastPresentableColor();
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
@@ -101,6 +102,7 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
+	void ConfigureGarbageCollectionBudget(uint64_t available_budget);
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
@@ -117,6 +119,7 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	[[nodiscard]] static bool SameGuestLayout(const ImageInfo& cached, const ImageInfo& requested);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -148,6 +151,7 @@ private:
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
+	void               NotePresentableColor(const Image& image);
 	void               AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
@@ -175,6 +179,8 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	uint64_t         m_presentable_address    = 0;
+	uint64_t         m_presentable_size       = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

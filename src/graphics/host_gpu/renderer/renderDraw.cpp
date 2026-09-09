@@ -490,7 +490,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
+		    old_image->binding.needs_rebind || old_image->depth_id) {
+			// FindRenderTarget rejects an image that carries a depth alias; the guest is
+			// reusing a depth surface as a color target. Re-resolve so FindImage recreates
+			// a color image for this address (textureCache.cpp force-recreates on IsDepth).
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
@@ -1076,6 +1079,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug) {
+	FrameWorkScope frame_work(FrameWorkKind::Draw);
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;

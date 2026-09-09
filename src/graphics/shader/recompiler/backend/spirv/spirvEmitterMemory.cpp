@@ -691,6 +691,51 @@ uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 	});
 }
 
+uint32_t EmitSharedCasReplacement(EmitterState& state, IR::ValueOpcode opcode, uint32_t old,
+                                  uint32_t data) {
+	switch (opcode) {
+		case IR::ValueOpcode::SharedAtomicInc32: {
+			// RDNA2 DS_INC: MEM = (tmp >= DATA) ? 0 : tmp + 1  (unsigned)
+			const auto wrap = Binary(state, OpUGreaterThanEqual, TypeBool(state), old, data);
+			const auto next = Binary(state, OpIAdd, TypeU32(state), old, ConstantU32(state, 1u));
+			return Select(state, TypeU32(state), wrap, ConstantU32(state, 0u), next);
+		}
+		case IR::ValueOpcode::SharedAtomicDec32: {
+			// RDNA2 DS_DEC: MEM = (tmp == 0 || tmp > DATA) ? DATA : tmp - 1  (unsigned)
+			const auto is_zero = Binary(state, OpIEqual, TypeBool(state), old, ConstantU32(state, 0u));
+			const auto above   = Binary(state, OpUGreaterThan, TypeBool(state), old, data);
+			const auto wrap    = Binary(state, OpLogicalOr, TypeBool(state), is_zero, above);
+			const auto next    = Binary(state, OpISub, TypeU32(state), old, ConstantU32(state, 1u));
+			return Select(state, TypeU32(state), wrap, data, next);
+		}
+		case IR::ValueOpcode::SharedAtomicIRsub32:
+			// RDNA2 DS_RSUB: MEM = DATA - tmp
+			return Binary(state, OpISub, TypeU32(state), data, old);
+		default: return old;
+	}
+}
+
+uint32_t SharedCasAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto pointer =
+			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
+			    const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+			    return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
+				    return EmitSharedCasReplacement(ctx.state, inst.GetOpcode(), old, data);
+			    });
+		    });
+	});
+}
+
+bool IsSharedCasAtomic(IR::ValueOpcode opcode) {
+	return opcode == IR::ValueOpcode::SharedAtomicInc32 ||
+	       opcode == IR::ValueOpcode::SharedAtomicDec32 ||
+	       opcode == IR::ValueOpcode::SharedAtomicIRsub32;
+}
+
 uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                            bool max_value) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -1172,6 +1217,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32) {
 		SharedFloatAtomic(ctx, inst, ctx.Memory(inst), op == IR::ValueOpcode::SharedAtomicFMax32);
+		return true;
+	}
+	if (IsSharedCasAtomic(op)) {
+		ctx.Define(inst, SharedCasAtomic(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
 	if (op == IR::ValueOpcode::DataAppend || op == IR::ValueOpcode::DataConsume) {

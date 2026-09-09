@@ -44,10 +44,14 @@ struct GotoVariable {
 	uint32_t index                                  = 0;
 	auto     operator<=>(const GotoVariable&) const = default;
 };
+struct DispatchState {
+	auto operator<=>(const DispatchState&) const = default;
+};
 
 using Variable =
-    std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable, SccTag,
-                 ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag, M0Tag>;
+    std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable,
+                 DispatchState, SccTag, ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag,
+                 M0Tag>;
 using ValueMap = std::unordered_map<Block*, Value>;
 
 struct DefTable {
@@ -94,6 +98,8 @@ struct DefTable {
 	void Set(Block* block, GotoVariable value, Value definition) {
 		goto_variables[value.index][block] = definition;
 	}
+	const Value& Get(Block* block, DispatchState) { return dispatch_state[block]; }
+	void         Set(Block* block, DispatchState, Value value) { dispatch_state[block] = value; }
 
 	const Value& Get(Block* block, SccTag) { return scc[block]; }
 	void         Set(Block* block, SccTag, Value value) { scc[block] = value; }
@@ -120,6 +126,7 @@ struct DefTable {
 	ValueMap                               vcc_lo;
 	ValueMap                               vcc_hi;
 	ValueMap                               m0;
+	ValueMap                               dispatch_state;
 	std::unordered_map<uint32_t, ValueMap> goto_variables;
 };
 
@@ -137,6 +144,9 @@ ValueOpcode UndefOpcode(VectorReg) {
 }
 ValueOpcode UndefOpcode(GotoVariable) {
 	return ValueOpcode::UndefU1;
+}
+ValueOpcode UndefOpcode(DispatchState) {
+	return ValueOpcode::UndefU32;
 }
 ValueOpcode UndefOpcode(SccTag) {
 	return ValueOpcode::UndefU1;
@@ -177,6 +187,9 @@ Value InitialValue(VectorReg) {
 }
 Value InitialValue(GotoVariable) {
 	return Value(false);
+}
+Value InitialValue(DispatchState) {
+	return Value(0u);
 }
 Value InitialValue(SccTag) {
 	return Value(false);
@@ -349,6 +362,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 		case ValueOpcode::SetGotoVariable:
 			pass.Write(GotoVariable {inst.Arg(0).U32()}, block, inst.Arg(1));
 			break;
+		case ValueOpcode::SetDispatchState:
+			pass.Write(DispatchState {}, block, inst.Arg(0));
+			break;
 		case ValueOpcode::SetScc: pass.Write(SccTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetExec: pass.Write(ExecTag {}, block, inst.Arg(0)); break;
 		case ValueOpcode::SetExecLo: pass.Write(ExecLoTag {}, block, inst.Arg(0)); break;
@@ -372,6 +388,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 			break;
 		case ValueOpcode::GetGotoVariable:
 			inst.ReplaceUsesWith(pass.Read(GotoVariable {inst.Arg(0).U32()}, block));
+			break;
+		case ValueOpcode::GetDispatchState:
+			inst.ReplaceUsesWith(pass.Read(DispatchState {}, block));
 			break;
 		case ValueOpcode::GetScc: inst.ReplaceUsesWith(pass.Read(SccTag {}, block)); break;
 		case ValueOpcode::GetExec: inst.ReplaceUsesWith(pass.Read(ExecTag {}, block)); break;

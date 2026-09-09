@@ -28,6 +28,8 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -39,6 +41,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <cinttypes>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -241,7 +244,13 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			case SDLK_F8: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			case SDLK_F9:
+				if (!key.repeat) {
+					RequestGpuImageDump();
+					LOGF("GPU dump requested (F9)\n");
+				}
+				break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
@@ -270,7 +279,8 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 	if (fullscreen_key_event && key.up) {
 		fullscreen_key = SDLK_UNKNOWN;
 	}
-	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event) {
+	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event &&
+	    key.key_code != SDLK_F8 && key.key_code != SDLK_F9) {
 		HostInputKey(key.key_code, key.down);
 	}
 }
@@ -1007,11 +1017,58 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	static uint32_t shader_compiles  = 0;
+	static uint32_t pipeline_creates = 0;
+	static double   shader_ms        = 0.0;
+	static double   pipeline_ms      = 0.0;
+	static uint32_t draws            = 0;
+	static uint32_t dispatches       = 0;
+	static uint32_t submits          = 0;
+	static uint32_t finishes         = 0;
+	static double   draw_ms          = 0.0;
+	static double   dispatch_ms      = 0.0;
+	static double   submit_ms        = 0.0;
+	static double   finish_ms        = 0.0;
+	static double   present_ms       = 0.0;
+	const auto      pulse            = ConsumeShaderCompilePulse();
+	const auto      gpu              = ConsumeFrameWorkPulse();
+	shader_compiles += pulse.shader_count;
+	pipeline_creates += pulse.pipeline_count;
+	shader_ms += pulse.shader_ms;
+	pipeline_ms += pulse.pipeline_ms;
+	draws += gpu.draws;
+	dispatches += gpu.dispatches;
+	submits += gpu.submits;
+	finishes += gpu.finishes;
+	draw_ms += gpu.draw_ms;
+	dispatch_ms += gpu.dispatch_ms;
+	submit_ms += gpu.submit_ms;
+	finish_ms += gpu.finish_ms;
+	present_ms += gpu.present_ms;
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+		LOGF("FrameProfile: fps=%.3f frames=%" PRIu64 " shader_compiles=%u shader_ms=%.1f "
+		     "pso_creates=%u pso_ms=%.1f draws=%u draw_ms=%.1f dispatch=%u dispatch_ms=%.1f "
+		     "submit=%u submit_ms=%.1f finish=%u finish_ms=%.1f present_ms=%.1f\n",
+		     current_fps, fps_frames, shader_compiles, shader_ms, pipeline_creates, pipeline_ms,
+		     draws, draw_ms, dispatches, dispatch_ms, submits, submit_ms, finishes, finish_ms,
+		     present_ms);
+		fps_start        = now;
+		fps_frames       = 0;
+		shader_compiles  = 0;
+		pipeline_creates = 0;
+		shader_ms        = 0.0;
+		pipeline_ms      = 0.0;
+		draws            = 0;
+		dispatches       = 0;
+		submits          = 0;
+		finishes         = 0;
+		draw_ms          = 0.0;
+		dispatch_ms      = 0.0;
+		submit_ms        = 0.0;
+		finish_ms        = 0.0;
+		present_ms       = 0.0;
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();

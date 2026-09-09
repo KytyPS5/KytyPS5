@@ -29,6 +29,8 @@ bool IsRegisterStatePseudo(ValueOpcode opcode) {
 		case ValueOpcode::SetVectorRegister:
 		case ValueOpcode::GetGotoVariable:
 		case ValueOpcode::SetGotoVariable:
+		case ValueOpcode::GetDispatchState:
+		case ValueOpcode::SetDispatchState:
 		case ValueOpcode::GetScc:
 		case ValueOpcode::SetScc:
 		case ValueOpcode::GetExec:
@@ -280,7 +282,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail("value IR conditional branch condition is invalid");
 				}
 				break;
-			case CFG::TerminatorKind::IndirectBranch: {
+			case CFG::TerminatorKind::IndirectBranch:
+			case CFG::TerminatorKind::DispatchSwitch: {
 				if (!validate_control_value(program.block_info[block_index].indirect_target,
 				                            Type::U32)) {
 					return Fail("value IR indirect branch selector is invalid");
@@ -304,6 +307,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					    !expected_successors.contains(found->second)) {
 						return Fail("value IR indirect selector target is not a CFG successor");
 					}
+				}
+				if (terminator.kind == CFG::TerminatorKind::DispatchSwitch &&
+				    terminator.true_block != UINT32_MAX && !add_target(terminator.true_block)) {
+					return Fail("value IR dispatch switch default target is missing");
 				}
 				break;
 			}

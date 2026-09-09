@@ -9912,6 +9912,34 @@ void TestCooperativeWave64CollectivesUseSharedFunctions() {
         "non-overlapping cooperative values did not reuse spill slots");
 }
 
+void TestDeadPhiWebsWithoutExternalConsumersAreRemoved() {
+  using namespace ShaderRecompiler::IR;
+  Block block;
+  auto& dead_a = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto& dead_b = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto& live_dependency = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto& live = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  dead_a.AddPhiOperand(&block, Value(&dead_b));
+  dead_b.AddPhiOperand(&block, Value(&dead_a));
+  live_dependency.AddPhiOperand(&block, Value(&live));
+  live.AddPhiOperand(&block, Value(&live_dependency));
+  block.AppendNewInst(ValueOpcode::ReferenceU32, {Value(&live)});
+
+  EliminateDeadCode(BlockList{&block});
+  const auto phi_count = std::ranges::count_if(block, [](const Inst& inst) {
+    return inst.GetOpcode() == ValueOpcode::Phi;
+  });
+  Check(phi_count == 2u,
+        "DCE retained a closed Phi web with no non-Phi consumer");
+  Check(block.begin()->GetOpcode() == ValueOpcode::Phi &&
+            block.begin()->HasUses(),
+        "DCE removed a Phi web that has a non-Phi consumer");
+}
+
 // TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
 // include the certificate header plus ShaderHostProfile.h. Register the five
 // TestF64Certificate* functions below. No compilation, Vulkan or game data.
@@ -15761,6 +15789,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-pipeline-flags-only") == 0) {
     Libs::Graphics::TestCooperativePipelineDisablesDriverOptimization();
     std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dead-phi-webs-only") == 0) {
+    Libs::Graphics::TestDeadPhiWebsWithoutExternalConsumersAreRemoved();
+    std::puts("KYTY_DEAD_PHI_WEBS_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--shader-debug-name-only") == 0) {

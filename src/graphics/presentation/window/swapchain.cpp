@@ -1116,14 +1116,18 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 
 	auto&  cache  = m_impl->renderer.GetTextureCache();
 	Image* source = &scanout;
-	auto try_present = [&](ImageId id, const char* tag) {
+	static std::atomic<uint32_t> ufc_present_logs = 0;
+	const auto consider = [&](ImageId id, const char* tag, bool allow_scanout_addr) {
 		if (!id || source != &scanout) {
 			return;
 		}
 		auto& candidate = cache.GetImage(id);
-		if (candidate.info.data.address == info.data.address ||
-		    candidate.info.data.address == 0x000000111a800000ull ||
-		    candidate.info.data.address == 0x000000111b800000ull) {
+		if (&candidate == &scanout) {
+			return;
+		}
+		if (!allow_scanout_addr && (candidate.info.data.address == info.data.address ||
+		                            candidate.info.data.address == 0x000000111a800000ull ||
+		                            candidate.info.data.address == 0x000000111b800000ull)) {
 			return;
 		}
 		if (!candidate.IsGpuModified() || candidate.backing.image == nullptr ||
@@ -1131,22 +1135,26 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			return;
 		}
 		source = &candidate;
-		static std::atomic<uint32_t> ufc_present_logs = 0;
 		if (ufc_present_logs.fetch_add(1, std::memory_order_relaxed) < 12) {
 			LOGF("UFC 5 present %s: fmt=%d gpu=%d rt=%d storage=%d extent=%ux%u "
 			     "addr=0x%016" PRIx64 " scanout=0x%016" PRIx64 "\n",
 			     tag, static_cast<int>(candidate.backing.format),
 			     candidate.IsGpuModified() ? 1 : 0, candidate.usage.render_target ? 1 : 0,
 			     candidate.usage.storage ? 1 : 0, candidate.backing.extent.width,
-			     candidate.backing.extent.height, candidate.info.data.address,
-			     info.data.address);
+			     candidate.backing.extent.height, candidate.info.data.address, info.data.address);
 		}
 	};
-	// Prefer the last large GPU-written color target so 3D/post-process shows after
-	// the title compositor at 0x1162c00000 stops being the current frame.
-	try_present(cache.FindLastPresentableColor(), "last color");
-	try_present(cache.FindImageFromRange(0x0000001162c00000ull, 0x0000000000870000ull, false),
-	            "compositor color");
+	// The game composites its final frame into a B10G11R11 storage image aliased at the
+	// flip address, but registers the VideoOut buffer with a different (color) format,
+	// so ResolveSurface() hands back a distinct image the compositor never writes.
+	// Present the GPU-written alias at the flip address first - that is the real frame.
+	consider(cache.FindImageFromRange(info.data.address, 0x0000000000870000ull, false),
+	         "flip alias", true);
+	// Fall back to the last large GPU-written color / the title compositor only when the
+	// flip alias had nothing (early boot, menu paths that render straight to 0x1162c00000).
+	consider(cache.FindLastPresentableColor(), "last color", false);
+	consider(cache.FindImageFromRange(0x0000001162c00000ull, 0x0000000000870000ull, false),
+	         "compositor color", false);
 	auto& image = *source;
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));

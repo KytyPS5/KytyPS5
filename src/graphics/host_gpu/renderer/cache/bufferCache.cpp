@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -49,6 +50,54 @@ struct BufferCache::DownloadCopy {
 	uint64_t address       = 0;
 	uint64_t size          = 0;
 };
+
+// A GPU->staging copy that has been recorded into the command stream but whose
+// staging->guest writeback is deferred until the owning tick retires.
+struct BufferCache::DeferredReadback {
+	struct Part {
+		uint64_t address;        // guest address to write
+		uint64_t staging_offset; // absolute offset in m_download_buffer
+		uint64_t size;
+	};
+	uint64_t          tick        = 0;
+	uint8_t*          mapped      = nullptr; // base of m_download_buffer host mapping
+	uint64_t          base_offset = 0;       // Map() base for this batch
+	std::vector<Part> parts;
+};
+
+void BufferCache::DrainDeferredReadbacks(bool force) {
+	if (m_deferred_readbacks.empty()) {
+		return;
+	}
+	std::vector<DeferredReadback> still_pending;
+	for (auto& rb: m_deferred_readbacks) {
+		if (!force && !m_scheduler.IsFree(rb.tick)) {
+			still_pending.push_back(std::move(rb));
+			continue;
+		}
+		if (!m_scheduler.IsFree(rb.tick)) {
+			m_scheduler.Wait(rb.tick);
+		}
+		for (const auto& p: rb.parts) {
+			m_download_buffer.Invalidate(p.staging_offset, p.size);
+			// The guest can unmap this range between scheduling and applying the
+			// readback; drop it silently in that case (the data is no longer wanted).
+			(void)Libs::LibKernel::Memory::TryWriteBacking(
+			    p.address, rb.mapped + (p.staging_offset - rb.base_offset), p.size);
+		}
+	}
+	m_deferred_readbacks = std::move(still_pending);
+}
+
+void BufferCache::EnsureCurrentForCpu(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0) {
+		return;
+	}
+	// Pull down any GPU-dirty bytes (these arg regions are small, so DownloadBufferMemory
+	// takes the synchronous path anyway) then land anything that was already deferred.
+	ReadMemory(vaddr, size, false);
+	DrainDeferredReadbacks(true);
+}
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
@@ -148,36 +197,79 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			     copies.empty() ? 0 : copies.front().size);
 		}
 	}
+	// Readback strategy. DEFAULT: synchronous (full GPU idle-stall per drain) - stable.
+	// 1-frame-latency deferral is a large win on finish_ms (~300ms -> ~20ms/frame) but
+	// still destabilises the in-match GPU somewhere beyond the indirect-arg reads that
+	// EnsureCurrentForCpu() now protects; needs more work before it can be the default.
+	//   KYTY_DEFER_READBACK=1        - defer copies >= 2 MiB
+	//   KYTY_DEFER_READBACK=<KiB>    - defer copies >= <KiB>
+	//   KYTY_DEFER_READBACK=all      - defer everything
+	static const uint64_t defer_min_copy = [] () -> uint64_t {
+		const char* d = std::getenv("KYTY_DEFER_READBACK");
+		if (d == nullptr || d[0] == '\0' || d[0] == '0') {
+			return UINT64_MAX; // never defer (default)
+		}
+		if (std::strcmp(d, "all") == 0) {
+			return 0;
+		}
+		char*      end = nullptr;
+		const auto kb  = std::strtoull(d, &end, 10);
+		if (end != d && kb > 1) {
+			return kb * 1024;
+		}
+		return 2 * 1024 * 1024;
+	}();
+
+	// The previous call's deferred batch has almost always retired by now, so this is
+	// a cheap check, not a stall. Draining before Map() guarantees the staging region
+	// it may wrap into has been consumed.
+	DrainDeferredReadbacks(true);
+
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
-	uint64_t                  packed_size = 0;
+	uint64_t                  packed_size   = 0;
+	uint64_t                  max_copy_size = 0;
 	auto&                     download    = m_download_buffer;
 	const auto flush = [&] {
 		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
 		EXIT_IF(mapped == nullptr);
-		uint64_t cursor = 0;
+		uint64_t          cursor = 0;
+		DeferredReadback  rb;
+		rb.mapped      = mapped;
+		rb.base_offset = base_offset;
+		rb.parts.reserve(batch.size());
 		for (const auto& copy: batch) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
 			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
 			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
 			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 			                  vk::AccessFlagBits::eHostRead);
+			const auto write_offset = cursor + copy.source_offset - source_begin;
+			rb.parts.push_back({copy.address, base_offset + write_offset, copy.size});
 			cursor += AlignDownload(envelope_size);
 		}
 		download.Commit();
-		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish("buffer-download");
-		m_scheduler.WaitPriorityOperations(completion_tick);
-		cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			const auto offset = cursor + copy.source_offset - source_begin;
-			download.Invalidate(base_offset + offset, copy.size);
-			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
-			cursor += AlignDownload(envelope_size);
+		rb.tick = m_scheduler.CurrentTick();
+
+		if (max_copy_size < defer_min_copy) {
+			m_scheduler.Finish("buffer-download");
+			m_scheduler.WaitPriorityOperations(rb.tick);
+			for (const auto& p: rb.parts) {
+				download.Invalidate(p.staging_offset, p.size);
+				Libs::LibKernel::Memory::WriteBacking(
+				    p.address, mapped + (p.staging_offset - base_offset), p.size);
+			}
+		} else {
+			// 1-frame-latency readback: the GPU->staging copy rides the current submit;
+			// the staging->guest writeback runs from the next DownloadBufferMemory (or
+			// GC) once this tick retires. Guest memory holds the previous frame's
+			// values until then. Frostbite's readbacks (occlusion, draw/instance
+			// counts, LOD) are next-frame decisions and tolerate this.
+			m_deferred_readbacks.push_back(std::move(rb));
 		}
 		batch.clear();
-		packed_size = 0;
+		packed_size   = 0;
+		max_copy_size = 0;
 	};
 	for (auto copy: copies) {
 		while (copy.size != 0) {
@@ -188,6 +280,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
 			(void)source_begin;
 			packed_size += AlignDownload(envelope_size);
+			max_copy_size = std::max(max_copy_size, bytes);
 			batch.push_back(part);
 			copy.source_offset += bytes;
 			copy.address += bytes;
@@ -731,6 +824,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	// Land any deferred readback whose tick has retired so guest memory does not lag
+	// when downloads pause (menus, load screens).
+	DrainDeferredReadbacks(false);
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

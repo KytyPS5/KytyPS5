@@ -40,6 +40,13 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Apply 1-frame-latency staging->guest writebacks whose GPU tick has retired
+	// (force = wait + apply all). Must be called before a guest range is unmapped.
+	void                   DrainDeferredReadbacks(bool force);
+	// Force [vaddr,size) fully current for an immediate CPU read (indirect draw /
+	// dispatch args, count buffers): download any GPU-dirty part and land every
+	// deferred writeback. Never leaves this range on the 1-frame-latency path.
+	void                   EnsureCurrentForCpu(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -85,6 +92,7 @@ private:
 	};
 
 	struct DownloadCopy;
+	struct DeferredReadback;
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
@@ -126,6 +134,7 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	std::vector<DeferredReadback>                     m_deferred_readbacks;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

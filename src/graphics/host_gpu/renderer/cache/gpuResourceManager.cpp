@@ -65,6 +65,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		if (m_scheduler.Active()) {
 			m_scheduler.SyncDeferredOperations();
 		}
+		// Land any deferred staging->guest readback before this range disappears,
+		// otherwise its writeback would hit unmapped (or re-mapped) memory.
+		m_buffer_cache.DrainDeferredReadbacks(true);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

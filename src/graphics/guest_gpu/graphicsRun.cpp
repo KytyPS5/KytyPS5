@@ -274,7 +274,7 @@ void CommandProcessor::BufferFlushAndWait() {
 
 void CommandProcessor::BufferWait() {
 	BufferInit();
-	GetScheduler().Finish();
+	GetScheduler().Finish("guest-bufwait");
 }
 
 void CommandProcessor::ResetDeCe() {
@@ -898,6 +898,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	const auto args_bytes = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	GetGpuResources().GetBufferCache().EnsureCurrentForCpu(
+	    m_draw_indirect_args_base_addr + data_offset, args_bytes);
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
 
@@ -976,8 +979,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	auto& args_buffer_cache = GetGpuResources().GetBufferCache();
+
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		args_buffer_cache.EnsureCurrentForCpu(reinterpret_cast<uint64_t>(count_addr),
+		                                      sizeof(uint32_t));
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -990,6 +997,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	// The GPU-built arg array can be large in a busy scene; make the whole span current
+	// before the loop reads it so no draw is set up from stale index/instance counts.
+	args_buffer_cache.EnsureCurrentForCpu(
+	    m_draw_indirect_args_base_addr + data_offset,
+	    static_cast<uint64_t>(draw_count - 1) * stride_in_bytes + args_size);
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
@@ -1146,8 +1158,21 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
+	GetGpuResources().GetBufferCache().EnsureCurrentForCpu(args_addr, sizeof(DispatchIndirectArgs));
+	auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
+	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+}
+
+void CommandProcessor::DispatchIndirectFromArgs(uint64_t args_addr, uint32_t mode) {
+	struct DispatchIndirectArgs {
+		uint32_t thread_group_x;
+		uint32_t thread_group_y;
+		uint32_t thread_group_z;
+	};
+	EXIT_NOT_IMPLEMENTED(args_addr == 0);
+	GetGpuResources().GetBufferCache().EnsureCurrentForCpu(args_addr, sizeof(DispatchIndirectArgs));
+	const auto* args = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
 
@@ -1598,7 +1623,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
-	GetScheduler().Finish();
+	GetScheduler().Finish("guest-sync");
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

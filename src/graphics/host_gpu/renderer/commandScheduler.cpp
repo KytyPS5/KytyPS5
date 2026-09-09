@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 
@@ -189,33 +190,38 @@ void CommandScheduler::FlushAndWait() {
 void CommandScheduler::Finish(const char* reason) {
 	FrameWorkScope frame_work(FrameWorkKind::Finish);
 	// DIAGNOSTIC: attribute the per-frame GPU-idle stalls (FrameProfile finish_ms) to
-	// their source. Counts reset each time the breakdown is logged (~every 200 stalls).
-	{
-		static std::atomic<uint32_t> n_bufdl {0}, n_gdsprobe {0}, n_gdschunk {0}, n_unmap {0},
-		    n_other {0}, total {0};
-		std::atomic<uint32_t>* c = &n_other;
-		if (reason != nullptr) {
-			if (std::strcmp(reason, "buffer-download") == 0) {
-				c = &n_bufdl;
-			} else if (std::strcmp(reason, "gds-probe") == 0) {
-				c = &n_gdsprobe;
-			} else if (std::strcmp(reason, "gds-chunk") == 0) {
-				c = &n_gdschunk;
-			} else if (std::strcmp(reason, "unmap") == 0) {
-				c = &n_unmap;
-			}
-		}
-		c->fetch_add(1, std::memory_order_relaxed);
-		if ((total.fetch_add(1, std::memory_order_relaxed) % 200) == 199) {
-			LOGF("SchedFinish per ~200 stalls: buffer-download=%u gds-probe=%u gds-chunk=%u "
-			     "unmap=%u other=%u\n",
-			     n_bufdl.exchange(0, std::memory_order_relaxed),
-			     n_gdsprobe.exchange(0, std::memory_order_relaxed),
-			     n_gdschunk.exchange(0, std::memory_order_relaxed),
-			     n_unmap.exchange(0, std::memory_order_relaxed),
-			     n_other.exchange(0, std::memory_order_relaxed));
-		}
+	// their source, by count and by wall time. Reset each time the breakdown is logged.
+	static std::atomic<uint32_t> n_bufdl {0}, n_gdsprobe {0}, n_gdschunk {0}, n_unmap {0},
+	    n_bufwait {0}, n_gsync {0}, n_shutdown {0}, n_other {0}, total {0};
+	static std::atomic<uint64_t> us_bufdl {0}, us_gdsprobe {0}, us_gdschunk {0}, us_unmap {0},
+	    us_bufwait {0}, us_gsync {0}, us_shutdown {0}, us_other {0};
+	std::atomic<uint32_t>* c   = &n_other;
+	std::atomic<uint64_t>* uus = &us_other;
+	const char*            tag = reason != nullptr ? reason : "null";
+	if (std::strcmp(tag, "buffer-download") == 0) {
+		c = &n_bufdl;
+		uus = &us_bufdl;
+	} else if (std::strcmp(tag, "gds-probe") == 0) {
+		c = &n_gdsprobe;
+		uus = &us_gdsprobe;
+	} else if (std::strcmp(tag, "gds-chunk") == 0) {
+		c = &n_gdschunk;
+		uus = &us_gdschunk;
+	} else if (std::strcmp(tag, "unmap") == 0) {
+		c = &n_unmap;
+		uus = &us_unmap;
+	} else if (std::strcmp(tag, "guest-bufwait") == 0) {
+		c = &n_bufwait;
+		uus = &us_bufwait;
+	} else if (std::strcmp(tag, "guest-sync") == 0) {
+		c = &n_gsync;
+		uus = &us_gsync;
+	} else if (std::strcmp(tag, "shutdown") == 0) {
+		c = &n_shutdown;
+		uus = &us_shutdown;
 	}
+	const auto stall_t0 = Common::Timer::QueryPerformanceCounter();
+
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -225,6 +231,24 @@ void CommandScheduler::Finish(const char* reason) {
 	BeginNext();
 	WaitPriorityOperations(completed_tick);
 	PopPendingOperations();
+
+	const auto freq = Common::Timer::QueryPerformanceFrequency();
+	const auto us   = freq == 0
+	                      ? 0
+	                      : (Common::Timer::QueryPerformanceCounter() - stall_t0) * 1000000ull / freq;
+	c->fetch_add(1, std::memory_order_relaxed);
+	uus->fetch_add(us, std::memory_order_relaxed);
+	if ((total.fetch_add(1, std::memory_order_relaxed) % 200) == 199) {
+		LOGF("SchedFinish/200: bufdl=%u/%.1fms  bufwait=%u/%.1fms  gsync=%u/%.1fms  "
+		     "unmap=%u/%.1fms  gdsprobe=%u/%.1fms  shutdown=%u/%.1fms  other=%u/%.1fms\n",
+		     n_bufdl.exchange(0), us_bufdl.exchange(0) / 1000.0, n_bufwait.exchange(0),
+		     us_bufwait.exchange(0) / 1000.0, n_gsync.exchange(0), us_gsync.exchange(0) / 1000.0,
+		     n_unmap.exchange(0), us_unmap.exchange(0) / 1000.0, n_gdsprobe.exchange(0),
+		     us_gdsprobe.exchange(0) / 1000.0, n_shutdown.exchange(0),
+		     us_shutdown.exchange(0) / 1000.0, n_other.exchange(0), us_other.exchange(0) / 1000.0);
+		n_gdschunk.exchange(0);
+		us_gdschunk.exchange(0);
+	}
 }
 
 void CommandScheduler::Wait(uint64_t tick) {

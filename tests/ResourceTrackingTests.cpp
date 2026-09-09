@@ -166,6 +166,8 @@ bool ReadTestMemory(void *userdata, uint64_t address, std::span<uint32_t> values
   return true;
 }
 
+bool RejectTestMemory(void *, uint64_t, uint32_t *) { return false; }
+
 struct LinearTestMemory {
   uint64_t base = 0x1000;
   std::vector<uint32_t> words = std::vector<uint32_t>(0x2200 / 4);
@@ -3570,8 +3572,8 @@ void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_t
   if (buffer_table) {
     Check(columns == 4u, "test descriptor table must have four columns");
     const auto source = AddBoundedSnapshotSource(fixture, {Value(0u),Value(0u),Value(0u),Value(0u)});
-    program.descriptor_sources[source].bounded_buffer =
-        DescriptorSource::BoundedBuffer{{0u, 1u, 2u, 3u}, {}, 0u};
+    program.descriptor_sources[source].bounded_buffer.emplace();
+    program.descriptor_sources[source].bounded_buffer->reads = {0u, 1u, 2u, 3u};
     program.info.buffers.push_back({.source=source});
   }
 }
@@ -4947,6 +4949,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--bounded-write-alias-only") == 0) {
       TestBoundedMaterializationRejectsWritableAliases();
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-uniform-buffer-phi-only") == 0) {
+      TestWaveUniformBufferPhiTable();
+      std::cout << "KYTY_WAVE_UNIFORM_BUFFER_PHI_PASS\n";
       return 0;
     }
     if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {

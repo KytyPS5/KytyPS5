@@ -193,6 +193,10 @@ void Run(const RunOptions& options) {
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 
+	// Init() configures the log, so this is the first point where a crash report has somewhere
+	// to go. Everything after it is covered.
+	Common::InstallCrashReporter();
+
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();

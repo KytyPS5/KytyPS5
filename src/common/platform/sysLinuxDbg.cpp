@@ -43,6 +43,16 @@ static bool OnOwnStack() {
 #endif
 }
 
+bool SysInstallCrashHandler(SysCrashHandler /*handler*/) {
+	// Not wired up here yet. SIGSEGV, SIGBUS and SIGILL already carry the guest page-fault
+	// handler installed by HostException, so a second handler for those signals would have to
+	// chain to it rather than replace it. Reporting the fault from the point where that handler
+	// gives up is the right hook, and it needs a POSIX machine to verify. Until then this
+	// hook returns false. The terminate and SIGABRT hooks in InstallCrashReporter are portable
+	// and do run here.
+	return false;
+}
+
 void SysStackWalk(void** stack, int* depth) {
 	if (stack == nullptr || depth == nullptr || *depth <= 0) {
 		if (depth != nullptr) {

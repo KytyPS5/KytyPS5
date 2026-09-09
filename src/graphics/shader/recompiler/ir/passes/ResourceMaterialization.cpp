@@ -491,7 +491,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	    !DecodeBufferDescriptor(heap_value, heap)) {
 		return note("material or heap is not a buffer descriptor");
 	}
-	if (material.Stride() != indirect.selector_stride) {
+	if (material.Stride() != 0u && material.Stride() != indirect.selector_stride) {
 		return note("material buffer stride no longer matches the tracked selector");
 	}
 
@@ -513,7 +513,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	seen.reserve(static_cast<size_t>(probe_count) + 1u);
 	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
 		uint32_t key = 0;
-		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key)) {
+		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset),
+		                          indirect.selector_immediate, runtime, key)) {
 			return note("material table key is not readable");
 		}
 		if (seen.insert(key).second) {

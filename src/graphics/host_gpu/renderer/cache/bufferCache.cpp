@@ -536,9 +536,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	const bool dense_backing =
+	    staging != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size);
+	const bool prt_backing = staging != nullptr && !dense_backing &&
+	                         Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size);
+	if (!dense_backing && !prt_backing) {
+		EXIT("BufferCache: failed to read mapped guest image backing "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " clamped=0x%016" PRIx64
+		     " staging=%d registered=%d cpu_dirty=%d gpu_dirty=%d buffer_dirty=%d\n",
+		     vaddr, size, Libs::LibKernel::Memory::TryClampRangeSize(vaddr, size),
+		     staging != nullptr, IsRegionRegistered(vaddr, size),
+		     m_memory_tracker.IsRegionCpuModified(vaddr, size),
+		     m_memory_tracker.IsRegionGpuModified(vaddr, size),
+		     m_gpu_modified_ranges.Intersects(vaddr, size));
 	}
 	m_staging_buffer.Commit();
 

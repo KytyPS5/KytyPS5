@@ -20964,6 +20964,51 @@ TestCase VectorVopcCmpxLtU16CapturedSdwaExecMask() {
   return test;
 }
 
+// VOPC opcode 153 is V_CMPX_LT_I16: a signed less-than on the selected words, not an equality.
+TestCase VectorVopcCmpxLtI16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+  struct CompareCase {
+    u32 lhs;
+    u32 rhs;
+    u32 incoming_exec;
+    u32 expected_exec;
+  };
+  const std::array<CompareCase, 6> cases{{
+      {0xffff1234u, 0x00015678u, 1, 1}, // Signed: -1 < 1.
+      {0x00050000u, 0x0005ffffu, 1, 0}, // Equal words are not less.
+      {0x7fff0000u, 0x80000000u, 1, 0}, // 32767 is not below -32768.
+      {0x80000000u, 0x7fff0000u, 1, 1},
+      {0x1234ffffu, 0x56780000u, 1, 1}, // Low halves are ignored.
+      {0xffff0000u, 0x00010000u, 0, 0}, // CMPX cannot reactivate an inactive lane.
+  }};
+  TestCase test;
+  test.name = "VectorVopcCmpxLtI16CapturedSdwaExecMask";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.lhs);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 39, 30);
+    AppendSMovLiteral(&code, 27, entry.rhs);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.incoming_exec)));
+    code.insert(code.end(), {0x7d3236f9u, 0x85050027u}); // v39.word1 < s27.word1
+    code.push_back(EncodeSMovB32(20, 126));
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendStoreSgprPair(&code, 20, static_cast<u32>(cases.size()) + i * 2u);
+    test.expected.insert(test.expected.end(), {entry.expected_exec, 0u});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_LT_I16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMPX_LT_I16", cases.size()}};
+  test.required_spirv = {"OpSLessThan"};
+  return test;
+}
+
 TestCase VectorVopcCmpxNgtF16CapturedSdwaExecMask() {
   using O = ShaderOpcode;
 
@@ -26440,6 +26485,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
   AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxLtU16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxLtI16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
@@ -31098,6 +31144,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-lt-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxLtU16CapturedSdwaExecMask());
+    RunCase(&vulkan, VectorVopcCmpxLtI16CapturedSdwaExecMask());
     RunCase(&vulkan, VectorVopcCmpxGtU16CapturedSdwaExecMask());
     RunCase(&vulkan, VectorVopcSdwaCmpxWritesExecMask());
     RunCase(&vulkan, VectorVop3CmpxWritesExecMask());

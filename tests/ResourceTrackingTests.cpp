@@ -1783,7 +1783,7 @@ void TestFindLsbDenseIndirectImage() {
   }
 }
 
-void TestReadLaneProbeIndirectImage() {
+void TestReadLaneProbeIndirectImageWith(ValueOpcode readlane) {
   Fixture fixture;
   const auto low = fixture.UserData(0);
   const auto high = fixture.UserData(1);
@@ -1816,7 +1816,8 @@ void TestReadLaneProbeIndirectImage() {
   const auto lane = fixture.Emit(
       ValueOpcode::BitwiseAnd32,
       {fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(5)}), Value(63u)});
-  const auto key = fixture.Emit(ValueOpcode::ReadLane, {per_lane, lane});
+  const auto key = fixture.Emit(
+      readlane, {per_lane, readlane == ValueOpcode::ReadLane ? lane : Value(true)});
   const auto scaled =
       fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
   const auto based = fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x20e0u)});
@@ -1907,6 +1908,14 @@ void TestReadLaneProbeIndirectImage() {
                   0x40u + key_value,
           "address probe read the wrong table entry for a key");
   }
+}
+
+void TestReadLaneProbeIndirectImage() {
+  TestReadLaneProbeIndirectImageWith(ValueOpcode::ReadLane);
+}
+
+void TestReadFirstLaneProbeIndirectImage() {
+  TestReadLaneProbeIndirectImageWith(ValueOpcode::ReadFirstLane);
 }
 
 void TestWaterfallDescriptorMatch() {
@@ -2684,6 +2693,7 @@ int main() {
     Run("dense indirect images", TestDenseIndirectImageMaterialization);
     Run("loop-bounded dense images", TestLoopBoundedDenseIndirectImage);
     Run("readlane probe images", TestReadLaneProbeIndirectImage);
+    Run("readfirstlane probe images", TestReadFirstLaneProbeIndirectImage);
     Run("lsb-keyed dense images", TestFindLsbDenseIndirectImage);
     Run("waterfall descriptor match", TestWaterfallDescriptorMatch);
     Run("waterfall near misses", TestWaterfallNearMissesRejected);

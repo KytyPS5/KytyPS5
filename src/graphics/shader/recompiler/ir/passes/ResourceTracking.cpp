@@ -5,11 +5,63 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+bool ProveBoundedSrtReadsPrecedeWrites(const Program& program) {
+	std::vector<const Inst*> reads;
+	std::vector<const Inst*> writes;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op == ValueOpcode::ReadBoundedSrtU32) reads.push_back(&inst);
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image == ImageAccess::Write || image == ImageAccess::Atomic)
+				writes.push_back(&inst);
+		}
+	}
+	if (reads.empty() || writes.empty()) return false;
+	const auto reachable_after_edge = [](const Block* from, const Block* target) {
+		std::vector<const Block*> pending;
+		for (const auto* successor: from->ImmSuccessors()) pending.push_back(successor);
+		std::unordered_set<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == target) return true;
+			if (!visited.insert(block).second) continue;
+			for (const auto* successor: block->ImmSuccessors()) pending.push_back(successor);
+		}
+		return false;
+	};
+	for (const auto* write: writes) {
+		for (const auto* read: reads) {
+			if (write->Parent() != read->Parent()) {
+				if (reachable_after_edge(write->Parent(), read->Parent())) return false;
+				continue;
+			}
+			bool saw_write = false;
+			for (const auto& inst: *write->Parent()) {
+				if (&inst == write) saw_write = true;
+				if (&inst == read && saw_write) return false;
+			}
+			// A later write in the same block is safe only when no successor path
+			// can revisit the bounded read in another loop iteration.
+			if (reachable_after_edge(write->Parent(), read->Parent())) return false;
+		}
+	}
+	return true;
+}
+
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -80,6 +132,33 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
 }
 
+uint64_t StrideZeroAccessSize(const Inst& inst, const MemoryInfo& memory) {
+	if (memory.kind != ResourceKind::Buffer || inst.NumArgs() < 4u) {
+		return 0u;
+	}
+	const auto offset  = inst.Arg(2u).Resolve();
+	const auto soffset = inst.Arg(3u).Resolve();
+	if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+	    !soffset.IsImmediate() || soffset.GetType() != Type::U32) {
+		return 0u;
+	}
+	// BufferByteAddress applies these as wrapping U32 additions. A wrap cannot be
+	// represented by one prefix range, so retain the full descriptor in that case.
+	uint64_t end = offset.U32();
+	if (end + memory.offset > UINT32_MAX) {
+		return 0u;
+	}
+	end += memory.offset;
+	if (end + soffset.U32() > UINT32_MAX) {
+		return 0u;
+	}
+	end += soffset.U32();
+	const auto bytes = std::max((memory.data_bits + 7u) / 8u, 1u);
+	const auto count = std::max(memory.data_dwords, 1u);
+	const auto width = static_cast<uint64_t>(bytes) * count;
+	return end + width <= uint64_t {UINT32_MAX} + 1u ? end + width : 0u;
+}
+
 class Tracker {
 public:
 	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
@@ -88,6 +167,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.writes_dma = false;
 	}
 
 	void Run() {
@@ -97,23 +177,50 @@ public:
 		if (!m_program.srt_plan_complete) {
 			Fail(0, "SRT plan is not ready");
 		}
-		PlanIndirectImages();
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				Collect(inst);
+		const char* trace_env = std::getenv("KYTY_RESOURCE_TRACKING_TRACE");
+		const bool  trace     = trace_env != nullptr && *trace_env != '\0';
+		const auto phase = [&](const char* name, auto&& action) {
+			const auto start = std::chrono::steady_clock::now();
+			if (trace) {
+				std::printf("ResourceTracking begin: hash=0x%016" PRIx64 " phase=%s\n",
+				            m_program.shader_hash, name);
+				std::fflush(stdout);
 			}
-		}
-		LinkImageAliases();
+			action();
+			if (trace) {
+				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                         std::chrono::steady_clock::now() - start)
+				                         .count();
+				std::printf("ResourceTracking end: hash=0x%016" PRIx64
+				            " phase=%s elapsed_ms=%" PRId64 "\n",
+				            m_program.shader_hash, name, elapsed);
+				std::fflush(stdout);
+			}
+		};
+		phase("PlanBoundedReads", [&] { PlanBoundedReads(); });
+		phase("PlanIndirectImages", [&] { PlanIndirectImages(); });
+		phase("PlanInlineDescriptors", [&] { PlanInlineDescriptors(); });
+		phase("Collect", [&] {
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					Collect(inst);
+				}
+			}
+		});
+		phase("LinkImageAliases", [&] { LinkImageAliases(); });
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
 		for (const auto& patch: m_memory_patches) {
 			auto& memory    = m_program.memory_info[patch.index];
+			memory.buffer_table = patch.buffer_table;
 			memory.resource = patch.resource;
 			if (patch.has_sampler) {
 				memory.sampler = patch.sampler;
 			}
 		}
+		phase("ApplyBoundedRootReads", [&] { ApplyBoundedRootReads(); });
+		phase("ApplyBoundedReads", [&] { ApplyBoundedReads(); });
 		for (const auto& plan: m_indirect_images) {
 			plan.handle->SetArg(0, plan.key);
 			for (uint32_t dword = 0; dword < 4u; dword++) {
@@ -126,15 +233,27 @@ public:
 				m_program.memory_info[index].planning_only = true;
 			}
 		}
+		for (const auto& plan: m_inline_descriptors) {
+			plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 1; dword < plan.handle->NumArgs(); dword++) {
+				plan.handle->SetArg(dword, dword <= plan.root_count ? plan.roots[dword - 1u] : plan.key);
+			}
+		}
+		for (const auto index: m_inline_planning_memory) {
+			m_program.memory_info[index].planning_only = true;
+		}
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
-			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+			return std::ranges::find(m_inline_planning_reads, inst) != m_inline_planning_reads.end() ||
+			       std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
+		m_program.bounded_srt_reads_precede_writes =
+		    ProveBoundedSrtReadsPrecedeWrites(m_program);
 		m_program.resource_tracking_complete = true;
 	}
 
@@ -149,6 +268,7 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+		uint32_t buffer_table = UINT32_MAX;
 	};
 
 	struct IndirectImagePlan {
@@ -158,6 +278,17 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+	};
+
+	struct InlineDescriptorPlan {
+		Inst*                      handle = nullptr;
+		uint32_t                   source = 0;
+		Value                      key;
+		std::array<Value, 6>        roots {};
+		std::array<uint32_t, 8>     memory {};
+		std::array<const Inst*, 8>  reads {};
+		uint32_t                   root_count = 4;
+		uint32_t                   read_count = 4;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -202,11 +333,822 @@ private:
 		return true;
 	}
 
+	struct BoundedReadPlan {
+		Inst* read = nullptr;
+		BoundedSrtReadProof proof;
+		uint32_t read_id = 0;
+	};
+	struct BoundedBufferPlan {
+		Inst* handle = nullptr;
+		Value index;
+		std::array<Value, 3> roots;
+	};
+	struct BoundedImagePlan {
+		Inst* handle = nullptr;
+		Value index;
+	};
+	struct BoundedSamplerPlan {
+		Inst* handle = nullptr;
+		Value index;
+	};
+
+	void PlanBoundedReads() {
+		if (m_program.stage != ShaderType::Compute) return;
+		for (auto* block : m_program.blocks) {
+			for (auto& inst : *block) {
+				if (!inst.HasUses()) continue;
+				const auto proof = ProveBoundedSrtRead(m_program, inst);
+				if (!proof) continue;
+				if (proof->workgroup_axis == UINT32_MAX) PlanBoundedRootReads(proof->count);
+				PlanBoundedRootReads(proof->address_low);
+				PlanBoundedRootReads(proof->address_high);
+				if (proof->source_dwords == 4u) {
+					PlanBoundedRootReads(proof->descriptor_word2);
+					PlanBoundedRootReads(proof->descriptor_word3);
+				}
+				DescriptorSource address;
+				address.dword_count = proof->source_dwords;
+				address.dwords[0] = proof->address_low;
+				address.dwords[1] = proof->address_high;
+				if (proof->source_dwords == 4u) {
+					address.dwords[2] = proof->descriptor_word2;
+					address.dwords[3] = proof->descriptor_word3;
+				}
+				const auto address_source = InternSource(address);
+				uint32_t count_source = UINT32_MAX;
+				if (proof->workgroup_axis == UINT32_MAX) {
+					DescriptorSource count;
+					count.dword_count = 1u;
+					count.dwords[0] = proof->count;
+					count_source = InternSource(count);
+				}
+				const BoundedSrtRead read {address_source, count_source,
+				                          proof->offset_scale, proof->offset_bias, proof->memory_offset,
+				                          proof->workgroup_axis, proof->count_signed};
+				auto found = std::ranges::find(m_bounded_srt_reads, read);
+				uint32_t read_id = static_cast<uint32_t>(found - m_bounded_srt_reads.begin());
+				if (found == m_bounded_srt_reads.end()) m_bounded_srt_reads.push_back(read);
+				m_bounded_reads.push_back({&inst, *proof, read_id});
+			}
+		}
+	}
+
+	const BoundedReadPlan* BoundedRead(const Inst* read) const {
+		const auto found = std::ranges::find_if(m_bounded_reads,
+		    [&](const BoundedReadPlan& plan) { return plan.read == read; });
+		return found == m_bounded_reads.end() ? nullptr : &*found;
+	}
+
+	const BoundedReadPlan* BoundedReadValue(Value value) const {
+		value = value.Resolve();
+		const Inst* read = value.TryInstruction();
+		std::unordered_set<uint32_t> visited_slots;
+		while (read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+		       read->NumArgs() == 2u) {
+			const auto slot = read->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size() ||
+			    !visited_slots.insert(slot.U32()).second) {
+				return nullptr;
+			}
+			read = m_program.srt_reads[slot.U32()].value.Resolve().TryInstruction();
+		}
+		return BoundedRead(read);
+	}
+
+	bool CollectBoundedDependencies(Value value, std::vector<const BoundedReadPlan*>& dependencies,
+	                                std::unordered_set<const Inst*>& visiting,
+	                                std::unordered_set<const Inst*>& completed) const {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return true;
+		if (completed.contains(inst)) return true;
+		if (const auto* bounded = BoundedRead(inst); bounded != nullptr) {
+			if (std::ranges::find(dependencies, bounded) == dependencies.end())
+				dependencies.push_back(bounded);
+			completed.insert(inst);
+			return true;
+		}
+		if (!visiting.insert(inst).second) return false;
+		const auto finish = [&](bool result) {
+			visiting.erase(inst);
+			if (result) completed.insert(inst);
+			return result;
+		};
+		if (inst->GetOpcode() == ValueOpcode::ReadConst && inst->NumArgs() == 2u) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) return finish(false);
+			return finish(CollectBoundedDependencies(m_program.srt_reads[slot.U32()].value,
+			                                           dependencies, visiting, completed));
+		}
+		for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+			if (!CollectBoundedDependencies(inst->Arg(arg), dependencies, visiting, completed))
+				return finish(false);
+		}
+		return finish(true);
+	}
+
+	uint32_t InternBoundedSelector(Value selector) {
+		selector = selector.Resolve();
+		for (uint32_t group = 0; group < m_bounded_selectors.size(); ++group) {
+			if (EquivalentValue(m_program, selector, m_bounded_selectors[group])) return group;
+		}
+		m_bounded_selectors.push_back(selector);
+		return static_cast<uint32_t>(m_bounded_selectors.size() - 1u);
+	}
+
+	bool MakeBoundedBufferExpression(Inst& handle, DescriptorSource descriptor,
+	                                 uint32_t& source, std::string& rejection) {
+		std::vector<const BoundedReadPlan*> dependencies;
+		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> completed;
+		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting,
+			                                completed)) {
+				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
+				return false;
+			}
+		}
+		if (dependencies.empty()) return false;
+		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		if (first.workgroup_axis != UINT32_MAX) {
+			rejection = "descriptor dependency is indexed by a workgroup axis";
+			return false;
+		}
+		for (const auto* dependency: dependencies) {
+			const auto& read = m_bounded_srt_reads[dependency->read_id];
+			if (dependency->proof.index != dependencies.front()->proof.index ||
+			    read.count_source != first.count_source || read.count_signed != first.count_signed ||
+			    read.workgroup_axis != first.workgroup_axis) {
+				rejection = "descriptor dependencies do not share one selector and count";
+				return false;
+			}
+		}
+		descriptor.bounded_buffer.emplace();
+		descriptor.bounded_buffer->expression = true;
+		descriptor.bounded_buffer->selector_group =
+		    InternBoundedSelector(dependencies.front()->proof.index);
+		for (const auto* dependency: dependencies)
+			descriptor.bounded_buffer->dependencies.push_back(dependency->read_id);
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_buffers,
+		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; })) {
+			m_bounded_buffers.push_back(
+			    {&handle, dependencies.front()->proof.index, {Value(0u), Value(0u), Value(0u)}});
+		}
+		return true;
+	}
+
+	bool MakeBoundedImageExpression(Inst& handle, DescriptorSource descriptor,
+	                                uint32_t& source, std::string& rejection) {
+		std::vector<const BoundedReadPlan*> dependencies;
+		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> completed;
+		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting,
+			                                completed)) {
+				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
+				return false;
+			}
+		}
+		if (dependencies.empty()) return false;
+		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		if (first.workgroup_axis != UINT32_MAX) {
+			rejection = "descriptor dependency is indexed by a workgroup axis";
+			return false;
+		}
+		for (const auto* dependency: dependencies) {
+			const auto& read = m_bounded_srt_reads[dependency->read_id];
+			if (dependency->proof.index != dependencies.front()->proof.index ||
+			    read.count_source != first.count_source || read.count_signed != first.count_signed ||
+			    read.workgroup_axis != first.workgroup_axis) {
+				rejection = "descriptor dependencies do not share one selector and count";
+				return false;
+			}
+		}
+		descriptor.bounded_image.emplace();
+		descriptor.bounded_image->expression = true;
+		descriptor.bounded_image->selector_group =
+		    InternBoundedSelector(dependencies.front()->proof.index);
+		for (const auto* dependency: dependencies)
+			descriptor.bounded_image->dependencies.push_back(dependency->read_id);
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_images,
+		    [&](const BoundedImagePlan& plan) { return plan.handle == &handle; }))
+			m_bounded_images.push_back({&handle, dependencies.front()->proof.index});
+		return true;
+	}
+
+	using WaveImageValues = std::array<Value, 8>;
+	using WaveImageCandidate =
+	    std::array<DescriptorSource::BoundedImage::CandidateDword, 8>;
+
+	static bool SameWaveValues(const WaveImageValues& left, const WaveImageValues& right) {
+		for (uint32_t word = 0; word < left.size(); ++word) {
+			if (left[word] != right[word]) return false;
+		}
+		return true;
+	}
+
+	bool DecodeWaveCandidate(Value value,
+	                         DescriptorSource::BoundedImage::CandidateDword& candidate) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() != Type::U32) return false;
+			candidate.value = value.U32();
+			candidate.immediate = true;
+			return true;
+		}
+		const auto* read = value.TryInstruction();
+		const auto slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+		                          read->NumArgs() == 2u
+		                      ? read->Arg(1).Resolve()
+		                      : Value {};
+		if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+		    slot.U32() >= m_program.srt_reads.size() ||
+		    !ValidateRuntimeValue(m_program, value)) {
+			return false;
+		}
+		candidate.value = slot.U32();
+		candidate.immediate = false;
+		return true;
+	}
+
+	bool CollectWaveImageCandidates(
+	    WaveImageValues values, std::vector<WaveImageCandidate>& candidates,
+	    std::vector<WaveImageValues>& visiting, std::vector<WaveImageValues>& completed) const {
+		for (auto& value: values) value = value.Resolve();
+		const auto same = [&](const WaveImageValues& current) {
+			return SameWaveValues(current, values);
+		};
+		if (std::ranges::find_if(completed, same) != completed.end()) return true;
+		if (std::ranges::find_if(visiting, same) != visiting.end()) return false;
+
+		WaveImageCandidate candidate;
+		bool terminal = true;
+		for (uint32_t word = 0; word < values.size(); ++word) {
+			terminal &= DecodeWaveCandidate(values[word], candidate[word]);
+		}
+		if (terminal) {
+			if (std::ranges::find(candidates, candidate) == candidates.end()) {
+				if (candidates.size() >= ShaderInfo::MaxImages) return false;
+				candidates.push_back(candidate);
+			}
+			completed.push_back(values);
+			return true;
+		}
+
+		std::array<const Inst*, 8> instructions {};
+		for (uint32_t word = 0; word < values.size(); ++word) {
+			instructions[word] = values[word].TryInstruction();
+			if (instructions[word] == nullptr) return false;
+		}
+		const auto opcode = instructions[0]->GetOpcode();
+		if (opcode != ValueOpcode::Phi && opcode != ValueOpcode::SelectU32) return false;
+		const auto argument_count = instructions[0]->NumArgs();
+		if (argument_count == 0u ||
+		    (opcode == ValueOpcode::SelectU32 && argument_count != 3u)) return false;
+		for (uint32_t word = 1; word < instructions.size(); ++word) {
+			if (instructions[word]->GetOpcode() != opcode ||
+			    instructions[word]->NumArgs() != argument_count) return false;
+		}
+		if (opcode == ValueOpcode::Phi) {
+			for (uint32_t word = 0; word < instructions.size(); ++word) {
+				if (instructions[word]->Parent() != instructions[0]->Parent() ||
+				    instructions[word]->NumPhiBlocks() != argument_count) return false;
+			}
+			for (uint32_t argument = 0; argument < argument_count; ++argument) {
+				for (uint32_t word = 1; word < instructions.size(); ++word) {
+					if (instructions[word]->PhiBlock(argument) !=
+					    instructions[0]->PhiBlock(argument)) return false;
+				}
+			}
+		} else {
+			const auto condition = instructions[0]->Arg(0).Resolve();
+			for (uint32_t word = 1; word < instructions.size(); ++word) {
+				if (!EquivalentValue(m_program, condition,
+				                     instructions[word]->Arg(0).Resolve())) return false;
+			}
+		}
+
+		visiting.push_back(values);
+		const uint32_t first_argument = opcode == ValueOpcode::SelectU32 ? 1u : 0u;
+		for (uint32_t argument = first_argument; argument < argument_count; ++argument) {
+			WaveImageValues next;
+			for (uint32_t word = 0; word < next.size(); ++word) {
+				next[word] = instructions[word]->Arg(argument);
+			}
+			if (!CollectWaveImageCandidates(next, candidates, visiting, completed)) {
+				visiting.pop_back();
+				return false;
+			}
+		}
+		visiting.pop_back();
+		completed.push_back(values);
+		return true;
+	}
+
+	bool MakeWaveUniformImageSource(Inst& handle, DescriptorSource descriptor,
+	                                uint32_t& source) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		WaveImageValues values;
+		Value active_mask;
+		for (uint32_t word = 0; word < values.size(); ++word) {
+			const auto* broadcast = handle.Arg(word).Resolve().TryInstruction();
+			if (broadcast == nullptr || broadcast->GetOpcode() != ValueOpcode::ReadFirstLane ||
+			    broadcast->NumArgs() != 2u || broadcast->Arg(0).GetType() != Type::U32 ||
+			    broadcast->Arg(1).GetType() != Type::U1) return false;
+			const auto current_mask = broadcast->Arg(1).Resolve();
+			if (word == 0u) {
+				active_mask = current_mask;
+			} else if (!EquivalentValue(m_program, active_mask, current_mask)) {
+				return false;
+			}
+			values[word] = broadcast->Arg(0);
+		}
+
+		std::vector<WaveImageCandidate> candidates;
+		std::vector<WaveImageValues> visiting;
+		std::vector<WaveImageValues> completed;
+		if (!CollectWaveImageCandidates(values, candidates, visiting, completed) ||
+		    candidates.empty()) return false;
+
+		descriptor.bounded_image.emplace();
+		descriptor.bounded_image->wave_uniform = true;
+		descriptor.bounded_image->wave_candidates = std::move(candidates);
+		descriptor.bounded_image->key_arg = 0u;
+		source = InternSource(descriptor);
+		return true;
+	}
+
+	static bool WaveUniformValue(Value value, std::unordered_set<const Inst*>& visiting,
+	                             std::unordered_set<const Inst*>& complete) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (complete.contains(inst)) return true;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::ReadConst:
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane:
+			case ValueOpcode::Ballot:
+				complete.insert(inst);
+				return true;
+			case ValueOpcode::Identity:
+			case ValueOpcode::CompositeExtractU32x4:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightArithmetic32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::SLessThan32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::SLessThanEqual32:
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::SGreaterThan32:
+			case ValueOpcode::UGreaterThan32:
+			case ValueOpcode::SGreaterThanEqual32:
+			case ValueOpcode::UGreaterThanEqual32:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::LogicalXor:
+			case ValueOpcode::LogicalNot:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32: break;
+			default: return false;
+		}
+		if (!visiting.insert(inst).second) return false;
+		for (uint32_t argument = 0; argument < inst->NumArgs(); ++argument) {
+			if (!WaveUniformValue(inst->Arg(argument), visiting, complete)) {
+				visiting.erase(inst);
+				return false;
+			}
+		}
+		visiting.erase(inst);
+		complete.insert(inst);
+		return true;
+	}
+
+	static bool WaveUniformValue(Value value) {
+		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> complete;
+		return WaveUniformValue(value, visiting, complete);
+	}
+
+	bool DecodeWaveBufferCandidate(
+	    Value value, DescriptorSource::BoundedBuffer::CandidateDword& candidate) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() != Type::U32) return false;
+			candidate.value = value.U32();
+			candidate.immediate = true;
+			return true;
+		}
+		const auto* read = value.TryInstruction();
+		const auto slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+		                          read->NumArgs() == 2u
+		                      ? read->Arg(1).Resolve()
+		                      : Value {};
+		if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+		    slot.U32() >= m_program.srt_reads.size() ||
+		    !ValidateRuntimeValue(m_program, value)) return false;
+		candidate.value = slot.U32();
+		candidate.immediate = false;
+		return true;
+	}
+
+	bool MakeWaveUniformBufferSource(Inst& handle, uint32_t& source) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
+		    handle.Parent() == nullptr) return false;
+		std::array<const Inst*, 4> phis {};
+		for (uint32_t word = 0; word < phis.size(); ++word) {
+			phis[word] = handle.Arg(word).Resolve().TryInstruction();
+			if (phis[word] == nullptr || phis[word]->GetOpcode() != ValueOpcode::Phi ||
+			    phis[word]->NumArgs() != 2u || phis[word]->NumPhiBlocks() != 2u ||
+			    phis[word]->Parent() != phis[0]->Parent()) return false;
+		}
+		for (uint32_t word = 1; word < phis.size(); ++word) {
+			for (uint32_t argument = 0; argument < 2u; ++argument) {
+				if (phis[word]->PhiBlock(argument) != phis[0]->PhiBlock(argument)) return false;
+			}
+		}
+		auto* first_arm = phis[0]->PhiBlock(0u);
+		auto* second_arm = phis[0]->PhiBlock(1u);
+		auto* merge = phis[0]->Parent();
+		if (first_arm == nullptr || second_arm == nullptr || first_arm == second_arm ||
+		    merge == nullptr || merge->ImmPredecessors().size() != 2u ||
+		    std::ranges::find(merge->ImmPredecessors(), first_arm) == merge->ImmPredecessors().end() ||
+		    std::ranges::find(merge->ImmPredecessors(), second_arm) == merge->ImmPredecessors().end() ||
+		    first_arm->ImmPredecessors().size() != 1u ||
+		    second_arm->ImmPredecessors().size() != 1u ||
+		    first_arm->ImmPredecessors().front() != second_arm->ImmPredecessors().front()) return false;
+		auto* split = first_arm->ImmPredecessors().front();
+		const auto* split_info = BlockMetadata(split);
+		const auto* first_info = BlockMetadata(first_arm);
+		const auto* second_info = BlockMetadata(second_arm);
+		const auto* merge_info = BlockMetadata(merge);
+		if (split_info == nullptr || first_info == nullptr || second_info == nullptr ||
+		    merge_info == nullptr ||
+		    split_info->terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    first_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    second_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    first_info->terminator.true_block != merge_info->id ||
+		    second_info->terminator.true_block != merge_info->id) return false;
+		uint32_t true_candidate = 0u;
+		uint32_t false_candidate = 0u;
+		if (split_info->terminator.true_block == first_info->id &&
+		    split_info->terminator.false_block == second_info->id) {
+			true_candidate = 0u;
+			false_candidate = 1u;
+		} else if (split_info->terminator.true_block == second_info->id &&
+		           split_info->terminator.false_block == first_info->id) {
+			true_candidate = 1u;
+			false_candidate = 0u;
+		} else {
+			return false;
+		}
+		const auto condition = split_info->condition.Resolve();
+		if (condition.GetType() != Type::U1 || !WaveUniformValue(condition)) return false;
+
+		std::array<std::array<DescriptorSource::BoundedBuffer::CandidateDword, 4>, 2>
+		    candidates {};
+		for (uint32_t candidate = 0; candidate < candidates.size(); ++candidate) {
+			for (uint32_t word = 0; word < phis.size(); ++word) {
+				if (!DecodeWaveBufferCandidate(phis[word]->Arg(candidate),
+				                               candidates[candidate][word])) return false;
+			}
+		}
+		auto* block = handle.Parent();
+		auto where = std::ranges::find_if(block->Instructions(),
+		    [&](const Inst& inst) { return &inst == &handle; });
+		if (where == block->Instructions().end()) return false;
+		const auto key = Value(&*block->PrependNewInst(
+		    where, ValueOpcode::SelectU32,
+		    {condition, Value(true_candidate), Value(false_candidate)}));
+		DescriptorSource descriptor;
+		descriptor.dword_count = 4u;
+		descriptor.dwords.fill(Value(0u));
+		descriptor.dwords[0] = key;
+		descriptor.bounded_buffer.emplace();
+		descriptor.bounded_buffer->wave_uniform = true;
+		descriptor.bounded_buffer->wave_candidates.assign(candidates.begin(), candidates.end());
+		descriptor.bounded_buffer->key_arg = 0u;
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_buffers,
+		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; })) {
+			m_bounded_buffers.push_back(
+			    {&handle, key, {Value(0u), Value(0u), Value(0u)}});
+		}
+		return true;
+	}
+
+	bool MakeBoundedSamplerExpression(Inst& handle, DescriptorSource descriptor,
+	                                  uint32_t& source, std::string& rejection) {
+		std::vector<const BoundedReadPlan*> dependencies;
+		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> completed;
+		for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+			if (!CollectBoundedDependencies(descriptor.dwords[word], dependencies, visiting,
+			                                completed)) {
+				rejection = "descriptor dependency graph is cyclic or has an invalid flat slot";
+				return false;
+			}
+		}
+		if (dependencies.empty()) return false;
+		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		if (first.workgroup_axis != UINT32_MAX) {
+			rejection = "descriptor dependency is indexed by a workgroup axis";
+			return false;
+		}
+		for (const auto* dependency: dependencies) {
+			const auto& read = m_bounded_srt_reads[dependency->read_id];
+			if (dependency->proof.index != dependencies.front()->proof.index ||
+			    read.count_source != first.count_source || read.count_signed != first.count_signed ||
+			    read.workgroup_axis != first.workgroup_axis) {
+				rejection = "descriptor dependencies do not share one selector and count";
+				return false;
+			}
+		}
+		descriptor.bounded_sampler.emplace();
+		descriptor.bounded_sampler->selector_group =
+		    InternBoundedSelector(dependencies.front()->proof.index);
+		for (const auto* dependency: dependencies)
+			descriptor.bounded_sampler->dependencies.push_back(dependency->read_id);
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_samplers,
+		    [&](const BoundedSamplerPlan& plan) { return plan.handle == &handle; }))
+			m_bounded_samplers.push_back({&handle, dependencies.front()->proof.index});
+		return true;
+	}
+
+	bool MakeBoundedBufferSource(Inst& handle, uint32_t& source, std::string& rejection) {
+		const auto reject = [&](std::string reason) {
+			rejection = std::move(reason);
+			return false;
+		};
+		if (handle.NumArgs() != 4u) return reject("descriptor width is not four DWORDs");
+		std::array<const BoundedReadPlan*, 4> words;
+		for (uint32_t word = 0; word < words.size(); ++word) {
+			words[word] = BoundedReadValue(handle.Arg(word));
+			if (words[word] == nullptr)
+				return reject(fmt::format("column {} is not a proved bounded read", word));
+		}
+		const auto& first = m_bounded_srt_reads[words[0]->read_id];
+		// Workgroup snapshots currently cover scalar payloads, not descriptor candidates.
+		if (first.workgroup_axis != UINT32_MAX)
+			return reject("column 0 is indexed by a workgroup axis");
+		for (uint32_t word = 1; word < words.size(); ++word) {
+			const auto& next = m_bounded_srt_reads[words[word]->read_id];
+			if (words[word]->proof.index != words[0]->proof.index ||
+			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    first.count_signed != next.count_signed ||
+			    next.workgroup_axis != UINT32_MAX ||
+			    first.offset_scale != next.offset_scale || first.offset_bias != next.offset_bias ||
+			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t))
+				return reject(fmt::format(
+				    "column {} is not correlated (read={} first_read={} offset={} expected={})",
+				    word, words[word]->read_id, words[0]->read_id, next.memory_offset,
+				    first.memory_offset + word * sizeof(uint32_t)));
+		}
+		DescriptorSource descriptor;
+		descriptor.dword_count = 4u;
+		descriptor.dwords[0] = words[0]->proof.address_low;
+		descriptor.dwords[1] = words[0]->proof.address_high;
+		descriptor.dwords[2] = words[0]->proof.source_dwords == 4u
+		                           ? words[0]->proof.descriptor_word2
+		                           : words[0]->proof.count;
+		descriptor.dwords[3] = words[0]->proof.source_dwords == 4u
+		                           ? words[0]->proof.descriptor_word3
+		                           : Value(0u);
+		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer {};
+		descriptor.bounded_buffer->selector_group = InternBoundedSelector(words[0]->proof.index);
+		for (uint32_t word = 0; word < words.size(); ++word)
+			descriptor.bounded_buffer->reads[word] = words[word]->read_id;
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_buffers,
+		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; }))
+			m_bounded_buffers.push_back({&handle, words[0]->proof.index,
+			                            {descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2]}});
+		return true;
+	}
+
+	bool MakeBoundedImageSource(Inst& handle, uint32_t& source) {
+		if (handle.NumArgs() != 8u) return false;
+		std::array<const BoundedReadPlan*, 8> words;
+		for (uint32_t word = 0; word < words.size(); ++word) {
+			words[word] = BoundedReadValue(handle.Arg(word));
+			if (words[word] == nullptr || words[word]->proof.source_dwords != 2u) return false;
+		}
+		const auto& first = m_bounded_srt_reads[words[0]->read_id];
+		if (first.workgroup_axis != UINT32_MAX) return false;
+		for (uint32_t word = 1; word < words.size(); ++word) {
+			const auto& next = m_bounded_srt_reads[words[word]->read_id];
+			if (words[word]->proof.index != words[0]->proof.index ||
+			    first.address_source != next.address_source || first.count_source != next.count_source ||
+			    first.count_signed != next.count_signed ||
+			    next.workgroup_axis != UINT32_MAX || first.offset_scale != next.offset_scale ||
+			    first.offset_bias != next.offset_bias ||
+			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t)) return false;
+		}
+		DescriptorSource descriptor;
+		descriptor.dword_count = 8u;
+		descriptor.dwords[0] = words[0]->proof.address_low;
+		descriptor.dwords[1] = words[0]->proof.address_high;
+		descriptor.dwords[2] = words[0]->proof.count;
+		for (uint32_t word = 3; word < descriptor.dword_count; ++word)
+			descriptor.dwords[word] = Value(0u);
+		descriptor.bounded_image.emplace();
+		descriptor.bounded_image->selector_group = InternBoundedSelector(words[0]->proof.index);
+		for (uint32_t word = 0; word < words.size(); ++word)
+			descriptor.bounded_image->reads[word] = words[word]->read_id;
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_images,
+		    [&](const BoundedImagePlan& plan) { return plan.handle == &handle; }))
+			m_bounded_images.push_back({&handle, words[0]->proof.index});
+		return true;
+	}
+
+	// Only roots of an already-proved bounded read receive this extension.
+	// Their raw ancestors execute before the unavoidable unsigned guard and
+	// use host-evaluable addresses; arbitrary dynamic shader reads stay live.
+	void PlanBoundedRootReads(Value value) {
+		value = value.Resolve();
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(m_bounded_root_visited, inst) !=
+		                           m_bounded_root_visited.end()) return;
+		m_bounded_root_visited.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < m_program.srt_reads.size())
+				PlanBoundedRootReads(m_program.srt_reads[slot.U32()].value);
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+			PlanBoundedRootReads(inst->Arg(arg));
+		const auto op = inst->GetOpcode();
+		if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) return;
+		const auto flags = inst->Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size())
+			Fail(flags.pc, "bounded snapshot root has invalid memory metadata");
+		const auto& memory = m_program.memory_info[flags.index];
+		if (memory.planning_only) return;
+		if ((op == ValueOpcode::LoadAddressU32 && memory.kind != ResourceKind::ScalarAddress) ||
+		    (op == ValueOpcode::ReadConstBuffer && memory.kind != ResourceKind::ScalarBuffer) ||
+		    inst->Parent() == nullptr || !ValidateRuntimeValue(m_program, value))
+			Fail(flags.pc, "bounded snapshot root is not a valid runtime scalar read");
+		m_bounded_root_reads.push_back(inst);
+	}
+
+	void ApplyBoundedRootReads() {
+		for (auto* read : m_bounded_root_reads) {
+			auto* block = read->Parent();
+			const auto where = std::ranges::find_if(block->Instructions(),
+			    [&](const Inst& inst) { return &inst == read; });
+			const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+			const auto srt = Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
+			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
+			                                                  {srt, Value(slot)}));
+			const auto original = Value(read);
+			const auto uses = read->Uses();
+			for (const auto& use : uses) use.user->SetArg(use.operand, flat);
+			const auto rewrite = [&](Value& value) {
+				if (value.Resolve() == original) value = flat;
+			};
+			for (auto& info : m_program.block_info) {
+				rewrite(info.condition);
+				rewrite(info.indirect_target);
+			}
+			// These retained values are not registered IR Uses. In particular,
+			// the count/address sources must point to ReadConst so extraction
+			// marks the exact flat slot for the coherent specialization reader.
+			for (auto& source : m_sources)
+				for (uint32_t word = 0; word < source.dword_count; ++word)
+					rewrite(source.dwords[word]);
+			for (auto& plan : m_bounded_buffers)
+				for (auto& root : plan.roots) rewrite(root);
+			for (auto& plan : m_indirect_images) {
+				rewrite(plan.key);
+				for (auto& root : plan.roots) rewrite(root);
+			}
+			for (auto& plan : m_inline_descriptors) {
+				rewrite(plan.key);
+				for (auto& root : plan.roots) rewrite(root);
+			}
+			// Keep a real raw template for host evaluation, without invalidating
+			// it as ReplaceUsesWith would. Isolate its planning metadata from any
+			// live access which happens to share the original MemoryInfo index.
+			auto flags = read->Flags<MemoryFlags>();
+			auto memory = m_program.memory_info[flags.index];
+			memory.planning_only = true;
+			flags.index = static_cast<uint32_t>(m_program.memory_info.size());
+			m_program.memory_info.push_back(memory);
+			read->SetFlags(flags);
+			m_program.srt_reads.push_back({original, slot});
+			block->AppendNewInst(ValueOpcode::ReferenceU32, {original});
+		}
+		std::erase_if(m_program.dynamic_reads, [&](Value value) {
+			return std::ranges::find(m_bounded_root_reads, value.Resolve().TryInstruction()) !=
+			       m_bounded_root_reads.end();
+		});
+	}
+
+	void ApplyBoundedReads() {
+		m_program.bounded_srt_reads = m_bounded_srt_reads;
+		for (const auto& plan : m_bounded_reads) {
+			auto* block = plan.read->Parent();
+			auto where = std::ranges::find_if(block->Instructions(),
+			    [&](const Inst& inst) { return &inst == plan.read; });
+			const auto replacement = Value(&*block->PrependNewInst(
+			    where, ValueOpcode::ReadBoundedSrtU32, {plan.proof.index}, plan.read_id));
+			// Real indexed immutable reads replace every consumer, including ordinary
+			// scalar threshold data. The raw memory instruction is no longer emitted;
+			// no planning_only shortcut discards its runtime index or shared readers.
+			plan.read->ReplaceUsesWith(replacement);
+		}
+		for (const auto& plan : m_bounded_buffers) {
+			plan.handle->SetArg(0, plan.index);
+			for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, plan.roots[word - 1u]);
+		}
+		for (const auto& plan : m_bounded_images) {
+			plan.handle->SetArg(0, plan.index);
+			for (uint32_t word = 1; word < 8u; ++word) plan.handle->SetArg(word, Value(0u));
+		}
+		for (const auto& plan : m_bounded_samplers) {
+			plan.handle->SetArg(0, plan.index);
+			for (uint32_t word = 1; word < 4u; ++word) plan.handle->SetArg(word, Value(0u));
+		}
+		std::erase_if(m_program.dynamic_reads, [](Value value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			return inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32;
+		});
+		// Descriptor sources are non-owning Values. Pure coefficient reads no
+		// longer have a resource handle retaining their address/count operands.
+		// Keep the final roots alive through DCE and plan extraction, including
+		// ReadConst roots introduced by ApplyBoundedRootReads above.
+		std::vector<uint8_t> retained_sources(m_sources.size());
+		std::vector<Inst*> retained_roots;
+		const auto retain = [&](uint32_t source) {
+			if (source >= m_sources.size()) Fail(0, "bounded snapshot source is missing");
+			if (retained_sources[source] != 0u) return;
+			retained_sources[source] = 1u;
+			auto& descriptor = m_sources[source];
+			for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+				auto& value = descriptor.dwords[word];
+				value = value.Resolve();
+				auto* inst = value.TryInstruction();
+				if (inst == nullptr) continue;
+				if (value.GetType() != Type::U32 || inst->Parent() == nullptr)
+					Fail(0, "bounded snapshot root is not a defined U32 value");
+				if (std::ranges::find(retained_roots, inst) != retained_roots.end()) continue;
+				retained_roots.push_back(inst);
+				inst->Parent()->AppendNewInst(ValueOpcode::ReferenceU32, {value});
+			}
+		};
+		for (const auto& read : m_bounded_srt_reads) {
+			retain(read.address_source);
+			if (read.workgroup_axis == UINT32_MAX) retain(read.count_source);
+		}
+		for (const auto& buffer: m_info.buffers) {
+			if (buffer.source < m_sources.size() && m_sources[buffer.source].bounded_buffer.has_value() &&
+			    m_sources[buffer.source].bounded_buffer->expression) {
+				retain(buffer.source);
+			}
+		}
+		for (const auto& image: m_info.images) {
+			if (image.source < m_sources.size() && m_sources[image.source].bounded_image.has_value() &&
+			    m_sources[image.source].bounded_image->expression) {
+				retain(image.source);
+			}
+		}
+		for (const auto& sampler: m_info.samplers) {
+			if (sampler.source < m_sources.size() &&
+			    m_sources[sampler.source].bounded_sampler.has_value()) {
+				retain(sampler.source);
+			}
+		}
+	}
+
 	uint32_t InternSource(const DescriptorSource& descriptor) {
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image != descriptor.indirect_image) {
+			    current.indirect_image != descriptor.indirect_image ||
+			    current.inline_descriptor != descriptor.inline_descriptor ||
+			    current.bounded_buffer != descriptor.bounded_buffer ||
+			    current.bounded_image != descriptor.bounded_image ||
+			    current.bounded_sampler != descriptor.bounded_sampler) {
 				continue;
 			}
 			bool same = true;
@@ -430,7 +1372,8 @@ private:
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
+		return std::ranges::find(m_inline_planning_memory, index) != m_inline_planning_memory.end() ||
+		       std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
 			return std::ranges::find(plan.memory, index) != plan.memory.end();
 		});
@@ -455,15 +1398,674 @@ private:
 		}
 	}
 
+	const InlineDescriptorPlan* FindInlineDescriptor(const Inst& handle) const {
+		const auto found = std::ranges::find_if(m_inline_descriptors, [&](const auto& plan) {
+			return plan.handle == &handle;
+		});
+		return found == m_inline_descriptors.end() ? nullptr : &*found;
+	}
+
+	static bool MatchInlineStride(Value key, uint32_t& stride, Value* selector = nullptr) {
+		const auto* multiply = key.Resolve().TryInstruction();
+		if (multiply == nullptr || multiply->NumArgs() != 2u) {
+			return false;
+		}
+		if (multiply->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+			uint32_t shift = 0;
+			if (!ImmediateU32(multiply->Arg(1), shift) || shift >= 32u) return false;
+			stride = uint32_t {1} << shift;
+			if (selector != nullptr) *selector = multiply->Arg(0).Resolve();
+			return true;
+		}
+		if (multiply->GetOpcode() != ValueOpcode::IMul32) return false;
+		Value selected;
+		if (ImmediateU32(multiply->Arg(0), stride)) {
+			selected = multiply->Arg(1).Resolve();
+		} else if (ImmediateU32(multiply->Arg(1), stride)) {
+			selected = multiply->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		if (selector != nullptr) {
+			*selector = selected;
+		}
+		return stride != 0u;
+	}
+
+	bool TryMakeInlineDescriptor(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan,
+	                             bool compact_image = true) {
+		const bool image           = handle.GetOpcode() == ValueOpcode::GetImageResource;
+		const bool buffer_resource = handle.GetOpcode() == ValueOpcode::GetBufferResource;
+		if ((!image && !buffer_resource &&
+		     handle.GetOpcode() != ValueOpcode::GetSamplerResource) ||
+		    handle.NumArgs() != (image ? 8u : 4u)) {
+			return false;
+		}
+		const uint32_t descriptor_dwords = image && !compact_image ? 8u : 4u;
+		if (image && compact_image) {
+			for (uint32_t i = 4u; i < 8u; i++) {
+				uint32_t upper = 0;
+				if (!ImmediateU32(handle.Arg(i), upper) || upper != 0u) {
+					return false;
+				}
+			}
+		}
+		Inst* buffer = nullptr;
+		uint32_t base_offset = 0;
+		for (uint32_t i = 0; i < descriptor_dwords; i++) {
+			const auto* read = handle.Arg(i).Resolve().TryInstruction();
+			uint32_t memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			auto* current_buffer = read->Arg(0).Resolve().TryInstruction();
+			if (current_buffer == nullptr || (buffer != nullptr && buffer != current_buffer)) {
+				return false;
+			}
+			buffer = current_buffer;
+			if (i == 0u) {
+				base_offset = memory->offset;
+				plan.key = read->Arg(1).Resolve();
+			} else if (static_cast<uint64_t>(base_offset) + i * 4u != memory->offset ||
+			           !EquivalentValue(m_program, plan.key, read->Arg(1))) {
+				return false;
+			}
+			plan.memory[i] = memory_index;
+			plan.reads[i] = read;
+		}
+		// Keep the wrapped byte offset on the GPU, including loop-carried selectors.
+		// Only the buffer descriptor itself must be runtime-uniform.
+		uint32_t stride = 0;
+		Value    selector;
+		if (!MatchInlineStride(plan.key, stride, &selector)) {
+			return false;
+		}
+		DescriptorSource buffer_source;
+		uint32_t buffer_source_index = 0;
+		if (!MakeRuntimeBufferSource(*buffer, pc, buffer_source_index, buffer_source)) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = image ? 8u : 4u;
+		std::copy_n(buffer_source.dwords.begin(), 4u, source.dwords.begin());
+		for (uint32_t i = 4u; i < source.dword_count; i++) {
+			source.dwords[i] = Value(0u);
+		}
+		source.inline_descriptor = DescriptorSource::InlineDescriptor {
+		    buffer_source_index, stride, base_offset, 0u};
+		source.inline_descriptor->descriptor_dwords = descriptor_dwords;
+		source.inline_descriptor->selector_limit =
+		    DominatingSelectorLimit(selector, handle.Parent());
+		// Buffer table lowering uses the selector as a dense mapping index. Unlike
+		// sampled-image key search, it therefore requires an exact guarded domain.
+		if (buffer_resource && source.inline_descriptor->selector_limit == 0u) {
+			return false;
+		}
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		if (buffer_resource) plan.key = selector;
+		plan.read_count = descriptor_dwords;
+		std::copy_n(buffer_source.dwords.begin(), 4u, plan.roots.begin());
+		return true;
+	}
+
+	bool TryMakeMaterialImageTable(Inst& handle, uint32_t pc, InlineDescriptorPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		Inst* address = nullptr;
+		Value table_index;
+		uint32_t table_offset = 0;
+		for (uint32_t i = 0; i < 8u; i++) {
+			const auto* read = handle.Arg(i).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 || read->NumArgs() != 4u) {
+				return false;
+			}
+			const auto memory_index = read->Flags<MemoryFlags>().index;
+			if (memory_index >= m_program.memory_info.size() || !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[memory_index];
+			uint32_t high_offset = 0;
+			const auto enabled = read->Arg(3).Resolve();
+			if (memory.kind != ResourceKind::ScalarAddress || memory.data_bits != 32u ||
+			    memory.data_dwords != 1u || !ImmediateU32(read->Arg(2), high_offset) || high_offset != 0u ||
+			    !enabled.IsImmediate() || enabled.GetType() != Type::U1 || !enabled.U1()) {
+				return false;
+			}
+			auto* current_address = read->Arg(0).Resolve().TryInstruction();
+			if (current_address == nullptr || current_address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (address != nullptr && address != current_address)) {
+				return false;
+			}
+			address = current_address;
+			if (i == 0u) {
+				table_offset = memory.offset;
+				table_index = read->Arg(1).Resolve();
+			} else if (static_cast<uint64_t>(table_offset) + i * 4u != memory.offset ||
+			           !EquivalentValue(m_program, table_index, read->Arg(1))) {
+				return false;
+			}
+			plan.memory[i] = memory_index;
+			plan.reads[i] = read;
+		}
+		const auto* scale = table_index.TryInstruction();
+		uint32_t table_shift = 0;
+		if (scale == nullptr || scale->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    !ImmediateU32(scale->Arg(1), table_shift) || table_shift != 5u) {
+			return false;
+		}
+		Value packed;
+		uint32_t index_shift = 0;
+		uint32_t index_mask = 0;
+		const auto* extract = scale->Arg(0).Resolve().TryInstruction();
+		if (extract != nullptr && extract->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			if (ImmediateU32(extract->Arg(0), index_mask)) {
+				packed = extract->Arg(1).Resolve();
+			} else if (ImmediateU32(extract->Arg(1), index_mask)) {
+				packed = extract->Arg(0).Resolve();
+			} else {
+				return false;
+			}
+			const auto* shift = packed.TryInstruction();
+			if (shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32) {
+				if (!ImmediateU32(shift->Arg(1), index_shift)) {
+					return false;
+				}
+				index_shift &= 31u;
+				packed = shift->Arg(0).Resolve();
+			}
+		} else if (extract != nullptr && extract->GetOpcode() == ValueOpcode::BitFieldUExtract) {
+			uint32_t width = 0;
+			if (!ImmediateU32(extract->Arg(1), index_shift) || !ImmediateU32(extract->Arg(2), width) ||
+			    width == 0u || width > 8u || index_shift > 32u - width) {
+				return false;
+			}
+			index_mask = (1u << width) - 1u;
+			packed = extract->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		if (index_mask == 0u || index_mask > 0xffu) {
+			return false;
+		}
+		const auto* material_read = packed.TryInstruction();
+		uint32_t material_memory = 0;
+		const auto* memory = material_read != nullptr ? ScalarReadMemory(*material_read, material_memory) : nullptr;
+		if (memory == nullptr) {
+			return false;
+		}
+		plan.key = material_read->Arg(1).Resolve();
+		uint32_t stride = 0;
+		auto* buffer = material_read->Arg(0).Resolve().TryInstruction();
+		Value selector;
+		if (buffer == nullptr || !MatchInlineStride(plan.key, stride, &selector)) {
+			return false;
+		}
+		DescriptorSource address_source;
+		MakeSource(*address, 2u, false, false, address_source, pc);
+		uint32_t bad_dword = 0;
+		if (!ValidateSource(address_source, bad_dword)) {
+			return false;
+		}
+		DescriptorSource buffer_source;
+		uint32_t buffer_index = 0;
+		if (!MakeRuntimeBufferSource(*buffer, pc, buffer_index, buffer_source)) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = 8u;
+		std::copy_n(buffer_source.dwords.begin(), 4u, source.dwords.begin());
+		std::copy_n(address_source.dwords.begin(), 2u, source.dwords.begin() + 4u);
+		source.dwords[6] = Value(0u);
+		source.dwords[7] = Value(0u);
+		source.inline_descriptor = DescriptorSource::InlineDescriptor {
+		    buffer_index, stride, memory->offset, 0u,
+		    DescriptorSource::InlineDescriptor::ImageTable {InternSource(address_source), table_offset, index_shift, index_mask}};
+		source.inline_descriptor->selector_limit =
+		    DominatingSelectorLimit(selector, handle.Parent());
+		plan.handle = &handle;
+		plan.source = InternSource(source);
+		plan.root_count = 6u;
+		plan.read_count = 8u;
+		std::copy_n(source.dwords.begin(), 6u, plan.roots.begin());
+		return true;
+	}
+
+	void PlanInlineDescriptors() {
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::None &&
+				    inst.NumArgs() != 0u) {
+					auto* handle = inst.Arg(0).Resolve().TryInstruction();
+					if (handle != nullptr && FindInlineDescriptor(*handle) == nullptr) {
+						InlineDescriptorPlan buffer_plan;
+						if (TryMakeInlineDescriptor(*handle, inst.Flags<MemoryFlags>().pc,
+						                            buffer_plan)) {
+							m_inline_descriptors.push_back(std::move(buffer_plan));
+						}
+					}
+				}
+				const auto image_info = ImageOpcodeInfoOf(inst.GetOpcode());
+				if (image_info.access == ImageAccess::None || inst.NumArgs() == 0u) {
+					continue;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					continue;
+				}
+				auto* image = inst.Arg(0).Resolve().TryInstruction();
+				auto* sampler = image_info.needs_sampler && inst.NumArgs() >= 2u
+				                    ? inst.Arg(1).Resolve().TryInstruction()
+				                    : nullptr;
+				InlineDescriptorPlan image_plan;
+				InlineDescriptorPlan sampler_plan;
+				if (image == nullptr || FindIndirectImage(*image) != nullptr ||
+				    !(TryMakeInlineDescriptor(*image, flags.pc, image_plan,
+				                              m_program.memory_info[flags.index].image_r128) ||
+				      (!m_program.memory_info[flags.index].image_r128 &&
+				       TryMakeMaterialImageTable(*image, flags.pc, image_plan)))) {
+					continue;
+				}
+				if (image_info.needs_sampler && sampler == nullptr) continue;
+				const bool inline_sampler =
+				    image_info.needs_sampler && TryMakeInlineDescriptor(*sampler, flags.pc, sampler_plan);
+				if (inline_sampler) {
+					const auto& image_source = *m_sources[image_plan.source].inline_descriptor;
+					const auto& sampler_source = *m_sources[sampler_plan.source].inline_descriptor;
+					if (image_source.buffer_source != sampler_source.buffer_source ||
+					    image_source.selector_stride != sampler_source.selector_stride ||
+					    !EquivalentValue(m_program, image_plan.key, sampler_plan.key)) {
+						Fail(flags.pc, "inline image and sampler require the same material buffer and selector");
+					}
+				} else {
+					if (sampler == nullptr || sampler->GetOpcode() != ValueOpcode::GetSamplerResource) {
+						continue;
+					}
+					DescriptorSource sampler_source;
+					const bool sample_adjust = (m_program.memory_info[flags.index].image_sample_flags &
+					                            Decoder::ImageSampleFlagAdjust) != 0;
+					MakeSource(*sampler, 4u, true, sample_adjust, sampler_source, flags.pc);
+					uint32_t bad_dword = 0;
+					if (!ValidateSource(sampler_source, bad_dword)) {
+						continue;
+					}
+				}
+				if (FindInlineDescriptor(*image) == nullptr) {
+					m_inline_descriptors.push_back(image_plan);
+				}
+				if (inline_sampler && FindInlineDescriptor(*sampler) == nullptr) {
+					m_inline_descriptors.push_back(sampler_plan);
+				}
+			}
+		}
+		std::vector<const Inst*> handles;
+		for (const auto& plan: m_inline_descriptors) {
+			handles.push_back(plan.handle);
+		}
+		for (const auto& plan: m_inline_descriptors) {
+			for (uint32_t i = 0; i < plan.read_count; i++) {
+				// A descriptor word may also be used by ordinary shader arithmetic.
+				// Only remove loads whose complete use set is rewritten by this plan.
+				if (UsesOnly(*plan.reads[i], handles)) {
+					m_inline_planning_reads.push_back(plan.reads[i]);
+					m_inline_planning_memory.push_back(plan.memory[i]);
+				}
+			}
+		}
+	}
+
+	const BlockInfo* BlockMetadata(const Block* block) const {
+		const auto found = std::ranges::find(m_program.blocks, block);
+		if (found == m_program.blocks.end()) return nullptr;
+		const auto index = static_cast<size_t>(found - m_program.blocks.begin());
+		return index < m_program.block_info.size() ? &m_program.block_info[index] : nullptr;
+	}
+
+	const Block* BlockById(uint32_t id) const {
+		for (size_t index = 0; index < m_program.block_info.size() &&
+		                       index < m_program.blocks.size(); ++index) {
+			if (m_program.block_info[index].id == id) {
+				return m_program.blocks[index];
+			}
+		}
+		return nullptr;
+	}
+
+	bool ReachableWithout(const Block* start, const Block* target,
+	                      const Block* excluded) const {
+		if (start == nullptr || target == nullptr || start == excluded) {
+			return false;
+		}
+		std::vector<const Block*> pending {start};
+		std::unordered_set<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == excluded || !visited.insert(block).second) {
+				continue;
+			}
+			if (block == target) {
+				return true;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				pending.push_back(successor);
+			}
+		}
+		return false;
+	}
+
+	bool Dominates(const Block* dominator, const Block* block) const {
+		return dominator != nullptr && block != nullptr && !m_program.blocks.empty() &&
+		       (dominator == block ||
+		        !ReachableWithout(m_program.blocks.front(), block, dominator));
+	}
+
+	uint32_t DominatingSelectorLimit(Value selector, const Block* access) const {
+		selector = selector.Resolve();
+		uint32_t limit = 0;
+		for (size_t index = 0; index < m_program.block_info.size() &&
+		                       index < m_program.blocks.size(); ++index) {
+			const auto* guard = m_program.blocks[index];
+			const auto& term  = m_program.block_info[index].terminator;
+			if (guard == access || term.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    !Dominates(guard, access)) {
+				continue;
+			}
+			const auto* compare = m_program.block_info[index].condition.Resolve().TryInstruction();
+			if (compare == nullptr || compare->NumArgs() != 2u ||
+			    compare->Arg(0).Resolve() != selector) {
+				continue;
+			}
+			uint32_t candidate_limit = 0;
+			if (!ImmediateU32(compare->Arg(1), candidate_limit) || candidate_limit == 0u) {
+				continue;
+			}
+			uint32_t bounded_id = 0;
+			if (compare->GetOpcode() == ValueOpcode::ULessThan32) {
+				bounded_id = term.true_block;
+			} else if (compare->GetOpcode() == ValueOpcode::UGreaterThanEqual32) {
+				bounded_id = term.false_block;
+			} else {
+				continue;
+			}
+			const auto other_id = bounded_id == term.true_block ? term.false_block : term.true_block;
+			const auto* bounded = BlockById(bounded_id);
+			const auto* other   = BlockById(other_id);
+			// Excluding the guard prevents a later loop iteration from making the opposite
+			// successor appear to reach this access. The selected edge must be the only
+			// immediate guarded region containing the descriptor handle.
+			if (!ReachableWithout(bounded, access, guard) ||
+			    ReachableWithout(other, access, guard)) {
+				continue;
+			}
+			limit = limit == 0u ? candidate_limit : std::min(limit, candidate_limit);
+		}
+		return limit;
+	}
+
+	Value LowerRuntimeDescriptorPhi(Value value, Inst& anchor) {
+		value = value.Resolve();
+		auto* phi = value.TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->NumArgs() != 2u ||
+		    phi->NumPhiBlocks() != 2u || phi->Parent() == nullptr || anchor.Parent() == nullptr ||
+		    phi->Parent()->ImmPredecessors().size() != 2u) return value;
+		auto* yes_block = phi->PhiBlock(0u);
+		auto* no_block  = phi->PhiBlock(1u);
+		if (yes_block == nullptr || no_block == nullptr || yes_block == no_block ||
+		    std::ranges::find(phi->Parent()->ImmPredecessors(), yes_block) ==
+		        phi->Parent()->ImmPredecessors().end() ||
+		    std::ranges::find(phi->Parent()->ImmPredecessors(), no_block) ==
+		        phi->Parent()->ImmPredecessors().end() ||
+		    yes_block->ImmPredecessors().size() != 1u ||
+		    no_block->ImmPredecessors().size() != 1u ||
+		    yes_block->ImmPredecessors().front() != no_block->ImmPredecessors().front()) return value;
+		auto* split = yes_block->ImmPredecessors().front();
+		const auto* split_info = BlockMetadata(split);
+		const auto* yes_info   = BlockMetadata(yes_block);
+		const auto* no_info    = BlockMetadata(no_block);
+		const auto* merge_info = BlockMetadata(phi->Parent());
+		if (split_info == nullptr || yes_info == nullptr || no_info == nullptr || merge_info == nullptr ||
+		    split_info->terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    yes_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    no_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    yes_info->terminator.true_block != merge_info->id ||
+		    no_info->terminator.true_block != merge_info->id) return value;
+		Value yes;
+		Value no;
+		if (split_info->terminator.true_block == yes_info->id &&
+		    split_info->terminator.false_block == no_info->id) {
+			yes = phi->Arg(0u).Resolve();
+			no  = phi->Arg(1u).Resolve();
+		} else if (split_info->terminator.true_block == no_info->id &&
+		           split_info->terminator.false_block == yes_info->id) {
+			yes = phi->Arg(1u).Resolve();
+			no  = phi->Arg(0u).Resolve();
+		} else {
+			return value;
+		}
+		const auto condition = split_info->condition.Resolve();
+		if (condition.GetType() != Type::U1 || yes.GetType() != Type::U32 ||
+		    no.GetType() != Type::U32 || !ValidateRuntimeValue(m_program, condition) ||
+		    !ValidateRuntimeValue(m_program, yes) || !ValidateRuntimeValue(m_program, no)) return value;
+		const auto clonable_arm = [&](Value arm) {
+			arm = arm.Resolve();
+			if (arm.IsImmediate()) return true;
+			const auto* read = arm.TryInstruction();
+			const auto slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+			                          read->NumArgs() == 2u
+			                      ? read->Arg(1).Resolve()
+			                      : Value {};
+			return slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			       slot.U32() < m_program.srt_reads.size();
+		};
+		if (!clonable_arm(yes) || !clonable_arm(no)) return value;
+		auto* block = anchor.Parent();
+		auto where = std::ranges::find_if(block->Instructions(),
+		    [&](const Inst& inst) { return &inst == &anchor; });
+		if (where == block->Instructions().end()) return value;
+		const auto clone_arm = [&](Value arm) {
+			arm = arm.Resolve();
+			if (arm.IsImmediate()) return arm;
+			const auto* read = arm.TryInstruction();
+			if (read == nullptr) return Value {};
+			const auto slot = read->Arg(1).Resolve();
+			const auto resource = Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource, {}));
+			return Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst, {resource, slot}));
+		};
+		yes = clone_arm(yes);
+		no  = clone_arm(no);
+		if (yes.IsEmpty() || no.IsEmpty()) return value;
+		return Value(&*block->PrependNewInst(where, ValueOpcode::SelectU32, {condition, yes, no}));
+	}
+
 	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
+		if (expected == ValueOpcode::GetBufferResource &&
+		    MakeWaveUniformBufferSource(*handle, source)) return;
+		if (expected == ValueOpcode::GetBufferResource) {
+			for (uint32_t dword = 0; dword < handle->NumArgs(); ++dword) {
+				handle->SetArg(dword, LowerRuntimeDescriptorPhi(handle->Arg(dword), *handle));
+			}
+		}
+		std::string bounded_rejection;
+		if (expected == ValueOpcode::GetBufferResource &&
+		    MakeBoundedBufferSource(*handle, source, bounded_rejection)) return;
+		bool has_bounded_column = false;
+		if (expected == ValueOpcode::GetBufferResource) {
+			for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
+				has_bounded_column |= BoundedReadValue(handle->Arg(word)) != nullptr;
+			}
+		}
+		if (expected == ValueOpcode::GetImageResource && m_program.dispatcher_fallback) {
+			static const bool trace = [] {
+				const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+				return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+			}();
+			if (trace) {
+				bool has_raw_descriptor = false;
+				for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
+					const auto value = handle->Arg(word).Resolve();
+					const auto* definition = value.TryInstruction();
+					has_raw_descriptor |= definition != nullptr &&
+					                      (definition->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+					                       definition->GetOpcode() == ValueOpcode::ReadConstBuffer);
+				}
+				if (has_raw_descriptor) {
+					const auto block_id = [&](const Inst* inst) {
+						if (inst == nullptr || inst->Parent() == nullptr) return UINT32_MAX;
+						for (uint32_t id = 0; id < m_program.blocks.size(); ++id)
+							if (m_program.blocks[id] == inst->Parent()) return m_program.block_info[id].id;
+						return UINT32_MAX;
+					};
+					std::fprintf(stderr,
+					             "shader resource tracking: dispatcher image handle pc=0x%08" PRIx32
+					             " args=%zu handle_block=%" PRIu32 "\n",
+					             pc, handle->NumArgs(), block_id(handle));
+					for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
+						const auto value = handle->Arg(word).Resolve();
+						const auto* definition = value.TryInstruction();
+						const auto offset = definition != nullptr && definition->NumArgs() > 1u
+						                        ? definition->Arg(1).Resolve()
+						                        : Value {};
+						const auto* offset_definition = offset.TryInstruction();
+						std::fprintf(stderr,
+						             "  image dword=%u opcode=%s block=%" PRIu32
+						             " uses=%zu bounded=%s offset=%s offset_arg0=%s "
+						             "offset_arg0_arg0=%s\n",
+						             word,
+						             definition == nullptr ? "immediate"
+						                                   : ValueOpcodeName(definition->GetOpcode()).data(),
+						             block_id(definition),
+						             definition == nullptr ? 0u : definition->Uses().size(),
+						             definition != nullptr &&
+						                     BoundedReadValue(Value(const_cast<Inst*>(definition))) != nullptr
+						                 ? "yes"
+						                 : "no",
+						             offset_definition == nullptr
+						                 ? (offset.IsImmediate() ? "immediate" : "unknown")
+						                 : ValueOpcodeName(offset_definition->GetOpcode()).data(),
+						             offset_definition == nullptr || offset_definition->NumArgs() == 0u
+						                 ? "none"
+						                 : (offset_definition->Arg(0).Resolve().TryInstruction() == nullptr
+						                        ? "immediate"
+						                        : ValueOpcodeName(offset_definition->Arg(0)
+						                                               .Resolve()
+						                                               .TryInstruction()
+						                                               ->GetOpcode())
+						                              .data()),
+						             offset_definition == nullptr || offset_definition->NumArgs() == 0u ||
+						                     offset_definition->Arg(0).Resolve().TryInstruction() == nullptr ||
+						                     offset_definition->Arg(0).Resolve().TryInstruction()->NumArgs() == 0u
+						                 ? "none"
+						                 : (offset_definition->Arg(0)
+						                                .Resolve()
+						                                .TryInstruction()
+						                                ->Arg(0)
+						                                .Resolve()
+						                                .TryInstruction() == nullptr
+						                        ? "immediate"
+						                        : ValueOpcodeName(offset_definition->Arg(0)
+						                                               .Resolve()
+						                                               .TryInstruction()
+						                                               ->Arg(0)
+						                                               .Resolve()
+						                                               .TryInstruction()
+						                                               ->GetOpcode())
+						                              .data()));
+						const auto* selector_definition =
+						    offset_definition == nullptr || offset_definition->NumArgs() == 0u
+						        ? nullptr
+						        : offset_definition->Arg(0).Resolve().TryInstruction();
+						if (selector_definition != nullptr &&
+						    selector_definition->GetOpcode() == ValueOpcode::ReadFirstLane &&
+						    selector_definition->NumArgs() > 0u) {
+							const auto* phi = selector_definition->Arg(0).Resolve().TryInstruction();
+							if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi) {
+								std::fprintf(stderr, "    selector phi args=%zu", phi->NumArgs());
+								for (uint32_t arg = 0; arg < phi->NumArgs(); ++arg) {
+									const auto* incoming = phi->Arg(arg).Resolve().TryInstruction();
+									std::fprintf(stderr, " %u:%s", arg,
+									             incoming == nullptr
+									                 ? "immediate"
+									                 : ValueOpcodeName(incoming->GetOpcode()).data());
+									if (incoming != nullptr && incoming->GetOpcode() == ValueOpcode::SelectU32) {
+										std::fprintf(stderr, "(");
+										for (uint32_t select_arg = 0;
+										     select_arg < incoming->NumArgs(); ++select_arg) {
+											const auto* select_value =
+											    incoming->Arg(select_arg).Resolve().TryInstruction();
+											std::fprintf(stderr, "%s%s",
+											             select_arg == 0u ? "" : ",",
+											             select_value == nullptr
+											                 ? "immediate"
+											                 : ValueOpcodeName(select_value->GetOpcode())
+											                       .data());
+										}
+										std::fprintf(stderr, ")");
+									}
+								}
+								std::fprintf(stderr, "\n");
+							}
+						}
+						if (definition != nullptr &&
+						    definition->GetOpcode() == ValueOpcode::ReadConstBuffer &&
+						    definition->NumArgs() > 0u) {
+							const auto* buffer = definition->Arg(0).Resolve().TryInstruction();
+							if (buffer != nullptr) {
+								std::fprintf(stderr, "    buffer opcode=%s block=%" PRIu32
+								             " args=%zu\n",
+								             ValueOpcodeName(buffer->GetOpcode()).data(),
+								             block_id(buffer), buffer->NumArgs());
+								for (uint32_t arg = 0; arg < buffer->NumArgs(); ++arg) {
+									const auto* root = buffer->Arg(arg).Resolve().TryInstruction();
+									std::fprintf(stderr, "      buffer arg=%u opcode=%s block=%" PRIu32
+									             "\n",
+									             arg,
+									             root == nullptr
+									                 ? "immediate"
+									                 : ValueOpcodeName(root->GetOpcode()).data(),
+									             block_id(root));
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if (has_bounded_column) {
+			static const bool trace = [] {
+				const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+				return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+			}();
+			if (trace) {
+				std::fprintf(stderr,
+				             "shader resource tracking: hash=0x%016" PRIx64
+				             " pc=0x%08" PRIx32 " bounded buffer recognition rejected: %s\n",
+				             m_program.shader_hash, pc, bounded_rejection.c_str());
+			}
+		}
+		if (expected == ValueOpcode::GetImageResource && MakeBoundedImageSource(*handle, source)) return;
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
+		if (expected == ValueOpcode::GetImageResource &&
+		    MakeWaveUniformImageSource(*handle, descriptor, source)) return;
+		if (expected == ValueOpcode::GetBufferResource &&
+		    MakeBoundedBufferExpression(*handle, descriptor, source, bounded_rejection)) return;
+		if (expected == ValueOpcode::GetImageResource &&
+		    MakeBoundedImageExpression(*handle, descriptor, source, bounded_rejection)) return;
+		if (expected == ValueOpcode::GetSamplerResource &&
+		    MakeBoundedSamplerExpression(*handle, descriptor, source, bounded_rejection)) return;
 		uint32_t bad_dword = 0;
+		static const bool trace_buffer_failure = [] {
+			const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+			return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		}();
 		if (expected == ValueOpcode::GetImageResource) {
 			for (; bad_dword < descriptor.dword_count; bad_dword++) {
 				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
@@ -475,8 +2077,80 @@ private:
 			bad_dword = 0;
 		}
 		if (!ValidateSource(descriptor, bad_dword)) {
+			if (trace_buffer_failure && expected == ValueOpcode::GetBufferResource) {
+				std::fprintf(stderr,
+				             "shader resource tracking: buffer validation failure pc=0x%08" PRIx32
+				             " args=%u bad=%u rejection=%s\n",
+				             pc, descriptor.dword_count, bad_dword, bounded_rejection.c_str());
+				for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+					const auto value = descriptor.dwords[word].Resolve();
+					const auto* definition = value.TryInstruction();
+					std::fprintf(stderr, "  buffer dword=%u opcode=%s bounded=%s\n", word,
+					             definition == nullptr
+					                 ? "immediate"
+					                 : ValueOpcodeName(definition->GetOpcode()).data(),
+					             definition != nullptr &&
+					                     BoundedReadValue(Value(const_cast<Inst*>(definition))) != nullptr
+					                 ? "yes"
+					                 : "no");
+					if (definition != nullptr &&
+					    definition->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+						const auto flags = definition->Flags<MemoryFlags>();
+						const auto* buffer = definition->NumArgs() > 0u
+						                         ? definition->Arg(0).Resolve().TryInstruction()
+						                         : nullptr;
+						const auto offset = definition->NumArgs() > 1u ? definition->Arg(1).Resolve()
+						                                                : Value {};
+						std::fprintf(stderr,
+						             "    read memory=%u offset=%s buffer=%s args=%zu\n", flags.index,
+						             offset.IsImmediate()
+						                 ? fmt::format("0x{:08x}", offset.U32()).c_str()
+						                 : (offset.TryInstruction() == nullptr
+						                        ? "unknown"
+						                        : ValueOpcodeName(offset.TryInstruction()->GetOpcode()).data()),
+						             buffer == nullptr ? "none" : ValueOpcodeName(buffer->GetOpcode()).data(),
+						             buffer == nullptr ? 0u : buffer->NumArgs());
+						if (buffer != nullptr) {
+							for (uint32_t arg = 0; arg < buffer->NumArgs(); ++arg) {
+								const auto root = buffer->Arg(arg).Resolve();
+								const auto* root_inst = root.TryInstruction();
+								std::fprintf(stderr, "      descriptor arg=%u opcode=%s\n", arg,
+								             root_inst == nullptr
+								                 ? (root.IsImmediate() ? "immediate" : "unknown")
+								                 : ValueOpcodeName(root_inst->GetOpcode()).data());
+							}
+						}
+					}
+				}
+			}
+			if (expected == ValueOpcode::GetImageResource) {
+				static const bool trace = [] {
+					const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
+					return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+				}();
+				if (trace) {
+					std::fprintf(stderr,
+					             "shader resource tracking: image validation failure pc=0x%08" PRIx32
+					             " dwords=%u bad=%u\n",
+					             pc, descriptor.dword_count, bad_dword);
+					for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+						const auto value = descriptor.dwords[word].Resolve();
+						const auto* definition = value.TryInstruction();
+						std::fprintf(stderr, "  failure dword=%u opcode=%s uses=%zu\n", word,
+						             definition == nullptr
+						                 ? "immediate"
+						                 : ValueOpcodeName(definition->GetOpcode()).data(),
+						             definition == nullptr ? 0u : definition->Uses().size());
+					}
+				}
+			}
+			const auto value = descriptor.dwords[bad_dword].Resolve();
+			const auto* definition = value.TryInstruction();
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			                     ValueOpcodeName(expected), bad_dword) +
+			             (definition != nullptr
+			                  ? fmt::format(" (root={})", ValueOpcodeName(definition->GetOpcode()))
+			                  : fmt::format(" (type={})", TypeName(value.GetType()))));
 		}
 		source = InternSource(descriptor);
 	}
@@ -491,10 +2165,11 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                   const Inst& inst) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
-				Merge(m_info.buffers[i], memory, op, pc);
+				Merge(m_info.buffers[i], memory, op, pc, inst, false);
 				return i;
 			}
 		}
@@ -502,24 +2177,37 @@ private:
 			return UINT32_MAX;
 		}
 		BufferResource resource;
+		resource.descriptor_formatted_only = true;
 		resource.source       = source;
 		resource.first_use_pc = pc;
-		Merge(resource, memory, op, pc);
+		Merge(resource, memory, op, pc, inst, true);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
 	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
-	                  uint32_t pc) {
+	                  uint32_t pc, const Inst& inst, bool first_access) {
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
+		const auto stride_zero_size = StrideZeroAccessSize(inst, memory);
+		if (first_access) {
+			resource.stride_zero_access_size = stride_zero_size;
+		} else if (resource.stride_zero_access_size != 0u) {
+			resource.stride_zero_access_size =
+			    stride_zero_size == 0u
+			        ? 0u
+			        : std::max(resource.stride_zero_access_size, stride_zero_size);
+		}
 		resource.first_use_pc    = std::min(resource.first_use_pc, pc);
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
+		resource.descriptor_formatted_only =
+		    resource.descriptor_formatted_only && memory.kind == ResourceKind::Buffer &&
+		    memory.formatted && !memory.typed && !atomic;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
 		                           memory.kind == ResourceKind::ScalarBuffer;
 	}
@@ -550,6 +2238,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.heterogeneous_numeric_compatible = true;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -563,6 +2252,10 @@ private:
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.heterogeneous_numeric_compatible =
+		    image.heterogeneous_numeric_compatible &&
+		    (op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageRead ||
+		     op == ValueOpcode::ImageWrite);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {
@@ -587,7 +2280,8 @@ private:
 			}
 		}
 		if (m_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
-			Fail(pc, "sampled image/sampler pair limit exceeded");
+			Fail(pc, fmt::format("sampled image/sampler pair limit exceeded (required={} limit={})",
+			                     m_info.sampled_pairs.size() + 1u, ShaderInfo::MaxSampledPairs));
 		}
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}
@@ -606,12 +2300,12 @@ private:
 	}
 
 	void AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
-	                    uint32_t pc) {
+	                    uint32_t pc, uint32_t buffer_table = UINT32_MAX) {
 		for (auto& patch: m_memory_patches) {
 			if (patch.index != index) {
 				continue;
 			}
-			if (patch.resource != resource ||
+			if (patch.resource != resource || patch.buffer_table != buffer_table ||
 			    (has_sampler && patch.has_sampler && patch.sampler != sampler)) {
 				Fail(pc, "memory metadata is reused with incompatible resources");
 			}
@@ -621,10 +2315,12 @@ private:
 			}
 			return;
 		}
-		m_memory_patches.push_back({index, resource, sampler, has_sampler});
+		m_memory_patches.push_back({index, resource, sampler, has_sampler, buffer_table});
 	}
 
 	void Collect(Inst& inst) {
+		if (BoundedRead(&inst) != nullptr ||
+		    std::ranges::find(m_bounded_root_reads, &inst) != m_bounded_root_reads.end()) return;
 		const auto op           = inst.GetOpcode();
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
@@ -649,13 +2345,26 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
-			resource = AddBuffer(source, memory, op, flags.pc);
+			handle = inst.Arg(0).Resolve().TryInstruction();
+			const auto* inline_descriptor =
+			    handle != nullptr ? FindInlineDescriptor(*handle) : nullptr;
+			if (inline_descriptor != nullptr) {
+				source = inline_descriptor->source;
+			} else {
+				GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
+				          source);
+			}
+			resource = AddBuffer(source, memory, op, flags.pc, inst);
 			if (resource == UINT32_MAX) {
-				Fail(flags.pc, "buffer resource limit exceeded");
+				Fail(flags.pc, fmt::format("buffer resource limit exceeded (required={} limit={})",
+				                           m_info.buffers.size() + 1u, ShaderInfo::MaxBuffers));
 			}
 			AddHandlePatch(handle, resource, flags.pc);
-			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
+			AddMemoryPatch(flags.index, resource, 0, false, flags.pc,
+			               (m_sources[source].bounded_buffer.has_value() ||
+			                m_sources[source].inline_descriptor.has_value())
+			                   ? resource
+			                   : UINT32_MAX);
 			return;
 		}
 		if (address_info.access != AddressAccess::None) {
@@ -675,6 +2384,7 @@ private:
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			m_info.uses_dma = true;
+			m_info.writes_dma |= address_info.access == AddressAccess::Write;
 			return;
 		}
 
@@ -684,14 +2394,18 @@ private:
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
+		const auto* inline_descriptor = handle != nullptr ? FindInlineDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
+		} else if (inline_descriptor != nullptr) {
+			source = inline_descriptor->source;
 		} else {
 			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
+			Fail(flags.pc, fmt::format("image resource limit exceeded (required={} limit={})",
+			                           m_info.images.size() + 1u, ShaderInfo::MaxImages));
 		}
 		AddHandlePatch(handle, resource, flags.pc);
 		uint32_t sampler = 0;
@@ -703,11 +2417,18 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			sampler_handle = inst.Arg(1).Resolve().TryInstruction();
+			const auto* inline_sampler = sampler_handle != nullptr ? FindInlineDescriptor(*sampler_handle) : nullptr;
+			if (inline_sampler != nullptr) {
+				sampler_source = inline_sampler->source;
+			} else {
+				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
+				          sampler_source, true, sample_adjust);
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
-				Fail(flags.pc, "sampler resource limit exceeded");
+				Fail(flags.pc, fmt::format("sampler resource limit exceeded (required={} limit={})",
+				                           m_info.samplers.size() + 1u, ShaderInfo::MaxSamplers));
 			}
 			AddHandlePatch(sampler_handle, sampler, flags.pc);
 			AddSampledPair(resource, sampler, flags.pc);
@@ -722,13 +2443,16 @@ private:
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
+			    buffer_source->bounded_buffer.has_value() ||
+			    buffer_source->inline_descriptor.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
 				const auto* image_source = Source(m_info.images[image].source);
 				if (image_source == nullptr || image_source->dword_count != 8 ||
-				    image_source->indirect_image.has_value()) {
+				    image_source->indirect_image.has_value() || image_source->inline_descriptor.has_value() ||
+				    image_source->bounded_image.has_value()) {
 					continue;
 				}
 				bool alias = true;
@@ -747,9 +2471,20 @@ private:
 	Program&                       m_program;
 	ShaderInfo                     m_info;
 	std::vector<DescriptorSource>  m_sources;
+	std::vector<BoundedSrtRead> m_bounded_srt_reads;
+	std::vector<BoundedReadPlan> m_bounded_reads;
+	std::vector<const Inst*> m_bounded_root_visited;
+	std::vector<Inst*> m_bounded_root_reads;
+	std::vector<BoundedBufferPlan> m_bounded_buffers;
+	std::vector<BoundedImagePlan> m_bounded_images;
+	std::vector<BoundedSamplerPlan> m_bounded_samplers;
+	std::vector<Value>             m_bounded_selectors;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
 	std::vector<IndirectImagePlan> m_indirect_images;
+	std::vector<InlineDescriptorPlan> m_inline_descriptors;
+	std::vector<const Inst*>       m_inline_planning_reads;
+	std::vector<uint32_t>          m_inline_planning_memory;
 };
 
 } // namespace

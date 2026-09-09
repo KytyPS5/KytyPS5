@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -43,7 +44,6 @@ void AddOutput(ShaderInfo& info, StageOutputKind kind, uint32_t index, uint32_t 
 void ValidateOptions(const Program& program, const ShaderInfoOptions& options) {
 	switch (program.stage) {
 		case ShaderType::Vertex:
-		case ShaderType::Mesh:
 			if (options.vertex == nullptr) {
 				return Fail("vertex shader has no input metadata");
 			}
@@ -115,14 +115,6 @@ void ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 					const auto kind      = static_cast<StageInputKind>(inst.Arg(0).U32());
 					const auto component = inst.Arg(1).U32();
 					switch (kind) {
-						case StageInputKind::PackedAncillary:
-							return Fail("packed pixel ancillary input has an unsupported live use");
-						case StageInputKind::Layer:
-						case StageInputKind::SampleId:
-							if (program.stage != ShaderType::Pixel || component != 0u) {
-								return Fail("typed pixel scalar input is invalid");
-							}
-							break;
 						case StageInputKind::VertexIndex:
 						case StageInputKind::InstanceIndex:
 						case StageInputKind::FrontFacing:
@@ -259,8 +251,6 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::FrontFacing:
 					AddInput(info, kind, 0, 1, "gl_FrontFacing");
 					break;
-				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
-				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 				case StageInputKind::BaryCoordSmooth:
 					AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
 					break;
@@ -279,7 +269,6 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::GlobalInvocationId:
 					AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 					break;
-				case StageInputKind::PackedAncillary:
 				case StageInputKind::Parameter: break;
 			}
 		}
@@ -324,7 +313,7 @@ void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 						const auto output = DecodePositionExportComponent(
 						    vertex->pa_cl_vs_out_cntl, export_info.index, component);
 						if (output.viewport) {
-							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0, "gl_ViewportIndex");
+							return Fail("vertex viewport-index export is unsupported");
 						}
 						if (output.point_size) {
 							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");
@@ -354,6 +343,37 @@ void CollectOutputs(const Program& program, const ShaderVertexInputInfo* vertex,
 			}
 		}
 	}
+	if (program.stage == ShaderType::Vertex) {
+		if (vertex->linked_param_count > ShaderVertexInputInfo::PARAM_LINK_MAX) {
+			return Fail("vertex parameter link count is out of range");
+		}
+		std::array<bool, ShaderVertexInputInfo::PARAM_LINK_MAX> exported_sources {};
+		for (const auto& output: info.outputs) {
+			if (output.kind == StageOutputKind::Parameter &&
+			    output.index < exported_sources.size()) {
+				exported_sources[output.index] = true;
+			}
+		}
+		for (uint32_t link = 0; link < vertex->linked_param_count; ++link) {
+			const auto source   = vertex->linked_param_sources[link];
+			const auto location = vertex->linked_param_locations[link];
+			if (source >= 32u || location >= 32u) {
+				return Fail("vertex parameter link is out of range");
+			}
+			const auto declared = std::ranges::any_of(info.outputs, [&](const auto& output) {
+				return output.kind == StageOutputKind::Parameter && output.index == source &&
+				       output.location == location;
+			});
+			if (!declared) {
+				std::erase_if(info.outputs, [&](const auto& output) {
+					return output.kind == StageOutputKind::Parameter && output.location == location;
+				});
+				const auto output_index = exported_sources[source] ? source : 32u + source;
+				info.outputs.push_back({StageOutputKind::Parameter, output_index, location,
+				                        fmt::format("out_param_{}_loc_{}", source, location)});
+			}
+		}
+	}
 }
 
 } // namespace
@@ -377,7 +397,6 @@ void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
-		case ShaderType::Mesh: break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
 		default: return Fail("unsupported shader stage for info collection");

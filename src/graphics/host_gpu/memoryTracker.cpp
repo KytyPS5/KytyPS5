@@ -23,7 +23,10 @@ void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr,
 		EXIT("MemoryTracker: invalid dirty-page validation range\n");
 	}
 	for (auto page = vaddr; page < vaddr + size; page += TRACKER_PAGE_SIZE) {
-		if (!dirty.Intersects(page, TRACKER_PAGE_SIZE)) {
+		bool found = false;
+		dirty.ForEachIntersection(page, TRACKER_PAGE_SIZE,
+		                          [&found](RangeSet::Range) { found = true; });
+		if (!found) {
 			EXIT("MemoryTracker: GPU-dirty tracker page has no dirty bytes, operation=%s "
 			     "addr=0x%016" PRIx64 "\n",
 			     operation, page);
@@ -37,7 +40,9 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 	const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
-		const bool has_dirty_bytes = dirty.Intersects(page, TRACKER_PAGE_SIZE);
+		bool has_dirty_bytes = false;
+		dirty.ForEachIntersection(page, TRACKER_PAGE_SIZE,
+		                          [&has_dirty_bytes](RangeSet::Range) { has_dirty_bytes = true; });
 		if (IsRegionGpuModified(page, TRACKER_PAGE_SIZE) != has_dirty_bytes) {
 			EXIT("MemoryTracker: tracker and byte ownership disagree, operation=%s "
 			     "addr=0x%016" PRIx64 "\n",
@@ -108,8 +113,7 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
-	CheckNotInUploadCallback();
+void MemoryTracker::UntrackMemoryImpl(uint64_t vaddr, uint64_t size) {
 	std::vector<RegionManager*> managers;
 	managers.reserve((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) /
 	                 TRACKER_REGION_SIZE);
@@ -130,6 +134,12 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	locks.clear();
+}
+
+void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	UntrackMemoryImpl(vaddr, size);
 }
 
 } // namespace Libs::Graphics

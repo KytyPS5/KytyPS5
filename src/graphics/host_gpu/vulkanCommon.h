@@ -25,13 +25,18 @@ namespace Libs::Graphics {
 
 using VulkanMemoryBarrier = vk::MemoryBarrier;
 
+std::string VulkanToString(vk::Result value);
+std::string VulkanToString(vk::Format value);
+std::string VulkanToString(vk::ImageLayout value);
+std::string VulkanToString(vk::QueueFlags value);
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if ((!Config::GraphicsDebugDumpEnabled() && !Config::GpuAssistedValidationEnabled()) ||
+	    device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

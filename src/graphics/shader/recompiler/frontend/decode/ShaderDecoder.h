@@ -38,7 +38,6 @@ enum class Opcode {
 
 	S_MOV_B32,
 	S_MOV_B64,
-	S_CMOV_B64,
 	S_MOVK_I32,
 	S_ABS_I32,
 	S_ABSDIFF_I32,
@@ -147,6 +146,12 @@ enum class Opcode {
 	V_CUBEMA_F32,
 	V_CNDMASK_B32,
 	V_DOT2C_F32_F16,
+	V_CVT_F64_I32,
+	V_CVT_F64_U32,
+	V_CVT_F32_F64,
+	V_RCP_F64,
+	V_MUL_F64,
+	V_FMA_F64,
 	V_CVT_F32_I32,
 	V_CVT_F32_U32,
 	V_CVT_U32_F32,
@@ -366,6 +371,12 @@ enum class Opcode {
 	V_CMP_GT_I16,
 	V_CMP_NE_I16,
 	V_CMP_GE_I16,
+	V_CMPX_LT_I16,
+	V_CMPX_EQ_I16,
+	V_CMPX_LE_I16,
+	V_CMPX_GT_I16,
+	V_CMPX_NE_I16,
+	V_CMPX_GE_I16,
 	V_CMP_LT_F16,
 	V_CMP_EQ_F16,
 	V_CMP_LE_F16,
@@ -379,6 +390,7 @@ enum class Opcode {
 	V_CMPX_GT_F16,
 	V_CMPX_GE_F16,
 	V_CMPX_NGT_F16,
+	V_CMPX_NLE_F16,
 	V_CMPX_NEQ_F16,
 	V_CMPX_NLT_F16,
 	V_CMPX_LT_I32,
@@ -392,6 +404,7 @@ enum class Opcode {
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
 	V_CMPX_GT_U16,
+	V_CMPX_NE_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,
@@ -430,6 +443,14 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
+	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_XY,
+	BUFFER_LOAD_FORMAT_D16_XYZ,
+	BUFFER_LOAD_FORMAT_D16_XYZW,
+	BUFFER_STORE_FORMAT_D16_X,
+	BUFFER_STORE_FORMAT_D16_XY,
+	BUFFER_STORE_FORMAT_D16_XYZ,
+	BUFFER_STORE_FORMAT_D16_XYZW,
 	BUFFER_STORE_FORMAT_X,
 	BUFFER_STORE_FORMAT_XY,
 	BUFFER_STORE_FORMAT_XYZ,
@@ -438,12 +459,20 @@ enum class Opcode {
 	BUFFER_LOAD_SBYTE,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
+	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
+	BUFFER_LOAD_SHORT_D16,
+	BUFFER_LOAD_SHORT_D16_HI,
 	BUFFER_LOAD_DWORD,
 	BUFFER_LOAD_DWORDX2,
 	BUFFER_LOAD_DWORDX3,
 	BUFFER_LOAD_DWORDX4,
 	BUFFER_STORE_BYTE,
+	BUFFER_STORE_BYTE_D16_HI,
 	BUFFER_STORE_SHORT,
+	BUFFER_STORE_SHORT_D16_HI,
 	BUFFER_STORE_DWORD,
 	BUFFER_STORE_DWORDX2,
 	BUFFER_STORE_DWORDX3,
@@ -503,6 +532,8 @@ enum class Opcode {
 	DS_AND_RTN_B32,
 	DS_OR_B32,
 	DS_OR_RTN_B32,
+	DS_ADD_U64,
+	DS_OR_B64,
 	DS_XOR_B32,
 	DS_XOR_RTN_B32,
 	DS_WRXCHG_RTN_B32,
@@ -552,6 +583,8 @@ enum class Opcode {
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
 	IMAGE_ATOMIC_XOR,
+	IMAGE_ATOMIC_FMIN,
+	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
 	IMAGE_GATHER4_LZ,
 	IMAGE_GATHER4_C,
@@ -637,6 +670,7 @@ struct Operand {
 	OperandKind kind       = OperandKind::Unknown;
 	uint32_t    value      = 0;
 	int32_t     signed_val = 0;
+	float       float_val  = 0.0f;
 	uint32_t    reg        = 0;
 	uint32_t    sdwa_sel   = 6;
 	// Native 16-bit destinations use the same selector fields internally but preserve the
@@ -657,12 +691,17 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	uint32_t dpp8_lane_selectors = 0;
+	bool     dpp8_fetch_inactive = false;
+	bool     dpp8                = false;
 };
 
 struct Instruction {
 	uint32_t       pc                          = 0;
+	uint32_t       word                        = 0;
 	uint32_t       word_count                  = 1;
 	uint32_t       raw[MaxInstructionRawWords] = {};
+	uint32_t       raw_count                   = 1;
 	Family         family                      = Family::Unknown;
 	uint32_t       opcode_id                   = 0;
 	Opcode         opcode                      = Opcode::UNKNOWN;
@@ -696,6 +735,7 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	int32_t        branch_offset                                = 0;
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;

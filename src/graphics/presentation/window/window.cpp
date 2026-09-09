@@ -30,9 +30,11 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/imeOverlay.h"
 #include "graphics/presentation/renderDoc.h"
-#include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
@@ -512,7 +514,7 @@ void WindowContext::ProcessEvent(double time_s) {
 		}
 		return;
 	}
-	if (ProcessSystemOverlayInput(*event)) {
+	if (ProcessImeInput(*event)) {
 		return;
 	}
 
@@ -823,7 +825,7 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 	HostInputInit();
-	InitializeSystemOverlayInput();
+	InitializeImeInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
@@ -1015,11 +1017,18 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	const auto  video_out   = VideoOut::VideoOutGetDiagnostics();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}, flips cpu/gpu: {}/{}, "
+	    "prepared: {}, ready: {}, shown: {}, last: {}, output status: {} (res {}), "
+	    "support: {} (mode 0x{:x} -> {})", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps, video_out.cpu_submitted,
+	    video_out.gpu_submitted, video_out.prepared, video_out.ready, video_out.presented,
+	    video_out.last_presented_index, video_out.output_status_calls,
+	    video_out.last_output_resolution, video_out.output_support_calls,
+	    video_out.last_output_mode, video_out.last_output_support);
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }

@@ -21,6 +21,10 @@ struct DeferredPhi {
 	size_t incoming_count = 0;
 };
 
+struct DeferredLoopMerge {
+	size_t word_offset = 0;
+};
+
 class Builder {
 public:
 	explicit Builder(uint32_t version = 0x00010300u);
@@ -28,7 +32,6 @@ public:
 	KYTY_CLASS_DEFAULT_COPY(Builder);
 
 	uint32_t AllocateId();
-	void     RequireVersion(uint32_t version);
 	void     RequireCapability(uint32_t capability);
 	void     RequireExtension(const char* name);
 	uint32_t Import(const char* name);
@@ -52,6 +55,8 @@ public:
 	void        AddFunction(const std::vector<uint32_t>& words);
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
+	DeferredLoopMerge AddDeferredLoopMerge(uint32_t merge, uint32_t loop_control);
+	void PatchDeferredLoopContinue(DeferredLoopMerge loop, uint32_t continue_target);
 
 	[[nodiscard]] std::vector<uint32_t> Build() const;
 
@@ -83,6 +88,7 @@ private:
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
 	size_t                                    m_unpatched_phi_incomings = 0;
+	size_t                                    m_unpatched_loop_merges   = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

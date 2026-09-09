@@ -105,7 +105,7 @@ private:
 		Format   format           = Format::Unknown;
 		uint64_t last_output_time = 0;
 		int      channels_num     = 0;
-		int      volume[12]       = {};
+		int      volume[8]        = {};
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
@@ -127,7 +127,7 @@ private:
 	static bool            FormatIsFloat(Format format);
 	static bool            FormatIsStd(Format format);
 	static uint32_t        BytesPerSample(Format format);
-	static uint32_t        OutputChannels(const PortOut& port);
+	static uint32_t        FrameSize(const PortOut& port);
 	static SDL_AudioFormat SdlFormat(Format format);
 	static bool            OpenSdlDevice(PortOut* port);
 	static void            CloseSdlDevice(PortOut* port);
@@ -201,14 +201,8 @@ Audio::~Audio() {
 }
 
 bool Audio::FormatIsFloat(Format format) {
-	switch (format) {
-		case Format::FloatMono:
-		case Format::FloatStereo:
-		case Format::Float8Ch:
-		case Format::Float8ChStd:
-		case Format::Float12Ch: return true;
-		default: return false;
-	}
+	return (format == Format::FloatMono || format == Format::FloatStereo ||
+	        format == Format::Float8Ch || format == Format::Float8ChStd);
 }
 
 bool Audio::FormatIsStd(Format format) {
@@ -219,9 +213,8 @@ uint32_t Audio::BytesPerSample(Format format) {
 	return FormatIsFloat(format) ? sizeof(float) : sizeof(int16_t);
 }
 
-uint32_t Audio::OutputChannels(const PortOut& port) {
-	// SDL only takes up to 8 channels. Keep the guest buffer's channel count separate.
-	return std::min(port.channels_num, 8);
+uint32_t Audio::FrameSize(const PortOut& port) {
+	return BytesPerSample(port.format) * port.channels_num;
 }
 
 SDL_AudioFormat Audio::SdlFormat(Format format) {
@@ -239,7 +232,7 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
-	desired.channels = static_cast<Uint8>(OutputChannels(*port));
+	desired.channels = static_cast<Uint8>(port->channels_num);
 	desired.samples  = static_cast<Uint16>(port->samples_num);
 	desired.callback = nullptr;
 
@@ -279,9 +272,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 
 	const auto frames           = port.samples_num;
 	const auto channels         = static_cast<uint32_t>(port.channels_num);
-	const auto output_channels  = OutputChannels(port);
 	const auto bytes_per_sample = BytesPerSample(port.format);
-	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
+	const auto src_size         = frames * channels * bytes_per_sample;
 
 	bool volume_changed = false;
 	for (uint32_t ch = 0; ch < channels; ch++) {
@@ -291,35 +283,24 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		}
 	}
 
-	if (!volume_changed && !reorder) {
+	if (!volume_changed && !FormatIsStd(port.format)) {
 		return data;
 	}
 
-	buffer->resize(frames * output_channels * bytes_per_sample);
+	buffer->resize(src_size);
 
-	// SDL wants back speakers before side speakers; non-STD PCM has them reversed.
-	static constexpr uint32_t SDL_8CH_MAP[8] = {0, 1, 2, 3, 6, 7, 4, 5};
+	static constexpr uint32_t STD_8CH_MAP[8] = {0, 1, 2, 3, 6, 7, 4, 5};
 
 	if (FormatIsFloat(port.format)) {
 		auto*       dst = reinterpret_cast<float*>(buffer->data());
 		const auto* src = static_cast<const float*>(data);
 
 		for (uint32_t frame = 0; frame < frames; frame++) {
-			for (uint32_t ch = 0; ch < output_channels; ch++) {
-				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				dst[frame * output_channels + ch] =
-				    src[frame * channels + src_ch] *
-				    (static_cast<float>(port.volume[src_ch]) / 32768.0f);
-			}
-			if (channels == 12) {
-				// Add the four top channels to their front/back channels, turning 12 into 8.
-				// SDL handles the rest if the output device has fewer channels.
-				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
-				for (uint32_t ch = 0; ch < 4; ch++) {
-					dst[frame * output_channels + HEIGHT_DST[ch]] +=
-					    src[frame * channels + 8 + ch] *
-					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f);
-				}
+			for (uint32_t ch = 0; ch < channels; ch++) {
+				const auto src_ch =
+				    (FormatIsStd(port.format) && channels == 8 ? STD_8CH_MAP[ch] : ch);
+				dst[frame * channels + ch] = src[frame * channels + src_ch] *
+				                             (static_cast<float>(port.volume[ch]) / 32768.0f);
 			}
 		}
 	} else {
@@ -327,16 +308,17 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		const auto* src = static_cast<const int16_t*>(data);
 
 		for (uint32_t frame = 0; frame < frames; frame++) {
-			for (uint32_t ch = 0; ch < output_channels; ch++) {
-				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
+			for (uint32_t ch = 0; ch < channels; ch++) {
+				const auto src_ch =
+				    (FormatIsStd(port.format) && channels == 8 ? STD_8CH_MAP[ch] : ch);
 				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[ch] / 32768;
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
 					sample = std::numeric_limits<int16_t>::min();
 				}
-				dst[frame * output_channels + ch] = static_cast<int16_t>(sample);
+				dst[frame * channels + ch] = static_cast<int16_t>(sample);
 			}
 		}
 	}
@@ -352,10 +334,8 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
-	const auto           output_channels = OutputChannels(*port);
-	const auto           prepared_size =
-	    BytesPerSample(port->format) * output_channels * port->samples_num;
+	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
+	const auto           prepared_size = FrameSize(*port) * port->samples_num;
 
 	std::vector<uint8_t> convert_buffer;
 	const void*          queue_data = prepared_data;
@@ -363,7 +343,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 
 	SDL_AudioCVT cvt {};
 	const int    cvt_result =
-	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(output_channels),
+	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(port->channels_num),
 	                      static_cast<int>(port->freq), port->audio_spec.format,
 	                      port->audio_spec.channels, port->audio_spec.freq);
 
@@ -436,7 +416,6 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				case Format::Float8Ch:
 				case Format::Signed16bit8ChStd:
 				case Format::Float8ChStd: port.channels_num = 8; break;
-				case Format::Float12Ch: port.channels_num = 12; break;
 				default: EXIT("unknown format");
 			}
 
@@ -509,9 +488,20 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 			auto bit = bitflag & 0x1u;
 
 			if (bit == 1) {
-				port.volume[i] = volume[i];
+				int src_index = i;
+				if (port.format == Format::Float8ChStd ||
+				    port.format == Format::Signed16bit8ChStd) {
+					switch (i) {
+						case 4: src_index = 6; break;
+						case 5: src_index = 7; break;
+						case 6: src_index = 4; break;
+						case 7: src_index = 5; break;
+						default:;
+					}
+				}
+				port.volume[i] = volume[src_index];
 
-				LOGF("\t port.volume[%d] = volume[%d] (%d)\n", i, i, volume[i]);
+				LOGF("\t port.volume[%d] = volume[%d] (%d)\n", i, src_index, volume[src_index]);
 			}
 		}
 
@@ -821,15 +811,22 @@ int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32
 	     "\t freq    = %u\n",
 	     user_id, type, index, len, freq);
 
+	if (user_id != 255 && user_id != 1) {
+		LOGF("\t temporary: accepting unsupported audio input user_id %d\n", user_id);
+	}
 	EXIT_NOT_IMPLEMENTED(type != 1);
 	EXIT_NOT_IMPLEMENTED(index != 0);
 
 	Audio::Format format = Audio::Format::Unknown;
 
 	switch (param) {
-		case 1: format = Audio::Format::Signed16bitMono; break;
+		case 0: format = Audio::Format::Signed16bitMono; break;
 		case 2: format = Audio::Format::Signed16bitStereo; break;
-		default: return AUDIO_IN_ERROR_INVALID_PARAM;
+		default:
+			LOGF("\t temporary: using signed 16-bit stereo for unsupported audio input param %u\n",
+			     param);
+			format = Audio::Format::Signed16bitStereo;
+			break;
 	}
 
 	LOGF("\t param   = %u (%s)\n", param, Common::EnumName(format).c_str());

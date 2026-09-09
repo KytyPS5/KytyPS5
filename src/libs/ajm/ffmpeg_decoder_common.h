@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/assert.h"
-#include "libs/ajm/decoder.h"
 
 #include <cstdint>
 
@@ -15,7 +14,7 @@ extern "C" {
 
 namespace Libs::Audio::Ajm {
 
-inline AVSampleFormat AjmSampleEncodingToAvFormat(AjmSampleEncoding encoding) {
+static AVSampleFormat AjmSampleEncodingToAvFormat(AjmSampleEncoding encoding) {
 	switch (encoding) {
 		case AjmSampleEncoding::S16: return AV_SAMPLE_FMT_S16;
 		case AjmSampleEncoding::S32: return AV_SAMPLE_FMT_S32;
@@ -25,7 +24,7 @@ inline AVSampleFormat AjmSampleEncodingToAvFormat(AjmSampleEncoding encoding) {
 	return AV_SAMPLE_FMT_S16;
 }
 
-inline AVFrame* AjmConvertFfmpegFrame(const AVFrame* frame, AjmSampleEncoding encoding,
+static AVFrame* AjmConvertFfmpegFrame(const AVFrame* frame, AjmSampleEncoding encoding,
                                       AjmDecodeResult* result) {
 	if (frame == nullptr || result == nullptr) {
 		return nullptr;

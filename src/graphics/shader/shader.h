@@ -33,7 +33,7 @@ struct ComputeShaderInfo;
 struct ShaderRegisters;
 } // namespace HW
 
-enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute, Mesh };
+enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute };
 
 namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
@@ -63,65 +63,54 @@ struct ShaderClipSpaceTransform {
 	bool  enabled        = false;
 };
 
-struct ShaderWorkgroupInputInfo {
-	uint32_t threads_num[3]      = {0, 0, 0};
-	uint32_t lds_size_dwords     = 0;
-	uint32_t scratch_size_dwords = 0;
-	uint32_t host_subgroup_size  = 64;
-	uint32_t wave_size           = 64;
-};
+// Unknown is distinct from a known zero register value, particularly for old
+// offline manifests which did not capture the initial guest FP controls.
+struct ShaderFloatingPointState {
+	bool    known      = false;
+	uint8_t float_mode = 0;
+	bool    ieee_mode  = false;
+	bool    dx10_clamp = false;
 
-struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
-	uint32_t input_primitive      = 0;
-	uint32_t primitives_per_group = 0;
-	uint32_t vertices_per_group   = 0;
-	uint32_t max_vertices         = 0;
-	uint32_t max_primitives       = 0;
-	uint32_t provoking_vertex     = 0;
-
-	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
-		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
-			case Prospero::PrimitiveType::kPointList: return 1u;
-			case Prospero::PrimitiveType::kLineList: return 2u;
-			default: return 3u;
-		}
-	}
-	[[nodiscard]] constexpr uint32_t InputPrimitiveStep() const {
-		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
-		           ? 1u : InputPrimitiveSize();
-	}
-	[[nodiscard]] constexpr uint32_t InputPrimitiveCount(uint32_t vertices) const {
-		const auto size = InputPrimitiveSize();
-		return vertices < size ? 0u : (vertices - size) / InputPrimitiveStep() + 1u;
-	}
-	[[nodiscard]] constexpr uint32_t InputVertexCount(uint32_t primitives) const {
-		return primitives == 0u ? 0u : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
+	[[nodiscard]] uint32_t StaticKey() const {
+		return known ? 0x10000u | float_mode | (uint32_t(ieee_mode) << 8u) |
+		                   (uint32_t(dx10_clamp) << 9u) : 0u;
 	}
 };
 
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
+	static constexpr uint32_t PARAM_LINK_MAX = 32;
 
 	ShaderBufferResource    resources[RES_MAX];
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
+	ShaderFloatingPointState initial_fp_state;
 	int                     resources_num       = 0;
+	int                     fetch_shader_reg    = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	uint32_t                linked_param_sources[PARAM_LINK_MAX]   = {};
+	uint32_t                linked_param_locations[PARAM_LINK_MAX] = {};
+	uint32_t                linked_param_count                     = 0;
 	ShaderClipSpaceTransform clip_space;
-	ShaderMeshInputInfo      mesh;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };
 
-struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
+struct ShaderComputeInputInfo {
+	ShaderFloatingPointState initial_fp_state;
+	uint32_t           threads_num[3]             = {0, 0, 0};
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	uint32_t           lds_size_dwords            = 0;
+	uint32_t           scratch_size_dwords        = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	bool               needs_lds_barriers          = false;
+	uint32_t           wave_size                  = 64;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
@@ -129,6 +118,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 };
 
 struct ShaderPixelInputInfo {
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       ps_system_input_base         = 0;
@@ -139,10 +129,10 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
+	bool                                           ps_pos_xy                    = false;
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;
-	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
@@ -160,15 +150,6 @@ union ShaderStageInputInfo {
 	const ShaderPixelInputInfo*   pixel;
 	const ShaderComputeInputInfo* compute = nullptr;
 };
-
-inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType           stage,
-                                                            ShaderStageInputInfo input) {
-	switch (stage) {
-		case ShaderType::Compute: return input.compute;
-		case ShaderType::Mesh: return &input.vertex->mesh;
-		default: return nullptr;
-	}
-}
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
@@ -262,7 +243,6 @@ struct Shader {
 };
 
 struct ShaderMappedData {
-	Prospero::ShaderBinaryType type {};
 	ShaderUserData* user_data           = nullptr;
 	ShaderSemantic* input_semantics     = nullptr;
 	uint32_t        num_input_semantics = 0;

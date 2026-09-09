@@ -989,7 +989,7 @@ static void HwShIgnoreComputeRegister([[maybe_unused]] uint32_t cmd_offset,
 static void HwShIgnoreShaderRegister([[maybe_unused]] uint32_t cmd_offset,
                                      [[maybe_unused]] uint32_t value) {}
 
-KYTY_HW_SH_PARSER(HwShSetRegisters) {
+KYTY_HW_SH_PARSER(HwShIgnoreRegisters) {
 	const auto reg_num = (cmd_id >> 16u) & 0x3fffu;
 	EXIT_NOT_IMPLEMENTED(reg_num == 0);
 
@@ -3638,13 +3638,12 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS;
-	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS; offset++) {
-		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetGsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS,
-			                                   value);
-		};
-	}
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};

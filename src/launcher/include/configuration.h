@@ -94,9 +94,7 @@ public:
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	PresentMode            present_mode                = PresentMode::Fifo;
-	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
-	bool                   readback_linear_images      = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -122,9 +120,7 @@ public:
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
 		present_mode                = other.present_mode;
-		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
-		readback_linear_images      = other.readback_linear_images;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -167,9 +163,7 @@ public:
 		KYTY_CFG_SET(user_name);
 		KYTY_CFG_SET(user_id);
 		KYTY_CFG_SET(present_mode);
-		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
-		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -203,12 +197,10 @@ public:
 		                         ? saved_user_id
 		                         : Config::DEFAULT_USER_ID;
 		KYTY_CFG_GET(present_mode);
-		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {
 			present_mode = PresentMode::Fifo;
 		}
 		KYTY_CFG_GET(fullscreen_enabled);
-		KYTY_CFG_GET(readback_linear_images);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

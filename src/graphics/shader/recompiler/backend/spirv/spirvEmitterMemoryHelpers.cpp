@@ -3,7 +3,7 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
-	if (state.program.bindings.UsesPushData()) {
+	if (state.push_constant_variable != 0) {
 		dword_index += state.program.bindings.push_data_start_dword;
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
@@ -37,6 +37,14 @@ uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint3
 	return ret;
 }
 
+uint32_t EmitStorageBufferElementCount(EmitterState& state, uint32_t byte_limit,
+                                       uint32_t element_shift) {
+	const auto rounded_limit =
+	    EmitAddU32(state, byte_limit, ConstantU32(state, (1u << element_shift) - 1u));
+	return EmitBinaryU32(state, OpShiftRightLogical, rounded_limit,
+	                     ConstantU32(state, element_shift));
+}
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -53,6 +61,19 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+bool BufferUsesDwordOffset(const EmitterState& state, const IR::MemoryInfo& mem) {
+	if (mem.kind != IR::ResourceKind::Buffer || mem.formatted || mem.typed ||
+	    mem.data_bits != 32u) return false;
+	if (mem.resource >= state.program.info.buffers.size()) {
+		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+		                             "buffer specialization is missing");
+	}
+	// Atomic64 descriptors also have data_bits32; keep every atomic resource
+	// on byte addressing. This fact is stable when wide accesses rebase each
+	// component and when a bounded table selects a specialized descriptor.
+	return !state.program.info.buffers[mem.resource].atomic;
+}
+
 void EmitMemoryOffsets(EmitterState& state) {
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		const auto word =
@@ -61,31 +82,48 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, OpBitwiseAnd, EmitBinaryU32(state, OpShiftRightLogical, word, shift),
 		    ConstantU32(state, 0xffu));
+		state.memory_byte_limits[i] =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_limit_dword + i);
 	}
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
-	const auto* workgroup = ShaderWorkgroupInput(state.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
+}
+
+uint32_t EmitWaveScratchIndex(EmitterState& state, uint32_t lane) {
+	if (state.wave_scratch_base_dwords == 0) {
+		return lane;
+	}
+	return EmitAddU32(state, lane, ConstantU32(state, state.wave_scratch_base_dwords));
 }
 
 static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
-	if (ShaderWorkgroupInput(state.stage, state.input_info) == nullptr) {
+	if (state.stage != ShaderType::Compute) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
-	    StorageClassWorkgroup);
-	state.builder.AddName(state.lds_variable, "lds_dwords");
+	if (state.requirements.shared_int64_atomics) {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeScalarU64ArrayPointer(state, StorageClassWorkgroup,
+		                              (LdsDwordCount(state) + 1u) / 2u),
+		    StorageClassWorkgroup);
+		state.builder.AddName(state.lds_variable, "lds_qwords");
+	} else {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
+		    StorageClassWorkgroup);
+		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
 }
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          uint32_t variable,
-                                                         uint32_t pointer_type) {
+                                                         uint32_t pointer_type,
+                                                         uint32_t element_shift) {
 	if (variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
@@ -97,9 +135,12 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
 	                           ConstantU32(state, array_index)});
 	access.byte_offset = state.memory_byte_offsets[array_index];
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	access.byte_limit  = state.memory_byte_limits[array_index];
+	// The renderer publishes the exact descriptor byte limit in shader data. Derive
+	// the element bound from that value instead of asking the NVIDIA compiler to
+	// lower OpArrayLength on a runtime descriptor array.
+	access.length =
+	    EmitStorageBufferElementCount(state, access.byte_limit, element_shift);
 	return access;
 }
 
@@ -123,10 +164,10 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			access.length = state.gds_length;
 			return access;
 		case IR::ResourceKind::Scratch:
-			if (state.scratch_variable[state.lane_half] == 0) {
+			if (state.scratch_variable == 0) {
 				EXIT("scratch storage was not prepared before SPIR-V function emission\n");
 			}
-			access.object_pointer = state.scratch_variable[state.lane_half];
+			access.object_pointer = state.scratch_variable;
 			access.length         = ConstantU32(state, state.program.scratch_dwords);
 			return access;
 		case IR::ResourceKind::ScalarAddress:
@@ -136,11 +177,16 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
-			access.index_offset =
-			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
-			                  ConstantU32(state, 2u));
-			access.add_index_offset = true;
+			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state), 2u);
+			// Scalar and raw DWORD paths use an aligned residual. Their index
+			// sum cannot wrap: (UINT32_MAX >> 2) + (255 >> 2) < UINT32_MAX.
+			// Other vector paths include the byte residual before decomposition.
+			if (mem.kind == IR::ResourceKind::ScalarBuffer || BufferUsesDwordOffset(state, mem)) {
+				access.index_offset =
+				    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
+				                  ConstantU32(state, 2u));
+				access.add_index_offset = true;
+			}
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
@@ -163,14 +209,27 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	return in_bounds;
 }
 
+uint32_t EmitMemoryByteRangeInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                     uint32_t address, uint32_t byte_count) {
+	const auto end = EmitAddU32(state, address, ConstantU32(state, byte_count));
+	const auto no_overflow = state.builder.AllocateId();
+	state.builder.AddFunction({OpUGreaterThanEqual, TypeBool(state), no_overflow, end, address});
+	const auto within_limit = state.builder.AllocateId();
+	state.builder.AddFunction({OpULessThanEqual, TypeBool(state), within_limit, end,
+	                           access.byte_limit});
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLogicalAnd, TypeBool(state), result, no_overflow, within_limit});
+	return result;
+}
+
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
 		const auto pointer = state.builder.AllocateId();
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
-		                           : ShaderWorkgroupInput(state.stage, state.input_info) != nullptr
-		                               ? StorageClassWorkgroup
-		                               : StorageClassFunction;
+		                           : state.stage == ShaderType::Compute     ? StorageClassWorkgroup
+		                                                                    : StorageClassFunction;
 		state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                           pointer, access.object_pointer, index});
 		return pointer;
@@ -188,9 +247,28 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 	return pointer;
 }
 
+uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitcast, TypeU32(state), ret, value});
+	return ret;
+}
+
+uint32_t EmitTBufferBitcastU32ToF32(EmitterState& state, uint32_t value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, value});
+	return ret;
+}
+
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction({OpBitcast, TypeI32(state), ret, value});
+	return ret;
+}
+
+uint32_t EmitTBufferCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
+                                       uint32_t constant) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({opcode, TypeBool(state), ret, value, ConstantU32(state, constant)});
 	return ret;
 }
 
@@ -204,6 +282,15 @@ uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t 
 bool IsSignedFormatComponent(Format::ComponentType type) {
 	return type == Format::ComponentType::Sint || type == Format::ComponentType::Snorm ||
 	       type == Format::ComponentType::Sscaled;
+}
+
+uint32_t EmitHalfToF32Bits(EmitterState& state, uint32_t raw) {
+	const auto unpacked = state.builder.AllocateId();
+	const auto value    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), GlslUnpackHalf2x16, raw});
+	state.builder.AddFunction({OpCompositeExtract, TypeF32(state), value, unpacked, 0});
+	return EmitTBufferBitcastF32ToU32(state, value);
 }
 
 uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
@@ -222,11 +309,11 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	const auto mantissa_bits_32 =
 	    EmitBinaryU32(state, OpShiftLeftLogical, mantissa, ConstantU32(state, 23u - mantissa_bits));
 	const auto normal_bits = EmitBinaryU32(state, OpBitwiseOr, exponent_bits, mantissa_bits_32);
-	const auto normal      = EmitBitcastU32ToF32(state, normal_bits);
+	const auto normal      = EmitTBufferBitcastU32ToF32(state, normal_bits);
 
 	const auto special_bits =
 	    EmitBinaryU32(state, OpBitwiseOr, ConstantU32(state, 0x7f800000u), mantissa_bits_32);
-	const auto special = EmitBitcastU32ToF32(state, special_bits);
+	const auto special = EmitTBufferBitcastU32ToF32(state, special_bits);
 
 	const auto mantissa_f32 = state.builder.AllocateId();
 	const auto subnormal    = state.builder.AllocateId();
@@ -235,11 +322,11 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	    {OpFMul, TypeF32(state), subnormal, mantissa_f32,
 	     ConstantF32Value(state, std::ldexp(1.0f, 1 - 15 - static_cast<int>(mantissa_bits)))});
 
-	const auto zero_exp    = EmitCompareU32Constant(state, OpIEqual, exponent, 0);
-	const auto special_exp = EmitCompareU32Constant(state, OpIEqual, exponent, 31);
+	const auto zero_exp    = EmitTBufferCompareU32Constant(state, OpIEqual, exponent, 0);
+	const auto special_exp = EmitTBufferCompareU32Constant(state, OpIEqual, exponent, 31);
 	const auto finite      = EmitTBufferSelectF32(state, zero_exp, subnormal, normal);
 	const auto result      = EmitTBufferSelectF32(state, special_exp, special, finite);
-	return EmitBitcastF32ToU32(state, result);
+	return EmitTBufferBitcastF32ToU32(state, result);
 }
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
@@ -251,13 +338,13 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 		case Format::ComponentType::Uscaled: {
 			const auto value = state.builder.AllocateId();
 			state.builder.AddFunction({OpConvertUToF, TypeF32(state), value, raw});
-			return EmitBitcastF32ToU32(state, value);
+			return EmitTBufferBitcastF32ToU32(state, value);
 		}
 		case Format::ComponentType::Sscaled: {
 			const auto signed_raw = EmitTBufferBitcastU32ToI32(state, raw);
 			const auto value      = state.builder.AllocateId();
 			state.builder.AddFunction({OpConvertSToF, TypeF32(state), value, signed_raw});
-			return EmitBitcastF32ToU32(state, value);
+			return EmitTBufferBitcastF32ToU32(state, value);
 		}
 		case Format::ComponentType::Unorm: {
 			const auto value      = state.builder.AllocateId();
@@ -266,7 +353,7 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 			state.builder.AddFunction({OpConvertUToF, TypeF32(state), value, raw});
 			state.builder.AddFunction(
 			    {OpFDiv, TypeF32(state), normalized, value, ConstantF32Value(state, max_value)});
-			return EmitBitcastF32ToU32(state, normalized);
+			return EmitTBufferBitcastF32ToU32(state, normalized);
 		}
 		case Format::ComponentType::Snorm: {
 			const auto signed_raw = EmitTBufferBitcastU32ToI32(state, raw);
@@ -279,16 +366,158 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 			    {OpFDiv, TypeF32(state), normalized, value, ConstantF32Value(state, max_value)});
 			state.builder.AddFunction({OpExtInst, TypeF32(state), clamped, GlslStd450(state),
 			                           GlslFMax, normalized, ConstantF32Value(state, -1.0f)});
-			return EmitBitcastF32ToU32(state, clamped);
+			return EmitTBufferBitcastF32ToU32(state, clamped);
 		}
 		case Format::ComponentType::Float:
 			if (bits == 32u) {
 				return raw;
 			}
 			if (bits == 16u) {
-				return EmitBitcastF32ToU32(state, EmitF16BitsToF32(state, raw));
+				return EmitHalfToF32Bits(state, raw);
 			}
 			return EmitUFloatToF32Bits(state, raw, bits);
+		default: return raw;
+	}
+}
+
+static uint32_t EmitSelectU32(EmitterState& state, uint32_t condition, uint32_t true_value,
+                              uint32_t false_value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeU32(state), ret, condition, true_value, false_value});
+	return ret;
+}
+
+static uint32_t EmitFormatClampF32(EmitterState& state, uint32_t raw, float low, float high) {
+	const auto value  = EmitTBufferBitcastU32ToF32(state, raw);
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction({OpIsNan, TypeBool(state), is_nan, value});
+	const auto finite  = EmitTBufferSelectF32(state, is_nan, ConstantF32Value(state, 0.0f), value);
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction({OpExtInst, TypeF32(state), clamped, GlslStd450(state), GlslFClamp,
+	                           finite, ConstantF32Value(state, low), ConstantF32Value(state, high)});
+	return clamped;
+}
+
+static uint32_t EmitScaledRoundEven(EmitterState& state, uint32_t value, float scale) {
+	const auto scaled = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFMul, TypeF32(state), scaled, value, ConstantF32Value(state, scale)});
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, TypeF32(state), rounded, GlslStd450(state), GlslRoundEven, scaled});
+	return rounded;
+}
+
+static uint32_t EmitF32ToU32(EmitterState& state, uint32_t value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertFToU, TypeU32(state), ret, value});
+	return ret;
+}
+
+static uint32_t EmitF32ToI32Bits(EmitterState& state, uint32_t value, uint32_t mask) {
+	const auto converted = state.builder.AllocateId();
+	state.builder.AddFunction({OpConvertFToS, TypeI32(state), converted, value});
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, converted});
+	return EmitBinaryU32(state, OpBitwiseAnd, bits, ConstantU32(state, mask));
+}
+
+static uint32_t EmitF32ToHalfBits(EmitterState& state, uint32_t raw) {
+	const auto value = EmitTBufferBitcastU32ToF32(state, raw);
+	const auto pair  = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
+	                           ConstantF32Value(state, 0.0f)});
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, TypeU32(state), packed, GlslStd450(state), GlslPackHalf2x16, pair});
+	return EmitBinaryU32(state, OpBitwiseAnd, packed, ConstantU32(state, 0xffffu));
+}
+
+static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t raw, uint32_t bits) {
+	const auto mantissa_bits = bits == 11u ? 6u : 5u;
+	const auto shift         = 23u - mantissa_bits;
+	const auto infinity      = 31u << mantissa_bits;
+	const auto exponent      = EmitBinaryU32(
+	    state, OpBitwiseAnd,
+	    EmitBinaryU32(state, OpShiftRightLogical, raw, ConstantU32(state, 23)),
+	    ConstantU32(state, 0xffu));
+	const auto half_ulp = EmitBinaryU32(
+	    state, OpBitwiseAnd,
+	    EmitBinaryU32(state, OpShiftRightLogical, raw, ConstantU32(state, shift)),
+	    ConstantU32(state, 1u));
+	const auto biased = EmitAddU32(
+	    state, EmitAddU32(state, raw, ConstantU32(state, (1u << (shift - 1u)) - 1u)), half_ulp);
+	const auto normal = EmitBinaryU32(
+	    state, OpISub, EmitBinaryU32(state, OpShiftRightLogical, biased, ConstantU32(state, shift)),
+	    ConstantU32(state, 112u << mantissa_bits));
+	const auto normal_clamped = state.builder.AllocateId();
+	state.builder.AddFunction({OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state),
+	                           GlslUMin, normal, ConstantU32(state, infinity)});
+	const auto value    = EmitTBufferBitcastU32ToF32(state, raw);
+	const auto denormal = EmitF32ToU32(
+	    state, EmitScaledRoundEven(state, value,
+	                               std::ldexp(1.0f, static_cast<int>(14u + mantissa_bits))));
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction({OpIsNan, TypeBool(state), is_nan, value});
+	const auto sign     = EmitBinaryU32(state, OpBitwiseAnd, raw, ConstantU32(state, 0x80000000u));
+	const auto negative = EmitTBufferCompareU32Constant(state, OpINotEqual, sign, 0);
+	const auto special  = EmitTBufferCompareU32Constant(state, OpIEqual, exponent, 255);
+	const auto small    = EmitTBufferCompareU32Constant(state, OpULessThan, exponent, 113);
+	const auto finite   = EmitSelectU32(state, small, denormal, normal_clamped);
+	const auto positive = EmitSelectU32(state, special, ConstantU32(state, infinity), finite);
+	const auto numeric  = EmitSelectU32(state, negative, ConstantU32(state, 0), positive);
+	return EmitSelectU32(state, is_nan,
+	                     ConstantU32(state, infinity | (1u << (mantissa_bits - 1u))), numeric);
+}
+
+uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                             uint32_t component, uint32_t raw) {
+	const auto bits = info.component_bits[component];
+	if (bits == 32u) {
+		return raw;
+	}
+	const auto max_unsigned = (1u << bits) - 1u;
+	const auto max_signed   = static_cast<int32_t>((1u << (bits - 1u)) - 1u);
+	switch (info.type) {
+		case Format::ComponentType::Uint: {
+			const auto ret = state.builder.AllocateId();
+			state.builder.AddFunction({OpExtInst, TypeU32(state), ret, GlslStd450(state), GlslUMin,
+			                           raw, ConstantU32(state, max_unsigned)});
+			return ret;
+		}
+		case Format::ComponentType::Sint: {
+			const auto clamped = state.builder.AllocateId();
+			state.builder.AddFunction({OpExtInst, TypeI32(state), clamped, GlslStd450(state),
+			                           GlslSClamp, EmitTBufferBitcastU32ToI32(state, raw),
+			                           ConstantI32(state, -max_signed - 1),
+			                           ConstantI32(state, max_signed)});
+			const auto clamped_bits = state.builder.AllocateId();
+			state.builder.AddFunction({OpBitcast, TypeU32(state), clamped_bits, clamped});
+			return EmitBinaryU32(state, OpBitwiseAnd, clamped_bits,
+			                     ConstantU32(state, max_unsigned));
+		}
+		case Format::ComponentType::Unorm:
+			return EmitF32ToU32(
+			    state, EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, 0.0f, 1.0f),
+			                               static_cast<float>(max_unsigned)));
+		case Format::ComponentType::Snorm:
+			return EmitF32ToI32Bits(
+			    state,
+			    EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, -1.0f, 1.0f),
+			                        static_cast<float>(max_signed)),
+			    max_unsigned);
+		case Format::ComponentType::Uscaled:
+			return EmitF32ToU32(
+			    state, EmitFormatClampF32(state, raw, 0.0f, static_cast<float>(max_unsigned)));
+		case Format::ComponentType::Sscaled:
+			return EmitF32ToI32Bits(state,
+			                        EmitFormatClampF32(state, raw,
+			                                           static_cast<float>(-max_signed - 1),
+			                                           static_cast<float>(max_signed)),
+			                        max_unsigned);
+		case Format::ComponentType::Float:
+			return bits == 16u ? EmitF32ToHalfBits(state, raw)
+			                   : EmitF32ToUFloatBits(state, raw, bits);
 		default: return raw;
 	}
 }
@@ -307,7 +536,8 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 		uint32_t key;
 	};
 	const auto classify = [&](uint32_t bits) {
-		const auto cls = EmitClassifyF32Bits(state, bits);
+		const auto value = EmitBitcastU32ToF32(state, bits);
+		const auto cls   = EmitClassifyF32(state, value);
 		const auto negative = EmitCompareU32Constant(
 		    state, OpINotEqual, EmitAndConstant(state, bits, 0x80000000u), 0u);
 		const auto negative_key = state.builder.AllocateId();

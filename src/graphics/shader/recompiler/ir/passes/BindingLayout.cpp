@@ -79,6 +79,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.memory_limit_dword  = next.memory_offset_dword + (next.memory_offset_count + 3u) / 4u;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
@@ -132,6 +133,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
+	    std::ranges::any_of(program.info.bounded_srt_reads, [](const auto& read) { return read.count != 0; }) ||
+	    std::ranges::any_of(program.info.buffer_tables, [](const auto& table) { return table.count != 0; }) ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
 		    return image.indirect_search_iterations != 0u;
 	    });

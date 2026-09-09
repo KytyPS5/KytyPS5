@@ -1,4 +1,4 @@
-#include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/imeOverlay.h"
 
 #include "SDL.h"
 #include "common/assert.h"
@@ -7,7 +7,6 @@
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
-#include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
 
@@ -30,7 +29,6 @@ namespace {
 
 namespace CoreIme   = Libs::Ime;
 namespace DialogIme = Libs::Dialog::ImeDialog;
-namespace ErrorDialog = Libs::Dialog::ErrorDialog;
 
 namespace Ime {
 
@@ -103,34 +101,6 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Error };
-
-struct OverlaySession {
-	OverlayKind kind       = OverlayKind::None;
-	uint64_t    generation = 0;
-
-	bool operator==(const OverlaySession&) const = default;
-};
-
-struct OverlaySnapshot {
-	OverlaySession            session;
-	Ime::HostSnapshot         ime;
-	ErrorDialog::HostSnapshot error;
-};
-
-bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
-	if (ErrorDialog::GetHostSnapshot(&snapshot->error)) {
-		snapshot->session = {OverlayKind::Error, snapshot->error.generation};
-		return true;
-	}
-	if (Ime::GetHostSnapshot(&snapshot->ime)) {
-		snapshot->session = {OverlayKind::Ime, snapshot->ime.generation};
-		return true;
-	}
-	snapshot->session = {};
-	return false;
-}
-
 constexpr size_t INPUT_QUEUE_CAPACITY = 128;
 
 enum class InputKind : uint8_t {
@@ -143,20 +113,19 @@ enum class InputKind : uint8_t {
 };
 
 struct InputEvent {
-	InputKind      kind;
-	OverlaySession session;
-	int            id;
-	float          x;
-	float          y;
+	InputKind kind;
+	uint64_t  generation;
+	int       id;
+	float     x;
+	float     y;
 };
 
 struct VisibilityUpdate {
-	OverlaySession session;
-	bool           visible;
-	bool           capture_controller;
-	bool           capture_keyboard;
-	bool           text_input;
-	bool           multiline;
+	uint64_t generation;
+	bool     visible;
+	bool     capture_controller;
+	bool     capture_keyboard;
+	bool     multiline;
 };
 
 std::atomic<Uint32>          g_visibility_event {static_cast<Uint32>(-1)};
@@ -168,14 +137,15 @@ size_t                       g_missing_visibility_wakeups = 0;
 bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
-OverlaySession               g_input_session;
+uint64_t                     g_input_generation           = 0;
 bool                         g_input_active               = false;
 bool                         g_input_controller           = false;
 bool                         g_input_keyboard             = false;
 bool                         g_input_multiline            = false;
 bool                         g_input_lifecycle_active     = false;
+bool                         g_active                     = false;
 bool                         g_controller_captured        = false;
-OverlaySession               g_session;
+uint64_t                     g_generation                 = 0;
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -189,7 +159,7 @@ void QueueInput(InputEvent event) {
 	    event.kind == InputKind::Axis || event.kind == InputKind::MousePosition;
 	if (replaceable && !g_input_events.empty()) {
 		auto& last = g_input_events.back();
-		if (last.session == event.session && last.kind == event.kind && last.id == event.id) {
+		if (last.generation == event.generation && last.kind == event.kind && last.id == event.id) {
 			last = event;
 			return;
 		}
@@ -222,36 +192,34 @@ void RefreshVisibility() {
 	if (!g_input_lifecycle_active) {
 		return;
 	}
-	OverlaySnapshot snapshot;
-	const bool      visible = GetOverlaySnapshot(&snapshot);
-	if (snapshot.session == g_session) {
+	Ime::HostSnapshot snapshot;
+	const bool        visible    = Ime::GetHostSnapshot(&snapshot);
+	const uint64_t    generation = visible ? snapshot.generation : g_generation;
+	if (visible == g_active && (!visible || generation == g_generation)) {
 		return;
 	}
-	g_session               = snapshot.session;
+	g_generation            = generation;
 	bool capture_controller = false;
 	bool capture_keyboard   = false;
-	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Error) {
-		capture_controller = true;
-		capture_keyboard   = true;
-	} else if (snapshot.session.kind == OverlayKind::Ime) {
-		capture_controller = (snapshot.ime.disable_device & Ime::DISABLE_DEVICE_CONTROLLER) == 0;
-		capture_keyboard   = (snapshot.ime.disable_device & Ime::DISABLE_DEVICE_EXT_KEYBOARD) == 0;
-		text_input         = capture_keyboard;
-		multiline          = (snapshot.ime.option & Ime::OPTION_MULTILINE) != 0;
+	if (visible) {
+		capture_controller = (snapshot.disable_device & Ime::DISABLE_DEVICE_CONTROLLER) == 0;
+		capture_keyboard   = (snapshot.disable_device & Ime::DISABLE_DEVICE_EXT_KEYBOARD) == 0;
+		multiline          = (snapshot.option & Ime::OPTION_MULTILINE) != 0;
 	}
 	const bool was_controller = std::exchange(g_controller_captured, capture_controller);
 	if (capture_controller || was_controller) {
 		Controller::ResetInputState();
 	}
+	g_active = visible;
+
 	const Uint32 type = g_visibility_event.load(std::memory_order_acquire);
 	if (type != static_cast<Uint32>(-1)) {
 		SDL_Event event {};
 		event.type = type;
 		std::scoped_lock input_lock(g_input_mutex);
-		g_visibility_updates.push_back({snapshot.session, visible, capture_controller,
-		                                capture_keyboard, text_input, multiline});
+		g_visibility_updates.push_back(
+		    {generation, visible, capture_controller, capture_keyboard, multiline});
 		if (g_missing_visibility_wakeups != 0 || SDL_PushEvent(&event) <= 0) {
 			g_missing_visibility_wakeups++;
 		}
@@ -415,7 +383,7 @@ void CheckVulkanResult(VkResult result) {
 
 } // namespace
 
-void InitializeSystemOverlayInput() {
+void InitializeImeInput() {
 	const Uint32 type = SDL_RegisterEvents(1);
 	EXIT_IF(type == static_cast<Uint32>(-1));
 	{
@@ -425,18 +393,16 @@ void InitializeSystemOverlayInput() {
 	}
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
-	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
 }
 
-void ShutdownSystemOverlayInput() {
+void ShutdownImeInput() {
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
-	ErrorDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
-		g_session                = {};
+		g_active                 = false;
 		if (std::exchange(g_controller_captured, false)) {
 			Controller::ResetInputState();
 		}
@@ -449,7 +415,6 @@ void ShutdownSystemOverlayInput() {
 		g_missing_visibility_wakeups = 0;
 	}
 	g_input_active     = false;
-	g_input_session    = {};
 	g_input_controller = false;
 	g_input_keyboard   = false;
 	g_input_multiline  = false;
@@ -458,15 +423,13 @@ void ShutdownSystemOverlayInput() {
 	}
 }
 
-SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
+ImeVisualState GetImeVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
-	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	return {core.active || dialog.active, core.revision + dialog.revision};
 }
 
-bool ProcessSystemOverlayInput(const SDL_Event& event) {
+bool ProcessImeInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
 		VisibilityUpdate update {};
@@ -481,12 +444,12 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		ClearInputEvents();
 		g_last_external_keycode = 0;
 		g_last_external_status  = 0;
-		g_input_session         = update.session;
+		g_input_generation      = update.generation;
 		g_input_active          = update.visible;
 		g_input_controller      = update.capture_controller;
 		g_input_keyboard        = update.capture_keyboard;
 		g_input_multiline       = update.multiline;
-		if (update.text_input) {
+		if (g_input_keyboard) {
 			SDL_StartTextInput();
 		} else if (SDL_IsTextInputActive() == SDL_TRUE) {
 			SDL_StopTextInput();
@@ -495,7 +458,7 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	}
 	if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
 		if (g_input_active && g_input_controller) {
-			QueueInput({InputKind::ResetController, g_input_session, 0, 0.0f, 0.0f});
+			QueueInput({InputKind::ResetController, g_input_generation, 0, 0.0f, 0.0f});
 		}
 		return false;
 	}
@@ -503,8 +466,7 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		return false;
 	}
 
-	const auto     session          = g_input_session;
-	const uint64_t generation       = session.generation;
+	const uint64_t generation       = g_input_generation;
 	const bool     controller_event = event.type == SDL_CONTROLLERBUTTONDOWN ||
 	                                  event.type == SDL_CONTROLLERBUTTONUP ||
 	                                  event.type == SDL_CONTROLLERAXISMOTION;
@@ -515,13 +477,6 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	                            event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
-	}
-	if (keyboard_event && session.kind == OverlayKind::Error) {
-		if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
-		    (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_KP_ENTER)) {
-			ErrorDialog::HostAccept(generation);
-		}
-		return true;
 	}
 	switch (event.type) {
 		case SDL_TEXTINPUT: {
@@ -569,33 +524,31 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		case SDL_KEYUP: return true;
 		case SDL_CONTROLLERBUTTONDOWN:
 		case SDL_CONTROLLERBUTTONUP:
-			QueueInput({InputKind::Button, session, event.cbutton.button,
+			QueueInput({InputKind::Button, generation, event.cbutton.button,
 			            event.type == SDL_CONTROLLERBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
 		case SDL_CONTROLLERAXISMOTION:
-			QueueInput({InputKind::Axis, session, event.caxis.axis,
+			QueueInput({InputKind::Axis, generation, event.caxis.axis,
 			            static_cast<float>(event.caxis.value), 0.0f});
 			return true;
 		case SDL_MOUSEMOTION:
-			QueueInput({InputKind::MousePosition, session, 0, static_cast<float>(event.motion.x),
+			QueueInput({InputKind::MousePosition, generation, 0, static_cast<float>(event.motion.x),
 			            static_cast<float>(event.motion.y)});
 			return true;
 		case SDL_MOUSEBUTTONDOWN:
 		case SDL_MOUSEBUTTONUP:
-			QueueInput({InputKind::MousePosition, session, 0, static_cast<float>(event.button.x),
-			            static_cast<float>(event.button.y)});
-			QueueInput({InputKind::MouseButton, session, event.button.button,
+			QueueInput({InputKind::MouseButton, generation, event.button.button,
 			            event.type == SDL_MOUSEBUTTONDOWN ? 1.0f : 0.0f, 0.0f});
 			return true;
 		case SDL_MOUSEWHEEL:
-			QueueInput({InputKind::MouseWheel, session, 0, static_cast<float>(event.wheel.x),
+			QueueInput({InputKind::MouseWheel, generation, 0, static_cast<float>(event.wheel.x),
 			            static_cast<float>(event.wheel.y)});
 			return true;
 		default: return false;
 	}
 }
 
-struct SystemOverlay::Impl {
+struct ImeOverlay::Impl {
 	explicit Impl(GraphicContext& context): graphics(context) {}
 
 	~Impl() {
@@ -617,9 +570,8 @@ struct SystemOverlay::Impl {
 		io.IniFilename = nullptr;
 		io.LogFilename = nullptr;
 		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-		io.BackendPlatformName = "Kyty system overlay input";
+		io.BackendPlatformName = "Kyty IME input";
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -657,7 +609,7 @@ struct SystemOverlay::Impl {
 		vulkan_initialized = true;
 	}
 
-	void DrainInput(OverlaySession session) {
+	void DrainInput(uint64_t generation) {
 		std::deque<InputEvent> events;
 		bool                   reset = false;
 		{
@@ -674,18 +626,16 @@ struct SystemOverlay::Impl {
 			right_stick = {};
 		}
 		for (const auto& event: events) {
-			if (event.session != session) {
+			if (event.generation != generation) {
 				continue;
 			}
 			switch (event.kind) {
 				case InputKind::Button: {
 					const bool down = event.x != 0.0f;
-					if (session.kind == OverlayKind::Ime && down) {
-						if (event.id == SDL_CONTROLLER_BUTTON_B) {
-							Ime::HostCancel(session.generation);
-						} else if (event.id == SDL_CONTROLLER_BUTTON_Y) {
-							Ime::HostBackspace(session.generation);
-						}
+					if (down && event.id == SDL_CONTROLLER_BUTTON_B) {
+						Ime::HostCancel(generation);
+					} else if (down && event.id == SDL_CONTROLLER_BUTTON_Y) {
+						Ime::HostBackspace(generation);
 					}
 					const ImGuiKey key = ControllerButtonToKey(event.id);
 					if (key != ImGuiKey_None) {
@@ -782,7 +732,7 @@ struct SystemOverlay::Impl {
 		focus_pending = false;
 	}
 
-	void DrawIme(const Ime::HostSnapshot& snapshot, vk::Extent2D extent) {
+	void DrawDialog(const Ime::HostSnapshot& snapshot, vk::Extent2D extent) {
 		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
 		const bool   over_2k          = (snapshot.option & Ime::OPTION_USE_OVER_2K) != 0;
 		const float  reference_width  = over_2k ? 3840.0f : 1920.0f;
@@ -901,58 +851,17 @@ struct SystemOverlay::Impl {
 		ImGui::End();
 	}
 
-	void DrawError(const ErrorDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
-		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
-		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
-		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
-		                                              IM_COL32(0, 0, 0, 160));
-		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always,
-		                        {0.5f, 0.5f});
-		ImGui::SetNextWindowSize(
-		    {std::max(std::min(620.0f * scale, display.x - 32.0f), 1.0f), 0.0f}, ImGuiCond_Always);
-		if (focus_pending) {
-			ImGui::SetNextWindowFocus();
-		}
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 24.0f * scale});
-		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 16.0f * scale});
-		ImGui::PushFont(nullptr, 20.0f * scale);
-		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-		                                   ImGuiWindowFlags_NoSavedSettings |
-		                                   ImGuiWindowFlags_AlwaysAutoResize;
-		ImGui::Begin("##SystemError", nullptr, flags);
-		ImGui::TextUnformatted("Error");
-		ImGui::Separator();
-		const auto error_code = static_cast<uint32_t>(snapshot.error_code);
-		ImGui::TextWrapped("%s", error_code == 0x80550006u
-		                             ? "You are not signed in to PlayStation Network."
-		                             : "An error has occurred.");
-		ImGui::TextDisabled("Error code: 0x%08X", error_code);
-		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
-		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
-		const bool accepted = ImGui::Button("OK", {button_width, 44.0f * scale});
-		if (focus_pending) {
-			ImGui::SetItemDefaultFocus();
-			focus_pending = false;
-		}
-		ImGui::End();
-		ImGui::PopFont();
-		ImGui::PopStyleVar(2);
-		if (accepted) {
-			ErrorDialog::HostAccept(snapshot.generation);
-		}
-	}
-
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
-		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		Ime::HostSnapshot snapshot;
+		if (!Ime::GetHostSnapshot(&snapshot)) {
 			return false;
 		}
-		const auto prepared_session = snapshot.session;
+		const uint64_t prepared_generation = snapshot.generation;
 		EnsureVulkan(format, image_count);
-		if (session != snapshot.session) {
-			session       = snapshot.session;
+		if (generation != snapshot.generation) {
+			generation    = snapshot.generation;
 			focus_pending = true;
-			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+			shift         = (snapshot.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
 			symbol_mode   = false;
 			panel_offset  = {};
 			right_stick   = {};
@@ -961,7 +870,7 @@ struct SystemOverlay::Impl {
 			io.ClearInputKeys();
 			io.ClearInputMouse();
 		}
-		DrainInput(snapshot.session);
+		DrainInput(snapshot.generation);
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -974,15 +883,11 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
+		if (!Ime::GetHostSnapshot(&snapshot) || snapshot.generation != prepared_generation) {
 			ImGui::EndFrame();
 			return false;
 		}
-		if (snapshot.session.kind == OverlayKind::Error) {
-			DrawError(snapshot.error, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
-		}
+		DrawDialog(snapshot, frame_extent);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;
@@ -1029,24 +934,24 @@ struct SystemOverlay::Impl {
 	float                                 button_height      = 42.0f;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
-	OverlaySession                        session;
+	uint64_t                              generation = 0;
 	vk::Extent2D                          extent {};
 	std::chrono::steady_clock::time_point last_frame;
 };
 
-SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}
+ImeOverlay::ImeOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}
 
-SystemOverlay::~SystemOverlay() = default;
+ImeOverlay::~ImeOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count) {
+bool ImeOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count) {
 	return m_impl->PrepareFrame(extent, format, image_count);
 }
 
-void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
+void ImeOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
 	m_impl->Record(command, target);
 }
 
-void SystemOverlay::ReleaseVulkan() {
+void ImeOverlay::ReleaseVulkan() {
 	m_impl->ReleaseVulkan();
 }
 

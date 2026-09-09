@@ -44,6 +44,8 @@ enum class ResourceKind {
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
+	// Logical pre-specialization buffer table, independent of dense native resources.
+	uint32_t                buffer_table             = UINT32_MAX;
 	uint32_t                sampler                  = 0;
 	uint32_t                offset                   = 0;
 	uint32_t                secondary_offset         = 0;
@@ -95,6 +97,9 @@ struct BufferResource {
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
+	// Positive proof that every access remains below this byte offset when a runtime
+	// descriptor has stride zero. Zero means that at least one access is unbounded.
+	uint64_t               stride_zero_access_size = 0;
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
@@ -103,7 +108,15 @@ struct BufferResource {
 	bool                   written            = false;
 	bool                   atomic             = false;
 	bool                   formatted          = false;
+	// Positive proof: every access uses the descriptor format, without typed overrides.
+	bool                   descriptor_formatted_only = false;
 	bool                   scalar             = false;
+
+	[[nodiscard]] uint64_t LimitDescriptorSize(uint32_t stride, uint64_t size) const {
+		return stride == 0u && stride_zero_access_size != 0u && stride_zero_access_size < size
+		           ? stride_zero_access_size
+		           : size;
+	}
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -130,9 +143,13 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	// Positive proof: every use can normalize a runtime candidate's numeric type
+	// to or from the guest's raw U32x4 image value at the indirect switch boundary.
+	bool                          heterogeneous_numeric_compatible = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	uint32_t                      indirect_sampler = UINT32_MAX;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -143,6 +160,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	uint8_t  depth_compare_func    = 0; // vk::CompareOp value from sampler descriptor
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -160,9 +178,6 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
-	PackedAncillary,
-	Layer,
-	SampleId,
 	BaryCoordSmooth,
 	BaryCoordNoPerspective,
 	WorkgroupId,
@@ -181,8 +196,7 @@ enum class StageOutputKind {
 	PointSize,
 	ClipDistance,
 	CullDistance,
-	Layer,
-	ViewportIndex
+	Layer
 };
 
 struct PositionExportComponent {
@@ -257,8 +271,8 @@ struct StageOutput {
 
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
-inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t FirstStorageImageBinding    = FirstComparisonImageBinding + 7u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -271,12 +285,11 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -319,7 +332,16 @@ DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledSintBinding  = 15u;
 	constexpr uint32_t StorageFloatBinding = FirstStorageImageBinding;
 	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 5u;
-	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 5u;
+	constexpr uint32_t StorageSintBinding  = StorageUintBinding + 5u;
+	constexpr uint32_t AtomicUintBinding   = StorageSintBinding + 5u;
+
+	// One descriptor variable must not mix ordinary image reads and Dref
+	// accesses: static descriptor validation combines its image operations.
+	if (image.depth_compare &&
+	    (image.resource_class != ImageResourceClass::Sampled ||
+	     image.numeric_class != Prospero::TextureNumericClass::Float)) {
+		return std::nullopt;
+	}
 
 	uint32_t base    = 0;
 	bool     sampled = false;
@@ -337,9 +359,6 @@ DescriptorBindingForImage(const ImageResource& image) {
 			case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
 			default: return std::nullopt;
 		}
-		if (image.depth_compare && image.numeric_class != Prospero::TextureNumericClass::Float) {
-			return std::nullopt;
-		}
 	} else if (image.resource_class == ImageResourceClass::Storage) {
 		if (image.atomic) {
 			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
@@ -350,7 +369,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 			switch (image.numeric_class) {
 				case Prospero::TextureNumericClass::Float: base = StorageFloatBinding; break;
 				case Prospero::TextureNumericClass::Uint: base = StorageUintBinding; break;
-				case Prospero::TextureNumericClass::Sint:
+				case Prospero::TextureNumericClass::Sint: base = StorageSintBinding; break;
 				case Prospero::TextureNumericClass::Unsupported: return std::nullopt;
 				default: return std::nullopt;
 			}
@@ -395,11 +414,12 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	uint32_t                       memory_limit_dword = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+		return memory_limit_dword + memory_offset_count;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -413,12 +433,46 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
-struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxImages       = 64;
-	static constexpr uint32_t MaxSamplers     = 32;
-	static constexpr uint32_t MaxSampledPairs = 64;
+struct BoundedSrtRead {
+	uint32_t address_source = 0;
+	uint32_t count_source   = 0;
+	uint32_t offset_scale   = 0;
+	uint32_t offset_bias    = 0;
+	// Kept separate from the wrapping U32 offset; scalar memory sign-extends this field.
+	uint32_t memory_offset = 0;
+	// UINT32_MAX selects count_source; otherwise count_source must be UINT32_MAX
+	// and the axis is bounded by the current guest dispatch supplied at materialization.
+	uint32_t workgroup_axis = UINT32_MAX;
+	// A signed loop guard executes only for positive int32 counts. Materialization
+	// clamps zero and negative runtime values to the loop's zero-iteration case.
+	bool count_signed = false;
+	bool operator==(const BoundedSrtRead&) const = default;
+};
 
+struct BoundedSrtLayout {
+	uint32_t count       = 0;
+	uint32_t flat_offset = 0;
+	bool operator==(const BoundedSrtLayout&) const = default;
+};
+
+struct BufferTableLayout {
+	uint32_t count               = 0;
+	uint32_t mapping_flat_offset = 0;
+	// Unique absolute dense buffer IDs. The flat mapping also contains absolute IDs.
+	std::vector<uint32_t> resources;
+	bool operator==(const BufferTableLayout&) const = default;
+};
+
+struct ShaderInfo {
+	// Bound compiler work independently of the host device. Final descriptor layouts
+	// must also fit the Vulkan device limits after resource specialization.
+	static constexpr uint32_t MaxBuffers      = 128;
+	static constexpr uint32_t MaxImages       = 512;
+	static constexpr uint32_t MaxSamplers     = 128;
+	static constexpr uint32_t MaxSampledPairs = 512;
+
+	std::vector<BoundedSrtLayout>     bounded_srt_reads;
+	std::vector<BufferTableLayout>    buffer_tables;
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
@@ -430,6 +484,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool                             writes_dma         = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -444,6 +499,7 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	bool shared_int64_atomics         = false;
 };
 
 struct BlockInfo {
@@ -456,6 +512,78 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
+	struct BoundedBuffer {
+		struct CandidateDword {
+			uint32_t value = 0;
+			bool immediate = true;
+
+			bool operator==(const CandidateDword&) const = default;
+		};
+
+		std::array<uint32_t, 4> reads {};
+		// Direct tables use one correlated read per descriptor DWORD. Expression tables
+		// evaluate the descriptor value graph once for every bounded selector candidate.
+		std::vector<uint32_t> dependencies;
+		// Wave-uniform control flow may choose one of a finite set of complete descriptors.
+		// The live shader key selects the corresponding pre-materialized table row.
+		std::vector<std::array<CandidateDword, 4>> wave_candidates;
+		uint32_t selector_group = UINT32_MAX;
+		uint32_t key_arg = 0;
+		bool expression = false;
+		bool wave_uniform = false;
+		bool operator==(const BoundedBuffer&) const = default;
+	};
+
+	struct BoundedImage {
+		struct CandidateDword {
+			uint32_t value = 0;
+			bool immediate = true;
+
+			bool operator==(const CandidateDword&) const = default;
+		};
+
+		std::array<uint32_t, 8> reads {};
+		std::vector<uint32_t> dependencies;
+		std::vector<std::array<CandidateDword, 8>> wave_candidates;
+		uint32_t selector_group = UINT32_MAX;
+		uint32_t key_arg = 0;
+		bool expression = false;
+		bool wave_uniform = false;
+		bool operator==(const BoundedImage&) const = default;
+	};
+
+	struct BoundedSampler {
+		std::vector<uint32_t> dependencies;
+		uint32_t selector_group = UINT32_MAX;
+		uint32_t key_arg = 0;
+		bool operator==(const BoundedSampler&) const = default;
+	};
+
+	struct InlineDescriptor {
+		struct ImageTable {
+			uint32_t address_source = 0;
+			uint32_t table_offset   = 0;
+			uint32_t index_shift    = 0;
+			uint32_t index_mask     = 0;
+
+			bool operator==(const ImageTable& other) const = default;
+		};
+
+		uint32_t buffer_source     = 0;
+		uint32_t selector_stride   = 0;
+		uint32_t descriptor_offset = 0;
+		uint32_t key_arg           = 0;
+		std::optional<ImageTable> image_table;
+		// Direct inline descriptors read four compact/sampler words or eight image words.
+		// ImageTable retains its separate packed selector and eight-word table-entry format.
+		uint32_t descriptor_dwords = 4;
+		// Exclusive selector bound proven by a dominating unsigned CFG guard. Zero means
+		// unknown, so materialization retains the conservative wrapped-U32 domain.
+		uint32_t selector_limit = 0;
+
+		bool operator==(const InlineDescriptor& other) const = default;
+	};
+
 	struct IndirectImage {
 		uint32_t material_source = 0;
 		uint32_t heap_source     = 0;
@@ -469,6 +597,10 @@ struct DescriptorSource {
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectImage> indirect_image;
+	std::optional<InlineDescriptor> inline_descriptor;
+	std::optional<BoundedBuffer> bounded_buffer;
+	std::optional<BoundedImage> bounded_image;
+	std::optional<BoundedSampler> bounded_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -480,13 +612,6 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
-struct ResourceBlock {
-	// Conditional successors are ordered true, false; an empty condition follows every edge.
-	Value                 condition;
-	std::vector<uint32_t> successors;
-	std::vector<uint32_t> sources;
-};
-
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -495,19 +620,22 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
+	// Retained after CFG disposal; only a compiler-verified wave split may set this.
+	uint32_t                      compute_wave_partition_factor = 1;
+	bool                          compute_cooperative_wave64 = false;
 	uint32_t                      param_export_mask   = 0;
+	bool                          bounded_srt_reads_precede_writes = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
 
-struct UniformFillPlan {
-	UniformFill          fill;
-	std::array<Value, 4> values;
-};
-
-// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
-// uniform condition and fill values without retaining translated blocks.
+// Immutable runtime resource analysis retained by the shader cache. It owns only the native
+// value graph reachable from descriptors/SRT reads, rather than the translated shader CFG.
 struct ResourcePlan {
+	static constexpr uint8_t FlatSlotOrdinary = 0u;
+	static constexpr uint8_t FlatSlotClean = 1u;
+	static constexpr uint8_t FlatSlotDeferred = 2u;
+
 	ResourcePlan() = default;
 	~ResourcePlan();
 
@@ -523,15 +651,17 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
-	std::vector<ResourceBlock>          control_flow;
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<BoundedSrtRead>          bounded_srt_reads;
+	// Per-slot evaluation mode. Deferred slots are owned by bounded descriptor
+	// expressions and are evaluated separately for each proved selector candidate.
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
+	bool                                bounded_srt_reads_precede_writes = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
-	UniformFillPlan                     uniform_fill;
 };
 
 struct Program: ResourcePlan {
@@ -548,6 +678,10 @@ struct Program: ResourcePlan {
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
+	// Set from decoded instructions before MODE writes become control NOPs.
+	bool                          fp_mode_inspected = false;
+	bool                          writes_fp_mode = false;
+	uint32_t                      first_fp_mode_write_pc = UINT32_MAX;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;

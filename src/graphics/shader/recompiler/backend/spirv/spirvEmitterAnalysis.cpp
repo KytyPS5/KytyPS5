@@ -6,6 +6,13 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t PixelParameterMappedLocation(const EmitterState& state, uint32_t attr) {
+	if (state.stage != ShaderType::Pixel) {
+		return attr;
+	}
+	return ShaderPixelParameterMappedLocation(*state.input_info.pixel, attr);
+}
+
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
 	std::array<uint32_t, 32> active_inputs {};
 	uint32_t                 active_count = 0;
@@ -31,9 +38,9 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 }
 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind,
-               uint32_t index) {
-	return std::any_of(outputs.begin(), outputs.end(), [kind, index](const OutputBinding& binding) {
-		return binding.kind == kind && binding.index == index;
+               uint32_t index, uint32_t location) {
+	return std::any_of(outputs.begin(), outputs.end(), [=](const OutputBinding& binding) {
+		return binding.kind == kind && binding.index == index && binding.location == location;
 	});
 }
 
@@ -43,7 +50,7 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 		                        input.debug_name, input.per_vertex});
 	}
 	for (const auto& output: program.info.outputs) {
-		if (HasOutput(state.outputs, output.kind, output.index)) {
+		if (HasOutput(state.outputs, output.kind, output.index, output.location)) {
 			continue;
 		}
 		state.outputs.push_back({output.kind, output.index, output.location, 0, output.debug_name});
@@ -139,8 +146,7 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT_IF(image.atomic);
 		sampled = 1;
 	} else if (image.resource_class == IR::ImageResourceClass::Storage) {
-		EXIT_IF(image.numeric_class == Prospero::TextureNumericClass::Sint ||
-		        image.numeric_class == Prospero::TextureNumericClass::Unsupported);
+		EXIT_IF(image.numeric_class == Prospero::TextureNumericClass::Unsupported);
 		sampled = 2;
 		if (image.atomic) {
 			EXIT_IF(image.numeric_class != Prospero::TextureNumericClass::Uint);
@@ -150,9 +156,12 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
+	// Vulkan determines comparison behavior from the sampling instruction.
+	// Preserve the known depth role in the type as well; binding isolation is
+	// provided separately by DescriptorBindingForImage.
+	const uint32_t depth = image.depth_compare ? 1u : 0u;
 	return state.builder.Type(OpTypeImage,
-	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension,
-	                           image.depth_compare ? 1u : 0u,
+	                          {ImageScalarType(state, image.numeric_class), info.spirv_dimension, depth,
 	                           info.arrayed, info.multisampled, sampled, format});
 }
 
@@ -196,8 +205,41 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 	return sampler_id;
 }
 
+static bool RequiresPointSampler(const IR::ImageResource& image) {
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
+	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	       image.conversion_format != Prospero::BufferFormat::kInvalid;
+}
+
+static uint32_t CompatibleSamplerForImage(const EmitterState& state, uint32_t resource,
+                                          uint32_t sampler) {
+	const auto& image = state.program.info.images.at(resource);
+	if (!RequiresPointSampler(image)) {
+		return sampler;
+	}
+	const auto& samplers = state.program.info.samplers;
+	EXIT_IF(sampler >= samplers.size());
+	const auto& base = samplers[sampler];
+	if (base.force_point_filtering) {
+		return sampler;
+	}
+	for (const auto& pair: state.program.info.sampled_pairs) {
+		if (pair.image >= state.program.info.images.size() || pair.image != resource ||
+		    pair.sampler >= samplers.size()) {
+			continue;
+		}
+		const auto& candidate = samplers[pair.sampler];
+		if (candidate.force_point_filtering && candidate.source == base.source &&
+		    candidate.depth_compare_func == base.depth_compare_func) {
+			return pair.sampler;
+		}
+	}
+	EXIT("point-only sampled image has no compatible sampler variant");
+}
+
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler) {
 	const auto& image_resource = state.program.info.images.at(resource);
+	sampler                    = CompatibleSamplerForImage(state, resource, sampler);
 	const auto  image          = LoadSampledImageDescriptor(state, resource);
 	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
 	const auto  sampled_image = state.builder.AllocateId();
@@ -272,7 +314,6 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return ExecutionModelVertex;
-		case ShaderType::Mesh: return 5365u; // MeshEXT
 		case ShaderType::Pixel: return ExecutionModelFragment;
 		default: return ExecutionModelGLCompute;
 	}

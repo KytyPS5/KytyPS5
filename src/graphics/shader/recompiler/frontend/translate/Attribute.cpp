@@ -1,5 +1,4 @@
 #include "common/assert.h"
-#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
@@ -48,27 +47,10 @@ IR::ExportFlags Translator::AddExportInfo(const Decoder::Instruction& inst) {
 }
 
 void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
-                                        uint32_t component_count,
-                                        const ShaderBufferResource& resource) {
-	const auto format = Format::GetFormatInfo(resource.Format());
+                                        uint32_t component_count) {
 	for (uint32_t component = 0; component < component_count; component++) {
-		auto source = Format::FormattedSource {Format::FormattedSourceKind::Memory, component};
-		if (inst.formatted && !inst.typed) {
-			source = Format::ResolveFormattedSource(
-			    format, GetDstSel(resource.DstSelXYZW(), component));
-			if (source.kind == Format::FormattedSourceKind::Invalid) {
-				EXIT("invalid formatted vertex input %u at pc 0x%08x", attribute, inst.pc);
-			}
-		}
-		IR::Value value;
-		if (source.kind == Format::FormattedSourceKind::Memory) {
-			value = ir.Emit(IR::ValueOpcode::GetAttribute,
-			                {IR::Value(attribute), IR::Value(source.component)});
-			auto& required = program.info.vertex_fetch_components[attribute];
-			required = static_cast<uint8_t>(std::max<uint32_t>(required, source.component + 1u));
-		} else {
-			value = IR::Value(Format::FormattedConstantBits(format, source.kind));
-		}
+		const auto value =
+		    ir.Emit(IR::ValueOpcode::GetAttribute, {IR::Value(attribute), IR::Value(component)});
 		WriteOperand(OffsetOperand(inst.dst, component), value);
 	}
 }

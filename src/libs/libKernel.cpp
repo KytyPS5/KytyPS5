@@ -2112,33 +2112,6 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
-                           void* uaddr, const void* timeout) {
-	constexpr int UMTX_OP_WAIT = 2;
-	constexpr int UMTX_OP_WAKE = 3;
-
-	EXIT_NOT_IMPLEMENTED(uaddr != nullptr);
-
-	switch (operation) {
-		case UMTX_OP_WAIT:
-			if (timeout != nullptr) {
-				LibKernel::KernelTimespec duration {};
-				std::memcpy(&duration, timeout, sizeof(duration));
-				if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
-					*GetErrorAddr() = POSIX_EINVAL;
-					return -1;
-				}
-				EXIT("Valid _umtx_op timed waits are not implemented\n");
-			}
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-			    static_cast<volatile uint64_t*>(address), value, nullptr,
-			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
-		case UMTX_OP_WAKE:
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
-		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);
-	}
-}
-
 LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("k+AXqu2-eBc", getpagesize);
 	LIB_FUNC("lLMT9vJAck0", clock_gettime);
@@ -3337,7 +3310,6 @@ static void AddLibkernelUnityFunc(Loader::SymbolDatabase* s, const char* nid, ui
 }
 
 LIB_DEFINE(InitLibKernel_1) {
-	LIB_FUNC("04AjkP0jO9U", Posix::UmtxOp);
 	InitLibKernel_1_FS(s);
 	InitLibKernel_1_Mem(s);
 	InitLibKernel_1_Equeue(s);

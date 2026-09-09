@@ -20,6 +20,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -30,8 +31,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <mutex>
+#include <nlohmann/json.hpp>
+#include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -618,6 +623,243 @@ static void patch_shader_register_address(ShaderRegister* regs, uint32_t num_reg
 	hi->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
 }
 
+// Registration capture precedes draw-time compilation, so one unsupported shader does not hide
+// other already-registered programs from an offline audit. These files contain guest code and
+// value metadata only; relocated header pointers and live resource contents are never serialized.
+template <typename T>
+static bool read_shader_capture_array(const T* source, uint32_t count, std::vector<T>& values) {
+	constexpr uint64_t max_capture_bytes = 64u * 1024u * 1024u;
+	const auto bytes = static_cast<uint64_t>(count) * sizeof(T);
+	if (bytes > max_capture_bytes || (count != 0u && source == nullptr)) {
+		return false;
+	}
+	values.resize(count);
+	return count == 0u || LibKernel::Memory::TryReadBacking(
+	                          reinterpret_cast<uint64_t>(source), values.data(), bytes);
+}
+
+static nlohmann::json shader_capture_register(const ShaderRegister& reg) {
+	return {{"offset", reg.offset}, {"value", reg.value}};
+}
+
+static nlohmann::json shader_capture_semantic(const ShaderSemantic& value) {
+	return {
+	    {"semantic", static_cast<uint32_t>(value.semantic)},
+	    {"hardware_mapping", static_cast<uint32_t>(value.hardware_mapping)},
+	    {"size_in_elements", static_cast<uint32_t>(value.size_in_elements)},
+	    {"is_f16", static_cast<uint32_t>(value.is_f16)},
+	    {"is_flat_shaded", static_cast<uint32_t>(value.is_flat_shaded)},
+	    {"is_linear", static_cast<uint32_t>(value.is_linear)},
+	    {"is_custom", static_cast<uint32_t>(value.is_custom)},
+	    {"static_vb_index", static_cast<uint32_t>(value.static_vb_index)},
+	    {"static_attribute", static_cast<uint32_t>(value.static_attribute)},
+	    {"reserved", static_cast<uint32_t>(value.reserved)},
+	    {"default_value", static_cast<uint32_t>(value.default_value)},
+	    {"default_value_hi", static_cast<uint32_t>(value.default_value_hi)},
+	};
+}
+
+static bool write_shader_capture_file(const std::filesystem::path& path, const void* data,
+                                      uint32_t size) {
+	// A final content-addressed file was already published in full by an earlier registration.
+	if (Common::File::IsFileExisting(path)) {
+		return Common::File::Size(path) == size;
+	}
+	auto temporary = path;
+	temporary += ".tmp";
+	Common::File file(temporary);
+	if (file.IsInvalid()) {
+		return false;
+	}
+	uint32_t written = 0;
+	file.Write(data, size, &written);
+	const bool complete = written == size && file.Flush();
+	file.Close();
+	std::error_code error;
+	if (complete) {
+		std::filesystem::rename(temporary, path, error);
+	}
+	if (!complete || error) {
+		std::filesystem::remove(temporary, error);
+		return false;
+	}
+	return true;
+}
+
+static void capture_registered_shader(const Shader& shader) {
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
+	static std::mutex capture_mutex;
+	static std::unordered_set<std::string> captured;
+	static uint64_t registrations = 0;
+	const std::scoped_lock lock(capture_mutex);
+	registrations++;
+	try {
+		constexpr std::array stages {"cs", "ps", "gs", "hs", "gs_front", "hs_front",
+		                             "gs_back", "hs_back", "fs"};
+		const auto* stage = shader.type < stages.size() ? stages[shader.type] : "unknown";
+		const auto fail = [&](const char* reason) {
+			LOGF("shader registration capture failed: registration=%" PRIu64
+			     " type=%u size=%u reason=%s\n", registrations,
+			     static_cast<unsigned>(shader.type), shader.shader_size, reason);
+		};
+		std::vector<uint32_t> code;
+		if (shader.shader_size == 0u || shader.shader_size % sizeof(uint32_t) != 0u ||
+		    !read_shader_capture_array(
+		        static_cast<const uint32_t*>(const_cast<const void*>(shader.code)),
+		        shader.shader_size / sizeof(uint32_t), code)) {
+			fail("shader code is unavailable or has an invalid size");
+			return;
+		}
+		std::vector<ShaderRegister> cx_registers;
+		std::vector<ShaderRegister> sh_registers;
+		std::vector<ShaderSemantic> input_semantics;
+		std::vector<ShaderSemantic> output_semantics;
+		if (!read_shader_capture_array(shader.cx_registers, shader.num_cx_registers, cx_registers) ||
+		    !read_shader_capture_array(shader.sh_registers, shader.num_sh_registers, sh_registers) ||
+		    !read_shader_capture_array(shader.input_semantics, shader.num_input_semantics,
+		                               input_semantics) ||
+		    !read_shader_capture_array(shader.output_semantics, shader.num_output_semantics,
+		                               output_semantics)) {
+			fail("register or semantic metadata is unavailable");
+			return;
+		}
+		using Json = nlohmann::json;
+		Json metadata = {
+		    {"schema_version", 1u}, {"stage", stage}, {"binary_type", shader.type},
+		    {"file_header", shader.file_header}, {"version", shader.version},
+		    {"header_size", shader.header_size}, {"shader_size_bytes", shader.shader_size},
+		    {"embedded_constant_buffer_size_dqw", shader.embedded_constant_buffer_size_dqw},
+		    {"target", shader.target}, {"scratch_size_dwords", shader.scratch_size_dw_per_thread},
+		    {"special_sizes_bytes", shader.special_sizes_bytes},
+		    {"register_address_encoding", "shader_relative"},
+		    {"runtime_resources_captured", false},
+		    {"num_cx_registers", shader.num_cx_registers},
+		    {"num_sh_registers", shader.num_sh_registers},
+		    {"num_input_semantics", shader.num_input_semantics},
+		    {"num_output_semantics", shader.num_output_semantics},
+		    {"cx_registers", Json::array()}, {"sh_registers", Json::array()},
+		    {"input_semantics", Json::array()}, {"output_semantics", Json::array()},
+		    {"user_data", nullptr}, {"specials", nullptr},
+		};
+		for (const auto& value: cx_registers) {
+			metadata["cx_registers"].push_back(shader_capture_register(value));
+		}
+		for (const auto& value: sh_registers) {
+			metadata["sh_registers"].push_back(shader_capture_register(value));
+		}
+		for (const auto& value: input_semantics) {
+			metadata["input_semantics"].push_back(shader_capture_semantic(value));
+		}
+		for (const auto& value: output_semantics) {
+			metadata["output_semantics"].push_back(shader_capture_semantic(value));
+		}
+		if (shader.user_data != nullptr) {
+			std::vector<ShaderUserData> users;
+			std::vector<uint16_t> direct;
+			if (!read_shader_capture_array(shader.user_data, 1u, users) ||
+			    !read_shader_capture_array(users[0].direct_resource_offset,
+			                               users[0].direct_resource_count, direct)) {
+				fail("user-data metadata is unavailable");
+				return;
+			}
+			const auto& user = users[0];
+			Json data = {
+			    {"eud_size_dw", user.eud_size_dw}, {"srt_size_dw", user.srt_size_dw},
+			    {"direct_resource_count", user.direct_resource_count},
+			    {"direct_resource_offsets", direct},
+			    {"sharp_resource_counts", user.sharp_resource_count},
+			    {"sharp_resource_offsets", Json::array()},
+			};
+			for (uint32_t kind = 0; kind < 4u; kind++) {
+				std::vector<ShaderSharp> sharps;
+				if (!read_shader_capture_array(user.sharp_resource_offset[kind],
+				                               user.sharp_resource_count[kind], sharps)) {
+					fail("sharp resource metadata is unavailable");
+					return;
+				}
+				auto offsets = Json::array();
+				for (const auto& sharp: sharps) {
+					offsets.push_back({{"offset_dw", static_cast<uint32_t>(sharp.offset_dw)},
+					                   {"size", static_cast<uint32_t>(sharp.size)}});
+				}
+				data["sharp_resource_offsets"].push_back(std::move(offsets));
+			}
+			metadata["user_data"] = std::move(data);
+		}
+		if (shader.specials != nullptr) {
+			std::vector<ShaderSpecialRegs> values;
+			if (!read_shader_capture_array(shader.specials, 1u, values)) {
+				fail("special register metadata is unavailable");
+				return;
+			}
+			const auto& value = values[0];
+			const auto& draw = value.draw_modifier;
+			metadata["specials"] = {
+			    {"ge_cntl", shader_capture_register(value.ge_cntl)},
+			    {"vgt_shader_stages_en", shader_capture_register(value.vgt_shader_stages_en)},
+			    {"vgt_gs_out_prim_type", shader_capture_register(value.vgt_gs_out_prim_type)},
+			    {"ge_user_vgpr_en", shader_capture_register(value.ge_user_vgpr_en)},
+			    {"dispatch_modifier", value.dispatch_modifier},
+			    {"user_data_range", {{"start", value.user_data_range.start},
+			                          {"end", value.user_data_range.end}}},
+			    {"draw_modifier", {
+			        {"enbl_start_vertex_offset", static_cast<uint32_t>(draw.enbl_start_vertex_offset)},
+			        {"enbl_start_index_offset", static_cast<uint32_t>(draw.enbl_start_index_offset)},
+			        {"enbl_start_instance_offset", static_cast<uint32_t>(draw.enbl_start_instance_offset)},
+			        {"enbl_draw_index", static_cast<uint32_t>(draw.enbl_draw_index)},
+			        {"enbl_user_vgprs", static_cast<uint32_t>(draw.enbl_user_vgprs)},
+			        {"render_target_slice_offset", static_cast<uint32_t>(draw.render_target_slice_offset)},
+			        {"fuse_draws", static_cast<uint32_t>(draw.fuse_draws)},
+			        {"compiler_flags", static_cast<uint32_t>(draw.compiler_flags)},
+			        {"is_default", static_cast<uint32_t>(draw.is_default)},
+			        {"reserved", static_cast<uint32_t>(draw.reserved)},
+			    }},
+			};
+		}
+		const auto content_hash = XXH3_64bits(code.data(), shader.shader_size);
+		uint64_t declared_hash = 0;
+		if (code.size() >= 2u && code[0] == 0xBEEB03FFu) {
+			// ShaderBinaryInfo occupies seven dwords; its two hash words are at offsets 4/5.
+			const auto info_word = (static_cast<uint64_t>(code[1]) + 1u) * 2u;
+			if (info_word <= code.size() && code.size() - info_word >= 7u) {
+				declared_hash = code[info_word + 4u] |
+				                (static_cast<uint64_t>(code[info_word + 5u]) << 32u);
+			}
+		}
+		const auto metadata_values = metadata.dump();
+		const auto metadata_hash = XXH3_64bits(metadata_values.data(), metadata_values.size());
+		const auto stem = fmt::format("{}_{:016x}_{:016x}", stage, content_hash, metadata_hash);
+		const auto folder = Config::GetShaderLogFolder() / "registered";
+		const auto identity = Common::PathToGenericString(folder / stem);
+		if (captured.contains(identity)) {
+			return;
+		}
+		metadata["content_hash_xxh3_64"] = fmt::format("{:016x}", content_hash);
+		metadata["metadata_hash_xxh3_64"] = fmt::format("{:016x}", metadata_hash);
+		metadata["declared_hash"] = fmt::format("{:016x}", declared_hash);
+		metadata["effective_hash"] = fmt::format("{:016x}", declared_hash != 0u ? declared_hash : content_hash);
+		metadata["code_file"] = stem + ".bin";
+		const auto json = metadata.dump(2) + "\n";
+		if (!Common::File::CreateDirectories(folder) ||
+		    !write_shader_capture_file(folder / (stem + ".bin"), code.data(), shader.shader_size) ||
+		    !write_shader_capture_file(folder / (stem + ".json"), json.data(),
+		                               static_cast<uint32_t>(json.size()))) {
+			fail("capture file could not be published");
+			return;
+		}
+		captured.insert(identity);
+		LOGF("shader registration capture: registration=%" PRIu64
+		     " unique=%zu stage=%s hash=%016" PRIx64 " bytes=%u file=%s\n",
+		     registrations, captured.size(), stage, declared_hash != 0u ? declared_hash : content_hash,
+		     shader.shader_size, stem.c_str());
+	} catch (const std::exception& error) {
+		LOGF("shader registration capture failed: registration=%" PRIu64 " reason=%s\n",
+		     registrations, error.what());
+	}
+}
+
 int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile void* code) {
 	PRINT_NAME();
 
@@ -657,12 +899,13 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	EXIT_NOT_IMPLEMENTED(h->file_header != 0x34333231);
 	EXIT_NOT_IMPLEMENTED(h->version != 0x00000018);
 
+	capture_registered_shader(*h);
+
 	auto base = reinterpret_cast<uint64_t>(code);
 
 	LOGF("\t base   = 0x%016" PRIx64 "\n", base);
 
 	ShaderMappedData map;
-	map.type                = static_cast<Prospero::ShaderBinaryType>(h->type);
 	map.user_data           = h->user_data;
 	map.input_semantics     = h->input_semantics;
 	map.num_input_semantics = h->num_input_semantics;
@@ -715,19 +958,10 @@ int KYTY_SYSV_ABI AgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* fro
 	return OK;
 }
 
-static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderRegister* src,
-                                            uint32_t shift, uint32_t mask) {
-	const auto dst_field = (dst->value >> shift) & mask;
-	const auto src_field = (src->value >> shift) & mask;
-	const auto field     = std::max(dst_field, src_field);
+int KYTY_SYSV_ABI AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
+                                             const Shader* back, void* scratch_mem) {
+	PRINT_NAME();
 
-	dst->value &= ~(mask << shift);
-	dst->value |= field << shift;
-}
-
-static int fuse_shader_halves(Shader* fused_result, const Shader* front,
-                              const Shader* back, void* scratch_mem,
-                              bool recompute_shared_vgprs) {
 	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
 	     "\t front        = 0x%016" PRIx64 "\n"
 	     "\t back         = 0x%016" PRIx64 "\n"
@@ -738,6 +972,84 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	EXIT_NOT_IMPLEMENTED(fused_result == nullptr);
 	EXIT_NOT_IMPLEMENTED(front == nullptr);
 	EXIT_NOT_IMPLEMENTED(back == nullptr);
+
+	const auto front_type = static_cast<Prospero::ShaderBinaryType>(front->type);
+	const auto back_type  = static_cast<Prospero::ShaderBinaryType>(back->type);
+	if (!((front_type == Prospero::ShaderBinaryType::kGsFront &&
+	       back_type == Prospero::ShaderBinaryType::kGsBack) ||
+	      (front_type == Prospero::ShaderBinaryType::kHsFront &&
+	       back_type == Prospero::ShaderBinaryType::kHsBack))) {
+		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+	}
+
+	*fused_result      = *back;
+	fused_result->type = static_cast<uint8_t>(front_type == Prospero::ShaderBinaryType::kGsFront
+	                                              ? Prospero::ShaderBinaryType::kGs
+	                                              : Prospero::ShaderBinaryType::kHs);
+
+	if (front->specials != nullptr && back->specials != nullptr) {
+		const auto front_stages = front->specials->vgt_shader_stages_en.value;
+		const auto back_stages  = back->specials->vgt_shader_stages_en.value;
+		const auto mismatch_bit =
+		    (front_type == Prospero::ShaderBinaryType::kGsFront ? (1u << 22u) : (1u << 21u));
+		if (((front_stages ^ back_stages) & mismatch_bit) != 0) {
+			return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+		}
+	}
+
+	if (scratch_mem != nullptr && back->sh_registers != nullptr && back->num_sh_registers != 0) {
+		auto* sh_registers = static_cast<ShaderRegister*>(scratch_mem);
+		memcpy(sh_registers, back->sh_registers,
+		       static_cast<size_t>(back->num_sh_registers) * sizeof(ShaderRegister));
+		fused_result->sh_registers = sh_registers;
+	}
+
+	auto*      fused_regs      = fused_result->sh_registers;
+	const auto fused_reg_count = static_cast<uint32_t>(fused_result->num_sh_registers);
+	const auto front_reg_count = static_cast<uint32_t>(front->num_sh_registers);
+
+	if (front_type == Prospero::ShaderBinaryType::kGsFront) {
+		for (uint32_t occurrence = 0; occurrence < 2; occurrence++) {
+			auto*       dst = find_shader_register(fused_regs, fused_reg_count,
+			                                       Pm4::SPI_SHADER_PGM_CHKSUM_GS, occurrence);
+			const auto* src = find_shader_register(front->sh_registers, front_reg_count,
+			                                       Pm4::SPI_SHADER_PGM_CHKSUM_GS, occurrence);
+			if (dst != nullptr && src != nullptr) {
+				dst->value = src->value;
+			}
+		}
+		patch_shader_register_address(fused_regs, fused_reg_count, Pm4::SPI_SHADER_PGM_LO_ES,
+		                              reinterpret_cast<uint64_t>(front->code));
+	} else {
+		patch_shader_register_address(fused_regs, fused_reg_count, Pm4::SPI_SHADER_PGM_LO_LS,
+		                              reinterpret_cast<uint64_t>(front->code));
+	}
+
+	fused_result->user_data = nullptr;
+
+	return OK;
+}
+
+static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderRegister* src,
+                                            uint32_t shift, uint32_t mask) {
+	const auto dst_field = (dst->value >> shift) & mask;
+	const auto src_field = (src->value >> shift) & mask;
+	const auto field     = std::max(dst_field, src_field);
+
+	dst->value &= ~(mask << shift);
+	dst->value |= field << shift;
+}
+
+int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
+                                        const Shader* back, void* scratch_mem) {
+	PRINT_NAME();
+
+	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
+	     "\t front        = 0x%016" PRIx64 "\n"
+	     "\t back         = 0x%016" PRIx64 "\n"
+	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
+	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
 
 	const auto front_type = static_cast<Prospero::ShaderBinaryType>(front->type);
 	const auto is_gs      = front_type == Prospero::ShaderBinaryType::kGsFront;
@@ -771,12 +1083,14 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	const auto front_reg_count = static_cast<uint32_t>(front->num_sh_registers);
 	const auto checksum_offset =
 	    is_gs ? Pm4::SPI_SHADER_PGM_CHKSUM_GS : Pm4::SPI_SHADER_PGM_CHKSUM_HS;
-	for (uint32_t occurrence = 0; occurrence < 2; occurrence++) {
-		const auto* src = find_shader_register(front->sh_registers, front_reg_count,
-		                                       checksum_offset, occurrence);
-		auto* dst = find_shader_register(fused_regs, fused_reg_count, checksum_offset, occurrence);
-		dst->value = src->value;
-	}
+	const auto* front_checksum0 =
+	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 0);
+	const auto* front_checksum1 =
+	    find_shader_register(front->sh_registers, front_reg_count, checksum_offset, 1);
+	auto* fused_checksum0  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 0);
+	auto* fused_checksum1  = find_shader_register(fused_regs, fused_reg_count, checksum_offset, 1);
+	fused_checksum0->value = front_checksum0->value;
+	fused_checksum1->value = front_checksum1->value;
 
 	const auto  rsrc1_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC1_GS : Pm4::SPI_SHADER_PGM_RSRC1_HS;
 	const auto  rsrc2_offset = is_gs ? Pm4::SPI_SHADER_PGM_RSRC2_GS : Pm4::SPI_SHADER_PGM_RSRC2_HS;
@@ -787,49 +1101,31 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	auto* fused_rsrc1 = find_shader_register(fused_regs, fused_reg_count, rsrc1_offset);
 	auto* fused_rsrc2 = find_shader_register(fused_regs, fused_reg_count, rsrc2_offset);
 
-	if (recompute_shared_vgprs) {
-		const auto front_vgprs = ((front_rsrc1->value & 0x3fu) + 1u) * 4u;
-		const auto back_vgprs  = ((fused_rsrc1->value & 0x3fu) + 1u) * 4u;
-		const auto front_total = front_vgprs + (front_rsrc2->value >> 28u) * 8u;
-		const auto back_total  = back_vgprs + (fused_rsrc2->value >> 28u) * 8u;
-		const auto max_total   = std::max(front_total, back_total);
-		// sceAgcFuseShaderHalves reallocates shared VGPRs; the older export takes the maximum.
-		const auto shared = std::max(front_vgprs, back_vgprs) >= max_total
-		                        ? 0u
-		                        : (max_total - std::min(front_total, back_total) + 7u) / 64u;
-		fused_rsrc2->value = (fused_rsrc2->value & 0x0fffffffu) | ((shared & 0xfu) << 28u);
-	} else {
-		merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 28, 0x0fu);
-	}
 	merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 0, 0x3fu);
+	merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 28, 0x0fu);
 	if (is_gs) {
 		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 29, 0x03u);
 		merge_shader_register_max_field(fused_rsrc2, front_rsrc2, 16, 0x03u);
 		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
+		fused_rsrc2->value =
 		    (fused_rsrc2->value & 0xfffbffffu) | (front_rsrc2->value & 0x00040000u);
 	} else {
 		merge_shader_register_max_field(fused_rsrc1, front_rsrc1, 28, 0x03u);
+		fused_rsrc2->value =
+		    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
 	}
-	fused_rsrc2->value =
-	    (fused_rsrc2->value & 0xf7ffffc1u) | (front_rsrc2->value & 0x0800003eu);
 
-	patch_shader_register_address(fused_regs, fused_reg_count,
-	                              is_gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS,
-	                              reinterpret_cast<uint64_t>(front->code));
-	fused_result->user_data = recompute_shared_vgprs ? nullptr : front->user_data;
+	const auto program_lo_offset = is_gs ? Pm4::SPI_SHADER_PGM_LO_ES : Pm4::SPI_SHADER_PGM_LO_LS;
+	auto*      program_lo = find_shader_register(fused_regs, fused_reg_count, program_lo_offset);
+	const auto address    = reinterpret_cast<uint64_t>(front->code);
+	program_lo->value     = static_cast<uint32_t>(address >> 8u);
+	(program_lo + 1)->value &= 0xffffff00u;
+	(program_lo + 1)->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
+
+	fused_result->user_data = front->user_data;
+
 	return OK;
-}
-
-int KYTY_SYSV_ABI AgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* front,
-                                           const Shader* back, void* scratch_mem) {
-	PRINT_NAME();
-	return fuse_shader_halves(fused_result, front, back, scratch_mem, true);
-}
-
-int KYTY_SYSV_ABI AgcUnknownNApJjpKNBl4(Shader* fused_result, const Shader* front,
-                                      const Shader* back, void* scratch_mem) {
-	PRINT_NAME();
-	return fuse_shader_halves(fused_result, front, back, scratch_mem, false);
 }
 
 static constexpr int GRAPHICS5_ERROR_INVALID_PACKET = static_cast<int>(0x8a6c000cu);

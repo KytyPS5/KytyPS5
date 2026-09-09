@@ -1,10 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstdint>
-#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -194,9 +192,7 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
-void FoldInstruction(Block& block, Block::iterator instruction,
-                      std::unordered_set<Inst*>& lowered_ancillary) {
-	auto& inst = *instruction;
+void FoldInstruction(Inst& inst) {
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
@@ -227,29 +223,6 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			const auto value  = Arg(inst, 0);
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
-			auto* source = value.TryInstruction();
-			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
-			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
-			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
-				constexpr struct {
-					uint32_t       start;
-					uint32_t       end;
-					StageInputKind kind;
-				} fields[] = {{8u, 12u, StageInputKind::SampleId}, {16u, 27u, StageInputKind::Layer}};
-				for (const auto& field: fields) {
-					if (offset.U32() >= field.start && offset.U32() < field.end &&
-					    count.U32() <= field.end - offset.U32()) {
-						// Preserve extraction and sign extension while exposing only the used field.
-						const auto input = block.PrependNewInst(
-						    instruction, ValueOpcode::GetBuiltin,
-						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
-						inst.SetArg(0, Value(&*input));
-						inst.SetArg(1, Value(offset.U32() - field.start));
-						lowered_ancillary.insert(source);
-						return;
-					}
-				}
-			}
 			if (!IsImmediate(value, Type::U32) || !IsImmediate(offset, Type::U32) ||
 			    !IsImmediate(count, Type::U32) || offset.U32() > 32u ||
 			    count.U32() > 32u - offset.U32()) {
@@ -610,25 +583,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 } // namespace
 
 void ConstantPropagationPass(const BlockList& blocks) {
-	std::unordered_set<Inst*> lowered_ancillary;
 	for (auto* block: blocks) {
-		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			FoldInstruction(*block, inst, lowered_ancillary);
-		}
-	}
-	// Normalize retained PHI/select values only after every supported field read has
-	// been lowered; direct raw consumers remain unsupported.
-	for (auto* source: lowered_ancillary) {
-		const bool retained_only = std::ranges::all_of(source->Uses(), [](const Use& use) {
-			const auto& user = *use.user;
-			if (!user.HasUses() && !user.MayHaveSideEffects()) {
-				return true;
-			}
-			return user.GetOpcode() == ValueOpcode::Phi ||
-			       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u);
-		});
-		if (retained_only) {
-			Replace(*source, Value(0u));
+		for (auto& inst: block->Instructions()) {
+			FoldInstruction(inst);
 		}
 	}
 }

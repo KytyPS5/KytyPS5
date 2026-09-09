@@ -12,9 +12,7 @@ GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandSchedule
 GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	// The host reports the faulting byte, not the instruction's access width. Both caches
-	// resolve its page; guessing a width can cross the end of a valid guest mapping.
-	constexpr uint64_t fault_size = 1;
+	constexpr uint64_t fault_size = 8;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
@@ -49,6 +47,7 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
 	}
+	m_page_manager.OnGpuMap(vaddr, size);
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -65,6 +64,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_page_manager.OnGpuUnmap(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};

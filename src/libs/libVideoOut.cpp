@@ -47,4 +47,17 @@ LIB_DEFINE(InitVideoOut_1) {
 
 } // namespace LibGen5
 
+namespace LibVideoOutVrrStatus {
+
+LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+
+LIB_DEFINE(InitVideoOutVrrStatus_1) {
+	PRINT_NAME_ENABLE(true);
+
+	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutVrrStatusInitialize);
+	LIB_FUNC("gWT7X8H0bYs", VideoOut::VideoOutGetVrrStatus);
+}
+
+} // namespace LibVideoOutVrrStatus
+
 } // namespace Libs

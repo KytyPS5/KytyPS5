@@ -1826,6 +1826,29 @@ static bool SkipAdjacentModuleFile(const std::string& name) {
 	return lower == "eboot.bin" || lower == "libkernel.prx" || lower == "libkernel_sys.prx";
 }
 
+std::vector<std::filesystem::path> DiscoverAdjacentProgramFiles(
+    const std::filesystem::path& root) {
+	std::vector<std::filesystem::path> module_paths;
+
+	auto add_dir = [&module_paths](const std::filesystem::path& dir) {
+		if (!Common::File::IsDirectoryExisting(dir)) {
+			return;
+		}
+		for (const auto& entry: Common::File::GetDirEntries(dir)) {
+			if (entry.is_file && IsAdjacentModuleFile(entry.name) &&
+			    !SkipAdjacentModuleFile(entry.name)) {
+				module_paths.push_back(dir / entry.name);
+			}
+		}
+	};
+
+	add_dir(root);
+	add_dir(root / "sce_module");
+	add_dir(root / "sce_modules");
+	add_dir(root / "fakelib");
+	return module_paths;
+}
+
 void RuntimeLinker::PreloadAdjacentPrograms() {
 	if (m_programs.empty()) {
 		return;
@@ -1858,26 +1881,14 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 		module_paths.push_back(path);
 	};
 
-	auto add_dir = [&add_path](const std::filesystem::path& dir) {
-		if (!Common::File::IsDirectoryExisting(dir)) {
-			return;
-		}
-		for (const auto& entry: Common::File::GetDirEntries(dir)) {
-			if (entry.is_file && IsAdjacentModuleFile(entry.name) &&
-			    !SkipAdjacentModuleFile(entry.name)) {
-				add_path(dir / entry.name);
-			}
-		}
-	};
-
 	auto root = m_programs.at(0)->file_name.parent_path();
 	if (root.empty()) {
 		return;
 	}
 
-	add_dir(root);
-	add_dir(root / "sce_module");
-	add_dir(root / "sce_modules");
+	for (const auto& path: DiscoverAdjacentProgramFiles(root)) {
+		add_path(path);
+	}
 
 	for (const auto& path: module_paths) {
 		auto* program                        = LoadProgram(path);

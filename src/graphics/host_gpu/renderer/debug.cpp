@@ -17,6 +17,8 @@
 
 namespace Libs::Graphics {
 
+static std::atomic<uint32_t> g_scissor_default_log_count = 0;
+
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
 }
@@ -385,6 +387,79 @@ static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
 	     z.size.valid ? "true" : "false");
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
+                   const HW::RenderControl& rc) {
+	const bool depth_active = dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable ||
+	                          rc.depth_clear_enable || rc.copy_depth_to_color;
+	const bool stencil_active =
+	    dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color;
+	if (!depth_active && !stencil_active) {
+		return;
+	}
+
+	EXIT_NOT_IMPLEMENTED(rc.copy_depth_to_color || rc.copy_stencil_to_color);
+	EXIT_NOT_IMPLEMENTED(!z.z_info.HasValidTextureCompatibility());
+	EXIT_NOT_IMPLEMENTED(!z.stencil_info.HasValidTextureCompatibility());
+	if (z.z_info.format == Prospero::DepthFormat::kInvalid) {
+		EXIT_NOT_IMPLEMENTED(z.z_info.format != Prospero::DepthFormat::kInvalid);
+		EXIT_NOT_IMPLEMENTED(z.z_info.num_samples != 0);
+		EXIT_NOT_IMPLEMENTED(z.z_info.htile_acceleration != false);
+		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
+		EXIT_NOT_IMPLEMENTED(z.z_info.partially_resident != false);
+		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
+	} else {
+		EXIT_NOT_IMPLEMENTED(z.z_info.format != Prospero::DepthFormat::kZ16 &&
+		                     z.z_info.format != Prospero::DepthFormat::kZ32F);
+		if (z.z_info.num_samples != 0x00000000) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("DepthTarget: using native num_samples=0x%08" PRIx32 "\n",
+				     z.z_info.num_samples);
+				logged = true;
+			}
+		}
+		EXIT_NOT_IMPLEMENTED(z.z_info.expclear_enabled != false);
+		EXIT_NOT_IMPLEMENTED(z.z_info.partially_resident != false);
+		EXIT_NOT_IMPLEMENTED(z.z_info.max_mip_level != 0);
+	}
+
+	if (z.stencil_info.format == Prospero::StencilFormat::kInvalid) {
+		EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
+		EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
+	} else {
+		EXIT_NOT_IMPLEMENTED(z.stencil_info.format != Prospero::StencilFormat::k8UInt);
+		EXIT_NOT_IMPLEMENTED(z.stencil_info.expclear_enabled != false);
+		EXIT_NOT_IMPLEMENTED(z.stencil_info.partially_resident != false);
+	}
+
+	if (z.z_info.format != Prospero::DepthFormat::kInvalid ||
+	    z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
+		if (z.depth_view.current_mip_level != 0x00000000) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DepthTarget: temporary: ignoring PS5 current mip level=0x%08" PRIx32 "\n",
+				     z.depth_view.current_mip_level);
+			}
+		}
+		if (z.depth_view.depth_write_disable || z.depth_view.stencil_write_disable) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DepthTarget: honoring write disable depth=%s, stencil=%s\n",
+				     z.depth_view.depth_write_disable ? "true" : "false",
+				     z.depth_view.stencil_write_disable ? "true" : "false");
+			}
+		}
+		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable &&
+		                     z.z_read_base_addr != z.z_write_base_addr);
+		EXIT_NOT_IMPLEMENTED(!z.depth_view.stencil_write_disable &&
+		                     z.stencil_read_base_addr != z.stencil_write_base_addr);
+		EXIT_NOT_IMPLEMENTED(!z.depth_view.depth_write_disable && z.z_write_base_addr == 0);
+		// EXIT_NOT_IMPLEMENTED(z.htile_data_base_addr == 0);
+		EXIT_NOT_IMPLEMENTED(!z.size.valid);
+	}
+}
+
 static void ClipPrint(const char* func, const HW::ClipControl& c) {
 	LOGF("%s\n", func);
 
@@ -469,6 +544,16 @@ static void McCheck(const HW::ModeControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.cull_front != false);
 	// EXIT_NOT_IMPLEMENTED(c.cull_back != false);
 	// EXIT_NOT_IMPLEMENTED(c.face != false);
+	if (c.poly_mode != 0) {
+		static bool logged = false;
+		if (!logged) {
+			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.POLY_MODE is not fully implemented; continuing "
+			     "with filled polygons\n");
+			logged = true;
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype != 0 && c.polymode_front_ptype != 2);
+	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype != 0 && c.polymode_back_ptype != 2);
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {
@@ -478,6 +563,7 @@ static void McCheck(const HW::ModeControl& c) {
 			logged = true;
 		}
 	}
+	EXIT_NOT_IMPLEMENTED(c.provoking_vtx_last != false);
 	EXIT_NOT_IMPLEMENTED(c.persp_corr_dis != false);
 }
 
@@ -757,6 +843,15 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(smc.vport_scissor_enable);
 	EXIT_NOT_IMPLEMENTED(smc.line_stipple_enable);
 
+	if (vp.viewports[0].zmin > 0.000000 || vp.viewports[0].zmax != 1.000000) {
+		static bool logged = false;
+		if (!logged) {
+			LOGF("\t warning: non-default viewport depth clamp zmin = %f, zmax = %f; using "
+			     "viewport scale/offset for Vulkan depth range\n",
+			     vp.viewports[0].zmin, vp.viewports[0].zmax);
+			logged = true;
+		}
+	}
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xscale != 960.000000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xoffset != 960.000000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yscale != -540.000000);
@@ -776,7 +871,7 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_horz_clip - 33.133327f) > 0.001f);
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_vert_clip - 59.629623f) > 0.001f);
 
-	if (vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f) {
+	if (vp.guard_band_horz_discard != 0.0f || vp.guard_band_vert_discard != 0.0f) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 16) {
 			LOGF("\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
@@ -796,6 +891,10 @@ static bool ScissorRectValid(const ScissorRect& r) {
 	return r.right > r.left && r.bottom > r.top;
 }
 
+static bool ScissorRectSet(const ScissorRect& r) {
+	return r.left != 0 || r.top != 0 || r.right != 0 || r.bottom != 0;
+}
+
 static ScissorRect ScissorRectOffset(ScissorRect r, int x, int y) {
 	r.left += x;
 	r.right += x;
@@ -805,8 +904,8 @@ static ScissorRect ScissorRectOffset(ScissorRect r, int x, int y) {
 }
 
 static ScissorRect ScissorRectIntersect(const ScissorRect& a, const ScissorRect& b) {
-	return {std::max(a.left, b.left), std::max(a.top, b.top),
-	        std::min(a.right, b.right), std::min(a.bottom, b.bottom)};
+	return {a.left > b.left ? a.left : b.left, a.top > b.top ? a.top : b.top,
+	        a.right < b.right ? a.right : b.right, a.bottom < b.bottom ? a.bottom : b.bottom};
 }
 
 static ScissorRect ScissorRectClamp(ScissorRect r, uint32_t width, uint32_t height) {
@@ -853,26 +952,49 @@ static bool ScissorClipRuleToIntersectionMask(uint16_t rule, uint8_t* mask) {
 }
 
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
-                               vk::Extent2D extent, uint32_t viewport_index) {
-	EXIT_IF(viewport_index >= std::size(vp.viewports));
-	ScissorRect final {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
-	                   vp.screen_scissor_bottom};
-	const auto intersect = [&](ScissorRect rect, bool window_offset) {
-		if (window_offset) {
-			rect = ScissorRectOffset(rect, vp.window_offset_x, vp.window_offset_y);
-		}
-		final = ScissorRectIntersect(final, rect);
-	};
-	intersect({vp.window_scissor_left, vp.window_scissor_top, vp.window_scissor_right,
-	           vp.window_scissor_bottom}, vp.window_scissor_window_offset_enable);
-	intersect({vp.generic_scissor_left, vp.generic_scissor_top, vp.generic_scissor_right,
-	           vp.generic_scissor_bottom}, vp.generic_scissor_window_offset_enable);
+                               vk::Extent2D extent) {
+	ScissorRect screen {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
+	                    vp.screen_scissor_bottom};
+	ScissorRect final = screen;
 
-	const auto& viewport = vp.viewports[viewport_index];
-	if (smc.vport_scissor_enable) {
-		intersect({viewport.viewport_scissor_left, viewport.viewport_scissor_top,
-		           viewport.viewport_scissor_right, viewport.viewport_scissor_bottom},
-		          viewport.viewport_scissor_window_offset_enable);
+	if (!ScissorRectSet(screen)) {
+		final = {0, 0, static_cast<int>(extent.width), static_cast<int>(extent.height)};
+
+		auto log_id = g_scissor_default_log_count.fetch_add(1);
+		if (log_id < 32) {
+			LOGF("temporary: default unset screen scissor to framebuffer extent %ux%u\n",
+			     extent.width, extent.height);
+		}
+	}
+
+	ScissorRect window {vp.window_scissor_left, vp.window_scissor_top, vp.window_scissor_right,
+	                    vp.window_scissor_bottom};
+	if (ScissorRectSet(window)) {
+		if (vp.window_scissor_window_offset_enable) {
+			window = ScissorRectOffset(window, vp.window_offset_x, vp.window_offset_y);
+		}
+		final = ScissorRectIntersect(final, window);
+	}
+
+	ScissorRect generic {vp.generic_scissor_left, vp.generic_scissor_top, vp.generic_scissor_right,
+	                     vp.generic_scissor_bottom};
+	if (ScissorRectSet(generic)) {
+		if (vp.generic_scissor_window_offset_enable) {
+			generic = ScissorRectOffset(generic, vp.window_offset_x, vp.window_offset_y);
+		}
+		final = ScissorRectIntersect(final, generic);
+	}
+
+	const auto& viewport = vp.viewports[0];
+	ScissorRect viewport_scissor {viewport.viewport_scissor_left, viewport.viewport_scissor_top,
+	                              viewport.viewport_scissor_right,
+	                              viewport.viewport_scissor_bottom};
+	if (smc.vport_scissor_enable && ScissorRectSet(viewport_scissor)) {
+		if (viewport.viewport_scissor_window_offset_enable) {
+			viewport_scissor =
+			    ScissorRectOffset(viewport_scissor, vp.window_offset_x, vp.window_offset_y);
+		}
+		final = ScissorRectIntersect(final, viewport_scissor);
 	}
 
 	if (vp.clip_rect_rule == 0) {
@@ -885,8 +1007,12 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 					continue;
 				}
 
-				intersect({vp.clip_rect_left[i], vp.clip_rect_top[i], vp.clip_rect_right[i],
-				           vp.clip_rect_bottom[i]}, vp.clip_rect_window_offset_enable[i]);
+				ScissorRect clip {vp.clip_rect_left[i], vp.clip_rect_top[i], vp.clip_rect_right[i],
+				                  vp.clip_rect_bottom[i]};
+				if (vp.clip_rect_window_offset_enable[i]) {
+					clip = ScissorRectOffset(clip, vp.window_offset_x, vp.window_offset_y);
+				}
+				final = ScissorRectIntersect(final, clip);
 			}
 		} else {
 			static std::atomic<uint32_t> log_count {0};
@@ -907,6 +1033,7 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& bc      = hw.GetBlendControl(rt_slot);
 	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
+	const auto& z       = hw.GetDepthRenderTarget();
 	const auto& c       = hw.GetClipControl();
 	const auto& rc      = hw.GetRenderControl();
 	const auto& d       = hw.GetDepthControl();
@@ -932,6 +1059,8 @@ void hw_check(const CommandBuffer& buffer) {
 	RtCheck(rt);
 	log_phase("vp");
 	VpCheck(vp, smc);
+	log_phase("z");
+	ZCheck(z, d, rc);
 	log_phase("clip");
 	ClipCheck(c);
 	log_phase("rc");

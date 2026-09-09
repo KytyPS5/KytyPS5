@@ -8,15 +8,24 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 struct MimgSampleInfo {
-	uint32_t    encoding = 0;
-	const char* name     = nullptr;
-	uint32_t    flags    = 0;
+	uint32_t    encoding           = 0;
+	const char* name               = nullptr;
+	uint32_t    flags              = 0;
+	uint32_t    address_components = 3;
 };
 
 struct MimgGatherInfo {
-	uint32_t encoding = 0;
-	Opcode   decoded  = Opcode::UNSUPPORTED;
-	uint32_t flags    = 0;
+	uint32_t    encoding           = 0;
+	const char* name               = nullptr;
+	Opcode      decoded            = Opcode::UNSUPPORTED;
+	uint32_t    flags              = 0;
+	uint32_t    address_components = 3;
+};
+
+struct MimgAtomicInfo {
+	uint32_t    encoding = 0;
+	const char* name     = nullptr;
+	Opcode      decoded  = Opcode::UNSUPPORTED;
 };
 
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
@@ -75,127 +84,133 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 	return components;
 }
 
+constexpr MimgSampleInfo SampleInfo(uint32_t opcode, const char* name, uint32_t flags) {
+	return {opcode, name, flags, ImageSampleAddressComponents(flags, ImageDimension::Dim2D)};
+}
+
 constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
-    {0x20u, "image_sample", 0},
-    {0x21u, "image_sample_cl", ImageSampleFlagLodClamp},
-    {0x22u, "image_sample_d", ImageSampleFlagDerivative},
-    {0x23u, "image_sample_d_cl", ImageSampleFlagDerivative | ImageSampleFlagLodClamp},
-    {0x24u, "image_sample_l", ImageSampleFlagLod},
-    {0x25u, "image_sample_b", ImageSampleFlagBias},
-    {0x26u, "image_sample_b_cl", ImageSampleFlagBias | ImageSampleFlagLodClamp},
-    {0x27u, "image_sample_lz", ImageSampleFlagLevelZero},
-    {0x28u, "image_sample_c", ImageSampleFlagCompare},
-    {0x29u, "image_sample_c_cl", ImageSampleFlagCompare | ImageSampleFlagLodClamp},
-    {0x2au, "image_sample_c_d", ImageSampleFlagCompare | ImageSampleFlagDerivative},
-    {0x2bu, "image_sample_c_d_cl",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp},
-    {0x2cu, "image_sample_c_l", ImageSampleFlagCompare | ImageSampleFlagLod},
-    {0x2du, "image_sample_c_b", ImageSampleFlagCompare | ImageSampleFlagBias},
-    {0x2eu, "image_sample_c_b_cl",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp},
-    {0x2fu, "image_sample_c_lz", ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x30u, "image_sample_o", ImageSampleFlagOffset},
-    {0x31u, "image_sample_cl_o", ImageSampleFlagLodClamp | ImageSampleFlagOffset},
-    {0x32u, "image_sample_d_o", ImageSampleFlagDerivative | ImageSampleFlagOffset},
-    {0x33u, "image_sample_d_cl_o",
-     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
-    {0x34u, "image_sample_l_o", ImageSampleFlagLod | ImageSampleFlagOffset},
-    {0x35u, "image_sample_b_o", ImageSampleFlagBias | ImageSampleFlagOffset},
-    {0x36u, "image_sample_b_cl_o",
-     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
-    {0x37u, "image_sample_lz_o", ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x38u, "image_sample_c_o", ImageSampleFlagCompare | ImageSampleFlagOffset},
-    {0x39u, "image_sample_c_cl_o",
-     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
-    {0x3au, "image_sample_c_d_o",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagOffset},
-    {0x3bu, "image_sample_c_d_cl_o",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
-         ImageSampleFlagOffset},
-    {0x3cu, "image_sample_c_l_o",
-     ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset},
-    {0x3du, "image_sample_c_b_o",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset},
-    {0x3eu, "image_sample_c_b_cl_o",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
-         ImageSampleFlagOffset},
-    {0x3fu, "image_sample_c_lz_o",
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x68u, "image_sample_cd", ImageSampleFlagDerivative | ImageSampleFlagCd},
-    {0x69u, "image_sample_cd_cl",
-     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp},
-    {0x6au, "image_sample_c_cd",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd},
-    {0x6bu, "image_sample_c_cd_cl",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
-         ImageSampleFlagLodClamp},
-    {0x6cu, "image_sample_cd_o",
-     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagOffset},
-    {0x6du, "image_sample_cd_cl_o",
-     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp |
-         ImageSampleFlagOffset},
-    {0x6eu, "image_sample_c_cd_o",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
-         ImageSampleFlagOffset},
-    {0x6fu, "image_sample_c_cd_cl_o",
-     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
-         ImageSampleFlagLodClamp | ImageSampleFlagOffset},
-    {0xa0u, "image_sample_a", ImageSampleFlagAdjust},
-    {0xa1u, "image_sample_cl_a", ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
-    {0xa5u, "image_sample_b_a", ImageSampleFlagBias | ImageSampleFlagAdjust},
-    {0xa6u, "image_sample_b_cl_a",
-     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
-    {0xa8u, "image_sample_c_a", ImageSampleFlagCompare | ImageSampleFlagAdjust},
-    {0xa9u, "image_sample_c_cl_a",
-     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
-    {0xadu, "image_sample_c_b_a",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagAdjust},
-    {0xaeu, "image_sample_c_b_cl_a",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
-         ImageSampleFlagAdjust},
-    {0xb0u, "image_sample_o_a", ImageSampleFlagOffset | ImageSampleFlagAdjust},
-    {0xb1u, "image_sample_cl_o_a",
-     ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust},
-    {0xb5u, "image_sample_b_o_a",
-     ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust},
-    {0xb6u, "image_sample_b_cl_o_a",
-     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
-         ImageSampleFlagAdjust},
-    {0xb8u, "image_sample_c_o_a",
-     ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust},
-    {0xb9u, "image_sample_c_cl_o_a",
-     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
-         ImageSampleFlagAdjust},
-    {0xbdu, "image_sample_c_b_o_a",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset |
-         ImageSampleFlagAdjust},
-    {0xbeu, "image_sample_c_b_cl_o_a",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
-         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    SampleInfo(0x20u, "image_sample", 0),
+    SampleInfo(0x21u, "image_sample_cl", ImageSampleFlagLodClamp),
+    SampleInfo(0x22u, "image_sample_d", ImageSampleFlagDerivative),
+    SampleInfo(0x23u, "image_sample_d_cl", ImageSampleFlagDerivative | ImageSampleFlagLodClamp),
+    SampleInfo(0x24u, "image_sample_l", ImageSampleFlagLod),
+    SampleInfo(0x25u, "image_sample_b", ImageSampleFlagBias),
+    SampleInfo(0x26u, "image_sample_b_cl", ImageSampleFlagBias | ImageSampleFlagLodClamp),
+    SampleInfo(0x27u, "image_sample_lz", ImageSampleFlagLevelZero),
+    SampleInfo(0x28u, "image_sample_c", ImageSampleFlagCompare),
+    SampleInfo(0x29u, "image_sample_c_cl", ImageSampleFlagCompare | ImageSampleFlagLodClamp),
+    SampleInfo(0x2au, "image_sample_c_d", ImageSampleFlagCompare | ImageSampleFlagDerivative),
+    SampleInfo(0x2bu, "image_sample_c_d_cl",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp),
+    SampleInfo(0x2cu, "image_sample_c_l", ImageSampleFlagCompare | ImageSampleFlagLod),
+    SampleInfo(0x2du, "image_sample_c_b", ImageSampleFlagCompare | ImageSampleFlagBias),
+    SampleInfo(0x2eu, "image_sample_c_b_cl",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp),
+    SampleInfo(0x2fu, "image_sample_c_lz", ImageSampleFlagCompare | ImageSampleFlagLevelZero),
+    SampleInfo(0x30u, "image_sample_o", ImageSampleFlagOffset),
+    SampleInfo(0x31u, "image_sample_cl_o", ImageSampleFlagLodClamp | ImageSampleFlagOffset),
+    SampleInfo(0x32u, "image_sample_d_o", ImageSampleFlagDerivative | ImageSampleFlagOffset),
+    SampleInfo(0x33u, "image_sample_d_cl_o",
+               ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagOffset),
+    SampleInfo(0x34u, "image_sample_l_o", ImageSampleFlagLod | ImageSampleFlagOffset),
+    SampleInfo(0x35u, "image_sample_b_o", ImageSampleFlagBias | ImageSampleFlagOffset),
+    SampleInfo(0x36u, "image_sample_b_cl_o",
+               ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset),
+    SampleInfo(0x37u, "image_sample_lz_o", ImageSampleFlagLevelZero | ImageSampleFlagOffset),
+    SampleInfo(0x38u, "image_sample_c_o", ImageSampleFlagCompare | ImageSampleFlagOffset),
+    SampleInfo(0x39u, "image_sample_c_cl_o",
+               ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset),
+    SampleInfo(0x3au, "image_sample_c_d_o",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagOffset),
+    SampleInfo(0x3bu, "image_sample_c_d_cl_o",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
+                   ImageSampleFlagOffset),
+    SampleInfo(0x3cu, "image_sample_c_l_o",
+               ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset),
+    SampleInfo(0x3du, "image_sample_c_b_o",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset),
+    SampleInfo(0x3eu, "image_sample_c_b_cl_o",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+                   ImageSampleFlagOffset),
+    SampleInfo(0x3fu, "image_sample_c_lz_o",
+               ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset),
+    SampleInfo(0x68u, "image_sample_cd", ImageSampleFlagDerivative | ImageSampleFlagCd),
+    SampleInfo(0x69u, "image_sample_cd_cl",
+               ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp),
+    SampleInfo(0x6au, "image_sample_c_cd",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd),
+    SampleInfo(0x6bu, "image_sample_c_cd_cl",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+                   ImageSampleFlagLodClamp),
+    SampleInfo(0x6cu, "image_sample_cd_o",
+               ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagOffset),
+    SampleInfo(0x6du, "image_sample_cd_cl_o",
+               ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp |
+                   ImageSampleFlagOffset),
+    SampleInfo(0x6eu, "image_sample_c_cd_o",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+                   ImageSampleFlagOffset),
+    SampleInfo(0x6fu, "image_sample_c_cd_cl_o",
+               ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+                   ImageSampleFlagLodClamp | ImageSampleFlagOffset),
+    SampleInfo(0xa0u, "image_sample_a", ImageSampleFlagAdjust),
+    SampleInfo(0xa1u, "image_sample_cl_a", ImageSampleFlagLodClamp | ImageSampleFlagAdjust),
+    SampleInfo(0xa5u, "image_sample_b_a", ImageSampleFlagBias | ImageSampleFlagAdjust),
+    SampleInfo(0xa6u, "image_sample_b_cl_a",
+               ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagAdjust),
+    SampleInfo(0xa8u, "image_sample_c_a", ImageSampleFlagCompare | ImageSampleFlagAdjust),
+    SampleInfo(0xa9u, "image_sample_c_cl_a",
+               ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagAdjust),
+    SampleInfo(0xadu, "image_sample_c_b_a",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagAdjust),
+    SampleInfo(0xaeu, "image_sample_c_b_cl_a",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+                   ImageSampleFlagAdjust),
+    SampleInfo(0xb0u, "image_sample_o_a", ImageSampleFlagOffset | ImageSampleFlagAdjust),
+    SampleInfo(0xb1u, "image_sample_cl_o_a",
+               ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust),
+    SampleInfo(0xb5u, "image_sample_b_o_a",
+               ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust),
+    SampleInfo(0xb6u, "image_sample_b_cl_o_a",
+               ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+                   ImageSampleFlagAdjust),
+    SampleInfo(0xb8u, "image_sample_c_o_a",
+               ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust),
+    SampleInfo(0xb9u, "image_sample_c_cl_o_a",
+               ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+                   ImageSampleFlagAdjust),
+    SampleInfo(0xbdu, "image_sample_c_b_o_a",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset |
+                   ImageSampleFlagAdjust),
+    SampleInfo(0xbeu, "image_sample_c_b_cl_o_a",
+               ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+                   ImageSampleFlagOffset | ImageSampleFlagAdjust),
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
-    {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
-    {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
-    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
-     ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x58u, Opcode::IMAGE_GATHER4_C_O,
-     ImageSampleFlagCompare | ImageSampleFlagOffset},
-    {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
+    {0x47u, "image_gather4_lz", Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero, 2u},
+    {0x48u, "image_gather4_c", Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare, 3u},
+    {0x4fu, "image_gather4_c_lz", Opcode::IMAGE_GATHER4_C_LZ,
+     ImageSampleFlagCompare | ImageSampleFlagLevelZero, 3u},
+    {0x57u, "image_gather4_lz_o", Opcode::IMAGE_GATHER4_LZ_O,
+     ImageSampleFlagLevelZero | ImageSampleFlagOffset, 3u},
+    {0x58u, "image_gather4_c_o", Opcode::IMAGE_GATHER4_C_O,
+     ImageSampleFlagCompare | ImageSampleFlagOffset, 4u},
+    {0x5fu, "image_gather4_c_lz_o", Opcode::IMAGE_GATHER4_C_LZ_O,
+     ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset, 4u},
+    {0x61u, "image_gather4h", Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal, 2u},
 };
 
-constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
-    {0x11u, Opcode::IMAGE_ATOMIC_ADD},
-    {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
-    {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
-    {0x18u, Opcode::IMAGE_ATOMIC_AND},
-    {0x19u, Opcode::IMAGE_ATOMIC_OR},
-    {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
+    {0x0fu, "image_atomic_swap", Opcode::IMAGE_ATOMIC_SWAP},
+    {0x11u, "image_atomic_add", Opcode::IMAGE_ATOMIC_ADD},
+    {0x15u, "image_atomic_umin", Opcode::IMAGE_ATOMIC_UMIN},
+    {0x17u, "image_atomic_umax", Opcode::IMAGE_ATOMIC_UMAX},
+    {0x18u, "image_atomic_and", Opcode::IMAGE_ATOMIC_AND},
+    {0x19u, "image_atomic_or", Opcode::IMAGE_ATOMIC_OR},
+    {0x1au, "image_atomic_xor", Opcode::IMAGE_ATOMIC_XOR},
+    {0x1eu, "image_atomic_fmin", Opcode::IMAGE_ATOMIC_FMIN},
+    {0x1fu, "image_atomic_fmax", Opcode::IMAGE_ATOMIC_FMAX},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
@@ -210,12 +225,12 @@ const MimgGatherInfo* LookupGather(uint32_t opcode) {
 	return Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
 }
 
-const Detail::OpcodeMap* LookupAtomic(uint32_t opcode) {
+const MimgAtomicInfo* LookupAtomic(uint32_t opcode) {
 	return Detail::FindOpcode(MIMG_ATOMIC_OPS, opcode);
 }
 
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                        const Detail::OpcodeMap* atomic) {
+                        const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
@@ -249,7 +264,7 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const Detail::OpcodeMap* atomic) {
+                                     const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -261,7 +276,6 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
-		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
@@ -285,36 +299,6 @@ bool IsSingleDmaskBit(uint32_t dmask) {
 
 } // namespace
 
-ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component) {
-	const auto width = [flags](uint32_t index) {
-		if ((flags & ImageSampleFlagA16) == 0u) return 32u;
-		uint32_t cursor = 0;
-		if ((flags & ImageSampleFlagOffset) != 0u) {
-			if (index == cursor++) return 32u;
-		}
-		if ((flags & ImageSampleFlagBias) != 0u) {
-			if (index == cursor++) return 16u;
-		}
-		if ((flags & ImageSampleFlagCompare) != 0u && index == cursor) return 32u;
-		return 16u;
-	};
-	uint32_t offset = 0;
-	for (uint32_t index = 0; index < component; index++) {
-		const auto bits = width(index);
-		if (bits == 32u) offset = (offset + 31u) & ~31u;
-		offset += bits;
-	}
-	const auto bits = width(component);
-	if (bits == 32u) offset = (offset + 31u) & ~31u;
-	return {offset, bits};
-}
-
-uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {
-	if (components == 0u) return 0u;
-	const auto last = ImageAddressComponentLayout(flags, components - 1u);
-	return (last.bit_offset + last.bit_width + 31u) / 32u;
-}
-
 void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
 	const uint32_t word0      = code[word_index];
@@ -336,6 +320,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const auto*    atomic = LookupAtomic(opcode);
 
 	inst.pc                 = pc;
+	inst.word               = word0;
 	inst.word_count         = word_count;
 	inst.family             = Family::MIMG;
 	inst.opcode_id          = opcode;

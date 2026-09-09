@@ -363,7 +363,11 @@ void PlayGo::Open(const std::filesystem::path& file_name) {
 
 	m_f.Read(&magic1, 4);
 
-	if (magic1 != 0x6f676c70) {
+	// PS4 uses "plgo" while PS5 uses "plgx" for the same header fields
+	// consumed here. Both store the 16-bit chunk count at offset 10.
+	constexpr uint32_t PlayGoPs4Magic = 0x6f676c70;
+	constexpr uint32_t PlayGoPs5Magic = 0x78676c70;
+	if (magic1 != PlayGoPs4Magic && magic1 != PlayGoPs5Magic) {
 		LOGF("invalid file: magic1 = %08" PRIx32 "\n", magic1);
 		return;
 	}

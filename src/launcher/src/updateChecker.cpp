@@ -84,8 +84,7 @@ void UpdateChecker::FetchUpdateInfo(const char* url, bool fallback, bool manual)
 		}
 		reply->deleteLater();
 
-		if (!fallback &&
-		    (!info.error.isEmpty() || info.tag != QString::fromLatin1(KYTY_RELEASE_TAG))) {
+		if (!info.error.isEmpty() && !fallback) {
 			FetchUpdateInfo(FALLBACK_FEED_URL, true, manual);
 			return;
 		}

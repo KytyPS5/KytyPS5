@@ -23,6 +23,22 @@ struct VideoOutOutputStatus;
 struct VideoOutOutputOptions;
 struct VideoOutBuffers;
 struct VideoOutColorSettings;
+struct VideoOutVrrStatus;
+
+struct VideoOutDiagnostics {
+	uint64_t cpu_submitted       = 0;
+	uint64_t gpu_submitted       = 0;
+	uint64_t prepared            = 0;
+	uint64_t ready                  = 0;
+	uint64_t presented              = 0;
+	uint64_t output_status_calls    = 0;
+	uint64_t output_support_calls   = 0;
+	uint64_t last_output_mode       = 0;
+	int      last_output_support    = 0;
+	uint32_t last_output_resolution = 0;
+	int      last_submitted_index   = -3;
+	int      last_presented_index = -3;
+};
 
 class VideoOutDriver final {
 public:
@@ -49,6 +65,7 @@ private:
 [[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
+[[nodiscard]] VideoOutDiagnostics VideoOutGetDiagnostics();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
@@ -99,6 +116,8 @@ KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle);
 KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point);
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
+KYTY_SYSV_ABI int VideoOutVrrStatusInitialize();
+KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, VideoOutVrrStatus* status);
 
 } // namespace Libs::VideoOut
 

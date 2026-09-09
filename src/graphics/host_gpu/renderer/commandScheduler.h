@@ -42,7 +42,7 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool             Active() const noexcept { return m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -80,7 +80,9 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	void BindCurrent();
 	void BeginNext();
+	void PopPendingOperations(bool refresh_gpu_tick);
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
@@ -97,6 +99,9 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	HW::Context*                 m_registers            = nullptr;
+	HW::UserConfig*              m_user_config          = nullptr;
+	HW::Shader*                  m_shaders              = nullptr;
 };
 
 } // namespace Libs::Graphics

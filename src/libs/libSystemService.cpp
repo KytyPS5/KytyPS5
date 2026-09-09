@@ -4,7 +4,6 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
-#include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -161,8 +160,7 @@ static int KYTY_SYSV_ABI SystemServiceGetStatus(SystemServiceStatus* status) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	*status                      = SystemServiceStatus();
-	status->is_system_ui_overlaid = Dialog::ErrorDialog::GetVisualState().active;
+	*status = SystemServiceStatus();
 
 	return OK;
 }

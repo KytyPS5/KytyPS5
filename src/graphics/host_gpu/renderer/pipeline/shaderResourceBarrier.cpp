@@ -13,9 +13,6 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eVertex) {
 		result |= vk::PipelineStageFlagBits::eVertexShader;
 	}
-	if (stages & vk::ShaderStageFlagBits::eMeshEXT) {
-		result |= vk::PipelineStageFlagBits::eMeshShaderEXT;
-	}
 	if (stages & vk::ShaderStageFlagBits::eFragment) {
 		result |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
@@ -28,6 +25,7 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 
 VulkanMemoryBarrier MakeShaderWriteDependency() {
 	VulkanMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
@@ -40,6 +38,7 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 
 VulkanMemoryBarrier MakeShaderAccessDependency() {
 	VulkanMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	return barrier;
@@ -47,6 +46,7 @@ VulkanMemoryBarrier MakeShaderAccessDependency() {
 
 VulkanMemoryBarrier MakeShaderWriteHazardDependency() {
 	VulkanMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	return barrier;
@@ -56,6 +56,7 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	EXIT_IF(buffer == nullptr);
 
 	vk::BufferMemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 	barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -67,12 +68,11 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	return barrier;
 }
 
-bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
-	EXIT_IF(!runtime);
-	const auto& program   = *runtime.program;
-	const auto& resources = runtime.resources;
+std::vector<ShaderBufferWriteRange>
+CollectShaderBufferWrites(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                          const ShaderRecompiler::IR::ResourceSnapshot& resources) {
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
-	bool has_writes = false;
+	std::vector<ShaderBufferWriteRange> writes;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;
@@ -81,11 +81,23 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		EXIT_IF(value.dword_count < 4);
 		ShaderBufferResource descriptor;
 		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
-		// A zero stride means byte addressing. For either addressing mode a nonzero record
-		// count is exactly the condition for a nonempty descriptor range.
-		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
+		const auto address = descriptor.Base48();
+		const auto records = static_cast<uint64_t>(descriptor.NumRecords());
+		const auto stride  = static_cast<uint64_t>(descriptor.Stride());
+		if (stride != 0 && records > UINT64_MAX / stride) {
+			EXIT("shader resource barrier buffer footprint overflow\n");
+		}
+		const auto size = stride == 0 ? records : stride * records;
+		if (address != 0 && size != 0) {
+			writes.push_back({address, size});
+		}
 	}
-	return has_writes;
+	return writes;
+}
+
+bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
+	EXIT_IF(!runtime);
+	return !CollectShaderBufferWrites(*runtime.program, runtime.resources).empty();
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
@@ -106,11 +118,13 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
-	vk_buffer.pipelineBarrier(source_stages,
-	                          vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.pipelineBarrier(
+	    source_stages,
+	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eVertexInput |
+	        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader |
+	        vk::PipelineStageFlagBits::eTransfer |
+	        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	    vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 } // namespace Libs::Graphics

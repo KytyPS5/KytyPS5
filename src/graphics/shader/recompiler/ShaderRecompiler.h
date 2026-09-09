@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/ComputeWorkgroup.h"
+#include "graphics/shader/recompiler/ShaderHostProfile.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -21,8 +23,9 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
-	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	ComputeWorkgroupLimits      compute_workgroup_limits;
+	ShaderHostProfile           host_profile;
 };
 
 struct TranslateResult {

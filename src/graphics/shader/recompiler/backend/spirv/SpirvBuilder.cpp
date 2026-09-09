@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 
-#include <algorithm>
 #include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -30,10 +29,6 @@ Builder::Builder(uint32_t version): m_version(version) {
 
 uint32_t Builder::AllocateId() {
 	return m_next_id++;
-}
-
-void Builder::RequireVersion(uint32_t version) {
-	m_version = std::max(m_version, version);
 }
 
 void Builder::RequireCapability(uint32_t capability) {
@@ -195,18 +190,6 @@ void Builder::AddEntryPoint(uint32_t execution_model, uint32_t entry_point, cons
 	std::vector<uint32_t> operands = {execution_model, entry_point};
 	AppendString(operands, name);
 	operands.insert(operands.end(), interfaces.begin(), interfaces.end());
-	if (m_version >= 0x00010400u) {
-		for (size_t offset = 0; offset < m_declarations.size();) {
-			const auto count = m_declarations[offset] >> 16u;
-			if ((m_declarations[offset] & 0xffffu) == 59u) {
-				const auto id = m_declarations[offset + 2u];
-				if (std::find(interfaces.begin(), interfaces.end(), id) == interfaces.end()) {
-					operands.push_back(id);
-				}
-			}
-			offset += count;
-		}
-	}
 	AppendInstruction(m_entry_points, 15u, operands);
 }
 
@@ -255,8 +238,25 @@ void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value,
 	m_unpatched_phi_incomings--;
 }
 
+DeferredLoopMerge Builder::AddDeferredLoopMerge(uint32_t merge, uint32_t loop_control) {
+	EXIT_IF(merge == 0);
+	const DeferredLoopMerge loop {m_functions.size()};
+	AddFunction({246u, merge, 0u, loop_control});
+	m_unpatched_loop_merges++;
+	return loop;
+}
+
+void Builder::PatchDeferredLoopContinue(DeferredLoopMerge loop, uint32_t continue_target) {
+	EXIT_IF(continue_target == 0 || m_unpatched_loop_merges == 0);
+	EXIT_IF(m_functions.at(loop.word_offset) != ((4u << 16u) | 246u));
+	const auto continue_word = loop.word_offset + 2u;
+	EXIT_IF(m_functions.at(continue_word) != 0);
+	m_functions[continue_word] = continue_target;
+	m_unpatched_loop_merges--;
+}
+
 std::vector<uint32_t> Builder::Build() const {
-	EXIT_IF(m_unpatched_phi_incomings != 0);
+	EXIT_IF(m_unpatched_phi_incomings != 0 || m_unpatched_loop_merges != 0);
 
 	std::vector<uint32_t> module;
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +

@@ -51,6 +51,7 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+	void                        AssociateDepth(ImageId image_id) { depth_id = image_id; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -128,6 +129,9 @@ public:
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
 		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
+	[[nodiscard]] bool GpuOverlaps(uint64_t address, uint64_t size) const noexcept {
+		return IsGpuModified() && Overlaps(address, size);
+	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
@@ -142,6 +146,8 @@ public:
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
+	// Imported from a sampled HTile clear; never denotes attachment ownership.
+	bool             sampled_htile_clear_import = false;
 	bool             registered     = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
@@ -159,8 +165,8 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext&   m_graphics;
-	CommandScheduler& m_scheduler;
+	GraphicContext*   m_graphics         = nullptr;
+	CommandScheduler* m_scheduler        = nullptr;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

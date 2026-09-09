@@ -2,6 +2,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+uint32_t EmitTrueBool(EmitterState& state) {
+	return ConstantBool(state, true);
+}
+
 DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
 	const auto quad_base = state.builder.AllocateId();
 	const auto lane      = state.builder.AllocateId();
@@ -19,7 +23,7 @@ DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uin
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, TypeU32(state), selected, selected0, ConstantU32(state, 3)});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, quad_base, selected});
-	return {target, ConstantBool(state, true)};
+	return {target, EmitTrueBool(state)};
 }
 
 DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
@@ -66,7 +70,7 @@ DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subi
 	    {OpIAdd, TypeU32(state), plus, lane, ConstantU32(state, 16u - amount)});
 	state.builder.AddFunction({OpSelect, TypeU32(state), selected, in_high, minus, plus});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, row, selected});
-	return {target, ConstantBool(state, true)};
+	return {target, EmitTrueBool(state)};
 }
 
 DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row) {
@@ -83,7 +87,7 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	state.builder.AddFunction(
 	    {OpISub, TypeU32(state), mirrored, ConstantU32(state, lane_mask), lane});
 	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), target, base, mirrored});
-	return {target, ConstantBool(state, true)};
+	return {target, EmitTrueBool(state)};
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
@@ -110,19 +114,47 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpBitwiseXor, TypeU32(state), target, subid, ConstantU32(state, control & 0xfu)});
-		return {target, ConstantBool(state, true)};
+		return {target, EmitTrueBool(state)};
 	}
-	return {subid, ConstantBool(state, true)};
+	return {subid, EmitTrueBool(state)};
+}
+
+DppTargetLane EmitDpp8TargetLane(EmitterState& state, uint32_t lane_selectors) {
+	// Each group of eight is independent, including both halves of a guest wave64.
+	const auto subid    = EmitSubgroupLocalInvocationId(state);
+	const auto group    = state.builder.AllocateId();
+	const auto in_group = state.builder.AllocateId();
+	const auto shift    = state.builder.AllocateId();
+	const auto shifted  = state.builder.AllocateId();
+	const auto sel      = state.builder.AllocateId();
+	const auto lane     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), group, subid, ConstantU32(state, 0xfffffff8u)});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), in_group, subid, ConstantU32(state, 7u)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU32(state), shift, in_group, ConstantU32(state, 3u)});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), shifted,
+	                           ConstantU32(state, lane_selectors), shift});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), sel, shifted, ConstantU32(state, 7u)});
+	state.builder.AddFunction({OpIAdd, TypeU32(state), lane, group, sel});
+	return {lane, EmitTrueBool(state)};
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.compute_execution.IsCooperativeWave64()) {
+		return EmitBinaryU32(state, OpBitwiseAnd, EmitHostLocalInvocationIndex(state),
+		                     ConstantU32(state, 63));
+	}
+	if (state.compute_execution.IsSplitWave64()) return EmitHostLocalInvocationIndex(state);
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpLoad, TypeU32(state), value, state.subgroup_local_invocation_id_variable});
-	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+	return value;
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -144,6 +176,41 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 }
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if ((state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) && (kind == IR::StageInputKind::LocalInvocationId ||
+	                                             kind == IR::StageInputKind::GlobalInvocationId)) {
+		EXIT_IF(component >= 3u);
+		const auto& guest = state.compute_workgroup.guest_size;
+		uint32_t    local = ConstantU32(state, 0);
+		if (guest[component] != 1u) {
+			// Recover guest coordinates from the unchanged X-major local invocation index.
+			local             = EmitLocalInvocationIndex(state);
+			const auto stride = component == 0u   ? 1u
+			                    : component == 1u ? guest[0]
+			                                      : guest[0] * guest[1];
+			if (stride != 1u) {
+				const auto divided = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpUDiv, TypeU32(state), divided, local, ConstantU32(state, stride)});
+				local = divided;
+			}
+			if (component != 2u) {
+				const auto remainder = state.builder.AllocateId();
+				state.builder.AddFunction({OpUMod, TypeU32(state), remainder, local,
+				                           ConstantU32(state, guest[component])});
+				local = remainder;
+			}
+		}
+		if (kind == IR::StageInputKind::LocalInvocationId) {
+			return local;
+		}
+		const auto group = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, component);
+		const auto offset = state.builder.AllocateId();
+		const auto global = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpIMul, TypeU32(state), offset, group, ConstantU32(state, guest[component])});
+		state.builder.AddFunction({OpIAdd, TypeU32(state), global, offset, local});
+		return global;
+	}
 	const auto variable = InputVariableForKind(state, kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
@@ -153,34 +220,65 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
 	                           pointer, variable, ConstantU32(state, component)});
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+	if (state.compute_execution.IsSplitWave64() && kind == IR::StageInputKind::WorkgroupId && component == 0) {
+		return EmitBinaryU32(state, OpUDiv, value,
+		                     ConstantU32(state, state.compute_execution.wave_partition_factor));
+	}
 	return value;
 }
 
-uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+uint32_t EmitHostLocalInvocationIndex(EmitterState& state) {
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
-	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction({OpLoad, TypeU32(state), value, variable});
-	if (state.lane_count == 2) {
-		const auto wave_base = EmitBinaryU32(state, OpBitwiseAnd, value, ConstantU32(state, ~31u));
-		return EmitAddU32(state, EmitAddU32(state, value, wave_base),
-		                  ConstantU32(state, state.lane_half * 32));
+	if (state.host_local_invocation_index == 0) {
+		state.host_local_invocation_index = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, TypeU32(state),
+		                           state.host_local_invocation_index, variable});
 	}
-	return value;
+	return state.host_local_invocation_index;
+}
+
+uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	const auto local = EmitHostLocalInvocationIndex(state);
+	if (!state.compute_execution.IsSplitWave64() || state.compute_execution.wave_partition_factor == 1)
+		return local;
+	const auto variable = InputVariableForKind(state, IR::StageInputKind::WorkgroupId);
+	EXIT_IF(variable == 0);
+	const auto pointer = state.builder.AllocateId();
+	const auto host_group_x = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
+	                           pointer, variable, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), host_group_x, pointer});
+	const auto wave = EmitBinaryU32(state, OpUMod, host_group_x,
+	                                ConstantU32(state, state.compute_execution.wave_partition_factor));
+	const auto offset = EmitBinaryU32(state, OpIMul, wave, ConstantU32(state, 64));
+	return EmitBinaryU32(state, OpIAdd, offset, local);
+}
+
+uint32_t VertexInputDefaultComponentU32(EmitterState& state, VertexInputScalarKind kind,
+                                        uint32_t component) {
+	if ((component & 3u) != 3u) {
+		return ConstantU32(state, 0);
+	}
+	return ConstantU32(state, kind == VertexInputScalarKind::Float ? 0x3f800000u : 1u);
 }
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(input);
+	const auto count = VertexParameterComponentCount(state, input);
 	const auto kind  = VertexParameterScalarKind(state, input.location);
+	if (component >= count) {
+		return VertexInputDefaultComponentU32(state, kind, component);
+	}
+
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {
 		state.builder.AddFunction({OpLoad, scalar_type, raw, input.variable_id});
 	} else {
-		const auto pointer_type = TypePointer(state, StorageClassInput, scalar_type);
+		const auto pointer_type = VertexParameterScalarPointerType(state, kind);
 		const auto pointer      = state.builder.AllocateId();
 		state.builder.AddFunction({OpAccessChain, pointer_type, pointer, input.variable_id,
 		                           ConstantU32(state, component)});
@@ -197,16 +295,20 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                           ConstantU32(state, ScopeSubgroup), ConstantBool(state, true)});
+	if (state.compute_execution.IsSplitWave64()) {
+		// Eligibility proves full convergence of all 64 actual invocations.
+		const auto valid = state.builder.AllocateId();
+		state.builder.AddFunction({OpULessThan, TypeBool(state), valid, lane, ConstantU32(state, 64)});
+		return valid;
+	}
+	const auto active_ballot = EmitWaveBallot(state, EmitTrueBool(state));
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, active_ballot, 0});
 	uint32_t mask = low;
-	if (state.program.wave_size == 64u) {
+	if (state.wave_size == 64u) {
 		const auto high     = state.builder.AllocateId();
 		const auto in_high  = state.builder.AllocateId();
 		const auto selected = state.builder.AllocateId();
@@ -231,7 +333,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), hit, mask, bit});
 	state.builder.AddFunction({OpINotEqual, TypeBool(state), active, hit, ConstantU32(state, 0)});
 	state.builder.AddFunction(
-	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.program.wave_size)});
+	    {OpULessThan, TypeBool(state), in_range, lane, ConstantU32(state, state.wave_size)});
 	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), ret, active, in_range});
 	return ret;
 }

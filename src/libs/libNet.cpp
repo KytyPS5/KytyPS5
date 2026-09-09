@@ -168,7 +168,7 @@ int KYTY_SYSV_ABI NetSocketClose(int s) {
 
 int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
                                 uint32_t optlen) {
-	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
+	return NET_CALL(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
@@ -1414,41 +1414,13 @@ namespace LibNpCommerce {
 
 LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
-constexpr int COMMERCE_STATUS_NONE        = 0;
-constexpr int COMMERCE_STATUS_INITIALIZED = 1;
-
-constexpr int COMMERCE_ERROR_NOT_INITIALIZED     = static_cast<int>(0x80B80003u);
-constexpr int COMMERCE_ERROR_ALREADY_INITIALIZED = static_cast<int>(0x80B80004u);
-
-static int g_commerce_status = COMMERCE_STATUS_NONE;
-
-static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
-	PRINT_NAME();
-	if (g_commerce_status != COMMERCE_STATUS_NONE) {
-		return COMMERCE_ERROR_ALREADY_INITIALIZED;
-	}
-	g_commerce_status = COMMERCE_STATUS_INITIALIZED;
-	return OK;
-}
-
-static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
-	PRINT_NAME();
-	if (g_commerce_status == COMMERCE_STATUS_NONE) {
-		return COMMERCE_ERROR_NOT_INITIALIZED;
-	}
-	g_commerce_status = COMMERCE_STATUS_NONE;
-	return OK;
-}
-
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
-	return g_commerce_status;
+	return 0; // SCE_COMMON_DIALOG_STATUS_NONE
 }
 
 LIB_DEFINE(InitNet_1_NpCommerce) {
-	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
-	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 

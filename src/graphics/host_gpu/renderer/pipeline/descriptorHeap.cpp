@@ -63,6 +63,7 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	layouts.fill(layout);
 
 	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.sType          = vk::StructureType::eDescriptorSetAllocateInfo;
 	allocate.descriptorPool = m_current_pool;
 	allocate.pSetLayouts    = layouts.data();
 
@@ -84,6 +85,8 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 
 void DescriptorHeap::CreatePool() {
 	vk::DescriptorPoolCreateInfo create {};
+	create.sType         = vk::StructureType::eDescriptorPoolCreateInfo;
+	create.flags         = {};
 	create.maxSets       = DescriptorHeapCount;
 	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
 	create.pPoolSizes    = DescriptorPoolSizes.data();

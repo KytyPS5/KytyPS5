@@ -8,7 +8,11 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/shader/recompiler/ComputeWorkgroup.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ShaderHostProfile.h"
+#include "graphics/shader/recompiler/ir/passes/F64Certificate.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -21,11 +25,15 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
+#include "libs/errno.h"
+#include "libs/libs.h"
+#include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
 
@@ -37,8 +45,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -53,6 +61,21 @@
 #endif
 
 namespace Libs::Graphics {
+bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
+                               const std::vector<uint32_t>& spirv);
+std::vector<uint32_t> OptimizeShaderSpirvForTest(
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization,
+    bool cooperative_wave64 = false);
+bool ShouldOptimizeShaderSpirvForTest(
+    bool dispatcher_fallback, bool cooperative_wave64,
+    Config::ShaderOptimizationType optimization);
+bool IsDriverCacheBuildIdentityUsableForTest(
+    std::string_view git_hash, std::string_view git_revision,
+    std::string_view worktree_fingerprint);
+bool IsDriverCacheSignatureCompatibleForTest(
+    std::string_view cached_signature, std::string_view expected_signature);
+std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash);
+bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -60,6 +83,237 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+void TestShaderOptimizationSelection() {
+  constexpr const char *source = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+        %one = OpConstant %u32 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %dead = OpIAdd %u32 %one %one
+               OpBranch %exit
+       %exit = OpLabel
+               OpReturn
+               OpFunctionEnd
+  )";
+  spvtools::SpirvTools assembler(SPV_ENV_VULKAN_1_3);
+  std::vector<uint32_t> spirv;
+  Check(assembler.Assemble(source, &spirv),
+        "shader optimization fixture did not assemble");
+
+  const auto unchanged = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::None);
+  const auto performance = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::Performance);
+  const auto size = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::Size);
+  const auto cooperative = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::Performance, true);
+  Check(unchanged == spirv,
+        "None shader optimization changed the generated module");
+  Check(performance.size() < spirv.size(),
+        "Performance shader optimization did not remove dead work");
+  Check(size.size() <= performance.size(),
+        "Size shader optimization produced more words than Performance");
+  Check(cooperative.size() < spirv.size(),
+        "bounded cooperative optimization did not merge trivial control flow");
+  Check(assembler.Validate(performance),
+        "Performance optimized module failed SPIR-V validation");
+  Check(assembler.Validate(size),
+        "Size optimized module failed SPIR-V validation");
+  Check(assembler.Validate(cooperative),
+        "bounded cooperative optimized module failed SPIR-V validation");
+
+  constexpr const char *redundant_source = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+      %v3u32 = OpTypeVector %u32 3
+  %input_v3 = OpTypePointer Input %v3u32
+    %func_u32 = OpTypePointer Function %u32
+       %zero = OpConstant %u32 0
+        %one = OpConstant %u32 1
+        %gid = OpVariable %input_v3 Input
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %slot = OpVariable %func_u32 Function
+      %value = OpLoad %v3u32 %gid
+          %x = OpCompositeExtract %u32 %value 0
+          %a = OpIAdd %u32 %x %one
+          %b = OpIAdd %u32 %x %one
+        %sum = OpIAdd %u32 %a %b
+               OpStore %slot %sum
+               OpReturn
+               OpFunctionEnd
+  )";
+  std::vector<uint32_t> redundant;
+  Check(assembler.Assemble(redundant_source, &redundant) &&
+            assembler.Validate(redundant),
+        "cooperative redundancy fixture did not assemble");
+  const auto cooperative_redundant = OptimizeShaderSpirvForTest(
+      redundant, Config::ShaderOptimizationType::Performance, true);
+  Check(cooperative_redundant.size() < redundant.size(),
+        "bounded cooperative optimization retained duplicate local expressions");
+  Check(assembler.Validate(cooperative_redundant),
+        "cooperative redundancy elimination produced invalid SPIR-V");
+
+  constexpr const char *sparse_ids_source = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %100002 "main"
+               OpExecutionMode %100002 LocalSize 1 1 1
+    %100000 = OpTypeVoid
+    %100001 = OpTypeFunction %100000
+    %100002 = OpFunction %100000 None %100001
+    %100003 = OpLabel
+               OpReturn
+               OpFunctionEnd
+  )";
+  std::vector<uint32_t> sparse_ids;
+  Check(assembler.Assemble(
+            sparse_ids_source, &sparse_ids,
+            SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS) &&
+            assembler.Validate(sparse_ids),
+        "sparse cooperative ID fixture did not assemble");
+  const auto compact = OptimizeShaderSpirvForTest(
+      sparse_ids, Config::ShaderOptimizationType::Performance, true);
+  Check(compact.size() >= 4u && compact[3] < sparse_ids[3],
+        "bounded cooperative optimization retained a sparse ID bound");
+  Check(assembler.Validate(compact),
+        "cooperative ID compaction produced invalid SPIR-V");
+  Check(ShouldOptimizeShaderSpirvForTest(
+            false, false, Config::ShaderOptimizationType::Performance),
+        "structured Performance shader was not admitted for optimization");
+  Check(!ShouldOptimizeShaderSpirvForTest(
+            true, false, Config::ShaderOptimizationType::Performance),
+        "dispatcher fallback was admitted to the driver-pathological optimization path");
+  Check(ShouldOptimizeShaderSpirvForTest(
+            false, true, Config::ShaderOptimizationType::Performance),
+        "cooperative wave64 scheduler was not admitted to bounded optimization");
+  Check(!ShouldOptimizeShaderSpirvForTest(
+            false, false, Config::ShaderOptimizationType::None),
+        "None optimization mode admitted a module");
+}
+
+void TestCooperativePipelineDisablesDriverOptimization() {
+  Check(ComputePipelineDisablesOptimizationForTest(true),
+        "cooperative scheduler did not request bounded driver compilation");
+  Check(!ComputePipelineDisablesOptimizationForTest(false),
+        "ordinary compute pipeline lost driver optimization");
+}
+
+void TestShaderModuleDebugName() {
+  Check(ShaderModuleDebugNameForTest(ShaderType::Compute,
+                                     0xb90e2024732c6111ull) ==
+            "kyty_shader_cs_b90e2024732c6111",
+        "compute shader debug name is not stable and regex-selectable");
+  Check(ShaderModuleDebugNameForTest(ShaderType::Vertex, 0x1234ull) ==
+            "kyty_shader_vs_0000000000001234",
+        "vertex shader debug name lost its fixed-width hash");
+  Check(ShaderModuleDebugNameForTest(ShaderType::Pixel, 0x5678ull) ==
+            "kyty_shader_ps_0000000000005678",
+        "pixel shader debug name lost its stage");
+}
+
+void TestDriverPipelineCacheBuildIdentity() {
+  constexpr std::string_view revision =
+      "0123456789abcdef0123456789abcdef01234567";
+  constexpr std::string_view fingerprint =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  Check(IsDriverCacheBuildIdentityUsableForTest(
+            "0123456-dirty", revision, fingerprint),
+        "a dirty build with an exact worktree fingerprint disabled the driver cache");
+  Check(IsDriverCacheBuildIdentityUsableForTest(
+            "0123456", revision, fingerprint),
+        "a clean build with an exact fingerprint disabled the driver cache");
+  Check(!IsDriverCacheBuildIdentityUsableForTest(
+             "unknown", revision, fingerprint) &&
+            !IsDriverCacheBuildIdentityUsableForTest(
+                "0123456-dirty", "unknown", fingerprint) &&
+            !IsDriverCacheBuildIdentityUsableForTest(
+                "0123456-dirty", revision, "unknown") &&
+            !IsDriverCacheBuildIdentityUsableForTest(
+                "0123456-dirty", revision, "1234"),
+        "driver cache accepted an incomplete build identity");
+}
+
+void TestDriverPipelineCacheRevisionCompatibility() {
+  constexpr std::string_view previous =
+      "KytyPC2:672af1f8c904418b8f592a0264b03bd845d48a3d:"
+      "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  constexpr std::string_view current =
+      "KytyPC2:9cb2a3e7e44b03880b17ee5ee618490ecb97c948:"
+      "a1279f6931abb9286c22cc53f97090a59e4cd093f6a072300e8b0b73c51a774e:"
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  constexpr std::string_view other_driver =
+      "KytyPC2:672af1f8c904418b8f592a0264b03bd845d48a3d:"
+      "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
+      "000010de:00002d04:9a200000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  constexpr std::string_view malformed_build =
+      "KytyPC2:not-a-revision:"
+      "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+  Check(IsDriverCacheSignatureCompatibleForTest(previous, current),
+        "a same-driver pipeline cache from the previous emulator revision was rejected");
+  Check(!IsDriverCacheSignatureCompatibleForTest(other_driver, current),
+        "a pipeline cache from a different driver was accepted");
+  Check(!IsDriverCacheSignatureCompatibleForTest(malformed_build, current),
+        "a pipeline cache with malformed build identity was accepted");
+}
+
+void TestVideoOutVrrStatusLibraryContract() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitAll(&symbols);
+
+  const auto resolve = [&](const char *nid) {
+    Loader::SymbolResolve request{};
+    request.name = nid;
+    request.library = "VideoOutVrrStatus";
+    request.library_version = 1;
+    request.module = "VideoOut";
+    request.module_version_major = 1;
+    request.module_version_minor = 1;
+    request.type = Loader::SymbolType::Func;
+    return symbols.Find(request);
+  };
+
+  const auto *initialize = resolve("kP2L8t3j-aM");
+  Check(initialize != nullptr,
+        "VideoOutVrrStatus initialization import did not resolve");
+  using Initialize = int(KYTY_SYSV_ABI *)();
+  Check(reinterpret_cast<Initialize>(initialize->vaddr)() == OK,
+        "VideoOutVrrStatus initialization failed");
+
+  const auto *query = resolve("gWT7X8H0bYs");
+  Check(query != nullptr, "VideoOutVrrStatus query import did not resolve");
+  using Query = int(KYTY_SYSV_ABI *)(int, void *);
+  struct GuardedStatus {
+    uint64_t pre;
+    std::array<uint8_t, 0x80> status;
+    uint64_t post;
+  } output{0x1122334455667788ull, {}, 0x8877665544332211ull};
+  output.status.fill(0xa5);
+  Check(reinterpret_cast<Query>(query->vaddr)(1, output.status.data()) == OK,
+        "VideoOutVrrStatus query failed");
+  Check(std::all_of(output.status.begin(), output.status.end(),
+                    [](uint8_t value) { return value == 0; }),
+        "fixed-rate host did not report a deterministic unsupported VRR status");
+  Check(output.pre == 0x1122334455667788ull &&
+            output.post == 0x8877665544332211ull,
+        "VideoOutVrrStatus query wrote outside its 0x80-byte output");
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -283,6 +537,195 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
       count++;
     }
     i += word_count;
+  }
+  return count;
+}
+
+uint32_t SpirvNamedVariableLoadCount(const std::vector<uint32_t> &binary,
+                                     const char *name) {
+  uint32_t variable = 0;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return 0;
+    if ((binary[offset] & 0xffffu) == 5u && words >= 3u) {
+      std::string instruction_name;
+      for (size_t word = offset + 2u; word < offset + words; ++word) {
+        for (uint32_t byte = 0; byte < 4u; ++byte) {
+          const char character =
+              static_cast<char>((binary[word] >> (byte * 8u)) & 0xffu);
+          if (character == '\0') break;
+          instruction_name.push_back(character);
+        }
+      }
+      if (instruction_name == name) variable = binary[offset + 1u];
+    }
+    offset += words;
+  }
+  if (variable == 0u) return 0;
+  uint32_t loads = 0;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return 0;
+    if ((binary[offset] & 0xffffu) == 61u && words >= 4u &&
+        binary[offset + 3u] == variable)
+      ++loads;
+    offset += words;
+  }
+  return loads;
+}
+
+bool SpirvSplitWaveBallotHasLeaderComparisons(const std::vector<uint32_t> &binary) {
+  uint32_t local_index_variable = 0;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return false;
+    if ((binary[offset] & 0xffffu) == 5u && words >= 3u) {
+      std::string instruction_name;
+      for (size_t word = offset + 2u; word < offset + words; ++word) {
+        for (uint32_t byte = 0; byte < 4u; ++byte) {
+          const char character =
+              static_cast<char>((binary[word] >> (byte * 8u)) & 0xffu);
+          if (character == '\0') break;
+          instruction_name.push_back(character);
+        }
+      }
+      if (instruction_name == "gl_LocalInvocationIndex")
+        local_index_variable = binary[offset + 1u];
+    }
+    offset += words;
+  }
+  if (local_index_variable == 0u) return false;
+
+  std::unordered_set<uint32_t> local_index_values;
+  std::unordered_set<uint32_t> zero_constants;
+  std::unordered_set<uint32_t> thirty_two_constants;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return false;
+    const uint32_t opcode = binary[offset] & 0xffffu;
+    if (opcode == 43u && words >= 4u && binary[offset + 3u] == 0u)
+      zero_constants.insert(binary[offset + 2u]);
+    if (opcode == 43u && words >= 4u && binary[offset + 3u] == 32u)
+      thirty_two_constants.insert(binary[offset + 2u]);
+    if (opcode == 61u && words >= 4u && binary[offset + 3u] == local_index_variable)
+      local_index_values.insert(binary[offset + 2u]);
+    offset += words;
+  }
+  bool compares_zero = false;
+  bool compares_thirty_two = false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) return false;
+    if ((binary[offset] & 0xffffu) == 170u && words >= 5u) {
+      const bool has_local_index =
+          local_index_values.contains(binary[offset + 3u]) ||
+          local_index_values.contains(binary[offset + 4u]);
+      compares_zero =
+          compares_zero ||
+          (has_local_index && (zero_constants.contains(binary[offset + 3u]) ||
+                               zero_constants.contains(binary[offset + 4u])));
+      compares_thirty_two =
+          compares_thirty_two ||
+          (has_local_index &&
+           (thirty_two_constants.contains(binary[offset + 3u]) ||
+            thirty_two_constants.contains(binary[offset + 4u])));
+    }
+    offset += words;
+  }
+  return compares_zero && compares_thirty_two;
+}
+
+bool SpirvHasZeroTestedBitwiseOrDeMorgan(const std::vector<uint32_t> &binary) {
+  constexpr uint32_t OpConstant = 43u;
+  constexpr uint32_t OpLogicalNot = 168u;
+  constexpr uint32_t OpLogicalAnd = 167u;
+  constexpr uint32_t OpIEqual = 170u;
+  constexpr uint32_t OpBitwiseAnd = 199u;
+  std::unordered_set<uint32_t> zero_constants;
+  std::unordered_set<uint32_t> bitwise_ands;
+  std::unordered_map<uint32_t, std::array<uint32_t, 2>> equal_operands;
+  std::unordered_map<uint32_t, std::array<uint32_t, 2>> logical_and_operands;
+  std::unordered_map<uint32_t, uint32_t> logical_not_operands;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16u;
+    if (words == 0u || words > binary.size() - offset) {
+      return false;
+    }
+    const uint32_t opcode = binary[offset] & 0xffffu;
+    if (opcode == OpConstant && words == 4u && binary[offset + 3] == 0u) {
+      zero_constants.insert(binary[offset + 2]);
+    } else if (opcode == OpBitwiseAnd && words == 5u) {
+      bitwise_ands.insert(binary[offset + 2]);
+    } else if (opcode == OpIEqual && words == 5u) {
+      equal_operands[binary[offset + 2]] = {binary[offset + 3], binary[offset + 4]};
+    } else if (opcode == OpLogicalAnd && words == 5u) {
+      logical_and_operands[binary[offset + 2]] = {binary[offset + 3], binary[offset + 4]};
+    } else if (opcode == OpLogicalNot && words == 4u) {
+      logical_not_operands[binary[offset + 2]] = binary[offset + 3];
+    }
+    offset += words;
+  }
+  const auto is_zero_test = [&](uint32_t id) {
+    const auto it = equal_operands.find(id);
+    if (it == equal_operands.end()) {
+      return false;
+    }
+    const auto operands = it->second;
+    const uint32_t value = zero_constants.contains(operands[0]) ? operands[1] : operands[0];
+    return (zero_constants.contains(operands[0]) || zero_constants.contains(operands[1])) &&
+           bitwise_ands.contains(value);
+  };
+  for (const auto &[logical_not, logical_and] : logical_not_operands) {
+    (void)logical_not;
+    const auto and_it = logical_and_operands.find(logical_and);
+    if (and_it != logical_and_operands.end() && is_zero_test(and_it->second[0]) &&
+        is_zero_test(and_it->second[1])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Count OpControlBarrier with ImageMemory whose nearest preceding image access
+// is `after_opcode` (OpImageFetch=95 or OpImageWrite=99). Sampled fetches are
+// not image-memory publications; a barrier on them is the split-wave defect.
+uint32_t CountImageMemoryBarriersAfter(const std::vector<uint32_t> &binary,
+                                       uint32_t after_opcode) {
+  constexpr uint32_t OpConstant = 43u;
+  constexpr uint32_t OpImageFetch = 95u;
+  constexpr uint32_t OpImageWrite = 99u;
+  constexpr uint32_t OpControlBarrier = 224u;
+  constexpr uint32_t ImageMemory = 0x00000800u;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  uint32_t last_image = 0;
+  uint32_t count = 0;
+  if (binary.size() < 5 || binary[0] != 0x07230203u) {
+    return 0;
+  }
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16;
+    if (words == 0 || words > binary.size() - offset) {
+      return count;
+    }
+    const uint32_t op = binary[offset] & 0xffffu;
+    const auto *args = binary.data() + offset + 1;
+    if (op == OpConstant && words == 4) {
+      constants[args[1]] = args[2];
+    }
+    if (op == OpImageFetch || op == OpImageWrite) {
+      last_image = op;
+    }
+    if (op == OpControlBarrier && words == 4) {
+      const auto semantics = constants.find(args[2]);
+      if (semantics != constants.end() &&
+          (semantics->second & ImageMemory) != 0u) {
+        if (last_image == after_opcode) {
+          count++;
+        }
+        last_image = 0;
+      }
+    }
+    offset += words;
   }
   return count;
 }
@@ -908,12 +1351,12 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
   return elements;
 }
 
-bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
-                                    uint32_t builtin, uint32_t operation,
-                                    std::initializer_list<uint32_t> literals) {
+bool SpirvBuiltInStoreUsesAndConstant(const std::vector<uint32_t> &binary,
+                                      uint32_t builtin,
+                                      uint32_t constant) {
   std::unordered_set<uint32_t> variables;
   std::unordered_map<uint32_t, uint32_t> constants;
-  std::unordered_map<uint32_t, std::vector<uint32_t>> operations;
+  std::unordered_map<uint32_t, std::array<uint32_t, 2>> bitwise_ands;
   std::unordered_map<uint32_t, uint32_t> stores;
   for (size_t i = 5; i < binary.size();) {
     const uint32_t opcode = binary[i] & 0xffffu;
@@ -926,8 +1369,8 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
       variables.insert(binary[i + 1]);
     } else if (opcode == 43u && count >= 4u) {
       constants[binary[i + 2]] = binary[i + 3];
-    } else if (opcode == operation && count == 4u + literals.size()) {
-      operations[binary[i + 2]] = {binary.begin() + i + 4, binary.begin() + i + count};
+    } else if (opcode == 199u && count == 5u) {
+      bitwise_ands[binary[i + 2]] = {binary[i + 3], binary[i + 4]};
     } else if (opcode == 62u && count >= 3u) {
       stores[binary[i + 1]] = binary[i + 2];
     }
@@ -938,16 +1381,15 @@ bool SpirvBuiltInStoreUsesOperation(const std::vector<uint32_t> &binary,
     if (store == stores.end()) {
       continue;
     }
-    const auto value = operations.find(store->second);
-    if (value == operations.end()) {
+    const auto value = bitwise_ands.find(store->second);
+    if (value == bitwise_ands.end()) {
       continue;
     }
-    if (std::equal(value->second.begin(), value->second.end(), literals.begin(),
-                   [&](uint32_t id, uint32_t expected) {
-                     const auto literal = constants.find(id);
-                     return literal != constants.end() && literal->second == expected;
-                   })) {
-      return true;
+    for (const auto operand : value->second) {
+      const auto literal = constants.find(operand);
+      if (literal != constants.end() && literal->second == constant) {
+        return true;
+      }
     }
   }
   return false;
@@ -1027,6 +1469,88 @@ void EnsureConfigInitialized() {
     ShaderInit();
     config_initialized = true;
   }
+}
+
+// Standalone validator contract; no Vulkan device, optimizer, or shader execution.
+// New numeric values are from the primary SPV_KHR_fma specification, revision 2:
+// https://github.khronos.org/SPIRV-Registry/extensions/KHR/SPV_KHR_fma.html
+// Keep these test constants independent of headers so OLD pinned tools can build
+// the regression and reject the otherwise valid extension module at runtime.
+std::vector<uint32_t> MakeFmaKhrValidatorModule(bool use_fma,
+                                              bool wrong_operand_type = false,
+                                              bool declare_fma = true) {
+  std::vector<uint32_t> words{
+      0x07230203u, 0x00010600u, 0u, 12u, 0u};
+  const auto emit = [&](uint32_t opcode,
+                        std::initializer_list<uint32_t> operands) {
+    words.push_back((static_cast<uint32_t>(operands.size() + 1u) << 16u) |
+                    opcode);
+    words.insert(words.end(), operands.begin(), operands.end());
+  };
+  emit(17u, {1u});  // OpCapability Shader
+  emit(17u, {10u}); // OpCapability Float64
+  if (use_fma && declare_fma) {
+    emit(17u, {6030u}); // OpCapability FMAKHR (SPV_KHR_fma)
+    emit(10u, {0x5f565053u, 0x5f52484bu, 0x00616d66u});
+    // OpExtension "SPV_KHR_fma"
+  }
+  emit(14u, {0u, 1u});                      // Logical GLSL450
+  emit(15u, {5u, 7u, 0x6e69616du, 0u});    // GLCompute %7 "main"
+  emit(16u, {7u, 17u, 1u, 1u, 1u});        // LocalSize 1 1 1
+  emit(19u, {1u});                         // %1 = OpTypeVoid
+  emit(33u, {2u, 1u});                     // %2 = OpTypeFunction %1
+  emit(22u, {3u, 64u});                    // %3 = OpTypeFloat 64
+  emit(43u, {3u, 4u, 0u, 0x3ff00000u});   // %4 = double(1)
+  emit(43u, {3u, 5u, 0u, 0x40000000u});   // %5 = double(2)
+  emit(43u, {3u, 6u, 0u, 0xbff00000u});   // %6 = double(-1)
+  emit(22u, {10u, 32u});                   // %10 = OpTypeFloat 32
+  emit(43u, {10u, 11u, 0x3f800000u});      // %11 = float(1)
+  emit(54u, {1u, 7u, 0u, 2u});            // %7 = OpFunction
+  emit(248u, {9u});                        // %9 = OpLabel
+  if (use_fma) {
+    emit(4427u, {3u, 8u, 4u, 5u, wrong_operand_type ? 11u : 6u});
+    // %8 = OpFmaKHR %double %one %two %minus_one (six words)
+  } else {
+    emit(129u, {3u, 8u, 4u, 5u});          // %8 = OpFAdd %double %one %two
+  }
+  emit(253u, {});                          // OpReturn
+  emit(56u, {});                           // OpFunctionEnd
+  return words;
+}
+
+void TestFmaKhrPipelineValidator() {
+  // Exercise the production helper's enabled path, not its configuration bypass.
+  Check(Config::ShaderValidationEnabled(),
+        "FMA validator regression requires shader validation enabled");
+  Check(ValidateShaderSpirvForTest("FMA baseline", 0u,
+                                 MakeFmaKhrValidatorModule(false)),
+        "ordinary scalar Float64 baseline failed before the FMA extension test");
+  std::puts("KYTY_FMA_VALIDATOR_BASELINE_PASS");
+  std::fflush(stdout);
+  Check(ValidateShaderSpirvForTest("FMAKHR valid Float64", 0u,
+                                 MakeFmaKhrValidatorModule(true)),
+        "valid scalar Float64 OpFmaKHR module was rejected by pipeline validation");
+  Check(!ValidateShaderSpirvForTest("FMAKHR wrong operand", 0u,
+                                  MakeFmaKhrValidatorModule(true, true)),
+        "OpFmaKHR accepted a Float32 operand in a Float64 operation");
+  Check(!ValidateShaderSpirvForTest("FMAKHR missing declaration", 0u,
+                                  MakeFmaKhrValidatorModule(true, false, false)),
+        "OpFmaKHR accepted missing FMAKHR capability and extension");
+  std::puts("KYTY_FMA_VALIDATOR_PASS");
+  std::fflush(stdout);
+}
+
+int RunFmaKhrPipelineValidator() {
+  Common::InitializeThreads();
+  Common::Subsystems subsystems;
+  subsystems.Initialize<Config::Lifecycle>();
+  Config::ConfigOptions options;
+  options.shader_validation_enabled = true;
+  options.printf_direction = Config::OutputDirection::Console;
+  Config::Load(options);
+  subsystems.Initialize<Log::Lifecycle>();
+  TestFmaKhrPipelineValidator();
+  return 0;
 }
 
 void TestResourceDescriptorClassification() {
@@ -1138,25 +1662,15 @@ void TestNativeShaderResourceDependencies() {
       .info = program.info,
       .bindings = program.bindings,
   };
-  ShaderStageRuntime runtime{.program = &compiled, .resources = resources};
-  Check(HasShaderBufferWrites(runtime),
-        "graphics/compute write predicate lost nonempty written buffers");
-  set_buffer(0, 0, 16, 3);
-  set_buffer(2, 0x2000, 0, 0);
-  runtime.resources = resources;
-  Check(!HasShaderBufferWrites(runtime),
-        "graphics/compute write predicate included null, empty, or read-only buffers");
-  set_buffer(2, 0x2000, 0, 64);
-  runtime.resources = resources;
-  Check(HasShaderBufferWrites(runtime),
-        "graphics/compute write predicate lost a byte-addressed buffer");
-  set_buffer(2, 0x2000, 0x3FFF, UINT32_MAX);
-  runtime.resources = resources;
-  Check(HasShaderBufferWrites(runtime),
-        "graphics/compute write predicate lost a maximum-size strided buffer");
+  const auto writes = CollectShaderBufferWrites(compiled, resources);
+  Check(writes ==
+            std::vector<ShaderBufferWriteRange>({{0x1000, 48}, {0x2000, 64}}),
+        "graphics/compute write collector lost or invented a storage-buffer "
+        "range");
 
-  const vk::Buffer buffer{reinterpret_cast<vk::Buffer::CType>(uintptr_t{1})};
-  const auto gds_barrier = MakeGdsDependency(buffer);
+  VulkanBuffer buffer;
+  buffer.buffer = reinterpret_cast<vk::Buffer::CType>(uintptr_t{1});
+  const auto gds_barrier = MakeGdsDependency(buffer.buffer);
   Check((gds_barrier.srcAccessMask & vk::AccessFlagBits::eHostWrite) &&
             (gds_barrier.srcAccessMask & vk::AccessFlagBits::eTransferWrite) &&
             (gds_barrier.srcAccessMask & vk::AccessFlagBits::eShaderWrite) &&
@@ -1480,6 +1994,7 @@ constexpr uint32_t EncodeSmem0(uint32_t opcode, uint32_t dst, uint32_t sbase) {
 constexpr uint32_t EncodeMubuf0(uint32_t opcode, uint32_t offset = 0,
                                 bool idxen = true, bool glc = false) {
   return (0x38u << 26u) | ((opcode & 0x7fu) << 18u) |
+         (((opcode >> 7u) & 1u) << 25u) |
          (idxen ? (1u << 13u) : 0u) | (glc ? (1u << 14u) : 0u) |
          (offset & 0xfffu);
 }
@@ -1541,6 +2056,148 @@ constexpr uint32_t EncodeMimg1(uint32_t vdata, uint32_t srsrc, uint32_t ssamp,
                                uint32_t vaddr, bool a16 = false) {
   return ((ssamp & 0x1fu) << 21u) | ((srsrc & 0x1fu) << 16u) |
          ((vdata & 0xffu) << 8u) | (vaddr & 0xffu) | (a16 ? (1u << 30u) : 0u);
+}
+
+// Insert in tests/shaderCfgTests.cpp after EncodeMimg0/1 and call
+// TestMixedComparisonImagesUseSeparateSpirvVariables() from its main.
+// CPU-only end-to-end guest decode -> tracking -> specialization -> SPIR-V.
+// No native image/device or guest payload is required. The Vulkan Depth type
+// operand is intentionally not the oracle: descriptor-variable isolation is.
+void TestMixedComparisonImagesUseSeparateSpirvVariables() {
+  using namespace ShaderRecompiler::IR;
+  for (const bool comparison_first : {false, true}) {
+    std::array<uint32_t, 64> user_data{};
+    for (const uint32_t sgpr : {0u, 8u, 16u, 32u}) {
+      user_data[sgpr] = 0x1000u + sgpr * 0x100u;
+      user_data[sgpr + 1u] =
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (1u << 30u); // width2
+      user_data[sgpr + 2u] = 0; // height1
+      user_data[sgpr + 3u] = 0x924u |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      user_data[sgpr + 5u] = 0x00700000u;
+    }
+    user_data[33] =
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (3u << 30u); // output width4 for three distinct stores
+    // Independent sampler in s[28:31], comparison LESS, clamp to edge.
+    user_data[28] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
+    std::vector<uint32_t> shader;
+    const auto mimg = [&](uint32_t opcode, uint32_t output, uint32_t resource,
+                          uint32_t sampler, uint32_t address) {
+      shader.push_back(EncodeMimg0(opcode, 1));
+      shader.push_back(EncodeMimg1(output, resource, sampler, address));
+    };
+    const auto load = [&] { mimg(0x00, 8, 0, 0, 1); };
+    const auto compare = [&] { mimg(0x2f, 12, 2, 7, 4); };
+    if (comparison_first) {
+      compare();
+      load();
+    } else {
+      load();
+      compare();
+    }
+    mimg(0x00, 16, 4, 0, 1);
+    // Keep each operation live through independent observable side effects.
+    // The test does not execute these stores or dereference descriptor bases.
+    shader.push_back(EncodeVop1(0x01, 21, 128)); // output y=0
+    uint32_t output_x = 0;
+    for (const auto value : {8u, 12u, 16u}) {
+      shader.push_back(EncodeVop1(0x01, 20, 128u + output_x++));
+      mimg(0x08, value, 8, 0, 20);
+    }
+    shader.push_back(0xbf810000u);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(result.program.info.images.size() == 4u,
+          "mixed comparison fixture lost an image resource");
+
+    struct Definition {
+      uint32_t opcode;
+      std::vector<uint32_t> operands;
+    };
+    std::unordered_map<uint32_t, Definition> definitions;
+    std::unordered_map<uint32_t, uint32_t> bindings;
+    std::unordered_set<uint32_t> fetch_values;
+    std::unordered_set<uint32_t> comparison_values;
+    for (size_t offset = 5; offset < result.spirv.size();) {
+      const uint32_t count = result.spirv[offset] >> 16u;
+      const uint32_t opcode = result.spirv[offset] & 0xffffu;
+      Check(count != 0 && count <= result.spirv.size() - offset,
+            "mixed comparison SPIR-V stream is malformed");
+      const auto* words = result.spirv.data() + offset;
+      // Variable, Load, AccessChain, InBoundsAccessChain, CopyObject,
+      // SampledImage, Image: every tracked instruction has type then result.
+      if (opcode == 59 || opcode == 61 || opcode == 65 || opcode == 66 ||
+          opcode == 83 || opcode == 86 || opcode == 100) {
+        Check(count >= 4, "mixed comparison descriptor definition is malformed");
+        definitions.emplace(words[2], Definition{
+            opcode, std::vector<uint32_t>(words + 1, words + count)});
+      } else if (opcode == 71 && count >= 4 && words[2] == 33u) {
+        bindings[words[1]] = words[3]; // OpDecorate Binding
+      } else if (opcode == 95 || opcode == 90) {
+        Check(count >= 4, "mixed comparison image operation is malformed");
+        (opcode == 95 ? fetch_values : comparison_values).insert(words[3]);
+      }
+      offset += count;
+    }
+    const auto variable_root = [&](uint32_t value) {
+      std::unordered_set<uint32_t> visited;
+      while (visited.insert(value).second) {
+        const auto found = definitions.find(value);
+        Check(found != definitions.end(),
+              "mixed comparison image operand lacks a tracked descriptor origin");
+        if (found->second.opcode == 59) {
+          return value;
+        }
+        value = found->second.operands[2];
+      }
+      Check(false, "mixed comparison descriptor origin is cyclic");
+      return 0u;
+    };
+    std::unordered_set<uint32_t> ordinary_roots;
+    std::unordered_set<uint32_t> comparison_roots;
+    for (const auto value : fetch_values) ordinary_roots.insert(variable_root(value));
+    for (const auto value : comparison_values) comparison_roots.insert(variable_root(value));
+    Check(fetch_values.size() == 2 && comparison_values.size() == 1 &&
+              ordinary_roots.size() == 1 && comparison_roots.size() == 1,
+          "mixed fixture did not retain two ordinary fetches and one comparison");
+    const auto ordinary_root = *ordinary_roots.begin();
+    const auto comparison_root = *comparison_roots.begin();
+    Check(ordinary_root != comparison_root,
+          "ordinary image fetch and depth comparison share one SPIR-V descriptor variable");
+    Check(bindings.contains(ordinary_root) && bindings.contains(comparison_root) &&
+              bindings.at(ordinary_root) != bindings.at(comparison_root),
+          "separate SPIR-V image variables still share one descriptor binding");
+
+    const DescriptorBinding* ordinary_binding = nullptr;
+    const DescriptorBinding* comparison_binding = nullptr;
+    std::vector<uint32_t> ordinary_indices;
+    std::vector<uint32_t> comparison_indices;
+    for (uint32_t index = 0; index < result.program.info.images.size(); ++index) {
+      const auto& image = result.program.info.images[index];
+      if (image.resource_class != ImageResourceClass::Sampled) continue;
+      const auto kind = DescriptorBindingForImage(image);
+      Check(kind.has_value(), "mixed image resource lacks a descriptor kind");
+      const auto* binding = FindBinding(result.program.bindings, *kind);
+      if (image.depth_compare) {
+        comparison_binding = binding;
+        comparison_indices.push_back(index);
+      } else {
+        ordinary_binding = binding;
+        ordinary_indices.push_back(index);
+      }
+    }
+    Check(ordinary_binding != nullptr && comparison_binding != nullptr &&
+              ordinary_indices.size() == 2 && comparison_indices.size() == 1 &&
+              ordinary_binding->resources == ordinary_indices &&
+              comparison_binding->resources == comparison_indices &&
+              bindings.at(ordinary_root) == NativeBinding(ShaderType::Compute, ordinary_binding->kind) &&
+              bindings.at(comparison_root) == NativeBinding(ShaderType::Compute, comparison_binding->kind),
+          "SPIR-V variable isolation disagrees with actual resource binding membership");
+  }
 }
 
 constexpr uint32_t EncodeVintrp(uint32_t opcode, uint32_t vdst, uint32_t attr,
@@ -1680,50 +2337,6 @@ void TestNewShaderRecompilerSopkWaitcntMarkers() {
   Check(Common::ContainsStr(result.ir_dump, "Waitcnt null, 0x0000ffff"),
         "SOPK waitcnt marker immediate was not translated as 16-bit unsigned");
   CheckSpirvBinaryValidates(result.spirv);
-}
-
-void TestSopkCompareImmediateExtension() {
-  using namespace ShaderRecompiler;
-  for (uint32_t opcode = 0x03; opcode <= 0x0e; opcode++) {
-    for (uint32_t immediate : {0x8000u, 0xffffu}) {
-      const std::array shader = {
-          EncodeSopk(opcode, 2, static_cast<int16_t>(immediate)),
-          EncodeSopp(0x01),
-      };
-      Decoder::Program decoded;
-      Decoder::DecodeProgram(shader, decoded);
-      const auto &operand = decoded.instructions.front().src1;
-      int32_t expected = static_cast<int32_t>(immediate);
-      if (opcode < 0x09) {
-        expected = immediate == 0x8000u ? -32768 : -1;
-      }
-      Check(operand.value == static_cast<uint32_t>(expected) &&
-                operand.signed_val == expected,
-            "SOPK compare immediate extension does not match its signedness");
-    }
-  }
-
-  // GTA3's LUT GS exports its UV parameter only when packed primitive count > 0.
-  for (uint32_t counts : {0x00000006u, 0x00020006u}) {
-    const std::array shader = {
-        EncodeSMovB32(2, 255), counts,
-        0xb582ffffu,             // s_cmpk_gt_u32 s2, 0xffff
-        EncodeSopp(0x04, 2),     // s_cbranch_scc0 past exp param0
-        0xf800020fu, 0x06060504u, // exp param0 v4, v5, v6, v6
-        EncodeSopp(0x01),
-    };
-    auto translated =
-        TranslateProgram(shader, MakeCompileOptions(ShaderType::Vertex));
-    const auto branch = std::ranges::find_if(
-        translated.program.block_info, [](const auto &block) {
-          return block.terminator.condition == CFG::BranchCondition::SccZero;
-        });
-    Check(branch != translated.program.block_info.end(),
-          "captured LUT parameter export branch was lost");
-    const auto condition = branch->condition.Resolve();
-    Check(condition.IsImmediate() && condition.U1() == (counts == 6u),
-          "captured LUT unsigned compare suppressed a live parameter export");
-  }
 }
 
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
@@ -4314,6 +4927,49 @@ void TestNewShaderDecoderArchitecture() {
         "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
 }
 
+// Insert beside TestNewShaderRecompilerRejectsDppOn64BitCompares and call
+// TestNewShaderRecompilerRejectsF64IntegerConversionModifiers from the same runner.
+void TestNewShaderRecompilerRejectsF64IntegerConversionModifiers() {
+  using namespace ShaderRecompiler;
+  // The first supported conversion profile has an unmodified two-word result.
+  // Reject even full-width modifier escapes rather than applying a single-word
+  // DPP destination update to only one half of the binary64 value.
+  struct Modifier {
+    uint32_t escape;
+    uint32_t word;
+  };
+  const Modifier modifiers[] = {
+      {250u, EncodeVop1Dpp(7u)},
+      {250u, EncodeVop1Dpp(7u, 0x101u, 1u, 3u)},
+      {233u, 0xfac68807u}, // DPP8 FI=0, identity selectors.
+      {234u, 0xfac68807u}, // DPP8 FI=1.
+      {249u, EncodeVop1Sdwa(7u)}, // Full-width SDWA remains outside this profile.
+      {249u, EncodeVop1Sdwa(7u, 4u, 2u, 4u)},
+      {249u, EncodeVop1Sdwa(7u, 6u, 0u, 6u, 1u)},
+  };
+  for (const uint32_t opcode : {0x04u, 0x16u}) {
+    for (const auto &modifier : modifiers) {
+      const uint32_t shader[] = {
+          EncodeVop1(opcode, 3u, modifier.escape), modifier.word,
+          EncodeSopp(0x01),
+      };
+      Decoder::Program program;
+      Decoder::DecodeProgram(shader, program);
+      Check(program.instructions.size() == 2u,
+            "FP64 conversion modifier did not consume its second word");
+      const auto &inst = program.instructions.front();
+      Check(inst.opcode == Decoder::Opcode::UNSUPPORTED &&
+                inst.opcode_id == opcode && inst.word_count == 2u &&
+                inst.raw_count == 2u,
+            "FP64 conversion illegally accepted a modifier escape");
+      Check(Common::ContainsStr(
+                inst.unsupported_reason,
+                "FP64 integer conversion DPP/DPP8/SDWA is not supported"),
+            "FP64 conversion modifier rejection was not explicit");
+    }
+  }
+}
+
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   const uint32_t opcodes[] = {
       0xa2u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
@@ -4338,6 +4994,133 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
   }
 }
 
+void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d7a40ffu, 0x00000001u, // v_cmpx_ne_u16 exec, 1, v32
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(shader, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode != Decoder::Opcode::UNSUPPORTED &&
+            decoded.opcode_id == 0xbdu && decoded.word_count == 2u &&
+            decoded.raw_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::LiteralConstant &&
+            decoded.src0.value == 1u &&
+            decoded.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src1.reg == 32u,
+        "decoder rejected captured VOPC V_CMPX_NE_U16 fields");
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.compute = &compute;
+  Decoder::DecodeProgram(shader, program);
+  graph = CFG::BuildGraph(program);
+  ir = Frontend::TranslateProgram(program, graph, translate_options);
+  uint32_t not_equal_compares = 0u;
+  uint32_t dynamic_exec_writes = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      not_equal_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::INotEqual32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        dynamic_exec_writes++;
+      }
+    }
+  }
+  Check(not_equal_compares >= 1u && dynamic_exec_writes == 1u,
+        "captured V_CMPX_NE_U16 did not lower to unsigned halfword compare plus EXEC update");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_NE_U16 exec_lo, 0x00000001, v32"),
+        "captured V_CMPX_NE_U16 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d3d00f9u,
+      0x86050021u, // v_cmpx_ge_i16 exec, v33.word1, 0 (SDWA)
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(shader, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_GE_I16 &&
+            decoded.opcode_id == 0x9eu && decoded.word_count == 2u &&
+            decoded.raw_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src0.reg == 33u && decoded.src0.sdwa_sel == 5u &&
+            decoded.src1.kind == Decoder::OperandKind::IntegerInlineConstant &&
+            decoded.src1.value == 0u && decoded.src1.sdwa_sel == 6u,
+        "decoder rejected captured SDWA V_CMPX_GE_I16 fields");
+
+  constexpr Decoder::Opcode signed_cmpx_opcodes[] = {
+      Decoder::Opcode::V_CMPX_LT_I16, Decoder::Opcode::V_CMPX_EQ_I16,
+      Decoder::Opcode::V_CMPX_LE_I16, Decoder::Opcode::V_CMPX_GT_I16,
+      Decoder::Opcode::V_CMPX_NE_I16, Decoder::Opcode::V_CMPX_GE_I16,
+  };
+  for (uint32_t index = 0u; index < std::size(signed_cmpx_opcodes); index++) {
+    const uint32_t neighbor[] = {EncodeVopc(0x99u + index, 0u, 1u),
+                                 EncodeSopp(0x01)};
+    Decoder::Instruction neighbor_decoded;
+    Decoder::DecodeInstruction(neighbor, 0u, neighbor_decoded);
+    Check(neighbor_decoded.opcode == signed_cmpx_opcodes[index] &&
+              neighbor_decoded.dst.kind == Decoder::OperandKind::ExecLo,
+          "signed halfword CMPX opcode family did not decode to an EXEC compare");
+  }
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.compute = &compute;
+  Decoder::DecodeProgram(shader, program);
+  graph = CFG::BuildGraph(program);
+  ir = Frontend::TranslateProgram(program, graph, translate_options);
+  uint32_t signed_ge_compares = 0u;
+  uint32_t dynamic_exec_writes = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      signed_ge_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::SGreaterThanEqual32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        dynamic_exec_writes++;
+      }
+    }
+  }
+  Check(signed_ge_compares >= 1u && dynamic_exec_writes == 1u,
+        "captured SDWA V_CMPX_GE_I16 did not lower to signed halfword compare plus EXEC update");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "V_CMPX_GE_I16 exec_lo"),
+        "captured SDWA V_CMPX_GE_I16 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   using namespace ShaderRecompiler;
 
@@ -4351,7 +5134,7 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   Check(decoded.family == Decoder::Family::VOPC &&
             decoded.opcode == Decoder::Opcode::V_CMPX_CLASS_F32 &&
             decoded.opcode_id == 0x98u && decoded.word_count == 2u &&
-            decoded.raw[0] == shader[0] && decoded.raw[1] == shader[1] &&
+            decoded.raw_count == 2u &&
             decoded.dst.kind == Decoder::OperandKind::ExecLo &&
             decoded.src_count == 2u &&
             decoded.src0.kind == Decoder::OperandKind::Vgpr &&
@@ -4464,13 +5247,15 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   Check(getpc_wrote_vcc_lo,
         "S_GETPC_B64 did not advance s105 through the VCC alias");
 
-  const Decoder::OperandKind canonical_zero_masks[] = {
-      Decoder::OperandKind::Null,
-      Decoder::OperandKind::PopsExitingWaveId,
-      Decoder::OperandKind::VccZ,
-      Decoder::OperandKind::ExecZ,
+  const std::pair<Decoder::OperandKind, bool> mask_tag_operands[] = {
+      {Decoder::OperandKind::Null, true},
+      {Decoder::OperandKind::PopsExitingWaveId, true},
+      // Scalar flags are numeric {flag, 0}, not replicated lane masks.
+      {Decoder::OperandKind::Scc, false},
+      {Decoder::OperandKind::VccZ, false},
+      {Decoder::OperandKind::ExecZ, false},
   };
-  for (const auto kind : canonical_zero_masks) {
+  for (const auto [kind, expected_mask_tag] : mask_tag_operands) {
     store = {};
     store.family = Decoder::Family::SOP1;
     store.opcode = Decoder::Opcode::S_NOT_B64;
@@ -4488,8 +5273,8 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
         preserved_mask_tag |= valid.IsImmediate() && valid.U1();
       }
     }
-    Check(preserved_mask_tag,
-          "canonical zero/condition operand lost scalar mask validity");
+    Check(preserved_mask_tag == expected_mask_tag,
+          "zero/flag operand has incorrect scalar mask validity");
   }
 }
 
@@ -4754,64 +5539,6 @@ void TestNewShaderRecompilerCubeSampleCoordinates() {
         "cube sample did not repack its face ID exactly once, or get-lod used "
         "an array layer");
   CheckSpirvBinaryValidates(result.spirv);
-}
-
-void TestImageAddressOperands() {
-  using namespace ShaderRecompiler;
-  struct Case {
-    uint32_t opcode;
-    uint32_t dimension;
-    bool a16;
-    bool nsa;
-    uint32_t logical_components;
-    uint32_t dwords;
-  };
-  constexpr std::array cases{
-      Case{0x27, 1, false, false, 2, 2}, // xy, explicit level zero
-      Case{0x22, 2, false, false, 9, 9}, // 3D gradients and xyz
-      Case{0x20, 1, true, false, 2, 1},  // packed xy
-      Case{0x3d, 1, true, false, 5, 4},  // offset, half bias, full dref, packed xy
-      Case{0x20, 2, true, true, 3, 2},   // packed xy/z in nonconsecutive VGPRs
-      Case{0x0e, 1, false, false, 1, 1}, // resource query mip
-  };
-  for (const auto &test : cases) {
-    std::vector<uint32_t> shader;
-    for (uint32_t reg = 0; reg < 16; reg++) {
-      shader.push_back(EncodeVop1(0x01, reg, 129 + reg));
-    }
-    shader.push_back(EncodeMimg0(test.opcode, 0x1, false, test.dimension) |
-                     (test.nsa ? 1u << 1u : 0u));
-    shader.push_back(EncodeMimg1(48, 0, 4, 0, test.a16));
-    if (test.nsa) shader.push_back(0x0f0b0703u);
-    shader.push_back(EncodeSopp(0x01));
-    Decoder::Program decoded;
-    Decoder::DecodeProgram(shader, decoded);
-    Check(decoded.instructions[16].image_address_components == test.logical_components,
-          "MIMG decoded address count does not match its logical operands");
-    ShaderComputeInputInfo compute = RegressionComputeInputInfo();
-    Frontend::TranslateOptions options{};
-    options.stage = ShaderType::Compute;
-    options.compute = &compute;
-    auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
-    IR::RewriteToSsa(program.blocks);
-    IR::ConstantPropagationPass(program.blocks);
-    uint32_t addresses = 0;
-    for (const auto *block : program.blocks) {
-      for (const auto &inst : *block) {
-        if (inst.GetOpcode() != IR::ValueOpcode::MakeImageAddress) continue;
-        addresses++;
-        for (uint32_t index = 0; index < inst.NumArgs(); index++) {
-          const auto value = inst.Arg(index).Resolve();
-          const auto reg = test.nsa && index > 0 ? 3u + (index - 1u) * 4u : index;
-          const auto expected = index < test.dwords ? reg + 1u : 0u;
-          Check(value.IsImmediate() && value.GetType() == IR::Type::U32 &&
-                    value.U32() == expected,
-                "MIMG address read an unused VGPR or lost a packed/NSA operand");
-        }
-      }
-    }
-    Check(addresses == 1, "MIMG address regression did not reach translation");
-  }
 }
 
 void TestNewShaderRecompilerImageSampleVariants() {
@@ -5299,10 +6026,10 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_22 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_29 "),
         "1D store did not access the 1D storage descriptor binding");
   Check(
-      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_23 "),
+      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_30 "),
       "1D-array store did not access the 1D-array storage descriptor binding");
 }
 
@@ -5598,7 +6325,7 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_33 "),
         "storage image store did not access the 3D storage descriptor binding");
 }
 
@@ -5634,13 +6361,13 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_24 "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_31 "),
         "2D descriptor storage image store did not access the base storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_25 "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_32 "),
         "2D descriptor storage image store unexpectedly used the array storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_33 "),
         "2D descriptor storage image store unexpectedly used the 3D storage "
         "binding");
 }
@@ -5965,124 +6692,6 @@ void TestPsInputCountRegisterDecode() {
         "SPI_PS_IN_CONTROL flags were not preserved");
   Check((ps_in_control & 0x3fu) == 3,
         "SPI_PS_IN_CONTROL NUM_INTERP decoding failed");
-}
-
-void TestPixelAncillaryLayerInput() {
-  using namespace ShaderRecompiler::IR;
-  std::vector<uint32_t> shader = {
-      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
-      EncodeVop3Word0(0x149, 7), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 3),
-      EncodeExp0(0x00, 0x3), EncodeExp1(6, 7, 0, 0), EncodeSopp(0x01),
-  };
-  HW::PixelShaderInfo regs{};
-  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
-  ShaderMappedData mapped{};
-  mapped.code_size_bytes = shader.size() * sizeof(uint32_t);
-  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
-  HW::ShaderRegisters sh{};
-  sh.ps_input_ena = sh.ps_input_addr = 0x3320; // Linear I/J, X/Y, front-face, ancillary.
-  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
-  ShaderPixelInputInfo pixel{};
-  (void)PrepareProgram(regs, sh, mappings, pixel);
-  Check(pixel.ps_system_input_base == 2 && pixel.ps_front_face && pixel.ps_ancillary,
-        "pixel ancillary register flags were not retained");
-  const auto ancillary_key = MakeStageStaticKey(pixel);
-  pixel.ps_ancillary = false;
-  Check(ancillary_key != MakeStageStaticKey(pixel),
-        "pixel ancillary input is missing from the shader cache key");
-  pixel.ps_ancillary = true;
-  auto options = MakeCompileOptions(ShaderType::Pixel);
-  options.input_info.pixel = &pixel;
-  auto result = RecompileForTest(shader, options);
-  Check(ProgramHasInput(result.program, StageInputKind::Layer),
-        "ancillary after X/Y and front-face did not provide the layer input");
-  Check(!ProgramHasInput(result.program, StageInputKind::PackedAncillary),
-        "symbolic ancillary input survived its layer extraction");
-  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 9u, 14u) &&
-            result.spirv[1] == 0x00010500u &&
-            SpirvContainsCapability(result.spirv, 69u) &&
-            !SpirvContainsCapability(result.spirv, 5254u),
-        "fragment layer input lacks its builtin, flat decoration or capability");
-  const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%int %gl_Layer") &&
-            SpirvInstructionOpcodeCount(result.spirv, 202u) == 1u &&
-            SpirvInstructionOpcodeCount(result.spirv, 203u) == 1u,
-        "layer extraction lost its scalar integer load or signedness");
-  Check(!SpirvHasDecorationValue(result.spirv, 11u, 18u),
-        "layer extraction unexpectedly enabled SampleId");
-  CheckSpirvBinaryValidates(result.spirv);
-
-  for (const uint32_t destination : {126u, 106u, 0u}) {
-    std::vector<uint32_t> wqm = {
-        EncodeSop1(0x04, 8, 126), // Save the incoming EXEC predicate.
-        EncodeSop1(0x0a, destination, 126),
-        EncodeSop1(0x04, 126, destination),
-        EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
-        EncodeVop1(0x01, 5, 6 + 256), // Overwrite the packed ancillary register.
-        EncodeSop1(0x04, 126, 8),
-        EncodeExp0(0x00, 0x1), EncodeExp1(5, 0, 0, 0), EncodeSopp(0x01),
-    };
-    auto wqm_result = RecompileForTest(wqm, options);
-    Check(ProgramHasInput(wqm_result.program, StageInputKind::Layer) &&
-              !ProgramHasInput(wqm_result.program, StageInputKind::PackedAncillary),
-          "WQM retained an unreachable old ancillary register value");
-    CheckSpirvBinaryValidates(wqm_result.spirv);
-  }
-
-  const uint32_t loop[] = {
-      EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
-      EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
-      EncodeSop1(0x24, 12, 0),   // Narrow EXEC while saving the widened mask.
-      EncodeSop1(0x04, 10, 126), // Save the final export mask.
-      EncodeSopp(0x08, 6),       // Skip the body when EXEC is zero.
-      EncodeVop3Word0(0x148, 5), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11),
-      EncodeSMovB32(2, 128),
-      EncodeSop2(0x00, 2, 2, 129),
-      EncodeSopc(0x0a, 2, 131),
-      EncodeSopp(0x05, 0xfffdu), // Repeat the scalar loop three times.
-      EncodeSop1(0x04, 126, 12), // Pack under the widened mask.
-      EncodeVop2(0x2f, 6, 5 + 256, 5),
-      EncodeSop1(0x04, 126, 10), // Export only lanes that entered the body.
-      EncodeExp0(0x00, 0x1, true, false, true), EncodeExp1(6, 0, 0, 0), EncodeSopp(0x01),
-  };
-  auto loop_result = RecompileForTest(loop, options);
-  Check(ProgramHasInput(loop_result.program, StageInputKind::Layer) &&
-            !ProgramHasInput(loop_result.program, StageInputKind::PackedAncillary),
-        "loop and skipped body retained the symbolic ancillary input after field lowering");
-  Check(SpirvContainsOpcode(loop_result.spirv, 246u),
-        "ancillary regression did not retain its scalar loop");
-  CheckSpirvBinaryValidates(loop_result.spirv);
-
-  const uint32_t unused[] = {EncodeSopp(0x01)};
-  auto unused_result = RecompileForTest(unused, options);
-  Check(!ProgramHasInput(unused_result.program, StageInputKind::Layer) &&
-            unused_result.spirv[1] == 0x00010300u &&
-            !SpirvContainsCapability(unused_result.spirv, 69u),
-        "unused ancillary input changed the module requirements");
-
-  shader[1] = EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4);
-  auto sample_result = RecompileForTest(shader, options);
-  Check(ProgramHasInput(sample_result.program, StageInputKind::SampleId) &&
-            ProgramHasInput(sample_result.program, StageInputKind::Layer) &&
-            !ProgramHasInput(sample_result.program, StageInputKind::PackedAncillary),
-        "sample index extraction discarded another live ancillary field");
-  Check(SpirvHasDecorationValueWithDecoration(sample_result.spirv, 11u, 18u, 14u) &&
-            SpirvContainsCapability(sample_result.spirv, 35u),
-        "sample index lacks its flat builtin or sample-rate capability");
-  const auto sample_source = DisassembleSpirvBinary(sample_result.spirv);
-  Check(SpirvSourceHasInstructionUsing(sample_source, "OpLoad", "%int %gl_SampleID"),
-        "sample index was not loaded from its scalar integer input");
-  CheckSpirvBinaryValidates(sample_result.spirv);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  shader[1] = EncodeVop3Word1(5 + 256, 128 + 12, 128 + 4);
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "unsupported live ancillary field was silently replaced");
-  shader[1] = EncodeVop3Word1(5 + 256, 128 + 16, 128 + 11);
-  shader[4] = EncodeExp0(0x00, 0x7);
-  shader[5] = EncodeExp1(6, 7, 5, 0);
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "direct raw ancillary export was silently replaced after field lowering");
-#endif
 }
 
 void TestGraphicsCreateInterpolantMapping() {
@@ -6432,7 +7041,84 @@ void TestNewShaderRecompilerMubufFormatTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
+void TestNewShaderRecompilerCapturedMubufStoreFormatD16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x84, 4), EncodeMubuf1(40, 0, 1), // packed x
+      EncodeMubuf0(0x85, 8), EncodeMubuf1(44, 0, 1), // packed xy
+      EncodeMubuf0(0x86, 12), EncodeMubuf1(48, 0, 1), // packed xyz
+      0xe21c6000u, 0x8002000eu, // captured packed xyzw: v[0:1], v14, s[8:11]
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 5u,
+        "captured D16 stores did not decode as four instructions plus endpgm");
+  const auto &captured = decoded.instructions[3];
+  Check(captured.family == Decoder::Family::MUBUF &&
+            captured.opcode != Decoder::Opcode::UNSUPPORTED &&
+            captured.opcode_id == 0x87u && captured.word_count == 2u &&
+            captured.raw_count == 2u && captured.raw[0] == 0xe21c6000u &&
+            captured.raw[1] == 0x8002000eu && captured.data_dwords == 2u &&
+            captured.data_bits == 16u && captured.data_components == 4u &&
+            captured.formatted && !captured.typed &&
+            captured.dst.kind == Decoder::OperandKind::Vgpr && captured.dst.reg == 0u &&
+            captured.src0.kind == Decoder::OperandKind::Vgpr && captured.src0.reg == 14u &&
+            captured.src1.kind == Decoder::OperandKind::Sgpr && captured.src1.reg == 8u,
+        "decoder rejected captured MUBUF BUFFER_STORE_FORMAT_D16_XYZW fields");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  std::array<uint32_t, 12> user_data{};
+  for (const uint32_t base : {0u, 8u}) {
+    user_data[base] = 0x10000u + base * 0x1000u;
+    user_data[base + 1u] = 8u << 16u;
+    user_data[base + 2u] = 16u;
+    user_data[base + 3u] =
+        static_cast<uint32_t>(base == 0u
+                                  ? Prospero::BufferFormat::k16_16_16_16UInt
+                                  : Prospero::BufferFormat::k16_16_16_16Float)
+        << 12u;
+  }
+  options.user_data = user_data;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_X") &&
+            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XY") &&
+            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XYZ") &&
+            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XYZW"),
+        "D16 formatted store family is incomplete in the decoded dump");
+  Check(CountSourceOccurrences(result.ir_dump, "StoreBufferU32 ") == 2u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32x2 ") == 2u,
+        "D16 formatted stores did not retain packed one/two-dword IR widths");
+  Check(std::ranges::any_of(result.program.memory_info, [](const auto &memory) {
+          return memory.formatted && !memory.typed && memory.data_bits == 16u &&
+                 memory.data_dwords == 2u && memory.component_count == 4u;
+        }),
+        "D16 formatted stores lost packed component metadata");
+  Check(SpirvContainsOpcode(result.spirv, 230),
+        "D16 formatted stores emitted no race-safe sub-dword atomic update");
+  Check(SpirvContainsOpcode(result.spirv, 194) &&
+            SpirvContainsOpcode(result.spirv, 199),
+        "D16 formatted stores did not unpack high/low halves");
+  Check(SpirvContainsExtInst(result.spirv, 62) &&
+            SpirvContainsExtInst(result.spirv, 58),
+        "floating D16 formatted store did not unpack FP16 source and repack the "
+        "destination component");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t short_format_shader[] = {
+      EncodeMubuf0(0x87), EncodeMubuf1(0, 0, 0), EncodeSopp(0x01)};
+  auto short_user_data = user_data;
+  short_user_data[3] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k16Float) << 12u;
+  options.user_data = short_user_data;
+  auto short_format_result = RecompileForTest(short_format_shader, options);
+  CheckSpirvBinaryValidates(short_format_result.spirv);
+}
+
+void TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x04),
       EncodeMubuf1(0, 0, 1), // buffer_store_format_x
@@ -6459,11 +7145,35 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "OpArrayLength"),
-        "formatted store SPIR-V lacks runtime storage-buffer bounds check");
+  Check(!SpirvContainsOpcode(result.spirv, 68u),
+        "formatted store SPIR-V retained the driver-crashing OpArrayLength");
+  Check(SpirvContainsOpcode(result.spirv, 176u),
+        "formatted store SPIR-V lacks dynamic byte-limit bounds checks");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
+}
+
+void TestStorageBufferBoundsAvoidDynamicArrayLengthLowering() {
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x04),
+      EncodeMubuf1(0, 0, 1), // buffer_store_format_x
+      0xbf810000u,
+  };
+
+  std::array<uint32_t, 64> user_data{};
+  user_data[1] = 4u << 16u;
+  user_data[2] = 5u;
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u;
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(!SpirvContainsOpcode(result.spirv, 68u),
+        "storage-buffer lowering retained the driver-crashing OpArrayLength");
+  Check(SpirvContainsOpcode(result.spirv, 176u),
+        "storage-buffer lowering lost dynamic byte-limit bounds checks");
 }
 
 void TestNewShaderRecompilerTypedBufferTranslation() {
@@ -7416,6 +8126,41 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestPartitionedGraphicsLoopBudgetSpirv() {
+  const uint32_t bounded_shader[] = {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 2),         // leave the loop when scc == 0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopp(0x02, 0xfffcu),   // backedge to the loop condition
+      EncodeSopp(0x01),            // s_endpgm
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  options.wave_size = 64;
+  options.compute_workgroup_limits.native_subgroup_size = 32;
+
+  auto bounded = RecompileForTest(bounded_shader, options);
+  Check(Common::ContainsStr(DisassembleSpirvBinary(bounded.spirv),
+                            "graphics_loop_counter"),
+        "partitioned graphics loop omitted its finite iteration budget");
+  CheckSpirvBinaryValidates(bounded.spirv);
+
+  const uint32_t stalled_shader[] = {
+      EncodeSMovB32(0, 128),        // s0 = 0
+      EncodeSop2(0x00, 0, 0, 129),  // loop: s_add_u32 s0, s0, 1
+      EncodeSopc(0x0a, 0, 130),     // s_cmp_lt_u32 s0, 2
+      EncodeSopp(0x05, 0xfffdu),    // do-while backedge
+      EncodeSopp(0x01),             // s_endpgm
+  };
+  auto stalled = RecompileForTest(stalled_shader, options);
+  Check(Common::ContainsStr(DisassembleSpirvBinary(stalled.spirv),
+                            "graphics_loop_counter"),
+        "stalled partitioned graphics loop omitted its finite budget");
+  CheckSpirvBinaryValidates(stalled.spirv);
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
@@ -8017,7 +8762,7 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
       std::ranges::count_if(graph.blocks, [](const auto &block) {
         return block.inst_begin == block.inst_end;
       });
-  Check(original_block_count == 7u && graph.natural_loops.size() == 1u,
+  Check(original_block_count == 8u && graph.natural_loops.size() == 1u,
         "nested early-exit fixture has the wrong native CFG");
   const bool structured = ShaderRecompiler::CFG::Structurize(graph);
   Check(structured, graph.unsupported_reason.c_str());
@@ -8087,11 +8832,44 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
                      ShaderRecompiler::CFG::BranchCondition::GotoVariable;
     route_sets += block.terminator.goto_value >= 0;
   }
-  Check(graph.blocks.size() == 5u && route_selects == 0u && route_sets == 0u,
-        "shared return arm introduced synthetic routing state");
+  Check(graph.blocks.size() == 10u && route_selects == 1u && route_sets == 3u,
+        "shared selection arm was not routed through typed goto state");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "EXEC/SCC shared-arm structurization changed semantic coverage");
+
+  ShaderRecompiler::IR::Program value_ir;
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.compute = &compute_info;
+  value_ir = ShaderRecompiler::Frontend::TranslateProgram(decoded, graph,
+                                                          translate_options);
+  uint32_t goto_sets = 0;
+  uint32_t goto_gets = 0;
+  for (const auto *block : value_ir.blocks) {
+    for (const auto &inst : *block) {
+      goto_sets += inst.GetOpcode() ==
+                   ShaderRecompiler::IR::ValueOpcode::SetGotoVariable;
+      goto_gets += inst.GetOpcode() ==
+                   ShaderRecompiler::IR::ValueOpcode::GetGotoVariable;
+    }
+  }
+  Check(goto_sets == 3u && goto_gets == 1u,
+        "shared-arm route was not represented by typed goto pseudo-ops");
+  ShaderRecompiler::IR::RewriteToSsa(value_ir.blocks);
+  ShaderRecompiler::IR::RemoveIdentities(value_ir.blocks);
+  ShaderRecompiler::IR::EliminateDeadCode(value_ir.blocks);
+  for (const auto *block : value_ir.blocks) {
+    for (const auto &inst : *block) {
+      Check(inst.GetOpcode() !=
+                    ShaderRecompiler::IR::ValueOpcode::GetGotoVariable &&
+                inst.GetOpcode() !=
+                    ShaderRecompiler::IR::ValueOpcode::SetGotoVariable,
+            "typed goto pseudo-op survived SSA rewriting");
+    }
+  }
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8099,65 +8877,13 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   Check(!result.program.dispatcher_fallback &&
             Common::ContainsStr(result.ir_dump, "mode=structured"),
         "EXEC/SCC shared-arm epilogue did not stay structured");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 2u,
+  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 3u,
         "EXEC/SCC shared-arm SPIR-V has the wrong selection-merge count");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "EXEC/SCC shared-arm SPIR-V unexpectedly used dispatcher OpSwitch");
   Check(Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
-                             "OpGroupNonUniformBallot"),
-        "scalar mask SCC did not reduce the complete wave mask");
-  CheckSpirvBinaryValidates(result.spirv);
-}
-
-void TestSharedReturnPreservesDescriptorDominance() {
-  const uint32_t shader[] = {
-      EncodeSmem0(0x02, 32, 14), (125u << 25u) | 0x60u,
-      EncodeSopc(0x06, 0, 128),
-      EncodeSopp(0x04, 10), // first early return
-      EncodeSmem0(0x02, 32, 14), (125u << 25u) | 0x50u,
-      EncodeSopc(0x06, 1, 128),
-      EncodeSopp(0x04, 6), // second early return after descriptor overwrite
-      EncodeSmem0(0x08, 56, 16), 125u << 25u,
-      EncodeVop1(0x01, 0, 56),
-      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
-      EncodeSopp(0x01),
-      EncodeSopp(0x01), // shared return epilogue
-  };
-  ShaderRecompiler::Decoder::Program decoded;
-  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
-  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
-  const auto original_coverage =
-      CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
-  const auto *overwrite = graph.FindBlockByPc(0x10u);
-  const auto *body = graph.FindBlockByPc(0x20u);
-  Check(graph.blocks.size() == 5u && overwrite != nullptr && body != nullptr &&
-            graph.Dominates(overwrite->id, body->id) &&
-            std::ranges::count_if(graph.blocks, [](const auto &block) {
-              return block.terminator.kind ==
-                     ShaderRecompiler::CFG::TerminatorKind::Return;
-            }) == 2 &&
-            CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-                original_coverage,
-        "shared return routing lost the live descriptor's dominance");
-
-  std::array<uint32_t, 28> table{};
-  table[0x50u / 4u] = 0x2000u;
-  table[0x50u / 4u + 2u] = 4u;
-  table[0x60u / 4u] = 0x3000u;
-  table[0x60u / 4u + 2u] = 4u;
-  std::array<uint32_t, 32> user_data{};
-  const auto address = reinterpret_cast<uint64_t>(table.data());
-  user_data[28] = static_cast<uint32_t>(address);
-  user_data[29] = static_cast<uint32_t>(address >> 32u);
-  auto options = MakeCompileOptions(ShaderType::Pixel);
-  options.user_data = user_data;
-  auto result = RecompileForTest(shader, options, ReadHostTestMemory);
-  Check(!result.program.dispatcher_fallback &&
-            result.resources.buffers.size() == 1u &&
-            result.resources.buffers[0].dwords[0] == 0x2000u,
-        "return-only descriptor reached the surviving buffer operation");
+                            "OpGroupNonUniformBallot"),
+        "EXEC/SCC branch lost the numeric initial wave mask");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8216,7 +8942,7 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
+void TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // outer forward-skip condition
       EncodeSopp(0x04, 4),    // outer -> shared or nested condition
@@ -8253,8 +8979,15 @@ void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
       std::ranges::count_if(graph.blocks, [](const auto &block) {
         return block.terminator.goto_value >= 0;
       });
-  Check(route_selects == 0u && route_sets == 0u,
-        "nested selections introduced routing state for a shared return");
+  const bool has_early_route =
+      std::ranges::any_of(graph.blocks, [](const auto &block) {
+        return block.start_pc < 0x30u &&
+               (block.terminator.condition ==
+                    ShaderRecompiler::CFG::BranchCondition::GotoVariable ||
+                block.terminator.goto_value >= 0);
+      });
+  Check(route_selects == 1u && route_sets == 3u && !has_early_route,
+        "shared exits were routed before the innermost blocking construct");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8263,38 +8996,6 @@ void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
             Common::ContainsStr(result.ir_dump, "mode=structured") &&
             SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "inner-first shared-exit routing did not stay structured");
-  CheckSpirvBinaryValidates(result.spirv);
-}
-
-void TestNewShaderRecompilerCfgAlternatingSharedReturns() {
-  // PS 0x845315ec188c33db: nested conditions alternate between two shared
-  // terminal epilogues. Each branch must leave through its own selection merge.
-  const uint32_t shader[] = {
-      EncodeSopc(0x06, 0, 128),
-      EncodeSopp(0x04, 8), // outer -> second return or middle condition
-      EncodeSopc(0x06, 1, 128),
-      EncodeSopp(0x04, 2), // middle -> first return or inner condition
-      EncodeSopc(0x06, 2, 128),
-      EncodeSopp(0x04, 4), // inner -> second return or first return
-      EncodeVop1(0x01, 0, 129),
-      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
-      EncodeSopp(0x01),
-      EncodeVop1(0x01, 0, 130),
-      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
-      EncodeSopp(0x01),
-  };
-  ShaderRecompiler::Decoder::Program decoded;
-  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
-  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
-  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(graph.blocks.size() == 5u, "alternating returns fixture has the wrong CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
-  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
-        "alternating returns duplicated a terminal epilogue");
-
-  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
-  Check(!result.program.dispatcher_fallback,
-        "alternating returns did not use structured control flow");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8360,60 +9061,6 @@ void TestNewShaderRecompilerCfgLoopSharedRegion() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
-  // The first selection needs routing at its externally entered common tail.
-  // A later loop has the same lexical shared-arm shape, but its exit branches
-  // are already structured and must retain their loop-control role.
-  const uint32_t shader[] = {
-      EncodeSopc(0x06, 0, 0), // 0: enclosing selection
-      EncodeSopp(0x04, 4),    // 0 -> 3 or 1
-      EncodeSopc(0x06, 1, 1), // 1: inner selection
-      EncodeSopp(0x04, 6),    // 1 -> 5 or 2
-      EncodeSMovB32(2, 129),  // 2: inner body
-      EncodeSopp(0x02, 2),    // 2 -> 4
-      EncodeSMovB32(3, 129),  // 3: outer arm
-      EncodeSopp(0x02, 0),    // 3 -> 4
-      EncodeSMovB32(4, 129),  // 4: shared tail
-      EncodeSopp(0x02, 0),    // 4 -> 5
-      EncodeSopc(0x06, 5, 5), // 5: loop header
-      EncodeSopp(0x04, 4),    // 5 -> 8 or 6
-      EncodeSopc(0x06, 6, 6), // 6: early break
-      EncodeSopp(0x04, 2),    // 6 -> 8 or 7
-      EncodeSopc(0x06, 7, 7), // 7: loop latch
-      EncodeSopp(0x05, 0xfffau), // 7 -> 5 or 8
-      EncodeSMovB32(8, 129),  // 8: terminal
-      0xbf810000u,
-  };
-
-  ShaderRecompiler::Decoder::Program decoded;
-  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
-  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
-  const auto original_coverage =
-      CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(graph.blocks.size() == 9u && graph.natural_loops.size() == 1u,
-        "shared-region/early-break fixture has the wrong native CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
-  Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u,
-        "selection routing introduced a cycle around a structured loop exit");
-  Check(std::ranges::count_if(graph.blocks, [](const auto &block) {
-          return block.terminator.condition ==
-                 ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-        }) == 1u,
-        "shared-region routing rewrote unrelated loop-control branches");
-  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-            original_coverage,
-        "shared-region/early-break routing changed semantic coverage");
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  auto result = RecompileForTest(shader, options);
-  Check(!result.program.dispatcher_fallback &&
-            SpirvInstructionOpcodeCount(result.spirv, 246) == 1u &&
-            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
-        "shared-region/early-break routing lost structured loop control");
-  CheckSpirvBinaryValidates(result.spirv);
-}
-
 void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // block 0
@@ -8425,9 +9072,9 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
       EncodeSopc(0x06, 3, 3), // block 3
       EncodeSopp(0x04, 2),    // block 3 -> 5 or 4
       EncodeSMovB32(4, 129),  // block 4
-      0xbf810000u,            // block 4 returns
+      0xbf810000u,            // block 4 -> 6
       EncodeSMovB32(5, 129),  // block 5
-      0xbf810000u,            // block 5 returns
+      0xbf810000u,            // block 5 -> 6
   };
 
   ShaderRecompiler::Decoder::Program decoded;
@@ -8435,7 +9082,7 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   Check(
-      graph.blocks.size() == 6u &&
+      graph.blocks.size() == 7u &&
           graph.blocks[0].successors == std::vector<uint32_t>({1, 2}) &&
           graph.blocks[0].terminator.true_block == 2u &&
           graph.blocks[0].terminator.false_block == 1u &&
@@ -8448,12 +9095,8 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
           graph.blocks[3].successors == std::vector<uint32_t>({4, 5}) &&
           graph.blocks[3].terminator.true_block == 5u &&
           graph.blocks[3].terminator.false_block == 4u &&
-          graph.blocks[4].successors.empty() &&
-          graph.blocks[5].successors.empty() &&
-          graph.blocks[4].terminator.kind ==
-              ShaderRecompiler::CFG::TerminatorKind::Return &&
-          graph.blocks[5].terminator.kind ==
-              ShaderRecompiler::CFG::TerminatorKind::Return,
+          graph.blocks[4].successors == std::vector<uint32_t>({6}) &&
+          graph.blocks[5].successors == std::vector<uint32_t>({6}),
       "overlapping early-exit fixture does not match the observed shader CFG");
   const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
@@ -8871,6 +9514,2911 @@ void TestComputeDispatchWaveSize() {
         "dispatch with CS_W32_EN did not select wave32");
 }
 
+uint64_t WorkgroupInvocationCount(const std::array<uint32_t, 3> &size) {
+  uint64_t count = 1;
+  for (const auto dimension : size) {
+    Check(dimension != 0 && count <= UINT32_MAX / dimension,
+          "accepted compute workgroup has zero or overflowing invocation count");
+    count *= dimension;
+  }
+  return count;
+}
+
+void CheckComputeWorkgroupLayout(
+    const ShaderRecompiler::ComputeWorkgroupLayout &layout,
+    const std::array<uint32_t, 3> &guest,
+    const ShaderRecompiler::ComputeWorkgroupLimits &limits) {
+  Check(layout.guest_size == guest,
+        "compute planner changed the guest geometry");
+  for (uint32_t axis = 0; axis < 3; axis++) {
+    Check(layout.host_size[axis] > 0 &&
+              layout.host_size[axis] <= limits.max_size[axis],
+          "compute host shape exceeds a per-axis device limit");
+  }
+  const auto count = WorkgroupInvocationCount(guest);
+  Check(WorkgroupInvocationCount(layout.host_size) == count &&
+            count <= limits.max_invocations,
+        "compute reshape changed the exact invocation count or exceeded its limit");
+  const bool guest_fits = guest[0] <= limits.max_size[0] &&
+                          guest[1] <= limits.max_size[1] &&
+                          guest[2] <= limits.max_size[2];
+  Check(!guest_fits || layout.host_size == guest,
+        "compute planner should preserve an already valid guest shape");
+}
+
+// Include ComputeExecution.h and place these synthetic unit tests beside the
+// existing compute planning tests. Register both functions in the CPU runner.
+ShaderRecompiler::IR::Block* AddExecutionPlanBlock(ShaderRecompiler::IR::Program& program) {
+  using namespace ShaderRecompiler::IR;
+  const auto id = static_cast<uint32_t>(program.blocks.size());
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto* block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = id});
+  return block;
+}
+
+struct CooperativeExecutionFixture {
+  using O = ShaderRecompiler::IR::ValueOpcode;
+  using V = ShaderRecompiler::IR::Value;
+  ShaderRecompiler::IR::Program program;
+  ShaderComputeInputInfo compute{};
+  ShaderRecompiler::ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  V local;
+  V lane;
+
+  explicit CooperativeExecutionFixture(std::array<uint32_t,3> shape = {128,1,1}) {
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    for (uint32_t axis=0; axis<3; ++axis) compute.threads_num[axis] = shape[axis];
+    compute.wave_size = 64;
+    compute.lds_size_dwords = shape[0]*shape[1]*shape[2] + 3u;
+    compute.needs_lds_barriers = true;
+    AddBlock();
+    local = Emit(0,O::GetBuiltin,{V(static_cast<uint32_t>(
+        ShaderRecompiler::IR::StageInputKind::LocalInvocationIndex)),V(0u)});
+    lane = Emit(0,O::LaneId);
+    program.memory_info.push_back({.kind=ShaderRecompiler::IR::ResourceKind::Lds});
+  }
+  uint32_t AddBlock() {
+    const auto index = static_cast<uint32_t>(program.blocks.size());
+    AddExecutionPlanBlock(program);
+    program.block_info.back().terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    return index;
+  }
+  V Emit(uint32_t block,O op,std::initializer_list<V> args={}) {
+    return V(&program.blocks[block]->AppendNewInst(op,args));
+  }
+  V Shared(uint32_t block,O op,std::initializer_list<V> args,uint32_t memory=0u) {
+    const auto value=Emit(block,op,args);
+    value.TryInstruction()->SetFlags(ShaderRecompiler::IR::MemoryFlags{.index=memory});
+    return value;
+  }
+  void Branch(uint32_t from,uint32_t to) {
+    program.blocks[from]->AddBranch(program.blocks[to]);
+    auto& term=program.block_info[from].terminator;
+    term.kind=ShaderRecompiler::CFG::TerminatorKind::Branch;
+    term.true_block=program.block_info[to].id;
+  }
+  void Conditional(uint32_t from,uint32_t yes,uint32_t no,V condition) {
+    program.blocks[from]->AddBranch(program.blocks[yes]);
+    program.blocks[from]->AddBranch(program.blocks[no]);
+    auto& info=program.block_info[from];
+    info.terminator.kind=ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    info.terminator.true_block=program.block_info[yes].id;
+    info.terminator.false_block=program.block_info[no].id;
+    info.condition=condition;
+  }
+  V FirstWave(uint32_t block) {
+    const auto pred=Emit(block,O::ULessThan32,{local,V(64u)});
+    const auto ballot=Emit(block,O::Ballot,{pred});
+    const auto low=Emit(block,O::CompositeExtractU32x4,{ballot,V(0u)});
+    return Emit(block,O::INotEqual32,{low,V(0u)});
+  }
+  void KeepWave(uint32_t block) {
+    const auto value=Emit(block,O::ReadLane,{local,V(63u)});
+    Emit(block,O::ReferenceU32,{value});
+  }
+  auto Plan() {
+    ShaderRecompiler::IR::ValidateProgram(program,true);
+    ShaderStageInputInfo input{};
+    input.compute=&compute;
+    return ShaderRecompiler::PlanComputeExecution(program,input,limits);
+  }
+  void RequireWholeGroup(const char* message) {
+    const auto plan=Plan();
+    const std::array<uint32_t,3> guest{compute.threads_num[0],compute.threads_num[1],compute.threads_num[2]};
+    Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor==1u &&
+          plan.layout.guest_size==guest &&
+          WorkgroupInvocationCount(plan.layout.host_size)==WorkgroupInvocationCount(guest),message);
+  }
+};
+
+void TestCooperativeWave64GeometryAndBudget() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  {
+    F f({8,8,1});
+    const auto own=f.Emit(0,O::ShiftLeftLogical32,{f.local,V(2u)});
+    f.Shared(0,O::WriteSharedU32,{own,f.local,V(true)});
+    f.Emit(0,O::Barrier);
+    const auto read=f.Shared(0,O::LoadSharedU32,{own,V(true)});
+    f.Emit(0,O::ReferenceU32,{read});
+    f.KeepWave(0);
+    Check(f.Plan().error.empty() && f.Plan().IsSplitWave64() && !f.Plan().IsCooperativeWave64(),
+          "one complete guest wave64 keeps LDS/barriers on the split host workgroup");
+  }
+  for (const auto shape : {std::array<uint32_t,3>{128,1,1},
+                          std::array<uint32_t,3>{8,4,4},
+                          std::array<uint32_t,3>{16,16,1}}) {
+    F f(shape);
+    const auto count=static_cast<uint32_t>(WorkgroupInvocationCount(shape));
+    const auto own=f.Emit(0,O::ShiftLeftLogical32,{f.local,V(2u)});
+    f.Shared(0,O::WriteSharedU32,{own,f.local,V(true)});
+    f.Emit(0,O::Barrier);
+    const auto next=f.Emit(0,O::IAdd32,{f.local,V(64u)});
+    const auto peer=f.Emit(0,O::BitwiseAnd32,{next,V(count-1u)});
+    const auto address=f.Emit(0,O::ShiftLeftLogical32,{peer,V(2u)});
+    const auto read=f.Shared(0,O::LoadSharedU32,{address,V(true)});
+    f.Emit(0,O::ReferenceU32,{read});
+    f.KeepWave(0);
+    f.RequireWholeGroup("multi-wave LDS requires one full host workgroup and isolated wave64 collectives");
+    // Collective scratch and guest LDS use separate full workgroup arrays;
+    // neither allocation may wrap.
+    const uint64_t bytes=(uint64_t{count}+f.compute.lds_size_dwords)*sizeof(uint32_t);
+    f.limits.max_shared_memory_bytes=static_cast<uint32_t>(bytes);
+    f.RequireWholeGroup("cooperative LDS and collective scratch must fit at the exact byte limit");
+    f.limits.max_shared_memory_bytes=static_cast<uint32_t>(bytes-1u);
+    Check(!f.Plan().error.empty(),"cooperative shared memory accepted one byte beyond its device limit");
+    f.limits.max_shared_memory_bytes=UINT32_MAX;
+    f.compute.lds_size_dwords=UINT32_MAX;
+    Check(!f.Plan().error.empty(),"cooperative LDS byte multiplication wrapped past the shared-memory guard");
+    f.compute.lds_size_dwords=count;
+    f.limits.max_invocations=count-1u;
+    Check(!f.Plan().error.empty(),"cooperative mode partitioned a guest workgroup that did not fit the device");
+  }
+}
+
+void TestCooperativeWave64BarrierOrderAndControl() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  // Both divergent arms rendezvous at the same two ordered, acyclic barriers.
+  // After the last barrier waves can take different paths or finish at different times.
+  {
+    F f;
+    const auto left=f.AddBlock(),right=f.AddBlock(),phase=f.AddBlock();
+    const auto finish=f.AddBlock(),work=f.AddBlock();
+    f.Conditional(0,left,right,f.FirstWave(0));
+    f.Shared(left,O::WriteSharedU32,{V(0u),V(7u),
+        f.Emit(left,O::IEqual32,{f.local,V(0u)})});
+    f.Branch(left,phase); f.Branch(right,phase);
+    f.Emit(phase,O::Barrier);
+    f.Emit(phase,O::Barrier); // distinct sites within the same original IR block
+    f.Conditional(phase,work,finish,f.FirstWave(phase));
+    f.KeepWave(work); f.Branch(work,finish);
+    f.RequireWholeGroup("ordered guest barriers must allow different per-wave control before and after rendezvous");
+  }
+  // A fixed loop lies between barrier phases; the scheduler must yield at
+  // its backedge instead of executing the complete loop as one quantum.
+  {
+    F f;
+    const auto loop=f.AddBlock(),phase=f.AddBlock(),finish=f.AddBlock();
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    f.Emit(0,O::Barrier); f.Branch(0,loop);
+    auto& phi=f.program.blocks[loop]->AppendNewInst(O::Phi,{},
+        static_cast<uint64_t>(ShaderRecompiler::IR::Type::U32));
+    phi.AddPhiOperand(f.program.blocks[0],V(0u));
+    const auto next=f.Emit(loop,O::IAdd32,{V(&phi),V(1u)});
+    phi.AddPhiOperand(f.program.blocks[loop],next);
+    f.KeepWave(loop);
+    f.Conditional(loop,loop,phase,f.Emit(loop,O::ULessThan32,{next,V(3u)}));
+    f.program.block_info[loop].terminator.loop_header=true;
+    f.program.block_info[loop].terminator.continue_block=f.program.block_info[loop].id;
+    f.program.block_info[loop].terminator.merge_block=f.program.block_info[phase].id;
+    f.Emit(phase,O::Barrier); f.Branch(phase,finish); f.KeepWave(finish);
+    f.RequireWholeGroup("a bounded per-wave loop between ordered barriers must remain schedulable");
+  }
+  // RDNA2 defines a barrier as satisfied once all surviving waves reach it.
+  // A wave may therefore terminate before the first barrier in the chain.
+  {
+    F f;
+    const auto body=f.AddBlock(),finish=f.AddBlock();
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    f.Conditional(0,body,finish,f.FirstWave(0));
+    f.Emit(body,O::Barrier); f.Branch(body,finish);
+    f.KeepWave(finish);
+    f.RequireWholeGroup("early-terminated waves must satisfy the remaining guest barrier");
+  }
+  // A barrier may be revisited. The scheduler must treat each release as one
+  // dynamic generation and keep loop-carried state separate for every wave.
+  {
+    F f;
+    const auto body=f.AddBlock(),finish=f.AddBlock();
+    f.Branch(0,body);
+    auto& phi=f.program.blocks[body]->AppendNewInst(O::Phi,{},
+        static_cast<uint64_t>(ShaderRecompiler::IR::Type::U32));
+    phi.AddPhiOperand(f.program.blocks[0],V(0u));
+    f.Emit(body,O::Barrier);
+    const auto next=f.Emit(body,O::IAdd32,{V(&phi),V(1u)});
+    phi.AddPhiOperand(f.program.blocks[body],next);
+    f.Conditional(body,body,finish,f.Emit(body,O::ULessThan32,{next,V(3u)}));
+    f.program.block_info[body].terminator.loop_header=true;
+    f.program.block_info[body].terminator.continue_block=f.program.block_info[body].id;
+    f.program.block_info[body].terminator.merge_block=f.program.block_info[finish].id;
+    f.KeepWave(finish);
+    f.RequireWholeGroup(
+        "a bounded cyclic guest barrier must preserve dynamic rendezvous generations");
+  }
+  {
+    F f;
+    const auto left=f.AddBlock(),right=f.AddBlock(),finish=f.AddBlock();
+    f.Conditional(0,left,right,f.FirstWave(0));
+    f.Emit(left,O::Barrier); f.Branch(left,finish);
+    f.Emit(right,O::Barrier); f.Branch(right,finish);
+    f.KeepWave(finish);
+    f.RequireWholeGroup(
+        "incomparable acyclic barrier sites must form one dynamic rendezvous");
+  }
+}
+
+void TestCooperativeWave64OperationBoundaries() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  enum class Scenario { IntegerAtomic,LiveAtomic,Gds,Scratch,WithinWaveBranch };
+  for (const auto scenario : {Scenario::IntegerAtomic,Scenario::LiveAtomic,
+       Scenario::Gds,Scenario::Scratch,Scenario::WithinWaveBranch}) {
+    F f({16,16,1});
+    const auto finish=f.AddBlock();
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(0u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    f.Emit(0,O::Barrier);
+    if (scenario==Scenario::IntegerAtomic || scenario==Scenario::LiveAtomic) {
+      const auto old=f.Shared(0,O::SharedAtomicOr32,{V(0u),V(1u),V(true)});
+      if (scenario==Scenario::LiveAtomic) f.Emit(0,O::ReferenceU32,{old});
+    }
+    if (scenario==Scenario::Gds || scenario==Scenario::Scratch) {
+      ShaderRecompiler::IR::MemoryInfo memory{};
+      memory.kind=scenario==Scenario::Gds ? ShaderRecompiler::IR::ResourceKind::Gds :
+                                          ShaderRecompiler::IR::ResourceKind::Scratch;
+      f.program.memory_info.push_back(memory);
+      if (scenario==Scenario::Gds) {
+        // factor==1 must not accidentally enable the earlier one-wave GDS path.
+        const auto append=f.Shared(0,O::DataAppend,
+            {V(0x00040004u),V(true),V(0xffffffffu),V(0xffffffffu)},1u);
+        f.Emit(0,O::ReferenceU32,{append});
+      } else {
+        const auto handle=f.Emit(0,O::GetScratchResource);
+        const auto read=f.Shared(0,O::LoadAddressU32,{handle,V(0u),V(0u),V(true)},1u);
+        f.Emit(0,O::ReferenceU32,{read});
+      }
+    }
+    f.Emit(0,O::Barrier);
+    if (scenario==Scenario::WithinWaveBranch) {
+      const auto body=f.AddBlock();
+      f.Conditional(0,body,finish,f.Emit(0,O::INotEqual32,{f.lane,V(0u)}));
+      f.KeepWave(body); f.Branch(body,finish);
+    } else {
+      f.Branch(0,finish);
+    }
+    f.KeepWave(finish);
+    if (scenario==Scenario::IntegerAtomic || scenario==Scenario::LiveAtomic)
+      f.RequireWholeGroup("cooperative LDS integer atomics lost their whole-workgroup allocation or return value");
+    else
+      Check(!f.Plan().error.empty(),
+            "cooperative LDS support bypassed GDS, scratch or within-wave convergence boundaries");
+  }
+}
+
+void TestCooperativeWave64ScalarReadBranchUniformity() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+
+  for (const bool scalar : {true, false}) {
+    F f({256, 1, 1});
+    f.program.memory_info.push_back({.kind = scalar ? IR::ResourceKind::ScalarBuffer
+                                                    : IR::ResourceKind::Buffer});
+    const auto resource = f.Emit(0, O::GetBufferResource,
+                                 {V(0u), V(0u), V(256u), V(0u)});
+    const auto value = scalar
+                           ? f.Shared(0, O::ReadConstBuffer,
+                                      {resource, V(0u)}, 1u)
+                           : f.Shared(0, O::LoadBufferU32,
+                                      {resource, V(0u), V(0u), V(0u), V(true)}, 1u);
+    // Force cooperative scheduling independently of the branch. Scalar memory
+    // loads execute once and broadcast within their guest wave. Ordinary
+    // vector loads remain per-lane and retain the rejection boundary.
+    f.Emit(0, O::Barrier);
+    const auto taken = f.AddBlock();
+    const auto other = f.AddBlock();
+    const auto finish = f.AddBlock();
+    const auto condition = f.Emit(0, O::ULessThanEqual32, {value, V(1u)});
+    f.Conditional(0, taken, other, condition);
+    f.KeepWave(taken);
+    f.Branch(taken, finish);
+    f.Branch(other, finish);
+    f.KeepWave(finish);
+
+    const auto plan = f.Plan();
+    if (!scalar) {
+      Check(!plan.error.empty() &&
+                Common::ContainsStr(plan.error, "wave-uniform branch"),
+            "per-lane vector-buffer load controlled a cooperative branch");
+    } else {
+      Check(plan.error.empty() && plan.IsCooperativeWave64() &&
+                plan.wave_partition_factor == 1u,
+            "wave-uniform scalar-buffer read was rejected as a cooperative branch condition");
+    }
+  }
+}
+
+void TestCooperativeWave64LegacyBarrierInsertionScope() {
+  using F=CooperativeExecutionFixture;
+  using O=F::O;
+  using V=F::V;
+  for (const uint32_t count : {128u,256u}) {
+    F f({count,1,1});
+    f.Shared(0,O::WriteSharedU32,{V(0u),V(1u),
+        f.Emit(0,O::IEqual32,{f.local,V(0u)})});
+    const auto read=f.Shared(0,O::LoadSharedU32,{V(0u),V(true)});
+    f.Emit(0,O::ReferenceU32,{read}); f.KeepWave(0);
+    const auto stats=ShaderRecompiler::IR::InsertSharedMemoryBarriers(
+        f.program,64u,f.compute);
+    Check(stats.inserted_barriers==0u,
+          "single-wave implicit LDS barriers became guest workgroup rendezvous in cooperative mode");
+    for (const auto* block : f.program.blocks)
+      for (const auto& inst : *block)
+        Check(inst.GetOpcode()!=O::Barrier,
+              "cooperative static barrier phases contain an unmarked heuristic barrier");
+  }
+}
+
+void TestCooperativeWave64ConsecutiveLdsReadsSharePhase() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  const auto compile = [](uint32_t read_count, bool intervening_write = false) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64u;
+    auto* block = AddExecutionPlanBlock(program);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+    program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+    auto& lane = block->AppendNewInst(O::LaneId);
+    auto& write = block->AppendNewInst(
+        O::WriteSharedU32,
+        {IR::Value(0u), IR::Value(&lane), IR::Value(true)});
+    write.SetFlags(IR::MemoryFlags{.index = 0u});
+    block->AppendNewInst(O::Barrier);
+    for (uint32_t index = 0; index < read_count; ++index) {
+      if (intervening_write && index == 1u) {
+        auto& boundary_write = block->AppendNewInst(
+            O::WriteSharedU32,
+            {IR::Value(4u), IR::Value(&lane), IR::Value(true)});
+        boundary_write.SetFlags(IR::MemoryFlags{.index = 0u});
+      }
+      auto& read = block->AppendNewInst(
+          O::LoadSharedU32, {IR::Value(index * 4u), IR::Value(true)});
+      read.SetFlags(IR::MemoryFlags{.index = 0u});
+      block->AppendNewInst(O::ReferenceU32, {IR::Value(&read)});
+    }
+    IR::ValidateProgram(program, true);
+    IR::BuildSrtPlan(program);
+    IR::TrackResources(program);
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 128u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.wave_size = 64u;
+    compute.lds_size_dwords = read_count;
+    compute.needs_lds_barriers = true;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 64u;
+    options.input_info.compute = &compute;
+    options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+    const auto plan = PlanComputeExecution(
+        program, options.input_info, options.compute_workgroup_limits);
+    Check(plan.error.empty() && plan.IsCooperativeWave64(),
+          "consecutive LDS read fixture did not enter cooperative scheduling");
+    TranslateResult translated;
+    translated.program = std::move(program);
+    auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    return compiled.spirv;
+  };
+
+  const auto one_read = compile(1u);
+  const auto two_reads = compile(2u);
+  Check(SpirvInstructionOpcodeCount(two_reads, 224u) ==
+            SpirvInstructionOpcodeCount(one_read, 224u),
+        "consecutive read-only LDS accesses created an unnecessary cooperative rendezvous");
+  const auto read_write_read = compile(2u, true);
+  Check(SpirvInstructionOpcodeCount(read_write_read, 224u) ==
+            SpirvInstructionOpcodeCount(two_reads, 224u) + 2u,
+        "cooperative LDS read/write hazards lost their phase boundaries");
+}
+
+void TestCooperativeWave64CollectivesUseSharedFunctions() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64u;
+  auto* block = AddExecutionPlanBlock(program);
+  program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+  const auto emit = [&](O op, std::initializer_list<IR::Value> args = {}) {
+    return IR::Value(&block->AppendNewInst(op, args));
+  };
+  const auto lane = emit(O::LaneId);
+  auto& write = block->AppendNewInst(
+      O::WriteSharedU32, {IR::Value(0u), lane, IR::Value(true)});
+  write.SetFlags(IR::MemoryFlags{.index = 0u});
+  block->AppendNewInst(O::Barrier);
+  for (uint32_t index = 0; index < 3u; ++index) {
+    const auto predicate = emit(O::ULessThan32, {lane, IR::Value(32u + index)});
+    const auto ballot = emit(O::Ballot, {predicate});
+    emit(O::ReferenceU32,
+         {emit(O::CompositeExtractU32x4, {ballot, IR::Value(index & 1u)})});
+    emit(O::ReferenceU32, {emit(O::ReadLane, {lane, IR::Value(index)})});
+  }
+  IR::ValidateProgram(program, true);
+  IR::BuildSrtPlan(program);
+  IR::TrackResources(program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 128u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 64u;
+  compute.lds_size_dwords = 1u;
+  compute.needs_lds_barriers = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  const auto plan = PlanComputeExecution(
+      program, options.input_info, options.compute_workgroup_limits);
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        "collective helper fixture did not enter cooperative scheduling");
+  TranslateResult translated;
+  translated.program = std::move(program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 57u) == 6u,
+        "cooperative wave64 collectives were duplicated instead of calling shared functions");
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 360u) == 1u,
+        "cooperative wave64 ballot duplicated its subgroup reduction body");
+  const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
+  Check(variable_count <= 9u,
+        "non-overlapping cooperative values did not reuse spill slots");
+}
+
+void TestCooperativeWave64CrossBlockSpillReuse() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+  F f;
+  const auto middle = f.AddBlock();
+  const auto finish = f.AddBlock();
+  const auto first = f.Emit(0, O::IAdd32, {f.local, V(1u)});
+  f.Emit(0, O::Barrier);
+  f.Branch(0, middle);
+  f.Emit(middle, O::ReferenceU32, {first});
+  const auto second = f.Emit(middle, O::IAdd32, {f.local, V(2u)});
+  f.Emit(middle, O::Barrier);
+  f.Branch(middle, finish);
+  f.Emit(finish, O::ReferenceU32, {second});
+  const auto plan = f.Plan();
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        "cross-block spill fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(f.program);
+  IR::TrackResources(f.program);
+  ShaderRecompiler::TranslateResult translated;
+  translated.program = std::move(f.program);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &f.compute;
+  options.compute_workgroup_limits = f.limits;
+  const auto compiled = ShaderRecompiler::CompileProgram(
+      std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 247u) == 6u,
+        "simple cooperative segments retained separate instruction and transition guards");
+  const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
+  Check(variable_count == 7u,
+        "sequential cross-block cooperative values did not share a spill slot");
+
+  F loop;
+  const auto first_block = loop.AddBlock();
+  const auto second_block = loop.AddBlock();
+  const auto latch = loop.AddBlock();
+  const auto exit = loop.AddBlock();
+  loop.Emit(0, O::Barrier);
+  loop.Branch(0, first_block);
+  const auto loop_first = loop.Emit(first_block, O::IAdd32, {loop.local, V(1u)});
+  loop.Branch(first_block, second_block);
+  loop.Emit(second_block, O::ReferenceU32, {loop_first});
+  const auto loop_second = loop.Emit(second_block, O::IAdd32, {loop.local, V(2u)});
+  loop.Branch(second_block, latch);
+  loop.Emit(latch, O::ReferenceU32, {loop_second});
+  loop.Conditional(latch, first_block, exit, V(true));
+  const auto loop_plan = loop.Plan();
+  Check(loop_plan.error.empty() && loop_plan.IsCooperativeWave64(),
+        "loop-local spill fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(loop.program);
+  IR::TrackResources(loop.program);
+  ShaderRecompiler::TranslateResult loop_translated;
+  loop_translated.program = std::move(loop.program);
+  auto loop_options = MakeCompileOptions(ShaderType::Compute);
+  loop_options.wave_size = 64u;
+  loop_options.input_info.compute = &loop.compute;
+  loop_options.compute_workgroup_limits = loop.limits;
+  const auto loop_compiled = ShaderRecompiler::CompileProgram(
+      std::move(loop_translated), loop_options, {}, 0u);
+  CheckSpirvBinaryValidates(loop_compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(loop_compiled.spirv, 59u) == 7u,
+        "sequential loop-local cooperative values did not share a spill slot");
+
+  F phis;
+  const auto first_phi_block = phis.AddBlock();
+  const auto second_phi_block = phis.AddBlock();
+  phis.Emit(0, O::Barrier);
+  phis.Branch(0, first_phi_block);
+  auto& first_phi = phis.program.blocks[first_phi_block]->AppendNewInst(
+      O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+  first_phi.AddPhiOperand(phis.program.blocks[0], V(1u));
+  phis.Emit(first_phi_block, O::ReferenceU32, {V(&first_phi)});
+  phis.Branch(first_phi_block, second_phi_block);
+  auto& second_phi = phis.program.blocks[second_phi_block]->AppendNewInst(
+      O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+  second_phi.AddPhiOperand(phis.program.blocks[first_phi_block], V(2u));
+  phis.Emit(second_phi_block, O::ReferenceU32, {V(&second_phi)});
+  const auto phi_plan = phis.Plan();
+  Check(phi_plan.error.empty() && phi_plan.IsCooperativeWave64(),
+        "sequential Phi spill fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(phis.program);
+  IR::TrackResources(phis.program);
+  ShaderRecompiler::TranslateResult phi_translated;
+  phi_translated.program = std::move(phis.program);
+  auto phi_options = MakeCompileOptions(ShaderType::Compute);
+  phi_options.wave_size = 64u;
+  phi_options.input_info.compute = &phis.compute;
+  phi_options.compute_workgroup_limits = phis.limits;
+  const auto phi_compiled = ShaderRecompiler::CompileProgram(
+      std::move(phi_translated), phi_options, {}, 0u);
+  CheckSpirvBinaryValidates(phi_compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(phi_compiled.spirv, 59u) == 6u,
+        "sequential cooperative Phi values did not share a spill slot");
+}
+
+void TestDeadPhiWebsWithoutExternalConsumersAreRemoved() {
+  using namespace ShaderRecompiler::IR;
+  Block block;
+  auto& dead_a = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto& dead_b = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto& live_dependency = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto& live = block.AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  dead_a.AddPhiOperand(&block, Value(&dead_b));
+  dead_b.AddPhiOperand(&block, Value(&dead_a));
+  live_dependency.AddPhiOperand(&block, Value(&live));
+  live.AddPhiOperand(&block, Value(&live_dependency));
+  block.AppendNewInst(ValueOpcode::ReferenceU32, {Value(&live)});
+
+  EliminateDeadCode(BlockList{&block});
+  const auto phi_count = std::ranges::count_if(block, [](const Inst& inst) {
+    return inst.GetOpcode() == ValueOpcode::Phi;
+  });
+  Check(phi_count == 2u,
+        "DCE retained a closed Phi web with no non-Phi consumer");
+  Check(block.begin()->GetOpcode() == ValueOpcode::Phi &&
+            block.begin()->HasUses(),
+        "DCE removed a Phi web that has a non-Phi consumer");
+}
+
+// TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
+// include the certificate header plus ShaderHostProfile.h. Register the five
+// TestF64Certificate* functions below. No compilation, Vulkan or game data.
+// Test-only admission boundaries for the bounded SSBO publication regression.
+// This does not admit image publication, DMA or scalar-buffer cache protocols.
+void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+  enum class Scenario {
+    CyclicImageRead, CyclicImageSample, ImageWriteBefore, ImageWriteAfter,
+    CyclicImageWrite, ImageAtomicBefore, ImageAtomicAfter,
+    CyclicAddressRead, CyclicAddressWrite, AddressWriteBefore,
+    CyclicScalarAddressRead, CyclicScalarBufferRead,
+    BufferAtomicBefore, CyclicBufferAtomic,
+    AcyclicAddressReadBefore, AcyclicAddressReadAfter,
+    VaryingBranch, Partitioned,
+    BufferCycle, SeparateWriterCycle, AcyclicInputImage,
+    ImmutableSnapshot, PlanningOnlyAddressTemplate
+  };
+  // First prove all neighboring rejections remain in force. The first positive
+  // below then produces the intended RED on the old cyclic-communication guard.
+  for (const auto scenario : {
+      Scenario::AcyclicAddressReadBefore, Scenario::AcyclicAddressReadAfter,
+      Scenario::CyclicImageRead, Scenario::CyclicImageSample,
+      Scenario::ImageWriteBefore, Scenario::ImageWriteAfter,
+      Scenario::CyclicImageWrite, Scenario::ImageAtomicBefore,
+      Scenario::ImageAtomicAfter, Scenario::CyclicAddressRead,
+      Scenario::CyclicAddressWrite, Scenario::AddressWriteBefore,
+      Scenario::CyclicScalarAddressRead, Scenario::CyclicScalarBufferRead,
+      Scenario::BufferAtomicBefore,
+      Scenario::CyclicBufferAtomic, Scenario::VaryingBranch,
+      Scenario::Partitioned, Scenario::BufferCycle,
+      Scenario::SeparateWriterCycle, Scenario::AcyclicInputImage,
+      Scenario::ImmutableSnapshot, Scenario::PlanningOnlyAddressTemplate}) {
+    if (address_only && scenario != Scenario::AcyclicAddressReadBefore &&
+        scenario != Scenario::AcyclicAddressReadAfter) continue;
+    F f({16,16,1});
+    f.compute.lds_size_dwords = 0;
+    f.program.memory_info.clear(); // This matrix has no actual guest LDS accesses.
+    const auto loop = f.AddBlock(), after = f.AddBlock();
+    const auto memory = [&](uint32_t block, O opcode,
+                            std::initializer_list<V> args, IR::ResourceKind kind,
+                            bool planning_only = false) {
+      const auto value = f.Emit(block, opcode, args);
+      const auto index = static_cast<uint32_t>(f.program.memory_info.size());
+      IR::MemoryInfo info{};
+      info.kind = kind;
+      info.glc = true;
+      info.planning_only = planning_only;
+      f.program.memory_info.push_back(info);
+      value.TryInstruction()->SetFlags(IR::MemoryFlags{.index=index});
+      return value;
+    };
+    const auto buffer = f.Emit(0,O::GetBufferResource,
+        {V(0u),V(0u),V(4096u),V(0u)});
+    const auto image = f.Emit(0,O::GetImageResource,
+        {V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),V(0u)});
+    const auto sampler = f.Emit(0,O::GetSamplerResource,
+        {V(0u),V(0u),V(0u),V(0u)});
+    const auto address = f.Emit(0,O::GetAddressResource,{V(0u),V(0u)});
+    const auto coords = f.Emit(0,O::MakeImageAddress,
+        {V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),V(0u),
+         V(0u),V(0u),V(0u),V(0u),V(0u),V(0u)});
+    const auto data = f.Emit(0,O::CompositeConstructU32x4,
+        {V(7u),V(0u),V(0u),V(0u)});
+    const auto image_read = [&](uint32_t block) {
+      const auto read = memory(block,O::ImageRead,{image,coords,V(true)},IR::ResourceKind::Image);
+      const auto word = f.Emit(block,O::CompositeExtractU32x4,{read,V(0u)});
+      f.Emit(block,O::ReferenceU32,{word});
+    };
+    const auto image_write = [&](uint32_t block) {
+      memory(block,O::ImageWrite,{image,coords,data,V(true)},IR::ResourceKind::Image);
+    };
+    const auto image_atomic = [&](uint32_t block) {
+      // Its return is deliberately dead: the earlier live-atomic guard must
+      // not be the reason this unproved image publication gets rejected.
+      memory(block,O::ImageAtomicOr32,{image,coords,V(1u),V(true)},IR::ResourceKind::Image);
+    };
+    const auto address_read = [&](uint32_t block) {
+      // BDA reads alias the same cached buffer through a physical pointer. The
+      // cooperative scheduler's UniformMemory rendezvous publishes each prior
+      // quantum before the selected guest wave follows this access path.
+      const auto raw = memory(block,O::LoadAddressU32,
+          {address,V(0u),V(0u),V(true)},IR::ResourceKind::Global);
+      f.Emit(block,O::ReferenceU32,{raw});
+    };
+    const auto address_write = [&](uint32_t block) {
+      memory(block,O::StoreAddressU32,{address,V(0u),V(0u),V(7u),V(true)},IR::ResourceKind::Global);
+    };
+    const auto buffer_write = [&](uint32_t block, V value) {
+      memory(block,O::StoreBufferU32,
+          {buffer,V(4u),V(0u),V(0u),value,V(true)},IR::ResourceKind::Buffer);
+    };
+    const auto buffer_atomic = [&](uint32_t block) {
+      memory(block,O::BufferAtomicOr32,
+          {buffer,V(4u),V(0u),V(0u),V(1u),V(true)},IR::ResourceKind::Buffer);
+    };
+    if (scenario == Scenario::AcyclicAddressReadBefore) address_read(0);
+    if (scenario == Scenario::ImageWriteBefore) image_write(0);
+    if (scenario == Scenario::ImageAtomicBefore) image_atomic(0);
+    if (scenario == Scenario::AddressWriteBefore) address_write(0);
+    if (scenario == Scenario::BufferAtomicBefore) buffer_atomic(0);
+    if (scenario == Scenario::AcyclicInputImage) image_read(0);
+    if (scenario != Scenario::Partitioned) f.Emit(0,O::Barrier);
+    f.Branch(0,loop);
+    auto& counter = f.program.blocks[loop]->AppendNewInst(
+        O::Phi,{},static_cast<uint64_t>(IR::Type::U32));
+    counter.AddPhiOperand(f.program.blocks[0],V(0u));
+    const auto read = memory(loop,O::LoadBufferU32,
+        {buffer,V(0u),V(0u),V(0u),V(true)},IR::ResourceKind::Buffer);
+    // A mutable read can drive a uniform wave condition. The original
+    // cross-workgroup partition proof must still reject this same shape.
+    const auto uniform_read = f.Emit(loop,O::ReadLane,{read,V(0u)});
+    const auto next = f.Emit(loop,O::IAdd32,{V(&counter),V(1u)});
+    counter.AddPhiOperand(f.program.blocks[loop],next);
+    const auto bounded = f.Emit(loop,O::ULessThan32,{next,V(4u)});
+    const auto pending = f.Emit(loop,O::IEqual32,
+        {scenario == Scenario::VaryingBranch ? read : uniform_read,V(0u)});
+    const auto condition = f.Emit(loop,O::LogicalAnd,{bounded,pending});
+    f.Conditional(loop,loop,after,condition);
+    f.program.block_info[loop].terminator.loop_header = true;
+    f.program.block_info[loop].terminator.continue_block = f.program.block_info[loop].id;
+    f.program.block_info[loop].terminator.merge_block = f.program.block_info[after].id;
+    if (scenario != Scenario::SeparateWriterCycle) buffer_write(loop,next);
+    if (scenario == Scenario::CyclicImageRead) image_read(loop);
+    if (scenario == Scenario::CyclicImageSample) {
+      const auto sample = memory(loop,O::ImageSampleRaw,{image,sampler,coords},IR::ResourceKind::Image);
+      f.Emit(loop,O::ReferenceU32,{f.Emit(loop,O::CompositeExtractU32x4,{sample,V(0u)})});
+    }
+    if (scenario == Scenario::CyclicImageWrite) image_write(loop);
+    if (scenario == Scenario::CyclicAddressRead ||
+        scenario == Scenario::PlanningOnlyAddressTemplate) {
+      const auto raw = memory(loop,O::LoadAddressU32,
+          {address,V(0u),V(0u),V(true)},IR::ResourceKind::Global,
+          scenario == Scenario::PlanningOnlyAddressTemplate);
+      f.Emit(loop,O::ReferenceU32,{raw});
+    }
+    if (scenario == Scenario::CyclicAddressWrite) address_write(loop);
+    if (scenario == Scenario::CyclicScalarAddressRead) {
+      const auto raw = memory(loop,O::LoadAddressU32,
+          {address,V(0u),V(0u),V(true)},IR::ResourceKind::ScalarAddress);
+      f.Emit(loop,O::ReferenceU32,{raw});
+    }
+    if (scenario == Scenario::CyclicScalarBufferRead) {
+      const auto raw = memory(loop,O::ReadConstBuffer,{buffer,V(0u)},IR::ResourceKind::ScalarBuffer);
+      f.Emit(loop,O::ReferenceU32,{raw});
+    }
+    if (scenario == Scenario::CyclicBufferAtomic) buffer_atomic(loop);
+    if (scenario == Scenario::ImmutableSnapshot) {
+      const auto srt = f.Emit(loop,O::GetSrtResource);
+      const auto snapshot = f.Emit(loop,O::ReadConst,{srt,V(0u)});
+      f.Emit(loop,O::ReferenceU32,{snapshot});
+    }
+    if (scenario == Scenario::SeparateWriterCycle) {
+      const auto finish = f.AddBlock();
+      auto& writer_counter = f.program.blocks[after]->AppendNewInst(
+          O::Phi,{},static_cast<uint64_t>(IR::Type::U32));
+      writer_counter.AddPhiOperand(f.program.blocks[loop],V(0u));
+      const auto writer_next = f.Emit(after,O::IAdd32,{V(&writer_counter),V(1u)});
+      writer_counter.AddPhiOperand(f.program.blocks[after],writer_next);
+      buffer_write(after,writer_next);
+      f.Conditional(after,after,finish,f.Emit(after,O::ULessThan32,{writer_next,V(4u)}));
+      f.program.block_info[after].terminator.loop_header = true;
+      f.program.block_info[after].terminator.continue_block = f.program.block_info[after].id;
+      f.program.block_info[after].terminator.merge_block = f.program.block_info[finish].id;
+      f.KeepWave(finish);
+    } else {
+      if (scenario == Scenario::AcyclicAddressReadAfter) address_read(after);
+      if (scenario == Scenario::ImageWriteAfter) image_write(after);
+      if (scenario == Scenario::ImageAtomicAfter) image_atomic(after);
+      // Concrete counterexample to checking only image instructions inside SCCs:
+      // an image payload precedes the cyclic buffer flag, and is read afterward.
+      if (scenario == Scenario::ImageWriteBefore) image_read(after);
+      f.Emit(after,O::ReferenceU32,{uniform_read});
+      f.KeepWave(after);
+    }
+	if (scenario == Scenario::Partitioned) f.limits.max_invocations = 128u;
+    const bool accepted = scenario == Scenario::AcyclicAddressReadBefore ||
+        scenario == Scenario::AcyclicAddressReadAfter ||
+        scenario == Scenario::CyclicAddressRead || scenario == Scenario::BufferCycle ||
+        scenario == Scenario::SeparateWriterCycle || scenario == Scenario::AcyclicInputImage ||
+        scenario == Scenario::ImmutableSnapshot || scenario == Scenario::PlanningOnlyAddressTemplate ||
+        scenario == Scenario::CyclicScalarAddressRead ||
+        scenario == Scenario::CyclicScalarBufferRead || scenario == Scenario::ImageWriteAfter ||
+        scenario == Scenario::CyclicImageRead || scenario == Scenario::CyclicImageSample;
+    const auto plan = f.Plan();
+    if (plan.error.empty() != accepted)
+      std::fprintf(stderr,"cooperative SSBO visibility scenario=%u: %s\n",
+          static_cast<unsigned>(scenario),plan.error.c_str());
+    if (accepted) {
+      Check(plan.error.empty() && plan.IsCooperativeWave64() && plan.IsSplitWave64() &&
+                plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 256u &&
+                plan.layout.guest_size == std::array<uint32_t,3>{16,16,1},
+            "cooperative buffer-only cyclic communication requires preserved whole-workgroup geometry");
+    } else {
+      Check(!plan.error.empty() && !plan.IsCooperativeWave64(),
+            "cooperative buffer visibility bypassed image, DMA, atomic, partition or convergence guards");
+    }
+  }
+}
+
+void TestCooperativeWave64AutomaticBufferCyclePromotion() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+
+  F f({16, 16, 1});
+  f.compute.lds_size_dwords = 0;
+  f.program.memory_info.clear();
+  const auto loop = f.AddBlock();
+  const auto finish = f.AddBlock();
+  const auto buffer = f.Emit(0, O::GetBufferResource,
+                             {V(0u), V(0u), V(4096u), V(0u)});
+  const auto memory = [&](uint32_t block, O opcode,
+                          std::initializer_list<V> args) {
+    const auto value = f.Emit(block, opcode, args);
+    const auto index = static_cast<uint32_t>(f.program.memory_info.size());
+    IR::MemoryInfo info{};
+    info.kind = IR::ResourceKind::Buffer;
+    info.glc = true;
+    f.program.memory_info.push_back(info);
+    value.TryInstruction()->SetFlags(IR::MemoryFlags{.index = index});
+    return value;
+  };
+
+  f.Branch(0, loop);
+  auto& counter = f.program.blocks[loop]->AppendNewInst(
+      O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+  counter.AddPhiOperand(f.program.blocks[0], V(0u));
+  const auto read = memory(loop, O::LoadBufferU32,
+                           {buffer, V(0u), V(0u), V(0u), V(true)});
+  const auto uniform_read = f.Emit(loop, O::ReadLane, {read, V(0u)});
+  const auto next = f.Emit(loop, O::IAdd32, {V(&counter), V(1u)});
+  counter.AddPhiOperand(f.program.blocks[loop], next);
+  memory(loop, O::StoreBufferU32,
+         {buffer, V(4u), V(0u), V(0u), next, V(true)});
+  const auto bounded = f.Emit(loop, O::ULessThan32, {next, V(4u)});
+  const auto pending = f.Emit(loop, O::IEqual32, {uniform_read, V(0u)});
+  const auto condition = f.Emit(loop, O::LogicalAnd, {bounded, pending});
+  f.Conditional(loop, loop, finish, condition);
+  f.program.block_info[loop].terminator.loop_header = true;
+  f.program.block_info[loop].terminator.continue_block =
+      f.program.block_info[loop].id;
+  f.program.block_info[loop].terminator.merge_block =
+      f.program.block_info[finish].id;
+  f.Emit(finish, O::ReferenceU32, {uniform_read});
+  f.KeepWave(finish);
+
+  const auto plan = f.Plan();
+  Check(plan.error.empty() && plan.IsCooperativeWave64() &&
+            plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
+            plan.layout.guest_size == std::array<uint32_t, 3>{16, 16, 1} &&
+            WorkgroupInvocationCount(plan.layout.host_size) == 256u,
+        "ordinary buffer feedback must promote a partitioned wave64 workgroup to the proved cooperative scheduler");
+
+  f.limits.max_invocations = 128u;
+  Check(!f.Plan().error.empty(),
+        "automatic cooperative promotion ignored the host workgroup invocation limit");
+}
+
+struct F64CertificateFixture {
+  using Value = ShaderRecompiler::IR::Value;
+  using Op = ShaderRecompiler::IR::ValueOpcode;
+  ShaderRecompiler::IR::Program program;
+  ShaderRecompiler::IR::Block* block;
+  ShaderFloatingPointState initial{true, 0xc0, false, true};
+  ShaderRecompiler::ShaderHostProfile host{true, true, true, true, true, true};
+
+  F64CertificateFixture() {
+    program.stage = ShaderType::Compute;
+    program.wave_size = 32;
+    program.user_data_count = 2;
+    program.fp_mode_inspected = true;
+    block = AddExecutionPlanBlock(program);
+  }
+  Value Emit(Op opcode, std::initializer_list<Value> args = {}) {
+    return Value(&block->AppendNewInst(opcode, args));
+  }
+  Value UnknownU32(uint32_t reg = 0) {
+    return Emit(Op::GetUserData, {Value(static_cast<ShaderRecompiler::IR::ScalarReg>(reg))});
+  }
+  Value Predicate(uint32_t reg = 0) {
+    return Emit(Op::INotEqual32, {UnknownU32(reg), Value(0u)});
+  }
+  Value Convert(Value input) { return Emit(Op::ConvertF64U32, {input}); }
+  Value Word(Value pair, uint32_t index) {
+    return Emit(Op::CompositeExtractF64, {pair, Value(index)});
+  }
+  Value Pack(Value low, Value high) {
+    return Emit(Op::CompositeConstructF64, {low, high});
+  }
+  Value SelectPair(Value predicate, Value yes, Value no) {
+    const auto low = Emit(Op::SelectU32, {predicate, Word(yes, 0), Word(no, 0)});
+    const auto high = Emit(Op::SelectU32, {predicate, Word(yes, 1), Word(no, 1)});
+    return Pack(low, high);
+  }
+  Value MultiplyByOne(Value input) {
+    return Emit(Op::FPMul64, {input, Value::F64(0x3ff0000000000000ull)});
+  }
+  void Keep64(Value value) {
+    Emit(Op::ReferenceU32, {Word(value, 0)});
+    Emit(Op::ReferenceU32, {Word(value, 1)});
+  }
+  void Keep32(Value value) {
+    Emit(Op::ReferenceU32, {Emit(Op::BitCastU32F32, {value})});
+  }
+  auto Analyze() const {
+    return ShaderRecompiler::IR::AnalyzeF64Program(program, initial, host);
+  }
+};
+
+void TestF64CertificateConstantsAndNativeRequirements() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  {
+    F f;
+    // Exact integer conversion is implemented with integer words, including
+    // INT/U32 boundaries; it must not acquire native FP or mode requirements.
+    f.initial = {};
+    f.host = {};
+    f.program.fp_mode_inspected = false;
+    f.Keep64(f.Convert(f.UnknownU32()));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && !result.needs_native64 && !result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "exact integer-to-F64 conversion unexpectedly requires native FP state");
+  }
+  {
+    F f;
+    const auto normal = f.Emit(O::FPNeg64, {f.Emit(O::FPAbs64,
+        {V::F64(0xc000000000000000ull)})}); // -abs(-2)
+    f.Keep64(f.MultiplyByOne(normal));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "normal constant/sign operations failed the F64 certificate");
+    f.host.fma_float64 = false;
+    Check(!f.Analyze().error.empty(),
+          "correctly rounded F64 multiplication ignored its native FMA requirement");
+  }
+  for (const uint64_t bits : {0x0000000000000001ull, 0x8000000000000001ull}) {
+    F f;
+    f.Keep64(f.MultiplyByOne(V::F64(bits)));
+    Check(!f.Analyze().error.empty(), "F64 certificate accepted a subnormal input");
+  }
+  {
+    F f;
+    f.Keep64(f.Emit(O::FPMul64, {V::F64(0x0010000000000000ull),
+                               V::F64(0x3fe0000000000000ull)}));
+    Check(!f.Analyze().error.empty(),
+          "normal F64 operands hid a subnormal multiplication result");
+  }
+  {
+    F f;
+    f.Keep64(f.Emit(O::FPFma64, {V::F64(0x4048800000000000ull),
+        V::F64(0x3f94e5e0a72f0539ull), V::F64(0xbff0000000000000ull)}));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "finite fused residual did not receive FMA64 requirements");
+    f.host.fma_float64 = false;
+    Check(!f.Analyze().error.empty(), "F64 FMA accepted a host without FMA64");
+  }
+  {
+    F f;
+    f.Keep32(f.Emit(O::ConvertF32F64, {V::F64(0x3ff0000010000000ull)}));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && !result.needs_fma64 &&
+              result.needs_narrow_f32,
+          "normal RTE narrowing did not record its native F32 requirement");
+    f.host.rte_float32 = false;
+    Check(!f.Analyze().error.empty(), "F64 narrowing ignored missing host F32 RTE");
+  }
+  {
+    F f;
+    f.Keep32(f.Emit(O::ConvertF32F64, {V::F64(0x3800000000000000ull)})); // 2^-127
+    Check(!f.Analyze().error.empty(),
+          "normal F64 input hid a subnormal F32 conversion result");
+  }
+}
+
+void TestF64CertificatePairProvenance() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    f.Keep64(f.MultiplyByOne(f.Pack(f.Word(a, 0), f.Word(a, 1))));
+    Check(f.Analyze().error.empty(), "matching F64 extract pair lost its typed producer");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u)); // words {0x10000000, 0x41700000}
+    const auto zero = f.Convert(V(0u));
+    // Each whole parent is zero/normal, but this crossed pair is subnormal.
+    f.Keep64(f.MultiplyByOne(f.Pack(f.Word(a, 0), f.Word(zero, 1))));
+    Check(!f.Analyze().error.empty(), "crossed F64 producers invented a safe complete pair");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    const auto b = f.Convert(V(3u));
+    f.Keep64(f.MultiplyByOne(f.SelectPair(f.Predicate(), a, b)));
+    Check(f.Analyze().error.empty(), "matching EXEC selects of normal F64 values were rejected");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    f.Keep64(f.MultiplyByOne(f.SelectPair(f.Predicate(), a, V::F64(1u))));
+    Check(!f.Analyze().error.empty(), "EXEC false arm discarded a retained subnormal pair");
+  }
+  {
+    F f;
+    const auto a = f.Convert(V(0x01000001u));
+    const auto low = f.Emit(O::SelectU32, {f.Predicate(0), f.Word(a, 0), V(0u)});
+    const auto high = f.Emit(O::SelectU32, {f.Predicate(1), f.Word(a, 1), V(0u)});
+    f.Keep64(f.MultiplyByOne(f.Pack(low, high)));
+    Check(!f.Analyze().error.empty(), "unrelated EXEC predicates were treated as one pair update");
+  }
+  {
+    F f;
+    const auto lane = f.Emit(O::LaneId);
+    const auto bit = f.Emit(O::BitwiseAnd32, {lane, V(31u)});
+    const auto shifted = f.Emit(O::ShiftRightLogical32, {V(0xffffffffu), bit});
+    const auto selected = f.Emit(O::BitwiseAnd32, {shifted, V(1u)});
+    const auto full_exec = f.Emit(O::INotEqual32, {selected, V(0u)});
+    const auto a = f.Convert(V(0x01000001u));
+    f.Keep64(f.MultiplyByOne(f.SelectPair(full_exec, a, V::F64(1u))));
+    Check(f.Analyze().error.empty(),
+          "full EXEC masked-shift proof failed to exclude the unreachable old pair");
+  }
+  for (const bool proven : {true, false}) {
+    F f;
+    const auto lane = f.Emit(O::LaneId);
+    const auto bit = f.Emit(O::BitwiseAnd32, {lane, V(31u)});
+    const auto shifted = f.Emit(O::ShiftRightLogical32, {V(0xffffffffu), bit});
+    const auto selected = f.Emit(O::BitwiseAnd32, {shifted, V(1u)});
+    const auto predicate = proven ? f.Emit(O::INotEqual32, {selected, V(0u)}) : f.Predicate();
+    // The folded low word and surviving high-word Select form a complete
+    // normal value only when the predicate is proved true. The old high word
+    // instead produces the nonzero subnormal 0x0000000010000000.
+    const auto high = f.Emit(O::SelectU32, {predicate, V(0x41700000u), V(0u)});
+    f.Keep64(f.MultiplyByOne(f.Pack(V(0x10000000u), high)));
+    Check(f.Analyze().error.empty() == proven,
+          "mixed constant/Select pair did not preserve its exact reachable arms");
+  }
+}
+
+void TestF64CertificateModeAndHostBoundaries() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  for (uint32_t boundary = 0; boundary < 6u; ++boundary) {
+    F f;
+    f.Keep64(f.MultiplyByOne(V::F64(0x4000000000000000ull)));
+    Check(f.Analyze().error.empty(), "F64 boundary fixture baseline is not certified");
+    switch (boundary) {
+      case 0: f.initial = {}; break;
+      case 1: f.program.fp_mode_inspected = false; break;
+      case 2:
+        f.program.writes_fp_mode = true;
+        f.program.first_fp_mode_write_pc = 0x40u;
+        break;
+      case 3: f.host.known = false; break;
+      case 4: f.host.float64 = false; break;
+      case 5: f.initial.float_mode = 0xc4u; break; // distinct FP64 rounding mode
+    }
+    Check(!f.Analyze().error.empty(), "F64 certificate ignored a mode/host boundary");
+  }
+}
+
+void TestF64CertificateReciprocalNonzeroProof() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  {
+    F f;
+    const auto odd = f.Emit(O::BitwiseOr32, {f.UnknownU32(), V(1u)});
+    f.Keep64(f.Emit(O::FPRecip64, {f.Convert(odd)}));
+    const auto result = f.Analyze();
+    Check(result.error.empty() && result.needs_native64 && result.needs_fma64 &&
+              !result.needs_narrow_f32,
+          "odd U32 conversion did not prove a nonzero integer reciprocal domain");
+    f.host.fma_float64 = false;
+    Check(!f.Analyze().error.empty(),
+          "F64 reciprocal correction ignored its native FMA requirement");
+  }
+  {
+    F f;
+    f.Keep64(f.Emit(O::FPRecip64, {f.Convert(f.UnknownU32())}));
+    Check(!f.Analyze().error.empty(), "possible zero integer entered the bounded reciprocal path");
+  }
+  for (const uint32_t addend : {63u, 64u}) {
+    F f;
+    const auto multiple = f.Emit(O::IMul32, {f.UnknownU32(), V(64u)});
+    const auto denominator = f.Emit(O::IAdd32, {multiple, V(addend)});
+    f.Keep64(f.Emit(O::FPRecip64, {f.Convert(denominator)}));
+    // uint32 wrapping preserves low six ones for +63, while +64 can be zero
+    // (for example input 0x03ffffff). Neither requires bounds on the input.
+    Check(f.Analyze().error.empty() == (addend == 63u),
+          "wrapped multiply/add reciprocal proof lost the actual nonzero boundary");
+  }
+}
+
+
+void TestF64CertificatePhiPredecessorProvenance() {
+  using F = F64CertificateFixture;
+  using V = F::Value;
+  using O = F::Op;
+  using namespace ShaderRecompiler;
+  for (const bool crossed : {false, true}) {
+    F f;
+    auto* entry = f.block;
+    auto* left = AddExecutionPlanBlock(f.program);
+    auto* right = AddExecutionPlanBlock(f.program);
+    auto* merge = AddExecutionPlanBlock(f.program);
+    entry->AddBranch(left);
+    entry->AddBranch(right);
+    f.program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    f.program.block_info[0].terminator.true_block = 1;
+    f.program.block_info[0].terminator.false_block = 2;
+    f.program.block_info[0].condition = f.Predicate();
+    // Both definitions dominate all Phi edges. Crossing their halves is
+    // therefore valid SSA, but changes the actual numeric value on each edge.
+    const auto a = f.Convert(V(0x01000001u));
+    const auto zero = f.Convert(V(0u));
+    const auto alo = f.Word(a, 0), ahi = f.Word(a, 1);
+    const auto zlo = f.Word(zero, 0), zhi = f.Word(zero, 1);
+    left->AddBranch(merge);
+    right->AddBranch(merge);
+    for (const uint32_t index : {1u, 2u}) {
+      f.program.block_info[index].terminator.kind = CFG::TerminatorKind::Branch;
+      f.program.block_info[index].terminator.true_block = 3;
+    }
+    f.block = merge;
+    auto& low = merge->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+    auto& high = merge->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+    low.AddPhiOperand(left, alo);
+    low.AddPhiOperand(right, zlo);
+    // Reversed vector order is deliberate: match the predecessor identity,
+    // not its position. The negative changes the edge values, not the order.
+    high.AddPhiOperand(right, crossed ? ahi : zhi);
+    high.AddPhiOperand(left, crossed ? zhi : ahi);
+    f.Keep64(f.MultiplyByOne(f.Pack(V(&low), V(&high))));
+    const auto result = f.Analyze();
+    Check(result.error.empty() != crossed,
+          "F64 paired Phi proof ignored predecessor identity or crossed halves");
+  }
+}
+
+// Insert beside the TestF64Certificate* functions in shaderCfgTests.cpp.
+// Uses existing RecompileForTest/CheckSpirvBinaryValidates helpers; no GPU.
+void TestUnusedNativeF64EmissionHasCompleteRequirements() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {EncodeSopp(0x01)}; // S_ENDPGM
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 32u;
+  compute.threads_num[1] = 1u;
+  compute.threads_num[2] = 1u;
+  compute.wave_size = 32u;
+  compute.initial_fp_state = {true, 0xc0, false, true};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 32u;
+  options.input_info.compute = &compute;
+  options.host_profile = {true, true, true, true, true, true};
+  auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto baseline = DisassembleSpirvBinary(result.spirv);
+  Check(!Common::ContainsStr(baseline, "OpCapability Float64") &&
+            !Common::ContainsStr(baseline, "OpTypeFloat 64"),
+        "unused native F64 fixture baseline already needs Float64");
+
+  // Add a legal SSA instruction after planning/DCE, exactly as other direct
+  // emitter tests do. It has no users; admission and emission must agree on
+  // whether it is retained. Either omission or complete declarations are legal.
+  auto& unused = result.program.blocks.front()->AppendNewInst(
+      IR::ValueOpcode::FPMul64,
+      {IR::Value::F64(0x4000000000000000ull),
+       IR::Value::F64(0x4008000000000000ull)}); // 2 * 3
+  Check(!unused.HasUses(), "unused native F64 fixture gained an accidental reader");
+  Spirv::AnalyzeProgramRequirements(result.program);
+  std::puts("KYTY_UNUSED_F64_EMISSION_READY");
+  std::fflush(stdout);
+  const auto emitted = Spirv::EmitProgram(result.program, options.input_info,
+                                          options.compute_workgroup_limits,
+                                          options.host_profile);
+  // Original certificate skipped this instruction while the backend emitted
+  // its native Float64/FmaKHR operations, yielding an invalid SPIR-V module.
+  CheckSpirvBinaryValidates(emitted);
+  std::puts("KYTY_UNUSED_F64_EMISSION_PASS");
+}
+
+// TEST ONLY: insert after AddExecutionPlanBlock in shaderCfgTests.cpp.
+// Call TestComputeExecutionGdsAppendAdmission from default main and a focused selector.
+void TestComputeExecutionGdsAppendAdmission() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  using V = IR::Value;
+  enum class Scenario { Valid, FixedLoop, VaryingM0, Offset, OffsetHigh, OffsetMax,
+                        OffsetLoop, OffsetUnaligned, OffsetTooLarge, Width, MissingMemory,
+                        Consume, LdsAppend, OtherGds, Partitioned, Divergent,
+                        CounterBranch, CyclicReadWrite };
+  for (const auto scenario : {Scenario::Valid, Scenario::FixedLoop, Scenario::VaryingM0,
+       Scenario::Offset, Scenario::OffsetHigh, Scenario::OffsetMax, Scenario::OffsetLoop,
+       Scenario::OffsetUnaligned, Scenario::OffsetTooLarge,
+       Scenario::Width, Scenario::MissingMemory, Scenario::Consume,
+       Scenario::LdsAppend, Scenario::OtherGds, Scenario::Partitioned, Scenario::Divergent,
+       Scenario::CounterBranch, Scenario::CyclicReadWrite}) {
+    const bool loop = scenario == Scenario::FixedLoop || scenario == Scenario::OffsetLoop ||
+                      scenario == Scenario::CounterBranch ||
+                      scenario == Scenario::CyclicReadWrite;
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64u;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* exit = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1u;
+    body->AddBranch(exit);
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[1].terminator.true_block = 2u;
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    IR::MemoryInfo memory{};
+    memory.kind = scenario == Scenario::LdsAppend ? IR::ResourceKind::Lds : IR::ResourceKind::Gds;
+    if (scenario == Scenario::Offset) memory.offset = 4u;
+    if (scenario == Scenario::OffsetHigh || scenario == Scenario::OffsetLoop) memory.offset = 0x104u;
+    if (scenario == Scenario::OffsetMax) memory.offset = 0xfffcu;
+    if (scenario == Scenario::OffsetUnaligned) memory.offset = 3u;
+    if (scenario == Scenario::OffsetTooLarge) memory.offset = 0x10000u;
+    if (scenario == Scenario::Width) memory.data_bits = 64u;
+    if (scenario != Scenario::MissingMemory) program.memory_info.push_back(memory);
+    IR::Inst* iteration = nullptr;
+    if (loop) {
+      iteration = &body->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+      iteration->AddPhiOperand(entry, V(0u));
+      body->AddBranch(body);
+      program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[1].terminator.true_block = 1u;
+      program.block_info[1].terminator.false_block = 2u;
+      program.block_info[1].terminator.loop_header = true;
+    }
+    const auto m0 = scenario == Scenario::VaryingM0 ? V(&lane) : V(0x00040004u);
+    auto& append = body->AppendNewInst(
+        scenario == Scenario::Consume ? O::DataConsume : O::DataAppend,
+        {m0, V(true), V(0xffffffffu), V(0xffffffffu)});
+    append.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x40u});
+    body->AppendNewInst(O::ReferenceU32, {V(&append)});
+    if (loop) {
+      auto& next = body->AppendNewInst(O::IAdd32, {V(iteration), V(1u)});
+      iteration->AddPhiOperand(body, V(&next));
+      auto& bounded = body->AppendNewInst(O::ULessThan32, {V(&next), V(3u)});
+      program.block_info[1].condition = V(&bounded);
+    }
+    if (scenario == Scenario::CounterBranch) {
+      auto& pred = body->AppendNewInst(O::INotEqual32, {V(&append), V(0u)});
+      auto& ballot = body->AppendNewInst(O::Ballot, {V(&pred)});
+      auto& low = body->AppendNewInst(O::CompositeExtractU32x4, {V(&ballot), V(0u)});
+      auto& condition = body->AppendNewInst(O::INotEqual32, {V(&low), V(0u)});
+      program.block_info[1].condition = V(&condition); // uniform, still polling GDS
+    }
+    if (scenario == Scenario::Divergent) {
+      auto& condition = entry->AppendNewInst(O::INotEqual32, {V(&lane), V(0u)});
+      entry->AddBranch(exit);
+      program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[0].terminator.false_block = 2u;
+      program.block_info[0].condition = V(&condition);
+    }
+    if (scenario == Scenario::OtherGds) {
+      auto& read = body->AppendNewInst(O::LoadSharedU32, {V(0u), V(true)});
+      read.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x50u});
+      body->AppendNewInst(O::ReferenceU32, {V(&read)});
+    }
+    if (scenario == Scenario::CyclicReadWrite) {
+      auto& source = entry->AppendNewInst(O::GetBufferResource, {V(0u),V(0u),V(256u),V(0u)});
+      IR::MemoryInfo scalar{}; scalar.kind = IR::ResourceKind::ScalarBuffer;
+      program.memory_info.push_back(scalar);
+      auto& read = body->AppendNewInst(O::ReadConstBuffer, {V(&source), V(0u)});
+      read.SetFlags(IR::MemoryFlags{.index=1u,.pc=0x50u});
+      body->AppendNewInst(O::ReferenceU32, {V(&read)});
+    }
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = scenario == Scenario::Partitioned ? 128u : 64u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.lds_size_dwords = scenario == Scenario::LdsAppend ? 4u : 0u;
+    compute.wave_size = 64u;
+    ShaderStageInputInfo input{}; input.compute = &compute;
+    ComputeWorkgroupLimits limits{{1024u,1024u,64u},1024u};
+    limits.native_subgroup_size = 32u;
+    const auto plan = PlanComputeExecution(program, input, limits);
+    // LLVM's GDS pointer lowering folds an aligned 16-bit byte displacement
+    // into DS_APPEND. Planning admits its shape; runtime backing bounds still
+    // decide whether a counter address can be accessed.
+    const bool allowed = scenario == Scenario::Valid || scenario == Scenario::FixedLoop ||
+                         scenario == Scenario::Offset || scenario == Scenario::OffsetHigh ||
+                         scenario == Scenario::OffsetMax || scenario == Scenario::OffsetLoop;
+    Check(plan.error.empty() == allowed,
+          "GDS append admission changed a supported or rejected boundary");
+    if (allowed) Check(plan.IsSplitWave64() && plan.wave_partition_factor == 1u,
+                       "GDS append lost its one-complete-wave execution plan");
+    if (scenario == Scenario::VaryingM0)
+      Check(plan.error.find("wave-uniform M0") != std::string::npos,
+            "varying M0 was not rejected by the counter-address proof");
+    if (scenario == Scenario::CounterBranch)
+      Check(plan.error.find("counter cannot control a branch") != std::string::npos,
+            "uniform ballot hid a cyclic counter progress dependency");
+    if (scenario == Scenario::CyclicReadWrite)
+      Check(plan.error.find("cyclic reads and writes") != std::string::npos,
+            "GDS append did not preserve the cyclic communication guard");
+  }
+}
+
+void TestComputeGuestWorkgroups() {
+  using ShaderRecompiler::ComputeGuestWorkgroups;
+  struct Case {
+    const char* name;
+    std::array<uint32_t, 3> dimensions;
+    std::array<uint32_t, 3> local;
+    bool thread_dimensions;
+    std::array<uint32_t, 3> expected;
+  };
+  // Expected counts describe coverage of the invocation range in each axis;
+  // local size zero retains the runtime convention of one invocation.
+  const Case cases[] = {
+      {"group dimensions unchanged", {UINT32_MAX, 0u, 17u},
+       {UINT32_MAX, 0u, 3u}, false, {UINT32_MAX, 0u, 17u}},
+      {"zero X", {0u, 9u, 17u}, {2u, 4u, 8u}, true, {0u, 3u, 3u}},
+      {"zero Y", {9u, 0u, 17u}, {4u, 2u, 8u}, true, {3u, 0u, 3u}},
+      {"zero Z", {9u, 17u, 0u}, {4u, 8u, 2u}, true, {3u, 3u, 0u}},
+      {"all zero", {0u, 0u, 0u}, {0u, UINT32_MAX, 2u}, true, {0u, 0u, 0u}},
+      {"zero locals normalize to one", {17u, 33u, 65u}, {0u, 0u, 0u},
+       true, {17u, 33u, 65u}},
+      {"all axes ceil", {17u, 33u, 65u}, {16u, 32u, 64u}, true, {2u, 2u, 2u}},
+      {"all axes exact", {32u, 96u, 256u}, {16u, 32u, 64u}, true, {2u, 3u, 4u}},
+      {"max count at unit locals", {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+       {1u, 0u, 1u}, true, {UINT32_MAX, UINT32_MAX, UINT32_MAX}},
+      {"max X ceil does not wrap", {UINT32_MAX, 9u, 17u}, {2u, 4u, 8u},
+       true, {2147483648u, 3u, 3u}},
+      {"max Y ceil does not wrap", {9u, UINT32_MAX, 17u}, {4u, 2u, 8u},
+       true, {3u, 2147483648u, 3u}},
+      {"max Z ceil does not wrap", {9u, 17u, UINT32_MAX}, {4u, 8u, 2u},
+       true, {3u, 3u, 2147483648u}},
+      {"largest local covers two", {2u, 2u, 2u},
+       {UINT32_MAX, UINT32_MAX, UINT32_MAX}, true, {1u, 1u, 1u}},
+      {"largest count and local", {UINT32_MAX, UINT32_MAX, UINT32_MAX},
+       {UINT32_MAX, UINT32_MAX, UINT32_MAX}, true, {1u, 1u, 1u}},
+  };
+  for (const auto& test : cases) {
+    const auto actual = ComputeGuestWorkgroups(test.dimensions, test.local,
+                                               test.thread_dimensions);
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+      if (actual[axis] != test.expected[axis]) {
+        std::fprintf(stderr,
+                     "ComputeGuestWorkgroups: %s axis=%u required=%u actual=%u\n",
+                     test.name, axis, test.expected[axis], actual[axis]);
+      }
+      Check(actual[axis] == test.expected[axis],
+            "guest workgroup count must cover all requested threads without overflow");
+    }
+  }
+}
+
+void TestComputeExecutionPlanningBoundaries() {
+  using namespace ShaderRecompiler;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* block = AddExecutionPlanBlock(program);
+  auto& ballot = block->AppendNewInst(IR::ValueOpcode::Ballot, {IR::Value(true)});
+  block->AppendNewInst(IR::ValueOpcode::ReferenceU32,
+      {IR::Value(&block->AppendNewInst(IR::ValueOpcode::CompositeExtractU32x4,
+                                     {IR::Value(&ballot), IR::Value(0u)}))});
+  ShaderComputeInputInfo compute{};
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024};
+  limits.native_subgroup_size = 32;
+  struct Case { uint32_t size; bool accepted; uint32_t factor; };
+  for (const auto test : {Case{1,true,1}, Case{32,true,1}, Case{33,false,0},
+                          Case{63,false,0}, Case{64,true,1}, Case{65,false,0},
+                          Case{256,true,4}}) {
+    compute.threads_num[0] = 1;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = test.size;
+    const auto plan = PlanComputeExecution(program, input, limits);
+    Check(plan.error.empty() == test.accepted, "wave64 plan accepted/rejected the wrong active-lane boundary");
+    if (test.accepted) {
+      Check(plan.layout.guest_size == std::array<uint32_t,3>{1,1,test.size}, "wave64 plan changed guest geometry");
+      Check(plan.wave_partition_factor == test.factor && plan.IsSplitWave64() == (test.size >= 64),
+            "wave64 plan lost split mode or wave partition count");
+      Check(WorkgroupInvocationCount(plan.layout.host_size) == std::min(test.size,64u),
+            "wave64 plan added or discarded real invocations");
+      if (test.size == 64) {
+        Check(!plan.IsCooperativeWave64(),
+              "one complete guest wave64 must not enter the multi-wave cooperative scheduler");
+      }
+    }
+  }
+  compute.threads_num[2] = 256;
+  for (const uint32_t native : {0u,64u}) {
+    auto profile = limits;
+    profile.native_subgroup_size = native;
+    const auto plan = PlanComputeExecution(program, input, profile);
+    Check(plan.error.empty() && !plan.IsSplitWave64() && plan.wave_partition_factor == 1 &&
+              WorkgroupInvocationCount(plan.layout.host_size) == 256,
+          "offline/native64 profile unexpectedly changed the guest workgroup count");
+  }
+  auto required64 = limits;
+  required64.can_require_subgroup_size_64 = true;
+  const auto native64 = PlanComputeExecution(program,input,required64);
+  Check(native64.error.empty() && !native64.IsSplitWave64() && native64.wave_partition_factor == 1,
+        "required native64 profile was rejected or emulated");
+  auto tiny = limits;
+  tiny.max_invocations = 63;
+  Check(!PlanComputeExecution(program,input,tiny).error.empty(), "wave64 plan exceeded host invocation budget");
+  compute.threads_num[0] = UINT32_MAX;
+  compute.threads_num[1] = UINT32_MAX;
+  compute.threads_num[2] = UINT32_MAX;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(), "wave64 planner overflowed invocation arithmetic");
+  IR::Program ordinary;
+  ordinary.stage = ShaderType::Compute;
+  ordinary.wave_size = 64;
+  AddExecutionPlanBlock(ordinary);
+  compute.threads_num[0] = 1;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 256;
+  compute.lds_size_dwords = 16;
+  const auto plain = PlanComputeExecution(ordinary,input,limits);
+  Check(plain.error.empty() && !plain.IsSplitWave64() && plain.wave_partition_factor == 1,
+        "shader without live wave operations unnecessarily split its LDS workgroup");
+}
+
+void TestComputeExecutionConvergenceProof() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  ShaderComputeInputInfo compute{};
+  // Preserve the partitioned-workgroup safety boundary for independent waves;
+  // live LDS selects the separate cooperative execution contract.
+  compute.threads_num[0] = 128;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024,1024,64},1024};
+  limits.native_subgroup_size = 32;
+  enum class Scenario { Uniform, Divergent, MutableRead, LoopRead, LoopSnapshot, LoopAtomic,
+                        LiveAtomic, Lds, Barrier, Dispatcher, DispatcherDivergent,
+                        UnknownSideEffect, UniformPhi, VaryingPhi, DppRowMask,
+                        DppInactiveBoundary };
+  for (const auto scenario : {Scenario::Uniform, Scenario::Divergent, Scenario::MutableRead,
+         Scenario::LoopRead, Scenario::LoopSnapshot, Scenario::LoopAtomic, Scenario::LiveAtomic,
+         Scenario::Lds, Scenario::Barrier, Scenario::Dispatcher, Scenario::DispatcherDivergent,
+         Scenario::UnknownSideEffect,
+         Scenario::UniformPhi, Scenario::VaryingPhi, Scenario::DppRowMask, Scenario::DppInactiveBoundary}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* exit = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    body->AddBranch(body);
+    body->AddBranch(exit);
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[1].terminator.loop_header = true;
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    auto& source = entry->AppendNewInst(O::GetBufferResource,
+        {IR::Value(0u),IR::Value(0u),IR::Value(256u),IR::Value(0u)});
+    auto& pred = body->AppendNewInst(O::IEqual32, {IR::Value(&lane), IR::Value(5u)});
+    auto& ballot = body->AppendNewInst(O::Ballot, {IR::Value(&pred)});
+    auto& low = body->AppendNewInst(O::CompositeExtractU32x4, {IR::Value(&ballot),IR::Value(0u)});
+    auto& uniform_cond = body->AppendNewInst(O::INotEqual32, {IR::Value(&low),IR::Value(0u)});
+    program.block_info[1].condition = IR::Value(&uniform_cond);
+    if (scenario == Scenario::Divergent || scenario == Scenario::DispatcherDivergent)
+      program.block_info[1].condition = IR::Value(&pred);
+    if (scenario == Scenario::MutableRead || scenario == Scenario::LoopRead) {
+      auto* target = scenario == Scenario::MutableRead ? entry : body;
+      auto& load = target->AppendNewInst(O::ReadConstBuffer, {IR::Value(&source),IR::Value(0u)});
+      if (scenario == Scenario::MutableRead) {
+        auto& condition = body->AppendNewInst(O::INotEqual32, {IR::Value(&load),IR::Value(0u)});
+        program.block_info[1].condition = IR::Value(&condition);
+      }
+    }
+    if (scenario == Scenario::LoopSnapshot) {
+      auto& srt = entry->AppendNewInst(O::GetSrtResource);
+      body->AppendNewInst(O::ReadConst, {IR::Value(&srt),IR::Value(0u)});
+    }
+    if (scenario == Scenario::LoopAtomic || scenario == Scenario::LiveAtomic) {
+      auto& atomic = body->AppendNewInst(O::BufferAtomicOr32,
+          {IR::Value(&source),IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(1u),IR::Value(true)});
+      if (scenario == Scenario::LiveAtomic) body->AppendNewInst(O::ReferenceU32, {IR::Value(&atomic)});
+    }
+    compute.lds_size_dwords = scenario == Scenario::Lds ? 16u : 0u;
+    if (scenario == Scenario::Lds) {
+      IR::MemoryInfo memory{};
+      memory.kind = IR::ResourceKind::Lds;
+      program.memory_info.push_back(memory);
+      auto& access = body->AppendNewInst(O::LoadSharedU32, {IR::Value(0u),IR::Value(true)});
+      access.SetFlags(IR::MemoryFlags{.index=0,.pc=0});
+      body->AppendNewInst(O::ReferenceU32, {IR::Value(&access)});
+    }
+    if (scenario == Scenario::Barrier) body->AppendNewInst(O::Barrier);
+    if (scenario == Scenario::UnknownSideEffect) body->AppendNewInst(O::Sendmsg);
+    program.dispatcher_fallback = scenario == Scenario::Dispatcher ||
+                                  scenario == Scenario::DispatcherDivergent;
+    if (scenario == Scenario::UniformPhi || scenario == Scenario::VaryingPhi) {
+      auto it = body->PrependNewInst(body->begin(), O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+      it->AddPhiOperand(entry, scenario == Scenario::VaryingPhi ? IR::Value(&lane) : IR::Value(0u));
+      auto& increment = body->AppendNewInst(O::IAdd32, {IR::Value(&*it),IR::Value(1u)});
+      it->AddPhiOperand(body,IR::Value(&increment));
+      auto& condition = body->AppendNewInst(O::ULessThan32, {IR::Value(&increment),IR::Value(8u)});
+      program.block_info[1].condition = IR::Value(&condition);
+    }
+    if (scenario == Scenario::DppRowMask) {
+      auto& update = body->AppendNewInst(O::DppUpdateU32,
+          {IR::Value(1u),IR::Value(0u),IR::Value(true)});
+      IR::DppMoveFlags flags{};
+      flags.row_mask = 1;
+      flags.bank_mask = 15;
+      update.SetFlags(flags);
+      auto& condition = body->AppendNewInst(O::INotEqual32,{IR::Value(&update),IR::Value(0u)});
+      program.block_info[1].condition = IR::Value(&condition);
+    }
+    if (scenario == Scenario::DppInactiveBoundary) {
+      auto& move = body->AppendNewInst(O::DppMoveU32,{IR::Value(1u),IR::Value(true)});
+      IR::DppMoveFlags flags{};
+      flags.control = 0x101;
+      flags.fetch_inactive = true;
+      flags.bound_control = true;
+      move.SetFlags(flags);
+    }
+    // Scalar-buffer reads are broadcast once per guest wave before they can
+    // control flow. A discarded loop read cannot feed another wave; the
+    // separate feedback cases below retain rejection of polling and cyclic writes.
+    const bool accepted = scenario == Scenario::Uniform || scenario == Scenario::MutableRead ||
+                          scenario == Scenario::LoopSnapshot ||
+                          scenario == Scenario::LoopAtomic || scenario == Scenario::UniformPhi ||
+                          scenario == Scenario::LoopRead || scenario == Scenario::Lds ||
+                          scenario == Scenario::Dispatcher;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    Check(plan.error.empty() == accepted, "split-wave convergence proof accepted/rejected the wrong invariant");
+    if (scenario == Scenario::Lds)
+      Check(plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 128u,
+            "live multi-wave LDS was admitted by partitioning its shared allocation");
+  }
+}
+
+bool SpirvLdsPhasesAreSynchronized(const std::vector<uint32_t>& binary,
+                                  uint32_t lds_dwords) {
+  struct Instruction {
+    uint32_t opcode;
+    std::vector<uint32_t> args;
+  };
+  std::vector<Instruction> instructions;
+  std::unordered_map<uint32_t, uint32_t> constants, arrays, pointees, pointer_bases;
+  std::unordered_map<uint32_t, size_t> labels;
+  std::vector<std::pair<uint32_t, uint32_t>> workgroup_variables;
+  if (binary.size() < 5 || binary[0] != 0x07230203u) return false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16;
+    if (words == 0 || words > binary.size() - offset) return false;
+    const uint32_t op = binary[offset] & 0xffffu;
+    std::vector<uint32_t> args(binary.begin() + offset + 1,
+                               binary.begin() + offset + words);
+    if (op == 43u && args.size() == 3) constants[args[1]] = args[2];
+    if (op == 28u && args.size() == 3) arrays[args[0]] = args[2];
+    if (op == 32u && args.size() == 3) pointees[args[0]] = args[2];
+    if (op == 59u && args.size() >= 3 && args[2] == 4u)
+      workgroup_variables.emplace_back(args[1], args[0]);
+    if ((op == 65u || op == 66u || op == 67u) && args.size() >= 3)
+      pointer_bases[args[1]] = args[2];
+    if (op == 83u && args.size() == 3) pointer_bases[args[1]] = args[2];
+    if (op == 248u && args.size() == 1) labels[args[0]] = instructions.size();
+    instructions.push_back({op, std::move(args)});
+    offset += words;
+  }
+  // Identify storage from OpVariable -> OpTypePointer -> OpTypeArray -> length.
+  // Guest LDS is either its own 128-DWORD array plus scratch, or the prefix of
+  // one combined Workgroup array. Scratch AccessChains add lds_dwords and must
+  // not count as guest LDS stores. Ballot aggregate words follow the
+  // per-lane scratch suffix and are ignored by this guest-LDS checker.
+  uint32_t lds = 0, wave = 0, combined = 0;
+  for (const auto& [variable, type] : workgroup_variables) {
+    const auto pointer = pointees.find(type);
+    if (pointer == pointees.end()) return false;
+    const auto array = arrays.find(pointer->second);
+    if (array == arrays.end()) return false;
+    const auto length = constants.find(array->second);
+    if (length == constants.end()) return false;
+    if (length->second == lds_dwords) {
+      if (lds != 0) return false;
+      lds = variable;
+    } else if (length->second == 64u) {
+      if (wave != 0) return false;
+      wave = variable;
+    } else if (length->second == lds_dwords + 64u ||
+               length->second == lds_dwords + 66u) {
+      if (combined != 0) return false;
+      combined = variable;
+    }
+  }
+  if (combined != 0) {
+    if (lds != 0 || wave != 0) return false;
+    lds = combined;
+  } else if (lds == 0 || wave == 0 || lds == wave) {
+    return false;
+  }
+  std::unordered_set<uint32_t> scratch_index_ids, scratch_pointers;
+  if (combined != 0) {
+    for (const auto& inst : instructions) {
+      if (inst.opcode != 128u || inst.args.size() != 4) continue;
+      const auto adds_base = [&](uint32_t id) {
+        const auto found = constants.find(id);
+        return found != constants.end() && found->second == lds_dwords;
+      };
+      if (adds_base(inst.args[2]) || adds_base(inst.args[3]))
+        scratch_index_ids.insert(inst.args[1]);
+    }
+    for (const auto& inst : instructions) {
+      if ((inst.opcode != 65u && inst.opcode != 66u) || inst.args.size() < 4 ||
+          inst.args[2] != combined)
+        continue;
+      const auto index = inst.args[3];
+      const auto constant = constants.find(index);
+      if (scratch_index_ids.contains(index) ||
+          (constant != constants.end() && constant->second >= lds_dwords))
+        scratch_pointers.insert(inst.args[1]);
+    }
+  }
+  const auto root = [&](uint32_t pointer) {
+    std::unordered_set<uint32_t> seen;
+    while (pointer_bases.contains(pointer)) {
+      if (scratch_pointers.contains(pointer)) return 0u;
+      if (!seen.insert(pointer).second) return 0u;
+      pointer = pointer_bases.at(pointer);
+    }
+    return scratch_pointers.contains(pointer) ? 0u : pointer;
+  };
+  std::vector<size_t> accesses;
+  std::vector<std::vector<size_t>> edges(instructions.size());
+  const auto add_label_edge = [&](size_t from, uint32_t label) {
+    const auto found = labels.find(label);
+    if (found == labels.end()) return false;
+    edges[from].push_back(found->second);
+    return true;
+  };
+  const auto barrier = [&](size_t index) {
+    const auto& inst = instructions[index];
+    if (inst.opcode != 224u || inst.args.size() != 3) return false;
+    const auto execution = constants.find(inst.args[0]);
+    const auto memory = constants.find(inst.args[1]);
+    const auto semantics = constants.find(inst.args[2]);
+    return execution != constants.end() && execution->second == 2u &&
+           memory != constants.end() && memory->second == 2u &&
+           semantics != constants.end() && (semantics->second & 0x108u) == 0x108u;
+  };
+  for (size_t index = 0; index < instructions.size(); ++index) {
+    const auto& inst = instructions[index];
+    const auto& args = inst.args;
+    if (inst.opcode == 61u && args.size() >= 3 && root(args[2]) == lds)
+      accesses.push_back(index);
+    if (inst.opcode == 62u && args.size() >= 2 && root(args[0]) == lds)
+      accesses.push_back(index);
+    if (inst.opcode == 228u && args.size() >= 1 && root(args[0]) == lds) {
+      if (args.size() != 4) return false;
+      const auto scope = constants.find(args[1]);
+      const auto semantics = constants.find(args[2]);
+      if (scope == constants.end() || scope->second != 2u ||
+          semantics == constants.end() || semantics->second != 0u) return false;
+      accesses.push_back(index);
+    }
+    if (inst.opcode == 249u) {
+      if (args.size() != 1 || !add_label_edge(index, args[0])) return false;
+    } else if (inst.opcode == 250u) {
+      if (args.size() < 3 || !add_label_edge(index, args[1]) ||
+          !add_label_edge(index, args[2])) return false;
+    } else if (inst.opcode == 251u || inst.opcode == 246u) {
+      // The bounded fixture has neither switches nor loops.
+      return false;
+    } else if (inst.opcode != 253u && inst.opcode != 254u &&
+               inst.opcode != 255u && inst.opcode != 56u &&
+               index + 1 < instructions.size()) {
+      edges[index].push_back(index + 1);
+    }
+  }
+  // Full initialization followed by the sparse body W/R/W/R.
+  const uint32_t expected_ops[] = {62u, 62u, 61u, 62u, 61u};
+  if (accesses.size() != std::size(expected_ops)) return false;
+  for (size_t i = 0; i < accesses.size(); ++i)
+    if (instructions[accesses[i]].opcode != expected_ops[i]) return false;
+
+  const auto reachable = [&](size_t start, size_t target, bool stop_at_barrier) {
+    std::vector<size_t> pending{start};
+    std::unordered_set<size_t> seen;
+    while (!pending.empty()) {
+      const auto index = pending.back();
+      pending.pop_back();
+      if (!seen.insert(index).second) continue;
+      if (index == target) return true;
+      if (stop_at_barrier && barrier(index)) continue;
+      for (const auto next : edges[index]) pending.push_back(next);
+    }
+    return false;
+  };
+  for (size_t i = 1; i + 1 < accesses.size(); ++i) {
+    // A barrier must cut every path between each RAW/WAR/RAW pair. A missing
+    // path is also an error, rather than a vacuous synchronization success.
+    if (!reachable(accesses[i] + 1, accesses[i + 1], false) ||
+        reachable(accesses[i] + 1, accesses[i + 1], true)) return false;
+  }
+  // This straight-line IR has no guest branch: emitted selections are the
+  // per-lane memory guards. Even a selection containing only a barrier is
+  // unsafe. Walk both arms up to each merge, excluding the preceding header.
+  for (size_t index = 0; index < instructions.size(); ++index) {
+    const auto& inst = instructions[index];
+    if (inst.opcode != 247u) continue;
+    if (inst.args.size() != 2 || !labels.contains(inst.args[0]) ||
+        index + 1 >= instructions.size() || instructions[index + 1].opcode != 250u)
+      return false;
+    const size_t merge = labels.at(inst.args[0]);
+    std::vector<size_t> pending = edges[index + 1];
+    std::unordered_set<size_t> region;
+    while (!pending.empty()) {
+      const auto next = pending.back();
+      pending.pop_back();
+      if (next == merge || !region.insert(next).second) continue;
+      for (const auto successor : edges[next]) pending.push_back(successor);
+    }
+    for (const auto member : region) if (barrier(member)) return false;
+  }
+  return true;
+}
+
+bool SpirvSplitWaveBallotLoadsAggregateWords(const std::vector<uint32_t>& binary,
+                                             uint32_t lds_dwords) {
+  struct Instruction {
+    uint32_t opcode;
+    std::vector<uint32_t> args;
+  };
+  std::vector<Instruction> instructions;
+  std::unordered_map<uint32_t, uint32_t> constants, arrays, pointees;
+  std::unordered_map<uint32_t, Instruction> definitions;
+  uint32_t workgroup_variable = 0;
+  uint32_t workgroup_length = 0;
+  if (binary.size() < 5 || binary[0] != 0x07230203u) return false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const uint32_t words = binary[offset] >> 16;
+    if (words == 0 || words > binary.size() - offset) return false;
+    const uint32_t opcode = binary[offset] & 0xffffu;
+    std::vector<uint32_t> args(binary.begin() + offset + 1,
+                               binary.begin() + offset + words);
+    if (opcode == 43u && args.size() == 3) constants[args[1]] = args[2];
+    if (opcode == 28u && args.size() == 3) arrays[args[0]] = args[2];
+    if (opcode == 32u && args.size() == 3) pointees[args[0]] = args[2];
+    if (opcode == 59u && args.size() >= 3 && args[2] == 4u) {
+      const auto pointer = pointees.find(args[0]);
+      if (pointer == pointees.end()) return false;
+      const auto array = arrays.find(pointer->second);
+      if (array == arrays.end()) return false;
+      const auto length = constants.find(array->second);
+      if (length == constants.end() || workgroup_variable != 0) return false;
+      workgroup_variable = args[1];
+      workgroup_length = length->second;
+    }
+    if (opcode == 65u || opcode == 128u || opcode == 194u || opcode == 196u ||
+        opcode == 197u || opcode == 198u || opcode == 199u) {
+      if (args.size() < 2) return false;
+      definitions.emplace(args[1], Instruction{opcode, args});
+    }
+    instructions.push_back({opcode, std::move(args)});
+    offset += words;
+  }
+  const uint32_t ballot_base = lds_dwords + 64u;
+  if (workgroup_variable == 0 || workgroup_length != ballot_base + 2u) return false;
+
+  const auto evaluate = [&](const auto& self, uint32_t id,
+                            std::unordered_set<uint32_t>& active) -> std::optional<uint32_t> {
+    const auto constant = constants.find(id);
+    if (constant != constants.end()) return constant->second;
+    if (!active.insert(id).second) return std::nullopt;
+    const auto definition = definitions.find(id);
+    if (definition == definitions.end()) {
+      active.erase(id);
+      return std::nullopt;
+    }
+    const auto& args = definition->second.args;
+    if (args.size() != 4) {
+      active.erase(id);
+      return std::nullopt;
+    }
+    const auto lhs = self(self, args[2], active);
+    const auto rhs = self(self, args[3], active);
+    if (!lhs || !rhs) {
+      active.erase(id);
+      return std::nullopt;
+    }
+    std::optional<uint32_t> result;
+    switch (definition->second.opcode) {
+      case 128u: result = *lhs + *rhs; break; // OpIAdd
+      case 194u: result = *lhs >> (*rhs & 31u); break; // OpShiftRightLogical
+      case 196u: result = *lhs << (*rhs & 31u); break; // OpShiftLeftLogical
+      case 197u: result = *lhs | *rhs; break; // OpBitwiseOr
+      case 198u: result = *lhs ^ *rhs; break; // OpBitwiseXor
+      case 199u: result = *lhs & *rhs; break; // OpBitwiseAnd
+      default: break;
+    }
+    active.erase(id);
+    return result;
+  };
+
+  bool loaded_lower = false;
+  bool loaded_upper = false;
+  for (const auto& instruction : instructions) {
+    if (instruction.opcode != 61u || instruction.args.size() < 3) continue;
+    const auto access = definitions.find(instruction.args[2]);
+    if (access == definitions.end() || access->second.opcode != 65u ||
+        access->second.args.size() < 4 || access->second.args[2] != workgroup_variable)
+      continue;
+    std::unordered_set<uint32_t> active;
+    const auto index = evaluate(evaluate, access->second.args[3], active);
+    if (!index) continue;
+    if (*index == ballot_base) loaded_lower = true;
+    if (*index == ballot_base + 1u) loaded_upper = true;
+  }
+  return loaded_lower && loaded_upper;
+}
+
+void TestSingleWaveLdsSpirvPhaseOrdering(bool check_phase_ordering = true,
+                                          const char* spirv_dump_path = nullptr,
+                                          bool check_zero_predicate = false,
+                                          bool check_mixed_or_consumer = false) {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* block = AddExecutionPlanBlock(program);
+  program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+  const auto emit = [&](O op, std::initializer_list<IR::Value> args = {}) {
+    return IR::Value(&block->AppendNewInst(op, args));
+  };
+  const auto lane = emit(O::LaneId);
+  const auto own = emit(O::ShiftLeftLogical32, {lane, IR::Value(2u)});
+  const auto peer = emit(O::ShiftLeftLogical32,
+      {emit(O::BitwiseXor32, {lane, IR::Value(32u)}), IR::Value(2u)});
+  const auto active = emit(O::ULessThan32, {lane, IR::Value(48u)});
+  const auto write = [&](uint32_t value, IR::Value exec) {
+    const auto address = emit(O::SelectU32, {exec, own, IR::Value(96u)});
+    auto& inst =
+        block->AppendNewInst(O::WriteSharedU32, {address, IR::Value(value), exec});
+    inst.SetFlags(IR::MemoryFlags{.index = 0});
+  };
+  const auto read = [&] {
+    auto& inst = block->AppendNewInst(O::LoadSharedU32, {peer, active});
+    inst.SetFlags(IR::MemoryFlags{.index = 0});
+    block->AppendNewInst(O::ReferenceU32, {IR::Value(&inst)});
+  };
+  write(1000u, IR::Value(true));
+  const auto ballot = emit(O::Ballot, {active});
+  emit(O::ReferenceU32, {emit(O::CompositeExtractU32x4, {ballot, IR::Value(1u)})});
+  if (check_zero_predicate) {
+    const auto lower = emit(O::CompositeExtractU32x4, {ballot, IR::Value(0u)});
+    const auto upper = emit(O::CompositeExtractU32x4, {ballot, IR::Value(1u)});
+    const auto lower_mask = emit(O::BitwiseAnd32, {lower, IR::Value(0xaaaaaaaau)});
+    const auto upper_mask = emit(O::BitwiseAnd32, {upper, IR::Value(0x55555555u)});
+    const auto merged = emit(O::BitwiseOr32, {lower_mask, upper_mask});
+    const auto nonzero = emit(O::INotEqual32, {merged, IR::Value(0u)});
+    const auto observed = emit(O::SelectU32, {nonzero, IR::Value(1u), IR::Value(0u)});
+    emit(O::ReferenceU32, {observed});
+    const auto zero = emit(O::IEqual32, {merged, IR::Value(0u)});
+    const auto observed_zero = emit(O::SelectU32, {zero, IR::Value(1u), IR::Value(0u)});
+    emit(O::ReferenceU32, {observed_zero});
+    if (check_mixed_or_consumer) {
+      const auto mixed = emit(O::BitwiseOr32, {lower_mask, upper_mask});
+      emit(O::ReferenceU32, {mixed});
+    }
+  }
+  write(2000u, active);
+  read();
+  write(3000u, active);
+  read();
+  IR::ValidateProgram(program, true);
+  IR::BuildSrtPlan(program);
+  IR::TrackResources(program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.wave_size = 64;
+  compute.lds_size_dwords = 128;
+  compute.needs_lds_barriers = false;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  TranslateResult translated;
+  translated.program = std::move(program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  if (spirv_dump_path != nullptr) {
+    auto* file = std::fopen(spirv_dump_path, "wb");
+    Check(file != nullptr, "could not open the synthetic SPIR-V dump");
+    const auto bytes = compiled.spirv.size() * sizeof(uint32_t);
+    Check(std::fwrite(compiled.spirv.data(), 1, bytes, file) == bytes,
+          "could not write the synthetic SPIR-V dump");
+    Check(std::fclose(file) == 0, "could not close the synthetic SPIR-V dump");
+  }
+  const auto ballot_source = DisassembleSpirvBinary(compiled.spirv);
+  Check(!Common::ContainsStr(ballot_source, "OpGroupNonUniformBallot") &&
+            !Common::ContainsStr(ballot_source, "OpCapability GroupNonUniformBallot"),
+        "split wave64 ballot used a native subgroup ballot instead of workgroup reconstruction");
+  Check(SpirvNamedVariableLoadCount(compiled.spirv, "gl_LocalInvocationIndex") == 1u,
+        "split wave64 emitter reloaded the host local invocation index");
+  const auto ballot_ors = SpirvInstructionOpcodeCount(compiled.spirv, 197u);
+  Check(ballot_ors == (check_mixed_or_consumer ? 1u : 0u),
+        "split wave64 ballot emitted an unexpected integer OR reduction");
+  if (check_zero_predicate) {
+    Check(SpirvHasZeroTestedBitwiseOrDeMorgan(compiled.spirv),
+          "nonzero-tested split ballot mask did not lower through De Morgan equality");
+  }
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 229u) == 0u &&
+            SpirvInstructionOpcodeCount(compiled.spirv, 241u) == 0u,
+        "split wave64 ballot introduced aggregate atomics");
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 228u) == 0u,
+        "collision-free lane-indexed LDS stores acquired atomics");
+  Check(SpirvContainsOpcode(compiled.spirv, 224u),
+        "split wave64 ballot omitted workgroup barriers");
+  Check(MeasureSpirv(compiled.spirv).workgroup_variables == 1u,
+        "split wave64 LDS and collective scratch used separate Workgroup variables");
+  if (!check_phase_ordering) return;
+  Check(SpirvLdsPhasesAreSynchronized(compiled.spirv, 128),
+        "guest LDS RAW/WAR ordering needs workgroup barriers outside sparse-EXEC guards");
+  // Execution rendezvous alone is insufficient: the checker must also require
+  // LDS availability/visibility, not just the presence of OpControlBarrier.
+  auto missing_memory_order = compiled.spirv;
+  std::unordered_set<uint32_t> unsigned_word_types;
+  for (size_t offset = 5; offset < missing_memory_order.size();) {
+    const auto words = missing_memory_order[offset] >> 16;
+    if ((missing_memory_order[offset] & 0xffffu) == 21u && words == 4 &&
+        missing_memory_order[offset + 2] == 32u &&
+        missing_memory_order[offset + 3] == 0u)
+      unsigned_word_types.insert(missing_memory_order[offset + 1]);
+    offset += words;
+  }
+  uint32_t zero = 0;
+  for (size_t offset = 5; offset < missing_memory_order.size();) {
+    const auto words = missing_memory_order[offset] >> 16;
+    if ((missing_memory_order[offset] & 0xffffu) == 43u && words == 4 &&
+        unsigned_word_types.contains(missing_memory_order[offset + 1]) &&
+        missing_memory_order[offset + 3] == 0)
+      zero = missing_memory_order[offset + 2];
+    offset += words;
+  }
+  Check(zero != 0, "LDS ordering fixture has no zero constant for its negative control");
+  for (size_t offset = 5; offset < missing_memory_order.size();) {
+    const auto words = missing_memory_order[offset] >> 16;
+    if ((missing_memory_order[offset] & 0xffffu) == 224u && words == 4)
+      missing_memory_order[offset + 3] = zero;
+    offset += words;
+  }
+  CheckSpirvBinaryValidates(missing_memory_order);
+  Check(!SpirvLdsPhasesAreSynchronized(missing_memory_order, 128),
+        "LDS ordering checker accepted barriers without WorkgroupMemory ordering");
+}
+
+void TestSplitWave64CyclicImageSpirvRendezvous() {
+  using namespace ShaderRecompiler;
+  // Bounded analogue of the Screen Space Shadows class: one complete guest
+  // wave64 on native32, LDS, a uniform loop, IMAGE_LOAD/IMAGE_STORE, and a
+  // wave op. Guest IMAGE_LOAD lowers to sampled OpImageFetch; that fetch must
+  // not pick up ImageMemory control barriers. Writes still rendezvous the two
+  // native halves. No proprietary shader bytes.
+  auto compile = [](bool cyclic_store) {
+    std::vector<uint32_t> shader{
+        EncodeVop1(0x01, 0, 128), // v0 = 0 LDS address
+        EncodeVop1(0x01, 1, 129), // v1 = 1 LDS data
+        EncodeVop1(0x01, 4, 128), // v4 = 0 image coords
+        EncodeSMovB32(16, 128),   // s16 = 0 loop counter
+    };
+    const auto loop = shader.size();
+    shader.push_back(EncodeDs0(0x0d, 0));
+    shader.push_back(EncodeDs1(0, 1, 0)); // ds_write_b32
+    shader.push_back(EncodeDs0(0x36, 0));
+    shader.push_back(EncodeDs1(2, 0, 0)); // ds_read_b32 v2
+    shader.push_back(EncodeMimg0(0x00, 0xf));
+    shader.push_back(EncodeMimg1(20, 0, 0, 4)); // image_load
+    if (cyclic_store) {
+      shader.push_back(EncodeMimg0(0x08, 0xf));
+      shader.push_back(EncodeMimg1(20, 0, 0, 4)); // image_store
+    } else {
+      shader.push_back(EncodeDs0(0x0d, 8));
+      shader.push_back(EncodeDs1(0, 20, 0)); // keep the fetch live without a store
+    }
+    shader.push_back(EncodeSop2(0x00, 16, 16, 129)); // s16 += 1
+    shader.push_back(EncodeSopc(0x0a, 16, 130));     // s16 < 2
+    const auto branch = shader.size();
+    shader.push_back(EncodeSopp(
+        0x05, static_cast<uint32_t>(static_cast<int32_t>(loop) -
+                                    static_cast<int32_t>(branch) - 1)));
+    shader.push_back(EncodeVop3Word0(0x360, 24));
+    shader.push_back(EncodeVop3Word1(2 + 256, 128, 0)); // s24 = readlane v2
+    shader.push_back(EncodeVop1(0x01, 5, 24));         // v5 = s24, keeps the wave op live
+    shader.push_back(EncodeDs0(0x0d, 4));
+    shader.push_back(EncodeDs1(0, 5, 0));
+    shader.push_back(EncodeSopp(0x01));
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    compute.lds_size_dwords = 128;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 64;
+    options.dump_ir = true;
+    options.user_data = ImageTestUserData();
+    options.input_info.compute = &compute;
+    options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+    auto result = RecompileForTest(shader, options);
+    const auto plan = PlanComputeExecution(result.program, options.input_info,
+                                           options.compute_workgroup_limits);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(MeasureSpirv(result.spirv).workgroup_variables == 1u,
+          "split wave64 LDS and collective scratch used separate Workgroup variables");
+    Check(SpirvUnsignedLessThanBoundCount(result.spirv, 128u) != 0u,
+          "guest LDS bounds did not keep the declared 128-DWORD allocation");
+    if (!(plan.error.empty() && plan.IsSplitWave64() &&
+          !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u)) {
+      std::fprintf(stderr,
+                   "split analogue plan error='%s' split=%u cooperative=%u factor=%u\n",
+                   plan.error.c_str(), plan.IsSplitWave64() ? 1u : 0u,
+                   plan.IsCooperativeWave64() ? 1u : 0u, plan.wave_partition_factor);
+    }
+    Check(plan.error.empty() && plan.IsSplitWave64() &&
+              !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u,
+          "looped LDS+image wave64 analogue left the split native32 workgroup");
+    Check(plan.SynchronizesSplitWaveMemory() == cyclic_store,
+          "cyclic image-store proof did not select split-wave memory rendezvous");
+    Check(SpirvContainsOpcode(result.spirv, 95u),
+          "IMAGE_LOAD analogue omitted OpImageFetch");
+    Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
+                               "OpGroupNonUniformBallot"),
+          "split analogue used a native subgroup ballot");
+    return std::pair{std::move(result.spirv), plan.SynchronizesSplitWaveMemory()};
+  };
+
+  const auto stored = compile(true);
+  Check(SpirvContainsOpcode(stored.first, 99u),
+        "IMAGE_STORE analogue omitted OpImageWrite");
+  Check(CountImageMemoryBarriersAfter(stored.first, 95u) == 0u,
+        "split wave64 attached ImageMemory control barriers to sampled OpImageFetch");
+  Check(CountImageMemoryBarriersAfter(stored.first, 99u) != 0u,
+        "split wave64 dropped ImageMemory rendezvous after cyclic image writes");
+
+  const auto reads = compile(false);
+  Check(!SpirvContainsOpcode(reads.first, 99u),
+        "read-only analogue unexpectedly emitted OpImageWrite");
+  Check(CountImageMemoryBarriersAfter(reads.first, 95u) == 0u &&
+            CountImageMemoryBarriersAfter(reads.first, 99u) == 0u,
+        "read-only image loop acquired ImageMemory control barriers");
+}
+
+void TestGraphicsFunctionLdsStoresRemainPrivate() {
+  // The same scalar/wide DS operations use invocation-private Function storage
+  // in graphics. Their four read results remain live through an actual export.
+  for (const auto stage : {ShaderType::Vertex, ShaderType::Pixel}) {
+    const uint32_t shader[] = {
+        EncodeVop1(0x01, 0, 128), // address = 0
+        EncodeVop1(0x01, 1, 129), EncodeVop1(0x01, 2, 130),
+        EncodeVop1(0x01, 3, 131), EncodeVop1(0x01, 4, 132),
+        EncodeDs0(0x0d, 0), EncodeDs1(0, 1, 0), // scalar store
+        EncodeDs0(0xde, 16), EncodeDs1(0, 2, 0), // three DWORDs
+        EncodeDs0(0x36, 0), EncodeDs1(6, 0, 0),
+        EncodeDs0(0xfe, 16), EncodeDs1(7, 0, 0),
+        EncodeExp0(stage == ShaderType::Vertex ? 0x0c : 0x00, 0xf),
+        EncodeExp1(6, 7, 8, 9), EncodeSopp(0x01),
+    };
+    const auto compiled = RecompileForTest(shader, MakeCompileOptions(stage));
+    CheckSpirvBinaryValidates(compiled.spirv);
+    Check(compiled.program.spirv_requirements.has_value() &&
+              compiled.program.spirv_requirements->function_lds,
+          "graphics DS fixture did not retain Function LDS");
+
+    std::unordered_set<uint32_t> word_types;
+    std::unordered_map<uint32_t, uint32_t> arrays, function_pointees, bases;
+    std::vector<std::pair<uint32_t, uint32_t>> variables;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words = compiled.spirv[offset] >> 16;
+      const auto op = compiled.spirv[offset] & 0xffffu;
+      const auto* args = compiled.spirv.data() + offset + 1;
+      if (op == 21u && words == 4 && args[1] == 32u && args[2] == 0u)
+        word_types.insert(args[0]);
+      if (op == 28u && words == 4) arrays[args[0]] = args[1];
+      if (op == 32u && words == 4 && args[1] == 7u)
+        function_pointees[args[0]] = args[2];
+      if (op == 59u && words >= 4 && args[2] == 7u)
+        variables.emplace_back(args[1], args[0]);
+      if ((op == 65u || op == 66u || op == 67u) && words >= 4)
+        bases[args[1]] = args[2];
+      if (op == 83u && words == 4) bases[args[1]] = args[2];
+      offset += words;
+    }
+    uint32_t lds = 0;
+    for (const auto& [variable, pointer] : variables) {
+      const auto pointee = function_pointees.find(pointer);
+      if (pointee == function_pointees.end()) continue;
+      const auto array = arrays.find(pointee->second);
+      if (array == arrays.end() || !word_types.contains(array->second)) continue;
+      Check(lds == 0, "graphics LDS fixture has ambiguous private word arrays");
+      lds = variable;
+    }
+    Check(lds != 0, "graphics LDS fixture omitted its private word array");
+    const auto root = [&](uint32_t pointer) {
+      std::unordered_set<uint32_t> seen;
+      while (bases.contains(pointer)) {
+        if (!seen.insert(pointer).second) return 0u;
+        pointer = bases.at(pointer);
+      }
+      return pointer;
+    };
+    uint32_t stores = 0, loads = 0;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto words = compiled.spirv[offset] >> 16;
+      const auto op = compiled.spirv[offset] & 0xffffu;
+      const auto* args = compiled.spirv.data() + offset + 1;
+      if (op == 62u && words >= 3 && root(args[0]) == lds) ++stores;
+      if (op == 61u && words >= 4 && root(args[2]) == lds) ++loads;
+      if (op == 228u && words >= 2)
+        Check(root(args[0]) != lds,
+              "graphics Function LDS acquired an invalid atomic store");
+      offset += words;
+    }
+    Check(stores == 4u && loads == 4u,
+          "graphics scalar/wide LDS stores or live reads changed shape");
+  }
+}
+
+void TestSingletonLdsStoresDoNotNeedAtomics() {
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 128), EncodeVop1(0x01, 1, 129),
+      EncodeDs0(0x0d, 0), EncodeDs1(0, 1, 0),
+      EncodeSopp(0x0a), // all invocations rendezvous before reading the word
+      EncodeDs0(0x36, 0), EncodeDs1(2, 0, 0),
+      EncodeDs0(0x0d, 4), EncodeDs1(0, 2, 0), // keep the read live
+      EncodeSopp(0x01),
+  };
+  for (const uint32_t count : {1u, 2u}) {
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = count;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.lds_size_dwords = 2u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    const auto compiled = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    const auto metrics = MeasureSpirv(compiled.spirv);
+    Check(metrics.workgroup_variables == 1u && metrics.function_variables == 0u,
+          "singleton LDS fixture did not retain shared storage");
+    const auto atomic_stores = SpirvInstructionOpcodeCount(compiled.spirv, 228u);
+    Check(atomic_stores == (count == 1u ? 0u : 2u) &&
+              metrics.stores == (count == 1u ? 2u : 0u),
+          "LDS store atomicity did not follow the actual competing invocation count");
+  }
+}
+
+void TestComputeExecutionWaveScratchBudget() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* entry = AddExecutionPlanBlock(program);
+  auto& ballot = entry->AppendNewInst(O::Ballot,{IR::Value(true)});
+  auto& high = entry->AppendNewInst(O::CompositeExtractU32x4,
+      {IR::Value(&ballot),IR::Value(1u)});
+  entry->AppendNewInst(O::ReferenceU32,{IR::Value(&high)});
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  // No LDS access: unused declarations must not inflate the actual allocation.
+  compute.lds_size_dwords = UINT32_MAX;
+  limits.max_shared_memory_bytes = 264;
+  Check(PlanComputeExecution(program,input,limits).IsSplitWave64(),
+        "wave scratch and ballot aggregate words should fit exactly 264 shared bytes");
+  limits.max_shared_memory_bytes = 263;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(),
+        "software wave64 scratch and ballot aggregate words exceeded the device shared memory limit");
+  IR::MemoryInfo memory{};
+  memory.kind = IR::ResourceKind::Lds;
+  program.memory_info.push_back(memory);
+  auto& read = entry->AppendNewInst(O::LoadSharedU32,{IR::Value(0u),IR::Value(true)});
+  read.SetFlags(IR::MemoryFlags{.index=0});
+  entry->AppendNewInst(O::ReferenceU32,{IR::Value(&read)});
+  compute.lds_size_dwords = 128;
+  limits.max_shared_memory_bytes = 776;
+  Check(PlanComputeExecution(program,input,limits).IsSplitWave64(),
+        "guest LDS, wave scratch and ballot aggregate words should fit their exact combined limit");
+  limits.max_shared_memory_bytes = 775;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(),
+        "combined guest LDS, wave scratch and ballot aggregate words exceeded the device limit");
+  limits.max_shared_memory_bytes = UINT32_MAX;
+  compute.lds_size_dwords = UINT32_MAX;
+  Check(!PlanComputeExecution(program,input,limits).error.empty(),
+        "overflowed guest LDS size bypassed the device limit");
+}
+
+void TestComputeExecutionSingleWaveLds() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  enum class Scenario { Lds, BarrierOnly, Gds, Scratch, LiveAtomic,
+                        DivergentBranch, MissingLdsSize };
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const auto shape : {std::array<uint32_t,3>{64,1,1},
+                          std::array<uint32_t,3>{8,8,1},
+                          std::array<uint32_t,3>{1,1,64},
+                          std::array<uint32_t,3>{8,8,2}}) {
+    for (const auto scenario : {Scenario::Lds,Scenario::BarrierOnly,Scenario::Gds,
+         Scenario::Scratch,Scenario::LiveAtomic,Scenario::DivergentBranch,
+         Scenario::MissingLdsSize}) {
+      IR::Program program;
+      program.stage = ShaderType::Compute;
+      program.wave_size = 64;
+      auto* entry = AddExecutionPlanBlock(program);
+      auto& lane = entry->AppendNewInst(O::LaneId);
+      auto& byte_address = entry->AppendNewInst(O::ShiftLeftLogical32,
+          {IR::Value(&lane),IR::Value(2u)});
+      IR::Inst* read = nullptr;
+      if (scenario == Scenario::BarrierOnly) {
+        entry->AppendNewInst(O::Barrier);
+      } else {
+        IR::MemoryInfo memory{};
+        memory.kind = scenario == Scenario::Gds ? IR::ResourceKind::Gds :
+                      scenario == Scenario::Scratch ? IR::ResourceKind::Scratch : IR::ResourceKind::Lds;
+        program.memory_info.push_back(memory);
+        const auto tag = [](IR::Inst& inst) {
+          inst.SetFlags(IR::MemoryFlags{.index=0,.pc=0});
+        };
+        if (scenario == Scenario::Scratch) {
+          auto& scratch = entry->AppendNewInst(O::GetScratchResource);
+          read = &entry->AppendNewInst(O::LoadAddressU32,
+              {IR::Value(&scratch),IR::Value(&byte_address),IR::Value(0u),IR::Value(true)});
+          tag(*read);
+        } else {
+          auto& write = entry->AppendNewInst(O::WriteSharedU32,
+              {IR::Value(&byte_address),IR::Value(&lane),IR::Value(true)});
+          tag(write);
+          // Explicit guest barrier keeps the synchronization contract separate
+          // from the frontend's implicit LDS phase-barrier insertion heuristic.
+          entry->AppendNewInst(O::Barrier);
+          auto& partner = entry->AppendNewInst(O::BitwiseXor32,
+              {IR::Value(&lane),IR::Value(32u)});
+          auto& partner_address = entry->AppendNewInst(O::ShiftLeftLogical32,
+              {IR::Value(&partner),IR::Value(2u)});
+          read = &entry->AppendNewInst(O::LoadSharedU32,
+              {IR::Value(&partner_address),IR::Value(true)});
+          tag(*read);
+          if (scenario == Scenario::LiveAtomic) {
+            auto& atomic = entry->AppendNewInst(O::SharedAtomicIAdd32,
+                {IR::Value(0u),IR::Value(1u),IR::Value(true)});
+            tag(atomic);
+            entry->AppendNewInst(O::ReferenceU32,{IR::Value(&atomic)});
+          }
+        }
+        entry->AppendNewInst(O::ReferenceU32,{IR::Value(read)});
+      }
+      auto* collective_block = entry;
+      if (scenario == Scenario::DivergentBranch) {
+        auto* yes = AddExecutionPlanBlock(program);
+        auto* no = AddExecutionPlanBlock(program);
+        auto* merge = AddExecutionPlanBlock(program);
+        entry->AddBranch(yes);
+        entry->AddBranch(no);
+        yes->AddBranch(merge);
+        no->AddBranch(merge);
+        // LDS[partner] is zero only for logical lane32. Accepting this branch
+        // would strand that lane outside the taken arm's collective barriers.
+        auto& condition = entry->AppendNewInst(O::INotEqual32,
+            {IR::Value(read),IR::Value(0u)});
+        entry->AppendNewInst(O::Reference,{IR::Value(&condition)});
+        program.block_info[0].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+        program.block_info[0].terminator.true_block = 1;
+        program.block_info[0].terminator.false_block = 2;
+        program.block_info[0].terminator.merge_block = 3;
+        program.block_info[0].condition = IR::Value(&condition);
+        for (const uint32_t index : {1u,2u}) {
+          program.block_info[index].terminator.kind = CFG::TerminatorKind::Branch;
+          program.block_info[index].terminator.true_block = 3;
+        }
+        collective_block = yes;
+      }
+      auto& ballot = collective_block->AppendNewInst(O::Ballot,{IR::Value(true)});
+      auto& high = collective_block->AppendNewInst(O::CompositeExtractU32x4,
+          {IR::Value(&ballot),IR::Value(1u)});
+      collective_block->AppendNewInst(O::ReferenceU32,{IR::Value(&high)});
+      IR::ValidateProgram(program,true);
+      ShaderComputeInputInfo compute{};
+      for (uint32_t axis=0;axis<3;++axis) compute.threads_num[axis]=shape[axis];
+      compute.wave_size = 64;
+      compute.lds_size_dwords = scenario == Scenario::MissingLdsSize ||
+                               scenario == Scenario::BarrierOnly ? 0u : 64u;
+      ShaderStageInputInfo input{};
+      input.compute = &compute;
+      const auto plan = PlanComputeExecution(program,input,limits);
+      // Multi-wave LDS/barriers now require a cooperative, unpartitioned
+      // host group; all other rejected resource/control classes stay rejected.
+      const bool accepted = scenario == Scenario::Lds || scenario == Scenario::BarrierOnly;
+      if (accepted) {
+        Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 1 &&
+                  plan.layout.guest_size == shape &&
+                  WorkgroupInvocationCount(plan.layout.host_size) == WorkgroupInvocationCount(shape),
+              "LDS and workgroup barriers must retain every guest invocation in one host group");
+      } else {
+        Check(!plan.error.empty() && !plan.IsSplitWave64(),
+              "LDS support bypassed resource, live-atomic, convergence, or declaration guards");
+      }
+    }
+  }
+}
+
+void TestComputeExecutionSingleWaveGdsAtomic() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  enum class Scenario { WriteOnly, LiveReturn, Multiwave, SameMemoryRead };
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const auto scenario : {Scenario::WriteOnly, Scenario::LiveReturn,
+                              Scenario::Multiwave, Scenario::SameMemoryRead}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    auto& data = entry->AppendNewInst(O::IAdd32,{IR::Value(&lane),IR::Value(1u)});
+    IR::MemoryInfo memory{};
+    memory.kind = IR::ResourceKind::Gds;
+    memory.data_bits = 32u;
+    memory.data_dwords = 1u;
+    program.memory_info.push_back(memory);
+    auto& atomic = entry->AppendNewInst(
+        O::SharedAtomicIAdd32,{IR::Value(0u),IR::Value(&data),IR::Value(true)});
+    atomic.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x40u});
+    if (scenario == Scenario::LiveReturn)
+      entry->AppendNewInst(O::ReferenceU32,{IR::Value(&atomic)});
+    if (scenario == Scenario::SameMemoryRead) {
+      auto& read = entry->AppendNewInst(O::LoadSharedU32,{IR::Value(0u),IR::Value(true)});
+      read.SetFlags(IR::MemoryFlags{.index=0u,.pc=0x44u});
+      entry->AppendNewInst(O::ReferenceU32,{IR::Value(&read)});
+    }
+    IR::ValidateProgram(program,true);
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = scenario == Scenario::Multiwave ? 128u : 64u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.wave_size = 64u;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    if (scenario == Scenario::WriteOnly) {
+      Check(plan.error.empty() && plan.IsSplitWave64() &&
+                !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u,
+            "acyclic write-only GDS atomic lost its single-wave64 execution plan");
+    } else {
+      Check(!plan.error.empty() && !plan.IsSplitWave64(),
+            "GDS atomic admission accepted a live return, multiwave use, or GDS read");
+    }
+  }
+}
+
+void TestComputeExecutionUnusedMemoryDeclarations() {
+  using namespace ShaderRecompiler;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64;
+  auto* block = AddExecutionPlanBlock(program);
+  auto& ballot = block->AppendNewInst(IR::ValueOpcode::Ballot, {IR::Value(true)});
+  block->AppendNewInst(IR::ValueOpcode::ReferenceU32,
+      {IR::Value(&block->AppendNewInst(IR::ValueOpcode::CompositeExtractU32x4,
+                                     {IR::Value(&ballot), IR::Value(0u)}))});
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 128;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024};
+  limits.native_subgroup_size = 32;
+  // Reservation metadata alone neither accesses memory nor synchronizes waves.
+  for (const auto sizes : {std::array<uint32_t, 3>{1024, 0, 0},
+                          std::array<uint32_t, 3>{0, 1024, 0},
+                          std::array<uint32_t, 3>{0, 0, 1024},
+                          std::array<uint32_t, 3>{1024, 1024, 1024}}) {
+    compute.lds_size_dwords = sizes[0];
+    compute.scratch_size_dwords = sizes[1];
+    program.scratch_dwords = sizes[2];
+    const auto plan = PlanComputeExecution(program, input, limits);
+    Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 2,
+          "unused memory declarations must not reject independent complete waves");
+  }
+}
+
+void TestComputeExecutionRejectsActualStorageAndSynchronization() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  // All storage declarations are zero here: real LDS without allocation,
+  // GDS and scratch remain unsupported. A barrier alone needs no LDS and
+  // may be executed cooperatively, retaining the whole guest workgroup.
+  for (const auto kind : {IR::ResourceKind::Lds,IR::ResourceKind::Gds,
+                         IR::ResourceKind::Scratch,IR::ResourceKind::None}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto& ballot = entry->AppendNewInst(O::Ballot,{IR::Value(true)});
+    auto& low = entry->AppendNewInst(O::CompositeExtractU32x4,
+                                    {IR::Value(&ballot),IR::Value(0u)});
+    entry->AppendNewInst(O::ReferenceU32,{IR::Value(&low)});
+    if (kind == IR::ResourceKind::None) {
+      entry->AppendNewInst(O::Barrier);
+    } else {
+      IR::MemoryInfo memory{};
+      memory.kind = kind;
+      program.memory_info.push_back(memory);
+      IR::Inst* access;
+      if (kind == IR::ResourceKind::Scratch) {
+        auto& resource = entry->AppendNewInst(O::GetScratchResource);
+        access = &entry->AppendNewInst(O::LoadAddressU32,
+            {IR::Value(&resource),IR::Value(0u),IR::Value(0u),IR::Value(true)});
+      } else {
+        access = &entry->AppendNewInst(O::LoadSharedU32,{IR::Value(0u),IR::Value(true)});
+      }
+      access->SetFlags(IR::MemoryFlags{.index=0,.pc=0});
+      entry->AppendNewInst(O::ReferenceU32,{IR::Value(access)});
+    }
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 128;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    if (kind == IR::ResourceKind::None) {
+      Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 128u,
+            "guest barrier without LDS must retain a complete cooperative host group");
+    } else {
+      Check(!plan.error.empty(),"cooperative execution accepted missing LDS allocation, GDS or scratch");
+    }
+  }
+}
+
+// Place after AddExecutionPlanBlock in shaderCfgTests.cpp and register
+// TestComputeExecutionDsLaneConvergence in the CPU runner.
+// This tests the planner only; it does not emit or execute a shader.
+void TestComputeExecutionDsLaneConvergence() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.wave_size = 64;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024};
+  limits.native_subgroup_size = 32;
+
+  for (const auto opcode : {O::BpermuteU32, O::SwizzleU32}) {
+    for (const bool branch_on_result : {false, true}) {
+      IR::Program program;
+      program.stage = ShaderType::Compute;
+      program.wave_size = 64;
+      auto* entry = AddExecutionPlanBlock(program);
+      // BPERMUTE wraps byte address 128 within each 32-lane half. SWIZZLE
+      // 0x00e0 selects lane 7 within each half. Both take U32,U32,U1.
+      const uint32_t control = opcode == O::BpermuteU32 ? 128u : 0x00e0u;
+      IR::Value source(17u);
+      IR::Value selector(control);
+      if (branch_on_result) {
+        auto& lane = entry->AppendNewInst(O::LaneId);
+        source = IR::Value(&lane);
+        if (opcode == O::BpermuteU32) {
+          auto& byte_address = entry->AppendNewInst(
+              O::ShiftLeftLogical32, {source, IR::Value(2u)});
+          selector = IR::Value(&byte_address);
+        } else {
+          selector = IR::Value(0x001fu); // Identity within each 32-lane half.
+        }
+      }
+      auto& lane_result = entry->AppendNewInst(
+          opcode, {source, selector, IR::Value(true)});
+      entry->AppendNewInst(O::ReferenceU32, {IR::Value(&lane_result)});
+
+      if (branch_on_result) {
+        auto* taken = AddExecutionPlanBlock(program);
+        auto* other = AddExecutionPlanBlock(program);
+        auto* merge = AddExecutionPlanBlock(program);
+        entry->AddBranch(taken);
+        entry->AddBranch(other);
+        taken->AddBranch(merge);
+        other->AddBranch(merge);
+        auto& condition = entry->AppendNewInst(
+            O::INotEqual32, {IR::Value(&lane_result), IR::Value(0u)});
+        entry->AppendNewInst(O::Reference, {IR::Value(&condition)});
+        auto& header = program.block_info[0];
+        header.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+        header.terminator.true_block = 1;
+        header.terminator.false_block = 2;
+        header.terminator.merge_block = 3;
+        header.condition = IR::Value(&condition);
+        for (const uint32_t arm : {1u, 2u}) {
+          program.block_info[arm].terminator.kind = CFG::TerminatorKind::Branch;
+          program.block_info[arm].terminator.true_block = 3;
+        }
+        // Keep a collective inside one arm: accepting an unproven condition
+        // would let only part of the logical wave reach its workgroup barriers.
+        auto& ballot = taken->AppendNewInst(O::Ballot, {IR::Value(true)});
+        auto& low = taken->AppendNewInst(
+            O::CompositeExtractU32x4, {IR::Value(&ballot), IR::Value(0u)});
+        taken->AppendNewInst(O::ReferenceU32, {IR::Value(&low)});
+      }
+
+      IR::ValidateProgram(program, true);
+      const auto plan = PlanComputeExecution(program, input, limits);
+      if (branch_on_result) {
+        // Each lane reads itself, so result != 0 is false only at lane zero.
+        // The remaining 63 lanes would reach the taken arm's collective alone.
+        Check(!plan.error.empty() &&
+                  Common::ContainsStr(plan.error, "wave-uniform branch"),
+              "DS lane branch was accepted or rejected before convergence analysis");
+        Check(!plan.IsSplitWave64(),
+              "rejected DS lane branch retained an executable split plan");
+      } else {
+        Check(plan.error.empty() && plan.IsSplitWave64() &&
+                  plan.wave_partition_factor == 1u &&
+                  plan.layout.guest_size == std::array<uint32_t, 3>{64, 1, 1} &&
+                  plan.layout.host_size == std::array<uint32_t, 3>{64, 1, 1},
+              "straight-line DS lane operation did not retain one complete split wave");
+      }
+    }
+  }
+}
+
+// Test-only draft. Insert beside AddExecutionPlanBlock and register
+// TestComputeExecutionLoopReadFeedback(). No proprietary shader bytes.
+void TestComputeExecutionLoopReadFeedback() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  enum class Scenario {
+    ImageOutput, BufferOutput, AddressOutput, PollDirect, PollBallot,
+    PollReadLane, PollReadFirst, PollPhi, PostLoopBranch,
+    CyclicImageWrite, CyclicDisjointImageWrite, CyclicAddressImageWrite,
+    CyclicBufferWrite,
+    CyclicAtomic, OtherCycleWrite
+  };
+  const ComputeWorkgroupLimits limits{{1024,1024,64},1024,32,false};
+  for (const uint32_t invocations : {64u,128u}) {
+  for (const auto scenario : {
+      Scenario::ImageOutput, Scenario::BufferOutput, Scenario::AddressOutput,
+      Scenario::PollDirect, Scenario::PollBallot, Scenario::PollReadLane,
+      Scenario::PollReadFirst, Scenario::PollPhi, Scenario::PostLoopBranch,
+      Scenario::CyclicImageWrite, Scenario::CyclicDisjointImageWrite,
+      Scenario::CyclicAddressImageWrite,
+      Scenario::CyclicBufferWrite,
+      Scenario::CyclicAtomic, Scenario::OtherCycleWrite}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* after = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    body->AddBranch(body);
+    body->AddBranch(after);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[1].terminator.loop_header = true;
+    auto& image = entry->AppendNewInst(O::GetImageResource,
+        {IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u)});
+    auto& buffer = entry->AppendNewInst(O::GetBufferResource,
+        {IR::Value(0u),IR::Value(0u),IR::Value(4096u),IR::Value(0u)});
+    auto& address = entry->AppendNewInst(O::GetAddressResource,
+        {IR::Value(0u),IR::Value(0u)});
+    const auto tag_memory = [&](IR::Inst& inst, IR::ResourceKind kind,
+                                uint32_t resource = 0u) {
+      const auto index = static_cast<uint32_t>(program.memory_info.size());
+      IR::MemoryInfo memory{};
+      memory.kind = kind;
+      memory.resource = resource;
+      program.memory_info.push_back(memory);
+      inst.SetFlags(IR::MemoryFlags{.index=index,.pc=0});
+    };
+    auto counter_it = body->PrependNewInst(body->begin(),O::Phi,{},
+                                         static_cast<uint64_t>(IR::Type::U32));
+    auto* counter = &*counter_it;
+    counter->AddPhiOperand(entry,IR::Value(0u));
+    auto accumulator_it = body->PrependNewInst(body->begin(),O::Phi,{},
+                                             static_cast<uint64_t>(IR::Type::U32));
+    auto* accumulator = &*accumulator_it;
+    accumulator->AddPhiOperand(entry,IR::Value(0u));
+    auto& coords = body->AppendNewInst(O::MakeImageAddress,
+        {IR::Value(counter),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(0u)});
+    IR::Value pixel;
+    if (scenario == Scenario::BufferOutput) {
+      auto& read = body->AppendNewInst(O::ReadConstBuffer,
+          {IR::Value(&buffer),IR::Value(counter)});
+      tag_memory(read,IR::ResourceKind::ScalarBuffer);
+      pixel = IR::Value(&read);
+    } else if (scenario == Scenario::AddressOutput ||
+               scenario == Scenario::CyclicAddressImageWrite) {
+      auto& read = body->AppendNewInst(O::LoadAddressU32,
+          {IR::Value(&address),IR::Value(counter),IR::Value(0u),IR::Value(true)});
+      tag_memory(read,scenario == Scenario::CyclicAddressImageWrite
+                          ? IR::ResourceKind::ScalarAddress
+                          : IR::ResourceKind::Global);
+      pixel = IR::Value(&read);
+    } else {
+      auto& read = body->AppendNewInst(O::ImageRead,
+          {IR::Value(&image),IR::Value(&coords),IR::Value(true)});
+      tag_memory(read,IR::ResourceKind::Image);
+      auto& extract = body->AppendNewInst(O::CompositeExtractU32x4,
+          {IR::Value(&read),IR::Value(0u)});
+      pixel = IR::Value(&extract);
+    }
+    // The positive contract has a live loop-carried result and a real output,
+    // but its four-iteration counter is independent of every loaded value.
+    auto& sum = body->AppendNewInst(O::IAdd32,{IR::Value(accumulator),pixel});
+    accumulator->AddPhiOperand(body,IR::Value(&sum));
+    auto& increment = body->AppendNewInst(O::IAdd32,
+        {IR::Value(counter),IR::Value(1u)});
+    counter->AddPhiOperand(body,IR::Value(&increment));
+    auto& bounded_condition = body->AppendNewInst(O::ULessThan32,
+        {IR::Value(&increment),IR::Value(4u)});
+    IR::Value condition(&bounded_condition);
+    if (scenario == Scenario::PollDirect || scenario == Scenario::PollBallot ||
+        scenario == Scenario::PollReadLane || scenario == Scenario::PollReadFirst ||
+        scenario == Scenario::PollPhi) {
+      IR::Value control = pixel;
+      if (scenario == Scenario::PollPhi) control = IR::Value(accumulator);
+      if (scenario == Scenario::PollReadLane || scenario == Scenario::PollPhi) {
+        auto& lane = body->AppendNewInst(O::ReadLane,{control,IR::Value(31u)});
+        control = IR::Value(&lane);
+      } else if (scenario == Scenario::PollReadFirst) {
+        auto& first = body->AppendNewInst(O::ReadFirstLane,{control,IR::Value(true)});
+        control = IR::Value(&first);
+      }
+      auto& nonzero = body->AppendNewInst(O::INotEqual32,{control,IR::Value(0u)});
+      IR::Value poll(&nonzero);
+      if (scenario == Scenario::PollBallot) {
+        auto& ballot = body->AppendNewInst(O::Ballot,{poll});
+        auto& low = body->AppendNewInst(O::CompositeExtractU32x4,
+            {IR::Value(&ballot),IR::Value(0u)});
+        auto& any = body->AppendNewInst(O::INotEqual32,{IR::Value(&low),IR::Value(0u)});
+        poll = IR::Value(&any);
+      }
+      // A bound prevents accidental hangs if this synthetic shape is ever run;
+      // it must not make memory-dependent loop control eligible for splitting.
+      auto& keep_going = body->AppendNewInst(O::LogicalAnd,{condition,poll});
+      condition = IR::Value(&keep_going);
+    }
+    program.block_info[1].condition = condition;
+    body->AppendNewInst(O::Reference,{condition});
+    auto& wave_result = after->AppendNewInst(O::ReadLane,
+        {IR::Value(&sum),IR::Value(63u)});
+    auto& output = after->AppendNewInst(O::StoreBufferU32,
+        {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),
+         IR::Value(&wave_result),IR::Value(true)});
+    tag_memory(output,IR::ResourceKind::Buffer);
+    if (scenario == Scenario::CyclicImageWrite ||
+        scenario == Scenario::CyclicDisjointImageWrite ||
+        scenario == Scenario::CyclicAddressImageWrite) {
+      auto& data = body->AppendNewInst(O::CompositeConstructU32x4,
+          {pixel,IR::Value(0u),IR::Value(0u),IR::Value(0u)});
+      auto& write = body->AppendNewInst(O::ImageWrite,
+          {IR::Value(&image),IR::Value(&coords),IR::Value(&data),IR::Value(true)});
+      tag_memory(write,IR::ResourceKind::Image,
+                 scenario == Scenario::CyclicDisjointImageWrite ? 1u : 0u);
+    }
+    if (scenario == Scenario::CyclicBufferWrite) {
+      auto& write = body->AppendNewInst(O::StoreBufferU32,
+          {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),pixel,IR::Value(true)});
+      tag_memory(write,IR::ResourceKind::Buffer);
+    }
+    if (scenario == Scenario::CyclicAtomic) {
+      // Even a discarded atomic result may couple different guest waves.
+      auto& atomic = body->AppendNewInst(O::BufferAtomicOr32,
+          {IR::Value(&buffer),IR::Value(0u),IR::Value(0u),IR::Value(0u),IR::Value(1u),IR::Value(true)});
+      tag_memory(atomic,IR::ResourceKind::Buffer);
+    }
+    if (scenario == Scenario::PostLoopBranch) {
+      auto* yes = AddExecutionPlanBlock(program);
+      auto* no = AddExecutionPlanBlock(program);
+      after->AddBranch(yes);
+      after->AddBranch(no);
+      auto& post_condition = after->AppendNewInst(O::INotEqual32,
+          {IR::Value(&wave_result),IR::Value(0u)});
+      after->AppendNewInst(O::Reference,{IR::Value(&post_condition)});
+      program.block_info[2].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[2].terminator.true_block = 3;
+      program.block_info[2].terminator.false_block = 4;
+      program.block_info[2].condition = IR::Value(&post_condition);
+      // This condition is outside every SCC. Rejecting it prevents implicit
+      // control dependence from being laundered through later constant phis.
+    }
+    if (scenario == Scenario::OtherCycleWrite) {
+      auto* done = AddExecutionPlanBlock(program);
+      after->AddBranch(after);
+      after->AddBranch(done);
+      auto it = after->PrependNewInst(after->begin(),O::Phi,{},
+                                     static_cast<uint64_t>(IR::Type::U32));
+      it->AddPhiOperand(body,IR::Value(0u));
+      auto& next = after->AppendNewInst(O::IAdd32,{IR::Value(&*it),IR::Value(1u)});
+      it->AddPhiOperand(after,IR::Value(&next));
+      auto& condition2 = after->AppendNewInst(O::ULessThan32,
+          {IR::Value(&next),IR::Value(4u)});
+      after->AppendNewInst(O::Reference,{IR::Value(&condition2)});
+      program.block_info[2].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[2].terminator.true_block = 2;
+      program.block_info[2].terminator.false_block = 3;
+      program.block_info[2].condition = IR::Value(&condition2);
+      // Its existing output store is now in a DIFFERENT cyclic SCC.
+    }
+    IR::ValidateProgram(program,true);
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = invocations;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program,input,limits);
+    // A single full guest wave remains one host workgroup. Its memory-driven
+    // uniform branches do not introduce progress dependence between partitions.
+    // Direct varying branches stay unsupported. Cyclic memory operations in one
+    // complete guest wave require the split-half rendezvous; 128 invocations
+    // partition the guest workgroup and therefore remain unsupported.
+    const bool cyclic_writer =
+        scenario == Scenario::CyclicImageWrite ||
+        scenario == Scenario::CyclicDisjointImageWrite ||
+        scenario == Scenario::CyclicAddressImageWrite ||
+        scenario == Scenario::CyclicBufferWrite ||
+        scenario == Scenario::CyclicAtomic ||
+        scenario == Scenario::OtherCycleWrite;
+    const bool single_wave_feedback = invocations == 64 &&
+        (scenario == Scenario::PollBallot || scenario == Scenario::PollReadLane ||
+         scenario == Scenario::PollReadFirst || scenario == Scenario::PollPhi ||
+         scenario == Scenario::PostLoopBranch || cyclic_writer);
+    const bool accepted = scenario == Scenario::ImageOutput ||
+                          scenario == Scenario::BufferOutput || scenario == Scenario::AddressOutput ||
+                          single_wave_feedback;
+    if (plan.error.empty() != accepted)
+      std::fprintf(stderr, "loop feedback scenario=%u invocations=%u: %s\n",
+                   static_cast<unsigned>(scenario), invocations, plan.error.c_str());
+    if (accepted) {
+      Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == invocations / 64,
+            "supported loop reads must preserve complete-wave dispatch geometry");
+      Check(plan.SynchronizesSplitWaveMemory() == cyclic_writer,
+            "split-wave external-memory rendezvous did not match the cyclic writer proof");
+    } else {
+      Check(!plan.error.empty() && !plan.IsSplitWave64(),
+            "split-wave proof accepted mutable loop feedback or cyclic memory communication");
+    }
+  }
+  }
+}
+
+void TestComputeDispatchGroupExpansion() {
+  using ShaderRecompiler::PlanComputeDispatchGroups;
+  constexpr std::array<uint32_t, 3> limits{65535u, 65535u, 65535u};
+  const auto expanded = PlanComputeDispatchGroups({15u, 8u, 1u}, 4u, limits);
+  Check(expanded && *expanded == std::array<uint32_t, 3>{60u, 8u, 1u},
+        "wave split changed Y/Z or used the wrong X partition factor");
+  const auto boundary = PlanComputeDispatchGroups({65535u, 65535u, 65535u}, 1u, limits);
+  Check(boundary && *boundary == limits, "valid native dispatch limit was rejected");
+  Check(!PlanComputeDispatchGroups({16384u, 1u, 1u}, 4u, limits),
+        "expanded X exceeded the device group limit");
+  Check(!PlanComputeDispatchGroups({UINT32_MAX, 1u, 1u}, 2u,
+                                   {UINT32_MAX, UINT32_MAX, UINT32_MAX}),
+        "expanded X overflowed before bounds validation");
+  Check(!PlanComputeDispatchGroups({1u, 65536u, 1u}, 1u, limits) &&
+            !PlanComputeDispatchGroups({1u, 1u, 65536u}, 1u, limits),
+        "native Y/Z device group limits were not checked");
+  Check(!PlanComputeDispatchGroups({1u, 1u, 1u}, 0u, limits),
+        "an invalid partition factor dropped required work");
+  const auto empty = PlanComputeDispatchGroups({0u, 8u, 1u}, 4u, limits);
+  Check(empty && *empty == std::array<uint32_t, 3>{0u, 8u, 1u},
+        "wave splitting turned zero work into a dispatch");
+}
+
+void TestComputeWorkgroupPlanningBoundaries() {
+  using ShaderRecompiler::ComputeWorkgroupLimits;
+  using ShaderRecompiler::PlanComputeWorkgroup;
+  struct ValidCase {
+    std::array<uint32_t, 3> guest;
+    ComputeWorkgroupLimits limits;
+  };
+  const ValidCase valid[] = {
+      {{2, 3, 4}, {{4, 4, 8}, 64}},
+      {{8, 4, 2}, {{8, 4, 2}, 64}},
+      {{1, 1, 256}, {{1024, 1024, 64}, 1024}},
+      {{8, 8, 4}, {{4, 4, 16}, 256}},
+      {{12, 6, 1}, {{8, 3, 3}, 72}},
+      {{9, 8, 7}, {{8, 9, 7}, 504}},
+      {{UINT32_MAX, 1, 1}, {{UINT32_MAX, 1, 1}, UINT32_MAX}},
+      {{1, 1, 256}, {}}, // Offline compilation retains the original shape.
+  };
+  for (const auto &test : valid) {
+    const auto layout = PlanComputeWorkgroup(test.guest, test.limits);
+    Check(layout.has_value(), "compute planner rejected a representable shape");
+    CheckComputeWorkgroupLayout(*layout, test.guest, test.limits);
+  }
+
+  for (uint32_t axis = 0; axis < 3; axis++) {
+    std::array<uint32_t, 3> guest = {1, 1, 1};
+    guest[axis] = 0;
+    Check(!PlanComputeWorkgroup(guest, {}),
+          "compute planner accepted a zero guest dimension");
+    ComputeWorkgroupLimits limits;
+    limits.max_size[axis] = 0;
+    Check(!PlanComputeWorkgroup({1, 1, 1}, limits),
+          "compute planner accepted a zero host dimension limit");
+  }
+  Check(!PlanComputeWorkgroup({1, 1, 1}, {{1, 1, 1}, 0}),
+        "compute planner accepted zero max invocations");
+  Check(!PlanComputeWorkgroup({8, 8, 8}, {{1024, 1024, 64}, 256}),
+        "compute planner ignored total invocation limit");
+  Check(!PlanComputeWorkgroup({UINT32_MAX, 2, 1}, {}),
+        "compute planner accepted overflowing uint32 invocation count");
+  Check(!PlanComputeWorkgroup({UINT32_MAX, UINT32_MAX, UINT32_MAX}, {}),
+        "compute planner accepted a product overflowing uint64");
+  Check(!PlanComputeWorkgroup({1, 1, 17}, {{4, 4, 4}, 64}),
+        "compute planner padded or split an unrepresentable prime workgroup");
+  Check(!PlanComputeWorkgroup({1, 1, 8}, {{3, 3, 1}, 9}),
+        "compute planner padded an unrepresentable composite workgroup");
+}
+
+void TestComputeWorkgroupPlanningMatchesSmallExhaustiveOracle() {
+  using ShaderRecompiler::ComputeWorkgroupLimits;
+  using ShaderRecompiler::PlanComputeWorkgroup;
+  for (uint32_t max_x = 1; max_x <= 4; max_x++) {
+    for (uint32_t max_y = 1; max_y <= 4; max_y++) {
+      for (uint32_t max_z = 1; max_z <= 4; max_z++) {
+        for (const uint32_t budget : {1u, 7u, 16u, 31u, 64u}) {
+          const ComputeWorkgroupLimits limits{{max_x, max_y, max_z}, budget};
+          // Independent oracle: enumerate every legal physical shape, without
+          // factorizing the guest count or reproducing the planner's search.
+          std::array<bool, 126> possible{};
+          for (uint32_t x = 1; x <= max_x; x++) {
+            for (uint32_t y = 1; y <= max_y; y++) {
+              for (uint32_t z = 1; z <= max_z; z++) {
+                if (x * y * z <= budget) {
+                  possible[x * y * z] = true;
+                }
+              }
+            }
+          }
+          for (uint32_t x = 1; x <= 5; x++) {
+            for (uint32_t y = 1; y <= 5; y++) {
+              for (uint32_t z = 1; z <= 5; z++) {
+                const std::array<uint32_t, 3> guest = {x, y, z};
+                const auto layout = PlanComputeWorkgroup(guest, limits);
+                if (layout.has_value() != possible[x * y * z]) {
+                  std::fprintf(stderr,
+                               "compute oracle mismatch: guest=%u,%u,%u "
+                               "limits=%u,%u,%u max_invocations=%u\n",
+                               x, y, z, max_x, max_y, max_z, budget);
+                  Check(false, "compute planner disagrees with exhaustive oracle");
+                }
+                if (layout) {
+                  CheckComputeWorkgroupLayout(*layout, guest, limits);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x0c),
@@ -8892,21 +12440,19 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       Common::FindIndex(source, std::string("OpBranchConditional"), 0);
-  const auto array_length =
-      Common::FindIndex(source, std::string("OpArrayLength"), 0);
   const auto bounds_branch = Common::FindIndex(
-      source, std::string("OpBranchConditional"), array_length);
+      source, std::string("OpBranchConditional"), exec_branch + 1u);
   const auto element_access = Common::FindIndex(
       source, std::string("OpAccessChain %_ptr_StorageBuffer_uint"), 0);
   Check(exec_branch != Common::FIND_INVALID_INDEX,
         "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != Common::FIND_INVALID_INDEX,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
   Check(bounds_branch != Common::FIND_INVALID_INDEX,
-        "buffer load SPIR-V lacks storage buffer bounds branch");
+        "buffer load SPIR-V lacks storage-buffer byte-limit bounds branch");
+  Check(!SpirvContainsOpcode(result.spirv, 68u),
+        "buffer load SPIR-V retained OpArrayLength on a storage-buffer descriptor");
   Check(element_access != Common::FIND_INVALID_INDEX,
         "buffer load SPIR-V lacks storage element access");
-  Check(exec_branch < array_length,
+  Check(exec_branch < bounds_branch,
         "buffer load bounds check was emitted outside EXEC guard");
   Check(bounds_branch < element_access,
         "buffer load storage element pointer was formed before bounds guard");
@@ -8939,15 +12485,16 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
-    const auto array_length =
-        Common::FindIndex(source, std::string("OpArrayLength"), 0);
+    const auto exec_branch =
+        Common::FindIndex(source, std::string("OpBranchConditional"), 0);
     const auto bounds_branch = Common::FindIndex(
-        source, std::string("OpBranchConditional"), array_length);
+        source, std::string("OpBranchConditional"), exec_branch + 1u);
     const auto atomic = Common::FindIndex(source, std::string(test.spirv), 0);
     const auto memory_barrier =
         Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
-    Check(array_length != Common::FIND_INVALID_INDEX &&
+    Check(exec_branch != Common::FIND_INVALID_INDEX &&
               bounds_branch != Common::FIND_INVALID_INDEX &&
+              !SpirvContainsOpcode(result.spirv, 68u) &&
               atomic != Common::FIND_INVALID_INDEX &&
               memory_barrier != Common::FIND_INVALID_INDEX,
           "buffer atomic SPIR-V lacks its bounds guard, operation, or barrier");
@@ -8993,15 +12540,16 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
-    const auto array_length =
-        Common::FindIndex(source, std::string("OpArrayLength"), 0);
+    const auto exec_branch =
+        Common::FindIndex(source, std::string("OpBranchConditional"), 0);
     const auto bounds_branch = Common::FindIndex(
-        source, std::string("OpBranchConditional"), array_length);
+        source, std::string("OpBranchConditional"), exec_branch + 1u);
     const auto atomic =
         Common::FindIndex(source, std::string(test.spirv_name), 0);
     const auto memory_barrier =
         Common::FindIndex(source, std::string("OpMemoryBarrier"), atomic);
-    Check(array_length != Common::FIND_INVALID_INDEX &&
+    Check(!SpirvContainsOpcode(result.spirv, 68u) &&
+              exec_branch != Common::FIND_INVALID_INDEX &&
               bounds_branch != Common::FIND_INVALID_INDEX &&
               atomic != Common::FIND_INVALID_INDEX && bounds_branch < atomic,
           "64-bit buffer atomic was not guarded by storage-buffer bounds");
@@ -9081,480 +12629,6 @@ void TestNewShaderRecompilerSetpcBranch() {
   Check(Common::ContainsStr(result.ir_dump, "successors=["),
         "S_SETPC_B64 did not participate in CFG");
   CheckSpirvBinaryValidates(result.spirv);
-}
-
-void TestFusedShaderHandoffPreservesRegisters() {
-  using namespace ShaderRecompiler;
-  const uint32_t front[] = {
-      EncodeSMovB32(12, 255), 0x1003u, // three vertices and one primitive
-      EncodeSop1(0x20, 0, 6), // merged-stage handoff through s[6:7]
-      0xffffffffu,            // front shader metadata must not be decoded
-  };
-  const uint32_t back[] = {
-      EncodeSMovB32(124, 12), // s_mov_b32 m0, s12
-      EncodeSopp(0x10, 9),   // s_sendmsg MSG_GS_ALLOC_REQ
-      EncodeSopp(0x01),
-  };
-  ShaderVertexInputInfo input{};
-  input.mesh.threads_num[0] = 192;
-  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
-  input.mesh.primitives_per_group = 62;
-  input.mesh.vertices_per_group = 64;
-  CompileOptions options{};
-  options.stage = ShaderType::Mesh;
-  options.input_info.vertex = &input;
-  options.back_code = back;
-  auto translated = TranslateProgram(front, options);
-  uint32_t allocations = 0;
-  for (const auto* block: translated.program.blocks) {
-    for (const auto& inst: *block) {
-      if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
-        continue;
-      }
-      const auto value = inst.Arg(0).Resolve();
-      Check(value.IsImmediate() && value.U32() == 0x1003u,
-            "fused back shader lost the front shader's scalar register value");
-      allocations++;
-    }
-  }
-  Check(allocations == 1u, "fused shader omitted the back shader allocation");
-}
-
-void TestMeshExportStorage() {
-  using ShaderRecompiler::IR::PushData;
-  const uint32_t front[] = {
-      EncodeSMovB32(12, 255), 0x1003u,
-      EncodeSop1(0x20, 0, 6), // merged-stage handoff
-  };
-  const uint32_t back[] = {
-      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
-      EncodeVop1(0x01, 0, 128),
-      EncodeVop1(0x01, 9, 13), // retain user s13
-      EncodeMubuf0(0x1c), EncodeMubuf1(9, 2, 5), // store using s[8:11] and vertex ID
-      EncodeDs0(0x0d), EncodeDs1(0, 0, 0), // retain guest LDS
-      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
-      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
-      EncodeExp0(0x21, 0xf, false), EncodeExp1(0, 0, 0, 0),
-      EncodeExp0(0x22, 0xf, false), EncodeExp1(0, 0, 0, 0),
-      EncodeExp0(0x0d, 0x4, false), EncodeExp1(0, 0, 0, 0), // Layer
-      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
-      EncodeSopp(0x01),
-  };
-  std::vector<uint32_t> monolithic(std::begin(front), std::begin(front) + 2);
-  monolithic.insert(monolithic.end(), std::begin(back), std::end(back));
-  ShaderVertexInputInfo input{};
-  input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 18u);
-  auto &mesh = input.mesh;
-  mesh.threads_num[0] = 192;
-  mesh.threads_num[1] = mesh.threads_num[2] = 1;
-  mesh.lds_size_dwords = 3840;
-  mesh.primitives_per_group = 62;
-  mesh.vertices_per_group = 64;
-  mesh.max_vertices = 192;
-  mesh.max_primitives = 176;
-  std::array<uint32_t, 14> user_data{};
-  user_data[8] = 0x10000008u;
-  user_data[9] = 4u << 16u;
-  user_data[10] = 64u;
-  user_data[11] = 0x00027000u;
-  user_data[13] = 0x3f800000u;
-  ShaderRecompiler::CompileOptions options{};
-  options.stage = ShaderType::Mesh;
-  options.input_info.vertex = &input;
-  options.user_data = user_data;
-  struct Case {
-    uint32_t subgroup_size, push_data_start;
-    bool split;
-  };
-  const Case cases[] = {
-      {32u, PushData::MeshDrawDwordCount, true}, {64u, PushData::MeshDrawDwordCount, true},
-      {32u, PushData::DwordCount, true}, {64u, PushData::DwordCount, true},
-      {32u, PushData::MeshDrawDwordCount, false}, {64u, PushData::MeshDrawDwordCount, false},
-      {32u, PushData::DwordCount, false}, {64u, PushData::DwordCount, false},
-  };
-  for (const auto [subgroup_size, push_data_start, split] : cases) {
-    mesh.host_subgroup_size = subgroup_size;
-    options.back_code = split ? std::span{back} : std::span<const uint32_t>{};
-    const auto result = RecompileForTest(
-        split ? std::span{front} : std::span<const uint32_t>{monolithic},
-        options, nullptr, nullptr, push_data_start);
-    CheckSpirvBinaryValidates(result.spirv);
-    const auto &layout = result.program.bindings;
-    Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
-              layout.memory_offset_count == 1,
-          "mesh shader did not retain its user-data placement and buffer offset");
-    const auto reg = std::ranges::find(layout.user_data_registers, 13u);
-    Check(reg != layout.user_data_registers.end(), "mesh shader lost user s13");
-    const auto source = DisassembleSpirvBinary(result.spirv);
-    for (const auto dword :
-         {static_cast<uint32_t>(reg - layout.user_data_registers.begin()),
-          layout.memory_offset_dword}) {
-      const auto operand =
-          std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
-          " %uint_0 %uint_" +
-          std::to_string(dword + (layout.UsesPushData() ? push_data_start : 0u));
-      Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
-            "mesh user SGPR or buffer offset loaded from the wrong storage");
-    }
-    Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                         "vsharp %uint_0 %uint_0") &&
-              !SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                              "vsharp %uint_0 %uint_4294967295"),
-          "mesh draw prefix was lost or spilled shader data wrapped into push constants");
-    const auto &binary = result.spirv;
-    std::vector<uint32_t> sizes(binary[3]), constants(binary[3]);
-    uint32_t shared_bytes = 0, private_bytes = 0;
-    for (size_t i = 5; i < binary.size(); i += binary[i] >> 16u) {
-      switch (binary[i] & 0xffffu) {
-      case 21u: // OpTypeInt
-      case 22u: // OpTypeFloat
-        sizes[binary[i + 1]] = binary[i + 2] / 8u;
-        break;
-      case 23u: // OpTypeVector
-        sizes[binary[i + 1]] = sizes[binary[i + 2]] * binary[i + 3];
-        break;
-      case 28u: // OpTypeArray
-        sizes[binary[i + 1]] = sizes[binary[i + 2]] * constants[binary[i + 3]];
-        break;
-      case 32u: // OpTypePointer
-        sizes[binary[i + 1]] = sizes[binary[i + 3]];
-        break;
-      case 43u: // OpConstant
-        constants[binary[i + 2]] = binary[i + 3];
-        break;
-      case 59u: // OpVariable
-        if (binary[i + 3] == 4u || binary[i + 3] == 6u) {
-          Check(sizes[binary[i + 1]] != 0, "unmeasured mesh staging type");
-          (binary[i + 3] == 4u ? shared_bytes : private_bytes) += sizes[binary[i + 1]];
-        }
-        break;
-      }
-    }
-    // The Pathless shader 35869c17ce783c88 exceeds the host's 28 KiB budget
-    // when its four vertex exports and primitive exports are shared arrays.
-    Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u && shared_bytes <= 28672u,
-          "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
-    Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
-          "mesh vertex and primitive exports lost their separate logical-lane storage");
-  }
-}
-
-void TestMergedShaderUserDataSnapshot() {
-  using namespace ShaderRecompiler;
-  const uint32_t front[] = {
-      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 1), // consume front s[8:11]
-      EncodeSop1(0x20, 0, 6),                   // merged-stage handoff
-  };
-  const uint32_t back[] = {
-      EncodeSmem0(0x02, 8, 0), 125u << 25u, // s_load_dwordx4 s[8:11], s[0:1]
-      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 1), EncodeSopp(0x01),
-  };
-  const std::array<uint32_t, 4> first_table = {0x12340000, 0, 64, 0x00027000};
-  const std::array<uint32_t, 4> second_table = {0x56780000, 0, 64, 0x00027000};
-  HW::VertexShaderInfo regs{};
-  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(front);
-  regs.gs_regs.data_addr = reinterpret_cast<uint64_t>(back);
-  regs.gs_regs.user_data_addr = reinterpret_cast<uint64_t>(first_table.data());
-  regs.gs_regs.rsrc1.gs_vgpr_component_count = 3;
-  regs.gs_regs.rsrc2.es_vgpr_component_count = 3;
-  regs.gs_regs.rsrc2.user_sgpr = 4;
-  for (uint32_t i = 0; i < 4; i++) {
-    regs.gs_user_sgpr.value[i] = 0x10001000u + i;
-  }
-  const std::array<uint32_t, 4> front_data = {regs.gs_user_sgpr.value[0],
-      regs.gs_user_sgpr.value[1], regs.gs_user_sgpr.value[2], regs.gs_user_sgpr.value[3]};
-  ShaderMappedData mapped{};
-  mapped.type = Prospero::ShaderBinaryType::kGsFront;
-  mapped.code_size_bytes = sizeof(front);
-  mapped.scratch_size_dwords = 3;
-  ShaderMapUserData(regs.es_regs.data_addr, mapped);
-  mapped.type = Prospero::ShaderBinaryType::kGsBack;
-  mapped.code_size_bytes = sizeof(back);
-  mapped.scratch_size_dwords = 7;
-  ShaderMapUserData(regs.gs_regs.data_addr, mapped);
-  HW::Context context;
-  context.SetShaderStages(0x20);
-  context.SetMaxOutputPerSubgroup(252);
-  context.SetGsMaxVertOut(18);
-  context.SetGsOutPrimType(2);
-  HW::UserConfig user_config;
-  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
-  user_config.SetGeControl({14, 14});
-  ShaderVertexInputInfo first_input{};
-  const auto first = PrepareProgram(regs, context, user_config, first_input);
-  regs.gs_regs.user_data_addr = reinterpret_cast<uint64_t>(second_table.data());
-  regs.gs_user_sgpr.value[0]++;
-  ShaderVertexInputInfo second_input{};
-  const auto second = PrepareProgram(regs, context, user_config, second_input);
-  Check(first.user_data.size() == 12 && second.user_data.size() == 12 &&
-            std::equal(front_data.begin(), front_data.end(), first.user_data.begin() + 8) &&
-            second.user_data[8] == front_data[0] + 1,
-        "merged shader parameters did not snapshot ordinary user SGPRs at s8");
-  Check(first.hash == second.hash &&
-            MakeStageStaticKey(first_input) == MakeStageStaticKey(second_input) &&
-            first_input.mesh.scratch_size_dwords == 7,
-        "merged shader identity or maximum scratch size changed with dynamic user data");
-  CompileOptions options{};
-  options.stage = ShaderType::Mesh;
-  options.user_data_base = 0;
-  options.user_data = first.user_data;
-  options.input_info.vertex = &first_input;
-  options.back_code = first.back_code;
-  const auto translated = TranslateProgram(first.code, options);
-  const auto &program = translated.program;
-  Check(program.info.buffers.size() == 2 && program.srt_reads.size() == 4,
-        "merged shader lost front user SGPRs or the back-stage SRT load");
-  for (const auto *params : {&first, &second}) {
-    const IR::SrtRuntime runtime{.user_data = params->user_data,
-                                 .read_memory = ReadHostTestMemory};
-    IR::DescriptorValue front_descriptor, back_descriptor;
-    const auto &table = params == &first ? first_table : second_table;
-    Check(IR::EvaluateDescriptorSource(program, program.info.buffers[0].source,
-                                       runtime, front_descriptor) &&
-              IR::EvaluateDescriptorSource(program, program.info.buffers[1].source,
-                                             runtime, back_descriptor) &&
-              std::equal(params->user_data.begin() + 8, params->user_data.end(),
-                         front_descriptor.dwords.begin()) &&
-              std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
-          "merged shader resource plan did not follow the current s0:s1 pointer and s8 data");
-  }
-  const uint32_t monolithic[] = {
-      EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 1), EncodeSopp(0x01),
-  };
-  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(monolithic);
-  mapped.type = Prospero::ShaderBinaryType::kGs;
-  mapped.code_size_bytes = sizeof(monolithic);
-  mapped.scratch_size_dwords = 3;
-  ShaderMapUserData(regs.es_regs.data_addr, mapped);
-  for (const auto back_address : {regs.gs_regs.data_addr, uint64_t{0}}) {
-    regs.gs_regs.data_addr = back_address;
-    ShaderVertexInputInfo input{};
-    const auto params = PrepareProgram(regs, context, user_config, input);
-    Check(params.back_code.empty() && params.hash == XXH3_64bits(monolithic, sizeof(monolithic)) &&
-              input.mesh.scratch_size_dwords == 3 && params.user_data.size() == 12 &&
-              params.user_data[0] == 0 && params.user_data[1] == 0 &&
-              std::equal(second.user_data.begin() + 8, second.user_data.end(),
-                         params.user_data.begin() + 8),
-          "monolithic NGG shader used stale GS-back state or lost its s8 user data");
-  }
-}
-
-void TestEmbeddedVertexFormatSwizzle() {
-  using namespace ShaderRecompiler;
-  using namespace ShaderRecompiler::IR;
-  struct Case {
-    Prospero::BufferFormat format;
-    uint32_t swizzle, opcode, components, source_width;
-    std::array<uint32_t, 4> expected;
-    Prospero::VertexAttribFormat attribute_format = Prospero::VertexAttribFormat::kInvalid;
-  };
-  const Case cases[] = {
-      {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 7), 3, 4, 3,
-       {0x3e800000, 0x3f000000, 0x3f400000, 0x3e800000}},
-      {Prospero::BufferFormat::k32_32_32Float, DstSel(4, 5, 6, 1), 3, 4, 3,
-       {0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000}},
-      {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(7, 6, 5, 0), 3, 4, 4,
-       {0x40000000, 0x3f400000, 0x3f000000, 0}},
-      {Prospero::BufferFormat::k32_32_32_32UInt, DstSel(7, 0, 0, 0), 0, 1, 4,
-       {0x40000000, 0, 0, 0}},
-      {Prospero::BufferFormat::k32UInt, DstSel(1, 0, 1, 0), 3, 4, 0,
-       {1, 0, 1, 0}},
-      {Prospero::BufferFormat::k32Float, DstSel(1, 0, 1, 0), 3, 4, 0,
-       {0x3f800000, 0, 0x3f800000, 0}},
-      {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 0x0e, 4, 4,
-       {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000}},
-      {Prospero::BufferFormat::k32UInt, DstSel(7, 6, 5, 4), 3, 4, 1,
-       {0x3e800000, 0, 0, 1}, Prospero::VertexAttribFormat::k32UInt},
-      {Prospero::BufferFormat::k32_32Float, DstSel(7, 6, 5, 4), 3, 4, 2,
-       {0x3e800000, 0x3f000000, 0, 0x3f800000}, Prospero::VertexAttribFormat::k32_32Float},
-      {Prospero::BufferFormat::k32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 3,
-       {0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000},
-       Prospero::VertexAttribFormat::k32_32_32Float},
-      {Prospero::BufferFormat::k32_32_32_32Float, DstSel(7, 6, 5, 4), 3, 4, 4,
-       {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000},
-       Prospero::VertexAttribFormat::k32_32_32_32Float},
-  };
-  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
-  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
-  ShaderUserData user_data{};
-  user_data.direct_resource_offset = offsets.data();
-  user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
-  for (const auto &test : cases) {
-    const uint32_t code[] = {EncodeMubuf0(test.opcode), EncodeMubuf1(9, 0, 0),
-                             EncodeExp0(0x20, (1u << test.components) - 1u),
-                             EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
-    Decoder::Program decoded;
-    Decoder::DecodeProgram(code, decoded);
-    const uint32_t attribute = static_cast<uint32_t>(test.attribute_format) << 5u;
-    const uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
-                               (static_cast<uint32_t>(test.format) << 12u) | test.swizzle};
-    HW::VertexShaderInfo regs{};
-    regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
-    regs.gs_regs.rsrc2.user_sgpr = 4;
-    const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffer),
-                               reinterpret_cast<uint64_t>(&attribute)};
-    std::memcpy(regs.gs_user_sgpr.value, tables, sizeof(tables));
-    ShaderSemantic semantic{};
-    semantic.hardware_mapping = 9;
-    semantic.size_in_elements = test.components;
-    ShaderMappedData mapped{};
-    mapped.user_data = &user_data;
-    mapped.input_semantics = &semantic;
-    mapped.num_input_semantics = 1;
-    mapped.code_size_bytes = sizeof(code);
-    ShaderMapUserData(regs.es_regs.data_addr, mapped);
-    ShaderVertexInputInfo input{};
-    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
-    Frontend::EmbeddedFetchPlan fetch;
-    fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
-    Frontend::TranslateOptions options{};
-    options.stage = ShaderType::Vertex;
-    options.wave_size = 32;
-    options.user_data_count = 0;
-    options.vertex = &input;
-    options.embedded_fetch = &fetch;
-    auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
-    Check(program.info.vertex_fetch_components[0] == test.source_width,
-          "vertex fetch width follows destination VGPR count instead of selected source channels");
-    const uint32_t source[] = {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000};
-    for (auto *block : program.blocks) {
-      for (auto &inst : *block) {
-        if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
-          Check(inst.Arg(0).U32() == 0 && inst.Arg(1).U32() < 4,
-                "vertex fetch selected an invalid attribute channel");
-          inst.ReplaceUsesWith(Value(source[inst.Arg(1).U32()]));
-        }
-      }
-    }
-    RewriteToSsa(program.blocks);
-    RemoveIdentities(program.blocks);
-    ConstantPropagationPass(program.blocks);
-    uint32_t exports = 0;
-    for (const auto *block : program.blocks) {
-      for (const auto &inst : *block) {
-        if (inst.GetOpcode() != ValueOpcode::SetAttribute) continue;
-        ++exports;
-        const auto *value = inst.Arg(0).ResolveInstruction();
-        Check(value != nullptr && value->GetOpcode() == ValueOpcode::CompositeConstructU32x4,
-              "vertex fetch export did not retain its four components");
-        for (uint32_t component = 0; component < 4; ++component) {
-          const auto actual = value->Arg(component).Resolve();
-          Check(actual.IsImmediate() && actual.U32() == test.expected[component],
-                "formatted vertex fetch did not apply the source-channel swizzle");
-        }
-      }
-    }
-    Check(exports == 1, "vertex fetch test did not reach its export");
-  }
-}
-
-void TestMeshInputAssembly() {
-  using namespace ShaderRecompiler;
-  using namespace ShaderRecompiler::IR;
-  struct Case {
-    Prospero::PrimitiveType topology;
-    uint32_t capacity, count, group, lane, width, address_low, base_vertex;
-    uint32_t wave_info, first, second, third, byte_offset, vertex_id;
-    bool fetch;
-  };
-  const Case cases[] = {
-      {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
-       0x40000309, 6, 7, 8, 340, 0xabcc, true},
-      {Prospero::PrimitiveType::kTriList, 14, 177, 14, 9, 2, 0x1002, 0,
-       0x40000309, 27, 28, 29, 356, 0, false},
-      {Prospero::PrimitiveType::kTriList, 8, 180, 0, 64, 2, 0x1002, 0,
-       0x41000000, 192, 193, 194, 128, 0, false},
-      {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 1, 0x1000, 5,
-       0x40000206, 3, 4, 5, 4, 0xb0, true},
-      {Prospero::PrimitiveType::kTriList, 8, 180, 1, 1, 4, 0x1000, 5,
-       0x40000206, 3, 4, 5, 28, 0xabcd0128, true},
-      {Prospero::PrimitiveType::kTriStrip, 5, 8, 1, 1, 0, 0, 11,
-       0x40000305, 1, 2, 3, 0, 15, false},
-      {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
-       0x40000305, 2, 1, 3, 0, 12, false},
-      {Prospero::PrimitiveType::kLineList, 5, 17, 3, 0, 0, 0, 11,
-       0x40000204, 0, 1, 0, 0, 23, false},
-      {Prospero::PrimitiveType::kLineList, 6, 17, 2, 4, 2, 0x1002, 11,
-       0x40000205, 8, 9, 0, 32, 0xabd8, true},
-      {Prospero::PrimitiveType::kLineList, 6, 17, 2, 5, 2, 0x1002, 0,
-       0x40000205, 10, 11, 0, 36, 0, false},
-      {Prospero::PrimitiveType::kLineList, 8, 180, 1, 64, 4, 0x1000, 0,
-       0x41000000, 128, 129, 0, 288, 0, false},
-      {Prospero::PrimitiveType::kPointList, 12, 265, 22, 0, 2, 0x1002, 0,
-       0x40000101, 0, 0, 0, 528, 0xabcd, true},
-      {Prospero::PrimitiveType::kPointList, 12, 265, 22, 1, 2, 0x1002, 0,
-       0x40000101, 1, 0, 0, 532, 0, false},
-      {Prospero::PrimitiveType::kPointList, 1, 1, 0, 0, 0, 0, 11,
-       0x40000101, 0, 0, 0, 0, 11, false},
-      {Prospero::PrimitiveType::kPointList, 12, 265, 1, 1, 4, 0x1000, 5,
-       0x40000c0c, 1, 0, 0, 52, 0xabcd0128, true},
-      {Prospero::PrimitiveType::kPointList, 12, 265, 1, 64, 4, 0x1000, 0,
-       0x41000000, 64, 0, 0, 304, 0, false},
-  };
-  for (const auto &test : cases) {
-    ShaderVertexInputInfo input{};
-    auto &mesh = input.mesh;
-    mesh.input_primitive = static_cast<uint32_t>(test.topology);
-    mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
-    mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-    mesh.threads_num[0] = 256;
-    mesh.threads_num[1] = mesh.threads_num[2] = 1;
-    Decoder::Program decoded;
-    CFG::Graph graph;
-    CFG::BasicBlock block;
-    block.id = 0;
-    block.terminator.kind = CFG::TerminatorKind::Return;
-    graph.blocks.push_back(std::move(block));
-    graph.entry_block = 0;
-    Frontend::TranslateOptions options{};
-    options.stage = ShaderType::Mesh;
-    options.wave_size = 64;
-    options.user_data_count = 0;
-    options.vertex = &input;
-    auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
-    Inst *load = nullptr;
-    for (auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
-        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
-      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
-        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
-        const uint32_t value = kind == StageInputKind::LocalInvocationIndex
-                                   ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
-        inst.ReplaceUsesWith(Value(value));
-      } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
-        Check(load == nullptr, "mesh index fetch emitted duplicate loads");
-        load = &inst;
-      }
-    }
-    ConstantPropagationPass(program.blocks);
-    Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
-              load->Arg(3).Resolve().U1() == test.fetch,
-          "mesh index fetch address or active-lane predicate is wrong");
-    const auto *resource = load->Arg(0).ResolveInstruction();
-    Check(resource != nullptr && resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-              resource->Arg(1).Resolve().U32() == 0x12 &&
-              program.memory_info[load->Flags<MemoryFlags>().index].kind == ResourceKind::Global,
-          "mesh index fetch lost its aligned guest address resource");
-    load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
-    ConstantPropagationPass(program.blocks);
-    std::array<uint32_t, 9> vgprs{};
-    uint32_t sgpr3 = 0;
-    for (const auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
-        vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
-      } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgpr3 = inst.Arg(1).Resolve().U32();
-      }
-    }
-    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
-  }
 }
 
 void TestNewShaderRecompilerSetpcJumpTable() {
@@ -9846,13 +12920,12 @@ void TestNewShaderRecompilerAuxPositionExports() {
             SpirvHasDecorationValue(all.spirv, 11u, 9u) &&
             SpirvContainsCapability(all.spirv, 32u) &&
             SpirvContainsCapability(all.spirv, 33u) &&
-            SpirvContainsCapability(all.spirv, 69u),
+            SpirvContainsCapability(all.spirv, 5254u),
         "auxiliary vertex BuiltIns or capabilities are missing");
   const auto all_source = DisassembleSpirvBinary(all.spirv);
-  Check(all.spirv[1] == 0x00010500u &&
-            !Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
-            SpirvBuiltInStoreUsesOperation(all.spirv, 9u, 199u, {0x7ffu}),
-        "layer export module version or GFX10 layer mask is incorrect");
+  Check(Common::ContainsStr(all_source, "SPV_EXT_shader_viewport_index_layer") &&
+            SpirvBuiltInStoreUsesAndConstant(all.spirv, 9u, 0x7ffu),
+        "layer export extension or GFX10 layer mask is missing");
   const auto positions = std::count_if(
       all.program.info.outputs.begin(), all.program.info.outputs.end(),
       [](const auto &output) {
@@ -9905,23 +12978,25 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 ShaderRecompiler::IR::StageOutputKind::Position,
         "unmapped auxiliary position export was not ignored");
 
-  // R-Type Final 3 packs a dynamic viewport index into POS1.z bits 16..19.
-  // The same component can carry an independent render-target layer in bits 0..10.
-  for (const uint32_t control : {0x01280000u, 0x012c0000u}) {
-    const auto indexed = compile(unmapped, control);
-    CheckSpirvBinaryValidates(indexed.spirv);
-    Check(indexed.spirv[1] == 0x00010500u &&
-              SpirvContainsCapability(indexed.spirv, 70u) &&
-              SpirvBuiltInStoreUsesOperation(indexed.spirv, 10u, 203u, {16u, 4u}),
-          "viewport export did not store the GFX10 four-bit index");
-    const bool layered = (control & (1u << 18u)) != 0;
-    Check(SpirvBuiltInStoreUsesOperation(indexed.spirv, 9u, 199u, {0x7ffu}) == layered,
-          "packed layer/viewport export dropped or invented a layer store");
-    Check(std::ranges::any_of(indexed.program.info.outputs, [](const auto &output) {
-            return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-          }),
-          "viewport export was omitted from shader reflection");
-  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const auto rejects = [](uint32_t control, uint32_t en,
+                          const char *message) {
+    const uint32_t shader[] = {
+        EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(0x0d, en), EncodeExp1(4, 5, 6, 7),
+        0xbf810000u,
+    };
+    ShaderVertexInputInfo vertex{};
+    vertex.pa_cl_vs_out_cntl = control;
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+                message);
+  };
+  rejects(0x00280000u, 0x4u,
+          "viewport-index auxiliary position export did not terminate "
+          "compilation");
+#endif
 
   ShaderVertexInputInfo key0{};
   ShaderVertexInputInfo key1{};
@@ -10066,16 +13141,16 @@ void TestTypedEntryStateIsMinimal() {
     uint32_t set_exec_lo = 0;
     uint32_t set_exec_hi = 0;
     uint32_t ballots = 0;
-    const IR::Inst* ballot = nullptr;
     IR::Value exec;
     IR::Value exec_lo;
     IR::Value exec_hi;
+    const IR::Inst *initial_ballot = nullptr;
     for (const auto *block : values.blocks) {
       for (const auto &inst : *block) {
         switch (inst.GetOpcode()) {
         case IR::ValueOpcode::Ballot:
           ballots++;
-          ballot = &inst;
+          initial_ballot = &inst;
           break;
         case IR::ValueOpcode::SetExec:
           set_exec++;
@@ -10105,24 +13180,31 @@ void TestTypedEntryStateIsMinimal() {
         }
       }
     }
-    const auto is_mask_word = [&](IR::Value value, uint32_t word) {
-      const auto* extract = value.ResolveInstruction();
+    const auto is_ballot_word = [&](IR::Value value, uint32_t word) {
+      const auto *extract = value.TryInstruction();
       return extract != nullptr &&
              extract->GetOpcode() == IR::ValueOpcode::CompositeExtractU32x4 &&
-             extract->Arg(0).ResolveInstruction() == ballot &&
+             extract->Arg(0).Resolve().TryInstruction() == initial_ballot &&
              extract->Arg(1).IsImmediate() && extract->Arg(1).U32() == word;
     };
     Check(set_exec == 1u && set_exec_lo == 1u && set_exec_hi == 1u &&
               ballots == 1u && exec.IsImmediate() && exec.U1() &&
-              ballot->Arg(0) == exec && is_mask_word(exec_lo, 0u) &&
-              (wave_size == 64u ? is_mask_word(exec_hi, 1u)
+              initial_ballot->Arg(0).IsImmediate() && initial_ballot->Arg(0).U1() &&
+              is_ballot_word(exec_lo, 0u) &&
+              (wave_size == 64u ? is_ballot_word(exec_hi, 1u)
                                : exec_hi.IsImmediate() && exec_hi.U32() == 0u),
-          "typed entry did not materialize the active invocation mask once");
+          "typed entry lost the active wave ballot or selected incorrect EXEC words");
 
     IR::RewriteToSsa(values.blocks);
     IR::RemoveIdentities(values.blocks);
     IR::EliminateDeadCode(values.blocks);
     IR::ValidateProgram(values, true);
+    for (const auto *block : values.blocks) {
+      Check(std::ranges::none_of(*block, [](const auto &inst) {
+              return inst.GetOpcode() == IR::ValueOpcode::Ballot;
+            }),
+            "unused initial EXEC ballot survived dead-code elimination");
+    }
   };
 
   check(32u);
@@ -10448,8 +13530,20 @@ void TestValuePhiValidation() {
 #endif
 }
 
-void TestU64ShiftConstantPropagation() {
+void TestWqmMaskSignatureAndU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  Program malformed;
+  malformed.block_storage.push_back(std::make_unique<Block>());
+  malformed.blocks.push_back(malformed.block_storage.back().get());
+  malformed.block_info.emplace_back();
+  IREmitter malformed_ir(malformed.blocks.front());
+  auto malformed_value = malformed_ir.Emit(ValueOpcode::WqmMask, {Value(true)});
+  malformed_value.TryInstruction()->SetArg(0, Value(uint64_t{1}));
+  ExpectFatal([&] { ValidateProgram(malformed, false); },
+              "invalid WqmMask operand type did not terminate IR validation");
+#endif
 
   Program shifts;
   shifts.block_storage.push_back(std::make_unique<Block>());
@@ -10849,7 +13943,7 @@ void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
-        "raw EXEC=1 did not select guest lane zero");
+        "vertex EXEC=1 guard lost numeric lane membership");
   Check(Common::ContainsStr(source, "OpBranchConditional"),
         "vertex export lost its per-invocation EXEC guard");
 }
@@ -10875,9 +13969,9 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(
       !Common::ContainsStr(source, "OpGroupNonUniformBallot"),
-      "per-invocation VCC producer still materialized a shared subgroup mask");
+      "overwritten VCC/EXEC producers retained dead subgroup ballots");
   Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
-        "BFM EXEC prefix did not select the four requested guest lanes");
+        "BFM EXEC=0xf guard lost numeric lane membership");
   Check(!Common::ContainsStr(source, "%vcc_lo") &&
             !Common::ContainsStr(source, "%vcc_hi"),
         "per-invocation comparison retained VCC register mirrors");
@@ -10893,16 +13987,17 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
   const auto wqm_source = DisassembleSpirvBinary(result.spirv);
   Check(Common::ContainsStr(wqm_source, "OpCapability GroupNonUniformBallot") &&
             Common::ContainsStr(wqm_source, "OpGroupNonUniformBallot"),
-        "per-invocation scalar WQM omitted its subgroup ballot capability");
+        "scalar WQM omitted the numeric initial EXEC mask");
+  // WqmU64 expands both raw DWORDs in one component-wise U32x2 operation.
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
-        "wave64 WQM did not expand its scalar word pair together");
+        "wave64 WQM did not expand the numeric mask as one U32x2 value");
 
   auto wave32_options = options;
   wave32_options.wave_size = 32u;
   result = RecompileForTest(wqm_shader, wave32_options);
   CheckSpirvBinaryValidates(result.spirv);
   Check(SpirvInstructionOpcodeCount(result.spirv, 132u) == 1u,
-        "wave32 WQM retained the unused high ballot-word expansion");
+        "wave32 WQM did not preserve the scalar U32x2 expansion");
 
   const uint32_t cross_lane_shader[] = {
       EncodeSop2(0x25, 126, 132, 128), // s_bfm_b64 exec, 4, 0
@@ -10937,10 +14032,10 @@ void TestNewShaderRecompilerPerInvocationU64Complement() {
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(Common::ContainsStr(source, "OpLogicalNot"),
-        "per-invocation s_not_b64 did not complement the lane predicate");
-  Check(!Common::ContainsStr(source, "OpNot %uint"),
-        "per-invocation s_not_b64 emitted raw complemented mask words");
+  Check(Common::ContainsStr(source, "OpNot %uint"),
+        "s_not_b64 did not complement the numeric wave mask");
+  Check(Common::ContainsStr(source, "OpLoad %uint %gl_SubgroupInvocationID"),
+        "complemented EXEC lost numeric lane membership");
 }
 
 void TestNewShaderRecompilerExpPixelOutputs() {
@@ -11530,92 +14625,6 @@ void TestTypedDescriptorRealWideMoveTranslation() {
                   20 + i,
           "real s_mov_b64 translation did not copy both descriptor pairs");
   }
-}
-
-void TestComputeImageFill() {
-  using namespace ShaderRecompiler::IR;
-  // Captured GTA3 stencil clear: one scalar load and one IMAGE_STORE, with
-  // x/y = local + 8 * group and array layer = group.z.
-  const uint32_t shader[] = {
-      0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u,
-      0xbf8cc07fu, 0x7e06026au, 0xd7460001u, 0x0405060du,
-      0x7e04020eu, 0xf0200128u, 0x00000300u, 0xbf810000u,
-  };
-  uint32_t value = 0x7bu;
-  const auto address = reinterpret_cast<uint64_t>(&value);
-  const std::array<uint32_t, 12> userdata = {
-      0x20021000u, 0xc0500000u, 0x01d8c347u, 0xd1800204u,
-      0u, 0x00700000u, 0u, 0u,
-      static_cast<uint32_t>(address),
-      static_cast<uint32_t>(address >> 32) | (4u << 16), 1u, 0x14204u,
-  };
-  ShaderComputeInputInfo compute{};
-  compute.threads_num[0] = compute.threads_num[1] = 8;
-  compute.threads_num[2] = 1;
-  compute.workgroup_register = 12;
-  compute.thread_ids_num = 2;
-  compute.group_id[0] = compute.group_id[1] = compute.group_id[2] = true;
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.input_info.compute = &compute;
-  options.user_data = userdata;
-  enum class Mutation { None, Offset, WrongAxis, VaryingValue, Predicate, ExtraStore, A16 };
-  const auto Run = [&](Mutation mutation, bool clean = true) {
-    auto translated = ShaderRecompiler::TranslateProgram(shader, options);
-    auto &program = translated.program;
-    for (auto *block : program.blocks) {
-      const auto found = std::ranges::find(*block, ValueOpcode::ImageWrite, &Inst::GetOpcode);
-      if (found == block->end()) continue;
-      auto &store = *found;
-      auto *coordinates = store.Arg(1).ResolveInstruction();
-      auto *values = store.Arg(2).ResolveInstruction();
-      Check(coordinates && values, "stencil fill fixture lost its image operands");
-      const auto x = coordinates->Arg(0);
-      switch (mutation) {
-      case Mutation::None: break;
-      case Mutation::Offset:
-        coordinates->SetArg(0, Value(&*block->PrependNewInst(found, ValueOpcode::IAdd32,
-                                                           {x, Value(1u)})));
-        break;
-      case Mutation::WrongAxis: coordinates->SetArg(1, x); break;
-      case Mutation::VaryingValue: values->SetArg(0, x); break;
-      case Mutation::Predicate:
-        store.SetArg(3, Value(&*block->PrependNewInst(found, ValueOpcode::ULessThan32,
-                                                    {x, Value(32u)})));
-        break;
-      case Mutation::ExtraStore:
-        block->PrependNewInst(found, ValueOpcode::ImageWrite,
-            {store.Arg(0), store.Arg(1), store.Arg(2), store.Arg(3)}, store.Flags<uint64_t>());
-        break;
-      case Mutation::A16:
-        program.memory_info[store.Flags<MemoryFlags>().index].image_sample_flags |=
-            ShaderRecompiler::Decoder::ImageSampleFlagA16;
-        break;
-      }
-      break;
-    }
-    auto plan = ExtractResourcePlan(program);
-    ResourceSnapshot snapshot;
-    ResourceSpecialization specialization;
-    Check(MaterializeResources(plan,
-              {.user_data = userdata, .read_memory = ReadHostTestMemory,
-               .read_specialization_memory = clean ? ReadHostTestMemory : nullptr},
-              snapshot, specialization),
-          "captured stencil clear did not materialize");
-    const auto &fill = snapshot.uniform_fill;
-    const bool expected = mutation == Mutation::None && clean;
-    Check((fill.kind == UniformFillKind::Image) == expected,
-          "image fill proof accepted an unsafe store or missed the captured clear");
-    if (expected) {
-      Check(fill.resource == 0 && fill.words == 1 && fill.value == value &&
-                fill.group_stride == std::array<uint32_t, 3>{8, 8, 1},
-            "image fill lost its scalar value or axis coverage");
-    }
-  };
-  Run(Mutation::None);
-  Run(Mutation::None, false);
-  for (const auto mutation : {Mutation::Offset, Mutation::WrongAxis, Mutation::VaryingValue,
-                              Mutation::Predicate, Mutation::ExtraStore, Mutation::A16})
-    Run(mutation);
 }
 
 void TestTypedDescriptorRealCarryAndScalarLoads() {
@@ -12212,6 +15221,75 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CompilePixelRuntime(vcc_params, vcc_input);
 }
 
+// Initial guest FP state must survive the public register-to-static-info path.
+// No compiler execution or new production field is needed for the baseline RED.
+void TestComputeFpModeStaticIdentity() {
+  static const uint32_t shader[] = {EncodeSopp(0x01)}; // s_endpgm
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.cs_regs.num_thread_x = 32;
+  regs.cs_regs.num_thread_y = 1;
+  regs.cs_regs.num_thread_z = 1;
+  regs.cs_regs.wave_size = 32;
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+
+  constexpr uint8_t baseline_mode = 0xc0u;
+  regs.cs_regs.float_mode = baseline_mode;
+  ShaderComputeInputInfo input_info{};
+  const auto baseline_params = PrepareProgram(regs, sh, input_info);
+  const auto baseline_key = MakeStageStaticKey(input_info);
+  Check(baseline_params.code.data() == shader &&
+            baseline_params.code.size_bytes() == sizeof(shader) &&
+            !baseline_key.empty(),
+        "FP mode fixture did not prepare the registered compute shader");
+  const auto repeated_params = PrepareProgram(regs, sh, input_info);
+  Check(repeated_params.hash == baseline_params.hash &&
+            MakeStageStaticKey(input_info) == baseline_key,
+        "unchanged compute registers produced unstable shader identity");
+  std::puts("KYTY_COMPUTE_FP_MODE_KEY_BASELINE_PASS");
+  std::fflush(stdout);
+
+  // FLOAT_MODE contains four independent two-bit round/denormal fields.
+  // Flip each bit independently, retaining the exact same code and all other
+  // registers, so omitting either precision's state cannot satisfy this test.
+  // IEEE_MODE and DX10_CLAMP are distinct initial FP controls as well.
+  for (uint32_t variant = 0; variant < 10u; ++variant) {
+    regs.cs_regs.float_mode = variant < 8u
+        ? static_cast<uint8_t>(baseline_mode ^ (1u << variant))
+        : baseline_mode;
+    regs.cs_regs.ieee_mode = variant == 8u;
+    regs.cs_regs.dx10_clamp = variant == 9u;
+    const auto changed_params = PrepareProgram(regs, sh, input_info);
+    Check(changed_params.hash == baseline_params.hash &&
+              changed_params.code.data() == baseline_params.code.data() &&
+              changed_params.code.size_bytes() == baseline_params.code.size_bytes() &&
+              changed_params.user_data.data() == baseline_params.user_data.data() &&
+              changed_params.user_data.size() == baseline_params.user_data.size(),
+          "changing initial FP controls changed code or runtime user data");
+    std::printf("KYTY_COMPUTE_FP_MODE_KEY_CHECK mode=0x%02x ieee=%u dx10_clamp=%u\n",
+                static_cast<unsigned>(regs.cs_regs.float_mode),
+                static_cast<unsigned>(regs.cs_regs.ieee_mode),
+                static_cast<unsigned>(regs.cs_regs.dx10_clamp));
+    std::fflush(stdout);
+    Check(MakeStageStaticKey(input_info) != baseline_key,
+          "compute shader static identity omitted initial guest FP controls");
+
+    // Reusing the same static-info object also checks that state from a prior
+    // variant does not leak into a later acquisition of the baseline mode.
+    regs.cs_regs.float_mode = baseline_mode;
+    regs.cs_regs.ieee_mode = false;
+    regs.cs_regs.dx10_clamp = false;
+    PrepareProgram(regs, sh, input_info);
+    Check(MakeStageStaticKey(input_info) == baseline_key,
+          "restoring initial FP controls did not restore shader identity");
+  }
+  std::puts("KYTY_COMPUTE_FP_MODE_KEY_PASS");
+  std::fflush(stdout);
+}
+
 void TestComputeLdsAllocationIdentity() {
   const uint32_t shader[] = {
       EncodeDs0(0x0d, 4288u), // ds_write_b32 v0, v1 offset:4288
@@ -12265,9 +15343,9 @@ void TestComputeLdsAllocationIdentity() {
         "compute pipeline identity omitted the LDS allocation");
 
   auto split_wave = lds_896;
-  split_wave.host_subgroup_size = 32;
+  split_wave.needs_lds_barriers = true;
   Check(MakeStageStaticKey(lds_896) != MakeStageStaticKey(split_wave),
-        "compute shader identity omitted the host subgroup size");
+        "compute shader identity omitted split-wave LDS synchronization");
 
   auto tg_size_disabled = lds_896;
   auto tg_size_enabled = lds_896;
@@ -12329,6 +15407,135 @@ void TestComputeLdsAllocationIdentity() {
   Check(SpirvUnsignedLessThanBoundCount(append_result.spirv, 1152u) == 1u,
         "typed LDS append omitted the declared allocation bound");
   CheckSpirvBinaryValidates(append_result.spirv);
+}
+
+void TestWave64LdsSynchronization() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x0d), // ds_write_b32 v0, v1
+      EncodeDs1(0, 1, 0),
+      EncodeSopp(0x01),
+  };
+
+  const auto compile = [&](bool needs_lds_barriers, uint32_t wave_size,
+                           uint32_t threads) {
+    ShaderComputeInputInfo input_info{};
+    input_info.lds_size_dwords = 128;
+    input_info.needs_lds_barriers = needs_lds_barriers;
+    input_info.threads_num[0] = threads;
+    input_info.threads_num[1] = 1;
+    input_info.threads_num[2] = 1;
+
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = wave_size;
+    options.input_info.compute = &input_info;
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return result;
+  };
+
+  const auto native_wave64 = compile(false, 64, 64);
+  Check(!SpirvContainsOpcode(native_wave64.spirv, 224),
+        "native wave64 shader gained a synthetic workgroup barrier");
+
+  const auto split_wave64 = compile(true, 64, 64);
+  Check(SpirvContainsOpcode(split_wave64.spirv, 224),
+        "split wave64 LDS shader omitted workgroup synchronization");
+
+  const auto split_wave32 = compile(true, 32, 64);
+  Check(!SpirvContainsOpcode(split_wave32.spirv, 224),
+        "wave32 shader gained wave64 synchronization");
+
+  const auto larger_workgroup = compile(true, 64, 128);
+  Check(!SpirvContainsOpcode(larger_workgroup.spirv, 224),
+        "multi-wave workgroup gained unsupported synthetic synchronization");
+}
+
+void TestSharedMemoryBarrierSafety() {
+  using namespace ShaderRecompiler::IR;
+
+  const auto make_program = [](size_t block_count) {
+    Program program;
+    program.memory_info.push_back({.kind = ResourceKind::Lds});
+    for (size_t index = 0; index < block_count; index++) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.emplace_back();
+      program.block_info.back().id = static_cast<uint32_t>(index);
+    }
+    return program;
+  };
+  const auto append_write = [](Block& block) {
+    auto& inst = block.AppendNewInst(
+        ValueOpcode::WriteSharedU32,
+        {Value(0u), Value(1u), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = 0});
+  };
+  const auto append_read = [](Block& block) {
+    auto& inst = block.AppendNewInst(ValueOpcode::LoadSharedU32,
+                                     {Value(0u), Value(true)});
+    inst.SetFlags(MemoryFlags{.index = 0});
+  };
+  const auto count_barriers = [](const Block& block) {
+    return std::ranges::count_if(block, [](const Inst& inst) {
+      return inst.GetOpcode() == ValueOpcode::Barrier;
+    });
+  };
+  const auto divergent_condition = [](Program& program, size_t block) {
+    IREmitter ir(program.blocks[block]);
+    const auto local_id = U32(ir.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)}));
+    return ir.INotEqual(local_id, U32(Value(0u)));
+  };
+
+  ShaderComputeInputInfo compute_info{};
+  compute_info.needs_lds_barriers = true;
+  compute_info.lds_size_dwords = 128;
+  compute_info.threads_num[0] = 64;
+  compute_info.threads_num[1] = 1;
+  compute_info.threads_num[2] = 1;
+
+  auto phases = make_program(1);
+  append_write(*phases.blocks[0]);
+  append_read(*phases.blocks[0]);
+  const auto phase_stats = InsertSharedMemoryBarriers(phases, 64u, compute_info);
+  std::vector<ValueOpcode> phase_opcodes;
+  for (const auto& inst : *phases.blocks[0]) {
+    phase_opcodes.push_back(inst.GetOpcode());
+  }
+  Check(phase_stats.inserted_barriers == 2 && phase_opcodes.size() == 4 &&
+            phase_opcodes[0] == ValueOpcode::WriteSharedU32 &&
+            phase_opcodes[1] == ValueOpcode::Barrier &&
+            phase_opcodes[2] == ValueOpcode::LoadSharedU32 &&
+            phase_opcodes[3] == ValueOpcode::Barrier,
+        "LDS write/read phases were not separated by a barrier");
+
+  auto selection = make_program(3);
+  selection.block_info[0].terminator.kind =
+      ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  selection.block_info[0].terminator.merge_block = 2;
+  selection.block_info[0].condition = divergent_condition(selection, 0);
+  append_write(*selection.blocks[1]);
+  append_read(*selection.blocks[2]);
+  const auto selection_stats =
+      InsertSharedMemoryBarriers(selection, 64u, compute_info);
+  Check(selection_stats.inserted_barriers == 2 &&
+            count_barriers(*selection.blocks[1]) == 0 &&
+            selection.blocks[2]->begin()->GetOpcode() ==
+                ValueOpcode::Barrier,
+        "workgroup barrier was placed inside divergent selection flow");
+
+  auto loop = make_program(1);
+  loop.block_info[0].terminator.kind =
+      ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  loop.block_info[0].condition = divergent_condition(loop, 0);
+  append_write(*loop.blocks[0]);
+  append_read(*loop.blocks[0]);
+  const auto loop_stats = InsertSharedMemoryBarriers(loop, 64u, compute_info);
+  Check(loop_stats.inserted_barriers == 0 &&
+            count_barriers(*loop.blocks[0]) == 0,
+        "workgroup barrier was inserted into divergent loop control");
 }
 
 void TestPixelProgramCacheBindingIdentity() {
@@ -12698,8 +15905,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                    .conditional_branches = 1,
                                    .ballots = 1},
                                   ShaderType::Vertex);
-  Check(Common::ContainsStr(wqm_result.ir_dump, "WqmU64"),
-        "WQM size fixture no longer reaches scalar mask expansion");
+  Check(count_shared(wqm_result,
+                     ShaderRecompiler::IR::ValueOpcode::WqmU64) == 1u,
+        "WQM size fixture did not retain its numeric scalar expansion");
 
   const uint32_t dispatcher[] = {
       EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
@@ -12733,10 +15941,246 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int RunShaderBatchAudit(int argc, char* argv[]);
+
+int main(int argc, char* argv[]) {
+  if (argc == 3 &&
+      (std::strcmp(argv[1], "--spirv-optimize-file") == 0 ||
+       std::strcmp(argv[1], "--spirv-optimize-cooperative-file") == 0)) {
+    auto *input = std::fopen(argv[2], "rb");
+    if (input == nullptr) return 2;
+    std::fseek(input, 0, SEEK_END);
+    const auto bytes = std::ftell(input);
+    std::rewind(input);
+    if (bytes <= 0 || (bytes % 4) != 0) {
+      std::fclose(input);
+      return 2;
+    }
+    std::vector<uint32_t> spirv(static_cast<size_t>(bytes) / 4u);
+    const auto read = std::fread(spirv.data(), 1, static_cast<size_t>(bytes), input);
+    std::fclose(input);
+    if (read != static_cast<size_t>(bytes)) return 2;
+    const auto optimized = Libs::Graphics::OptimizeShaderSpirvForTest(
+        spirv, Config::ShaderOptimizationType::Performance,
+        std::strcmp(argv[1], "--spirv-optimize-cooperative-file") == 0);
+    std::printf("original_words=%zu optimized_words=%zu\n", spirv.size(), optimized.size());
+    return optimized.empty() ? 1 : 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--spirv-optimization-only") == 0) {
+    Libs::Graphics::TestShaderOptimizationSelection();
+    std::puts("KYTY_SPIRV_OPTIMIZATION_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-pipeline-flags-only") == 0) {
+    Libs::Graphics::TestCooperativePipelineDisablesDriverOptimization();
+    std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-spill-reuse-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64CrossBlockSpillReuse();
+    std::puts("KYTY_COOPERATIVE_SPILL_REUSE_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dead-phi-webs-only") == 0) {
+    Libs::Graphics::TestDeadPhiWebsWithoutExternalConsumersAreRemoved();
+    std::puts("KYTY_DEAD_PHI_WEBS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-debug-name-only") == 0) {
+    Libs::Graphics::TestShaderModuleDebugName();
+    std::puts("KYTY_SHADER_DEBUG_NAME_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-identity-only") == 0) {
+    Libs::Graphics::TestDriverPipelineCacheBuildIdentity();
+    std::puts("KYTY_PIPELINE_CACHE_IDENTITY_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--videoout-vrr-status-only") == 0) {
+    Libs::Graphics::TestVideoOutVrrStatusLibraryContract();
+    std::puts("KYTY_VIDEOOUT_VRR_STATUS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-guest-workgroups-only") == 0) {
+    Libs::Graphics::TestComputeGuestWorkgroups();
+    std::puts("KYTY_COMPUTE_GUEST_WORKGROUPS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-acyclic-bda-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64BufferCycleVisibility(true);
+    std::puts("KYTY_COOPERATIVE_ACYCLIC_BDA_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-buffer-cycles-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64BufferCycleVisibility();
+    std::puts("KYTY_COOPERATIVE_BUFFER_CYCLES_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-autopromotion-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64AutomaticBufferCyclePromotion();
+    std::puts("KYTY_COOPERATIVE_AUTOPROMOTION_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-wave64-admission-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64GeometryAndBudget();
+    Libs::Graphics::TestCooperativeWave64BarrierOrderAndControl();
+    Libs::Graphics::TestCooperativeWave64OperationBoundaries();
+    Libs::Graphics::TestCooperativeWave64LegacyBarrierInsertionScope();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-lds-read-phases-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
+    std::puts("KYTY_COOPERATIVE_LDS_READ_PHASES_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-collective-functions-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64CollectivesUseSharedFunctions();
+    std::puts("KYTY_COOPERATIVE_COLLECTIVE_FUNCTIONS_PASS");
+    return 0;
+  }
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--single-wave64-ballot-spirv-only") == 0) {
+    Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
+        true, argc == 3 ? argv[2] : nullptr);
+    std::puts("KYTY_SINGLE_WAVE64_BALLOT_SPIRV_PASS");
+    return 0;
+  }
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--single-wave64-ballot-zero-predicate-spirv-only") == 0) {
+    Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
+        true, argc == 3 ? argv[2] : nullptr, true);
+    std::puts("KYTY_SINGLE_WAVE64_BALLOT_ZERO_PREDICATE_PASS");
+    return 0;
+  }
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--single-wave64-ballot-mixed-consumer-spirv-only") == 0) {
+    Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
+        true, argc == 3 ? argv[2] : nullptr, true, true);
+    std::puts("KYTY_SINGLE_WAVE64_BALLOT_MIXED_CONSUMER_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--split-wave64-cyclic-image-spirv-only") == 0) {
+    Libs::Graphics::TestSplitWave64CyclicImageSpirvRendezvous();
+    std::puts("KYTY_SPLIT_WAVE64_CYCLIC_IMAGE_SPIRV_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--partitioned-graphics-loop-only") == 0) {
+    Libs::Graphics::TestPartitionedGraphicsLoopBudgetSpirv();
+    std::puts("KYTY_PARTITIONED_GRAPHICS_LOOP_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-scalar-read-branch-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64ScalarReadBranchUniformity();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gds-append-admission-only") == 0) {
+    Libs::Graphics::TestComputeExecutionGdsAppendAdmission();
+    std::puts("KYTY_GDS_APPEND_ADMISSION_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--single-wave64-gds-atomic-admission-only") == 0) {
+    Libs::Graphics::TestComputeExecutionSingleWaveGdsAtomic();
+    std::puts("KYTY_SINGLE_WAVE64_GDS_ATOMIC_ADMISSION_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--unused-f64-emission-only") == 0) {
+    Libs::Graphics::TestUnusedNativeF64EmissionHasCompleteRequirements();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f64-certificate-only") == 0) {
+    using namespace Libs::Graphics;
+  TestF64CertificateConstantsAndNativeRequirements();
+  TestF64CertificatePairProvenance();
+  TestF64CertificateModeAndHostBoundaries();
+  TestF64CertificateReciprocalNonzeroProof();
+  TestF64CertificatePhiPredecessorProvenance();
+    std::puts("KYTY_F64_CERTIFICATE_PASS");
+    return 0;
+  }
   using namespace Libs::Graphics;
 
+  if (argc > 1 && std::strcmp(argv[1], "--audit-shader") == 0) {
+    return RunShaderBatchAudit(argc, argv);
+  }
+
+  if (argc > 1 && std::strcmp(argv[1], "--fma-khr-validator-only") == 0) {
+    if (argc != 2) {
+      std::fprintf(stderr, "usage: shader_cfg_tests --fma-khr-validator-only\n");
+      return 2;
+    }
+    return RunFmaKhrPipelineValidator();
+  }
+
+  if (argc > 1 && std::strcmp(argv[1], "--compute-fp-mode-key-only") == 0) {
+    if (argc != 2) {
+      std::fprintf(stderr, "usage: shader_cfg_tests --compute-fp-mode-key-only\n");
+      return 2;
+    }
+    EnsureConfigInitialized();
+    TestComputeFpModeStaticIdentity();
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-bounds-only") == 0) {
+    EnsureConfigInitialized();
+    TestStorageBufferBoundsAvoidDynamicArrayLengthLowering();
+    std::puts("KYTY_STORAGE_BUFFER_BOUNDS_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-access-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerBufferLoadsGuardedByExec();
+    TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
+    TestCapturedBufferAtomicsX2();
+    std::puts("KYTY_STORAGE_BUFFER_ACCESS_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--vopc-cmpx-ne-u16-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCapturedVopcCmpxNeU16();
+    std::puts("KYTY_VOPC_CMPX_NE_U16_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--vopc-sdwa-cmpx-ge-i16-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16();
+    std::puts("KYTY_VOPC_SDWA_CMPX_GE_I16_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--mubuf-store-format-d16-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerMubufFormatTranslation();
+    TestNewShaderRecompilerCapturedMubufStoreFormatD16();
+    std::puts("KYTY_MUBUF_STORE_FORMAT_D16_PASS");
+    return 0;
+  }
+
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--pipeline-cache-revision-only") == 0) {
+    TestDriverPipelineCacheRevisionCompatibility();
+    std::puts("KYTY_PIPELINE_CACHE_REVISION_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--shared-merge-cfg-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
+    TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
+    TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst();
+    TestNewShaderRecompilerCfgLoopSharedRegion();
+    TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
+    TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
+    TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
+    std::puts("KYTY_SHARED_MERGE_CFG_PASS");
+    return 0;
+  }
+
   EnsureConfigInitialized();
+  TestDriverPipelineCacheRevisionCompatibility();
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
@@ -12750,6 +16194,9 @@ int main() {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestNewShaderRecompilerCapturedMubufStoreFormatD16();
+  TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly();
+  TestStorageBufferBoundsAvoidDynamicArrayLengthLowering();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
@@ -12759,13 +16206,13 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
-  TestImageAddressOperands();
-  TestSopkCompareImmediateExtension();
+  TestNewShaderRecompilerCapturedVopcCmpxNeU16();
+  TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
+  TestNewShaderRecompilerRejectsF64IntegerConversionModifiers();
   TestPsInputCountRegisterDecode();
-  TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();
@@ -12776,6 +16223,7 @@ int main() {
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();
+  TestPartitionedGraphicsLoopBudgetSpirv();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
@@ -12798,12 +16246,9 @@ int main() {
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
-  TestSharedReturnPreservesDescriptorDominance();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
-  TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
-  TestNewShaderRecompilerCfgAlternatingSharedReturns();
+  TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst();
   TestNewShaderRecompilerCfgLoopSharedRegion();
-  TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
@@ -12812,17 +16257,49 @@ int main() {
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerU64PairTranslation();
   TestComputeDispatchWaveSize();
+  TestComputeWorkgroupPlanningBoundaries();
+  TestF64CertificateConstantsAndNativeRequirements();
+  TestF64CertificatePairProvenance();
+  TestF64CertificateModeAndHostBoundaries();
+  TestF64CertificateReciprocalNonzeroProof();
+  TestF64CertificatePhiPredecessorProvenance();
+  TestUnusedNativeF64EmissionHasCompleteRequirements();
+  TestComputeExecutionGdsAppendAdmission();
+  TestComputeGuestWorkgroups();
+  TestComputeExecutionPlanningBoundaries();
+  TestComputeExecutionConvergenceProof();
+  TestSingleWaveLdsSpirvPhaseOrdering();
+  TestSingleWaveLdsSpirvPhaseOrdering(true, nullptr, true);
+  TestSingleWaveLdsSpirvPhaseOrdering(true, nullptr, true, true);
+  TestSplitWave64CyclicImageSpirvRendezvous();
+  TestGraphicsFunctionLdsStoresRemainPrivate();
+  TestSingletonLdsStoresDoNotNeedAtomics();
+  TestMixedComparisonImagesUseSeparateSpirvVariables();
+  TestComputeExecutionWaveScratchBudget();
+  TestCooperativeWave64GeometryAndBudget();
+  TestCooperativeWave64BarrierOrderAndControl();
+  TestCooperativeWave64OperationBoundaries();
+  TestCooperativeWave64ScalarReadBranchUniformity();
+  TestCooperativeWave64LegacyBarrierInsertionScope();
+  TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
+  TestCooperativeWave64CollectivesUseSharedFunctions();
+  TestCooperativeWave64CrossBlockSpillReuse();
+  TestCooperativeWave64BufferCycleVisibility();
+  TestCooperativeWave64AutomaticBufferCyclePromotion();
+  TestComputeExecutionSingleWaveLds();
+  TestComputeExecutionSingleWaveGdsAtomic();
+  TestComputeExecutionUnusedMemoryDeclarations();
+  TestComputeExecutionRejectsActualStorageAndSynchronization();
+  TestComputeExecutionDsLaneConvergence();
+  TestComputeExecutionLoopReadFeedback();
+  TestComputeDispatchGroupExpansion();
+  TestComputeWorkgroupPlanningMatchesSmallExhaustiveOracle();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
-  TestFusedShaderHandoffPreservesRegisters();
-  TestMeshExportStorage();
-  TestMergedShaderUserDataSnapshot();
-  TestMeshInputAssembly();
-  TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
   TestNewShaderRecompilerSetpcDwordJumpTable();
@@ -12831,7 +16308,7 @@ int main() {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
-  TestU64ShiftConstantPropagation();
+  TestWqmMaskSignatureAndU64ShiftConstantPropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
 #endif
@@ -12844,7 +16321,6 @@ int main() {
   TestRenderTargetReverseExportMapping();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();
-  TestComputeImageFill();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();
   TestSrtWalkerVccBaseTranslation();
@@ -12859,7 +16335,10 @@ int main() {
   TestCustomVintrpMovTranslation();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
+  TestComputeFpModeStaticIdentity();
   TestComputeLdsAllocationIdentity();
+  TestWave64LdsSynchronization();
+  TestSharedMemoryBarrierSafety();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();

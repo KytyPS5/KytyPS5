@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -17,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ComputeExecution.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -25,12 +27,12 @@
 #include "libs/errno.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cmath>
+#include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -39,25 +41,23 @@ namespace Libs::Graphics {
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
+	if (stride != 0 && records > UINT64_MAX / stride) {
+		EXIT("compute buffer descriptor footprint overflow\n");
+	}
 	return stride == 0 ? records : records * stride;
 }
 
-static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
-                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
-	for (uint32_t i = 0; i < sources.size(); ++i) {
-		if (i == output_buffer) continue;
-		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
-		const auto bytes  = BufferDescriptorSize(source);
-		if (source.Base48() < destination.End() && destination.address < source.Base48() + bytes)
-			return false;
-	}
-	return true;
-}
-
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+	                                                const CommandBuffer& buffer, uint32_t group_x,
+	                                                uint32_t group_y, uint32_t group_z,
+	                                                uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
+	// Snapshot-dependent stores require shader execution and the immutable-source
+	// alias preflight. Buffer write metadata alone does not prove a constant fill.
+	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty()) {
+		return false;
+	}
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -73,12 +73,24 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		ShaderBufferResource fill_descriptor {};
+		uint32_t             fill_value = 0;
+		uint64_t             fill_size  = 0;
+		const bool uniform_fill = ResolveComputeImageClear(
+		    input, group_x, group_y, group_z, mode, fill_descriptor, fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const bool known =
+				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
+				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
+				          : cache.ClearMeta(descriptor.Base48())) {
+					if (known) {
+						buffer.GetContext().GetBufferCache().FillBuffer(
+						    fill_descriptor.Base48(), fill_size, fill_value, false);
+					}
 					return true;
 				}
 			}
@@ -87,115 +99,156 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
-bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
-                              uint32_t group_y, uint32_t group_z, uint32_t mode,
-                              ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
-                              uint64_t& resolved_size) {
+static bool ResolveComputeUniformImageClear(
+	const ShaderComputeInputInfo& input, uint32_t group_x, uint32_t group_y, uint32_t group_z,
+	uint32_t mode, ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
+	uint64_t& resolved_size) {
+	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
-	const auto& fill      = resources.uniform_fill;
-	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty()) {
 		return false;
 	}
-	const auto element_size = fill.words * sizeof(uint32_t);
-	const auto descriptor =
-	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
-	constexpr std::array formats {
-	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
-	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
-	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
+	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
+	    !resources.images.empty() || !resources.samplers.empty()) {
+		return false;
+	}
+	const auto& resource   = program.info.buffers.front();
+	const auto& raw        = resources.buffers.front();
+	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	if (!resource.formatted || !resource.written || resource.read || resource.atomic ||
+	    resource.scalar || resource.max_byte_extent != 16 || descriptor.Stride() != 16 ||
+	    descriptor.Format() != Prospero::BufferFormat::k32_32_32_32UInt ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-	    descriptor.Base48() == 0) {
+	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
+	    program.user_data_base != 0 || resources.user_data.size() != 8) {
 		return false;
 	}
-	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
-	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
-	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != resources.user_data[i]) {
+			return false;
+		}
+	}
+	const uint32_t clear = resources.user_data[4];
+	if (resources.user_data[5] != clear || resources.user_data[6] != clear ||
+	    resources.user_data[7] != clear) {
 		return false;
 	}
-	const uint64_t invocations = input.dispatch_thread_dimensions
-	                                 ? group_x
-	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
-	const auto     size        = BufferDescriptorSize(descriptor);
-	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
-	    (input.dispatch_thread_dimensions &&
-	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
-	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
+	const bool full_dispatch =
+	    input.dispatch_thread_dimensions && input.threads_num[0] == 64 &&
+	    input.threads_num[1] == 1 && input.threads_num[2] == 1 && group_x != 0 && group_y == 1 &&
+	    group_z == 1 && input.dispatch_threads_num[0] == group_x &&
+	    input.dispatch_threads_num[1] == 1 && input.dispatch_threads_num[2] == 1 &&
+	    input.group_id[0] && !input.group_id[1] && !input.group_id[2] &&
+	    input.thread_ids_num == 1 && input.wave_size == 64 && !input.tg_size_en && mode == 0x61u &&
+	    group_x % input.threads_num[0] == 0 && descriptor.NumRecords() == group_x;
+	const auto size = BufferDescriptorSize(descriptor);
+	if (!full_dispatch || size == 0) {
 		return false;
 	}
-	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource))
-		return false;
 	resolved_descriptor = descriptor;
-	resolved_clear      = fill.value;
+	resolved_clear      = clear;
 	resolved_size       = size;
 	return true;
 }
 
-bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-                                                CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+	                                  uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                                  ShaderBufferResource& resolved_descriptor,
+	                                  uint32_t& resolved_clear, uint64_t& resolved_size) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
-	const auto& fill      = resources.uniform_fill;
-	auto&       cache     = command.GetContext().GetTextureCache();
-	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
-		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||
-		    input.threads_num[2] != 1)
-			return false;
-		const auto  descriptor = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[0]);
-		const auto& resource   = program.info.images[0];
-		if (descriptor.IsNull() || descriptor.Format() != Prospero::BufferFormat::k8UInt ||
-		    descriptor.Type() != Prospero::ImageType::kColor2DArray || descriptor.MetaCompress() ||
-		    descriptor.WriteCompress() || descriptor.BaseLevel() > descriptor.LastLevel() ||
-		    descriptor.BaseLevel() > descriptor.MaxMip() ||
-		    descriptor.BaseArray5() > descriptor.Depth() || descriptor.DstSelX() != 4)
-			return false;
-		const std::array extents {
-		    std::max(1u, (descriptor.Width5() + 1u) >> descriptor.BaseLevel()),
-		    std::max(1u, (descriptor.Height5() + 1u) >> descriptor.BaseLevel()),
-		    descriptor.Depth() - descriptor.BaseArray5() + 1u};
-		const std::array groups {group_x, group_y, group_z};
-		for (uint32_t axis = 0; axis < 3; ++axis) {
-			const uint64_t threads = input.threads_num[axis];
-			// Guest image writes outside the descriptor dimensions are discarded. Only the
-			// final workgroup may extend beyond the selected image view.
-			if (threads == 0 || threads != fill.group_stride[axis] ||
-			    groups[axis] != (extents[axis] + threads - 1) / threads ||
-			    groups[axis] * threads > UINT32_MAX) return false;
-		}
-		const auto  binding     = ResolveTexture(resource, resources.images[0]);
-		const auto& destination = binding.desc.info.data;
-		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
-		std::scoped_lock lock {cache.m_lock};
-		const auto&      image = cache.GetImage(binding.image_id);
-		const auto&      view  = binding.desc.view_info;
-		if (image.backing.format != vk::Format::eD32SfloatS8Uint || image.info.samples != 1 ||
-		    image.info.stencil != destination || view.base_level >= image.backing.mip_levels ||
-		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
-		    view.layer_count > image.backing.layers - view.base_layer ||
-		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
-		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
-		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
-		                                       1, view.base_layer, view.layer_count};
-		vk::ClearValue clear {};
-		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
-		cache.ClearImage(command, binding.image_id, range, clear);
-		return true;
+	const auto& user_data = resources.user_data;
+	if (!program.info.bounded_srt_reads.empty() || !resources.immutable_srt_ranges.empty() ||
+	    program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() ||
+	    !resources.images.empty() || !resources.samplers.empty() || program.info.uses_dma ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || user_data.size() != 10 ||
+	    program.user_data_base != 0) {
+		return false;
 	}
+	const auto& resource   = program.info.buffers.front();
+	const auto& raw        = resources.buffers.front();
+	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	if (!resource.written || resource.read || resource.atomic || resource.scalar ||
+	    resource.max_byte_extent != sizeof(uint32_t) ||
+	    (resource.formatted && descriptor.Format() != Prospero::BufferFormat::k32UInt) ||
+	    (descriptor.Stride() != sizeof(uint32_t) && descriptor.Stride() != 0) ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
+	    descriptor.Base48() == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != user_data[i]) {
+			return false;
+		}
+	}
+	const uint32_t clear  = user_data[4];
+	const uint32_t period = user_data[9];
+	const uint32_t slots  = period == 0u ? 4u : std::min(period, 4u);
+	for (uint32_t slot = 1; slot < slots; slot++) {
+		if (user_data[4 + slot] != clear) {
+			return false;
+		}
+	}
+	if (input.threads_num[0] != 64 || input.threads_num[1] != 1 ||
+	    input.threads_num[2] != 1 || group_x == 0 || group_y != 1 || group_z != 1 ||
+	    !input.group_id[0] || input.group_id[1] || input.group_id[2] ||
+	    input.thread_ids_num != 1 || input.wave_size != 64 || input.tg_size_en) {
+		return false;
+	}
+	const uint32_t count = user_data[8];
+	const uint64_t size  = BufferDescriptorSize(descriptor);
+	const uint64_t covered_size = static_cast<uint64_t>(count) * sizeof(uint32_t);
+	const uint64_t required_groups =
+	    (static_cast<uint64_t>(count) + input.threads_num[0] - 1u) / input.threads_num[0];
+	if (count == 0 || size == 0 || size > UINT32_MAX || covered_size != size ||
+	    required_groups != group_x) {
+		return false;
+	}
+	resolved_descriptor = descriptor;
+	resolved_clear      = clear;
+	resolved_size       = size;
+	return true;
+}
+
+bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
+	                              uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                              ShaderBufferResource& resolved_descriptor,
+	                              uint32_t& resolved_clear, uint64_t& resolved_size) {
+	return ResolveComputeUniformImageClear(input, group_x, group_y, group_z, mode,
+	                                       resolved_descriptor, resolved_clear, resolved_size) ||
+	       ResolveComputePatternFill(input, group_x, group_y, group_z, mode,
+	                                 resolved_descriptor, resolved_clear, resolved_size);
+}
+
+static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, CommandBuffer& command,
+                                        uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                        uint32_t mode) {
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
-	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
+	if (!ResolveComputeImageClear(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
 	                              size)) {
 		return false;
 	}
+	auto& cache = command.GetContext().GetTextureCache();
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		// Track deferred DCC state while the original dispatch writes the metadata allocation.
-		cache.TrackDccFill(descriptor.Base48(), size, packed_clear);
+		// Recognized metadata-fill shaders access DCC as an ordinary storage buffer and may run
+		// before the render target is bound. TryConsumeDccFill either consumes registered state
+		// or retains a PendingDcc fill while allowing the dispatch to run.
+		const bool registered_metadata =
+		    cache.TryConsumeDccFill(descriptor.Base48(), size, packed_clear);
 		static std::atomic<uint32_t> logged_metadata_clears {0};
 		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: metadata fill shader=0x%016" PRIx64
+			LOGF("GraphicsRenderDispatchDirect: %s metadata clear shader=0x%016" PRIx64
 			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-			     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
+			     registered_metadata ? "tracked" : "deferred", input.stage.program->shader_hash,
+			     descriptor.Base48(), size, packed_clear);
+		}
+		if (registered_metadata) {
+			return true;
 		}
 		return false;
 	}
@@ -219,6 +272,26 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
+
+	// A zero dimension creates no invocations, including USE_THREAD_DIMENSIONS.
+	// Process queued operations above, but do not inspect shader or descriptor memory:
+	// games may leave those resources uninitialized when there is no work to dispatch.
+	const auto skip_empty_dispatch = [&]() {
+		if (thread_group_x != 0u && thread_group_y != 0u && thread_group_z != 0u) {
+			return false;
+		}
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
+			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
+			     thread_group_x, thread_group_y, thread_group_z, mode,
+			     sh_ctx.GetCs().cs_regs.data_addr);
+		}
+		return true;
+	};
+	if (skip_empty_dispatch()) {
+		return;
+	}
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
@@ -256,8 +329,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	// Snapshot bounds and the eventual dispatch must use the same guest grid.
+	// Compute it before materialization, without putting counts in the static shader key.
+	const auto guest_groups = ShaderRecompiler::ComputeGuestWorkgroups(
+	    {thread_group_x, thread_group_y, thread_group_z},
+	    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+	     cs_regs.cs_regs.num_thread_z}, use_thread_dimensions);
 	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info, guest_groups);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -269,7 +348,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y,
+	                               thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -337,18 +417,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (use_thread_dimensions) {
-		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
-			return (threads == 0
-			            ? 0u
-			            : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
-		};
-
 		const uint32_t old_x = thread_group_x;
 		const uint32_t old_y = thread_group_y;
 		const uint32_t old_z = thread_group_z;
-		thread_group_x       = groups_from_threads(thread_group_x, cs_regs.cs_regs.num_thread_x);
-		thread_group_y       = groups_from_threads(thread_group_y, cs_regs.cs_regs.num_thread_y);
-		thread_group_z       = groups_from_threads(thread_group_z, cs_regs.cs_regs.num_thread_z);
+		thread_group_x = guest_groups[0];
+		thread_group_y = guest_groups[1];
+		thread_group_z = guest_groups[2];
 
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -361,18 +435,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
-			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
-			     thread_group_x, thread_group_y, thread_group_z, mode,
-			     sh_ctx.GetCs().cs_regs.data_addr);
-		}
+	if (skip_empty_dispatch()) {
 		return;
 	}
 
 	buffer.EndRendering();
+	const auto& dispatch_limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const auto dispatch_groups = ShaderRecompiler::PlanComputeDispatchGroups(
+	    {thread_group_x, thread_group_y, thread_group_z}, program.compute_wave_partition_factor,
+	    {dispatch_limits.maxComputeWorkGroupCount[0], dispatch_limits.maxComputeWorkGroupCount[1],
+	     dispatch_limits.maxComputeWorkGroupCount[2]});
+	if (!dispatch_groups) {
+		EXIT("compute dispatch exceeds device limits: guest=%ux%ux%u wave_partition_factor=%u "
+		     "limits=%ux%ux%u\n", thread_group_x, thread_group_y, thread_group_z,
+		     program.compute_wave_partition_factor, dispatch_limits.maxComputeWorkGroupCount[0],
+		     dispatch_limits.maxComputeWorkGroupCount[1], dispatch_limits.maxComputeWorkGroupCount[2]);
+	}
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	auto bindings = PrepareBindings(input_info.stage);
@@ -402,7 +480,86 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	vk_buffer.dispatch((*dispatch_groups)[0], (*dispatch_groups)[1], (*dispatch_groups)[2]);
+
+	if (const char* readback_address = std::getenv("KYTY_COMPUTE_READBACK_ADDRESS");
+	    readback_address != nullptr && *readback_address != '\0' &&
+	    std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK") != nullptr) {
+		char* end = nullptr;
+		const auto address = std::strtoull(readback_address, &end, 0);
+		static std::atomic<uint32_t> readback_count = 0;
+		if (end != readback_address && *end == '\0') {
+			for (const auto& binding: bindings.resources.images) {
+				if (binding.desc.type != TextureCache::BindingType::Storage ||
+				    binding.desc.info.data.address != address ||
+				    readback_count.fetch_add(1, std::memory_order_relaxed) >= 16) {
+					continue;
+				}
+				const bool scheduled =
+				    m_context.GetTextureCache().TryDownloadImage(binding.image_id);
+				LOGF("ComputeReadback: shader=0x%016" PRIx64 " addr=0x%016" PRIx64
+				     " scheduled=%d\n",
+				     input_info.stage.program->shader_hash, address, scheduled ? 1 : 0);
+				static std::atomic<uint32_t> input_readback_count = 0;
+				if (std::getenv("KYTY_COMPUTE_READBACK_INPUTS") != nullptr &&
+				    input_readback_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					const char* input_address_text =
+					    std::getenv("KYTY_COMPUTE_READBACK_INPUT_ADDRESS");
+					char*    input_address_end = nullptr;
+					uint64_t input_address     = 0;
+					if (input_address_text != nullptr && *input_address_text != '\0') {
+						input_address = std::strtoull(input_address_text, &input_address_end, 0);
+					}
+					for (uint32_t image_index = 0;
+					     image_index < bindings.resources.images.size(); image_index++) {
+						const auto& image = program.info.images[image_index];
+						if (image.resource_class !=
+						    ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+							continue;
+						}
+						const auto& input = bindings.resources.images[image_index];
+						if (input_address_text != nullptr &&
+						    (input_address_end == input_address_text || *input_address_end != '\0' ||
+						     input.desc.info.data.address != input_address)) {
+							continue;
+						}
+						const bool input_scheduled =
+						    m_context.GetTextureCache().TryDownloadImage(input.image_id);
+						LOGF("ComputeReadbackInput: shader=0x%016" PRIx64
+						     " index=%u addr=0x%016" PRIx64 " scheduled=%d\n",
+						     input_info.stage.program->shader_hash, image_index,
+						     input.desc.info.data.address, input_scheduled ? 1 : 0);
+						if (std::getenv("KYTY_COMPUTE_READBACK_STATE") != nullptr) {
+							const auto& native =
+							    m_context.GetTextureCache().GetImage(input.image_id);
+							LOGF(
+							    "ComputeReadbackInputState: shader=0x%016" PRIx64
+							    " index=%u image=%u fmt=%u guest_fmt=%u tile=%u"
+							    " depth=%d usage=t%d/s%d/r%d/d%d/v%d"
+							    " dirty=g%d/b%d/c%d backing_fmt=%u layout=%u\n",
+							    input_info.stage.program->shader_hash, image_index,
+							    input.image_id.index,
+							    static_cast<uint32_t>(native.info.pixel_format),
+							    static_cast<uint32_t>(native.info.guest_format),
+							    static_cast<uint32_t>(native.info.tile_mode),
+							    native.info.IsDepth() ? 1 : 0,
+							    native.usage.texture ? 1 : 0,
+							    native.usage.storage ? 1 : 0,
+							    native.usage.render_target ? 1 : 0,
+							    native.usage.depth_target ? 1 : 0,
+							    native.usage.video_out ? 1 : 0,
+							    native.IsGpuModified() ? 1 : 0,
+							    native.IsBufferModified() ? 1 : 0,
+							    native.IsCpuDirty() ? 1 : 0,
+							    static_cast<uint32_t>(native.backing.format),
+							    static_cast<uint32_t>(native.backing.state.layout));
+						}
+					}
+				}
+				break;
+			}
+		}
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

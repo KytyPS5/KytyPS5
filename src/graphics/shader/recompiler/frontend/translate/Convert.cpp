@@ -46,6 +46,20 @@ void Translator::V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte
 	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertF32U32, {byte}));
 }
 
+void Translator::V_CVT_F64_32(const Decoder::Instruction& inst, bool signed_value) {
+	if (inst.src0.dpp || inst.src0.dpp8 || inst.dst.explicit_sdwa_dst ||
+	    inst.src0.sdwa_sel != 6u || inst.src0.sdwa_sext || inst.src0.negate ||
+	    inst.src0.absolute) {
+		EXIT("FP64 integer conversion source modifiers are not implemented");
+	}
+	// Read the entire integer source before writing either destination word.
+	const auto source = ReadU32(SourceAt(inst, 0));
+	const auto converted = ir.Emit(signed_value ? IR::ValueOpcode::ConvertF64S32
+	                                           : IR::ValueOpcode::ConvertF64U32,
+	                               {source});
+	WriteOperand(DestinationOperand(inst), converted);
+}
+
 void Translator::V_CVT_F32_U32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst),
 	             ir.Emit(IR::ValueOpcode::ConvertF32U32, {ReadU32(SourceAt(inst, 0))}));
@@ -89,10 +103,10 @@ void Translator::V_CVT_16_F16(const Decoder::Instruction& inst, bool signed_valu
 	if (signed_value) {
 		const auto converted =
 		    ConvertF32ToI32Saturated(value, -32768.0f, 32768.0f, 32767.0f, 0xffff8000u, 0x7fffu);
-		Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
+		WriteU16(DestinationOperand(inst), ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
 		return;
 	}
-	Write16Bits(DestinationOperand(inst),
+	WriteU16(DestinationOperand(inst),
 	         ConvertF32ToU32Saturated(value, 65536.0f, 65535.0f, 0xffffu));
 }
 

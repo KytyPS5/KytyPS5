@@ -21,6 +21,10 @@ namespace {
 	}
 }
 
+[[nodiscard]] bool IsCompatibleViewFormat(vk::Format image_format, vk::Format view_format) {
+	return ImageViewOps::FormatsCompatible(image_format, view_format);
+}
+
 [[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
 	switch (format) {
 		case vk::Format::eS8Uint:
@@ -323,7 +327,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
-	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);
+	                               IsCompatibleViewFormat(image.format, normalized.format);
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);
@@ -342,13 +346,22 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u "
+		     "guest=0x%016llx+0x%llx info_format=%d guest_format=%u image_type=%u "
+		     "tile=%u samples=%u extent=%ux%ux%u info_levels=%u info_layers=%u "
+		     "stencil=0x%016llx+0x%llx depth_association=%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
 		     static_cast<int>(normalized.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		     image.layers, static_cast<unsigned long long>(info.data.address),
+		     static_cast<unsigned long long>(info.data.size), static_cast<int>(info.pixel_format),
+		     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
+		     static_cast<uint32_t>(info.tile_mode), info.samples, info.extent.width,
+		     info.extent.height, info.extent.depth, info.resources.levels, info.resources.layers,
+		     static_cast<unsigned long long>(info.stencil.address),
+		     static_cast<unsigned long long>(info.stencil.size), depth_id.index);
 	}
 
 	for (const auto& cached: views) {
@@ -358,11 +371,13 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};
+	usage.sType = vk::StructureType::eImageViewUsageCreateInfo;
 	usage.usage = image.usage;
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
 	vk::ImageViewCreateInfo create {};
+	create.sType                           = vk::StructureType::eImageViewCreateInfo;
 	create.pNext                           = &usage;
 	create.image                           = image.image;
 	create.viewType                        = normalized.type;
@@ -375,7 +390,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.subresourceRange.layerCount     = normalized.layer_count;
 
 	vk::ImageView view   = nullptr;
-	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
+	const auto    result = m_graphics->device.createImageView(&create, nullptr, &view);
 	if (result != vk::Result::eSuccess || view == nullptr) {
 		EXIT("failed to create image view: result=%d image_format=%d view_format=%d type=%d "
 		     "aspect=0x%x mip=%u+%u layer=%u+%u usage=0x%x\n",

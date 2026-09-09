@@ -1004,7 +1004,9 @@ private:
 	bool MatchReadLaneProbe(const Inst& key, uint32_t pc, uint32_t& material_source,
 	                        uint32_t& selector_offset, uint32_t& selector_stride,
 	                        uint32_t& item_bound, std::string& reason) {
-		if (key.GetOpcode() != ValueOpcode::ReadLane || key.NumArgs() != 2u) {
+		if ((key.GetOpcode() != ValueOpcode::ReadLane &&
+		     key.GetOpcode() != ValueOpcode::ReadFirstLane) ||
+		    key.NumArgs() != 2u) {
 			reason = "key is not a readlane of a per-lane value";
 			return false;
 		}

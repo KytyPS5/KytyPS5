@@ -123,6 +123,20 @@ static JsonValue* JsonStaticNullValue() {
 	return &value;
 }
 
+// Returned for a key that is absent from an object (as opposed to the parent not
+// being an object at all). Retail data leaves optional boolean flags out of a
+// serialised object; the engine then reads such a flag straight back and, in a
+// checked build, asserts that its type is boolean before use (Astro Bot
+// PPSA21564, Module/Network/Json.cpp:399, key "applyToAll"). On real hardware the
+// omitted flag reads as false, so resolve an absent key to a read-only
+// boolean-false rather than a null value.
+static JsonValue* JsonStaticAbsentValue() {
+	static JsonValue value {};
+	value.type    = JsonValueTypeBoolean;
+	value.boolean = false;
+	return &value;
+}
+
 static JsonString* JsonStaticString() {
 	static JsonString str {new std::string};
 	return &str;
@@ -759,7 +773,14 @@ static const JsonValue* KYTY_SYSV_ABI JsonValueIndexString(const JsonValue* self
 	if (self == nullptr || self->type != JsonValueTypeObject) {
 		return JsonStaticNullValue();
 	}
-	return JsonObjectLookup(self->object, key != nullptr ? key : "", false);
+	auto* impl = JsonObjectImpl(self->object);
+	if (impl != nullptr) {
+		auto it = impl->find(key != nullptr ? key : "");
+		if (it != impl->end()) {
+			return it->second;
+		}
+	}
+	return JsonStaticAbsentValue();
 }
 
 static const JsonValue* KYTY_SYSV_ABI JsonValueIndexUInt(const JsonValue* self, uint64_t index) {

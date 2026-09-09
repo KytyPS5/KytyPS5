@@ -64,7 +64,8 @@ namespace Libs::Graphics {
 bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
                                const std::vector<uint32_t>& spirv);
 std::vector<uint32_t> OptimizeShaderSpirvForTest(
-    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization);
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization,
+    bool cooperative_wave64 = false);
 bool ShouldOptimizeShaderSpirvForTest(
     bool dispatcher_fallback, bool cooperative_wave64,
     Config::ShaderOptimizationType optimization);
@@ -96,6 +97,8 @@ void TestShaderOptimizationSelection() {
        %main = OpFunction %void None %fn
       %entry = OpLabel
        %dead = OpIAdd %u32 %one %one
+               OpBranch %exit
+       %exit = OpLabel
                OpReturn
                OpFunctionEnd
   )";
@@ -110,25 +113,31 @@ void TestShaderOptimizationSelection() {
       spirv, Config::ShaderOptimizationType::Performance);
   const auto size = OptimizeShaderSpirvForTest(
       spirv, Config::ShaderOptimizationType::Size);
+  const auto cooperative = OptimizeShaderSpirvForTest(
+      spirv, Config::ShaderOptimizationType::Performance, true);
   Check(unchanged == spirv,
         "None shader optimization changed the generated module");
   Check(performance.size() < spirv.size(),
         "Performance shader optimization did not remove dead work");
   Check(size.size() <= performance.size(),
         "Size shader optimization produced more words than Performance");
+  Check(cooperative.size() < spirv.size(),
+        "bounded cooperative optimization did not merge trivial control flow");
   Check(assembler.Validate(performance),
         "Performance optimized module failed SPIR-V validation");
   Check(assembler.Validate(size),
         "Size optimized module failed SPIR-V validation");
+  Check(assembler.Validate(cooperative),
+        "bounded cooperative optimized module failed SPIR-V validation");
   Check(ShouldOptimizeShaderSpirvForTest(
             false, false, Config::ShaderOptimizationType::Performance),
         "structured Performance shader was not admitted for optimization");
   Check(!ShouldOptimizeShaderSpirvForTest(
             true, false, Config::ShaderOptimizationType::Performance),
         "dispatcher fallback was admitted to the driver-pathological optimization path");
-  Check(!ShouldOptimizeShaderSpirvForTest(
+  Check(ShouldOptimizeShaderSpirvForTest(
             false, true, Config::ShaderOptimizationType::Performance),
-        "cooperative wave64 scheduler was admitted to the driver-pathological optimization path");
+        "cooperative wave64 scheduler was not admitted to bounded optimization");
   Check(!ShouldOptimizeShaderSpirvForTest(
             false, false, Config::ShaderOptimizationType::None),
         "None optimization mode admitted a module");
@@ -15711,7 +15720,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int RunShaderBatchAudit(int argc, char* argv[]);
 
 int main(int argc, char* argv[]) {
-  if (argc == 3 && std::strcmp(argv[1], "--spirv-optimize-file") == 0) {
+  if (argc == 3 &&
+      (std::strcmp(argv[1], "--spirv-optimize-file") == 0 ||
+       std::strcmp(argv[1], "--spirv-optimize-cooperative-file") == 0)) {
     auto *input = std::fopen(argv[2], "rb");
     if (input == nullptr) return 2;
     std::fseek(input, 0, SEEK_END);
@@ -15726,7 +15737,8 @@ int main(int argc, char* argv[]) {
     std::fclose(input);
     if (read != static_cast<size_t>(bytes)) return 2;
     const auto optimized = Libs::Graphics::OptimizeShaderSpirvForTest(
-        spirv, Config::ShaderOptimizationType::Performance);
+        spirv, Config::ShaderOptimizationType::Performance,
+        std::strcmp(argv[1], "--spirv-optimize-cooperative-file") == 0);
     std::printf("original_words=%zu optimized_words=%zu\n", spirv.size(), optimized.size());
     return optimized.empty() ? 1 : 0;
   }

@@ -359,7 +359,8 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 }
 
 std::vector<uint32_t> OptimizeShaderSpirv(
-    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization) {
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization,
+    bool cooperative_wave64 = false) {
 	if (optimization == Config::ShaderOptimizationType::None || spirv.empty()) {
 		return spirv;
 	}
@@ -375,16 +376,23 @@ std::vector<uint32_t> OptimizeShaderSpirv(
 	});
 	// The stock -O/-Os recipes include exhaustive inlining, scalar replacement and forced loop
 	// unrolling. Generated dispatcher/cooperative modules can contain hundreds of thousands of
-	// words, making those passes super-linear and stalling first launch for minutes. Keep the
-	// bounded passes that remove dead/control-flow work without cloning or unrolling code.
-	optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
-	    .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
-	    .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-	    .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-	    .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-	    .RegisterPass(spvtools::CreateSimplificationPass())
-	    .RegisterPass(spvtools::CreateRedundancyEliminationPass())
-	    .RegisterPass(spvtools::CreateBlockMergePass());
+	// words, making those passes super-linear and stalling first launch for minutes. Cooperative
+	// schedulers also make global redundancy analysis super-linear; keep their measured bounded
+	// recipe to local simplification and block merging. Ordinary structured modules retain the
+	// wider bounded recipe.
+	if (cooperative_wave64) {
+		optimizer.RegisterPass(spvtools::CreateSimplificationPass())
+		    .RegisterPass(spvtools::CreateBlockMergePass());
+	} else {
+		optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
+		    .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
+		    .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
+		    .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
+		    .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
+		    .RegisterPass(spvtools::CreateSimplificationPass())
+		    .RegisterPass(spvtools::CreateRedundancyEliminationPass())
+		    .RegisterPass(spvtools::CreateBlockMergePass());
+	}
 	if (optimization == Config::ShaderOptimizationType::Size) {
 		optimizer.RegisterPass(spvtools::CreateStripDebugInfoPass());
 	}
@@ -399,8 +407,8 @@ std::vector<uint32_t> OptimizeShaderSpirv(
 
 bool ShouldOptimizeShaderSpirv(bool dispatcher_fallback, bool cooperative_wave64,
                                Config::ShaderOptimizationType optimization) {
-	return optimization != Config::ShaderOptimizationType::None && !dispatcher_fallback &&
-	       !cooperative_wave64;
+	(void)cooperative_wave64;
+	return optimization != Config::ShaderOptimizationType::None && !dispatcher_fallback;
 }
 
 std::string ShaderModuleDebugName(ShaderType stage, uint64_t shader_hash) {
@@ -424,8 +432,9 @@ bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
 }
 
 std::vector<uint32_t> OptimizeShaderSpirvForTest(
-    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization) {
-	return OptimizeShaderSpirv(spirv, optimization);
+    const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization,
+    bool cooperative_wave64) {
+	return OptimizeShaderSpirv(spirv, optimization, cooperative_wave64);
 }
 
 bool ShouldOptimizeShaderSpirvForTest(bool dispatcher_fallback, bool cooperative_wave64,
@@ -535,7 +544,8 @@ struct PipelineCache::ProgramCache {
 		}
 		if (ShouldOptimizeShaderSpirv(result.program.dispatcher_fallback, cooperative_wave64,
 		                              Config::GetShaderOptimizationType())) {
-			result.spirv = OptimizeShaderSpirv(result.spirv, Config::GetShaderOptimizationType());
+			result.spirv = OptimizeShaderSpirv(result.spirv, Config::GetShaderOptimizationType(),
+			                                  cooperative_wave64);
 		}
 		if (optimization_trace != nullptr && *optimization_trace != '\0') {
 			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

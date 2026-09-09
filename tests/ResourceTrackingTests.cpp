@@ -3120,6 +3120,8 @@ struct BoundedSnapshotReader {
   uint32_t ordinary_reads = 0;
   uint32_t generated_descriptors = 0;
   uint64_t unmapped_address = UINT64_MAX;
+  uint64_t clamped_address = UINT64_MAX;
+  uint64_t clamped_size = UINT64_MAX;
   bool change_repeated_reads = false;
 
   static bool Clean(void* userdata, uint64_t address, uint32_t* word) {
@@ -3152,7 +3154,8 @@ struct BoundedSnapshotReader {
   }
   static uint64_t Clamp(void* userdata, uint64_t address, uint64_t size) {
     const auto& self = *static_cast<BoundedSnapshotReader*>(userdata);
-    return address == self.unmapped_address ? 0u : size;
+    if (address == self.unmapped_address) return 0u;
+    return address == self.clamped_address ? std::min(size, self.clamped_size) : size;
   }
 };
 
@@ -3536,6 +3539,27 @@ void TestBoundedMaterializationRejectsWritableAliases() {
               : "bounded source final-word alias or exact-end disjoint writer misclassified");
     if (overlap) CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
   }
+
+  // Guest buffer descriptors may reserve a much larger logical record range
+  // than the VMA that NativeStorageBuffer can actually bind.  The immutable
+  // table starts exactly after that mapped prefix, so the formal descriptor
+  // overlaps it while the native writable interval does not.
+  Fixture mapped_prefix;
+  InitializeBoundedSnapshot(mapped_prefix,4u,true);
+  const auto writer=AddBoundedSnapshotSource(mapped_prefix,
+      {Value(0x800u),Value(0u),Value(0x1000u),Value(0u)});
+  mapped_prefix.program.info.buffers.push_back({.source=writer,.written=true});
+  auto mapped_plan=ExtractResourcePlan(mapped_prefix.program);
+  BoundedSnapshotReader mapped_reader;
+  mapped_reader.generated_descriptors=1u;
+  mapped_reader.clamped_address=0x800u;
+  mapped_reader.clamped_size=0x800u;
+  const std::array<uint32_t,3> mapped_data{1u,0x1000u,0u};
+  ResourceSnapshot mapped_snapshot;
+  ResourceSpecialization mapped_specialization;
+  Check(MaterializeResources(mapped_plan,BoundedSnapshotRuntime(mapped_reader,mapped_data),
+                             mapped_snapshot,mapped_specialization),
+        "formal writable descriptor overlap ignored the disjoint mapped prefix");
 }
 
 void TestBoundedMaterializationNullsForeignBufferSlots() {
@@ -4493,6 +4517,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--descriptor-format-provenance-only") == 0) {
       TestDescriptorFormattedBufferProvenance();
       std::cout << "KYTY_DESCRIPTOR_FORMAT_PROVENANCE_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-write-alias-only") == 0) {
+      TestBoundedMaterializationRejectsWritableAliases();
+      std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
       return 0;
     }
     if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {

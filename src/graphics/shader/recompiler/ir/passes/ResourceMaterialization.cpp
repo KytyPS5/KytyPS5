@@ -1188,8 +1188,9 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 	return true;
 }
 
-bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSnapshot& snapshot,
-                                 const ResourceSpecialization& specialization) {
+bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime& runtime,
+                                  const ResourceSnapshot& snapshot,
+                                  const ResourceSpecialization& specialization) {
 	if (snapshot.immutable_srt_ranges.empty()) {
 		return true;
 	}
@@ -1215,11 +1216,17 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const ResourceSna
 			    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]));
 		}
 		// Buffer descriptors may conservatively declare more records than the mapped VMA.
-		// NativeStorageBuffer clamps that requested footprint to the actual guest mapping.  The
-		// alias proof has no mapping lookup, so clamp only to the complete tracker address space:
-		// every range the renderer can bind remains a subset of this interval.
-		const auto write_end =
-		    address + std::min(size, RegisteredBufferAddressLimit - address);
+		// Match NativeStorageBuffer's exact contiguous mapped prefix when the renderer supplied
+		// its address-space query. Offline callers retain the conservative 40-bit fallback.
+		uint64_t writable_size = std::min(size, RegisteredBufferAddressLimit - address);
+		if (runtime.clamp_memory_range != nullptr) {
+			const auto mapped = runtime.clamp_memory_range(runtime.userdata, address, size);
+			if (mapped > size) {
+				return SpecializationFail("buffer range clamp exceeded the requested descriptor size");
+			}
+			writable_size = mapped;
+		}
+		const auto write_end = address + writable_size;
 		for (const auto& read: snapshot.immutable_srt_ranges) {
 			if (address < read.address + read.size && read.address < write_end) {
 				return SpecializationFail(fmt::format(
@@ -1806,7 +1813,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			next_snapshot.samplers.push_back(next_snapshot.samplers[index]);
 		}
 	}
-	if (!ValidateSnapshotBufferWrites(program, next_snapshot, next_specialization)) {
+	if (!ValidateSnapshotBufferWrites(program, runtime, next_snapshot, next_specialization)) {
 		return false;
 	}
 	specialization       = std::move(next_specialization);

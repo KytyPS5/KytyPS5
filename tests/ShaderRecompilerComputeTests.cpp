@@ -34128,6 +34128,14 @@ void CheckIndirectImageKeySwitch(
   program.info.images = {root, candidate};
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+  const bool mixed_numeric =
+      candidate_numeric_class != Prospero::TextureNumericClass::Float;
+  if (mixed_numeric) {
+    auto point_sampler = program.info.samplers[0];
+    point_sampler.force_point_filtering = true;
+    program.info.samplers.push_back(point_sampler);
+    program.info.sampled_pairs.push_back({1u, 1u, 0x10f0u});
+  }
 
   AllocateBindings(program);
   const auto root_binding = DescriptorBindingForImage(root);
@@ -34151,7 +34159,7 @@ void CheckIndirectImageKeySwitch(
          .indirect_sampler = resource.indirect_sampler,
          .cube = resource.cube});
   }
-  specialization.sampler_depth_compare_funcs.push_back(0u);
+  specialization.sampler_depth_compare_funcs.resize(program.info.samplers.size());
   ShaderComputeInputInfo compute{};
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     {.compute = &compute});

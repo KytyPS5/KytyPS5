@@ -4033,6 +4033,16 @@ void TestNewShaderDecoderArchitecture() {
   Check(GetInstructionFamily(EncodeDs0(0x36)) == Family::DS,
         "decoder did not classify DS directly");
 
+  const uint32_t orn2_saveexec_code[] = {0xbeea407eu};
+  Instruction orn2_saveexec;
+  ShaderRecompiler::Decoder::DecodeInstruction(orn2_saveexec_code, 0u, orn2_saveexec);
+  Check(orn2_saveexec.family == Family::SOP1 &&
+            orn2_saveexec.opcode == Opcode::S_ORN2_SAVEEXEC_B32 &&
+            orn2_saveexec.word_count == 1u && orn2_saveexec.src_count == 1u &&
+            orn2_saveexec.dst.kind == OperandKind::VccLo &&
+            orn2_saveexec.src0.kind == OperandKind::ExecLo,
+        "decoder rejected or misdecoded captured S_ORN2_SAVEEXEC_B32");
+
   const uint32_t offset_code[] = {0u, EncodeVop1(0x01, 2, 3)};
   Instruction direct;
   ShaderRecompiler::Decoder::DecodeInstruction(offset_code, 1u, direct);

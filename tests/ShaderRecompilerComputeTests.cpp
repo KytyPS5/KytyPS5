@@ -14968,6 +14968,69 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
+  using O = ShaderOpcode;
+  constexpr u32 exec_hi = 0xa5a55a5au;
+  constexpr u32 vcc_hi = 0x13579bdfu;
+  struct Case {
+    u32 exec_lo, source, destination, result;
+  };
+  constexpr Case cases[] = {
+      {0x8000000cu, 126, 106, 0xffffffffu}, // Captured vcc_lo, exec_lo.
+      {0x0000000fu, 6, 6, 0xfffffff3u},    // Aliased SGPR source/destination.
+      {0xffffffffu, 128, 8, 0},            // SCC ignores the nonzero high half.
+      {0xffffffffu, 107, 8, vcc_hi},
+      {0xffffffffu, 127, 8, exec_hi},
+      {0xffffffffu, 253, 8, 1},            // SCC is a scalar value, not a mask.
+  };
+  TestCase test;
+  test.name = wave_size == 64 ? "ScalarOrn2SaveexecB32Wave64"
+              : threads == 32 ? "ScalarOrn2SaveexecB32Wave32"
+                              : "ScalarOrn2SaveexecB32PartialWave";
+  auto &code = test.code;
+  for (const auto &item : cases) {
+    AppendVMovU32(&code, 2, 0);
+    AppendSMovLiteral(&code, 126, item.exec_lo);
+    AppendSMovLiteral(&code, 127, exec_hi);
+    AppendSMovLiteral(&code, 107, vcc_hi);
+    AppendSMovLiteral(&code, 6, 3);
+    code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(0)));
+    code.push_back(item.source == 126 ? 0xbeea407eu
+                                     : EncodeSop1(0x40, item.destination, item.source));
+    const u32 snapshots[] = {item.destination, 126, 127, 107, 253};
+    for (u32 i = 0; i < std::size(snapshots); ++i) {
+      code.push_back(EncodeSMovB32(20 + i, snapshots[i]));
+    }
+    AppendVMovU32(&code, 2, 1);
+    code.push_back(EncodeSop1(0x04, 126, 193u)); // Restore EXEC for readback.
+    const u32 expected[] = {item.exec_lo, item.result, exec_hi, vcc_hi,
+                            item.result != 0 ? 1u : 0u};
+    for (u32 i = 0; i < std::size(expected); ++i) {
+      AppendStoreSgprAtLaneDwordOffset(&code, 20 + i, 0,
+                                      static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), threads, expected[i]);
+    }
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0,
+                                    static_cast<u32>(test.expected.size()));
+    for (u32 lane = 0; lane < threads; ++lane) {
+      const u32 mask = lane < 32 ? item.result : exec_hi;
+      test.expected.push_back((mask >> (lane % 32)) & 1u);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32,
+                  O::S_ORN2_SAVEEXEC_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_ORN2_SAVEEXEC_B32 vcc_lo, exec_lo", 1}};
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarGetpcWritesNextInstructionPc() {
   using O = ShaderOpcode;
 
@@ -23993,6 +24056,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarFlbitI32B32Gpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
+  cases.push_back(ScalarOrn2SaveexecB32(32, 32));
+  cases.push_back(ScalarOrn2SaveexecB32(64, 64));
+  cases.push_back(ScalarOrn2SaveexecB32(32, 4));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
   AddCase(ScalarBrevB32PreservesScc);
@@ -28448,6 +28514,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DispatcherIrreducibleControlFlow());
     RunCase(&vulkan, ScalarSaveExecOps());
     RunCase(&vulkan, ScalarOrn2SaveexecUsesSourceOrNotExec());
+    RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 32));
+    RunCase(&vulkan, ScalarOrn2SaveexecB32(64, 64));
+    RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 4));
     RunCase(&vulkan, ScalarNotB64UpdatesScc());
     RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance());
     RunCase(&vulkan, ScalarConditionalMoveB64());

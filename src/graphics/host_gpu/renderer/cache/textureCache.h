@@ -132,6 +132,8 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	[[nodiscard]] static GuestRange  SelectUploadRange(const ImageInfo& info,
+	                                                   const ImageViewInfo& view) noexcept;
 	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
@@ -145,7 +147,8 @@ private:
 	void                        RefreshImage(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] ColorTransferPlan BuildColorTransfer(const Image& image, BindingType binding,
-	                                                   TransferDirection direction) const;
+	                                                   TransferDirection direction,
+	                                                   const ImageViewInfo* view = nullptr) const;
 	[[nodiscard]] DownloadPlan      BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, const ImageDesc& desc, Buffer& source, uint64_t source_offset);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,

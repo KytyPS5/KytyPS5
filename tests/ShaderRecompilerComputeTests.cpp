@@ -299,6 +299,11 @@ struct TextureCacheTestAccess {
     return owners != nullptr && owners->Erase(id);
   }
 
+  static GuestRange SelectUploadRange(const ImageInfo &info,
+                                      const ImageViewInfo &view) {
+    return TextureCache::SelectUploadRange(info, view);
+  }
+
   static void SetQueryEpoch(TextureCache &cache, uint32_t epoch) {
     std::lock_guard lock(cache.m_lock);
     cache.m_image_query_epoch = epoch;
@@ -32247,6 +32252,63 @@ void CheckStorageTextureLinearUploadLayout() {
   std::printf("[host]    %-32s ok\n", "StorageTextureLinearUpload");
 }
 
+void CheckPartialMipUploadRange() {
+  constexpr uint64_t base = 0x1000000000ull;
+  ImageInfo info{};
+  info.data = {base, 0x2ab000};
+  info.type = Prospero::ImageType::kColor2D;
+  info.resources = {12, 1};
+  info.mip_layout[0] = {0xab000, 0x200000, 2048, 2048};
+  info.mip_layout[1] = {0x2b000, 0x80000, 1024, 1024};
+  info.mip_layout[2] = {0xb000, 0x20000, 512, 512};
+  info.mip_layout[3] = {0x3000, 0x8000, 256, 256};
+  info.mip_layout[4] = {0x1000, 0x2000, 128, 128};
+  for (uint32_t level = 5; level < info.resources.levels; ++level) {
+    info.mip_layout[level] = {0, 0x1000, 128, 64};
+  }
+  ImageViewInfo view{};
+  view.base_level = 1;
+  view.level_count = 11;
+  view.base_layer = 0;
+  view.layer_count = 1;
+  Require("PartialMipUploadRange", "reverse-packed mip view",
+          TextureCacheTestAccess::SelectUploadRange(info, view) ==
+              GuestRange{base, 0xab000},
+          "an unreferenced base mip remained in the guest upload range");
+
+  ImageInfo array = info;
+  array.data = {base, 0x6000};
+  array.resources = {2, 3};
+  array.mip_layout = {};
+  array.mip_layout[0] = {0x3000, 0x3000, 16, 16};
+  array.mip_layout[1] = {0, 0x3000, 8, 8};
+  view.base_level = 1;
+  view.level_count = 1;
+  view.base_layer = 1;
+  view.layer_count = 1;
+  Require("PartialMipUploadRange", "array slice",
+          TextureCacheTestAccess::SelectUploadRange(array, view) ==
+              array.data,
+          "an array slice was narrowed without a contiguous layer-major proof");
+
+  ImageInfo volume = info;
+  volume.data = {base, 0xc000};
+  volume.type = Prospero::ImageType::kColor3D;
+  volume.resources = {2, 1};
+  volume.mip_layout = {};
+  volume.mip_layout[0] = {0x4000, 0x8000, 32, 32};
+  volume.mip_layout[1] = {0, 0x4000, 16, 16};
+  view.base_level = 1;
+  view.level_count = 1;
+  view.base_layer = 0;
+  view.layer_count = 1;
+  Require("PartialMipUploadRange", "volume mip",
+          TextureCacheTestAccess::SelectUploadRange(volume, view) ==
+              volume.data,
+          "a volume mip view was narrowed without per-block-depth transfer support");
+  std::printf("[host]    %-32s ok\n", "PartialMipUploadRange");
+}
+
 void CheckStorageTextureDepthTileUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k8UInt;
   constexpr uint32_t width = 1;
@@ -35524,6 +35586,10 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--partial-mip-upload-only") == 0) {
+    CheckPartialMipUploadRange();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {

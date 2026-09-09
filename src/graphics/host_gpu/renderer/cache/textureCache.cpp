@@ -923,6 +923,8 @@ struct TextureCache::ColorTransferPlan {
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
 	uint64_t                         linear_size = 0;
+	uint64_t                         source_offset = 0;
+	uint64_t                         source_size   = 0;
 	bool                             tiled       = false;
 	bool                             swap_bgra16 = false;
 	bool                             valid       = false;
@@ -942,9 +944,47 @@ struct TextureCache::DownloadPlan {
 	bool              valid = false;
 };
 
+GuestRange TextureCache::SelectUploadRange(const ImageInfo& info,
+                                           const ImageViewInfo& view) noexcept {
+	if (!info.data.Valid() || info.IsVolume() || info.resources.levels == 0 ||
+	    info.resources.levels > info.mip_layout.size() || info.resources.layers != 1 ||
+	    view.level_count == 0 || view.base_level >= info.resources.levels ||
+	    view.level_count > info.resources.levels - view.base_level || view.layer_count == 0 ||
+	    view.base_layer >= info.resources.layers ||
+	    view.layer_count > info.resources.layers - view.base_layer) {
+		return info.data;
+	}
+	uint64_t begin = UINT64_MAX;
+	uint64_t end   = 0;
+	for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
+		const auto& mip = info.mip_layout[level];
+		if (mip.size == 0 || mip.size % info.resources.layers != 0) {
+			return info.data;
+		}
+		const auto layer_size = mip.size;
+		if (view.base_layer > (UINT64_MAX - mip.offset) / layer_size) {
+			return info.data;
+		}
+		const auto mip_begin = mip.offset + layer_size * view.base_layer;
+		if (view.layer_count > (UINT64_MAX - mip_begin) / layer_size) {
+			return info.data;
+		}
+		const auto mip_end = mip_begin + layer_size * view.layer_count;
+		if (mip_begin > info.data.size || mip_end > info.data.size) {
+			return info.data;
+		}
+		begin = std::min(begin, mip_begin);
+		end   = std::max(end, mip_end);
+	}
+	if (begin == UINT64_MAX || begin >= end || begin > UINT64_MAX - info.data.address) {
+		return info.data;
+	}
+	return {info.data.address + begin, end - begin};
+}
+
 TextureCache::ColorTransferPlan
 TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
-                                 TransferDirection direction) const {
+	                             TransferDirection direction, const ImageViewInfo* view) const {
 	const auto& info             = image.info;
 	auto        format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
@@ -954,6 +994,7 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 	    direction == TransferDirection::Upload ? "TextureCache" : "TextureCache readback";
 
 	ColorTransferPlan plan;
+	plan.source_size = info.data.size;
 	if (direction == TransferDirection::Upload) {
 		switch (binding) {
 			case BindingType::Texture: break;
@@ -1014,6 +1055,60 @@ TextureCache::BuildColorTransfer(const Image& image, BindingType binding,
 		}
 		plan.linear_size = GetLinearSize(plan.tiles);
 	}
+	if (direction == TransferDirection::Upload && view != nullptr && !volume &&
+	    (binding == BindingType::Texture || binding == BindingType::Storage)) {
+		const auto selected = SelectUploadRange(info, *view);
+		if (!selected.Valid() || selected.address < info.data.address) {
+			return plan;
+		}
+		plan.source_offset = selected.address - info.data.address;
+		plan.source_size   = selected.size;
+		const auto selected_region = [&](const vk::BufferImageCopy& region) {
+			const auto level = region.imageSubresource.mipLevel;
+			const auto layer = region.imageSubresource.baseArrayLayer;
+			return level >= view->base_level && level - view->base_level < view->level_count &&
+			       layer >= view->base_layer && layer - view->base_layer < view->layer_count;
+		};
+		if (plan.tiled) {
+			if (plan.tiles.size() != plan.regions.size()) {
+				return plan;
+			}
+			std::vector<vk::BufferImageCopy> selected_regions;
+			std::vector<GpuTileInfo>         selected_tiles;
+			selected_regions.reserve(plan.regions.size());
+			selected_tiles.reserve(plan.tiles.size());
+			for (size_t index = 0; index < plan.regions.size(); ++index) {
+				if (!selected_region(plan.regions[index])) {
+					continue;
+				}
+				auto tile = plan.tiles[index];
+				const auto tiled_delta = tile.tiled_offset - plan.source_offset;
+				if (tile.tiled_offset < plan.source_offset || tiled_delta > plan.source_size ||
+				    tile.tiled_size > plan.source_size - tiled_delta) {
+					return plan;
+				}
+				tile.tiled_offset -= plan.source_offset;
+				selected_regions.push_back(plan.regions[index]);
+				selected_tiles.push_back(tile);
+			}
+			plan.regions    = std::move(selected_regions);
+			plan.tiles      = std::move(selected_tiles);
+			plan.linear_size = GetLinearSize(plan.tiles);
+		} else {
+			std::erase_if(plan.regions, [&](const vk::BufferImageCopy& region) {
+				return !selected_region(region);
+			});
+			for (auto& region: plan.regions) {
+				if (region.bufferOffset < plan.source_offset) {
+					return plan;
+				}
+				region.bufferOffset -= plan.source_offset;
+			}
+		}
+		if (plan.regions.empty() || (plan.tiled && plan.tiles.empty())) {
+			return plan;
+		}
+	}
 	plan.valid = true;
 	return plan;
 }
@@ -1049,7 +1144,8 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 	};
 
 	if (desc.type != BindingType::DepthTarget) {
-		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
+		auto plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload,
+		                               &desc.view_info);
 		if (!plan.valid) {
 			EXIT("TextureCache: invalid color upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
@@ -1060,9 +1156,9 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
-		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
+		TileManager::Result linear {source.Handle(), source_offset, plan.source_size};
 		if (plan.tiled) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			linear = m_tiler.Detile(source.Handle(), source_offset, plan.source_size,
 			                        plan.linear_size, plan.tiles);
 		}
 		if (plan.swap_bgra16) {
@@ -1153,15 +1249,20 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	bool       data_imported = false;
 	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto mapped_size = LibKernel::Memory::TryClampRangeSize(
-		    image.info.data.address, image.info.data.size);
-		if (mapped_size < image.info.data.size) {
+		const auto upload_range = desc.type == BindingType::Texture || desc.type == BindingType::Storage
+		                              ? SelectUploadRange(image.info, desc.view_info)
+		                              : image.info.data;
+		const auto mapped_size =
+		    LibKernel::Memory::TryClampRangeSize(upload_range.address, upload_range.size);
+		if (mapped_size < upload_range.size) {
 			LOGF("TextureUploadLayout binding=%s addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " mapped=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " upload=0x%016" PRIx64 "+0x%016" PRIx64
+			     " mapped=0x%016" PRIx64
 			     " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u"
 			     " type=%u tile=%u format=%u guest=%u bpb=%u view=%u+%u/%u+%u\n",
 			     BindingTypeName(desc.type), image.info.data.address, image.info.data.size,
-			     mapped_size, image.info.extent.width, image.info.extent.height,
+			     upload_range.address, upload_range.size, mapped_size, image.info.extent.width,
+			     image.info.extent.height,
 			     image.info.extent.depth, image.info.pitch, image.info.resources.levels,
 			     image.info.resources.layers, image.info.samples,
 			     static_cast<uint32_t>(image.info.type),
@@ -1180,7 +1281,7 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 			}
 		}
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    m_buffer_cache.ObtainBufferForImage(upload_range.address, upload_range.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}

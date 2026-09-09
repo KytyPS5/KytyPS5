@@ -1389,7 +1389,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			if (!MaterializeInlineImage(*source->inline_descriptor, inline_sampler,
 			                            tables[0], tables.size() > 1u ? &tables[1] : nullptr,
 			                            image.first_use_pc, runtime, table)) {
-				return SpecializationFail("inline sampled table materialization failed");
+				return false;
 			}
 			next.images[image_index] = table.descriptors[0];
 			if (table.descriptors.size() > 1u) {

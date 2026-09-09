@@ -1388,6 +1388,8 @@ void TestInlineFullWidthImages() {
                                         memory.base + 440u + 60u}) {
     memory.fail_address = failed_address;
     Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+              Common::ContainsStr(LastResourceSpecializationError(),
+                                  "inline sampled pair at pc") &&
               SameResourceSnapshot(snapshot, prior_snapshot) &&
               specialization == prior_specialization,
           "failed final inline descriptor word was skipped or partially committed");
@@ -1531,6 +1533,8 @@ void TestInlineImageAddressTable() {
   for (const uint64_t failed_address : {table_address + 28u, table_address + 32u + 28u}) {
     memory.fail_address = failed_address;
     Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+              Common::ContainsStr(LastResourceSpecializationError(),
+                                  "inline sampled pair at pc") &&
               SameResourceSnapshot(snapshot, prior_snapshot) &&
               specialization == prior_specialization,
           "failed raw image-table read partially updated resources or skipped descriptor tail");
@@ -4801,6 +4805,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--wave-uniform-buffer-phi-only") == 0) {
       TestWaveUniformBufferPhiTable();
       std::cout << "KYTY_WAVE_UNIFORM_BUFFER_PHI_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-image-address-table-only") == 0) {
+      TestInlineImageAddressTable();
+      std::cout << "KYTY_INLINE_IMAGE_ADDRESS_TABLE_PASS\n";
       return 0;
     }
     if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {

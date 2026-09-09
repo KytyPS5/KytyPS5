@@ -34,6 +34,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		switch (operation) {
 			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
+			case IR::ValueOpcode::LogicalXor: result = ir.BitwiseXor(lhs, rhs); break;
 			default: EXIT("unsupported SAVEEXEC operation");
 		}
 		WriteRawU32(inst.dst, old);

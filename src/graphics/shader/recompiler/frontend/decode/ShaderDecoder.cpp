@@ -482,9 +482,13 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_BITSET0_B64:
 		case Opcode::S_BITSET1_B64:
 		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
+		case Opcode::S_OR_SAVEEXEC_B32:
+		case Opcode::S_XOR_SAVEEXEC_B32:
+		case Opcode::S_ANDN2_SAVEEXEC_B32:
 		case Opcode::S_ORN2_SAVEEXEC_B32:
 		case Opcode::S_ANDN1_SAVEEXEC_B32:
 		case Opcode::S_AND_SAVEEXEC_B64:

@@ -16,6 +16,27 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 	return true;
 }
 
+uint32_t EmitWqmU32(EmitterState& state, uint32_t value) {
+	// For every aligned group of 4 bits: if any bit is set, set all 4; else clear all 4.
+	const auto shifted_one = state.builder.AllocateId();
+	const auto merged_one  = state.builder.AllocateId();
+	const auto shifted_two = state.builder.AllocateId();
+	const auto merged_two  = state.builder.AllocateId();
+	const auto quad_bits   = state.builder.AllocateId();
+	const auto result      = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU32(state), shifted_one, value, ConstantU32(state, 1u)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), merged_one, value, shifted_one});
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU32(state), shifted_two, merged_one, ConstantU32(state, 2u)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), merged_two, merged_one, shifted_two});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), quad_bits, merged_two, ConstantU32(state, 0x11111111u)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU32(state), result, quad_bits, ConstantU32(state, 0x0fu)});
+	return result;
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -594,6 +615,9 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Emit(inst, OpSelect, IR::Type::U32, {write, ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
 			return true;
 		}
+		case IR::ValueOpcode::WqmU32:
+			ctx.Define(inst, EmitWqmU32(ctx.state, ctx.Arg(inst, 0)));
+			return true;
 		case IR::ValueOpcode::WqmU64:
 			ctx.Define(inst, EmitWqmU64(ctx.state, ctx.Arg(inst, 0)));
 			return true;

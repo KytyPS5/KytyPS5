@@ -82,6 +82,7 @@ VALUE_OPCODE(BitFieldUExtract, U32, U32, U32, U32)
 VALUE_OPCODE(BitFieldSExtract, U32, U32, U32, U32)
 VALUE_OPCODE(DppMoveU32, U32, U32, U1)
 VALUE_OPCODE(DppUpdateU32, U32, U32, U32, U1)
+VALUE_OPCODE(WqmU32, U32, U32)
 VALUE_OPCODE(WqmU64, U64, U64)
 
 // Core value operations used to expand architectural side effects.

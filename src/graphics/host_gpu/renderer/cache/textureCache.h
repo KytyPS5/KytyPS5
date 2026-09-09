@@ -6,6 +6,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
@@ -87,10 +88,26 @@ private:
 		// registered beside HTile and DCC without introducing parallel tracking paths.
 		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
 
+		// Slices still awaiting materialization, as absolute slice indices in half-open ranges.
+		// A range set rather than a bitmask: the guest encodes 13-bit slice indices, so volumetric
+		// render targets legitimately exceed any fixed-width mask, and consumption is naturally
+		// expressed as "remove the contiguous runs that were just cleared".
 		Type     type       = Type::PendingDcc;
-		uint32_t clear_mask = 0;
+		RangeSet pending_clear;
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
+
+		void ArmSlices(uint64_t capacity) {
+			pending_clear.Clear();
+			if (capacity != 0) {
+				pending_clear.Add(0, capacity);
+			}
+		}
+		void DisarmSlices() { pending_clear.Clear(); }
+		[[nodiscard]] bool AnyPending() const { return !pending_clear.Empty(); }
+		[[nodiscard]] bool IsPending(uint32_t slice) const {
+			return pending_clear.Contains(slice, 1);
+		}
 	};
 
 	struct OverlapResult {

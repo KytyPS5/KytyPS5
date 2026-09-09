@@ -372,10 +372,25 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
-    metadata.clear_mask = 0;
+    metadata.DisarmSlices();
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
+
+  // Stands in for "the guest rendered into these slices since the clear was
+  // materialised", so a later bind must not clear them again.
+  static void PaintSlices(TextureCache &cache, CommandBuffer &command, ImageId id,
+                          uint32_t base_slice, uint32_t slice_count,
+                          const std::array<float, 4> &color) {
+    std::lock_guard lock(cache.m_lock);
+    auto &image = cache.m_slot_images[id];
+    vk::ClearValue clear{};
+    clear.color.float32 = color;
+    cache.ClearImage(command, id,
+                     {vk::ImageAspectFlagBits::eColor, 0,
+                      image.info.resources.levels, base_slice, slice_count},
+                     clear);
+  }
 };
 
 struct RenderExecutorTestAccess {
@@ -8313,6 +8328,247 @@ public:
     auto result = ReadBuffer(name, probe, bytes / 4);
     DestroyBuffer(&probe);
     return result;
+  }
+
+  // Drives one DCC-backed volume colour target through the production bind path
+  // (ResolveRenderColorTarget -> FindRenderTarget -> PrepareDccClear -> ClearImage)
+  // and hands the live context to the case body.
+  template <typename Body>
+  void RunDccVolumeCase(const char *name, uintptr_t base, uint32_t width_minus1,
+                        uint32_t height_minus1, uint32_t depth_minus1,
+                        Body &&body) {
+    constexpr uint64_t color_size = 0x1000000;
+    constexpr uint64_t metadata_size = 0x100000;
+    constexpr uint64_t allocation_size = color_size + metadata_size;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    const uint64_t dcc_address = base + color_size;
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "DCC slice-range direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "DCC slice-range direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.dcc_compression_enable = true,
+              .format = Prospero::ChannelLayout::k16_16_16_16,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = height_minus1, .width = width_minus1});
+      registers.SetColorAttrib3(0,
+                                {.depth = depth_minus1,
+                                 .tile_mode = Prospero::TileMode::kRenderTarget,
+                                 .dimension = 2,
+                                 .metadata_pipe_aligned = true});
+      registers.SetColorDccAddr(0, {.addr = dcc_address});
+      registers.SetColorClearWord0(0, {.word0 = 0});
+      registers.SetColorClearWord1(0, {.word1 = 0});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      resources.MapMemory(base, allocation_size);
+      body(context, registers, dcc_address, metadata_size);
+      RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "DCC slice-range direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "DCC slice-range direct-memory allocation release failed");
+  }
+
+  // Deferred DCC colour clears must cover every slice the guest can address. Kena's volumetric
+  // light-injection target is a 140x79x64 RGBA16F volume; its per-frame DCC fast clear was dropped
+  // whenever the slice range did not fit a 32-bit mask, so stale radiance survived into the next
+  // frame's additive light injection.
+  void CheckDccClearSliceRanges() {
+    constexpr const char *name = "DccClearSliceRanges";
+    // (0,0,0,1), decoded from DCC clear code 0x40 on an RGBA16F kStandard target.
+    const std::vector<u32> cleared{0x00000000u, 0x3c000000u};
+    // Distinctive non-zero contents so zero-initialised memory cannot pass for a clear.
+    constexpr std::array<float, 4> paint{0.5f, 0.25f, 0.75f, 0.125f};
+    const std::vector<u32> painted{0x34003800u, 0x30003a00u};
+    constexpr std::array<float, 4> repaint{0.25f, 0.5f, 0.125f, 0.75f};
+    const std::vector<u32> repainted{0x38003400u, 0x3a003000u};
+    EnsureRuntimeContext();
+
+    const auto arm_and_bind = [&](RenderContext &context, HW::Context &registers,
+                                  uint64_t dcc_address, uint32_t first,
+                                  uint32_t last) {
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetGpuResources().GetTextureCache();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetColorView(
+          0, {.base_array_slice_index = first, .last_array_slice_index = last});
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, context.GetCommandScheduler().Current(), color, 0);
+      Require(name, "resolved slices",
+              color.image_id &&
+                  color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  color.desc.info.metadata.range.address == dcc_address &&
+                  color.desc.view_info.base_layer == first &&
+                  color.desc.view_info.layer_count == last - first + 1,
+              "the volume colour target did not resolve the requested slice range");
+      // The DCC allocation sits immediately after the colour image, so metadata must not overlap
+      // image storage if a tiling or layout change ever grows the resolved size.
+      Require(name, "colour storage fits its reservation",
+              color.desc.info.data.size <= dcc_address - color.desc.info.data.address,
+              "the resolved colour image is larger than the space reserved before its metadata");
+      const auto attachment =
+          texture_cache.FindRenderTarget(color.image_id, color.desc);
+      Require(name, "bind slices", attachment != nullptr,
+              "the volume colour target did not produce an attachment view");
+      return color.image_id;
+    };
+
+    // T1 - the Kena shape: a full 64-slice view must clear every slice, including above 31.
+    RunDccVolumeCase(name, 0x0000000210000000ull, 139, 78, 63,
+                     [&](RenderContext &context, HW::Context &registers,
+                         uint64_t dcc_address, uint64_t fill_size) {
+      auto &texture_cache = context.GetGpuResources().GetTextureCache();
+      const auto id = arm_and_bind(context, registers, dcc_address, 0, 63);
+      TextureCacheTestAccess::PaintSlices(
+          texture_cache, context.GetCommandScheduler().Current(), id, 0, 64, paint);
+      texture_cache.TrackDccFill(dcc_address, fill_size, 0x40404040u);
+      Require(name, "T1 armed",
+              texture_cache.IsMetaCleared(dcc_address, 0) &&
+                  texture_cache.IsMetaCleared(dcc_address, 31) &&
+                  texture_cache.IsMetaCleared(dcc_address, 32) &&
+                  texture_cache.IsMetaCleared(dcc_address, 63),
+              "a full DCC fill did not arm every slice of a 64-slice target");
+      arm_and_bind(context, registers, dcc_address, 0, 63);
+      Require(name, "T1 consumed",
+              !texture_cache.IsMetaCleared(dcc_address, 0) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 31) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 32) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 63),
+              "materialising a 64-slice view left pending clear state behind");
+      Require(name, "T1 texels",
+              ReadCachedTexel(name, context, id, {0, 0, 0}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 31}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 32}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 63}) == cleared,
+              "a 64-slice DCC clear did not reach every slice");
+    });
+
+    // T2 - a view entirely above slice 31 must clear exactly itself.
+    RunDccVolumeCase(name, 0x0000000212000000ull, 139, 78, 63,
+                     [&](RenderContext &context, HW::Context &registers,
+                         uint64_t dcc_address, uint64_t fill_size) {
+      auto &texture_cache = context.GetGpuResources().GetTextureCache();
+      const auto id = arm_and_bind(context, registers, dcc_address, 0, 63);
+      TextureCacheTestAccess::PaintSlices(
+          texture_cache, context.GetCommandScheduler().Current(), id, 0, 64, paint);
+      texture_cache.TrackDccFill(dcc_address, fill_size, 0x40404040u);
+      Require(name, "T2 armed", texture_cache.IsMetaCleared(dcc_address, 40),
+              "a full DCC fill did not arm a slice above 31");
+      arm_and_bind(context, registers, dcc_address, 40, 55);
+      Require(name, "T2 consumed range only",
+              !texture_cache.IsMetaCleared(dcc_address, 40) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 55) &&
+                  texture_cache.IsMetaCleared(dcc_address, 39) &&
+                  texture_cache.IsMetaCleared(dcc_address, 56) &&
+                  texture_cache.IsMetaCleared(dcc_address, 0) &&
+                  texture_cache.IsMetaCleared(dcc_address, 63),
+              "a base_layer>=32 view consumed the wrong pending slices");
+      Require(name, "T2 texels",
+              ReadCachedTexel(name, context, id, {0, 0, 40}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 55}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 39}) == painted &&
+                  ReadCachedTexel(name, context, id, {0, 0, 56}) == painted,
+              "a base_layer>=32 view cleared slices outside itself");
+    });
+
+    // T3 - slices already materialised may have been rendered into, so a wider view that crosses
+    // slice 32 must clear only the part still pending.
+    RunDccVolumeCase(name, 0x0000000214000000ull, 139, 78, 63,
+                     [&](RenderContext &context, HW::Context &registers,
+                         uint64_t dcc_address, uint64_t fill_size) {
+      auto &texture_cache = context.GetGpuResources().GetTextureCache();
+      const auto id = arm_and_bind(context, registers, dcc_address, 0, 63);
+      TextureCacheTestAccess::PaintSlices(
+          texture_cache, context.GetCommandScheduler().Current(), id, 0, 64, paint);
+      texture_cache.TrackDccFill(dcc_address, fill_size, 0x40404040u);
+      arm_and_bind(context, registers, dcc_address, 20, 25);
+      Require(name, "T3 first range consumed",
+              !texture_cache.IsMetaCleared(dcc_address, 20) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 25) &&
+                  texture_cache.IsMetaCleared(dcc_address, 26),
+              "the first partial materialisation consumed the wrong slices");
+      // Stand in for the guest rendering into the slices it just had cleared.
+      TextureCacheTestAccess::PaintSlices(
+          texture_cache, context.GetCommandScheduler().Current(), id, 20, 6, repaint);
+      arm_and_bind(context, registers, dcc_address, 20, 45);
+      Require(name, "T3 widened range consumed",
+              !texture_cache.IsMetaCleared(dcc_address, 26) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 45) &&
+                  texture_cache.IsMetaCleared(dcc_address, 46),
+              "widening the view did not consume the remaining pending slices");
+      Require(name, "T3 texels",
+              ReadCachedTexel(name, context, id, {0, 0, 20}) == repainted &&
+                  ReadCachedTexel(name, context, id, {0, 0, 25}) == repainted &&
+                  ReadCachedTexel(name, context, id, {0, 0, 26}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 45}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 19}) == painted &&
+                  ReadCachedTexel(name, context, id, {0, 0, 46}) == painted,
+              "an overlapping view re-cleared slices that had been rendered into");
+    });
+
+    // T4 - more than 64 slices, so a wider fixed-width mask is not a general fix either.
+    RunDccVolumeCase(name, 0x0000000216000000ull, 7, 7, 127,
+                     [&](RenderContext &context, HW::Context &registers,
+                         uint64_t dcc_address, uint64_t fill_size) {
+      auto &texture_cache = context.GetGpuResources().GetTextureCache();
+      const auto id = arm_and_bind(context, registers, dcc_address, 0, 127);
+      TextureCacheTestAccess::PaintSlices(
+          texture_cache, context.GetCommandScheduler().Current(), id, 0, 128, paint);
+      texture_cache.TrackDccFill(dcc_address, fill_size, 0x40404040u);
+      Require(name, "T4 armed",
+              texture_cache.IsMetaCleared(dcc_address, 64) &&
+                  texture_cache.IsMetaCleared(dcc_address, 127),
+              "a full DCC fill did not arm slices above 63");
+      arm_and_bind(context, registers, dcc_address, 20, 100);
+      Require(name, "T4 consumed range only",
+              !texture_cache.IsMetaCleared(dcc_address, 20) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 64) &&
+                  !texture_cache.IsMetaCleared(dcc_address, 100) &&
+                  texture_cache.IsMetaCleared(dcc_address, 19) &&
+                  texture_cache.IsMetaCleared(dcc_address, 101),
+              "a view spanning more than 64 slices consumed the wrong range");
+      Require(name, "T4 texels",
+              ReadCachedTexel(name, context, id, {0, 0, 20}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 63}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 64}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 100}) == cleared &&
+                  ReadCachedTexel(name, context, id, {0, 0, 19}) == painted &&
+                  ReadCachedTexel(name, context, id, {0, 0, 101}) == painted,
+              "a view spanning more than 64 slices was not fully cleared");
+    });
+
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckRenderExecutorDccFixedClearFloat() {
@@ -29079,10 +29335,16 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dcc-slice-range-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDccClearSliceRanges();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckDccClearSliceRanges();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckSampledDccClear();

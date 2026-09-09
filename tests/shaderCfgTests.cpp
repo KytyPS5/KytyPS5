@@ -4943,6 +4943,77 @@ void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d3d00f9u,
+      0x86050021u, // v_cmpx_ge_i16 exec, v33.word1, 0 (SDWA)
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(shader, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_GE_I16 &&
+            decoded.opcode_id == 0x9eu && decoded.word_count == 2u &&
+            decoded.raw_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src0.reg == 33u && decoded.src0.sdwa_sel == 5u &&
+            decoded.src1.kind == Decoder::OperandKind::IntegerInlineConstant &&
+            decoded.src1.value == 0u && decoded.src1.sdwa_sel == 6u,
+        "decoder rejected captured SDWA V_CMPX_GE_I16 fields");
+
+  constexpr Decoder::Opcode signed_cmpx_opcodes[] = {
+      Decoder::Opcode::V_CMPX_LT_I16, Decoder::Opcode::V_CMPX_EQ_I16,
+      Decoder::Opcode::V_CMPX_LE_I16, Decoder::Opcode::V_CMPX_GT_I16,
+      Decoder::Opcode::V_CMPX_NE_I16, Decoder::Opcode::V_CMPX_GE_I16,
+  };
+  for (uint32_t index = 0u; index < std::size(signed_cmpx_opcodes); index++) {
+    const uint32_t neighbor[] = {EncodeVopc(0x99u + index, 0u, 1u),
+                                 EncodeSopp(0x01)};
+    Decoder::Instruction neighbor_decoded;
+    Decoder::DecodeInstruction(neighbor, 0u, neighbor_decoded);
+    Check(neighbor_decoded.opcode == signed_cmpx_opcodes[index] &&
+              neighbor_decoded.dst.kind == Decoder::OperandKind::ExecLo,
+          "signed halfword CMPX opcode family did not decode to an EXEC compare");
+  }
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.compute = &compute;
+  Decoder::DecodeProgram(shader, program);
+  graph = CFG::BuildGraph(program);
+  ir = Frontend::TranslateProgram(program, graph, translate_options);
+  uint32_t signed_ge_compares = 0u;
+  uint32_t dynamic_exec_writes = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      signed_ge_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::SGreaterThanEqual32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        dynamic_exec_writes++;
+      }
+    }
+  }
+  Check(signed_ge_compares >= 1u && dynamic_exec_writes == 1u,
+        "captured SDWA V_CMPX_GE_I16 did not lower to signed halfword compare plus EXEC update");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "V_CMPX_GE_I16 exec_lo"),
+        "captured SDWA V_CMPX_GE_I16 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   using namespace ShaderRecompiler;
 
@@ -15674,6 +15745,13 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--vopc-sdwa-cmpx-ge-i16-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16();
+    std::puts("KYTY_VOPC_SDWA_CMPX_GE_I16_PASS");
+    return 0;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--mubuf-store-format-d16-only") == 0) {
     EnsureConfigInitialized();
     TestNewShaderRecompilerMubufFormatTranslation();
@@ -15730,6 +15808,7 @@ int main(int argc, char* argv[]) {
   // here.
   TestNewShaderDecoderArchitecture();
   TestNewShaderRecompilerCapturedVopcCmpxNeU16();
+  TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();

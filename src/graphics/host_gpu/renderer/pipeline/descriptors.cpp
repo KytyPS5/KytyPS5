@@ -135,11 +135,11 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 // and 32-bit formats. The proof covers every use of the resource; one formatted
 // use must not authorize a neighboring raw/typed access.
 static bool SupportsFormattedStorageOffset(
-    const ShaderBufferResource& descriptor,
+    const ShaderBufferResource&,
     const ShaderRecompiler::IR::BufferResource& resource) {
 	if (!resource.descriptor_formatted_only || !resource.formatted || resource.scalar ||
 	    resource.atomic) return false;
-	return ShaderRecompiler::Format::IsKnownFormat(descriptor.Format());
+	return true;
 }
 
 static bool SupportsScalarStorageOffset(const ShaderRecompiler::IR::BufferResource& resource) {

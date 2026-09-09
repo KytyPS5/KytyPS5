@@ -9782,7 +9782,8 @@ void CheckSampledHtileArrayClearDiscovery() {
   // binding mutation, without dispatching potentially conflicting resources.
   void CheckStorageBufferByteOffsetBinding(bool unsupported_halfword = false,
                                            const char* mixed_mode = nullptr,
-                                           bool formatted_dword = false) {
+                                           bool formatted_dword = false,
+                                           bool formatted_unknown = false) {
     const bool boundary = unsupported_halfword || mixed_mode != nullptr;
     const char* boundary_mode = unsupported_halfword ? "unaligned-halfword" : mixed_mode;
     const bool partial_tail = mixed_mode != nullptr &&
@@ -9794,11 +9795,13 @@ void CheckSampledHtileArrayClearDiscovery() {
     constexpr uint64_t allocation_size = 0x10000u;
     constexpr uint64_t allocation_alignment = 0x10000u;
     const std::array<uint32_t, 4> offsets{
-        formatted_dword ? 1u : unsupported_halfword ? 15u : 13u, 12u, 8u, 3u};
+        formatted_unknown ? 7u : formatted_dword ? 1u : unsupported_halfword ? 15u : 13u,
+        12u, 8u, 3u};
     // New byte-offset admission ends on a complete native DWORD. Preserve the
     // original size4/range17 case separately: its last guest byte is not
     // representable by the current runtime uint-array length contract.
-    const std::array<uint32_t, 4> sizes{boundary ? 4u : 3u, 4u, 24u, 4u};
+    const std::array<uint32_t, 4> sizes{
+        boundary || formatted_unknown ? 4u : 3u, 4u, 24u, 4u};
     EnsureRuntimeContext();
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
@@ -9849,12 +9852,13 @@ void CheckSampledHtileArrayClearDiscovery() {
         // ResourceTracking regression derives the same fact from actual mixed IR.
         info.descriptor_formatted_only = index == 0u && !mixed_access;
         info.atomic = index == 2u;
-        info.max_byte_extent = index == 0u ? (mixed_access || formatted_dword
+        info.max_byte_extent = index == 0u ? (mixed_access || formatted_dword || formatted_unknown
                                                   ? 4u
                                                   : unsupported_halfword ? 2u : 1u)
                                            : index == 1u ? 4u : index == 2u ? 8u : 4u;
         info.descriptor_format = index == 0u
-            ? (formatted_dword ? Prospero::BufferFormat::k32UInt
+            ? (formatted_unknown ? Prospero::BufferFormat::kInvalid
+               : formatted_dword ? Prospero::BufferFormat::k32UInt
                                : unsupported_halfword ? Prospero::BufferFormat::k16UInt
                                                       : Prospero::BufferFormat::k8UInt)
             : Prospero::BufferFormat::kInvalid;
@@ -35062,6 +35066,12 @@ int main(int argc, char **argv) {
       std::strcmp(argv[1], "--storage-buffer-byte-offset-dword-binding-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStorageBufferByteOffsetBinding(false, nullptr, true);
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--storage-buffer-byte-offset-unknown-binding-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageBufferByteOffsetBinding(false, nullptr, false, true);
     return 0;
   }
 #endif

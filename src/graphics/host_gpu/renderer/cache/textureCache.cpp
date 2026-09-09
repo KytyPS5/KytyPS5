@@ -1156,32 +1156,28 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 		const auto mapped_size = LibKernel::Memory::TryClampRangeSize(
 		    image.info.data.address, image.info.data.size);
 		if (mapped_size < image.info.data.size) {
-			std::fprintf(stderr,
-			             "TextureUploadLayout binding=%s addr=0x%016" PRIx64
-			             " size=0x%016" PRIx64 " mapped=0x%016" PRIx64
-			             " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u"
-			             " type=%u tile=%u format=%u guest=%u bpb=%u view=%u+%u/%u+%u\n",
-			             BindingTypeName(desc.type), image.info.data.address, image.info.data.size,
-			             mapped_size, image.info.extent.width, image.info.extent.height,
-			             image.info.extent.depth, image.info.pitch, image.info.resources.levels,
-			             image.info.resources.layers, image.info.samples,
-			             static_cast<uint32_t>(image.info.type),
-			             static_cast<uint32_t>(image.info.tile_mode),
-			             static_cast<uint32_t>(image.info.pixel_format),
-			             static_cast<uint32_t>(image.info.guest_format),
-			             image.info.bytes_per_block, desc.view_info.base_level,
-			             desc.view_info.level_count, desc.view_info.base_layer,
-			             desc.view_info.layer_count);
+			LOGF("TextureUploadLayout binding=%s addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " mapped=0x%016" PRIx64
+			     " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u"
+			     " type=%u tile=%u format=%u guest=%u bpb=%u view=%u+%u/%u+%u\n",
+			     BindingTypeName(desc.type), image.info.data.address, image.info.data.size,
+			     mapped_size, image.info.extent.width, image.info.extent.height,
+			     image.info.extent.depth, image.info.pitch, image.info.resources.levels,
+			     image.info.resources.layers, image.info.samples,
+			     static_cast<uint32_t>(image.info.type),
+			     static_cast<uint32_t>(image.info.tile_mode),
+			     static_cast<uint32_t>(image.info.pixel_format),
+			     static_cast<uint32_t>(image.info.guest_format), image.info.bytes_per_block,
+			     desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+			     desc.view_info.layer_count);
 			for (uint32_t level = 0;
 			     level < image.info.resources.levels && level < image.info.mip_layout.size();
 			     ++level) {
 				const auto& mip = image.info.mip_layout[level];
-				std::fprintf(stderr,
-				             "TextureUploadMip level=%u offset=0x%016" PRIx64
-				             " size=0x%016" PRIx64 " pitch=%u height=%u\n",
-				             level, mip.offset, mip.size, mip.pitch, mip.height);
+				LOGF("TextureUploadMip level=%u offset=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " pitch=%u height=%u\n",
+				     level, mip.offset, mip.size, mip.pitch, mip.height);
 			}
-			std::fflush(stderr);
 		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);

@@ -1233,7 +1233,19 @@ private:
 			}
 			bad_dword = 0;
 		}
-		if (!ValidateSource(descriptor, bad_dword, reason)) {
+		while (!ValidateSource(descriptor, bad_dword, reason)) {
+			// Soft ladder (PPSA21564): a sampler S# anisotropy / LOD-clamp / border dword (2-3)
+			// the shader left holding non-descriptor scratch (a loop-counter phi,
+			// min(iter, 0x3c), ...) that CanonicalizeSamplerScratchDwords did not catch. Those
+			// fields are don't-care for the fetch, so zero them and carry on. Dwords 0-1 and
+			// every image / buffer / address dword stay strict -- a real unresolved descriptor
+			// still aborts loudly.
+			if (expected == ValueOpcode::GetSamplerResource && bad_dword >= 2 &&
+			    bad_dword < descriptor.dword_count && !descriptor.dwords[bad_dword].IsImmediate()) {
+				descriptor.dwords[bad_dword] = Value(0u);
+				handle->SetArg(bad_dword, Value(0u));
+				continue;
+			}
 			const auto indirect = m_indirect_reasons.find(handle);
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value: {}{}",
 			                     ValueOpcodeName(expected), bad_dword, reason,

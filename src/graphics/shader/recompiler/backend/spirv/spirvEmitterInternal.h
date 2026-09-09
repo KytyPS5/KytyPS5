@@ -486,6 +486,8 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
+	// IndexedVectorLoad (v_movrels_b32): inst -> {Function-array OpVariable id, element count}.
+	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> indexed_vector_arrays;
 	uint32_t                                                           scratch_u32_variable = 0;
 	ValueEmitContext*                                                  other_half = nullptr;
 	uint32_t                                                           half       = 0;

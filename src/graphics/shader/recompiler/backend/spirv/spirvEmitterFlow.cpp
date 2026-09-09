@@ -544,6 +544,42 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	switch (inst.GetOpcode()) {
 		case IR::ValueOpcode::Identity: ctx.Define(inst, ctx.Arg(inst, 0)); return true;
+		case IR::ValueOpcode::IndexedVectorLoad: {
+			// v_movrels_b32: pick element inst.Arg(0) from inst.Arg(1..N). Build the candidate
+			// list as one array value, store it into a Function-local variable, then index it
+			// dynamically -- an N-deep select ladder is what blows the composite/tonemap pixel
+			// shaders past the module size limit.
+			const auto found = ctx.indexed_vector_arrays.find(&inst);
+			if (found == ctx.indexed_vector_arrays.end() || inst.NumArgs() < 2) {
+				ctx.Fail(inst, "IndexedVectorLoad has no array variable");
+			}
+			const auto var   = found->second.first;
+			const auto count = found->second.second;
+			const auto array_type =
+			    state.builder.Type(OpTypeArray, {TypeU32(state), ConstantU32(state, count)});
+			std::vector<uint32_t> compose {OpCompositeConstruct, array_type,
+			                               state.builder.AllocateId()};
+			for (uint32_t i = 0; i < count; i++) {
+				compose.push_back(ctx.Arg(inst, i + 1u));
+			}
+			state.builder.AddFunction(compose);
+			state.builder.AddFunction({OpStore, var, compose[2]});
+			// Match the old select-ladder: an index past the enumerated range falls back to
+			// element 0 (never an out-of-bounds Function-array access, which is UB / a GPU
+			// fault).
+			const auto raw_index = ctx.Arg(inst, 0);
+			const auto in_range  = state.builder.AllocateId();
+			state.builder.AddFunction({OpULessThan, TypeBool(state), in_range, raw_index,
+			                           ConstantU32(state, count)});
+			const auto index = state.builder.AllocateId();
+			state.builder.AddFunction({OpSelect, TypeU32(state), index, in_range, raw_index,
+			                           ConstantU32(state, 0)});
+			const auto elem_ptr = TypePointer(state, StorageClassFunction, TypeU32(state));
+			const auto ptr      = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, elem_ptr, ptr, var, index});
+			state.builder.AddFunction({OpLoad, TypeU32(state), ctx.Result(inst), ptr});
+			return true;
+		}
 		case IR::ValueOpcode::Void:
 		case IR::ValueOpcode::Reference:
 		case IR::ValueOpcode::ReferenceU32:

@@ -626,6 +626,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
 	    .scratch_dwords      = options.scratch_dwords,
 	    .dispatcher_fallback = dispatcher_fallback,
+	    .lower_wide_movrels  = options.lower_wide_movrels,
 	    .cfg_failure_kind    = cfg.failure_kind,
 	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
 	                                                    : dispatcher_reason,

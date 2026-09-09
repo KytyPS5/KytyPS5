@@ -567,6 +567,8 @@ struct Program: ResourcePlan {
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+	// Mirrors CompileOptions::lower_wide_movrels (PPSA21564-gated v_movrels lowering).
+	bool                          lower_wide_movrels = false;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };

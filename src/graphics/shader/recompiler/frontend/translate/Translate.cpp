@@ -944,6 +944,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.user_data_count     = options.user_data_count;
 	result.scratch_dwords      = options.scratch_dwords;
 	result.dispatcher_fallback = options.dispatcher_fallback;
+	result.lower_wide_movrels  = options.lower_wide_movrels;
 	result.cfg_failure_kind    = options.cfg_failure_kind;
 	result.fallback_reason     = options.fallback_reason;
 	if (options.embedded_fetch != nullptr) {

@@ -19,6 +19,10 @@ VALUE_OPCODE(GetScalarRegister, U32, ScalarReg)
 VALUE_OPCODE(SetScalarRegister, Void, ScalarReg, U32)
 VALUE_OPCODE(GetVectorRegister, U32, VectorReg)
 VALUE_OPCODE(SetVectorRegister, Void, VectorReg, U32)
+// Variadic: arg[0] = element index, arg[1..N] = the candidate U32 values (a v_movrels_b32
+// indexed register read). The backend lowers it to a Function-local array + dynamic
+// OpAccessChain instead of an N-deep select ladder.
+VALUE_OPCODE(IndexedVectorLoad, U32)
 VALUE_OPCODE(GetGotoVariable, U1, U32)
 VALUE_OPCODE(SetGotoVariable, Void, U32, U1)
 VALUE_OPCODE(GetScc, U1)

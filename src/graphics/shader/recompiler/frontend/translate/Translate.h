@@ -31,6 +31,7 @@ struct TranslateOptions {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	bool                          dispatcher_fallback = false;
+	bool                          lower_wide_movrels  = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string_view              fallback_reason;
 	const ShaderVertexInputInfo*  vertex         = nullptr;

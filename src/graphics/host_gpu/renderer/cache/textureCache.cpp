@@ -1165,21 +1165,21 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	const auto  first          = volume_texture ? 0u : view.base_layer;
 	const auto  count = volume_texture ? std::max(image.info.extent.depth >> view.base_level, 1u)
 	                                   : view.layer_count;
-	if (first >= 32 || count > 32 - first) {
+	if (first >= 64 || count > 64 - first) {
 		return;
 	}
 	// The metadata fill covers the complete allocation. Consume each layer only after its
 	// native image contents exist; already materialized layers may have been rendered since.
 	for (uint32_t layer = first; layer < first + count;) {
-		if ((metadata.clear_mask & (1u << layer)) == 0) {
+		if ((metadata.clear_mask & (UINT64_C(1) << layer)) == 0) {
 			layer++;
 			continue;
 		}
 		const auto start = layer;
-		uint32_t   mask  = 0;
+		uint64_t   mask  = 0;
 		do {
-			mask |= 1u << layer++;
-		} while (layer < first + count && (metadata.clear_mask & (1u << layer)) != 0);
+			mask |= UINT64_C(1) << layer++;
+		} while (layer < first + count && (metadata.clear_mask & (UINT64_C(1) << layer)) != 0);
 		ClearImage(m_scheduler.Current(), id,
 		           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count, start,
 		            layer - start},
@@ -1885,13 +1885,13 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    slice >= 32) {
+	    slice >= 64) {
 		return false;
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return (found->second.clear_mask & (UINT64_C(1) << slice)) != 0;
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -1903,7 +1903,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		// validated fill value, so an arbitrary compute write must not clear it.
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask = UINT64_MAX;
 	return true;
 }
 
@@ -1913,7 +1913,7 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 	}
 	// DCC fills use a repeated byte code. Require all four bytes of the detected dword to agree,
 	// and mark only recognized deferred-clear encodings as logically clear.
-	const auto dcc_clear_mask = [fill_value] {
+	const auto dcc_clear_mask = [fill_value]() -> uint64_t {
 		const auto code = static_cast<uint8_t>(fill_value);
 		if (fill_value != static_cast<uint32_t>(code) * 0x01010101u) {
 			return 0u;
@@ -1923,7 +1923,7 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 			case 0x20:
 			case 0x40:
 			case 0x80:
-			case 0xc0: return UINT32_MAX;
+			case 0xc0: return UINT64_MAX;
 			default: return 0u;
 		}
 	}();
@@ -1943,13 +1943,13 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    slice >= 32) {
+	    slice >= 64) {
 		return false;
 	}
 	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
+		found->second.clear_mask |= UINT64_C(1) << slice;
 	} else {
-		found->second.clear_mask &= ~(1u << slice);
+		found->second.clear_mask &= ~(UINT64_C(1) << slice);
 	}
 	return true;
 }

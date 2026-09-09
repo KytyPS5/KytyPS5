@@ -88,7 +88,7 @@ private:
 		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
 
 		Type     type       = Type::PendingDcc;
-		uint32_t clear_mask = 0;
+		uint64_t clear_mask = 0;
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
 	};

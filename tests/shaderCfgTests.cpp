@@ -9776,6 +9776,70 @@ void TestCooperativeWave64LegacyBarrierInsertionScope() {
   }
 }
 
+void TestCooperativeWave64ConsecutiveLdsReadsSharePhase() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  const auto compile = [](uint32_t read_count, bool intervening_write = false) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64u;
+    auto* block = AddExecutionPlanBlock(program);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+    program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+    auto& lane = block->AppendNewInst(O::LaneId);
+    auto& write = block->AppendNewInst(
+        O::WriteSharedU32,
+        {IR::Value(0u), IR::Value(&lane), IR::Value(true)});
+    write.SetFlags(IR::MemoryFlags{.index = 0u});
+    block->AppendNewInst(O::Barrier);
+    for (uint32_t index = 0; index < read_count; ++index) {
+      if (intervening_write && index == 1u) {
+        auto& boundary_write = block->AppendNewInst(
+            O::WriteSharedU32,
+            {IR::Value(4u), IR::Value(&lane), IR::Value(true)});
+        boundary_write.SetFlags(IR::MemoryFlags{.index = 0u});
+      }
+      auto& read = block->AppendNewInst(
+          O::LoadSharedU32, {IR::Value(index * 4u), IR::Value(true)});
+      read.SetFlags(IR::MemoryFlags{.index = 0u});
+      block->AppendNewInst(O::ReferenceU32, {IR::Value(&read)});
+    }
+    IR::ValidateProgram(program, true);
+    IR::BuildSrtPlan(program);
+    IR::TrackResources(program);
+
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 128u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.wave_size = 64u;
+    compute.lds_size_dwords = read_count;
+    compute.needs_lds_barriers = true;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 64u;
+    options.input_info.compute = &compute;
+    options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+    const auto plan = PlanComputeExecution(
+        program, options.input_info, options.compute_workgroup_limits);
+    Check(plan.error.empty() && plan.IsCooperativeWave64(),
+          "consecutive LDS read fixture did not enter cooperative scheduling");
+    TranslateResult translated;
+    translated.program = std::move(program);
+    auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    return compiled.spirv;
+  };
+
+  const auto one_read = compile(1u);
+  const auto two_reads = compile(2u);
+  Check(SpirvInstructionOpcodeCount(two_reads, 224u) ==
+            SpirvInstructionOpcodeCount(one_read, 224u),
+        "consecutive read-only LDS accesses created an unnecessary cooperative rendezvous");
+  const auto read_write_read = compile(2u, true);
+  Check(SpirvInstructionOpcodeCount(read_write_read, 224u) ==
+            SpirvInstructionOpcodeCount(two_reads, 224u) + 2u,
+        "cooperative LDS read/write hazards lost their phase boundaries");
+}
+
 // TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
 // include the certificate header plus ShaderHostProfile.h. Register the five
 // TestF64Certificate* functions below. No compilation, Vulkan or game data.
@@ -15661,6 +15725,11 @@ int main(int argc, char* argv[]) {
     Libs::Graphics::TestCooperativeWave64LegacyBarrierInsertionScope();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-lds-read-phases-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
+    std::puts("KYTY_COOPERATIVE_LDS_READ_PHASES_PASS");
+    return 0;
+  }
   if ((argc == 2 || argc == 3) &&
       std::strcmp(argv[1], "--single-wave64-ballot-spirv-only") == 0) {
     Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
@@ -15904,6 +15973,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64OperationBoundaries();
   TestCooperativeWave64ScalarReadBranchUniformity();
   TestCooperativeWave64LegacyBarrierInsertionScope();
+  TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
   TestCooperativeWave64BufferCycleVisibility();
   TestCooperativeWave64AutomaticBufferCyclePromotion();
   TestComputeExecutionSingleWaveLds();

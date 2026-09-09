@@ -285,22 +285,25 @@ struct PipelineCache::ProgramCache {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-		// Soft ladder (PPSA21564): a handful of Astro Bot GI kernels fail CFG
-		// structurization, run through the linear dispatcher, AND assemble bindless
-		// descriptors from loop-carried SRT pointers that get degraded to zero. So bound they
-		// fault the GPU (VK_ERROR_DEVICE_LOST at the first fully-lit title-screen frame). Hand
-		// back a null module so the caller skips the dispatch/draw -- a missing GI pass renders
-		// wrong, a device loss ends the title. Gated on dispatcher_fallback: Demon's Souls has
-		// large (600k-word) compute shaders too, but they emit structured SPIR-V and never take
-		// this path, so they are untouched. Real fix: bind-time dynamic-SRT (flat-SRT/BDA).
-		if (result.program.dispatcher_fallback &&
-		    (options.stage == ShaderType::Compute || options.stage == ShaderType::Pixel ||
-		     options.stage == ShaderType::Mesh) &&
+		// Soft ladder (PPSA21564 only). Astro Bot's title-screen GI / lighting compute kernels
+		// assemble bindless descriptors from loop-carried SRT pointers. The ~6 that cannot be
+		// materialised are already dropped upstream; a few more compile a valid but very large
+		// module that still faults the GPU at the first fully-lit frame (VK_ERROR_DEVICE_LOST,
+		// commandScheduler.cpp:388, submit ~6500). For this title only, hand back a null module
+		// for an oversized compute shader so the frame completes without their contribution.
+		// Gated hard on TITLE_ID: every other title is untouched -- Demon's Souls legitimately
+		// compiles 250k-650k-word structured compute shaders and must keep them. Real fix:
+		// bind-time dynamic-SRT resolution (flat-SRT / BDA bindless).
+		static const bool kDropOversizedCompute = [] {
+			std::string id;
+			return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
+		}();
+		if (kDropOversizedCompute && options.stage == ShaderType::Compute &&
 		    result.spirv.size() > 40000) {
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("PipelineCache: dropping oversized dispatcher %s shader hash=0x%016" PRIx64
-				     " words=%zu (degraded bindless SRT -> device loss)\n",
+				LOGF("PipelineCache: dropping oversized %s shader hash=0x%016" PRIx64
+				     " words=%zu (PPSA21564 degraded bindless SRT -> device loss)\n",
 				     stage_name, options.shader_hash, result.spirv.size());
 			}
 			return {

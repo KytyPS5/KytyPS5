@@ -378,7 +378,9 @@ std::vector<uint32_t> OptimizeShaderSpirv(
 	// wider bounded recipe.
 	if (cooperative_wave64) {
 		optimizer.RegisterPass(spvtools::CreateSimplificationPass())
-		    .RegisterPass(spvtools::CreateBlockMergePass());
+		    .RegisterPass(spvtools::CreateLocalRedundancyEliminationPass())
+		    .RegisterPass(spvtools::CreateBlockMergePass())
+		    .RegisterPass(spvtools::CreateCompactIdsPass());
 	} else {
 		optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
 		    .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())

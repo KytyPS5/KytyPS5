@@ -367,6 +367,12 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
 				planning_only = index < program.memory_info.size() && program.memory_info[index].planning_only;
 			}
+			const bool scalar_address_read = [&] {
+				if (op != O::LoadAddressU32) return false;
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				return index < program.memory_info.size() &&
+				       program.memory_info[index].kind == IR::ResourceKind::ScalarAddress;
+			}();
 			if (!planning_only) {
 				const auto image_access = IR::ImageOpcodeInfoOf(op).access;
 				const auto buffer_access = IR::BufferAccessOf(op);
@@ -379,16 +385,19 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				const bool unsupported_publication =
 				    (image_access == IR::ImageAccess::Write && can_reach_cycle(block)) ||
 				    image_access == IR::ImageAccess::Atomic || buffer_access == IR::BufferAccess::Atomic ||
-				    IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None;
-				// Physical pointers do not inherit the SSBO's Coherent decoration.
-				// Scalar reads are emitted through the cooperative wave broadcast and
-				// the scheduler's AcquireRelease UniformMemory rendezvous. Read-only
+				    (IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None &&
+				     !scalar_address_read);
+				// Vector physical pointers do not inherit the SSBO's Coherent decoration.
+				// Scalar-address reads follow SMEM scalar-cache semantics and are emitted
+				// through the cooperative wave broadcast. Scalar buffer reads use the same
+				// path and the scheduler's AcquireRelease UniformMemory rendezvous. Read-only
 				// image payloads also need no publication when every image write is
 				// terminal with respect to all scheduler cycles.
 				const bool read_only_image = image_access == IR::ImageAccess::Read &&
 				                             !image_write_reaches_cycle;
 				const bool unsupported_cyclic_read = cyclic.contains(block) && IsGuestRead(op) &&
 				    buffer_access != IR::BufferAccess::Read && op != O::ReadConstBuffer &&
+				    !scalar_address_read &&
 				    !read_only_image;
 				if (unsupported_publication ||
 				    (unsupported_cyclic_read && !unproved_cooperative_publication)) {

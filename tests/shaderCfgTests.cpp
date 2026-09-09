@@ -9840,6 +9840,58 @@ void TestCooperativeWave64ConsecutiveLdsReadsSharePhase() {
         "cooperative LDS read/write hazards lost their phase boundaries");
 }
 
+void TestCooperativeWave64CollectivesUseSharedFunctions() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64u;
+  auto* block = AddExecutionPlanBlock(program);
+  program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+  const auto emit = [&](O op, std::initializer_list<IR::Value> args = {}) {
+    return IR::Value(&block->AppendNewInst(op, args));
+  };
+  const auto lane = emit(O::LaneId);
+  auto& write = block->AppendNewInst(
+      O::WriteSharedU32, {IR::Value(0u), lane, IR::Value(true)});
+  write.SetFlags(IR::MemoryFlags{.index = 0u});
+  block->AppendNewInst(O::Barrier);
+  for (uint32_t index = 0; index < 3u; ++index) {
+    const auto predicate = emit(O::ULessThan32, {lane, IR::Value(32u + index)});
+    const auto ballot = emit(O::Ballot, {predicate});
+    emit(O::ReferenceU32,
+         {emit(O::CompositeExtractU32x4, {ballot, IR::Value(index & 1u)})});
+    emit(O::ReferenceU32, {emit(O::ReadLane, {lane, IR::Value(index)})});
+  }
+  IR::ValidateProgram(program, true);
+  IR::BuildSrtPlan(program);
+  IR::TrackResources(program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 128u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 64u;
+  compute.lds_size_dwords = 1u;
+  compute.needs_lds_barriers = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  const auto plan = PlanComputeExecution(
+      program, options.input_info, options.compute_workgroup_limits);
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        "collective helper fixture did not enter cooperative scheduling");
+  TranslateResult translated;
+  translated.program = std::move(program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 57u) == 6u,
+        "cooperative wave64 collectives were duplicated instead of calling shared functions");
+  Check(SpirvInstructionOpcodeCount(compiled.spirv, 360u) == 1u,
+        "cooperative wave64 ballot duplicated its subgroup reduction body");
+}
+
 // TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and
 // include the certificate header plus ShaderHostProfile.h. Register the five
 // TestF64Certificate* functions below. No compilation, Vulkan or game data.
@@ -15730,6 +15782,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_COOPERATIVE_LDS_READ_PHASES_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-collective-functions-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64CollectivesUseSharedFunctions();
+    std::puts("KYTY_COOPERATIVE_COLLECTIVE_FUNCTIONS_PASS");
+    return 0;
+  }
   if ((argc == 2 || argc == 3) &&
       std::strcmp(argv[1], "--single-wave64-ballot-spirv-only") == 0) {
     Libs::Graphics::TestSingleWaveLdsSpirvPhaseOrdering(
@@ -15974,6 +16031,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64ScalarReadBranchUniformity();
   TestCooperativeWave64LegacyBarrierInsertionScope();
   TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
+  TestCooperativeWave64CollectivesUseSharedFunctions();
   TestCooperativeWave64BufferCycleVisibility();
   TestCooperativeWave64AutomaticBufferCyclePromotion();
   TestComputeExecutionSingleWaveLds();

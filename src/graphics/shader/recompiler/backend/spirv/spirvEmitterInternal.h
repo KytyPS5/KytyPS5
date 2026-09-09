@@ -386,6 +386,8 @@ struct EmitterState {
 	uint32_t                                         wave_scratch_variable = 0;
 	uint32_t                                         wave_scratch_base_dwords = 0;
 	uint32_t                                         wave_ballot_base_dwords = 0;
+	uint32_t                                         wave_ballot_function    = 0;
+	uint32_t                                         wave_read_lane_function = 0;
 	uint32_t                                         host_local_invocation_index = 0;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
@@ -671,6 +673,7 @@ uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate);
 uint32_t NormalizeWaveLaneTarget(EmitterState& state, uint32_t target);
 uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target);
 uint32_t EmitWaveFindFirst(EmitterState& state, uint32_t ballot);
+void DefineCooperativeWaveFunctions(EmitterState& state);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 

@@ -977,7 +977,60 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 	// whole document, after which every key reads back absent and the engine's checked-build
 	// type asserts (Module/Network/Json.cpp:272 / :399) trap.
 	auto json = nlohmann::json::parse(src, src + size, nullptr, false, true);
+	if (json.is_discarded()) {
+		// Some of those assets also use trailing commas (`, }` / `, ]`), which nlohmann rejects
+		// even with comments allowed. Strip them and retry once before giving up -- the whole
+		// document being discarded is what makes every later key read back absent.
+		std::string cleaned(src, src + size);
+		bool        in_string = false;
+		bool        escaped   = false;
+		for (size_t i = 0; i < cleaned.size(); i++) {
+			const char c = cleaned[i];
+			if (in_string) {
+				escaped   = (c == '\\' && !escaped);
+				in_string = !(c == '"' && !escaped);
+				continue;
+			}
+			if (c == '"') {
+				in_string = true;
+				escaped   = false;
+				continue;
+			}
+			if (c == ',') {
+				size_t j = i + 1;
+				while (j < cleaned.size() &&
+				       (cleaned[j] == ' ' || cleaned[j] == '\t' || cleaned[j] == '\r' ||
+				        cleaned[j] == '\n')) {
+					j++;
+				}
+				if (j < cleaned.size() && (cleaned[j] == '}' || cleaned[j] == ']')) {
+					cleaned[i] = ' ';
+				}
+			}
+		}
+		json = nlohmann::json::parse(cleaned.data(), cleaned.data() + cleaned.size(), nullptr,
+		                             false, true);
+	}
+	if (json.is_discarded()) {
+		// The PS5 parser accepts a bare top-level scalar (an unquoted identifier such as
+		// `ui_title_03`); nlohmann does not. If the input has no JSON container/quote/keyword
+		// lead-in, treat the whole trimmed span as a string value rather than discarding the
+		// document (which would make every later key on it read back absent and trap the
+		// engine's checked-build type asserts).
+		size_t begin = 0;
+		size_t end   = size;
+		while (begin < end && static_cast<unsigned char>(src[begin]) <= ' ') begin++;
+		while (end > begin && static_cast<unsigned char>(src[end - 1]) <= ' ') end--;
+		const bool looks_structured =
+		    begin < end && (src[begin] == '{' || src[begin] == '[' || src[begin] == '"' ||
+		                    src[begin] == '-' || (src[begin] >= '0' && src[begin] <= '9') ||
+		                    src[begin] == 't' || src[begin] == 'f' || src[begin] == 'n');
+		if (begin < end && !looks_structured) {
+			json = nlohmann::json(std::string(src + begin, src + end));
+		}
+	}
 	if (json.is_discarded() || !JsonValueFromNlohmann(&parsed, json)) {
+		LOGF("JsonParserParse: document discarded (size=%zu, head: %.80s)\n", size, src);
 		JsonValueClear(&parsed);
 		return JSON_ERROR_PARSE_INVALID_CHAR;
 	}

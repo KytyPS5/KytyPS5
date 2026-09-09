@@ -623,6 +623,7 @@ struct CompiledShaderInfo {
 	// Retained after CFG disposal; only a compiler-verified wave split may set this.
 	uint32_t                      compute_wave_partition_factor = 1;
 	uint32_t                      param_export_mask   = 0;
+	bool                          bounded_srt_reads_precede_writes = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -656,6 +657,7 @@ struct ResourcePlan {
 	// expressions and are evaluated separately for each proved selector candidate.
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
+	bool                                bounded_srt_reads_precede_writes = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;

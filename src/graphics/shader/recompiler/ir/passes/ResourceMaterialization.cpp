@@ -1226,6 +1226,9 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime&
 	if (snapshot.immutable_srt_ranges.empty()) {
 		return true;
 	}
+	if (program.bounded_srt_reads_precede_writes) {
+		return true;
+	}
 	for (uint32_t resource = 0; resource < snapshot.buffers.size(); resource++) {
 		const auto& metadata = program.info.buffers[specialization.buffer_origins[resource]];
 		if ((!metadata.written && !metadata.atomic) || metadata.image_alias != BufferResource::NoImageAlias) {
@@ -1910,6 +1913,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
 	plan.bounded_srt_reads           = program.bounded_srt_reads;
+	plan.bounded_srt_reads_precede_writes = program.bounded_srt_reads_precede_writes;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 

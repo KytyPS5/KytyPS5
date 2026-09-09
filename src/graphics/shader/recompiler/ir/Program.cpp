@@ -137,6 +137,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_base  = user_data_base,
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
+	    .bounded_srt_reads_precede_writes = bounded_srt_reads_precede_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};

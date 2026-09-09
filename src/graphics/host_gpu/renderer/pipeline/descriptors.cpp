@@ -955,6 +955,9 @@ static void ValidateImmutableSrtWriteAliases(
 	};
 	for (const auto* stage: stages) {
 		const auto& info = stage->program->info;
+		if (stage->program->bounded_srt_reads_precede_writes) {
+			continue;
+		}
 		for (uint32_t index = 0; index < info.images.size(); ++index) {
 			auto resource = info.images[index];
 			if (!resource.written && !resource.atomic) {

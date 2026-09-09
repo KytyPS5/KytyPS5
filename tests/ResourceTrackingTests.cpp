@@ -3732,6 +3732,52 @@ void TestBoundedMaterializationRejectsWritableAliases() {
     if (overlap) CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
   }
 
+  // A frontend CFG proof may establish that every live bounded SRT read
+  // executes before any possible writer. The pre-dispatch snapshot then has
+  // the same value as the guest scalar read even when the later output aliases
+  // its source bytes.
+  Fixture ordered;
+  InitializeBoundedSnapshot(ordered, 4u, true);
+  const auto ordered_writer = AddBoundedSnapshotSource(
+      ordered, {Value(0x100cu), Value(0u), Value(4u), Value(0u)});
+  ordered.program.info.buffers.push_back(
+      {.source = ordered_writer, .written = true});
+  auto ordered_plan = ExtractResourcePlan(ordered.program);
+  ordered_plan.bounded_srt_reads_precede_writes = true;
+  BoundedSnapshotReader ordered_reader;
+  ordered_reader.generated_descriptors = 1u;
+  const std::array<uint32_t, 3> ordered_data{1u, 0x1000u, 0u};
+  ResourceSnapshot ordered_snapshot;
+  ResourceSpecialization ordered_specialization;
+  Check(MaterializeResources(ordered_plan,
+                             BoundedSnapshotRuntime(ordered_reader, ordered_data),
+                             ordered_snapshot, ordered_specialization),
+        "proved read-before-write bounded snapshot overlap was rejected");
+
+  for (const bool writer_first : {false, true}) {
+    for (const bool cyclic : {false, true}) {
+      Fixture proof;
+      const auto buffer = proof.Buffer(
+          {Value(0x100cu), Value(0u), Value(4u), Value(0u)});
+      const auto emit_read = [&] {
+        proof.Emit(ValueOpcode::ReadBoundedSrtU32, {Value(0u)}, 0u);
+      };
+      const auto emit_write = [&] {
+        proof.Emit(ValueOpcode::StoreBufferU32,
+                   {buffer, Value(0u), Value(0u), Value(0u), Value(7u),
+                    Value(true)},
+                   proof.AddMemory({.kind = ResourceKind::Buffer}, 0x1d94u));
+      };
+      if (writer_first) emit_write();
+      emit_read();
+      if (!writer_first) emit_write();
+      if (cyclic) proof.block->AddBranch(proof.block);
+      Check(ProveBoundedSrtReadsPrecedeWrites(proof.program) ==
+                (!writer_first && !cyclic),
+            "bounded SRT read/write CFG order proof crossed a writer or loop");
+    }
+  }
+
   // Guest buffer descriptors may reserve a much larger logical record range
   // than the VMA that NativeStorageBuffer can actually bind.  The immutable
   // table starts exactly after that mapped prefix, so the formal descriptor

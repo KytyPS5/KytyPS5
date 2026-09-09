@@ -130,6 +130,8 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	[[nodiscard]] static GuestRange  SelectUploadRange(const ImageInfo& info,
+	                                                   const ImageViewInfo& view) noexcept;
 	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.

@@ -3,6 +3,19 @@
 Обновлено **9 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint синхронизации **9 сентября 2026, 15:55 UTC**: merge-коммит
+`a309653` включает `upstream/main` до `0b4e78c` и устраняет конфликты PR #497
+без title/hash branching. Помимо upstream DB render-override copy, CES, APR и
+shader ISA изменений, интеграция добавила недостающую поддержку live-return
+`DS_INC_RTN_U32`/`DS_DEC_RTN_U32` для cooperative wave64 LDS/GDS. Неизменённый
+upstream selector `--ds-atomics-only` сначала дал RED на
+`SharedAtomicInc32`, затем полностью GREEN; `--context-state-only`, три
+SAVEEXEC wave cases, `kernel_file_system_tests` и
+`resource_materialization_tests` также GREEN. Native Windows build завершён,
+локальный эквивалент Windows CI — **3/3 PASS**. Полный расширенный CTest —
+**46/51 PASS**: пять ранее существующих веточных долгов перечислены в
+`docs/emulator-test-debt.md`; этот merge не объявляет нового игрового кадра.
+
 Текущий rendered-frame checkpoint **9 сентября 2026, 10:10–10:18 UTC**
 впервые доказал ненулевой source RGB на `96611fe` (RTX 5060 Ti). Bounded
 GPUAV-lite run `_Build/runs/yotei-integrated-20260909-101008-669804` с

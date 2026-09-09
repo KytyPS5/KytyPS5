@@ -66,7 +66,8 @@ bool ValidateShaderSpirvForTest(const char* label, uint64_t shader_hash,
 std::vector<uint32_t> OptimizeShaderSpirvForTest(
     const std::vector<uint32_t>& spirv, Config::ShaderOptimizationType optimization);
 bool ShouldOptimizeShaderSpirvForTest(
-    bool dispatcher_fallback, Config::ShaderOptimizationType optimization);
+    bool dispatcher_fallback, bool cooperative_wave64,
+    Config::ShaderOptimizationType optimization);
 bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view git_hash, std::string_view git_revision,
     std::string_view worktree_fingerprint);
@@ -120,13 +121,16 @@ void TestShaderOptimizationSelection() {
   Check(assembler.Validate(size),
         "Size optimized module failed SPIR-V validation");
   Check(ShouldOptimizeShaderSpirvForTest(
-            false, Config::ShaderOptimizationType::Performance),
+            false, false, Config::ShaderOptimizationType::Performance),
         "structured Performance shader was not admitted for optimization");
   Check(!ShouldOptimizeShaderSpirvForTest(
-            true, Config::ShaderOptimizationType::Performance),
+            true, false, Config::ShaderOptimizationType::Performance),
         "dispatcher fallback was admitted to the driver-pathological optimization path");
   Check(!ShouldOptimizeShaderSpirvForTest(
-            false, Config::ShaderOptimizationType::None),
+            false, true, Config::ShaderOptimizationType::Performance),
+        "cooperative wave64 scheduler was admitted to the driver-pathological optimization path");
+  Check(!ShouldOptimizeShaderSpirvForTest(
+            false, false, Config::ShaderOptimizationType::None),
         "None optimization mode admitted a module");
 }
 

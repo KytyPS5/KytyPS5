@@ -162,7 +162,8 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	if (stride != 0 && records > UINT64_MAX / stride) {
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
-	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	const auto descriptor_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	const auto requested_size = resource.LimitDescriptorSize(stride, descriptor_size);
 	if (address == 0 || requested_size == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
@@ -1292,7 +1293,9 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		const auto stride     = descriptor.Stride();
 		const auto records    = descriptor.NumRecords();
 		EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
-		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		const auto descriptor_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		const auto requested_size = program.info.buffers[i].LimitDescriptorSize(stride,
+		                                                                      descriptor_size);
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
 			continue;

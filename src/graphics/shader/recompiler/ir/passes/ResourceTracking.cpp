@@ -84,6 +84,33 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
 }
 
+uint64_t StrideZeroAccessSize(const Inst& inst, const MemoryInfo& memory) {
+	if (memory.kind != ResourceKind::Buffer || inst.NumArgs() < 4u) {
+		return 0u;
+	}
+	const auto offset  = inst.Arg(2u).Resolve();
+	const auto soffset = inst.Arg(3u).Resolve();
+	if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+	    !soffset.IsImmediate() || soffset.GetType() != Type::U32) {
+		return 0u;
+	}
+	// BufferByteAddress applies these as wrapping U32 additions. A wrap cannot be
+	// represented by one prefix range, so retain the full descriptor in that case.
+	uint64_t end = offset.U32();
+	if (end + memory.offset > UINT32_MAX) {
+		return 0u;
+	}
+	end += memory.offset;
+	if (end + soffset.U32() > UINT32_MAX) {
+		return 0u;
+	}
+	end += soffset.U32();
+	const auto bytes = std::max((memory.data_bits + 7u) / 8u, 1u);
+	const auto count = std::max(memory.data_dwords, 1u);
+	const auto width = static_cast<uint64_t>(bytes) * count;
+	return end + width <= uint64_t {UINT32_MAX} + 1u ? end + width : 0u;
+}
+
 class Tracker {
 public:
 	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
@@ -1916,10 +1943,11 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc,
+	                   const Inst& inst) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
-				Merge(m_info.buffers[i], memory, op, pc);
+				Merge(m_info.buffers[i], memory, op, pc, inst, false);
 				return i;
 			}
 		}
@@ -1930,16 +1958,25 @@ private:
 		resource.descriptor_formatted_only = true;
 		resource.source       = source;
 		resource.first_use_pc = pc;
-		Merge(resource, memory, op, pc);
+		Merge(resource, memory, op, pc, inst, true);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
 	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
-	                  uint32_t pc) {
+	                  uint32_t pc, const Inst& inst, bool first_access) {
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
+		const auto stride_zero_size = StrideZeroAccessSize(inst, memory);
+		if (first_access) {
+			resource.stride_zero_access_size = stride_zero_size;
+		} else if (resource.stride_zero_access_size != 0u) {
+			resource.stride_zero_access_size =
+			    stride_zero_size == 0u
+			        ? 0u
+			        : std::max(resource.stride_zero_access_size, stride_zero_size);
+		}
 		resource.first_use_pc    = std::min(resource.first_use_pc, pc);
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
@@ -2095,7 +2132,7 @@ private:
 				GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
 				          source);
 			}
-			resource = AddBuffer(source, memory, op, flags.pc);
+			resource = AddBuffer(source, memory, op, flags.pc, inst);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, fmt::format("buffer resource limit exceeded (required={} limit={})",
 				                           m_info.buffers.size() + 1u, ShaderInfo::MaxBuffers));

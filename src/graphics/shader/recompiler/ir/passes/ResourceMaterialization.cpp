@@ -1222,10 +1222,14 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime&
 		// Buffer descriptors may conservatively declare more records than the mapped VMA.
 		// Match NativeStorageBuffer's exact contiguous mapped prefix when the renderer supplied
 		// its address-space query. Offline callers retain the conservative 40-bit fallback.
-		uint64_t writable_size = std::min(size, RegisteredBufferAddressLimit - address);
+		const auto requested_writable_size =
+		    metadata.LimitDescriptorSize(descriptor.Stride(), size);
+		uint64_t writable_size =
+		    std::min(requested_writable_size, RegisteredBufferAddressLimit - address);
 		if (runtime.clamp_memory_range != nullptr) {
-			const auto mapped = runtime.clamp_memory_range(runtime.userdata, address, size);
-			if (mapped > size) {
+			const auto mapped = runtime.clamp_memory_range(runtime.userdata, address,
+			                                                    requested_writable_size);
+			if (mapped > requested_writable_size) {
 				return SpecializationFail("buffer range clamp exceeded the requested descriptor size");
 			}
 			writable_size = mapped;

@@ -1600,6 +1600,7 @@ void TestDenseBufferTracking() {
   const auto &resource = fixture.program.info.buffers[0];
   Check(resource.read && resource.written && resource.atomic &&
             resource.formatted && resource.max_byte_extent == 16 &&
+            resource.stride_zero_access_size == 16u &&
             resource.first_use_pc == 4,
         "buffer access facts were not merged");
   Check(first.Instruction()->Flags<uint32_t>() == 0 &&
@@ -3613,6 +3614,37 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   Check(MaterializeResources(mapped_plan,BoundedSnapshotRuntime(mapped_reader,mapped_data),
                              mapped_snapshot,mapped_specialization),
         "formal writable descriptor overlap ignored the disjoint mapped prefix");
+
+  // With STRIDE=0, vector-buffer instructions ignore vindex. Every access in
+  // this resource has zero voffset/soffset and writes one U32x4, so only the
+  // first 16 bytes are writable even though the descriptor reserves a much
+  // larger byte-addressed range that crosses the immutable table.
+  Fixture stride_zero;
+  InitializeBoundedSnapshot(stride_zero,4u,true);
+  auto& stride_zero_writer=stride_zero.program.info.buffers[0];
+  stride_zero_writer.written=true;
+  stride_zero_writer.formatted=true;
+  stride_zero_writer.descriptor_formatted_only=true;
+  stride_zero_writer.max_byte_extent=16u;
+  stride_zero_writer.stride_zero_access_size=16u;
+  stride_zero_writer.first_use_pc=0x1d94u;
+  const auto stride_zero_plan=ExtractResourcePlan(stride_zero.program);
+  BoundedSnapshotReader stride_zero_reader;
+  constexpr uint64_t table_address=0x201347c600ull;
+  const std::array<uint32_t,4> captured_descriptor{
+      0x132143d0u,0x00000020u,0x13214580u,0x00000020u};
+  for (uint32_t word=0u; word<captured_descriptor.size(); ++word)
+    stride_zero_reader.words.emplace_back(table_address+word*4u,
+                                          captured_descriptor[word]);
+  const std::array<uint32_t,3> stride_zero_data{
+      1u,static_cast<uint32_t>(table_address),
+      static_cast<uint32_t>(table_address>>32u)};
+  ResourceSnapshot stride_zero_snapshot;
+  ResourceSpecialization stride_zero_specialization;
+  Check(MaterializeResources(stride_zero_plan,
+                             BoundedSnapshotRuntime(stride_zero_reader,stride_zero_data),
+                             stride_zero_snapshot,stride_zero_specialization),
+        "bounded stride-zero writer used its unreachable formal tail for aliasing");
 }
 
 void TestBoundedMaterializationNullsForeignBufferSlots() {

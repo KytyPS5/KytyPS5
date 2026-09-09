@@ -97,6 +97,9 @@ struct BufferResource {
 	uint32_t               source             = 0;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
+	// Positive proof that every access remains below this byte offset when a runtime
+	// descriptor has stride zero. Zero means that at least one access is unbounded.
+	uint64_t               stride_zero_access_size = 0;
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
@@ -108,6 +111,12 @@ struct BufferResource {
 	// Positive proof: every access uses the descriptor format, without typed overrides.
 	bool                   descriptor_formatted_only = false;
 	bool                   scalar             = false;
+
+	[[nodiscard]] uint64_t LimitDescriptorSize(uint32_t stride, uint64_t size) const {
+		return stride == 0u && stride_zero_access_size != 0u && stride_zero_access_size < size
+		           ? stride_zero_access_size
+		           : size;
+	}
 
 	bool operator==(const BufferResource& other) const = default;
 };

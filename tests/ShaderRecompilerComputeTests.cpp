@@ -11812,9 +11812,10 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
-  void CheckRasterization(bool depth_feedback) {
-    const char *name = depth_feedback ? "DepthAttachmentFeedback"
-                                     : "PolygonModeRasterization";
+  void CheckRasterization(bool depth_feedback, bool packed_vertex_color = false) {
+    const char *name = packed_vertex_color ? "PackedFloatVertexColor"
+                      : depth_feedback ? "DepthAttachmentFeedback"
+                                       : "PolygonModeRasterization";
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x20000;
@@ -11898,10 +11899,13 @@ public:
       test.fragment_code.push_back(EncodeExp1(1, 1, 1, 1));
     } else {
       test.pixel_interpolator_settings = {0x400u};
-      test.fragment_code.push_back(EncodeVintrp(0x02, 0, 0, 0, 2));
+      for (uint32_t component = 0; component < (packed_vertex_color ? 4u : 1u); component++) {
+        test.fragment_code.push_back(EncodeVintrp(0x02, component, 0, component, 2));
+      }
     }
     test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
-    test.fragment_code.push_back(EncodeExp1(0, 0, 0, 0));
+    test.fragment_code.push_back(packed_vertex_color ? EncodeExp1(0, 1, 2, 3)
+                                                    : EncodeExp1(0, 0, 0, 0));
     AppendEnd(&test.fragment_code);
     auto fragment = CompileFragmentCase(test);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
@@ -11910,7 +11914,7 @@ public:
     ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.info.vertex_fetch_components[0] = 2;
-    vertex_program.info.vertex_fetch_components[1] = 4;
+    vertex_program.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
     ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
     pixel_program.stage = ShaderType::Pixel;
     pixel_program.info = fragment.program.info;
@@ -11925,10 +11929,12 @@ public:
     vertex.buffers[0].attr_offsets[1] = 2 * sizeof(float);
     for (uint32_t i = 0; i < 2; i++) {
       const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float
-                                 : Prospero::BufferFormat::k32_32_32_32Float;
+                          : packed_vertex_color ? Prospero::BufferFormat::k11_11_10Float
+                                                : Prospero::BufferFormat::k32_32_32_32Float;
       vertex.resources[i].fields[3] = DstSel(4, 5, 6, 7) |
                                       (static_cast<uint32_t>(format) << 12u);
-      vertex.resources_dst[i].registers_num = i == 0 ? 2 : 4;
+      vertex.resources_dst[i].registers_num =
+          i == 0 ? 2 : vertex_program.info.vertex_fetch_components[1];
     }
     ShaderPixelInputInfo pixel{};
     pixel.stage.program = &pixel_program;
@@ -11954,6 +11960,12 @@ public:
     }
     std::vector<u32> vertex_words(vertices.size());
     std::memcpy(vertex_words.data(), vertices.data(), sizeof(vertices));
+    if (packed_vertex_color) {
+      // R11/G11/B10 unsigned floats: 0.5, 1.0, 2.0; Vulkan supplies the missing alpha as 1.
+      for (uint32_t i = 0; i < 3; i++) {
+        vertex_words[i * 6 + 2] = 0x801e0380u;
+      }
+    }
     auto buffer = CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
                                    vertex_words);
     const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back,
@@ -12019,7 +12031,16 @@ public:
     };
     draw(filled);
     const auto solid_pixels = read_color();
-    if (depth_feedback) {
+    if (packed_vertex_color) {
+      const std::array<float, 4> expected{0.5f, 1.0f, 2.0f, 1.0f};
+      const auto center = 4 * ((extent / 2) * extent + extent / 2);
+      for (uint32_t component = 0; component < expected.size(); component++) {
+        Require(name, "packed vertex fetch and coverage",
+                std::abs(std::bit_cast<float>(solid_pixels[center + component]) -
+                         expected[component]) < 0.0001f && solid_pixels[component] == 0,
+                "packed vertex color changed channels, clamped HDR, or filled outside the triangle");
+      }
+    } else if (depth_feedback) {
       // Consecutive draws in the same submission must see each earlier depth write.
       draw(filled);
       draw(filled);
@@ -29072,6 +29093,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
+    vulkan.CheckRasterization(false, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -29276,6 +29298,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
+  vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
   vulkan.CheckUnifiedImageViewCache();

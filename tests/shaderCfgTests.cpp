@@ -10008,6 +10008,68 @@ void TestCooperativeWave64CrossBlockSpillReuse() {
   const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
   Check(variable_count == 7u,
         "sequential cross-block cooperative values did not share a spill slot");
+
+  F loop;
+  const auto first_block = loop.AddBlock();
+  const auto second_block = loop.AddBlock();
+  const auto latch = loop.AddBlock();
+  const auto exit = loop.AddBlock();
+  loop.Emit(0, O::Barrier);
+  loop.Branch(0, first_block);
+  const auto loop_first = loop.Emit(first_block, O::IAdd32, {loop.local, V(1u)});
+  loop.Branch(first_block, second_block);
+  loop.Emit(second_block, O::ReferenceU32, {loop_first});
+  const auto loop_second = loop.Emit(second_block, O::IAdd32, {loop.local, V(2u)});
+  loop.Branch(second_block, latch);
+  loop.Emit(latch, O::ReferenceU32, {loop_second});
+  loop.Conditional(latch, first_block, exit, V(true));
+  const auto loop_plan = loop.Plan();
+  Check(loop_plan.error.empty() && loop_plan.IsCooperativeWave64(),
+        "loop-local spill fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(loop.program);
+  IR::TrackResources(loop.program);
+  ShaderRecompiler::TranslateResult loop_translated;
+  loop_translated.program = std::move(loop.program);
+  auto loop_options = MakeCompileOptions(ShaderType::Compute);
+  loop_options.wave_size = 64u;
+  loop_options.input_info.compute = &loop.compute;
+  loop_options.compute_workgroup_limits = loop.limits;
+  const auto loop_compiled = ShaderRecompiler::CompileProgram(
+      std::move(loop_translated), loop_options, {}, 0u);
+  CheckSpirvBinaryValidates(loop_compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(loop_compiled.spirv, 59u) == 7u,
+        "sequential loop-local cooperative values did not share a spill slot");
+
+  F phis;
+  const auto first_phi_block = phis.AddBlock();
+  const auto second_phi_block = phis.AddBlock();
+  phis.Emit(0, O::Barrier);
+  phis.Branch(0, first_phi_block);
+  auto& first_phi = phis.program.blocks[first_phi_block]->AppendNewInst(
+      O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+  first_phi.AddPhiOperand(phis.program.blocks[0], V(1u));
+  phis.Emit(first_phi_block, O::ReferenceU32, {V(&first_phi)});
+  phis.Branch(first_phi_block, second_phi_block);
+  auto& second_phi = phis.program.blocks[second_phi_block]->AppendNewInst(
+      O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+  second_phi.AddPhiOperand(phis.program.blocks[first_phi_block], V(2u));
+  phis.Emit(second_phi_block, O::ReferenceU32, {V(&second_phi)});
+  const auto phi_plan = phis.Plan();
+  Check(phi_plan.error.empty() && phi_plan.IsCooperativeWave64(),
+        "sequential Phi spill fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(phis.program);
+  IR::TrackResources(phis.program);
+  ShaderRecompiler::TranslateResult phi_translated;
+  phi_translated.program = std::move(phis.program);
+  auto phi_options = MakeCompileOptions(ShaderType::Compute);
+  phi_options.wave_size = 64u;
+  phi_options.input_info.compute = &phis.compute;
+  phi_options.compute_workgroup_limits = phis.limits;
+  const auto phi_compiled = ShaderRecompiler::CompileProgram(
+      std::move(phi_translated), phi_options, {}, 0u);
+  CheckSpirvBinaryValidates(phi_compiled.spirv);
+  Check(SpirvInstructionOpcodeCount(phi_compiled.spirv, 59u) == 6u,
+        "sequential cooperative Phi values did not share a spill slot");
 }
 
 void TestDeadPhiWebsWithoutExternalConsumersAreRemoved() {

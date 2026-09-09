@@ -199,24 +199,58 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 	}
 	std::array<bool, 32> per_vertex {};
 	std::array<bool, 32> interpolated {};
+	std::array<bool, 32> referenced {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
 				interpolated[inst.Arg(0).U32()] = true;
+				referenced[inst.Arg(0).U32()]   = true;
 			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
 				const auto input = inst.Arg(0).U32();
 				const auto mode  = inst.Arg(2).U32();
+				referenced[input] = true;
 				per_vertex[input] =
 				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
 			}
 		}
 	}
+	std::array<bool, 32>     declared {};
+	std::array<uint32_t, 32> primary {};
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
-		         per_vertex[input]);
+		primary[input]        = input;
+		uint32_t default_bits = 0;
+		if (!referenced[input] || ShaderPixelParameterDefault(*pixel, input, 0, default_bits)) {
+			continue;
+		}
+		const auto mapped = ShaderPixelParameterMappedLocation(*pixel, input);
+		for (uint32_t earlier = 0; earlier < input; earlier++) {
+			if (declared[earlier] && ShaderPixelParameterMappedLocation(*pixel, earlier) == mapped) {
+				primary[input] = earlier;
+				break;
+			}
+		}
+		declared[input] = primary[input] == input;
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		if (interpolated[input] && per_vertex[input]) {
+		if (!declared[input] && primary[input] == input) {
+			continue;
+		}
+		const auto target = primary[input];
+		const bool shared_disagree =
+		    ShaderPixelParameterIsFlat(*pixel, input) != ShaderPixelParameterIsFlat(*pixel, target);
+		AddInput(info, StageInputKind::Parameter, target, 4, fmt::format("in_param_{}", target),
+		         per_vertex[input] || shared_disagree);
+	}
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		if (!interpolated[input] || ShaderPixelParameterIsFlat(*pixel, input)) {
+			continue;
+		}
+		const auto target = primary[input];
+		const auto variable =
+		    std::find_if(info.inputs.begin(), info.inputs.end(), [target](const auto& value) {
+			    return value.kind == StageInputKind::Parameter && value.location == target;
+		    });
+		if (variable != info.inputs.end() && variable->per_vertex) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,

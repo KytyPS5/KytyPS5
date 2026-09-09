@@ -5796,13 +5796,13 @@ void TestNewShaderRecompilerVintrpTranslation() {
   auto duplicate_result =
       RecompileForTest(duplicate_location_shader, options);
   Check(ProgramInputCount(duplicate_result.program,
-                          ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
-        "duplicate-location VINTRP shader did not reflect both raw parameter "
-        "attrs");
+                          ShaderRecompiler::IR::StageInputKind::Parameter) == 1,
+        "duplicate-location VINTRP shader did not share one parameter input");
   Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 0u) == 1,
         "duplicate-location VINTRP emitted more than one Location 0 input");
-  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 1,
-        "duplicate-location VINTRP did not fall back attr1 to Location 1");
+  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 0,
+        "duplicate-location VINTRP declared a Location the vertex stage does "
+        "not export");
   CheckSpirvBinaryValidates(duplicate_result.spirv);
 
   const uint32_t flat_shader[] = {
@@ -12082,6 +12082,39 @@ void TestDirectTranslationResetsAnalysisState() {
         "direct translation reused stale provenance/resource/interface state");
 }
 
+void TestNewShaderRecompilerSharedParameterPerVertexInput() {
+  const uint32_t shader[] = {
+      EncodeVintrp(0, 6, 1, 0, 4),
+      EncodeVintrp(1, 6, 1, 0, 4),
+      EncodeVintrp(2, 12, 2, 0, 2),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(6, 12, 6, 12),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 3;
+  ps_info.interpolator_settings[0] = 0x00000000u;
+  ps_info.interpolator_settings[1] = 0x00000001u;
+  ps_info.interpolator_settings[2] = 0x00000421u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+
+  auto result = RecompileForTest(shader, options);
+  Check(ProgramInputCount(result.program,
+                          ShaderRecompiler::IR::StageInputKind::Parameter) == 1,
+        "two pixel inputs of one vertex parameter did not share an input");
+  Check(SpirvDecorationValueCount(result.spirv, 30u, 1u) == 1,
+        "shared vertex parameter was not declared once at its location");
+  Check(SpirvDecorationValueCount(result.spirv, 30u, 2u) == 0,
+        "per-vertex reader of a shared parameter declared its own location");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 1u, 5285u),
+        "shared parameter with a per-vertex reader is not PerVertexKHR");
+  Check(SpirvContainsCapability(result.spirv, 5284u),
+        "shared per-vertex parameter did not enable FragmentBarycentricKHR");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerStageInputInfo() {
   using StageInputKind = ShaderRecompiler::IR::StageInputKind;
 
@@ -12141,14 +12174,13 @@ void TestNewShaderRecompilerStageInputInfo() {
   auto ps_result = RecompileForTest(shader, ps_options);
   Check(ProgramHasInput(ps_result.program, StageInputKind::FragCoord),
         "pixel FragCoord input missing from reflection");
-  Check(ProgramInputCount(ps_result.program, StageInputKind::Parameter) == 2,
-        "pixel interpolant inputs missing from reflection");
+  Check(ProgramInputCount(ps_result.program, StageInputKind::Parameter) == 0,
+        "unread pixel interpolants were reflected as inputs");
   Check(SpirvHasDecorationValue(ps_result.spirv, 11u, 15u),
         "SPIR-V lacks FragCoord BuiltIn decoration");
-  Check(SpirvHasDecorationValue(ps_result.spirv, 30u, 0u),
-        "SPIR-V lacks interpolant Location 0 decoration");
-  Check(SpirvHasDecorationValue(ps_result.spirv, 30u, 1u),
-        "SPIR-V lacks interpolant Location 1 decoration");
+  Check(!SpirvHasDecorationValue(ps_result.spirv, 30u, 0u) &&
+            !SpirvHasDecorationValue(ps_result.spirv, 30u, 1u),
+        "unread pixel interpolants were declared as SPIR-V inputs");
   CheckSpirvBinaryValidates(ps_result.spirv);
 
   ShaderPixelInputInfo ps_pos_y_info{};
@@ -12857,6 +12889,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestNewShaderRecompilerSharedParameterPerVertexInput();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

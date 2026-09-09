@@ -25888,6 +25888,53 @@ TestCase Wave64MultiWaveCyclicGuestBarrier() {
   return test;
 }
 
+// All native halves and guest waves contend on one float LDS atomic. The
+// barrier makes the final value observable only after every candidate has
+// completed, proving that cooperative wave64 keeps the existing compare/data
+// semantics while serialising the shared update correctly.
+TestCase Wave64MultiWaveLdsFloatMin() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256u;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64MultiWaveLdsFloatMin", local_count, 1u, 1u);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+
+  // One leader seeds LDS[0] with +infinity.
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 6));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  AppendVMovU32(&code, 10, 0u);
+  AppendVMovLiteral(&code, 11, 0x7f800000u);
+  AppendMultiWaveLdsStore(&code, 11, 10);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendMultiWaveGuestBarrier(&code);
+
+  // Positive normal floats preserve integer ordering in their bit pattern.
+  AppendVMovLiteral(&code, 13, 0x3f800000u);
+  code.push_back(EncodeVop2(0x25, 12, Vgpr(5), 13));
+  code.push_back(EncodeDs0(0x12, 0));
+  code.push_back(EncodeDs1Ex(0, 12, 12, 10));
+  AppendMultiWaveGuestBarrier(&code);
+  AppendMultiWaveLdsRead(&code, 14, 10);
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 4, 4u);
+  AppendEnd(&code);
+
+  for (u32 group = 0; group < 2u; ++group) {
+    const u32 minimum = 0x3f801000u + (group << 16u);
+    for (u32 lane = 0; lane < local_count; ++lane) {
+      test.expected[4u + group * local_count + lane] = minimum;
+    }
+  }
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_EQ_U32, O::DS_WRITE_B32, O::DS_MIN_F32,
+                  O::DS_READ_B32, O::S_WAITCNT, O::S_BARRIER,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"DS_MIN_F32", 1u}};
+  test.ir_counts = {{"SharedAtomicFMin32", 1u}};
+  test.required_spirv = {"OpAtomicCompareExchange", "OpControlBarrier"};
+  return test;
+}
+
 // A bounded inter-wave publication test. GLC loads bypass the guest L0;
 // VSCNT, unlike ordinary S_WAITCNT, completes vector stores before publishing
 // the flag. Every observed payload is loaded with GLC as well. The producer's
@@ -30153,6 +30200,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64CooperativeUnalignedScalarBufferLoadBranch);
   AddCase(Wave64MultiWaveLdsDifferentIterationsBeforeBarrier);
   AddCase(Wave64MultiWaveCyclicGuestBarrier);
+  AddCase(Wave64MultiWaveLdsFloatMin);
   AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
@@ -35366,6 +35414,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave64-cyclic-barrier-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64MultiWaveCyclicGuestBarrier());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-shared-float-atomic-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64MultiWaveLdsFloatMin());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsFloatMinMaxUsesSeparateCompareOperand());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-descriptor-neighbors-only") == 0) {

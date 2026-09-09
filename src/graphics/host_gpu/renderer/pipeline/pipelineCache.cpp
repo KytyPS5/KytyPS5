@@ -626,8 +626,11 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, resources, specialization)) {
-				EXIT("shader resource rematerialization failed: stage=%u hash=0x%016" PRIx64 "\n",
-				     static_cast<uint32_t>(stage), params.hash);
+				const auto reason = ShaderRecompiler::IR::LastResourceSpecializationError();
+				EXIT("shader resource rematerialization failed: stage=%u hash=0x%016" PRIx64
+				     " reason=%.*s\n",
+				     static_cast<uint32_t>(stage), params.hash, static_cast<int>(reason.size()),
+				     reason.data());
 			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {

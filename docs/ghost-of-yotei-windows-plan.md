@@ -1,7 +1,39 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **8 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Обновлено **9 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
+
+Текущий rendered-frame checkpoint **9 сентября 2026, 10:10–10:18 UTC**
+впервые доказал ненулевой source RGB на `96611fe` (RTX 5060 Ti). Bounded
+GPUAV-lite run `_Build/runs/yotei-integrated-20260909-101008-669804` с
+`ShaderOptimizationType=None` достиг `shown=280`. Readback
+`_Build/analysis/yotei-present-none-96611fe-20260909.txt` остаётся нулевым до
+source frame 235, затем фиксирует анимированный белый loading spinner:
+frame 236 имеет `colored=10`, frame 242 — `colored=214`, а максимум RGB доходит
+до `658/670/658`. Screenshot
+`_Build/analysis/yotei-first-nonzero-96611fe.png` визуально подтверждает spinner
+в правом верхнем углу. Критерий **первого ненулевого кадра выполнен**; меню и
+gameplay остаются **PENDING**.
+
+Перед этим checkpoint `96611fe` добавил regression-first объединение
+последовательных read-only LDS accesses в одну cooperative scheduler phase.
+Неизменённый synthetic сначала дал RED
+`consecutive read-only LDS accesses created an unnecessary cooperative rendezvous`,
+затем GREEN; `read -> write -> read` сохраняет две hazard-границы. Соседние
+cooperative CPU selectors и четыре Vulkan compute tests GREEN. Точный
+`54904fb419d79e49` уменьшился с 702 611 до 697 920 SPIR-V слов, но 60-секундный
+watchdog остановил run на `VkCreateComputePipelinesBegin`: этого уменьшения пока
+недостаточно для bounded driver compile.
+
+Performance A/B показал, почему холодный запуск выглядит как очень низкий FPS:
+на предыдущем run 269 SPIR-V optimizer calls заняли суммарно 241 с (до 8,7 с
+на permutation), тогда как traced `vkCreateComputePipelines` для обычных модулей
+завершался быстро. Режим `None` дошёл до первого spinner примерно за 77 с, но
+для огромного cooperative module переложил стоимость в NVIDIA pipeline compiler.
+Следующий шаг — regression-first factoring повторяющихся software wave64
+collectives в общие SPIR-V functions, затем повторный bounded run с watchdog
+60 с. Отключение Vulkan/GPUAV validation остаётся небезопасным из-за
+воспроизводимого `0x80000003` около guest frame 13.
 
 Текущий performance/runtime checkpoint **8 сентября 2026, 20:04–20:12 UTC**
 проверил `f1776f0` на RTX 5060 Ti. Общая CFG-правка ограничивает semantic

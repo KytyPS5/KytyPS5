@@ -1626,14 +1626,34 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	    view_info.format != vk::Format::eUndefined &&
 	    !ImageViewOps::ViewEncodingCompatible(image.backing.format, view_info.format) &&
 	    SameTexelBlockSize(image.backing.format, view_info.format)) {
+		const auto is_packed_float = [](vk::Format f) {
+			return f == vk::Format::eB10G11R11UfloatPack32 || f == vk::Format::eE5B9G9R9UfloatPack32;
+		};
+		// When the GPU wrote a packed-float (HDR) surface but the shader binds it through a
+		// normalized / signed descriptor, sampling the raw bits as packed-float is nonsense
+		// (rainbow marbling on skin, garbage HUD panels). Serve a true bitcast reinterpret
+		// view in the descriptor's format instead - legal because images are created
+		// VK_IMAGE_CREATE_MUTABLE_FORMAT and both formats are in the 32-bit compatibility
+		// class. Keep the old "sample the backing encoding" path for the other direction
+		// (e.g. UFC's RGBA8 title compositor bound with an 11-11-10 descriptor).
+		static const bool alias_reinterpret_disabled =
+		    std::getenv("KYTY_NO_ALIAS_REINTERPRET") != nullptr;
+		const bool reinterpret = is_packed_float(image.backing.format) &&
+		                         !is_packed_float(view_info.format) &&
+		                         ImageViewOps::FormatsCompatible(image.backing.format,
+		                                                         view_info.format) &&
+		                         !alias_reinterpret_disabled;
 		static std::atomic<uint32_t> encoding_logs = 0;
 		if (encoding_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
-			LOGF("TextureCache: sampling backing format %d instead of descriptor format %d "
-			     "addr=0x%016" PRIx64 "\n",
+			LOGF("TextureCache: %s: backing format %d vs descriptor format %d addr=0x%016" PRIx64
+			     "\n",
+			     reinterpret ? "reinterpret packed-float alias" : "sampling backing encoding",
 			     static_cast<int>(image.backing.format), static_cast<int>(view_info.format),
 			     image.info.data.address);
 		}
-		view_info.format = image.backing.format;
+		if (!reinterpret) {
+			view_info.format = image.backing.format;
+		}
 	}
 	const auto view = image.FindView(view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, view_info);

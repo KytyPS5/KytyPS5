@@ -624,8 +624,11 @@ struct PipelineCache::ProgramCache {
 		    .clamp_memory_range         = ClampShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, resources, specialization)) {
+				EXIT("shader resource rematerialization failed: stage=%u hash=0x%016" PRIx64 "\n",
+				     static_cast<uint32_t>(stage), params.hash);
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;

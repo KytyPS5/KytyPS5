@@ -1803,6 +1803,44 @@ void TestImagesSamplersAndAliases() {
         "buffer/image descriptor alias was not linked");
 }
 
+void TestInvalidSampledFormatHoleCanonicalization() {
+  Fixture fixture;
+  std::array<Value, 8> image_words;
+  for (uint32_t index = 0; index < image_words.size(); ++index) {
+    image_words[index] = fixture.UserData(index);
+  }
+  const auto image = fixture.Image(image_words, 0x180);
+  const auto sampler = fixture.Sampler(
+      {Value(0u), Value(0u), Value(0u), Value(0u)}, 0x180);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(
+      ValueOpcode::ImageSampleRaw,
+      {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(memory, 0x180));
+  fixture.Emit(ValueOpcode::ReferenceU32, {sampled});
+  fixture.PlanAndTrack();
+
+  // 98 lies in the reserved gap between the ordinary and SRGB format ranges.
+  // Random/stale descriptor bits must become the canonical null image instead
+  // of surviving validation and failing later numeric specialization.
+  std::array<uint32_t, 8> user_data{};
+  user_data[0] = 0x2000u;
+  user_data[1] = 98u << 20u;
+  user_data[2] = 3u | (3u << 14u);
+  user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  const auto plan = ExtractResourcePlan(fixture.program);
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u &&
+            std::ranges::all_of(snapshot.images[0].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "reserved sampled-image format was not canonicalized to null");
+}
+
 void TestSampleAdjustSamplerScratch() {
   Fixture fixture(ShaderType::Pixel);
   const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
@@ -4517,6 +4555,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--descriptor-format-provenance-only") == 0) {
       TestDescriptorFormattedBufferProvenance();
       std::cout << "KYTY_DESCRIPTOR_FORMAT_PROVENANCE_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--invalid-sampled-format-hole-only") == 0) {
+      TestInvalidSampledFormatHoleCanonicalization();
+      std::cout << "KYTY_INVALID_SAMPLED_FORMAT_HOLE_PASS\n";
       return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-write-alias-only") == 0) {

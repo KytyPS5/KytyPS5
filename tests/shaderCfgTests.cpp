@@ -9975,6 +9975,41 @@ void TestCooperativeWave64CollectivesUseSharedFunctions() {
         "non-overlapping cooperative values did not reuse spill slots");
 }
 
+void TestCooperativeWave64CrossBlockSpillReuse() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+  F f;
+  const auto middle = f.AddBlock();
+  const auto finish = f.AddBlock();
+  const auto first = f.Emit(0, O::IAdd32, {f.local, V(1u)});
+  f.Emit(0, O::Barrier);
+  f.Branch(0, middle);
+  f.Emit(middle, O::ReferenceU32, {first});
+  const auto second = f.Emit(middle, O::IAdd32, {f.local, V(2u)});
+  f.Emit(middle, O::Barrier);
+  f.Branch(middle, finish);
+  f.Emit(finish, O::ReferenceU32, {second});
+  const auto plan = f.Plan();
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        "cross-block spill fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(f.program);
+  IR::TrackResources(f.program);
+  ShaderRecompiler::TranslateResult translated;
+  translated.program = std::move(f.program);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &f.compute;
+  options.compute_workgroup_limits = f.limits;
+  const auto compiled = ShaderRecompiler::CompileProgram(
+      std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
+  Check(variable_count == 7u,
+        "sequential cross-block cooperative values did not share a spill slot");
+}
+
 void TestDeadPhiWebsWithoutExternalConsumersAreRemoved() {
   using namespace ShaderRecompiler::IR;
   Block block;
@@ -15854,6 +15889,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-spill-reuse-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64CrossBlockSpillReuse();
+    std::puts("KYTY_COOPERATIVE_SPILL_REUSE_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dead-phi-webs-only") == 0) {
     Libs::Graphics::TestDeadPhiWebsWithoutExternalConsumersAreRemoved();
     std::puts("KYTY_DEAD_PHI_WEBS_PASS");
@@ -16156,6 +16196,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64LegacyBarrierInsertionScope();
   TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
   TestCooperativeWave64CollectivesUseSharedFunctions();
+  TestCooperativeWave64CrossBlockSpillReuse();
   TestCooperativeWave64BufferCycleVisibility();
   TestCooperativeWave64AutomaticBufferCyclePromotion();
   TestComputeExecutionSingleWaveLds();

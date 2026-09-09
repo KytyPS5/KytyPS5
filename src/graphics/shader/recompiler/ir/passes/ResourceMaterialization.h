@@ -57,6 +57,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
+// After extracting the CPU resource plan and applying specialization, remove operands used only
+// by CPU descriptor planning. Dense resource indices and GPU address/key operands are retained.
+void DiscardResourcePlanningInputs(Program& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_ */

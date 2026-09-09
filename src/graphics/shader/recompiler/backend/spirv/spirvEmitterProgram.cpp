@@ -449,10 +449,26 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, ScopeSubgroup);
-	const auto low         = state.builder.AllocateId();
+	// A helper invocation is not a live guest lane: it never clears its EXEC bit, so leaving it
+	// in a wave-level ballot makes an s_cbranch_execnz loop test true forever and hangs the GPU
+	// (Astro Bot's looping composite pixel shaders). Mask helpers out of every ballot.
+	const auto live = [&](uint32_t value) {
+		if (state.helper_invocation_variable == 0) {
+			return value;
+		}
+		const auto helper = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpLoad, TypeBool(state), helper, state.helper_invocation_variable});
+		const auto not_helper = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalNot, TypeBool(state), not_helper, helper});
+		const auto masked = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalAnd, TypeBool(state), masked, value, not_helper});
+		return masked;
+	};
+	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpGroupNonUniformBallot, ballot_type, low, scope,
-	     other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)});
+	     live(other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate))});
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -461,7 +477,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformBallot, ballot_type, high, scope,
-	                           half == 1 ? Def(predicate) : other_half->Def(predicate)});
+	                           live(half == 1 ? Def(predicate) : other_half->Def(predicate))});
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low_word, low, 0});
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high_word, high, 0});
 	state.builder.AddFunction({OpCompositeConstruct, ballot_type, ballot, low_word, high_word,

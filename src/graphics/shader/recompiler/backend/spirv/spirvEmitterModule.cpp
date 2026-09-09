@@ -408,6 +408,13 @@ void AllocateInputVariables(EmitterState& state) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
+	if (state.stage == ShaderType::Pixel) {
+		// Helper invocations have to be excluded from wave-level EXEC/VCC ballots: a helper's
+		// exec bit never clears (it computes on data it will never store), so an
+		// s_cbranch_execnz loop tested across the whole wave would never exit.
+		state.helper_invocation_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.helper_invocation_variable);
+	}
 }
 
 static uint32_t AllocateInterfaceVariable(EmitterState& state) {
@@ -498,6 +505,11 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			state.builder.AddAnnotation(
 			    {OpDecorate, state.subgroup_local_invocation_id_variable, DecorationFlat});
 		}
+	}
+	if (state.helper_invocation_variable != 0) {
+		state.builder.AddName(state.helper_invocation_variable, "gl_HelperInvocation");
+		state.builder.AddAnnotation({OpDecorate, state.helper_invocation_variable,
+		                             DecorationBuiltIn, BuiltInHelperInvocation});
 	}
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
@@ -769,6 +781,11 @@ void DefineModule(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.DefineGlobalVariable(state.subgroup_local_invocation_id_variable,
 		                                   TypePointer(state, StorageClassInput, TypeU32(state)),
+		                                   StorageClassInput);
+	}
+	if (state.helper_invocation_variable != 0) {
+		state.builder.DefineGlobalVariable(state.helper_invocation_variable,
+		                                   TypePointer(state, StorageClassInput, TypeBool(state)),
 		                                   StorageClassInput);
 	}
 	for (const auto& input: state.inputs) {

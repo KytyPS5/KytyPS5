@@ -689,6 +689,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	IR::DiscardResourcePlanningInputs(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 

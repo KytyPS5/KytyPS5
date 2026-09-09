@@ -1186,6 +1186,31 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+static bool IsResourcePlanningReference(const Program& program, const Inst& inst) {
+	if (inst.GetOpcode() != ValueOpcode::ReferenceU32) {
+		return false;
+	}
+	const auto* value = inst.Arg(0).Resolve().TryInstruction();
+	if (value == nullptr || (value->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+	                         value->GetOpcode() != ValueOpcode::ReadConstBuffer)) {
+		return false;
+	}
+	const auto memory = value->Flags<MemoryFlags>().index;
+	return memory < program.memory_info.size() && program.memory_info[memory].planning_only;
+}
+
+static uint32_t NativeImageKeyArg(const Program& program, const Inst& inst) {
+	const auto index = inst.Flags<uint32_t>();
+	EXIT_IF(index >= program.info.images.size());
+	const auto source = program.info.images[index].source;
+	EXIT_IF(source >= program.descriptor_sources.size());
+	if (const auto& indirect = program.descriptor_sources[source].indirect_image; indirect) {
+		EXIT_IF(indirect->key_arg >= inst.NumArgs());
+		return indirect->key_arg;
+	}
+	return UINT32_MAX;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1441,6 +1466,45 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	program.info.samplers      = std::move(samplers);
 	program.info.sampled_pairs = std::move(sampled_pairs);
 	program.memory_info        = std::move(memory_info);
+}
+
+void DiscardResourcePlanningInputs(Program& program) {
+	EXIT_IF(!program.resource_tracking_complete || program.binding_layout_complete);
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (IsResourcePlanningReference(program, inst)) {
+				inst.Invalidate();
+				continue;
+			}
+			if (op != ValueOpcode::GetBufferResource && op != ValueOpcode::GetSamplerResource &&
+			    op != ValueOpcode::GetImageResource) {
+				continue;
+			}
+			uint32_t key_arg = UINT32_MAX;
+			if (op == ValueOpcode::GetImageResource) {
+				key_arg = NativeImageKeyArg(program, inst);
+			}
+			// The emitter identifies these resources by their dense flags. Keep typed operand
+			// slots, but detach their CPU-only expressions so ordinary DCE can remove them.
+			for (uint32_t arg = 0; arg < inst.NumArgs(); ++arg) {
+				if (arg != key_arg) {
+					inst.SetArg(arg, Value(0u));
+				}
+			}
+		}
+	}
+	// These values belong to the original planning graph, which DCE can now reclaim. Its
+	// independent ResourcePlan remains responsible for all runtime descriptor evaluation.
+	for (auto& source: program.descriptor_sources) {
+		source.dwords = {};
+	}
+	for (auto& read: program.srt_reads) {
+		read.value = {};
+	}
+	program.dynamic_reads.clear();
+	program.control_flow.clear();
+	program.uniform_fill = {};
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

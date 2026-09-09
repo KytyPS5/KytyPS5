@@ -335,6 +335,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program) {
+		// Soft ladder (PPSA21564): the shader's resources could not be materialised (a
+		// descriptor it builds from a runtime-dynamic / loop-carried SRT pointer, which
+		// KytyPS5 has no bindless path for). Drop the dispatch rather than abort the title --
+		// same handling as a null / invalid CS address.
+		LOGF("GraphicsRenderDispatchDirect: skipping dispatch, shader resources not "
+		     "materialisable, shader=0x%016" PRIx64 "\n",
+		     sh_ctx.GetCs().cs_regs.data_addr);
+		ResetBindings();
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;

@@ -116,9 +116,22 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
 
-void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+// Returns false when the shader's resources could not be fully materialised. For a compute
+// dispatch the caller then drops that dispatch -- a descriptor the shader assembles from a
+// runtime-dynamic / loop-carried SRT pointer cannot be reconstructed ahead of the dispatch,
+// and KytyPS5 has no bindless (srt_flatbuf / BDA) descriptor path yet.
+// Soft ladder (PPSA21564): the real fix is a shadPS4-style flat-SRT bindless model; until then
+// dropping the un-materialisable GI/lighting compute kernels keeps the title running. A
+// graphics stage still aborts loudly.
+bool ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
+		if (stage == ShaderType::Compute) {
+			LOGF("shader resource materialization incomplete: stage=%u hash=0x%016" PRIx64
+			     " reason=%s -- dropping this dispatch\n",
+			     static_cast<uint32_t>(stage), hash, report.reason.c_str());
+			return false;
+		}
 		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
 		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
 	}
@@ -128,6 +141,7 @@ void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
 		     label, hash, report.dropped_candidates, report.dropped_shapes,
 		     report.dropped_summary.c_str());
 	}
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -340,10 +354,12 @@ struct PipelineCache::ProgramCache {
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          entry->second.resource_plan, runtime, resources,
-			                          specialization, &report));
+			if (!ReportMaterialization(label, stage, params.hash, report,
+			                           ShaderRecompiler::IR::MaterializeResources(
+			                               entry->second.resource_plan, runtime, resources,
+			                               specialization, &report))) {
+				return {};
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -390,11 +406,15 @@ struct PipelineCache::ProgramCache {
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
-			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          resource_plan, runtime, resources, specialization, &report));
+			auto       resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			const bool mat_ok        = ReportMaterialization(
+                label, stage, params.hash, report,
+                ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+                                                          specialization, &report));
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			if (!mat_ok) {
+				return {};
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));

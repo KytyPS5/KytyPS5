@@ -26199,6 +26199,62 @@ TestCase Wave64CooperativeBdaCoefficientsByWorkgroup() {
   return test;
 }
 
+// Scalar-address SMEM remains one architectural value per guest wave even
+// when a bounded loop revisits the load. Require every lane in both native32
+// halves to observe the same four-iteration sum.
+TestCase Wave64CooperativeCyclicScalarAddressRead() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256u;
+  constexpr u32 total = 2u * local_count;
+  constexpr u32 coefficient_dword = 1024u;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64CooperativeCyclicScalarAddressRead", local_count, local_count, 1u);
+  test.initial.resize(coefficient_dword + 1u);
+  for (u32 word = 0; word < test.initial.size(); ++word)
+    test.initial[word] = 0xac000000u | word;
+  test.initial[coefficient_dword] = 0x110u;
+  test.expected = test.initial;
+  test.has_user_data = true;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.user_data[0] = 0u;
+  test.user_data[1] = 0u;
+  test.user_data[50] = (4u + total) * sizeof(u32);
+  test.bda_mappings = {{0u, 0u}};
+
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendMultiWaveLdsStore(&code, 5u, 7u);
+  AppendMultiWaveGuestBarrier(&code);
+  code.push_back(EncodeSMovB32(23u, InlineU32(0u)));
+  code.push_back(EncodeSMovB32(24u, InlineU32(0u)));
+  const size_t loop = code.size();
+  code.push_back(EncodeSmem0(0x00, 22u, 0u));
+  code.push_back(EncodeSmem1(coefficient_dword * sizeof(u32)));
+  code.push_back(EncodeSopp(0x0c, 0u));
+  code.push_back(EncodeSop2(0x00, 23u, 23u, 22u));
+  code.push_back(EncodeSop2(0x00, 24u, 24u, InlineU32(1u)));
+  code.push_back(EncodeSopc(0x0a, 24u, InlineU32(4u)));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  AppendStoreSgprAtLaneDwordOffset(&code, 23u, 4u, 4u);
+  AppendEnd(&code);
+
+  for (u32 group = 0; group < 2u; ++group) {
+    for (u32 lane = 0; lane < local_count; ++lane) {
+      test.expected[4u + group * local_count + lane] = 4u * 0x110u;
+    }
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::S_BARRIER,
+                  O::S_LOAD_DWORD, O::S_WAITCNT,
+                  O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_LOAD_DWORD", 1u}};
+  test.ir_counts = {{"LoadAddressU32", 1u}};
+  test.required_spirv = {"OpControlBarrier"};
+  return test;
+}
+
 TestCase MakeWave64SingleGroupLdsTileCase(bool explicit_barrier) {
   using O = ShaderOpcode;
   constexpr u32 count = 128;
@@ -30203,6 +30259,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64MultiWaveLdsFloatMin);
   AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
+  AddCase(Wave64CooperativeCyclicScalarAddressRead);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
   AddCase(Wave64SingleGroupLdsExplicitBarrier);
   AddCase(Wave64SingleGroupLdsUniformBranchOrdering);
@@ -35378,6 +35435,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-bda-coefficients-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64CooperativeBdaCoefficientsByWorkgroup());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-cyclic-scalar-address-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64CooperativeCyclicScalarAddressRead());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-cooperative-ssbo-only") == 0) {

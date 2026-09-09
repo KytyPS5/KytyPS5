@@ -75,6 +75,14 @@ bool IsLds(const IR::Program& program, const IR::Inst& inst) {
 	return index < program.memory_info.size() && program.memory_info[index].kind == IR::ResourceKind::Lds;
 }
 
+bool IsRuntimeScalarRead(const ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto op = inst.GetOpcode();
+	if (op == O::ReadConstBuffer) return !ctx.Memory(inst).planning_only;
+	return op == O::LoadAddressU32 &&
+	       ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress &&
+	       !ctx.Memory(inst).planning_only;
+}
+
 void StoreResult(ValueEmitContext& ctx, const CooperativeFunctionState& function, const IR::Inst& inst) {
 	if (const auto slot = function.spills.find(&inst); slot != function.spills.end()) {
 		const auto value = ctx.definitions.find(&inst);
@@ -91,7 +99,7 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 	for (size_t index = 0; index < segment.instructions.size();) {
 		const auto& inst = *segment.instructions[index];
 		if (inst.GetOpcode() == O::Phi) { ++index; continue; }
-		if (inst.GetOpcode() == O::ReadConstBuffer && !ctx.Memory(inst).planning_only) {
+		if (IsRuntimeScalarRead(ctx, inst)) {
 			// Only the selected guest wave may touch its descriptor, but every
 			// physical invocation must join the cross-subgroup rendezvous. Publish
 			// the raw host loads first, broadcast this wave's lane zero, then commit
@@ -181,7 +189,7 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 				ordinary_phase = 0;
 				continue;
 			}
-			if ((op == O::ReadConstBuffer && !ctx.Memory(inst).planning_only) ||
+			if (IsRuntimeScalarRead(ctx, inst) ||
 			    IsCollective(op)) {
 				function.phases.emplace(&inst, next_phase++);
 				ordinary_phase = 0;
@@ -210,8 +218,7 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 		if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
 		    ctx.Memory(inst).planning_only) continue;
 		const auto phase = function.phases.find(&inst);
-		bool spill = inst.GetOpcode() == O::Phi ||
-		             (inst.GetOpcode() == O::ReadConstBuffer && !ctx.Memory(inst).planning_only) ||
+		bool spill = inst.GetOpcode() == O::Phi || IsRuntimeScalarRead(ctx, inst) ||
 		             branch_conditions.contains(&inst) || phase == function.phases.end();
 		for (const auto& use : inst.Uses()) {
 			const auto user_phase = function.phases.find(use.user);

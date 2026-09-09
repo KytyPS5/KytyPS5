@@ -9786,7 +9786,8 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
     CyclicImageRead, CyclicImageSample, ImageWriteBefore, ImageWriteAfter,
     CyclicImageWrite, ImageAtomicBefore, ImageAtomicAfter,
     CyclicAddressRead, CyclicAddressWrite, AddressWriteBefore,
-    CyclicScalarBufferRead, BufferAtomicBefore, CyclicBufferAtomic,
+    CyclicScalarAddressRead, CyclicScalarBufferRead,
+    BufferAtomicBefore, CyclicBufferAtomic,
     AcyclicAddressReadBefore, AcyclicAddressReadAfter,
     VaryingBranch, Partitioned,
     BufferCycle, SeparateWriterCycle, AcyclicInputImage,
@@ -9801,7 +9802,8 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
       Scenario::CyclicImageWrite, Scenario::ImageAtomicBefore,
       Scenario::ImageAtomicAfter, Scenario::CyclicAddressRead,
       Scenario::CyclicAddressWrite, Scenario::AddressWriteBefore,
-      Scenario::CyclicScalarBufferRead, Scenario::BufferAtomicBefore,
+      Scenario::CyclicScalarAddressRead, Scenario::CyclicScalarBufferRead,
+      Scenario::BufferAtomicBefore,
       Scenario::CyclicBufferAtomic, Scenario::VaryingBranch,
       Scenario::Partitioned, Scenario::BufferCycle,
       Scenario::SeparateWriterCycle, Scenario::AcyclicInputImage,
@@ -9909,6 +9911,11 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
       f.Emit(loop,O::ReferenceU32,{raw});
     }
     if (scenario == Scenario::CyclicAddressWrite) address_write(loop);
+    if (scenario == Scenario::CyclicScalarAddressRead) {
+      const auto raw = memory(loop,O::LoadAddressU32,
+          {address,V(0u),V(0u),V(true)},IR::ResourceKind::ScalarAddress);
+      f.Emit(loop,O::ReferenceU32,{raw});
+    }
     if (scenario == Scenario::CyclicScalarBufferRead) {
       const auto raw = memory(loop,O::ReadConstBuffer,{buffer,V(0u)},IR::ResourceKind::ScalarBuffer);
       f.Emit(loop,O::ReferenceU32,{raw});
@@ -9946,6 +9953,7 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
     const bool accepted = scenario == Scenario::BufferCycle ||
         scenario == Scenario::SeparateWriterCycle || scenario == Scenario::AcyclicInputImage ||
         scenario == Scenario::ImmutableSnapshot || scenario == Scenario::PlanningOnlyAddressTemplate ||
+        scenario == Scenario::CyclicScalarAddressRead ||
         scenario == Scenario::CyclicScalarBufferRead || scenario == Scenario::ImageWriteAfter ||
         scenario == Scenario::CyclicImageRead || scenario == Scenario::CyclicImageSample;
     const auto plan = f.Plan();

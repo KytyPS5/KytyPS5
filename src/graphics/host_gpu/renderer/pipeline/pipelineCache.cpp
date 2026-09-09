@@ -397,9 +397,10 @@ std::vector<uint32_t> OptimizeShaderSpirv(
 	return optimized;
 }
 
-bool ShouldOptimizeShaderSpirv(bool dispatcher_fallback,
+bool ShouldOptimizeShaderSpirv(bool dispatcher_fallback, bool cooperative_wave64,
                                Config::ShaderOptimizationType optimization) {
-	return optimization != Config::ShaderOptimizationType::None && !dispatcher_fallback;
+	return optimization != Config::ShaderOptimizationType::None && !dispatcher_fallback &&
+	       !cooperative_wave64;
 }
 
 std::string ShaderModuleDebugName(ShaderType stage, uint64_t shader_hash) {
@@ -427,9 +428,9 @@ std::vector<uint32_t> OptimizeShaderSpirvForTest(
 	return OptimizeShaderSpirv(spirv, optimization);
 }
 
-bool ShouldOptimizeShaderSpirvForTest(bool dispatcher_fallback,
+bool ShouldOptimizeShaderSpirvForTest(bool dispatcher_fallback, bool cooperative_wave64,
                                       Config::ShaderOptimizationType optimization) {
-	return ShouldOptimizeShaderSpirv(dispatcher_fallback, optimization);
+	return ShouldOptimizeShaderSpirv(dispatcher_fallback, cooperative_wave64, optimization);
 }
 
 std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash) {
@@ -501,6 +502,29 @@ struct PipelineCache::ProgramCache {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		const char* optimization_trace = std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE");
+		uint32_t    wave_partition_factor = 1;
+		bool        cooperative_wave64    = false;
+		if constexpr (Stage == ShaderType::Compute) {
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("ComputePlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
+				std::fflush(stdout);
+			}
+			// The renderer no longer owns the CFG after TakeCompiledInfo. Preserve
+			// the exact dispatch geometry and generated-control-flow classification
+			// selected by the same compiler planner.
+			const auto execution = ShaderRecompiler::PlanComputeExecution(
+			    result.program, options.input_info, options.compute_workgroup_limits);
+			if (optimization_trace != nullptr && *optimization_trace != '\0') {
+				std::printf("ComputePlanEnd: hash=0x%016" PRIx64 " error=%s\n", options.shader_hash,
+				            execution.error.c_str());
+				std::fflush(stdout);
+			}
+			if (!execution.error.empty()) {
+				EXIT("compute execution plan failed: %s\n", execution.error.c_str());
+			}
+			wave_partition_factor = execution.wave_partition_factor;
+			cooperative_wave64    = execution.IsCooperativeWave64();
+		}
 		const auto  optimization_start = std::chrono::steady_clock::now();
 		const auto  original_words     = result.spirv.size();
 		if (optimization_trace != nullptr && *optimization_trace != '\0') {
@@ -509,7 +533,7 @@ struct PipelineCache::ProgramCache {
 			            static_cast<uint32_t>(Config::GetShaderOptimizationType()));
 			std::fflush(stdout);
 		}
-		if (ShouldOptimizeShaderSpirv(result.program.dispatcher_fallback,
+		if (ShouldOptimizeShaderSpirv(result.program.dispatcher_fallback, cooperative_wave64,
 		                              Config::GetShaderOptimizationType())) {
 			result.spirv = OptimizeShaderSpirv(result.spirv, Config::GetShaderOptimizationType());
 		}
@@ -524,26 +548,6 @@ struct PipelineCache::ProgramCache {
 		}
 		if (ShouldDumpShaderSpirv(options.shader_hash)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-		}
-		uint32_t wave_partition_factor = 1;
-		if constexpr (Stage == ShaderType::Compute) {
-			if (optimization_trace != nullptr && *optimization_trace != '\0') {
-				std::printf("ComputePlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
-				std::fflush(stdout);
-			}
-			// The renderer no longer owns the CFG after TakeCompiledInfo. Preserve
-			// the exact dispatch geometry selected by the same compiler planner.
-			const auto execution = ShaderRecompiler::PlanComputeExecution(
-			    result.program, options.input_info, options.compute_workgroup_limits);
-			if (optimization_trace != nullptr && *optimization_trace != '\0') {
-				std::printf("ComputePlanEnd: hash=0x%016" PRIx64 " error=%s\n", options.shader_hash,
-				            execution.error.c_str());
-				std::fflush(stdout);
-			}
-			if (!execution.error.empty()) {
-				EXIT("compute execution plan failed: %s\n", execution.error.c_str());
-			}
-			wave_partition_factor = execution.wave_partition_factor;
 		}
 		if (optimization_trace != nullptr && *optimization_trace != '\0') {
 			std::printf("CompilePermutationPostPlan: hash=0x%016" PRIx64 "\n", options.shader_hash);

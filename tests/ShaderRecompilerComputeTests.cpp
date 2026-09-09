@@ -223,10 +223,11 @@ struct TextureCacheTestAccess {
 
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
-                                         uint64_t tick, uint64_t pressure) {
+                                         uint64_t tick, uint64_t pressure,
+                                         uint64_t critical = UINT64_MAX) {
     cache.m_trigger_gc_memory = 0;
     cache.m_pressure_gc_memory = pressure;
-    cache.m_critical_gc_memory = UINT64_MAX;
+    cache.m_critical_gc_memory = critical;
     cache.m_gc_tick = tick;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
@@ -7569,6 +7570,48 @@ public:
       Require(name, "depth/stencil GC traversal budget", gc_depth_budget,
               "recursive association deletion stopped LRU traversal or "
               "exceeded the ten-entry deletion budget");
+
+      // Retained images must not monopolize the bounded GC scan, even under
+      // critical pressure. The last entry is clean and can be reclaimed.
+      for (const uint64_t critical : {UINT64_MAX, uint64_t{0}}) {
+        constexpr uint64_t offset = 0x360000;
+        constexpr uint64_t stride = 0x1000;
+        std::array<ImageId, 41> oldest{};
+        for (size_t index = 0; index < oldest.size(); index++) {
+          const auto address = base + offset + index * stride;
+          auto desc = MakeLinearDesc(
+              address, 4, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+              Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+          if (index + 1 < oldest.size()) {
+            auto [buffer, buffer_offset] =
+                resources.GetBufferCache().ObtainBuffer(address, 4, true);
+            buffer->Fill(buffer_offset, 4, 0x11111111u);
+          }
+          oldest[index] = texture_cache.FindImage(desc);
+          if (index + 1 < oldest.size()) {
+            Require(name, "blocked GC image clear",
+                    texture_cache.ClearImageFromBuffer(
+                        command, address, 4, 0x33333333u),
+                    "failed to prepare a rendered image over older dirty buffer bytes");
+          }
+        }
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            texture_cache, oldest, 161, 0, critical);
+        for (uint32_t cycle = 0; cycle < 3; cycle++) {
+          texture_cache.RunGarbageCollector();
+        }
+        Require(name, "GC progresses past retained images",
+                !texture_cache.FindImageFromRange(
+                    base + offset + 40 * stride, 4, false),
+                "forty retained images prevented collection of a later clean image");
+        for (size_t index = 0; index < 40; index++) {
+          Require(name, "GC retains ambiguous image contents",
+                  texture_cache.FindImageFromRange(
+                      base + offset + index * stride, 4, false) == oldest[index],
+                  "GC gained progress by discarding potentially newer image contents");
+        }
+        texture_cache.UnmapMemory(base + offset, oldest.size() * stride);
+      }
 
       constexpr uint64_t large_offset = 0x400000;
       constexpr uint32_t large_width = 4096;

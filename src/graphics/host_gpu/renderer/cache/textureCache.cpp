@@ -2129,18 +2129,32 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered) {
+				continue;
+			}
+			// Rotate retained entries so they cannot monopolize subsequent bounded scans.
+			if (owner->depth_id) {
+				TouchImage(*owner);
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
+				// Buffer dirtiness may predate image writes; blocked readback does not prove
+				// these pixels are stale. Keep them until invalidation or safe readback.
+				if (!safe && owner->SafeToDownload()) {
+					TouchImage(*owner);
+					continue;
+				}
 				if (safe && owner->info.IsTiled()) {
+					TouchImage(*owner);
 					continue;
 				}
 				if (safe && !pressured) {
+					TouchImage(*owner);
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {
+					TouchImage(*owner);
 					continue;
 				}
 				owner->ClearGpuModified();

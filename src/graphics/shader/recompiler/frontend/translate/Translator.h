@@ -94,6 +94,7 @@ private:
 	bool IMAGE_STORE(const Decoder::Instruction& inst);
 	bool IMAGE_SAMPLE(const Decoder::Instruction& inst);
 	bool IMAGE_GATHER(const Decoder::Instruction& inst);
+	bool IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
 	IR::Value LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
 	                        uint32_t pc);
 	IR::Value ExtractSharedU32(IR::Value value, uint32_t width, uint32_t index);

@@ -1454,7 +1454,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   const auto uses_image =
       std::any_of(test.opcodes.begin(), test.opcodes.end(), [](auto op) {
         return op >= ShaderOpcode::IMAGE_GET_RESINFO &&
-               op <= ShaderOpcode::IMAGE_GATHER4H;
+               op <= ShaderOpcode::IMAGE_GATHER4;
       });
   if (uses_image && ((user_data[3] >> 28u) & 0xfu) == 0) {
     user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
@@ -15821,12 +15821,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_ATOMIC_OR:
   case Opcode::IMAGE_ATOMIC_XOR:
   case Opcode::IMAGE_SAMPLE:
-  case Opcode::IMAGE_GATHER4_LZ:
-  case Opcode::IMAGE_GATHER4_C:
-  case Opcode::IMAGE_GATHER4_C_LZ:
-  case Opcode::IMAGE_GATHER4_LZ_O:
-  case Opcode::IMAGE_GATHER4_C_O:
-  case Opcode::IMAGE_GATHER4_C_LZ_O:
+  case Opcode::IMAGE_GATHER4:
     return CoverageClass::NeedsImageCase;
 
   case Opcode::V_INTERP_P1_F32:
@@ -24678,7 +24673,7 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   test.code = std::move(code);
   test.expected = {0x2abu, 0x456u, 0x321u, 0x321u,
                    0x456u, 0x456u, 0x456u, 0x456u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = std::vector<u32>(16, 0xaae2b321u);
   test.sampled_image_format = vk::Format::eR32Uint;
@@ -24773,7 +24768,7 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   test.name = "ImageGather2DInstructionWith1DDescriptor";
   test.code = code;
   test.expected = {0x40000000u, 0x40400000u, 0x40400000u, 0x40000000u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.image_width = 4;
   test.image_height = 1;
@@ -25042,9 +25037,8 @@ TestCase ImageSampleAndGather() {
                    0x3f800000u,
                    0};
   test.opcodes = {
-      O::V_MOV_B32,        O::IMAGE_SAMPLE,       O::IMAGE_GET_LOD,
-      O::IMAGE_GATHER4_LZ, O::IMAGE_GATHER4_LZ_O, O::BUFFER_STORE_DWORD,
-      O::S_ENDPGM};
+      O::V_MOV_B32, O::IMAGE_SAMPLE,       O::IMAGE_GET_LOD,
+      O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.sampled_image_rgba = image;
   return test;
 }
@@ -25073,7 +25067,7 @@ TestCase ImageD16GatherPacksHalfPairs() {
   test.name = "ImageD16GatherPacksHalfPairs";
   test.code = code;
   test.expected = {0x38003800u, 0x38003800u};
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_LZ, O::BUFFER_STORE_DWORD,
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
@@ -25226,9 +25220,7 @@ TestCase ImageGatherCompareOpcodes() {
   test.name = "ImageGatherCompareOpcodes";
   test.code = code;
   test.opcodes = {
-      O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
-      O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
-      O::S_ENDPGM};
+      O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
   test.compile_only = true;
   return test;

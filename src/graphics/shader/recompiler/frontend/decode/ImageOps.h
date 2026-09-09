@@ -9,6 +9,8 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
                 Instruction& inst);
 
 const char* MimgSampleOpcodeName(uint32_t opcode);
+const char* MimgGatherOpcodeName(uint32_t opcode);
+const char* MimgBvhOpcodeName(uint32_t opcode);
 
 struct ImageAddressComponent {
 	uint32_t bit_offset;

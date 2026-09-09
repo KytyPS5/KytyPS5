@@ -549,6 +549,9 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// Set when a hardware ray-tracing intersect was lowered to a constant miss. Purely
+	// diagnostic: the caller reports the shader once so the log shows which output is a lie.
+	bool                          uses_bvh_intersect_stub = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;

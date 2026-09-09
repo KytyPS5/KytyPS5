@@ -691,6 +691,34 @@ bool Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	return true;
 }
 
+// APPROXIMATION, NOT AN IMPLEMENTATION. image_bvh_intersect_ray / image_bvh64_intersect_ray are
+// the RDNA2 hardware ray-tracing primitive: each intersects a ray against ONE AMD-format BVH node
+// read from a raw guest address and returns four dwords - the sorted child pointers of a box node,
+// or hit distance and triangle data for a triangle node. Vulkan cannot express that. Ray query
+// (SPV_KHR_ray_query) runs against a driver-built opaque acceleration structure, not a
+// caller-supplied node at a guest address, so a faithful emulation means reimplementing AMD's node
+// layout and its box/triangle intersection math in SPIR-V.
+//
+// Until then every intersection reports a MISS: 0xffffffff in all four result registers. That
+// value is well defined under both readings of the result. As a child pointer it is INVALID_NODE,
+// so the guest traversal loop pushes nothing and drains its stack; as an f32 distance it is a NaN,
+// so every "closer than t_max" compare is false. Traversal therefore terminates and reports no hit
+// instead of spinning or reading uninitialised memory.
+//
+// WHAT IS LOST: every hardware-ray-traced effect renders as if the scene were empty - for UE5 this
+// is Lumen's hardware reflections and GI. The shader still runs and still writes its other
+// outputs, which is why this beats skipping the dispatch outright. The 128-bit srsrc is a BVH
+// descriptor and NOT a T#: it is deliberately never read here, so it can never reach
+// GetImageResource and be bound into a descriptor set.
+bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	program.uses_bvh_intersect_stub = true;
+	// data_dwords is pinned to 4 by the decoder: VDataDwords is 4 in both encodings.
+	for (uint32_t index = 0; index < inst.data_dwords; index++) {
+		WriteOperand(OffsetOperand(inst.dst, index), IR::Value(0xffffffffu));
+	}
+	return true;
+}
+
 IR::Value Translator::LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
                                     uint32_t pc) {
 	IR::ValueOpcode opcode;
@@ -1034,13 +1062,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
-		case Decoder::Opcode::IMAGE_GATHER4_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_C:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_GATHER4: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);

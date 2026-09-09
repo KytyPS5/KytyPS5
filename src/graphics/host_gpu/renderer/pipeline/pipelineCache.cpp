@@ -168,7 +168,9 @@ void CaptureDispatchedShader(const ShaderParams& params,
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 	try {
+#endif
 		const char* stage = options.stage == ShaderType::Compute ? "compute"
 		                    : options.stage == ShaderType::Vertex ? "vertex"
 		                    : options.stage == ShaderType::Pixel ? "pixel" : "unknown";
@@ -250,11 +252,13 @@ void CaptureDispatchedShader(const ShaderParams& params,
 		    !write(directory / (stem + ".json"), json.data(), json.size())) {
 			LOGF("Shader capture: cannot write dispatched shader %s\n", stem.c_str());
 		}
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 	} catch (const std::exception& error) {
 		LOGF("Shader capture: cannot capture dispatched shader: %s\n", error.what());
 	} catch (...) {
 		LOGF("Shader capture: cannot capture dispatched shader: unknown exception\n");
 	}
+#endif
 }
 
 bool ShouldDumpShaderSpirv(uint64_t shader_hash) {

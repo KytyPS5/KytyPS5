@@ -201,7 +201,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                          bool memory_backed_material = false,
-                         bool storage_write = false) {
+                         bool storage_write = false,
+                         ValueOpcode sampled_opcode = ValueOpcode::ImageSampleRaw) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -281,7 +282,7 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   } else {
     const auto sampler =
         fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-    const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
+    const auto sampled = fixture->Emit(sampled_opcode,
                                        {image, sampler, fixture->ImageAddress()},
                                        fixture->AddMemory(access, 0x10f0));
     const auto sampled_x =

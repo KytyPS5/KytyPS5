@@ -34051,8 +34051,10 @@ TestCase Images65FromSrtWithDistinctSamplerOrigins() {
   return test;
 }
 
-void CheckIndirectImageKeySwitch() {
-  constexpr const char *name = "IndirectImageKeySwitch";
+void CheckIndirectImageKeySwitch(
+    Prospero::TextureNumericClass candidate_numeric_class =
+        Prospero::TextureNumericClass::Float,
+    const char *name = "IndirectImageKeySwitch") {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
@@ -34116,11 +34118,12 @@ void CheckIndirectImageKeySwitch() {
   root.read = true;
   root.indirect_root = 0;
   root.indirect_mapping_offset = 0;
-	root.indirect_search_iterations = std::bit_width(mapping_capacity);
+  root.indirect_search_iterations = std::bit_width(mapping_capacity);
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
-	candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
-	candidate.indirect_search_iterations = 0;
+  candidate.numeric_class = candidate_numeric_class;
+  candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+  candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
   program.info.samplers.push_back({1u, 0x10f0u});
@@ -34222,6 +34225,11 @@ void CheckIndirectImageKeySwitch() {
   }
 }
 
+void CheckIndirectImageNumericClassSwitch() {
+  CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Uint,
+                              "IndirectImageNumericClassSwitch");
+}
+
 void CheckIndirectStorageImageWriteSwitch() {
   constexpr const char *name = "IndirectStorageImageWriteSwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -34283,6 +34291,7 @@ void CheckIndirectStorageImageWriteSwitch() {
   root.indirect_search_iterations = std::bit_width(mapping_capacity);
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
+  candidate.numeric_class = Prospero::TextureNumericClass::Uint;
   candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
   candidate.shader_swizzle = DstSel(0, 0, 0, 0);
   candidate.indirect_search_iterations = 0;
@@ -34296,7 +34305,7 @@ void CheckIndirectStorageImageWriteSwitch() {
           root_binding.has_value() && candidate_binding.has_value() &&
               FindBinding(program.bindings, *root_binding) != nullptr &&
               FindBinding(program.bindings, *candidate_binding) != nullptr,
-          "mixed storage candidate bindings were not allocated");
+          "mixed Float/Uint storage candidate bindings were not allocated");
   ResourceSpecialization specialization;
   for (const auto &resource : program.info.images) {
     specialization.images.push_back(
@@ -34324,7 +34333,7 @@ void CheckIndirectStorageImageWriteSwitch() {
           text.find("OpSwitch") != std::string::npos &&
               CountText(text, "OpImageWrite") == 2 &&
               CountText(text, "OpIEqual") == 11,
-          "mixed 2D/1D storage key did not use a compact two-write switch");
+          "mixed Float/Uint 2D/1D storage key did not use a compact two-write switch");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

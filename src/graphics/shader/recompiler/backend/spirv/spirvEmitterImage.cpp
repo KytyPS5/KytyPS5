@@ -735,9 +735,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto  numeric_class  = image.numeric_class;
-		const auto  condition      = ctx.Arg(inst, 2);
-		const auto  result_type    = ImageVectorType(state, numeric_class, 4);
+		const auto condition = ctx.Arg(inst, 2);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
@@ -1104,6 +1102,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
 		auto result = phi_words[2];
+		if (heterogeneous_numeric) {
+			ctx.Define(inst, result);
+			return true;
+		}
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		} else if (use_manual_compare) {

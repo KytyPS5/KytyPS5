@@ -1,11 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -29,6 +31,52 @@ const char* StageName(ShaderType stage) {
 std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::string& message) {
 	return fmt::format("shader SRT: hash=0x{:016x} stage={} pc=0x{:08x} {}", program.shader_hash,
 	                   StageName(program.stage), pc, message);
+}
+
+// KYTY_SRT_DIAG=1 dumps the opcode tree of a descriptor dword that failed bind-time evaluation
+// (the "a descriptor source did not evaluate" drop). Zero cost unless the env var is set.
+bool SrtDiagEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SRT_DIAG");
+		return v != nullptr && v[0] != '0';
+	}();
+	return on;
+}
+
+std::string DescribeValueTree(const ResourcePlan& program, Value value, uint32_t depth = 0) {
+	value            = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return value.IsImmediate() && value.GetType() == Type::U32
+		           ? fmt::format("0x{:08x}", value.U32())
+		           : std::string("opaque");
+	}
+	const auto op   = inst->GetOpcode();
+	auto       text = std::string(ValueOpcodeName(op));
+	if (op == ValueOpcode::GetUserData && inst->NumArgs() == 1 &&
+	    inst->Arg(0).GetType() == Type::ScalarReg) {
+		return text + fmt::format(" s{}", RegIndex(inst->Arg(0).ScalarRegister()));
+	}
+	if (op == ValueOpcode::ReadConst && inst->NumArgs() == 2 &&
+	    inst->Arg(1).Resolve().IsImmediate()) {
+		return text + fmt::format(" slot={}", inst->Arg(1).Resolve().U32());
+	}
+	if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+		const auto flags = inst->Flags<MemoryFlags>();
+		text += fmt::format(" pc=0x{:08x}", flags.pc);
+		if (flags.index < program.memory_info.size()) {
+			text += fmt::format(" offset=0x{:x}", program.memory_info[flags.index].offset);
+		}
+	}
+	if (inst->NumArgs() == 0 || depth >= 5u) {
+		return text;
+	}
+	text += '(';
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		text += index == 0 ? "" : ", ";
+		text += DescribeValueTree(program, inst->Arg(index), depth + 1u);
+	}
+	return text + ')';
 }
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -611,6 +659,9 @@ private:
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
+			if (m_diag_first_fail == nullptr) {
+				m_diag_first_fail = inst;
+			}
 			return false;
 		}
 		m_cache.emplace(inst, out);
@@ -1097,6 +1148,11 @@ private:
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
+
+public:
+	// Deepest instruction whose EvaluateInst returned false during the last Evaluate() call.
+	// Only meaningful when KYTY_SRT_DIAG is set; harmless otherwise.
+	const Inst* m_diag_first_fail = nullptr;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -1167,6 +1223,39 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+					if (SrtDiagEnabled()) {
+						std::string fail_node = "(none)";
+						if (evaluator.m_diag_first_fail != nullptr) {
+							fail_node = DescribeValueTree(
+							    program,
+							    Value(const_cast<Inst*>(evaluator.m_diag_first_fail)));
+						}
+						std::string probe;
+						const Inst* fi = evaluator.m_diag_first_fail;
+						if (fi != nullptr && fi->GetOpcode() == ValueOpcode::Phi) {
+							for (size_t e = 0; e < fi->NumArgs(); e++) {
+								Evaluator  pe(program, runtime, clean_flat_slots, &clean_evaluator);
+								uint32_t   v  = 0;
+								const bool ok = pe.Evaluate(fi->Arg(e), v);
+								probe += fmt::format("\n  phi-edge[{}] const={} value=0x{:08x} {}", e,
+								                     ok ? "YES" : "no", v,
+								                     DescribeValueTree(program, fi->Arg(e), 1));
+							}
+						}
+						LOGF("SRT-DIAG: hash=0x%016" PRIx64 " stage=%s source=%u/%u dword=%u/%u "
+						     "srt_slots=%u buffers=%u images=%u samplers=%u indirect_img=%d "
+						     "did not evaluate:\n  tree: %s\n  first-fail: %s%s\n",
+						     program.shader_hash, StageName(program.stage), source_index,
+						     static_cast<uint32_t>(program.descriptor_sources.size()), index,
+						     source->dword_count,
+						     static_cast<uint32_t>(program.srt_reads.size()),
+						     static_cast<uint32_t>(program.info.buffers.size()),
+						     static_cast<uint32_t>(program.info.images.size()),
+						     static_cast<uint32_t>(program.info.samplers.size()),
+						     source->indirect_image.has_value() ? 1 : 0,
+						     DescribeValueTree(program, source->dwords[index]).c_str(),
+						     fail_node.c_str(), probe.c_str());
+					}
 					return false;
 				}
 			}

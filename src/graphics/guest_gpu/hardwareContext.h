@@ -202,6 +202,13 @@ struct RenderControl {
 	uint8_t copy_sample              = 0;
 };
 
+struct DepthRenderOverride {
+	bool force_z_valid       = false;
+	bool force_z_dirty       = false;
+	bool force_stencil_valid = false;
+	bool force_stencil_dirty = false;
+};
+
 struct GdsOaCounter {
 	uint32_t counter = 0;
 	uint32_t address = 0;
@@ -809,6 +816,12 @@ public:
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
+	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
+		return m_depth_render_override;
+	}
+	void SetDepthRenderOverride(const DepthRenderOverride& control) {
+		m_depth_render_override = control;
+	}
 	[[nodiscard]] const DepthControl& GetDepthControl() const { return m_depth_control; }
 	void SetDepthControl(const DepthControl& control) { m_depth_control = control; }
 	[[nodiscard]] const ModeControl& GetModeControl() const { return m_mode_control; }
@@ -904,15 +917,16 @@ private:
 
 	uint32_t m_shader_stages = 0;
 
-	DepthRenderTarget m_depth_render_target;
-	RenderControl     m_render_control;
-	DepthControl      m_depth_control;
-	StencilControl    m_stencil_control;
-	StencilMask       m_stencil_mask;
-	float             m_depth_clear_value   = 0.0f;
-	float             m_depth_bounds_min    = 0.0f;
-	float             m_depth_bounds_max    = 1.0f;
-	uint8_t           m_stencil_clear_value = 0;
+	DepthRenderTarget   m_depth_render_target;
+	RenderControl       m_render_control;
+	DepthRenderOverride m_depth_render_override;
+	DepthControl        m_depth_control;
+	StencilControl      m_stencil_control;
+	StencilMask         m_stencil_mask;
+	float               m_depth_clear_value   = 0.0f;
+	float               m_depth_bounds_min    = 0.0f;
+	float               m_depth_bounds_max    = 1.0f;
+	uint8_t             m_stencil_clear_value = 0;
 
 	ModeControl m_mode_control;
 	PolyOffset  m_poly_offset;

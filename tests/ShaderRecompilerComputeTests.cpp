@@ -504,6 +504,10 @@ struct RenderExecutorTestAccess {
     executor.ResolveRenderDepthTarget(buffer, depth);
   }
 
+  static bool DepthStencilCopy(RenderExecutor &executor, CommandBuffer &buffer) {
+    return executor.DepthStencilCopy(buffer);
+  }
+
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
@@ -8941,7 +8945,7 @@ public:
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x180000;
+    constexpr uint64_t allocation_size = 0x200000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -10086,6 +10090,261 @@ public:
               "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
       DestroyBuffer(&bounds_readback);
       registers.SetDepthClearValue(0.0f);
+
+      // DB override copies run with depth and stencil tests disabled.
+      constexpr uint64_t copy_source_depth = base + 0x180000;
+      constexpr uint64_t copy_source_stencil = base + 0x1a0000;
+      constexpr uint64_t copy_destination_depth = base + 0x1c0000;
+      constexpr uint64_t copy_destination_stencil = base + 0x1e0000;
+      constexpr uint32_t copy_side = 8;
+      constexpr uint32_t copy_layer_texels = copy_side * copy_side;
+      constexpr uint32_t copy_depth_bytes =
+          copy_layer_texels * 2 * sizeof(uint32_t);
+      constexpr uint32_t copy_readback_stride =
+          copy_depth_bytes + copy_layer_texels * 2;
+      HW::DepthRenderTarget copy_target{};
+      copy_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      copy_target.z_info.texture_compatibility =
+          Prospero::TextureCompatiblePlaneCompression::kEnable;
+      copy_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      copy_target.stencil_info.texture_compatibility =
+          Prospero::TextureCompatibleStencil::kEnable;
+      copy_target.stencil_info.htile_stencil_disabled = true;
+      copy_target.depth_view.slice_max = 1;
+      copy_target.size = {copy_side - 1, copy_side - 1, true};
+      HW::DepthControl copy_seed_control{};
+      copy_seed_control.z_enable = true;
+      copy_seed_control.z_write_enable = true;
+      copy_seed_control.stencil_enable = true;
+      registers.SetDepthControl(copy_seed_control);
+      registers.SetRenderControl({});
+      const auto make_copy_target = [&](uint64_t depth, uint64_t stencil) {
+        auto target = copy_target;
+        target.z_read_base_addr = depth;
+        target.z_write_base_addr = depth;
+        target.stencil_read_base_addr = stencil;
+        target.stencil_write_base_addr = stencil;
+        registers.SetDepthRenderTarget(target);
+        RenderDepthInfo resolved{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), resolved);
+        (void)texture_cache.FindDepthTarget(resolved.image_id, resolved.desc);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        return resolved;
+      };
+      const auto copy_source =
+          make_copy_target(copy_source_depth, copy_source_stencil);
+      const auto copy_destination =
+          make_copy_target(copy_destination_depth, copy_destination_stencil);
+      const auto clear_copy_target = [&](ImageId id, bool source) {
+        auto &image = texture_cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        for (uint32_t layer = 0; layer < 2; ++layer) {
+          const vk::ClearDepthStencilValue clear{
+              source ? (layer == 0 ? 0.75f : 0.25f)
+                     : (layer == 0 ? 0.875f : 0.625f),
+              source ? (layer == 0 ? 0xa3u : 0x5au)
+                     : (layer == 0 ? 0x31u : 0xc4u)};
+          const vk::ImageSubresourceRange range{
+              vk::ImageAspectFlagBits::eDepth |
+                  vk::ImageAspectFlagBits::eStencil,
+              0, 1, layer, 1};
+          scheduler.Current().Handle().clearDepthStencilImage(
+              image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear,
+              1, &range);
+        }
+        texture_cache.MarkGpuWritten(id);
+      };
+      struct CopyCase {
+        const char *label;
+        HW::DepthRenderOverride override;
+        uint32_t color_mode;
+        bool depth;
+        bool stencil;
+      };
+      constexpr std::array copy_cases{
+          CopyCase{"no override", {}, 0, false, false},
+          CopyCase{
+              "depth valid only", {true, false, false, false}, 0, false, false},
+          CopyCase{
+              "depth dirty only", {false, true, false, false}, 0, false, false},
+          CopyCase{"stencil valid only",
+                   {false, false, true, false},
+                   0,
+                   false,
+                   false},
+          CopyCase{"stencil dirty only",
+                   {false, false, false, true},
+                   0,
+                   false,
+                   false},
+          CopyCase{
+              "unpaired aspects", {true, false, false, true}, 0, false, false},
+          CopyCase{"color enabled", {true, true, true, true}, 1, false, false},
+          CopyCase{"depth only", {true, true, false, false}, 0, true, false},
+          CopyCase{"stencil only", {false, false, true, true}, 0, false, true},
+          CopyCase{
+              "depth and stencil", {true, true, true, true}, 0, true, true}};
+      auto copy_readback =
+          CreateHostBuffer(name, copy_cases.size() * copy_readback_stride,
+                           vk::BufferUsageFlagBits::eTransferDst, {});
+      copy_target.z_read_base_addr = copy_source_depth;
+      copy_target.z_write_base_addr = copy_destination_depth;
+      copy_target.stencil_read_base_addr = copy_source_stencil;
+      copy_target.stencil_write_base_addr = copy_destination_stencil;
+      copy_target.depth_view.slice_start = 1;
+      registers.SetDepthRenderTarget(copy_target);
+      registers.SetDepthControl({});
+      RenderDepthInfo copy_disabled_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), copy_disabled_depth);
+      Require(name, "copy without attachment tests",
+              !copy_disabled_depth.image_id,
+              "disabled depth/stencil tests acquired a regular attachment");
+      for (size_t index = 0; index < copy_cases.size(); ++index) {
+        const auto &test = copy_cases[index];
+        clear_copy_target(copy_source.image_id, true);
+        clear_copy_target(copy_destination.image_id, false);
+        registers.SetDepthRenderOverride(test.override);
+        auto color_control = registers.GetColorControl();
+        color_control.mode = test.color_mode;
+        registers.SetColorControl(color_control);
+        Require(name, test.label,
+                RenderExecutorTestAccess::DepthStencilCopy(
+                    executor, scheduler.Current()) ==
+                    (test.depth || test.stencil),
+                "DB override copy did not honor paired flags and disabled "
+                "color output");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const auto offset = index * copy_readback_stride;
+        const std::array<vk::BufferImageCopy, 2> copies{
+            {{offset,
+              0,
+              0,
+              {vk::ImageAspectFlagBits::eDepth, 0, 0, 2},
+              {},
+              copy_destination.desc.info.extent},
+             {offset + copy_depth_bytes,
+              0,
+              0,
+              {vk::ImageAspectFlagBits::eStencil, 0, 0, 2},
+              {},
+              copy_destination.desc.info.extent}}};
+        texture_cache.GetImage(copy_destination.image_id)
+            .Download(copies, copy_readback.buffer, 0, copy_readback.size);
+      }
+      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Finish();
+      const auto copy_result = ReadBuffer(
+          name, copy_readback,
+          copy_cases.size() * copy_readback_stride / sizeof(uint32_t));
+      for (size_t index = 0; index < copy_cases.size(); ++index) {
+        const auto &test = copy_cases[index];
+        const auto *depth = copy_result.data() +
+                            index * copy_readback_stride / sizeof(uint32_t);
+        const auto *stencil =
+            reinterpret_cast<const uint8_t *>(depth) + copy_depth_bytes;
+        for (uint32_t layer = 0; layer < 2; ++layer) {
+          const auto expected_depth =
+              std::bit_cast<uint32_t>(layer == 0   ? 0.875f
+                                      : test.depth ? 0.25f
+                                                   : 0.625f);
+          const auto expected_stencil = layer == 0     ? 0x31u
+                                        : test.stencil ? 0x5au
+                                                       : 0xc4u;
+          for (uint32_t texel = 0; texel < copy_layer_texels; ++texel) {
+            const auto position = layer * copy_layer_texels + texel;
+            Require(name, test.label,
+                    depth[position] == expected_depth &&
+                        stencil[position] == expected_stencil,
+                    "DB override copy changed an unselected layer/aspect or "
+                    "missed copied texels");
+          }
+        }
+      }
+      DestroyBuffer(&copy_readback);
+
+      ShaderTextureResource copy_sample_descriptor{};
+      copy_sample_descriptor.fields[0] =
+          static_cast<uint32_t>(copy_destination_depth >> 8u);
+      copy_sample_descriptor.fields[1] =
+          static_cast<uint32_t>(copy_destination_depth >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (((copy_side - 1u) & 3u) << 30u);
+      copy_sample_descriptor.fields[2] =
+          ((copy_side - 1u) >> 2u) | ((copy_side - 1u) << 14u);
+      copy_sample_descriptor.fields[3] =
+          DstSel(4, 4, 4, 4) |
+          (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+      copy_sample_descriptor.fields[4] = 1;
+      copy_sample_descriptor.fields[5] = 0x00700000u;
+      TestCase copy_sample_test;
+      copy_sample_test.name = "DepthOverrideR32Sampling";
+      copy_sample_test.has_user_data = true;
+      copy_sample_test.image_descriptor_swizzle =
+          copy_sample_descriptor.DstSelXYZW();
+      std::copy_n(copy_sample_descriptor.fields, 8,
+                  copy_sample_test.user_data.begin());
+      copy_sample_test.user_data[50] = 2 * sizeof(uint32_t);
+      copy_sample_test.opcodes = {
+          ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+          ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      copy_sample_test.required_spirv = {"OpImageSampleExplicitLod"};
+      for (uint32_t layer = 0; layer < 2; ++layer) {
+        AppendVMovLiteral(&copy_sample_test.code, 20,
+                          std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&copy_sample_test.code, 21,
+                          std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&copy_sample_test.code, 22,
+                          std::bit_cast<uint32_t>(static_cast<float>(layer)));
+        copy_sample_test.code.push_back(EncodeMimg0(0x20, 1, 0, false, 5));
+        copy_sample_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+        AppendStoreVgpr(&copy_sample_test.code, 0, layer);
+        copy_sample_test.expected.push_back(
+            std::bit_cast<uint32_t>(layer == 0 ? 0.875f : 0.25f));
+      }
+      AppendEnd(&copy_sample_test.code);
+      const auto copy_sample_program =
+          CompileCase(copy_sample_test, SubgroupSize());
+      ShaderRecompiler::IR::DescriptorValue copy_sample_value{};
+      copy_sample_value.dword_count = 8;
+      std::copy_n(copy_sample_descriptor.fields, 8,
+                  copy_sample_value.dwords.begin());
+      const auto copy_sample_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, copy_sample_program.program.info.images[0],
+          copy_sample_value);
+      const auto copy_sample_view = texture_cache.FindTexture(
+          copy_sample_binding.image_id, copy_sample_binding.desc);
+      Require(
+          name, "copied depth sampled owner",
+          copy_sample_binding.image_id == copy_destination.image_id &&
+              copy_sample_binding.desc.info.pixel_format ==
+                  vk::Format::eR32Sfloat,
+          "R32 sampling did not reuse the GPU-written depth-copy destination");
+      auto &copy_sample_image = texture_cache.GetImage(copy_destination.image_id);
+      copy_sample_image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                                vk::AccessFlagBits2::eShaderRead, {},
+                                scheduler.Current().Handle());
+      Image copied_depth_sample;
+      copied_depth_sample.view = copy_sample_view;
+      copied_depth_sample.layout = copy_sample_image.backing.state.layout;
+      scheduler.Finish();
+      auto copy_sample_output = CreateStorageBuffer(name, {}, 2);
+      const auto copy_sampler = CreateNearestSampler(name);
+      Dispatch(copy_sample_test, copy_sample_program, copy_sample_output,
+               nullptr, &copied_depth_sample, nullptr, nullptr, copy_sampler);
+      Require(
+          name, "copied depth R32 samples",
+          ReadBuffer(name, copy_sample_output, 2) == copy_sample_test.expected,
+          "R32 post-effect sampling saw stale depth after the override copy");
+      m_device.destroySampler(copy_sampler);
+      DestroyBuffer(&copy_sample_output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetDepthRenderOverride({});
+      registers.SetColorControl({});
 
       auto shared_depth_descriptor = sampled_depth_descriptor;
       shared_depth_descriptor.fields[0] =
@@ -13118,6 +13377,17 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
+    const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
+        .format = vk::Format::eBc1RgbaUnormBlock,
+        .type = vk::ImageType::e2D,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eSampled,
+        .flags = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+    };
+    const auto block_texel_view_props =
+        m_physical_device.getImageFormatProperties2(block_texel_view_info);
+    m_runtime_context.supports_block_texel_view =
+        block_texel_view_props.result == vk::Result::eSuccess;
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr =
@@ -27947,6 +28217,49 @@ void CheckPm4DepthControlHighBits(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4DepthControlHighBits");
 }
 
+void CheckPm4DepthRenderOverride(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DepthRenderOverride";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  struct Case {
+    uint32_t value;
+    HW::DepthRenderOverride expected;
+  };
+  constexpr std::array cases{Case{0x28000000u, {true, true, false, false}},
+                             Case{0x50000000u, {false, false, true, true}},
+                             Case{0x18000000u, {false, true, false, true}},
+                             Case{0x60000000u, {true, false, true, false}},
+                             Case{0xf8000000u, {true, true, true, true}},
+                             Case{0x82001a0fu, {false, false, false, false}}};
+  for (const bool indirect : {false, true}) {
+    for (const auto &test : cases) {
+      std::array<uint32_t, 2> registers{Pm4::DB_RENDER_OVERRIDE, test.value};
+      const auto address = reinterpret_cast<uint64_t>(registers.data());
+      const std::array<uint32_t, 3> direct_packet{
+          KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+          Pm4::DB_RENDER_OVERRIDE, test.value};
+      const std::array<uint32_t, 5> indirect_packet{
+          KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::R_ZERO),
+          static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+          0x80000000u, 1u};
+      Pm4Execution execution;
+      const auto result = processor.Process(
+          execution, indirect ? std::span<const uint32_t>{indirect_packet}
+                              : std::span<const uint32_t>{direct_packet});
+      const auto &actual = processor.GetCtx().GetDepthRenderOverride();
+      Require(
+          name, indirect ? "indirect register" : "direct register",
+          result == Pm4ProcessResult::Complete &&
+              actual.force_z_valid == test.expected.force_z_valid &&
+              actual.force_z_dirty == test.expected.force_z_dirty &&
+              actual.force_stencil_valid == test.expected.force_stencil_valid &&
+              actual.force_stencil_dirty == test.expected.force_stencil_dirty,
+          "DB_RENDER_OVERRIDE lost, exchanged, or retained force flags");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckAgcShaderFusion() {
   struct Case {
     bool gs;
@@ -28721,6 +29034,7 @@ int main(int argc, char **argv) {
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+    CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -28931,6 +29245,7 @@ int main(int argc, char **argv) {
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+  CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckAgcShaderFusion();
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());

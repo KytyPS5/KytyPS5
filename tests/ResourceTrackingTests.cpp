@@ -5002,6 +5002,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_WAVE_UNIFORM_BUFFER_PHI_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-image-address-table-only") == 0) {
+      TestInlineImageAddressTable();
+      std::cout << "KYTY_INLINE_IMAGE_ADDRESS_TABLE_PASS\n";
+      return 0;
+    }
     if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {
       CheckSrtRawFallbackCase(argv[2]);
       return 0;

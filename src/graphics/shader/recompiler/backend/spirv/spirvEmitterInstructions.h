@@ -120,8 +120,8 @@ inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
-inline constexpr auto EmitFPFma32 =
-    EmitGlsl<GLSLstd450Fma, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
+uint32_t EmitFPFma32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitFPMad32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);

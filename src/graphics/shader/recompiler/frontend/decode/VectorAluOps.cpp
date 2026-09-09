@@ -65,9 +65,9 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x2au, Opcode::V_SUBREV_CO_CI_U32},
     {0x26u, Opcode::V_SUB_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x27u, Opcode::V_SUBREV_NC_U32, Vop2SdwaProfile::IntegerFullDestination},
-    {0x2bu, Opcode::V_MAC_F32},
-    {0x2cu, Opcode::V_MADMK_F32},
-    {0x2du, Opcode::V_MADAK_F32},
+    {0x2bu, Opcode::V_FMAC_F32},
+    {0x2cu, Opcode::V_FMAMK_F32},
+    {0x2du, Opcode::V_FMAAK_F32},
     {0x2fu, Opcode::V_CVT_PKRTZ_F16_F32, Vop2SdwaProfile::PackedFloat16},
     {0x32u, Opcode::V_ADD_F16, Vop2SdwaProfile::Float16},
     {0x33u, Opcode::V_SUB_F16, Vop2SdwaProfile::Float16},
@@ -731,6 +731,9 @@ bool IsVop2FloatOpcode(Opcode opcode) {
 		case Opcode::V_MAC_F32:
 		case Opcode::V_MADMK_F32:
 		case Opcode::V_MADAK_F32:
+		case Opcode::V_FMAC_F32:
+		case Opcode::V_FMAMK_F32:
+		case Opcode::V_FMAAK_F32:
 		case Opcode::V_CVT_PKRTZ_F16_F32:
 		case Opcode::V_ADD_F16:
 		case Opcode::V_SUB_F16:
@@ -978,6 +981,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
                              Instruction& inst) {
 	switch (inst.opcode) {
 		case Opcode::V_MADMK_F32:
+		case Opcode::V_FMAMK_F32:
 		case Opcode::V_FMAMK_F16:
 			inst.src2      = inst.src1;
 			inst.src1      = {};
@@ -985,6 +989,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count = 3;
 			break;
 		case Opcode::V_MADAK_F32:
+		case Opcode::V_FMAAK_F32:
 		case Opcode::V_FMAAK_F16:
 			inst.src2      = {};
 			inst.src2.kind = OperandKind::LiteralConstant;
@@ -1312,6 +1317,7 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MIN_F32:
 		case Opcode::V_MAX_F32:
 		case Opcode::V_MAC_F32:
+		case Opcode::V_FMAC_F32:
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_PACK_B32_F16:
@@ -1342,6 +1348,7 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 		case Opcode::V_MIN_F32:
 		case Opcode::V_MAX_F32:
 		case Opcode::V_MAC_F32:
+		case Opcode::V_FMAC_F32:
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_FMA_F16:

@@ -15579,6 +15579,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_MAC_F32:
   case Opcode::V_MADMK_F32:
   case Opcode::V_MADAK_F32:
+  case Opcode::V_FMAC_F32:
+  case Opcode::V_FMAMK_F32:
+  case Opcode::V_FMAAK_F32:
   case Opcode::V_MIN_F32:
   case Opcode::V_MAX_F32:
   case Opcode::V_MAD_F32:
@@ -19520,7 +19523,7 @@ TestCase Vop3FmacF32NegatedSourceAccumulates() {
                   0x3f800001u, 0x3f7ffffeu, 0x3f800000u};
   // 10 - 2*3 = 4; 1 - (1+2^-23)*(1-2^-23) = 2^-46, not rounded zero.
   test.expected = {0x40800000u, 0x28800000u};
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAC_F32,
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FMAC_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpFNegate", "Fma"};
   return test;

@@ -160,6 +160,10 @@ public:
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
+	void                           PublishBuffers(PreparedBindings& bindings);
+	// Rebind and publish every stage: three passes over the whole span, never stage at a time.
+	// Both the graphics and compute paths go through this.
+	void                           FinalizeBindings(std::span<PreparedBindings* const> stages);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,

@@ -380,8 +380,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.GetGpuResources().PrepareBda();
 	}
-	RebindBuffers(bindings);
-	RebindImages(bindings);
+	PreparedBindings* stages[1] = {&bindings};
+	FinalizeBindings(std::span<PreparedBindings* const> {stages, 1u});
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;

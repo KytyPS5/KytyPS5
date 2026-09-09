@@ -55,6 +55,20 @@ public:
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// Resolves the buffer that currently owns a guest range, or {nullptr, 0} when none does.
+	// Performs a page-table lookup and nothing else: no allocation, no join, no synchronize, no
+	// upload, no dirty-state change, no LRU touch. Those belong to ObtainBuffer and must not be
+	// repeated when a binding is republished.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> FindPublishedOwner(uint64_t vaddr, uint64_t size);
+
+	// True when the buffer is the stream ring rather than a cached, guest-range-owned buffer.
+	// ObtainBuffer's stream fast path returns a throwaway ring allocation holding a private copy
+	// of the guest bytes; such a binding is owned by no guest range, must never be re-resolved by
+	// address, and keeps its allocation, offset and lifetime as issued.
+	[[nodiscard]] bool IsStreamAllocation(const Buffer* buffer) const noexcept {
+		return buffer == &m_stream_buffer;
+	}
+
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }

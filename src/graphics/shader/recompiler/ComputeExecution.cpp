@@ -171,10 +171,12 @@ bool IsSupportedLdsIntegerAtomic(O op) {
 	}
 }
 
-// Cooperative mode accepts one ordered, acyclic chain of guest workgroup
-// barriers. RDNA2 permits waves to terminate before or between barriers; those
-// paths need not pass every phase. The scheduler keeps their host invocations
-// alive until the group ends while each barrier waits only for surviving waves.
+// Cooperative mode accepts guest workgroup barriers at any statically known
+// control-flow site, including sites revisited by a loop. A waiting wave cannot
+// be scheduled again until every surviving wave is waiting, so each release
+// advances exactly one dynamic barrier generation. RDNA2 permits waves to
+// terminate between barriers; the scheduler keeps their host invocations alive
+// until the group ends while each generation waits only for surviving waves.
 std::string ProveCooperativeBarrierOrder(const IR::Program& program) {
 	const auto count = program.blocks.size();
 	if (count == 0 || count != program.block_info.size())
@@ -245,14 +247,9 @@ std::string ProveCooperativeBarrierOrder(const IR::Program& program) {
 	}
 	if (barrier_blocks.empty()) return {};
 	if (exits.empty()) return "cooperative wave64 barrier order requires a reachable exit";
-	const auto cyclic = CyclicBlocks(program);
-	for (const auto barrier : barrier_blocks) {
-		if (cyclic.contains(program.blocks[barrier]))
-			return "cooperative wave64 does not support cyclic guest barriers";
-	}
 	// A guest barrier rendezvous is identified by its dynamic occurrence, not
 	// by one static instruction address. Different waves may therefore wait at
-	// incomparable acyclic barrier sites before continuing from their own site.
+	// different sites, or revisit a site, before continuing from their own site.
 	return {};
 }
 

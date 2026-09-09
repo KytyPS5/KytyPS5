@@ -599,6 +599,7 @@ struct PipelineCache::ProgramCache {
 		}
 		auto compiled_info = std::move(result.program).TakeCompiledInfo();
 		compiled_info.compute_wave_partition_factor = wave_partition_factor;
+		compiled_info.compute_cooperative_wave64 = cooperative_wave64;
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(compiled_info),

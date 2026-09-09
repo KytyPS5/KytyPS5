@@ -24,6 +24,15 @@
 
 namespace Libs::Graphics {
 
+vk::PipelineCreateFlags ComputePipelineCreationFlags(bool cooperative_wave64) {
+	return cooperative_wave64 ? vk::PipelineCreateFlagBits::eDisableOptimization
+	                          : vk::PipelineCreateFlags {};
+}
+
+bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64) {
+	return static_cast<VkPipelineCreateFlags>(ComputePipelineCreationFlags(cooperative_wave64)) != 0;
+}
+
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
     static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
@@ -1016,7 +1025,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipe
 	vk::ComputePipelineCreateInfo info {};
 	info.sType              = vk::StructureType::eComputePipelineCreateInfo;
 	info.pNext              = nullptr;
-	info.flags              = {};
+	info.flags              = ComputePipelineCreationFlags(
+	    input_info.stage.program->compute_cooperative_wave64);
 	info.stage              = comp_shader_stage_info;
 	info.layout             = pipeline.pipeline_layout;
 	info.basePipelineHandle = nullptr;

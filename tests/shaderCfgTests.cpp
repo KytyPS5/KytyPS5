@@ -75,6 +75,7 @@ bool IsDriverCacheBuildIdentityUsableForTest(
 bool IsDriverCacheSignatureCompatibleForTest(
     std::string_view cached_signature, std::string_view expected_signature);
 std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash);
+bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64);
 namespace {
 
 void Check(bool value, const char *text) {
@@ -141,6 +142,13 @@ void TestShaderOptimizationSelection() {
   Check(!ShouldOptimizeShaderSpirvForTest(
             false, false, Config::ShaderOptimizationType::None),
         "None optimization mode admitted a module");
+}
+
+void TestCooperativePipelineDisablesDriverOptimization() {
+  Check(ComputePipelineDisablesOptimizationForTest(true),
+        "cooperative scheduler did not request bounded driver compilation");
+  Check(!ComputePipelineDisablesOptimizationForTest(false),
+        "ordinary compute pipeline lost driver optimization");
 }
 
 void TestShaderModuleDebugName() {
@@ -15748,6 +15756,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--spirv-optimization-only") == 0) {
     Libs::Graphics::TestShaderOptimizationSelection();
     std::puts("KYTY_SPIRV_OPTIMIZATION_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-pipeline-flags-only") == 0) {
+    Libs::Graphics::TestCooperativePipelineDisablesDriverOptimization();
+    std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--shader-debug-name-only") == 0) {

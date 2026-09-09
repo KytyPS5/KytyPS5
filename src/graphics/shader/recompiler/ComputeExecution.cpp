@@ -159,11 +159,12 @@ bool HasGuestBarrier(const IR::Program& program) {
 	return false;
 }
 
-bool IsSupportedLdsIntegerAtomic(O op) {
+bool IsSupportedSharedAtomic(O op) {
 	switch (op) {
 		case O::SharedAtomicSwap32: case O::SharedAtomicIAdd32: case O::SharedAtomicISub32:
 		case O::SharedAtomicSMin32: case O::SharedAtomicUMin32:
 		case O::SharedAtomicSMax32: case O::SharedAtomicUMax32:
+		case O::SharedAtomicFMin32: case O::SharedAtomicFMax32:
 		case O::SharedAtomicAnd32: case O::SharedAtomicOr32: case O::SharedAtomicXor32:
 		case O::SharedAtomicIAdd64: case O::SharedAtomicOr64:
 			return true;
@@ -278,7 +279,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			if (index < program.memory_info.size()) {
 				const auto& memory = program.memory_info[index];
 				if (memory.kind == IR::ResourceKind::Gds && memory.data_bits == 32u &&
-				    memory.data_dwords == 1u && IsSupportedLdsIntegerAtomic(op) &&
+				    memory.data_dwords == 1u && IsSupportedSharedAtomic(op) &&
 				    op != O::SharedAtomicIAdd64 && op != O::SharedAtomicOr64)
 					write_only_gds_atomic_memory.insert(index);
 			}
@@ -338,7 +339,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 		for (const auto& inst : *block) {
 			collect(IR::Value(const_cast<IR::Inst*>(&inst)));
 			const auto op = inst.GetOpcode();
-			if (!IsSupportedSplitOperation(op) && !IsSupportedLdsIntegerAtomic(op))
+			if (!IsSupportedSplitOperation(op) && !IsSupportedSharedAtomic(op))
 				return "wave64 splitting does not support operation " + std::string(IR::ValueOpcodeName(op));
 			if (IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) {
 				const auto index = inst.Flags<IR::MemoryFlags>().index;
@@ -352,7 +353,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				    (!write_only_gds && program.memory_info[index].kind != IR::ResourceKind::Lds) ||
 				    program.memory_info[index].data_bits != 32u ||
 				    program.memory_info[index].data_dwords != expected_dwords)
-					return "wave64 splitting requires matching shared integer atomic metadata";
+					return "wave64 splitting requires matching shared atomic metadata";
 			}
 			if (op == O::DppMoveU32) {
 				const auto flags = inst.Flags<IR::DppMoveFlags>();

@@ -32967,6 +32967,37 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   return test;
 }
 
+TestCase ImageSampleR8UintForcesPointSampler() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
+  code.push_back(EncodeMimg0(0x20, 0x1));
+  code.push_back(EncodeMimg1(0, 20, 0, 2));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageSampleR8UintForcesPointSampler";
+  test.code = std::move(code);
+  test.expected = {0x5au};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = std::vector<u32>(16, 0x5a5a5a5au);
+  test.sampled_image_format = vk::Format::eR8Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8UInt);
+  test.user_data[10] =
+      (static_cast<u32>(Prospero::SamplerFilter::kBilinear) << 20u) |
+      (static_cast<u32>(Prospero::SamplerFilter::kBilinear) << 22u);
+  test.has_user_data = true;
+  test.expected_force_point_sampler = true;
+  test.use_runtime_samplers = true;
+  test.required_spirv = {"OpTypeImage %uint", "OpImageSampleExplicitLod"};
+  return test;
+}
+
 TestCase ImageLoadR128IgnoresAdjacentMaskSgprs() {
   using O = ShaderOpcode;
 
@@ -36329,6 +36360,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
+  AddCase(ImageSampleR8UintForcesPointSampler);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageSampleR128DynamicMaterialPairs);
   AddCase(ImageSampleLzR128DynamicMaterialStaticSampler);
@@ -38642,10 +38674,10 @@ void CheckImageSamplerSpecialization() {
   sampled_image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   sampled_image.read = true;
   mixed_sampler_program.info.images = {sampled_image, sampled_image,
-                                       sampled_image};
+                                       sampled_image, sampled_image};
   mixed_sampler_program.info.samplers.push_back({0u, 4u});
   mixed_sampler_program.info.sampled_pairs = {
-      {0u, 0u, 8u}, {1u, 0u, 12u}, {2u, 0u, 16u}};
+      {0u, 0u, 8u}, {1u, 0u, 12u}, {2u, 0u, 16u}, {3u, 0u, 20u}};
   ShaderRecompiler::IR::MemoryInfo signed_memory;
   signed_memory.kind = ShaderRecompiler::IR::ResourceKind::Image;
   signed_memory.resource = 2u;
@@ -38695,11 +38727,16 @@ void CheckImageSamplerSpecialization() {
   signed_image_descriptor.dwords[0] = 0x3000u;
   signed_image_descriptor.dwords[1] =
       static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u;
+  auto uint_image_descriptor = native_image_descriptor;
+  uint_image_descriptor.dwords[0] = 0x4000u;
+  uint_image_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u;
 
   ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   const std::array descriptors{native_image_descriptor, packed_image_descriptor,
-                               signed_image_descriptor, sampler_descriptor};
+                               signed_image_descriptor, uint_image_descriptor,
+                               sampler_descriptor};
   mixed_sampler_program.descriptor_sources.resize(descriptors.size());
   for (u32 source = 0; source < descriptors.size(); source++) {
     auto &destination = mixed_sampler_program.descriptor_sources[source];
@@ -38711,7 +38748,7 @@ void CheckImageSamplerSpecialization() {
   for (u32 image = 0; image < mixed_sampler_program.info.images.size(); image++) {
     mixed_sampler_program.info.images[image].source = image;
   }
-  mixed_sampler_program.info.samplers[0].source = 3;
+  mixed_sampler_program.info.samplers[0].source = 4;
   mixed_sampler_program.srt_plan_complete = true;
   auto mixed_sampler_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(mixed_sampler_program);
@@ -38731,10 +38768,11 @@ void CheckImageSamplerSpecialization() {
               mixed_sampler_program.info.sampled_pairs[0].sampler == 0u &&
               mixed_sampler_program.info.sampled_pairs[1].sampler == 1u &&
               mixed_sampler_program.info.sampled_pairs[2].sampler == 1u &&
+              mixed_sampler_program.info.sampled_pairs[3].sampler == 1u &&
               mixed_sampler_program.memory_info[0].sampler == 1u &&
               mixed_sampler_snapshot.samplers.size() == 2u,
           "a shared float/integer sampler was not split into point and native "
-          "variants or the signed instruction retained the native sampler");
+          "variants or an integer image retained the native sampler");
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }

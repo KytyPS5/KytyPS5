@@ -1230,8 +1230,16 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime&
 		for (const auto& read: snapshot.immutable_srt_ranges) {
 			if (address < read.address + read.size && read.address < write_end) {
 				return SpecializationFail(fmt::format(
-				    "immutable SRT snapshot overlaps writable buffer {} (source=0x{:x}+{} writer=0x{:x}+{})",
-				    resource, read.address, read.size, address, size));
+				    "immutable SRT snapshot overlaps writable buffer {} "
+				    "(source=0x{:x}+{} writer=0x{:x}+{} mapped={} origin={} first_use_pc=0x{:08x} "
+				    "max_byte_extent={} stride={} records={} formatted={} descriptor_formatted_only={} "
+				    "scalar={} atomic={} descriptor={:08x}:{:08x}:{:08x}:{:08x})",
+				    resource, read.address, read.size, address, size, writable_size,
+				    specialization.buffer_origins[resource], metadata.first_use_pc,
+				    metadata.max_byte_extent, descriptor.Stride(), descriptor.NumRecords(),
+				    metadata.formatted, metadata.descriptor_formatted_only, metadata.scalar,
+				    metadata.atomic, descriptor.fields[0], descriptor.fields[1],
+				    descriptor.fields[2], descriptor.fields[3]));
 			}
 		}
 	}

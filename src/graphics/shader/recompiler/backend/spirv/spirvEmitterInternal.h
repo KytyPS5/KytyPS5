@@ -376,6 +376,7 @@ uint32_t EmitWaveBallot(EmitterState& state, uint32_t predicate);
 uint32_t NormalizeWaveLaneTarget(EmitterState& state, uint32_t target);
 uint32_t EmitWaveReadLane(EmitterState& state, uint32_t source, uint32_t target);
 uint32_t EmitWaveFindFirst(EmitterState& state, uint32_t ballot);
+void DefineCooperativeWaveFunctions(EmitterState& state);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 

@@ -712,6 +712,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Backs the guest's CxDbCountControl.PerfectZPassCounts -> VK_QUERY_CONTROL_PRECISE_BIT for
+	// occlusion queries (see CommandScheduler occlusion emulation). Without a precise query a
+	// driver may legally under-report partial/edge coverage as zero samples, which shows up as
+	// genuinely visible geometry being predicated away. Present on effectively every desktop GPU;
+	// degrade to approximate queries where it is not rather than refusing the device.
+	device_features.occlusionQueryPrecise    = supported_features2.features.occlusionQueryPrecise;
+	graphics.occlusion_query_precise_enabled =
+	    supported_features2.features.occlusionQueryPrecise == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};

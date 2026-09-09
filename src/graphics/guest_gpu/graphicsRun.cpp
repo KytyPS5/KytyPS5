@@ -836,17 +836,45 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: {
 			m_predicate_skip = false;
 		} break;
-		case 0x01: {
-			// Z-pass (occlusion) predication: skip the following draws when a preceding
-			// occlusion query counted zero samples. Host occlusion queries are not implemented,
-			// so results are reported as always-visible -- never predicate the draw away.
-			// (graphics tutorial 10-agc_occlusion_queries reaches here.)
+		case 0x01: { // zpass (occlusion-query) predication
+			if (address == nullptr) {
+				m_predicate_skip = false;
+				break;
+			}
+			// PredicationZPassWaitOp: kWaitForQueryResults == 0 asks the CP to stall until the
+			// occlusion result is ready (the inverse of the usual "0 means don't wait"). Without
+			// waiting, `address` still holds the pre-draw begin count and every predication would
+			// misread as "not visible".
+			if (wait_op == 0) {
+				BufferFlushAndWait();
+			}
+			// OcclusionQueryResults: DB0's {m_zPassCountBegin, m_zPassCountEnd} at [0] and [1].
+			// Bit 63 is the "written" marker (see TriggerEvent 0x39); mask it off before diffing.
+			const auto*        block   = reinterpret_cast<const volatile uint64_t*>(address);
+			constexpr uint64_t mask    = (1ull << 63u) - 1u;
+			const uint64_t     begin   = block[0] & mask;
+			const uint64_t     end     = block[1] & mask;
+			const bool         visible = end > begin;
+			switch (condition) {
+				case 0x00: m_predicate_skip = visible; break;   // kSkipIfVisible
+				case 0x01: m_predicate_skip = !visible; break;  // kSkipIfNotVisible
+				default: EXIT("unknown z-pass predication condition: 0x%08" PRIx32 "\n", condition);
+			}
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 64) {
+				LOGF("\t z-pass predication: addr=0x%016" PRIx64 ", begin=%" PRIu64 ", end=%" PRIu64
+				     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
+				     reinterpret_cast<uint64_t>(address), begin, end, condition,
+				     m_predicate_skip ? 1u : 0u, wait_op);
+			}
+		} break;
+		case 0x02: { // primitive-count predication
+			// No emulated primitive counter -- treat as unpredicated (draw everything) rather
+			// than risk wrongly culling.
 			m_predicate_skip = false;
 			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 8) {
-				LOGF("\t z-pass predication treated as always-visible (addr=0x%016" PRIx64
-				     ", condition=%" PRIu32 ")\n",
-				     reinterpret_cast<uint64_t>(address), condition);
+			if (log_count.fetch_add(1) < 32) {
+				LOGF("\t predication op 0x%08" PRIx32 " (primcount) treated as unpredicated\n", op);
 			}
 		} break;
 		case 0x03: {
@@ -1547,15 +1575,21 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			// Real Vulkan occlusion query where the sample can be serviced (render pass open,
+			// pool available): the begin/end dump pair maps onto beginQuery/endQuery around the
+			// one occlusion-tested draw the guest brackets. SampleOcclusion writes the block.
+			if (GetScheduler().Active() && GetScheduler().SampleOcclusion(event_address)) {
+				break;
+			}
+
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+				std::printf("Warning: occlusion query could not be serviced by a host query; "
+				            "falling back to always-visible (culling lost for this sample).\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
+			// Fallback: publish an always-visible result. The PS5 layout contains one interleaved
+			// begin/end pair per DB, and bit 63 marks a result ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);

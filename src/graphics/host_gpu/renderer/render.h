@@ -119,6 +119,7 @@ public:
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] bool             IsRendering() const noexcept { return m_rendering; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -131,6 +132,7 @@ private:
 	void Begin();
 	void End() const;
 
+	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;

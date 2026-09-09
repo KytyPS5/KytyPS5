@@ -980,7 +980,8 @@ static void ValidateImmutableSrtWriteAliases(
 			if (stride != 0 && records > UINT64_MAX / stride) {
 				EXIT("immutable SRT writable buffer footprint overflow\n");
 			}
-			const uint64_t size = stride == 0 ? records : stride * records;
+			const uint64_t descriptor_size = stride == 0 ? records : stride * records;
+			const uint64_t size = resource.LimitDescriptorSize(stride, descriptor_size);
 			// Match NativeStorageBuffer's explicit null/empty descriptor behavior.
 			if (address != 0 && size != 0) {
 				validate_write({address, size}, stage->program->stage, "buffer", index);

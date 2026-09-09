@@ -1747,6 +1747,7 @@ constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"dma-write", "immutable SRT snapshot requires compute without DMA writes"},
     ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute without DMA writes"},
     ImmutableSrtScenario{"buffer-disjoint", "", true},
+    ImmutableSrtScenario{"buffer-stride-zero-disjoint", "", true},
     ImmutableSrtScenario{"image-padding-disjoint", "", true},
 };
 
@@ -9951,6 +9952,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     const std::string_view selected(mode);
     const bool image_writer = selected.starts_with("image-padding-");
     const bool buffer_writer = selected.starts_with("buffer-");
+    const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint";
     const bool graphics = selected == "vertex-snapshot";
     constexpr uintptr_t base = 0x0000000205200000ull;
     constexpr uint64_t allocation_size = 0x20000u;
@@ -10000,7 +10002,9 @@ void CheckSampledHtileArrayClearDiscovery() {
       ShaderStageRuntime runtime{};
       runtime.resources.flattened_srt = {0x13579bdfu};
       constexpr uint32_t buffer_size = 256u;
-      const uint64_t writer_size = image_writer ? image_layout.size : buffer_size;
+      const uint64_t writer_size = image_writer ? image_layout.size
+                                   : stride_zero_writer ? 16u
+                                                        : buffer_size;
       ResourceReadRange source{base+writer_size-(scenario.allowed ? 0u : 4u),4u};
       if (!image_writer && !buffer_writer) source={base+0x10000u,4u};
       if (selected == "range-overflow") source={UINT64_MAX-3u,8u};
@@ -10016,11 +10020,12 @@ void CheckSampledHtileArrayClearDiscovery() {
         BufferResource info{};
         info.written = selected != "buffer-atomic-overlap";
         info.atomic = selected == "buffer-atomic-overlap";
+        info.stride_zero_access_size = stride_zero_writer ? 16u : 0u;
         program.info.buffers.push_back(info);
         ShaderBufferResource buffer{};
         buffer.UpdateAddress48(base);
-        buffer.fields[1] |= 4u<<16u;
-        buffer.fields[2] = buffer_size/4u;
+        buffer.fields[1] |= (stride_zero_writer ? 0u : 4u)<<16u;
+        buffer.fields[2] = stride_zero_writer ? 0x1000u : buffer_size/4u;
         buffer.fields[3] = DstSel(4,5,6,7);
         DescriptorValue value{};
         value.dword_count=4u;
@@ -10077,8 +10082,9 @@ void CheckSampledHtileArrayClearDiscovery() {
                       prepared.resources.images.size()==info.info.images.size(),
                   "disjoint immutable snapshot suppressed a declared writable resource");
           if (buffer_writer) {
+            const auto expected_size = stride_zero_writer ? 16u : buffer_size;
             Require(name,mode,prepared.resources.buffers[0].buffer!=nullptr &&
-                        prepared.resources.buffers[0].range==buffer_size &&
+                        prepared.resources.buffers[0].range==expected_size &&
                         prepared.buffer_sources[0].first.Base48()==base,
                     "disjoint buffer writer was omitted or rebound to a different extent");
           }
@@ -34994,7 +35000,7 @@ void CheckImmutableSrtBindingAdmission() {
   VulkanHarness vulkan;
   for (const auto& scenario:ImmutableSrtScenarios)
     if (scenario.allowed) vulkan.CheckImmutableSrtBindingCase(scenario.mode);
-  std::printf("[host]    %-32s ok (%zu rejected, 2 allowed)\n",name,cases.size());
+  std::printf("[host]    %-32s ok (%zu rejected, 3 allowed)\n",name,cases.size());
 }
 #endif
 

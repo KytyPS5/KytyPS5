@@ -130,6 +130,69 @@ void TestShaderOptimizationSelection() {
         "Size optimized module failed SPIR-V validation");
   Check(assembler.Validate(cooperative),
         "bounded cooperative optimized module failed SPIR-V validation");
+
+  constexpr const char *redundant_source = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+      %v3u32 = OpTypeVector %u32 3
+  %input_v3 = OpTypePointer Input %v3u32
+    %func_u32 = OpTypePointer Function %u32
+       %zero = OpConstant %u32 0
+        %one = OpConstant %u32 1
+        %gid = OpVariable %input_v3 Input
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+       %slot = OpVariable %func_u32 Function
+      %value = OpLoad %v3u32 %gid
+          %x = OpCompositeExtract %u32 %value 0
+          %a = OpIAdd %u32 %x %one
+          %b = OpIAdd %u32 %x %one
+        %sum = OpIAdd %u32 %a %b
+               OpStore %slot %sum
+               OpReturn
+               OpFunctionEnd
+  )";
+  std::vector<uint32_t> redundant;
+  Check(assembler.Assemble(redundant_source, &redundant) &&
+            assembler.Validate(redundant),
+        "cooperative redundancy fixture did not assemble");
+  const auto cooperative_redundant = OptimizeShaderSpirvForTest(
+      redundant, Config::ShaderOptimizationType::Performance, true);
+  Check(cooperative_redundant.size() < redundant.size(),
+        "bounded cooperative optimization retained duplicate local expressions");
+  Check(assembler.Validate(cooperative_redundant),
+        "cooperative redundancy elimination produced invalid SPIR-V");
+
+  constexpr const char *sparse_ids_source = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %100002 "main"
+               OpExecutionMode %100002 LocalSize 1 1 1
+    %100000 = OpTypeVoid
+    %100001 = OpTypeFunction %100000
+    %100002 = OpFunction %100000 None %100001
+    %100003 = OpLabel
+               OpReturn
+               OpFunctionEnd
+  )";
+  std::vector<uint32_t> sparse_ids;
+  Check(assembler.Assemble(
+            sparse_ids_source, &sparse_ids,
+            SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS) &&
+            assembler.Validate(sparse_ids),
+        "sparse cooperative ID fixture did not assemble");
+  const auto compact = OptimizeShaderSpirvForTest(
+      sparse_ids, Config::ShaderOptimizationType::Performance, true);
+  Check(compact.size() >= 4u && compact[3] < sparse_ids[3],
+        "bounded cooperative optimization retained a sparse ID bound");
+  Check(assembler.Validate(compact),
+        "cooperative ID compaction produced invalid SPIR-V");
   Check(ShouldOptimizeShaderSpirvForTest(
             false, false, Config::ShaderOptimizationType::Performance),
         "structured Performance shader was not admitted for optimization");

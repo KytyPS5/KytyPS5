@@ -376,6 +376,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			if (!planning_only) {
 				const auto image_access = IR::ImageOpcodeInfoOf(op).access;
 				const auto buffer_access = IR::BufferAccessOf(op);
+				const auto address_access = IR::AddressOpcodeInfoOf(op).access;
 				// The cooperative scheduler publishes SSBO writes between quanta.
 				// An image payload may be outside the polling SCC, so checking only
 				// cyclic image writes would miss publication through a buffer flag.
@@ -385,19 +386,19 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				const bool unsupported_publication =
 				    (image_access == IR::ImageAccess::Write && can_reach_cycle(block)) ||
 				    image_access == IR::ImageAccess::Atomic || buffer_access == IR::BufferAccess::Atomic ||
-				    (IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None &&
-				     !scalar_address_read);
+				    address_access == IR::AddressAccess::Write;
 				// Vector physical pointers do not inherit the SSBO's Coherent decoration.
-				// Scalar-address reads follow SMEM scalar-cache semantics and are emitted
-				// through the cooperative wave broadcast. Scalar buffer reads use the same
-				// path and the scheduler's AcquireRelease UniformMemory rendezvous. Read-only
-				// image payloads also need no publication when every image write is
+				// The cooperative scheduler therefore executes lane-varying physical reads
+				// only for the selected guest wave and publishes the previous quantum with
+				// AcquireRelease UniformMemory. Physical writes remain unsupported. Scalar
+				// address and buffer reads use the same rendezvous plus a wave broadcast.
+				// Read-only image payloads need no publication when every image write is
 				// terminal with respect to all scheduler cycles.
 				const bool read_only_image = image_access == IR::ImageAccess::Read &&
 				                             !image_write_reaches_cycle;
 				const bool unsupported_cyclic_read = cyclic.contains(block) && IsGuestRead(op) &&
 				    buffer_access != IR::BufferAccess::Read && op != O::ReadConstBuffer &&
-				    !scalar_address_read &&
+				    address_access != IR::AddressAccess::Read && !scalar_address_read &&
 				    !read_only_image;
 				if (unsupported_publication ||
 				    (unsupported_cyclic_read && !unproved_cooperative_publication)) {
@@ -470,11 +471,11 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 
 	if (!cyclic_reads.empty()) {
 		// A complete host workgroup can fairly interleave logical waves and
-		// publish coherent buffer accesses at each PC publication barrier. Keep
-		// image, raw-address, scalar-cache and atomic communication unsupported
-		// until their distinct visibility protocols have executable regressions.
+		// publish coherent buffer and read-only physical-address accesses at each
+		// PC publication barrier. Keep physical writes and atomic communication
+		// unsupported until their distinct visibility protocols have regressions.
 		if (cooperative && unproved_cooperative_publication)
-			return "cooperative wave64 cyclic communication requires ordinary buffer reads and writes; found " +
+			return "cooperative wave64 cyclic communication does not support memory operation " +
 			       std::string(IR::ValueOpcodeName(unproved_cooperative_operation)) +
 			       (unproved_cooperative_operation_is_cyclic ? " in cycle" : " outside cycle");
 		if ((!cyclic_writes.empty() || !cyclic_appends.empty()) && !cooperative) {

@@ -9853,8 +9853,9 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
       memory(block,O::ImageAtomicOr32,{image,coords,V(1u),V(true)},IR::ResourceKind::Image);
     };
     const auto address_read = [&](uint32_t block) {
-      // BDA reads alias the same cached buffer through an unqualified physical
-      // pointer. Descriptor Coherent does not publish to this access path.
+      // BDA reads alias the same cached buffer through a physical pointer. The
+      // cooperative scheduler's UniformMemory rendezvous publishes each prior
+      // quantum before the selected guest wave follows this access path.
       const auto raw = memory(block,O::LoadAddressU32,
           {address,V(0u),V(0u),V(true)},IR::ResourceKind::Global);
       f.Emit(block,O::ReferenceU32,{raw});
@@ -9950,7 +9951,9 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
       f.KeepWave(after);
     }
 	if (scenario == Scenario::Partitioned) f.limits.max_invocations = 128u;
-    const bool accepted = scenario == Scenario::BufferCycle ||
+    const bool accepted = scenario == Scenario::AcyclicAddressReadBefore ||
+        scenario == Scenario::AcyclicAddressReadAfter ||
+        scenario == Scenario::CyclicAddressRead || scenario == Scenario::BufferCycle ||
         scenario == Scenario::SeparateWriterCycle || scenario == Scenario::AcyclicInputImage ||
         scenario == Scenario::ImmutableSnapshot || scenario == Scenario::PlanningOnlyAddressTemplate ||
         scenario == Scenario::CyclicScalarAddressRead ||

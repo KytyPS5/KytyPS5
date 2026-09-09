@@ -26259,6 +26259,65 @@ TestCase Wave64CooperativeCyclicScalarAddressRead() {
   return test;
 }
 
+// A FLAT load remains lane-varying inside a cooperative loop. Each logical
+// wave revisits values written through the ordinary storage-buffer binding,
+// so the scheduler must publish the previous quantum before the physical
+// address load executes again.
+TestCase Wave64CooperativeCyclicPhysicalAddressRead() {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256u;
+  constexpr u32 total = 2u * local_count;
+  constexpr u32 output_dword = 4u;
+  constexpr u32 mailbox_dword = output_dword + total;
+  constexpr u32 iterations = 4u;
+  auto test = MakeMultiWaveLdsCase(
+      "Wave64CooperativeCyclicPhysicalAddressRead", local_count, local_count,
+      2u);
+  for (u32 index = 0; index < total; ++index) {
+    test.initial[mailbox_dword + index] = 0x41000000u + index;
+  }
+  test.expected = test.initial;
+  test.bda_mappings = {{0u, 0u}};
+
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  AppendMultiWaveLdsStore(&code, 5u, 7u);
+  AppendMultiWaveGuestBarrier(&code);
+  AppendVMovU32(&code, 9u, mailbox_dword);
+  code.push_back(EncodeVop2(0x25, 9u, Vgpr(4u), 9u));
+  code.push_back(EncodeVop2(0x1a, 9u, InlineU32(2u), 9u));
+  code.push_back(EncodeVop1(0x01, 20u, Vgpr(9u)));
+  AppendVMovU32(&code, 21u, 0u);
+  code.push_back(EncodeSMovB32(40u, InlineU32(0u)));
+  const size_t loop = code.size();
+  code.push_back(EncodeFlat0(0x0cu, 0u));
+  code.push_back(EncodeFlat1(10u, 0x7du, 0u, 20u));
+  code.push_back(EncodeSopp(0x0cu, 0u));
+  code.push_back(EncodeVop2(0x25, 10u, InlineU32(1u), 10u));
+  AppendBufferStoreDword(&code, 10u, 9u);
+  code.push_back(EncodeSopk(0x17u, 125u, 0u));
+  code.push_back(EncodeSop2(0x00u, 40u, 40u, InlineU32(1u)));
+  code.push_back(EncodeSopc(0x0au, 40u, InlineU32(iterations)));
+  const size_t repeat = code.size();
+  code.push_back(EncodeSopp(0x05u, static_cast<u32>(
+      static_cast<int32_t>(loop) - static_cast<int32_t>(repeat) - 1)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10u, 4u, output_dword);
+  AppendEnd(&code);
+
+  for (u32 index = 0; index < total; ++index) {
+    const u32 value = 0x41000000u + index + iterations;
+    test.expected[output_dword + index] = value;
+    test.expected[mailbox_dword + index] = value;
+  }
+  test.opcodes = {O::DS_WRITE_B32, O::S_BARRIER, O::FLAT_LOAD_DWORD,
+                  O::S_WAITCNT, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD,
+                  O::S_ADD_U32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1,
+                  O::S_ENDPGM};
+  test.ir_counts = {{"LoadAddressU32", 1u}};
+  test.required_spirv = {"OpControlBarrier"};
+  return test;
+}
+
 TestCase MakeWave64SingleGroupLdsTileCase(bool explicit_barrier) {
   using O = ShaderOpcode;
   constexpr u32 count = 128;
@@ -30264,6 +30323,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64CooperativeBufferProducerConsumer);
   AddCase(Wave64CooperativeBdaCoefficientsByWorkgroup);
   AddCase(Wave64CooperativeCyclicScalarAddressRead);
+  AddCase(Wave64CooperativeCyclicPhysicalAddressRead);
   AddCase(Wave64SingleGroupLdsImplicitOrdering);
   AddCase(Wave64SingleGroupLdsExplicitBarrier);
   AddCase(Wave64SingleGroupLdsUniformBranchOrdering);
@@ -35453,6 +35513,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-cyclic-scalar-address-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64CooperativeCyclicScalarAddressRead());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-cyclic-physical-address-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Wave64CooperativeCyclicPhysicalAddressRead());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-cooperative-ssbo-only") == 0) {

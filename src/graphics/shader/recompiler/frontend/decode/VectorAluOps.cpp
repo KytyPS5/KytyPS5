@@ -1253,6 +1253,90 @@ bool SupportsVopcSdwa(Opcode opcode) {
 	       (opcode < Opcode::V_CMP_F_I64 || opcode > Opcode::V_CMPX_T_U64);
 }
 
+// V_CMP_CLASS_* is the only VOPC whose sources differ: its second source is an integer mask.
+enum class VopcSdwaSource {
+	Integer32,
+	Integer16,
+	Float32,
+	Float16,
+};
+
+bool IsVopc16BitCompareOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::V_CMPX_LE_I16:
+		case Opcode::V_CMPX_GT_I16:
+		case Opcode::V_CMPX_NE_I16:
+		case Opcode::V_CMPX_GE_I16:
+		case Opcode::V_CMPX_LT_U16:
+		case Opcode::V_CMPX_EQ_U16:
+		case Opcode::V_CMP_NGE_F16:
+		case Opcode::V_CMP_NGT_F16:
+		case Opcode::V_CMPX_NLE_F16:
+		case Opcode::V_CMP_LT_I16:
+		case Opcode::V_CMP_EQ_I16:
+		case Opcode::V_CMPX_LT_I16:
+		case Opcode::V_CMPX_EQ_I16:
+		case Opcode::V_CMP_LE_I16:
+		case Opcode::V_CMP_GT_I16:
+		case Opcode::V_CMP_NE_I16:
+		case Opcode::V_CMP_GE_I16:
+		case Opcode::V_CMP_LT_U16:
+		case Opcode::V_CMP_EQ_U16:
+		case Opcode::V_CMP_LE_U16:
+		case Opcode::V_CMP_GT_U16:
+		case Opcode::V_CMPX_GT_U16:
+		case Opcode::V_CMP_NE_U16:
+		case Opcode::V_CMPX_NE_U16:
+		case Opcode::V_CMP_GE_U16:
+		case Opcode::V_CMP_LT_F16:
+		case Opcode::V_CMP_EQ_F16:
+		case Opcode::V_CMP_LE_F16:
+		case Opcode::V_CMP_GT_F16:
+		case Opcode::V_CMP_LG_F16:
+		case Opcode::V_CMP_GE_F16:
+		case Opcode::V_CMP_NEQ_F16:
+		case Opcode::V_CMP_NLT_F16:
+		case Opcode::V_CMPX_LT_F16:
+		case Opcode::V_CMPX_EQ_F16:
+		case Opcode::V_CMPX_LE_F16:
+		case Opcode::V_CMPX_GT_F16:
+		case Opcode::V_CMPX_GE_F16:
+		case Opcode::V_CMPX_NGT_F16:
+		case Opcode::V_CMPX_NEQ_F16:
+		default: return false;
+	}
+}
+
+VopcSdwaSource VopcSdwaSourceClass(Opcode opcode, bool second) {
+		return VopcSdwaSource::Integer32;
+	}
+	const bool half = IsVopc16BitCompareOpcode(opcode);
+	if (IsVopcFloatCompareOpcode(opcode)) {
+		return half ? VopcSdwaSource::Float16 : VopcSdwaSource::Float32;
+	}
+	return half ? VopcSdwaSource::Integer16 : VopcSdwaSource::Integer32;
+}
+
+// Returns why one SDWA source cannot be translated, or nullptr when it can.
+const char* VopcSdwaSourceRejection(VopcSdwaSource source, bool sext, bool negate, bool absolute) {
+	switch (source) {
+		case VopcSdwaSource::Float32:
+		case VopcSdwaSource::Float16:
+			// SRC_SEXT shares its encoding bit with the float modifiers.
+			if (sext) {
+				return "VOPC SDWA sign extension is not supported for float compares";
+			}
+			break;
+		case VopcSdwaSource::Integer32:
+		case VopcSdwaSource::Integer16:
+			if (negate || absolute) {
+				return "VOPC SDWA float source modifiers are not supported for integer compares";
+			}
+			break;
+	}
+	return nullptr;
+}
+
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
 	const auto modifier = code[word_index + 1u];
@@ -1266,6 +1350,17 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 		SetUnsupported(inst, Family::VOPC, opcode,
 		               "VOPC SDWA modifier is not supported for opcode");
 		return;
+	}
+	for (const bool second: {false, true}) {
+		const auto* reason =
+		    VopcSdwaSourceRejection(VopcSdwaSourceClass(inst.opcode, second),
+		                            (second ? fields.src1_sext : fields.src0_sext) != 0u,
+		                            (second ? fields.src1_neg : fields.src0_neg) != 0u,
+		                            (second ? fields.src1_abs : fields.src0_abs) != 0u);
+		if (reason != nullptr) {
+			SetUnsupported(inst, Family::VOPC, opcode, reason);
+			return;
+		}
 	}
 
 	DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0);

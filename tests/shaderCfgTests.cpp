@@ -4901,6 +4901,64 @@ void TestNewShaderDecoderArchitecture() {
             byte_left_shift.src1.value == 1u,
         "decoder rejected or misdecoded captured V_LSHLREV_B32 byte shift");
 
+  // VOPC opcode 153 is V_CMPX_LT_I16 and 154 is V_CMPX_EQ_I16.
+  const uint32_t vopc_sdwa_cmpx_lt_i16[] = {
+      0x7d3236f9u,
+      0x85050027u, // v_cmpx_lt_i16 v39.word1, s27.word1
+  };
+  Instruction cmpx_lt_i16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmpx_lt_i16, 0u,
+                                               cmpx_lt_i16);
+  Check(cmpx_lt_i16.family == Family::VOPC &&
+            cmpx_lt_i16.opcode == Opcode::V_CMPX_LT_I16 &&
+            cmpx_lt_i16.word_count == 2u && cmpx_lt_i16.src_count == 2u &&
+            cmpx_lt_i16.dst.kind == OperandKind::ExecLo &&
+            cmpx_lt_i16.src0.kind == OperandKind::Vgpr &&
+            cmpx_lt_i16.src0.reg == 39u && cmpx_lt_i16.src0.sdwa_sel == 5u &&
+            !cmpx_lt_i16.src0.sdwa_sext && !cmpx_lt_i16.src0.negate &&
+            !cmpx_lt_i16.src0.absolute &&
+            cmpx_lt_i16.src1.kind == OperandKind::Sgpr &&
+            cmpx_lt_i16.src1.reg == 27u && cmpx_lt_i16.src1.sdwa_sel == 5u &&
+            !cmpx_lt_i16.src1.sdwa_sext && !cmpx_lt_i16.src1.negate &&
+            !cmpx_lt_i16.src1.absolute,
+        "decoder rejected or misdecoded captured VOPC SDWA V_CMPX_LT_I16");
+
+  const uint32_t vopc_sdwa_cmpx_eq_i16[] = {0x7d3436f9u, 0x85050027u};
+  Instruction cmpx_eq_i16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmpx_eq_i16, 0u,
+                                               cmpx_eq_i16);
+  Check(cmpx_eq_i16.family == Family::VOPC &&
+            cmpx_eq_i16.opcode == Opcode::V_CMPX_EQ_I16 &&
+            cmpx_eq_i16.dst.kind == OperandKind::ExecLo &&
+            cmpx_eq_i16.src0.reg == 39u && cmpx_eq_i16.src1.reg == 27u,
+        "decoder misdecoded VOPC opcode 154 as something other than V_CMPX_EQ_I16");
+
+  const uint32_t vopc_sdwa_cmp_nlt_f16[] = {
+      0x7ddde0f9u,
+      0x86068210u, // v_cmp_nlt_f16 s2, v16, 0.5
+  };
+  Instruction cmp_nlt_f16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmp_nlt_f16, 0u,
+                                               cmp_nlt_f16);
+  Check(cmp_nlt_f16.family == Family::VOPC &&
+            cmp_nlt_f16.opcode == Opcode::V_CMP_NLT_F16 &&
+            cmp_nlt_f16.word_count == 2u && cmp_nlt_f16.src_count == 2u &&
+            cmp_nlt_f16.dst.kind == OperandKind::Sgpr &&
+            cmp_nlt_f16.dst.reg == 2u &&
+            cmp_nlt_f16.src0.kind == OperandKind::Vgpr &&
+            cmp_nlt_f16.src0.reg == 16u && cmp_nlt_f16.src0.sdwa_sel == 6u &&
+            !cmp_nlt_f16.src0.sdwa_sext &&
+            cmp_nlt_f16.src1.kind == OperandKind::FloatInlineConstant &&
+            cmp_nlt_f16.src1.value == 0x3f000000u &&
+            cmp_nlt_f16.src1.sdwa_sel == 6u && !cmp_nlt_f16.src1.sdwa_sext,
+        "decoder rejected or misdecoded captured VOPC SDWA V_CMP_NLT_F16");
+
+  // SDWA on a 64-bit compare is not encodable, so it must stay rejected.
+  const uint32_t vopc_sdwa_u64[] = {0x7dc200f9u, 0x86060610u};
+  Instruction sdwa_u64;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_u64, 0u, sdwa_u64);
+  Check(sdwa_u64.opcode == Opcode::UNSUPPORTED,
+        "decoder accepted SDWA on a 64-bit VOPC compare");
   const uint32_t vop2_sdwa_byte_left_destination[] = {
       0x340a08f9u, 0x01861187u, // v_lshlrev_b32 v5.byte1, 7, v4.byte1; preserve
   };

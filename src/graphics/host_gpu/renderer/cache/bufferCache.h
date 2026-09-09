@@ -40,7 +40,10 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
-	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
+	[[nodiscard]] Buffer&  GetBuffer(BufferId id) {
+		EnsureDeviceStateCleared();
+		return m_slot_buffers[id];
+	}
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
@@ -56,8 +59,14 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
-	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() {
+		EnsureDeviceStateCleared();
+		return &m_bda_pagetable_buffer;
+	}
+	[[nodiscard]] Buffer* GetFaultBuffer() {
+		EnsureDeviceStateCleared();
+		return m_fault_manager.GetFaultBuffer();
+	}
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -91,6 +100,16 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// Device-local allocations start undefined. The BDA page table, the fault bitset and the
+	// null buffer are all read before anything writes them, and a zero word is what makes them
+	// safe, so clear them at the first access: Buffer::Fill needs a recording command buffer,
+	// which the constructor does not have.
+	void EnsureDeviceStateCleared() {
+		if (!m_device_state_cleared) [[unlikely]] {
+			ClearDeviceState();
+		}
+	}
+	void ClearDeviceState();
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -111,6 +130,7 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
+	bool                                              m_device_state_cleared = false;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;

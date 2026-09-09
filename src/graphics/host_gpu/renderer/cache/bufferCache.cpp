@@ -43,7 +43,25 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+void BufferCache::ClearDeviceState() {
+	// Buffer::Fill records into the scheduler's current command buffer, so the clear can only run
+	// once one is open. Skipping an earlier accessor only defers it.
+	if (!m_scheduler.Active()) {
+		return;
+	}
+	// Set the flag first: Buffer::Fill acquires the scheduler's command buffer, and a nested
+	// accessor call must not restart the clear.
+	m_device_state_cleared = true;
+	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	auto* fault_buffer = m_fault_manager.GetFaultBuffer();
+	fault_buffer->Fill(0, fault_buffer->Size(), 0);
+	auto& null_buffer = m_slot_buffers[NULL_BUFFER_ID];
+	null_buffer.Fill(0, null_buffer.Size(), 0);
+}
+
 void BufferCache::Register(BufferId id) {
+	// Page-table entries written below must not be undone by a later clear.
+	EnsureDeviceStateCleared();
 	ChangeRegister<true>(id);
 }
 

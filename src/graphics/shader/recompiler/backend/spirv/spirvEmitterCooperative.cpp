@@ -226,30 +226,77 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 		}
 	}
 	std::unordered_set<const IR::Inst*> branch_conditions;
-	for (const auto& block : ctx.program.block_info) {
+	std::unordered_set<const IR::Inst*> cross_block_conditions;
+	for (size_t index = 0; index < ctx.program.block_info.size(); ++index) {
+		const auto& block = ctx.program.block_info[index];
 		if (const auto* condition = block.condition.Resolve().TryInstruction(); condition != nullptr) {
 			branch_conditions.insert(condition);
-		}
-	}
-	for (const auto* block : ctx.program.blocks) for (const auto& inst : *block) {
-		// Opaque resource/address recipes are compile-time structures. Runtime
-		// values need Function storage only when a scheduler phase, CFG edge, or
-		// Phi assignment can separate their definition from a consumer.
-		if (ctx.TypeId(inst.GetType()) == 0) continue;
-		if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
-		    ctx.Memory(inst).planning_only) continue;
-		const auto phase = function.phases.find(&inst);
-		bool spill = inst.GetOpcode() == O::Phi || IsRuntimeScalarRead(ctx, inst) ||
-		             branch_conditions.contains(&inst) || phase == function.phases.end();
-		for (const auto& use : inst.Uses()) {
-			const auto user_phase = function.phases.find(use.user);
-			if (phase == function.phases.end() || user_phase == function.phases.end() ||
-			    user_phase->second != phase->second) {
-				spill = true;
-				break;
+			if (index >= ctx.program.blocks.size() || condition->Parent() != ctx.program.blocks[index]) {
+				cross_block_conditions.insert(condition);
 			}
 		}
-		if (spill) function.spills.emplace(&inst, ctx.state.builder.AllocateId());
+	}
+	struct ReusableSlot {
+		uint32_t        id = 0;
+		uint32_t        end = 0;
+		const IR::Block* block = nullptr;
+	};
+	std::unordered_map<IR::Type, std::vector<ReusableSlot>> reusable_slots;
+	for (const auto* block : ctx.program.blocks) {
+		std::unordered_map<const IR::Inst*, uint32_t> positions;
+		uint32_t position = 0;
+		for (const auto& inst : *block) positions.emplace(&inst, position++);
+		for (const auto& inst : *block) {
+			// Opaque resource/address recipes are compile-time structures. Runtime
+			// values need Function storage only when a scheduler phase, CFG edge, or
+			// Phi assignment can separate their definition from a consumer.
+			if (ctx.TypeId(inst.GetType()) == 0) continue;
+			if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
+			    ctx.Memory(inst).planning_only) continue;
+			const auto phase = function.phases.find(&inst);
+			bool spill = inst.GetOpcode() == O::Phi || IsRuntimeScalarRead(ctx, inst) ||
+			             branch_conditions.contains(&inst) || phase == function.phases.end();
+			for (const auto& use : inst.Uses()) {
+				const auto user_phase = function.phases.find(use.user);
+				if (phase == function.phases.end() || user_phase == function.phases.end() ||
+				    user_phase->second != phase->second) {
+					spill = true;
+					break;
+				}
+			}
+			if (!spill) continue;
+
+			const auto start = positions.at(&inst);
+			auto       end = start;
+			bool reusable = inst.GetOpcode() != O::Phi && !cross_block_conditions.contains(&inst);
+			for (const auto& use : inst.Uses()) {
+				const auto found = positions.find(use.user);
+				if (use.user == nullptr || use.user->Parent() != block || found == positions.end() ||
+				    found->second < start) {
+					reusable = false;
+					break;
+				}
+				end = std::max(end, found->second);
+			}
+			if (branch_conditions.contains(&inst)) end = position;
+			if (!reusable) {
+				function.spills.emplace(&inst, ctx.state.builder.AllocateId());
+				continue;
+			}
+			auto& slots = reusable_slots[inst.GetType()];
+			const auto available = std::ranges::find_if(slots, [&](const ReusableSlot& slot) {
+				return slot.block != block || slot.end < start;
+			});
+			if (available != slots.end()) {
+				available->block = block;
+				available->end = end;
+				function.spills.emplace(&inst, available->id);
+			} else {
+				const auto id = ctx.state.builder.AllocateId();
+				slots.push_back({id, end, block});
+				function.spills.emplace(&inst, id);
+			}
+		}
 	}
 	return function;
 }
@@ -259,8 +306,10 @@ void DeclareCooperativeFunctionVariables(ValueEmitContext& ctx, const Cooperativ
 	for (const auto variable : {function.pc_variable, function.cursor_variable})
 		ctx.state.builder.AddFunction({OpVariable, word_pointer, variable, StorageClassFunction});
 	// Follow instruction order to keep generated modules deterministic.
+	std::unordered_set<uint32_t> declared;
 	for (const auto* block : ctx.program.blocks) for (const auto& inst : *block) {
-		if (const auto found = function.spills.find(&inst); found != function.spills.end())
+		if (const auto found = function.spills.find(&inst);
+		    found != function.spills.end() && declared.insert(found->second).second)
 			ctx.state.builder.AddFunction({OpVariable,
 			    TypePointer(ctx.state, StorageClassFunction, ctx.TypeId(inst.GetType())),
 			    found->second, StorageClassFunction});

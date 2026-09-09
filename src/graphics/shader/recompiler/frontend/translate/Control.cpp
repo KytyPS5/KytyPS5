@@ -301,10 +301,19 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 	}
 }
 
-void Translator::S_WQM_B64(const Decoder::Instruction& inst) {
-	const auto mask_valid  = ReadMaskValid(inst.src0);
-	const auto result =
-	    IR::U64(ir.Emit(IR::ValueOpcode::WqmU64, {ReadOperand(inst.src0, IR::Type::U64)}));
+void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
+	const auto source = wide ? ReadU64(inst.src0)
+	                         : ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)));
+	const auto result = IR::U64(ir.Emit(IR::ValueOpcode::WqmU64, {source}));
+	if (!wide) {
+		const auto low = ir.CompositeExtract(result, 0);
+		// A 32-bit write preserves the other EXEC/VCC half and invalidates any
+		// overlapping SGPR-pair mask provenance through the ordinary scalar path.
+		WriteRawU32(inst.dst, low);
+		ir.SetScc(ir.INotEqual(low, IR::U32(IR::Value(0u))));
+		return;
+	}
+	const auto mask_valid = ReadMaskValid(inst.src0);
 	WriteOperand(DestinationOperand(inst), result);
 	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);

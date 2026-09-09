@@ -15882,6 +15882,84 @@ TestCase ScalarSelectB64PreservesMaskProvenance() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarWqmB32Masks(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 64 ? "ScalarWqmB32MasksWave64" : "ScalarWqmB32MasksWave32";
+  auto &code = test.code;
+  const auto store_scalar = [&](u32 reg, u32 expected) {
+    AppendStoreSgprAtLaneDwordOffset(&code, reg, 0,
+                                    static_cast<u32>(test.expected.size()));
+    test.expected.insert(test.expected.end(), wave_size, expected);
+  };
+  const auto store_marker = [&](u32 lo, u32 hi) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0,
+                                    static_cast<u32>(test.expected.size()));
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const u32 mask = lane < 32 ? lo : hi;
+      test.expected.push_back(((mask >> (lane % 32)) & 1u) != 0 ? 9u : 0u);
+    }
+  };
+  constexpr u32 other_half = 0x2468ace0u;
+  constexpr u32 masks[] = {0, 1, 8, 0x10, 0x100, 0x80000000u, 0x12481248u, ~0u};
+  for (u32 mask : masks) {
+    u32 expanded = 0;
+    for (u32 bit = 0; bit < 32; bit += 4) {
+      if ((mask & (0xfu << bit)) != 0) expanded |= 0xfu << bit;
+    }
+    AppendVMovU32(&code, 2, 0);
+    AppendSMovLiteral(&code, 126, mask);
+    AppendSMovLiteral(&code, 127, other_half);
+    code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(mask == 0 ? 0 : 1)));
+    code.push_back(0xbefe097eu); // Captured S_WQM_B32 EXEC_LO, EXEC_LO.
+    code.push_back(EncodeSMovB32(20, 126));
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(22, 253));
+    AppendVMovU32(&code, 2, 9);
+    code.push_back(EncodeSop1(0x04, 126, 193));
+    store_scalar(20, expanded);
+    store_scalar(21, other_half);
+    store_scalar(22, mask != 0 ? 1u : 0u);
+    store_marker(expanded, other_half);
+  }
+  // VALU-produced masks keep WQM dynamic and carry provenance through S_MOV_B64.
+  // Updating either word must invalidate an old SGPR-pair predicate and preserve
+  // the other word. Wave32 still reads/writes the scalar high half independently.
+  for (u32 base : {8u, 106u, 126u}) {
+    for (u32 half : {0u, 1u}) {
+      AppendVMovU32(&code, 2, 0);
+      code.push_back(EncodeVop2(0x1b, 1, InlineU32(31), 0));
+      code.push_back(EncodeVopc(0xc2, InlineU32(3), 1)); // Lanes 3 and 35.
+      code.push_back(EncodeSop1(0x04, base, 106));
+      code.push_back(EncodeSop1(0x09, base + half, base + half));
+      code.push_back(EncodeSMovB32(20, base));
+      code.push_back(EncodeSMovB32(21, base + 1));
+      code.push_back(EncodeSMovB32(22, 253));
+      code.push_back(EncodeSop1(0x04, 126, base));
+      AppendVMovU32(&code, 2, 9);
+      code.push_back(EncodeSop1(0x04, 126, 193));
+      const u32 lo = half == 0 ? 0xfu : 8u;
+      const u32 hi = wave_size == 32 ? 0u : half == 1 ? 0xfu : 8u;
+      store_scalar(20, lo);
+      store_scalar(21, hi);
+      store_scalar(22, wave_size == 32 && half == 1 ? 0u : 1u);
+      store_marker(lo, hi);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_WQM_B32, O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32,
+                  O::V_CMP_EQ_U32, O::V_MOV_B32, O::V_AND_B32, O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_WQM_B32 exec_lo, exec_lo", 9}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarWqmB64SelectsSccDomain() {
   using O = ShaderOpcode;
 
@@ -24538,6 +24616,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarSelectB64PreservesMaskProvenance);
   AddCase(ScalarWqmB64SelectsSccDomain);
   AddCase(ScalarWqmB64PreservesPartialMasks);
+  cases.push_back(ScalarWqmB32Masks(32));
+  cases.push_back(ScalarWqmB32Masks(64));
   AddCase(ScalarMaskProvenanceOverlapAndMixedBinary);
   AddCase(ScalarLiteral);
   AddCase(VectorMoves);
@@ -29034,6 +29114,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarConditionalMoveB64PreservesMasks());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
     RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
+    RunCase(&vulkan, ScalarWqmB32Masks(32));
+    RunCase(&vulkan, ScalarWqmB32Masks(64));
     RunCase(&vulkan, ScalarMaskProvenanceOverlapAndMixedBinary());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     RunCase(&vulkan, Vop1MoveRelDestination());

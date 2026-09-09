@@ -340,10 +340,12 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		end                       = std::max(end, buffer_end);
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
-			if (expands_right) {
+			// Fix the shadPS4 bug that reserves space opposite to the incoming stream's growth.
+			// The old buffer extending left of the request predicts growth to the right, and vice versa.
+			if (expands_left) {
 				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
 			}
-			if (expands_left) {
+			if (expands_right) {
 				const auto minimum = CACHING_PAGESIZE * 2;
 				if (begin > minimum) {
 					begin -= std::min(StreamLeapSize, begin - minimum);

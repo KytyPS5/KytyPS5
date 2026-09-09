@@ -3605,33 +3605,80 @@ public:
                   resolved_left_offset != resolved_right_offset,
               "saved descriptor IDs did not resolve through the merged owner");
 
-      constexpr uint64_t stream_begin = base + 0x1800000;
       constexpr uint64_t stream_page = BufferCache::CACHING_PAGESIZE;
       constexpr uint64_t stream_leap = stream_page * 128;
-      const auto caught =
-          cache.FindBuffer(stream_begin - stream_leap / 2, stream_page);
-      const auto anchor = cache.FindBuffer(stream_begin, stream_page * 2);
-      cache.GetBuffer(anchor).IncreaseStreamScore(16);
-      const auto scored =
-          cache.FindBuffer(stream_begin + stream_page * 2 - 4, 8);
-      Require(name, "stream growth threshold",
-              cache.GetBuffer(scored).CpuAddress() == stream_begin &&
-                  cache.GetBuffer(scored).Size() == stream_page * 3 &&
-                  cache.GetBuffer(scored).StreamScore() == 17,
-              "buffer range grew before the stream threshold");
-      const auto grown =
-          cache.FindBuffer(stream_begin + stream_page * 3 - 4, 8);
-      const auto &grown_buffer = cache.GetBuffer(grown);
-      Require(name, "stream range leap",
-              grown_buffer.CpuAddress() == stream_begin - stream_leap &&
-                  grown_buffer.Size() == stream_leap + stream_page * 4 &&
-                  grown_buffer.StreamScore() == 0 &&
-                  cache.GetBuffer(caught).is_deleted &&
-                  cache.GetBuffer(scored).is_deleted &&
-                  BufferCacheTestAccess::PageOwner(
-                      cache, stream_begin - stream_leap / 2) == grown,
-              "buffer stream leap changed its direction, size, reset, or "
-              "overlap capture");
+      for (const bool forward : {true, false}) {
+        const char *stream_name =
+            forward ? "ForwardBufferStream" : "BackwardBufferStream";
+        const uint64_t stream_begin = base + (forward ? 0x1800000 : 0x2000000);
+        const uint64_t caught_address = forward
+                                            ? stream_begin + stream_leap / 2
+                                            : stream_begin - stream_leap / 2;
+        const uint64_t untouched_address = forward
+                                               ? stream_begin - stream_leap / 2
+                                               : stream_begin + stream_leap / 2;
+        const auto caught = cache.FindBuffer(caught_address, stream_page);
+        const auto untouched = cache.FindBuffer(untouched_address, stream_page);
+        auto grown = cache.FindBuffer(stream_begin, stream_page * 2);
+        constexpr uint32_t stream_value = 0x6a3b92d1u;
+        for (const auto address : {stream_begin, caught_address}) {
+          MarkGpuWrite(address, sizeof(stream_value));
+          cache.FillBuffer(address, sizeof(stream_value), stream_value, false);
+        }
+
+        uint64_t requested_begin = stream_begin;
+        uint64_t requested_end = stream_begin + stream_page * 2;
+        for (uint32_t step = 1; step <= 18; ++step) {
+          const auto address = (forward ? requested_end : requested_begin) - 4;
+          grown = cache.FindBuffer(address, 8);
+          if (forward) {
+            requested_end += stream_page;
+          } else {
+            requested_begin -= stream_page;
+          }
+          if (step < 18) {
+            const auto &owner = cache.GetBuffer(grown);
+            Require(stream_name, "growth before threshold",
+                    owner.CpuAddress() == requested_begin &&
+                        owner.Size() == requested_end - requested_begin &&
+                        owner.StreamScore() == static_cast<int>(step),
+                    "sequential requests grew beyond their consumed pages too "
+                    "early");
+          }
+        }
+        const auto &grown_buffer = cache.GetBuffer(grown);
+        Require(stream_name, "growth reserve",
+                grown_buffer.CpuAddress() ==
+                        (forward ? requested_begin
+                                 : requested_begin - stream_leap) &&
+                    grown_buffer.Size() ==
+                        requested_end - requested_begin + stream_leap &&
+                    grown_buffer.StreamScore() == 0 &&
+                    cache.GetBuffer(caught).is_deleted &&
+                    !cache.GetBuffer(untouched).is_deleted &&
+                    BufferCacheTestAccess::PageOwner(cache, caught_address) ==
+                        grown &&
+                    BufferCacheTestAccess::PageOwner(
+                        cache, untouched_address) == untouched,
+                "streaming did not reserve the next pages or retain correct "
+                "neighboring owners");
+        for (uint32_t step = 0; step < 128; ++step) {
+          const auto address = forward
+                                   ? requested_end + step * stream_page - 4
+                                   : requested_begin - step * stream_page - 4;
+          Require(stream_name, "reuse reserved pages",
+                  cache.FindBuffer(address, 8) == grown,
+                  "continued sequential requests replaced the buffer within "
+                  "its growth reserve");
+        }
+        for (const auto address : {stream_begin, caught_address}) {
+          Require(
+              stream_name, "preserve GPU contents",
+              ReadNativeValue(grown_buffer, grown_buffer.Offset(address)) ==
+                  stream_value,
+              "stream growth lost GPU-written contents from a merged owner");
+        }
+      }
 
       resources.UnmapMemory(index_begin, index_span);
       resources.UnmapMemory(base + recycled_offset, index_page);

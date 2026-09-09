@@ -955,7 +955,7 @@ struct TextureCache::DownloadPlan {
 
 TextureCache::TextureTransferPlan
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
-                                    TransferDirection direction) const {
+                                   TransferDirection direction) const {
 	const auto& info             = image.info;
 	const bool  upload           = direction == TransferDirection::Upload;
 	const bool  render_target    = binding == BindingType::RenderTarget;
@@ -1040,7 +1040,7 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
-	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
+	const auto  upload = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
 		}
@@ -1071,8 +1071,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		return;
 	}
 
-	if (info.samples != 1 || image.backing.samples != 1 ||
-	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
+	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
@@ -1530,7 +1530,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	} else {
 		uint8_t stencil_clear = 0;
 		if ((aspect == vk::ImageAspectFlagBits::eDepth &&
-		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
+		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear,
+		                             clear.depthStencil.depth)) ||
 		    (aspect == vk::ImageAspectFlagBits::eStencil &&
 		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
 			return false;
@@ -1544,7 +1545,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
-	auto& image = m_slot_images[id];
+	auto&      image   = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -1721,7 +1722,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
+	auto&            image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!m_texture_cache.SafeToDownload(image)) {
 		return false;

@@ -264,7 +264,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
-	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	auto& null_buffer = m_slot_buffers[null_id];
+	SetVulkanObjectNameF(m_graphics.device, null_buffer.Handle(), "Kyty.NullBuffer");
+	// Bound in place of a missing guest buffer, so a read must see zeros.
+	null_buffer.Fill(0, null_buffer.Size(), 0);
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}

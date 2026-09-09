@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -33,6 +34,7 @@ constexpr uint64_t MaxBoundedSnapshotBytes = 64u * 1024u * 1024u;
 constexpr uint64_t MaxBoundedSnapshotWords = MaxBoundedSnapshotBytes / sizeof(uint32_t);
 
 bool SpecializationFail(std::string_view message) {
+	g_last_specialization_error.assign(message);
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	std::fflush(stderr);
@@ -2062,6 +2064,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+std::string_view LastResourceSpecializationError() noexcept {
+	return g_last_specialization_error;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

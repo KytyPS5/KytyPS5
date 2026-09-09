@@ -79,6 +79,45 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void CheckMountRoot(const std::filesystem::path &root) {
+  Common::File cache;
+  Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
+  cache.Close();
+  FileSystem::Mount(root, "/app0");
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == root / "rpf.cache",
+        "resolve mount descendant");
+  Check(FileSystem::GetRealFilename("/app01/rpf.cache") == "/app01/rpf.cache",
+        "mount prefix must end at a path component");
+
+  for (const char *path : {"/app0", "/app0/"}) {
+    for (const int flags : {0, 0x00020000}) {
+      const int fd = FileSystem::KernelOpen(path, flags, 0);
+      Check(fd >= 3, "open mounted root with O_RDONLY or O_DIRECTORY");
+      std::array<char, 512> entries {};
+      const int size = FileSystem::KernelGetdents(fd, entries.data(), entries.size());
+      Check(size > 0 && size <= entries.size(), "enumerate mounted root");
+      bool found = false;
+      for (int offset = 0; offset < size;) {
+        // Directory record: inode, record length, type, name length, name.
+        Check(size - offset >= 8, "directory record header fits");
+        uint16_t length = 0;
+        std::memcpy(&length, entries.data() + offset + 4, sizeof(length));
+        const auto name_length = static_cast<uint8_t>(entries[offset + 7]);
+        Check(length >= 8 + name_length + 1 && length <= size - offset,
+              "directory record and name fit");
+        if (std::string_view(entries.data() + offset + 8, name_length) == "rpf.cache") {
+          Check(entries[offset + 6] == 8, "cache directory entry is a regular file");
+          found = true;
+        }
+        offset += length;
+      }
+      Check(found, "mounted root listing contains rpf.cache");
+      Check(FileSystem::KernelClose(fd) == OK, "close mounted root");
+    }
+  }
+  FileSystem::Umount("/app0");
+}
+
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   // Guest sockaddr_in: length, family, network-order port/address, padding.
@@ -156,6 +195,7 @@ int main() {
 
   TempDirectory temporary;
   FileSystem::Initialize();
+  CheckMountRoot(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

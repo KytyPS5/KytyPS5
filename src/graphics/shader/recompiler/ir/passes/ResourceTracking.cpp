@@ -519,7 +519,8 @@ private:
 	}
 
 	bool MatchDenseTable(const Inst& handle, Inst*& heap_handle, const Inst*& based,
-	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices) {
+	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices,
+	                     uint32_t& table_immediate) {
 		for (uint32_t dword = 0; dword < handle.NumArgs(); dword++) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
@@ -554,7 +555,13 @@ private:
 				}
 				extra = immediate;
 			}
-			if (extra + memory->offset != dword * sizeof(uint32_t)) {
+			if (extra + memory->offset < dword * sizeof(uint32_t)) {
+				return false;
+			}
+			const uint32_t immediate = extra + memory->offset - dword * sizeof(uint32_t);
+			if (dword == 0u) {
+				table_immediate = immediate;
+			} else if (immediate != table_immediate) {
 				return false;
 			}
 			auto* address = read->Arg(0).Resolve().TryInstruction();
@@ -1053,6 +1060,30 @@ private:
 		return true;
 	}
 
+	bool MatchFindLsbKeyBound(const Inst& key, const Inst& handle, uint32_t& bound) const {
+		if (key.GetOpcode() != ValueOpcode::FindILsb32 || key.NumArgs() != 1u ||
+		    handle.Parent() == nullptr) {
+			return false;
+		}
+		const auto* mask = key.Arg(0).Resolve().TryInstruction();
+		if (mask == nullptr) {
+			return false;
+		}
+		for (const auto& use: mask->Uses()) {
+			const auto* compare = use.user;
+			uint32_t    zero    = 1;
+			if (compare == nullptr || compare->GetOpcode() != ValueOpcode::INotEqual32 ||
+			    compare->NumArgs() != 2u || use.operand > 1u ||
+			    !ImmediateU32(compare->Arg(1u - use.operand), zero) || zero != 0u ||
+			    !BlockRunsOnlyWhen(*handle.Parent(), *compare)) {
+				continue;
+			}
+			bound = 32u;
+			return true;
+		}
+		return false;
+	}
+
 	bool MatchKeyBound(const Inst& key, uint32_t& bound) const {
 		for (const auto& use: key.Uses()) {
 			uint32_t limit = 0;
@@ -1076,23 +1107,31 @@ private:
 		const Inst*             based       = nullptr;
 		std::array<Inst*, 8>    reads {};
 		std::array<uint32_t, 8> memory_indices {};
-		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices)) {
+		uint32_t                table_immediate = 0;
+		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices,
+		                     table_immediate)) {
 			return false;
 		}
-		uint32_t table_offset = 0;
-		Value    scaled_value;
-		if (based->GetOpcode() != ValueOpcode::IAdd32 || based->NumArgs() != 2u) {
-			return false;
-		}
-		if (ImmediateU32(based->Arg(1), table_offset)) {
-			scaled_value = based->Arg(0);
-		} else if (ImmediateU32(based->Arg(0), table_offset)) {
-			scaled_value = based->Arg(1);
+		uint32_t    table_offset = table_immediate;
+		const Inst* scaled       = nullptr;
+		if (based->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+			scaled = based;
+		} else if (based->GetOpcode() == ValueOpcode::IAdd32 && based->NumArgs() == 2u) {
+			uint32_t bias = 0;
+			Value    scaled_value;
+			if (ImmediateU32(based->Arg(1), bias)) {
+				scaled_value = based->Arg(0);
+			} else if (ImmediateU32(based->Arg(0), bias)) {
+				scaled_value = based->Arg(1);
+			} else {
+				return false;
+			}
+			table_offset += bias;
+			scaled = scaled_value.Resolve().TryInstruction();
 		} else {
 			return false;
 		}
-		const auto* scaled = scaled_value.Resolve().TryInstruction();
-		uint32_t    shift  = 0;
+		uint32_t shift = 0;
 		if (scaled == nullptr || scaled->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
 		    scaled->NumArgs() != 2u || !ImmediateU32(scaled->Arg(1), shift) ||
 		    shift != DenseIndirectImageShift) {
@@ -1109,7 +1148,7 @@ private:
 		uint32_t selector_offset = 0;
 		uint32_t selector_stride = 0;
 		uint32_t item_bound      = 0;
-		if (!MatchKeyBound(*key, bound)) {
+		if (!MatchKeyBound(*key, bound) && !MatchFindLsbKeyBound(*key, handle, bound)) {
 			if (MatchLoopKeyBound(*key, handle, loop_bound, bound_signed)) {
 				bound = MaxDenseIndirectImageEntries;
 			} else if (!MatchReadLaneProbe(*key, pc, material_source, selector_offset,

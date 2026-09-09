@@ -22,6 +22,33 @@ Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 
 } // namespace
 
+void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) {
+	const auto zero  = IR::U32(IR::Value(0u));
+	const auto lo    = ir.GetExecLo();
+	const auto hi    = ir.GetExecHi();
+	const auto saved = ReadU32(inst.dst);
+	if (begin) {
+		const auto low_active = ir.INotEqual(lo, zero);
+		instruction_branch_condition = ir.IEqual(ir.BitwiseOr(lo, hi), zero);
+		WriteRawU32(inst.dst, ir.Select(instruction_branch_condition, saved,
+		                               ir.Select(low_active, hi, lo)));
+		// Keep the ISA assignment order: SDST may itself name an EXEC half.
+		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
+		            ir.Select(low_active, zero, ir.GetExecHi()));
+	} else {
+		const auto high_active = ir.INotEqual(hi, zero);
+		instruction_branch_condition =
+		    ir.LogicalAnd(ir.LogicalNot(high_active), ir.INotEqual(saved, zero));
+		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
+		            ir.Select(instruction_branch_condition, saved, hi));
+		WriteRawU32(inst.dst,
+		            ir.Select(instruction_branch_condition, lo, ReadU32(inst.dst)));
+		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo),
+		            ir.Select(high_active, saved,
+		                      ir.Select(instruction_branch_condition, zero, ir.GetExecLo())));
+	}
+}
+
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
 	if (!write_64) {

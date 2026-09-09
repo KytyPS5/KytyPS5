@@ -15389,6 +15389,112 @@ TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
   return test;
 }
 
+TestCase ScalarSubvectorLoops(u32 wave_size) {
+  using O = ShaderOpcode;
+  using namespace ShaderRecompiler::Decoder;
+  TestCase test;
+  test.name = wave_size == 64 ? "ScalarSubvectorLoopsWave64"
+                              : "ScalarSubvectorLoopsWave32";
+  // The captured mesh shader's signed SOPK targets are relative to PC + 4.
+  std::array<u32, 47> captured{};
+  captured[0x30 / 4] = 0xbda60022u;
+  captured[0xb8 / 4] = 0xbe26ffdeu;
+  Instruction begin, end;
+  DecodeInstruction(captured, 0x30 / 4, begin);
+  DecodeInstruction(captured, 0xb8 / 4, end);
+  Require(test.name, "captured branch decode",
+          begin.opcode == O::S_SUBVECTOR_LOOP_BEGIN && begin.dst.reg == 38 &&
+              begin.dst.kind == OperandKind::Sgpr && begin.branch_target == 0xbc &&
+              end.opcode == O::S_SUBVECTOR_LOOP_END && end.dst.reg == 38 &&
+              end.dst.kind == OperandKind::Sgpr && end.branch_target == 0x34 &&
+              begin.word_count == 1 && end.word_count == 1,
+          "subvector SDST or signed PC-relative target was decoded incorrectly");
+
+  constexpr u32 sentinel = 0x5a13abcdu;
+  constexpr u32 low = 0x80000005u, high = 0x42000002u;
+  struct Case {
+    u32 lo, hi, body_mode, saved, final_lo, final_hi, passes;
+  };
+  constexpr Case cases[] = {
+      {0, 0, 0, sentinel, 0, 0, 0},
+      {low, 0, 0, 0, low, 0, 1},
+      {0, high, 0, 0, 0, high, 1},
+      {low, high, 0, low, low, high, 2},
+      {~0u, ~0u, 0, ~0u, ~0u, ~0u, 2},
+      // The game resets the full EXEC mask before END, selecting its HI != 0 arm.
+      {low, high, 1, high, high, ~0u, 1},
+      // END must restore the low mask saved after the body has changed it.
+      {low, high, 2, 0, 0, high, 2},
+      // BEGIN EXEC_LO first copies HI to its aliased destination, then clears HI.
+      {low, high, 3, 0, 0, high, 2},
+  };
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    const auto &item = cases[index];
+    const u32 scc = index & 1u;
+    const u32 saved_reg = item.body_mode == 3 ? 126u : 38u;
+    AppendVMovU32(&code, 2, 0);
+    AppendVMovU32(&code, 3, 0);
+    AppendSMovLiteral(&code, 38, sentinel);
+    AppendSMovLiteral(&code, 32, 1); // Scalar 2^passes; MULK preserves SCC.
+    AppendSMovLiteral(&code, 33, 0xff);
+    AppendSMovLiteral(&code, 126, item.lo);
+    AppendSMovLiteral(&code, 127, item.hi);
+    code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(scc == 0 ? 1 : 0)));
+    const auto begin_word = static_cast<u32>(code.size());
+    code.push_back(0);
+    const auto body_word = static_cast<u32>(code.size());
+    code.push_back(EncodeSMovB32(33, 253)); // Observe SCC immediately after BEGIN.
+    code.push_back(EncodeSopk(0x10, 32, 2));
+    code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
+    code.push_back(EncodeVop1(0x01, 3, 32));
+    if (item.body_mode == 1) {
+      code.push_back(EncodeSop1(0x04, 126, 193)); // S_MOV_B64 EXEC, -1.
+    } else if (item.body_mode == 2) {
+      code.push_back(EncodeSMovB32(126, InlineU32(0)));
+    }
+    const auto end_word = static_cast<u32>(code.size());
+    code.push_back(EncodeSopk(0x1c, saved_reg, body_word - end_word - 1u));
+    code[begin_word] = EncodeSopk(0x1b, saved_reg, end_word - begin_word);
+    const u32 sources[] = {saved_reg, 126, 127, 253, 32, 33};
+    for (u32 i = 0; i < std::size(sources); ++i) {
+      code.push_back(EncodeSMovB32(20 + i, sources[i]));
+    }
+    code.push_back(EncodeSop1(0x04, 126, 193)); // Restore all lanes for readback.
+    const u32 expected[] = {item.saved, item.final_lo, item.final_hi, scc,
+                            1u << item.passes, item.passes == 0 ? 0xff : scc};
+    for (u32 i = 0; i < std::size(expected); ++i) {
+      AppendStoreSgprAtLaneDwordOffset(&code, 20 + i, 0,
+                                      static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), wave_size, expected[i]);
+    }
+    for (u32 reg : {2u, 3u}) {
+      AppendStoreVgprAtLaneDwordOffset(&code, reg, 0,
+                                      static_cast<u32>(test.expected.size()));
+      for (u32 lane = 0; lane < wave_size; ++lane) {
+        const bool upper = lane >= 32;
+        const u32 mask = upper || item.body_mode == 3 ? item.hi : item.lo;
+        const bool active = ((mask >> (lane % 32)) & 1u) != 0 &&
+                            !(upper && item.body_mode == 1);
+        const u32 pass_value = upper && item.lo != 0 ? 4u : 2u;
+        test.expected.push_back(active ? (reg == 2 ? 1u : pass_value) : 0u);
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_SUBVECTOR_LOOP_BEGIN, O::S_SUBVECTOR_LOOP_END,
+                  O::S_MOV_B32, O::S_MOV_B64, O::S_MULK_I32, O::S_CMP_EQ_U32,
+                  O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarGetpcWritesNextInstructionPc() {
   using O = ShaderOpcode;
 
@@ -24417,6 +24523,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
   cases.push_back(ScalarOrn2SaveexecB32(64, 64));
   cases.push_back(ScalarOrn2SaveexecB32(32, 4));
+  cases.push_back(ScalarSubvectorLoops(32));
+  cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
   AddCase(ScalarBrevB32PreservesScc);
@@ -28918,6 +29026,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 32));
     RunCase(&vulkan, ScalarOrn2SaveexecB32(64, 64));
     RunCase(&vulkan, ScalarOrn2SaveexecB32(32, 4));
+    RunCase(&vulkan, ScalarSubvectorLoops(32));
+    RunCase(&vulkan, ScalarSubvectorLoops(64));
     RunCase(&vulkan, ScalarNotB64UpdatesScc());
     RunCase(&vulkan, ScalarSelectB64PreservesMaskProvenance());
     RunCase(&vulkan, ScalarConditionalMoveB64());

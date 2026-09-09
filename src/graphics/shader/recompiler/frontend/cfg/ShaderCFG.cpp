@@ -61,6 +61,8 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_CBRANCH_VCCNZ: return BranchCondition::VccNonZero;
 		case Opcode::S_CBRANCH_EXECZ: return BranchCondition::ExecZero;
 		case Opcode::S_CBRANCH_EXECNZ: return BranchCondition::ExecNonZero;
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
 	}
 }
@@ -2224,6 +2226,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::VccNonZero: return "vccnz";
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
+		case BranchCondition::ScalarInstruction: return "scalar_instruction";
 		case BranchCondition::GotoVariable: return "goto_variable";
 		default: return "unknown";
 	}

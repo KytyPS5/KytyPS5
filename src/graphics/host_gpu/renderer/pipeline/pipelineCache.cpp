@@ -107,9 +107,22 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 // clean-gated reader above, which refuses while the GPU has pending writes to the range. Without
 // this the SRT evaluator cannot resolve a descriptor the shader builds from SRT dwords
 // (Astro Bot PPSA21564: a buffer V# base = CompositeExtractU64(... ReadConst(GetSrtResource))).
+//
+// Gated to PPSA21564: wiring this reader for every title changes descriptor resolution for
+// shaders whose SRT raw-reads previously failed and were handled by a fallback -- it made
+// Demon's Souls hang in the intro. PR #500 shipped this field NULL for that reason. Real fix:
+// bind-time dynamic-SRT resolution, after which the reader is safe for all titles.
 bool ReadShaderMappedMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+}
+
+ShaderRecompiler::IR::SrtMemoryReader ShaderMappedMemoryReaderForTitle() {
+	static const bool enabled = [] {
+		std::string id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
+	}();
+	return enabled ? &ReadShaderMappedMemory : nullptr;
 }
 
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
@@ -375,7 +388,7 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
-		    .read_memory                = ReadShaderMappedMemory,
+		    .read_memory                = ShaderMappedMemoryReaderForTitle(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};

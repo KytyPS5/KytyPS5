@@ -381,6 +381,16 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
+	if (mem.kind == IR::ResourceKind::Buffer && mem.formatted) {
+		const auto address   = ByteAddress(ctx, inst, mem);
+		const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
+		                              ConstantU32(ctx.state, 2));
+		const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryByteRangeInBounds(ctx.state, access.resource, address, 4u), [&]() {
+			    return LoadSubwordInBounds(ctx, access.resource, address, access.index, 32u, false);
+		    });
+	}
 	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
@@ -644,11 +654,13 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	    ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
 	    byte,
 	    ConstantU32(ctx.state, 3));
-	const auto mask  = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-	                          ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu), shift);
+	const auto component_mask =
+	    ConstantU32(ctx.state, bits == 8u ? 0xffu : bits == 16u ? 0xffffu : UINT32_MAX);
+	const auto mask  = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state), component_mask,
+	                          shift);
 	const auto value = Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
 	                          Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), data,
-	                                 ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
+	                                 component_mask),
 	                          shift);
 	const auto merge = [&](uint32_t old, uint32_t update_mask, uint32_t update_value) {
 		return Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
@@ -679,16 +691,22 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 		}
 	};
 	update_word(index, mask, value);
-	if (bits == 16u) {
-		const auto crosses = Binary(state, OpIEqual, TypeBool(state), byte, ConstantU32(state, 3));
+	if (bits == 16u || bits == 32u) {
+		const auto crosses = Binary(state, bits == 16u ? OpIEqual : OpINotEqual,
+		                            TypeBool(state), byte,
+		                            ConstantU32(state, bits == 16u ? 3u : 0u));
 		EmitIfCondition(state, crosses, [&]() {
 			const auto next_index =
 			    Binary(state, OpIAdd, TypeU32(state), index, ConstantU32(state, 1));
-			const auto next_mask    = ConstantU32(state, 0xffu);
-			const auto next_value = Binary(state, OpBitwiseAnd, TypeU32(state),
-			                               Binary(state, OpShiftRightLogical, TypeU32(state), data,
-			                                      ConstantU32(state, 8)),
-			                               next_mask);
+			const auto upper_shift = Binary(
+			    state, OpShiftLeftLogical, TypeU32(state),
+			    Binary(state, OpISub, TypeU32(state), ConstantU32(state, 4u), byte),
+			    ConstantU32(state, 3u));
+			const auto next_mask = Binary(state, OpShiftRightLogical, TypeU32(state),
+			                              component_mask, upper_shift);
+			const auto next_value = Binary(
+			    state, OpBitwiseAnd, TypeU32(state),
+			    Binary(state, OpShiftRightLogical, TypeU32(state), data, upper_shift), next_mask);
 			update_word(next_index, next_mask, next_value);
 		});
 	}
@@ -744,6 +762,17 @@ void StoreWordInBounds(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
+	if (mem.kind == IR::ResourceKind::Buffer && mem.formatted) {
+		const auto address   = ByteAddress(ctx, inst, mem);
+		const auto raw_index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), address,
+		                              ConstantU32(ctx.state, 2));
+		const auto access    = PrepareMemoryElement(ctx, mem, resource, raw_index);
+		EmitIfCondition(
+		    ctx.state, EmitMemoryByteRangeInBounds(ctx.state, access.resource, address, 4u), [&]() {
+			    StoreSubwordInBounds(ctx, mem, access.resource, address, access.index, 32u, data);
+		    });
+		return;
+	}
 	const auto access = PrepareMemoryElement(ctx, mem, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {

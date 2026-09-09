@@ -130,22 +130,16 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
-// Descriptor-formatted 8-bit and 16-bit components can be rebased from any byte
-// alignment. The emitter joins or splits a 16-bit access that crosses a DWORD.
-// The proof covers every use of the resource; one formatted use must not
-// authorize a neighboring raw/typed access.
-static bool SupportsSubwordStorageOffset(const ShaderBufferResource& descriptor,
-                                         const ShaderRecompiler::IR::BufferResource& resource) {
+// Descriptor-formatted components can be rebased from any byte alignment. The
+// emitter joins or splits accesses that cross a host DWORD, including packed
+// and 32-bit formats. The proof covers every use of the resource; one formatted
+// use must not authorize a neighboring raw/typed access.
+static bool SupportsFormattedStorageOffset(
+    const ShaderBufferResource& descriptor,
+    const ShaderRecompiler::IR::BufferResource& resource) {
 	if (!resource.descriptor_formatted_only || !resource.formatted || resource.scalar ||
 	    resource.atomic) return false;
-	const auto format = ShaderRecompiler::Format::GetFormatInfo(descriptor.Format());
-	if (format.type == ShaderRecompiler::Format::ComponentType::Unknown ||
-	    format.packed_bitfield || format.component_count == 0u) return false;
-	for (uint32_t component = 0; component < format.component_count; ++component) {
-		const auto bits = format.component_bits[component];
-		if (bits != 8u && bits != 16u) return false;
-	}
-	return true;
+	return ShaderRecompiler::Format::IsKnownFormat(descriptor.Format());
 }
 
 static bool SupportsScalarStorageOffset(const ShaderRecompiler::IR::BufferResource& resource) {
@@ -186,7 +180,7 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsSubwordStorageOffset(descriptor, resource) &&
+	if ((byte_adjustment && !SupportsFormattedStorageOffset(descriptor, resource) &&
 	     !SupportsScalarStorageOffset(resource)) ||
 	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64

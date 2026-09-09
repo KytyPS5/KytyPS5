@@ -9781,7 +9781,8 @@ void CheckSampledHtileArrayClearDiscovery() {
   // Place inside VulkanHarness. Reaches actual renderer admission before any
   // binding mutation, without dispatching potentially conflicting resources.
   void CheckStorageBufferByteOffsetBinding(bool unsupported_halfword = false,
-                                         const char* mixed_mode = nullptr) {
+                                           const char* mixed_mode = nullptr,
+                                           bool formatted_dword = false) {
     const bool boundary = unsupported_halfword || mixed_mode != nullptr;
     const char* boundary_mode = unsupported_halfword ? "unaligned-halfword" : mixed_mode;
     const bool partial_tail = mixed_mode != nullptr &&
@@ -9792,7 +9793,8 @@ void CheckSampledHtileArrayClearDiscovery() {
     constexpr uintptr_t base = 0x0000000205c00000ull;
     constexpr uint64_t allocation_size = 0x10000u;
     constexpr uint64_t allocation_alignment = 0x10000u;
-    const std::array<uint32_t, 4> offsets{unsupported_halfword ? 15u : 13u, 12u, 8u, 3u};
+    const std::array<uint32_t, 4> offsets{
+        formatted_dword ? 1u : unsupported_halfword ? 15u : 13u, 12u, 8u, 3u};
     // New byte-offset admission ends on a complete native DWORD. Preserve the
     // original size4/range17 case separately: its last guest byte is not
     // representable by the current runtime uint-array length contract.
@@ -9847,11 +9849,14 @@ void CheckSampledHtileArrayClearDiscovery() {
         // ResourceTracking regression derives the same fact from actual mixed IR.
         info.descriptor_formatted_only = index == 0u && !mixed_access;
         info.atomic = index == 2u;
-        info.max_byte_extent = index == 0u ? (mixed_access ? 4u : unsupported_halfword ? 2u : 1u)
+        info.max_byte_extent = index == 0u ? (mixed_access || formatted_dword
+                                                  ? 4u
+                                                  : unsupported_halfword ? 2u : 1u)
                                            : index == 1u ? 4u : index == 2u ? 8u : 4u;
         info.descriptor_format = index == 0u
-            ? (unsupported_halfword ? Prospero::BufferFormat::k16UInt
-                                    : Prospero::BufferFormat::k8UInt)
+            ? (formatted_dword ? Prospero::BufferFormat::k32UInt
+                               : unsupported_halfword ? Prospero::BufferFormat::k16UInt
+                                                      : Prospero::BufferFormat::k8UInt)
             : Prospero::BufferFormat::kInvalid;
         program.info.buffers.push_back(info);
         ShaderBufferResource descriptor{};
@@ -12864,8 +12869,11 @@ void CheckSampledHtileArrayClearDiscovery() {
           const auto offset = i < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[i]
                                   : 0u;
-          info.range = static_cast<vk::DeviceSize>(
-              test.storage_buffer_range_dwords * sizeof(u32) + offset);
+          const auto byte_limit =
+              test.storage_buffer_range_dwords * sizeof(u32) + offset;
+          // NativeStorageBuffer exposes complete uint elements while publishing
+          // the exact unpadded byte limit separately to the shader.
+          info.range = static_cast<vk::DeviceSize>((byte_limit + 3u) & ~3u);
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
@@ -21622,6 +21630,56 @@ TestCase BufferStoreFormatXUint8AppliesByteHostOffset() {
   return test;
 }
 
+TestCase BufferStoreFormatXUint32AppliesByteHostOffset() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0u);
+  AppendVMovLiteral(&code, 0, 0xaabbccddu);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferStoreFormatXUint32AppliesByteHostOffset";
+  test.code = std::move(code);
+  test.initial = {0x44332211u, 0x88776655u, 0x90a0b0c0u};
+  // The aligned host view begins one byte before the guest descriptor. A
+  // formatted DWORD store at guest byte zero therefore spans two host DWORDs.
+  test.expected = {0xbbccdd11u, 0x887766aau, 0x90a0b0c0u};
+  test.storage_buffer_range_dwords = 1u;
+  test.storage_buffer_offsets = {1u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0u, 4u, false, static_cast<u32>(Prospero::BufferFormat::k32UInt));
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferLoadStoreFormatXUint32CrossesHostDwords() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0u);
+  code.push_back(EncodeMubuf0(0x00u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  code.push_back(EncodeMubuf0(0x04u, 4u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferLoadStoreFormatXUint32CrossesHostDwords";
+  test.code = std::move(code);
+  test.initial = {0x44332211u, 0x88776655u, 0x90a0b0c0u};
+  // Load guest bytes [0,4) through a one-byte host residual and write the
+  // resulting DWORD to guest bytes [4,8), crossing the next boundary again.
+  test.expected = {0x44332211u, 0x44332255u, 0x90a0b055u};
+  test.storage_buffer_range_dwords = 2u;
+  test.storage_buffer_offsets = {1u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X,
+                  O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0u, 8u, false, static_cast<u32>(Prospero::BufferFormat::k32UInt));
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferAtomic64AppliesHostOffsetOnce() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -29830,6 +29888,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferStoreByteAppliesByteHostOffset);
   AddCase(BufferStoreFormatXUint8AppliesByteHostOffset);
+  AddCase(BufferStoreFormatXUint32AppliesByteHostOffset);
+  AddCase(BufferLoadStoreFormatXUint32CrossesHostDwords);
   AddCase(BufferAtomic64AppliesHostOffsetOnce);
   AddCase(BufferStoreByteHostOffsetOverflowStaysOutOfBounds);
   AddCase(BufferFormatUint8HostOffsetOverflowStaysOutOfBounds);
@@ -34812,10 +34872,8 @@ void CheckSampledHtileAdmission() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckStorageBufferByteOffsetBoundary() {
   const std::array cases{
-      RendererFailureCase{"unaligned-halfword", "storage buffer offset adjustment is unsupported"},
       RendererFailureCase{"mixed-raw-word", "storage buffer offset adjustment is unsupported"},
       RendererFailureCase{"mixed-typed-word", "storage buffer offset adjustment is unsupported"},
-      RendererFailureCase{"partial-dword-tail", "storage buffer offset adjustment is unsupported"},
   };
   CheckRendererFailureCases("StorageBufferByteOffsetBoundary",
                            "--storage-buffer-byte-offset-reject",
@@ -34998,6 +35056,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-byte-offset-binding-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStorageBufferByteOffsetBinding();
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--storage-buffer-byte-offset-dword-binding-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageBufferByteOffsetBinding(false, nullptr, true);
     return 0;
   }
 #endif

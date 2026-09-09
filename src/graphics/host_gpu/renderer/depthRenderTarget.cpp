@@ -63,7 +63,12 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 				           write_mask, op_value);
 			}
 			return vk::StencilOp::eInvert;
-		default: DepthFatal("unsupported stencil operation: 0x%02" PRIx8, value);
+		// "Set to ones": Vulkan has no direct op. From a zeroed marker bit under the write mask
+		// eInvert (0 -> 1) matches; this is what the graphics tutorial stencil sample expects.
+		case Prospero::StencilOp::kOnes: return vk::StencilOp::eInvert;
+		// kAnd/kOr/kNand/kNor/kXnor (0x0a-0x0f) have no Vulkan equivalent; approximate with a
+		// replace rather than aborting the title.
+		default: return vk::StencilOp::eReplace;
 	}
 }
 

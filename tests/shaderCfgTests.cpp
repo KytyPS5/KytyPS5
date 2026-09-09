@@ -9899,6 +9899,9 @@ void TestCooperativeWave64CollectivesUseSharedFunctions() {
         "cooperative wave64 collectives were duplicated instead of calling shared functions");
   Check(SpirvInstructionOpcodeCount(compiled.spirv, 360u) == 1u,
         "cooperative wave64 ballot duplicated its subgroup reduction body");
+  const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
+  Check(variable_count <= 9u,
+        "non-overlapping cooperative values did not reuse spill slots");
 }
 
 // TEST ONLY. Insert after AddExecutionPlanBlock in shaderCfgTests.cpp and

@@ -968,6 +968,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, false);
 		case Decoder::Opcode::DS_SUB_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, true);
+		case Decoder::Opcode::DS_INC_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, true);
+		case Decoder::Opcode::DS_DEC_RTN_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, true);
 		case Decoder::Opcode::DS_MIN_I32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSMin32, false);
 		case Decoder::Opcode::DS_MIN_RTN_I32:

@@ -4224,6 +4224,19 @@ void TestNewShaderDecoderArchitecture() {
   Check(ds.opcode == Opcode::DS_READ_B32 && ds.gds,
         "DS decoder lost the GFX10 opcode or GDS fields");
 
+  for (bool decrement : {false, true}) {
+    const uint32_t words[] = {decrement ? 0xd8920004u : 0xd88e0004u, 0x03000302u};
+    Instruction atomic;
+    ShaderRecompiler::Decoder::DecodeInstruction(words, 0u, atomic);
+    Check(atomic.family == Family::DS &&
+              atomic.opcode == (decrement ? Opcode::DS_DEC_RTN_U32 : Opcode::DS_INC_RTN_U32) &&
+              atomic.word_count == 2u && atomic.src_count == 2u &&
+              atomic.data_dwords == 1u && atomic.data_bits == 32u &&
+              atomic.gds && atomic.offset == 4u && atomic.dst.reg == 3u &&
+              atomic.src0.reg == 2u && atomic.src1.reg == 3u,
+          "DS decoder misdecoded bounded atomic return fields");
+  }
+
   const uint32_t boot_ds[] = {0xd8d4c480u, 0x45000045u};
   Instruction boot;
   ShaderRecompiler::Decoder::DecodeInstruction(boot_ds, 0u, boot);

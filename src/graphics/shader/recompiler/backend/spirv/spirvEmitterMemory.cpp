@@ -589,31 +589,58 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	return old;
 }
 
+template <typename Fn>
+uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
+                          const IR::MemoryInfo& mem, Fn&& operation) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    return operation(EmitMemoryElementPointer(ctx.state, access.resource, access.index));
+		    });
+	});
+}
+
 uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	const auto result =
-	    EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		    const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		    return EmitValueOrZeroIfCondition(
-		        ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index),
-		        [&]() {
-			        const auto scope =
-			            mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
-			        const auto pointer =
-			            EmitMemoryElementPointer(ctx.state, access.resource, access.index);
-			        const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
-			        if (mem.kind == IR::ResourceKind::Lds) {
-				        const auto semantics =
-				            MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
-				        ctx.state.builder.AddFunction({OpMemoryBarrier,
-				                                       ConstantU32(ctx.state, ScopeWorkgroup),
-				                                       ConstantU32(ctx.state, semantics)});
-			        } else {
-				        EmitDeviceAtomicMemoryBarrier(ctx.state);
-			        }
-			        return old;
-		        });
-	    });
-	return result;
+	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		const auto scope = mem.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+		const auto old   = EmitAtomicOperation(ctx, inst, pointer, scope);
+		if (mem.kind == IR::ResourceKind::Lds) {
+			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			ctx.state.builder.AddFunction({OpMemoryBarrier, ConstantU32(ctx.state, scope),
+			                               ConstantU32(ctx.state, semantics)});
+		} else {
+			EmitDeviceAtomicMemoryBarrier(ctx.state);
+		}
+		return old;
+	});
+}
+
+template <typename Fn>
+uint32_t EmitAtomicUpdate(ValueEmitContext& ctx, const IR::Inst& inst,
+                          const IR::MemoryInfo& mem, Fn&& replacement) {
+	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
+			return replacement(ctx.state, old, value);
+		});
+	});
+}
+
+uint32_t AtomicIncrement(EmitterState& state, uint32_t old, uint32_t limit) {
+	// old >= limit ? 0 : old + 1 (unsigned).
+	const auto wrap = Binary(state, OpUGreaterThanEqual, TypeBool(state), old, limit);
+	const auto next = Binary(state, OpIAdd, TypeU32(state), old, ConstantU32(state, 1));
+	return Select(state, TypeU32(state), wrap, ConstantU32(state, 0), next);
+}
+
+uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limit) {
+	// old == 0 || old > limit ? limit : old - 1 (unsigned).
+	const auto zero  = Binary(state, OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
+	const auto above = Binary(state, OpUGreaterThan, TypeBool(state), old, limit);
+	const auto wrap  = Binary(state, OpLogicalOr, TypeBool(state), zero, above);
+	const auto next  = Binary(state, OpISub, TypeU32(state), old, ConstantU32(state, 1));
+	return Select(state, TypeU32(state), wrap, limit, next);
 }
 
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
@@ -647,17 +674,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 
 uint32_t FloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      bool max_value) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    const auto pointer =
-			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
-			    const auto source = ctx.Arg(inst, inst.NumArgs() - 2);
-			    return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
-				    return EmitFloatAtomicReplacement(ctx.state, old, source, max_value);
-			    });
-		    });
+	return EmitAtomicUpdate(ctx, inst, mem, [max_value](EmitterState& state, uint32_t old,
+	                                                  uint32_t value) {
+		return EmitFloatAtomicReplacement(state, old, value, max_value);
 	});
 }
 
@@ -1136,6 +1155,12 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {
 		ctx.Define(inst, FloatAtomic(ctx, inst, ctx.Memory(inst),
 		                             op == IR::ValueOpcode::BufferAtomicFMax32));
+		return true;
+	}
+	if (op == IR::ValueOpcode::SharedAtomicInc32 || op == IR::ValueOpcode::SharedAtomicDec32) {
+		const auto replacement = op == IR::ValueOpcode::SharedAtomicInc32
+		                             ? AtomicIncrement : AtomicDecrement;
+		ctx.Define(inst, EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement));
 		return true;
 	}
 	if (op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32) {

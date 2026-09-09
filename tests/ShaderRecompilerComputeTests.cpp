@@ -86,6 +86,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -14015,6 +14016,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_ADD_RTN_U32:
   case Opcode::DS_SUB_U32:
   case Opcode::DS_SUB_RTN_U32:
+  case Opcode::DS_INC_RTN_U32:
+  case Opcode::DS_DEC_RTN_U32:
   case Opcode::DS_MIN_I32:
   case Opcode::DS_MIN_RTN_I32:
   case Opcode::DS_MAX_I32:
@@ -21221,6 +21224,213 @@ TestCase DsAtomicReturnVariants() {
        O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase DsBoundedAtomicBoundaries(bool decrement, bool gds) {
+  using O = ShaderOpcode;
+  constexpr u32 guard = 0x13579bdfu;
+  struct Boundary {
+    u32 before, limit, incremented, decremented;
+  };
+  constexpr Boundary boundaries[] = {
+      {4, 5, 5, 3},
+      {5, 5, 0, 4},
+      {6, 5, 0, 5},
+      {0, 5, 1, 5},
+      {0, 0, 0, 0},
+      {1, 0, 0, 0},
+      {0xffffffffu, 0xffffffffu, 0, 0xfffffffeu},
+      {0xfffffffeu, 0xffffffffu, 0xffffffffu, 0xfffffffdu},
+      {0, 0xffffffffu, 1, 0xffffffffu},
+      {0x80000000u, 0x7fffffffu, 0, 0x7fffffffu},
+      {0x7fffffffu, 0x80000000u, 0x80000000u, 0x7ffffffeu},
+      {0xffffffffu, 0x80000000u, 0, 0x80000000u}};
+  constexpr u32 count = static_cast<u32>(std::size(boundaries));
+  const u32 opcode = decrement ? 0x24u : 0x23u;
+  TestCase test;
+  test.name =
+      decrement
+          ? (gds ? "DsDecReturnGdsBoundaries" : "DsDecReturnLdsBoundaries")
+          : (gds ? "DsIncReturnGdsBoundaries" : "DsIncReturnLdsBoundaries");
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 0);
+  std::vector<u32> memory(68, guard);
+  for (u32 i = 0; i < count; ++i)
+    memory[i + 1] = boundaries[i].before;
+  if (!gds) {
+    for (u32 i = 0; i < memory.size(); ++i) {
+      AppendVMovLiteral(&code, 3, memory[i]);
+      code.push_back(EncodeDs0(0x0d, i * 4));
+      code.push_back(EncodeDs1(0, 3, 2));
+    }
+  }
+  auto StoreResult = [&](u32 vgpr, u32 expected) {
+    AppendStoreVgpr(&code, vgpr, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  for (u32 i = 0; i < count; ++i) {
+    AppendVMovU32(&code, 2, i * 4);
+    AppendVMovLiteral(&code, 3, boundaries[i].limit);
+    // Preserve the captured DATA0/VDST alias and exact increment words in GDS.
+    code.push_back(decrement ? EncodeDs0(opcode, 4, gds)
+                             : (gds ? 0xd88e0004u : 0xd88c0004u));
+    code.push_back(0x03000302u);
+    StoreResult(3, boundaries[i].before);
+    code.push_back(EncodeDs0(0x36, 4, gds));
+    code.push_back(EncodeDs1(4, 0, 2));
+    StoreResult(4, decrement ? boundaries[i].decremented
+                             : boundaries[i].incremented);
+  }
+
+  // EXEC=0 preserves memory and the aliased destination register.
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.push_back(EncodeDs0(opcode, 4, gds));
+  code.push_back(0x03000302u);
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  StoreResult(3, 0x12345678u);
+
+  // Use both offset bytes and alias VDST with ADDR instead of DATA0.
+  AppendVMovU32(&code, 2, 4);
+  AppendVMovLiteral(&code, 3, 0xffffffffu);
+  code.push_back(EncodeDs0(opcode, 0x104, gds));
+  code.push_back(EncodeDs1(2, 3, 2));
+  StoreResult(2, guard);
+
+  // Overwriting an unused return must not let DCE discard the atomic update.
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeDs0(opcode, 0x108, gds));
+  code.push_back(EncodeDs1(4, 3, 2));
+  AppendVMovU32(&code, 4, 0);
+
+  // An active access just outside the resource returns zero.
+  AppendVMovU32(&code, 2, static_cast<u32>(memory.size() * 4 - 4));
+  code.push_back(EncodeDs0(opcode, 4, gds));
+  code.push_back(0x03000302u);
+  StoreResult(3, 0);
+
+  // Read back all words, including guards around both address ranges.
+  AppendVMovU32(&code, 2, 0);
+  for (u32 i = 0; i < memory.size(); ++i) {
+    u32 expected = memory[i];
+    if (i >= 1 && i <= count) {
+      expected = decrement ? boundaries[i - 1].decremented
+                           : boundaries[i - 1].incremented;
+    } else if (i == 66) {
+      expected = decrement ? guard - 2 : guard + 2;
+    }
+    code.push_back(EncodeDs0(0x36, i * 4, gds));
+    code.push_back(EncodeDs1(4, 0, 2));
+    StoreResult(4, expected);
+    if (gds)
+      test.expected_gds.push_back(expected);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.compute_info.lds_size_dwords = static_cast<u32>(memory.size());
+  test.opcodes = {
+      O::S_MOV_B64,          O::V_MOV_B32,
+      O::DS_READ_B32,        decrement ? O::DS_DEC_RTN_U32 : O::DS_INC_RTN_U32,
+      O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange",
+                         "OpLoopMerge"};
+  if (gds)
+    test.gds_initial = memory;
+  else
+    test.opcodes.push_back(O::DS_WRITE_B32);
+  return test;
+}
+
+TestCase DsBoundedAtomicContention(bool decrement, bool gds, u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 guard = 0x13579bdfu;
+  constexpr u32 limit = 15;
+  TestCase test;
+  if (wave_size == 32) {
+    test.name = decrement ? (gds ? "DsDecReturnGdsContentionWave32"
+                                 : "DsDecReturnLdsContentionWave32")
+                          : (gds ? "DsIncReturnGdsContentionWave32"
+                                 : "DsIncReturnLdsContentionWave32");
+  } else {
+    test.name = decrement ? (gds ? "DsDecReturnGdsContentionWave64"
+                                 : "DsDecReturnLdsContentionWave64")
+                          : (gds ? "DsIncReturnGdsContentionWave64"
+                                 : "DsIncReturnLdsContentionWave64");
+  }
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 3, limit);
+  AppendVMovU32(&code, 5, 1);
+  AppendVMovLiteral(&code, 6, guard);
+  if (!gds) {
+    // One lane initializes LDS before every wave in the workgroup uses it.
+    code.push_back(EncodeSop1(0x04, 10, 126));
+    code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
+    code.push_back(EncodeSop1(0x04, 126, 106));
+    code.push_back(EncodeDs0(0x0d, 4));
+    code.push_back(EncodeDs1(0, 2, 2));
+    code.push_back(EncodeSop1(0x04, 126, 10));
+    code.push_back(EncodeSopp(0x0a, 0));
+  }
+  // Distinct masks in the wave64 halves also check inactive return
+  // preservation.
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  AppendSMovLiteral(&code, 126, 0x55555555u);
+  AppendSMovLiteral(&code, 127, 0xaaaaaaaau);
+  code.push_back(EncodeDs0(decrement ? 0x24 : 0x23, 4, gds));
+  code.push_back(EncodeDs1(6, 3, 2));
+  // Returned old values form a histogram; no lane ordering is assumed.
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));
+  AppendBufferStoreOpcode(&code, 0x32, 5, 7);
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  AppendVMovLiteral(&code, 7, guard);
+  code.push_back(EncodeVopc(0xc2, Vgpr(7), 6));
+  code.push_back(EncodeVop2(0x01, 8, InlineU32(0), 5));
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 16);
+  code.push_back(EncodeSopp(0x0a, 0));
+  // S_BARRIER orders LDS; use atomic add-zero to read GDS consistently.
+  code.push_back(EncodeDs0(gds ? 0x20 : 0x36, 4, gds));
+  code.push_back(EncodeDs1(9, 2, 2));
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 144);
+  AppendEnd(&code);
+  test.expected.assign(16, 4); // 64 active lanes, four complete wraps.
+  for (u32 lane = 0; lane < 128; ++lane) {
+    const uint64_t mask = 0xaaaaaaaa55555555ull;
+    test.expected.push_back(
+        (mask & (uint64_t{1} << (lane % wave_size))) == 0 ? 1 : 0);
+  }
+  test.expected.resize(272, 0);
+  test.initial.resize(test.expected.size());
+  test.compute_info.threads_num[0] = 128;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.lds_size_dwords = 3;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_MOV_B32,
+                  O::S_MOV_B64,
+                  O::S_BARRIER,
+                  O::V_MOV_B32,
+                  O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32,
+                  O::V_CMP_EQ_U32,
+                  O::V_CNDMASK_B32,
+                  decrement ? O::DS_DEC_RTN_U32 : O::DS_INC_RTN_U32,
+                  gds ? O::DS_ADD_RTN_U32 : O::DS_READ_B32,
+                  O::BUFFER_ATOMIC_ADD,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange",
+                         "OpLoopMerge"};
+  if (gds) {
+    test.gds_initial = {guard, 0, guard};
+    test.expected_gds = test.gds_initial;
+  } else
+    test.opcodes.push_back(O::DS_WRITE_B32);
+  return test;
+}
+
 TestCase DsMiscVariants() {
   using O = ShaderOpcode;
 
@@ -23989,6 +24199,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsWideGdsPartialBounds);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
+  for (bool decrement : {false, true}) {
+    for (bool gds : {false, true}) {
+      cases.push_back(DsBoundedAtomicBoundaries(decrement, gds));
+      for (u32 wave_size : {32u, 64u}) {
+        cases.push_back(DsBoundedAtomicContention(decrement, gds, wave_size));
+      }
+    }
+  }
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
@@ -28291,6 +28509,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      if (std::string_view(test.name).starts_with("Ds") ||
+          std::string_view(test.name).starts_with("BufferAtomic")) {
+        RunCase(&vulkan, test);
+      }
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mapped-range-only") == 0) {

@@ -449,13 +449,43 @@ void TestInvariantIndirectImageMaterialization() {
             malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
-  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
-  BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program); },
-             "not a valid runtime value",
-             "wrapped scalar immediate entered the invariant image proof");
-  Check(!wrapped_immediate->program.resource_tracking_complete,
-        "wrapped scalar immediate entered the invariant image proof");
+  auto immediate_fixture = MakeIndirectImageFixture(false, 4u);
+  immediate_fixture->PlanAndTrack();
+  auto immediate_plan = ExtractResourcePlan(immediate_fixture->program);
+  Check(immediate_fixture->program.resource_tracking_complete &&
+            std::ranges::any_of(immediate_plan.descriptor_sources,
+                                [](const DescriptorSource &source) {
+                                  return source.indirect_image.has_value() &&
+                                         source.indirect_image->selector_immediate == 4u;
+                                }),
+        "material key immediate was not carried into the indirect image source");
+  LinearTestMemory immediate_memory;
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    immediate_memory.words[(0x2000u - immediate_memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    immediate_memory.words[(0x2020u - immediate_memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  immediate_memory.words[(0x2020u - immediate_memory.base) / 4u] ^= 1u;
+  SrtRuntime immediate_runtime{.user_data = user_data,
+                               .userdata = &immediate_memory,
+                               .read_specialization_memory = ReadLinearTestMemory};
+  immediate_memory.words[(0x1000u - immediate_memory.base + 36u) / 4u] = 1u;
+  ResourceSnapshot unshifted_snapshot;
+  ResourceSpecialization unshifted_specialization;
+  Check(MaterializeResources(immediate_plan, immediate_runtime, unshifted_snapshot,
+                             unshifted_specialization) &&
+            unshifted_snapshot.images.size() == 1,
+        "material key immediate was applied to the wrapped dynamic offset");
+  immediate_memory.words[(0x1000u - immediate_memory.base + 36u) / 4u] = 0u;
+  immediate_memory.words[(0x1000u - immediate_memory.base + 40u) / 4u] = 1u;
+  ResourceSnapshot shifted_snapshot;
+  ResourceSpecialization shifted_specialization;
+  Check(MaterializeResources(immediate_plan, immediate_runtime, shifted_snapshot,
+                             shifted_specialization) &&
+            shifted_snapshot.images.size() == 2 &&
+            shifted_specialization.images.size() == 2,
+        "material key immediate did not select the record field after the wrapped offset");
 }
 
 void TestComputeBufferFill() {

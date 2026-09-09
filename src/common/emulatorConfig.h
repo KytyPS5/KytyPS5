@@ -68,6 +68,9 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
+	// Retry a fault on guest memory this emulator's own map reports as committed, rather than
+	// aborting. Bounded per address, so a genuinely bad address still fails.
+	bool                   retry_transient_map_faults  = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -82,6 +85,7 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
+bool     RetryTransientMapFaults();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();

@@ -51,6 +51,10 @@ int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }
 
+bool RetryTransientMapFaults() {
+	return g_config->retry_transient_map_faults;
+}
+
 bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }

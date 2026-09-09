@@ -172,6 +172,54 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     {0xbeu, "image_sample_c_b_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
          ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    // PlayStation gradient-adjust ("_a") derivative / coarse-derivative variants. Team Asobi
+    // shaders (Astro Bot PPSA21564) emit these; they route through the same explicit-LOD sample
+    // path as the plain _d / _cd ops, with Adjust only steering sampler dword3 canonicalization.
+    {0xa2u, "image_sample_d_a", ImageSampleFlagDerivative | ImageSampleFlagAdjust},
+    {0xa3u, "image_sample_d_cl_a",
+     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xaau, "image_sample_c_d_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagAdjust},
+    {0xabu, "image_sample_c_d_cl_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
+         ImageSampleFlagAdjust},
+    {0xb2u, "image_sample_d_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xb3u, "image_sample_d_cl_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xbau, "image_sample_c_d_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xbbu, "image_sample_c_d_cl_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xe6u, "image_sample_d_cl_o_a_0xe6",
+     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xe8u, "image_sample_cd_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagAdjust},
+    {0xe9u, "image_sample_cd_cl_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp |
+         ImageSampleFlagAdjust},
+    {0xeau, "image_sample_c_cd_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagAdjust},
+    {0xebu, "image_sample_c_cd_cl_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xecu, "image_sample_cd_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xedu, "image_sample_cd_cl_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xeeu, "image_sample_c_cd_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xefu, "image_sample_c_cd_cl_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust},
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {

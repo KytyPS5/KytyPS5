@@ -102,6 +102,16 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
+// Raw current guest memory, no GPU-clean gate. Shader resource tables (SRTs) are CPU-written
+// and GPU-read-only, so a plain backing read is both correct and always available -- unlike the
+// clean-gated reader above, which refuses while the GPU has pending writes to the range. Without
+// this the SRT evaluator cannot resolve a descriptor the shader builds from SRT dwords
+// (Astro Bot PPSA21564: a buffer V# base = CompositeExtractU64(... ReadConst(GetSrtResource))).
+bool ReadShaderMappedMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr &&
+	       Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+}
+
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
 }
@@ -324,6 +334,7 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderMappedMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};

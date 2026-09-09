@@ -1358,3 +1358,22 @@ Required tests:
   or install-path branches; keep unsupported neighboring formats fail-closed.
 - Run unchanged GREEN, neighboring opcode cases, the 825-manifest corpus and a
   warm GPUAV-lite/source-readback game retry.
+
+## First nonzero Yotei source frame
+
+Status: **rendered-pixel milestone reached; menu and gameplay remain pending.**
+
+Native GPUAV-lite run `_Build/runs/yotei-integrated-20260909-101008-669804` at
+checkpoint `96611fe` reached `shown=280`. The unchanged source readback is black
+through frame 235, then frame 236 contains 10 nonzero RGB pixels and frame 242
+contains 214. `_Build/analysis/yotei-first-nonzero-96611fe.png` independently
+shows the white animated loading spinner in the upper-right corner.
+
+Remaining validation:
+
+- Preserve the readback and screenshot as the evidence boundary: do not promote
+  the result to menu or gameplay until a recognizable full scene is captured.
+- Continue bounded runs with the 60-second shown-frame watchdog and record the
+  first post-spinner compile, resource, GPU execution, or presentation blocker.
+- Re-run the accumulated shader/GPU test debt before upstream submission; the
+  rendered-pixel milestone does not waive neighboring regressions.

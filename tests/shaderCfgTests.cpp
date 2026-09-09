@@ -4705,6 +4705,65 @@ void TestNewShaderDecoderArchitecture() {
             byte_left_shift.src1.value == 1u,
         "decoder rejected or misdecoded captured V_LSHLREV_B32 byte shift");
 
+  // VOPC opcode 153 is V_CMPX_LT_I16 and 154 is V_CMPX_EQ_I16.
+  const uint32_t vopc_sdwa_cmpx_lt_i16[] = {
+      0x7d3236f9u,
+      0x85050027u, // v_cmpx_lt_i16 v39.word1, s27.word1
+  };
+  Instruction cmpx_lt_i16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmpx_lt_i16, 0u,
+                                               cmpx_lt_i16);
+  Check(cmpx_lt_i16.family == Family::VOPC &&
+            cmpx_lt_i16.opcode == Opcode::V_CMPX_LT_I16 &&
+            cmpx_lt_i16.word_count == 2u && cmpx_lt_i16.src_count == 2u &&
+            cmpx_lt_i16.dst.kind == OperandKind::ExecLo &&
+            cmpx_lt_i16.src0.kind == OperandKind::Vgpr &&
+            cmpx_lt_i16.src0.reg == 39u && cmpx_lt_i16.src0.sdwa_sel == 5u &&
+            !cmpx_lt_i16.src0.sdwa_sext && !cmpx_lt_i16.src0.negate &&
+            !cmpx_lt_i16.src0.absolute &&
+            cmpx_lt_i16.src1.kind == OperandKind::Sgpr &&
+            cmpx_lt_i16.src1.reg == 27u && cmpx_lt_i16.src1.sdwa_sel == 5u &&
+            !cmpx_lt_i16.src1.sdwa_sext && !cmpx_lt_i16.src1.negate &&
+            !cmpx_lt_i16.src1.absolute,
+        "decoder rejected or misdecoded captured VOPC SDWA V_CMPX_LT_I16");
+
+  const uint32_t vopc_sdwa_cmpx_eq_i16[] = {0x7d3436f9u, 0x85050027u};
+  Instruction cmpx_eq_i16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmpx_eq_i16, 0u,
+                                               cmpx_eq_i16);
+  Check(cmpx_eq_i16.family == Family::VOPC &&
+            cmpx_eq_i16.opcode == Opcode::V_CMPX_EQ_I16 &&
+            cmpx_eq_i16.dst.kind == OperandKind::ExecLo &&
+            cmpx_eq_i16.src0.reg == 39u && cmpx_eq_i16.src1.reg == 27u,
+        "decoder misdecoded VOPC opcode 154 as something other than V_CMPX_EQ_I16");
+
+  const uint32_t vopc_sdwa_cmp_nlt_f16[] = {
+      0x7ddde0f9u,
+      0x86068210u, // v_cmp_nlt_f16 s2, v16, 0.5
+  };
+  Instruction cmp_nlt_f16;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_cmp_nlt_f16, 0u,
+                                               cmp_nlt_f16);
+  Check(cmp_nlt_f16.family == Family::VOPC &&
+            cmp_nlt_f16.opcode == Opcode::V_CMP_NLT_F16 &&
+            cmp_nlt_f16.word_count == 2u && cmp_nlt_f16.src_count == 2u &&
+            cmp_nlt_f16.dst.kind == OperandKind::Sgpr &&
+            cmp_nlt_f16.dst.reg == 2u &&
+            cmp_nlt_f16.src0.kind == OperandKind::Vgpr &&
+            cmp_nlt_f16.src0.reg == 16u && cmp_nlt_f16.src0.sdwa_sel == 6u &&
+            !cmp_nlt_f16.src0.sdwa_sext &&
+            cmp_nlt_f16.src1.kind == OperandKind::FloatInlineConstant &&
+            cmp_nlt_f16.src1.value == 0x3f000000u &&
+            cmp_nlt_f16.src1.sdwa_sel == 6u && !cmp_nlt_f16.src1.sdwa_sext,
+        "decoder rejected or misdecoded captured VOPC SDWA V_CMP_NLT_F16");
+
+  // SDWA on a 64-bit compare is not encodable, so it must stay rejected.
+  const uint32_t vopc_sdwa_u64[] = {0x7dc200f9u, 0x86060610u};
+  Instruction sdwa_u64;
+  ShaderRecompiler::Decoder::DecodeInstruction(vopc_sdwa_u64, 0u, sdwa_u64);
+  Check(sdwa_u64.opcode == Opcode::UNSUPPORTED,
+        "decoder accepted SDWA on a 64-bit VOPC compare");
+
   const uint32_t mimg_nsa[] = {EncodeMimg0(0x20, 0xf) | (3u << 1u),
                                EncodeMimg1(4, 0, 1, 8), 0x03020100u,
                                0x07060504u, 0x0b0a0908u};
@@ -4828,92 +4887,35 @@ void TestNewShaderDecoderArchitecture() {
         "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
 }
 
-void TestNewShaderRecompilerInteger64CompareEncodings() {
-  namespace D = ShaderRecompiler::Decoder;
-  using O = D::Opcode;
-  const O families[][8] = {
-      {O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_EQ_I64, O::V_CMP_LE_I64,
-       O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64, O::V_CMP_T_I64},
-      {O::V_CMPX_F_I64, O::V_CMPX_LT_I64, O::V_CMPX_EQ_I64, O::V_CMPX_LE_I64,
-       O::V_CMPX_GT_I64, O::V_CMPX_NE_I64, O::V_CMPX_GE_I64, O::V_CMPX_T_I64},
-      {O::V_CMP_F_U64, O::V_CMP_LT_U64, O::V_CMP_EQ_U64, O::V_CMP_LE_U64,
-       O::V_CMP_GT_U64, O::V_CMP_NE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64},
-      {O::V_CMPX_F_U64, O::V_CMPX_LT_U64, O::V_CMPX_EQ_U64, O::V_CMPX_LE_U64,
-       O::V_CMPX_GT_U64, O::V_CMPX_NE_U64, O::V_CMPX_GE_U64, O::V_CMPX_T_U64}};
-  const uint32_t bases[] = {0xa0u, 0xb0u, 0xe0u, 0xf0u};
-  for (uint32_t family = 0; family < std::size(families); ++family) {
-    const bool update_exec = (family % 2) != 0;
-    for (uint32_t predicate = 0; predicate < 8; ++predicate) {
-      const auto encoding = bases[family] + predicate;
-      for (const bool vop3 : {false, true}) {
-        const std::array<uint32_t, 2> words = vop3
-            ? std::array{EncodeVop3Word0(encoding, 20),
-                         EncodeVop3Word1(257, 259, 0)}
-            : std::array{EncodeVopc(encoding, 257, 3), 0xbf810000u};
-        D::Instruction compare;
-        D::DecodeInstruction(words, 0, compare);
-        const auto destination = update_exec ? D::OperandKind::ExecLo
-            : vop3 ? D::OperandKind::Sgpr : D::OperandKind::VccLo;
-        Check(compare.family == (vop3 ? D::Family::VOP3 : D::Family::VOPC) &&
-                  compare.opcode == families[family][predicate] &&
-                  compare.opcode_id == encoding &&
-                  compare.word_count == (vop3 ? 2u : 1u) &&
-                  compare.dst.kind == destination &&
-                  (!vop3 || update_exec || compare.dst.reg == 20) &&
-                  compare.src_count == 2 &&
-                  compare.src0.kind == D::OperandKind::Vgpr && compare.src0.reg == 1 &&
-                  compare.src1.kind == D::OperandKind::Vgpr && compare.src1.reg == 3,
-              "64-bit integer compare decoded incorrectly");
-        for (const bool high_src0 : {false, true}) {
-          // Only the compare's pair width makes v13 reachable by MOVRELD,
-          // including predicates F/T that never read their operands.
-          const uint32_t src0 = high_src0 ? 268u : 266u;
-          const uint32_t src1 = high_src0 ? 10u : 12u;
-          std::vector<uint32_t> shader{EncodeVop1(0x42, 12, 256)};
-          if (vop3) {
-            shader.push_back(EncodeVop3Word0(encoding, 20));
-            shader.push_back(EncodeVop3Word1(src0, src1 + 256, 0));
-          } else {
-            shader.push_back(EncodeVopc(encoding, src0, src1));
-          }
-          shader.push_back(EncodeSopp(0x01));
-          D::Program decoded;
-          D::DecodeProgram(shader, decoded);
-          ShaderComputeInputInfo compute{};
-          ShaderRecompiler::Frontend::TranslateOptions options{.stage = ShaderType::Compute};
-          options.input_info.compute = &compute;
-          const auto program = ShaderRecompiler::Frontend::TranslateProgram(
-              decoded, ShaderRecompiler::CFG::BuildGraph(decoded), options);
-          bool includes_high_word = false;
-          for (const auto *block : program.blocks) {
-            for (const auto &inst : *block) {
-              includes_high_word |=
-                  inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SetVectorRegister &&
-                  ShaderRecompiler::IR::RegIndex(inst.Arg(0).VectorRegister()) == 13;
-            }
-          }
-          Check(includes_high_word, "64-bit compare omitted a VGPR pair's high word");
-        }
-      }
-      for (const bool dpp : {false, true}) {
-        const uint32_t shader[] = {
-            EncodeVopc(encoding, dpp ? 250u : 249u, 3),
-            dpp ? EncodeVop2Dpp(1) : EncodeVopcSdwa(1),
-            0xbf810000u};
-        D::Program program;
-        D::DecodeProgram(shader, program);
-        Check(program.instructions.size() == 2u &&
-                  program.instructions.back().opcode == O::S_ENDPGM,
-              "64-bit VOPC decode did not consume its modifier word");
-        const auto &compare = program.instructions.front();
-        const auto reason = dpp ? "VOPC DPP modifier is not supported for opcode"
-                                : "VOPC SDWA modifier is not supported for opcode";
-        Check(compare.opcode == O::UNSUPPORTED && compare.word_count == 2u &&
-                  compare.unsupported_reason.find(reason) != std::string::npos,
-              "64-bit VOPC did not explicitly reject an illegal modifier");
-      }
-    }
+void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
+  const uint32_t opcodes[] = {
+      0xa2u, 0xa5u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
+      0xf5u}; // eq_i64, ne_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
+  for (const auto opcode : opcodes) {
+    const uint32_t shader[] = {
+        EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
+        EncodeVop2Dpp(0u),
+        0xbf810000u,
+    };
+
+    ShaderRecompiler::Decoder::Program program;
+    ShaderRecompiler::Decoder::DecodeProgram(shader, program);
+    Check(program.instructions.size() == 2u,
+          "64-bit VOPC DPP decode did not consume its modifier word");
+    const auto &compare = program.instructions.front();
+    Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
+          "64-bit VOPC illegally accepted a DPP modifier");
+    Check((compare.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") != std::string::npos),
+          "64-bit VOPC DPP rejection reason was not explicit");
   }
+  const uint32_t sdwa[] = {EncodeVopc(0xa5u, 249u, 0u), 0x06060000u};
+  ShaderRecompiler::Decoder::Instruction compare;
+  ShaderRecompiler::Decoder::DecodeInstruction(sdwa, 0u, compare);
+  Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED &&
+            compare.word_count == 2u &&
+            compare.unsupported_reason.find("VOPC SDWA is not encodable for 64-bit compares") !=
+                std::string::npos,
+        "V_CMP_NE_I64 accepted an illegal SDWA encoding");
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {

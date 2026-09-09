@@ -75,6 +75,11 @@ bool IsLds(const IR::Program& program, const IR::Inst& inst) {
 	return index < program.memory_info.size() && program.memory_info[index].kind == IR::ResourceKind::Lds;
 }
 
+bool IsReadOnlyLds(const IR::Program& program, const IR::Inst& inst) {
+	return IsLds(program, inst) &&
+	       IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::Read;
+}
+
 bool IsRuntimeScalarRead(const ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op = inst.GetOpcode();
 	if (op == O::ReadConstBuffer) return !ctx.Memory(inst).planning_only;
@@ -131,19 +136,24 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			continue;
 		}
 		bool lds = false;
-		ctx.cooperative_phase = function.phases.at(segment.instructions[index]);
+		const auto phase = function.phases.at(segment.instructions[index]);
+		ctx.cooperative_phase = phase;
 		Guard(ctx.state, active, [&] {
-			// Coalesce ordinary instructions into one selection. A DS phase ends
-			// it, so its rendezvous remains outside every wave/EXEC/bounds guard.
+			// Coalesce ordinary instructions and consecutive read-only DS accesses
+			// into one selection. Conflicting DS accesses retain separate phases,
+			// so the rendezvous remains outside every wave/EXEC/bounds guard.
 			do {
 				const auto& current = *segment.instructions[index++];
 				if (current.GetOpcode() != O::Phi) {
 					EmitDirectValueInstruction(ctx, current);
 					StoreResult(ctx, function, current);
 				}
-				lds = IsLds(ctx.program, current);
-			} while (!lds && index < segment.instructions.size() &&
-			         !IsCollective(segment.instructions[index]->GetOpcode()));
+				lds |= IsLds(ctx.program, current);
+			} while (index < segment.instructions.size() &&
+			         segment.instructions[index]->GetOpcode() != O::Phi &&
+			         !IsRuntimeScalarRead(ctx, *segment.instructions[index]) &&
+			         !IsCollective(segment.instructions[index]->GetOpcode()) &&
+			         function.phases.at(segment.instructions[index]) == phase);
 		});
 		ctx.cooperative_phase = 0;
 		// Atomic completion is a phase too: OpMemoryBarrier in an active atomic
@@ -180,6 +190,7 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 	uint32_t next_phase = 1;
 	for (const auto* block : ctx.program.blocks) {
 		uint32_t ordinary_phase = 0;
+		bool ordinary_phase_has_lds_read = false;
 		for (const auto& inst : *block) {
 			const auto op = inst.GetOpcode();
 			if (op == O::Phi) {
@@ -187,20 +198,30 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 			}
 			if (op == O::Barrier) {
 				ordinary_phase = 0;
+				ordinary_phase_has_lds_read = false;
 				continue;
 			}
 			if (IsRuntimeScalarRead(ctx, inst) ||
 			    IsCollective(op)) {
 				function.phases.emplace(&inst, next_phase++);
 				ordinary_phase = 0;
+				ordinary_phase_has_lds_read = false;
 				continue;
+			}
+			const bool read_only_lds = IsReadOnlyLds(ctx.program, inst);
+			if (IsLds(ctx.program, inst) && !read_only_lds && ordinary_phase_has_lds_read) {
+				ordinary_phase = 0;
+				ordinary_phase_has_lds_read = false;
 			}
 			if (ordinary_phase == 0) {
 				ordinary_phase = next_phase++;
 			}
 			function.phases.emplace(&inst, ordinary_phase);
-			if (IsLds(ctx.program, inst)) {
+			if (read_only_lds) {
+				ordinary_phase_has_lds_read = true;
+			} else if (IsLds(ctx.program, inst)) {
 				ordinary_phase = 0;
+				ordinary_phase_has_lds_read = false;
 			}
 		}
 	}

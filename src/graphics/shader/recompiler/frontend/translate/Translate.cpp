@@ -134,11 +134,15 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::Scc:
 			return ir.Select(ir.GetScc(), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
 		case Decoder::OperandKind::VccZ:
-			return ir.Select(ir.LogicalNot(ir.GetVcc()), IR::U32(IR::Value(1u)),
-			                 IR::U32(IR::Value(0u)));
-		case Decoder::OperandKind::ExecZ:
-			return ir.Select(ir.LogicalNot(ir.GetExec()), IR::U32(IR::Value(1u)),
-			                 IR::U32(IR::Value(0u)));
+		case Decoder::OperandKind::ExecZ: {
+			const bool vcc = operand.kind == Decoder::OperandKind::VccZ;
+			auto mask = vcc ? ir.GetVccLo() : ir.GetExecLo();
+			if (program.wave_size == 64u) {
+				mask = ir.BitwiseOr(mask, vcc ? ir.GetVccHi() : ir.GetExecHi());
+			}
+			const auto zero = IR::U32(IR::Value(0u));
+			return ir.Select(ir.IEqual(mask, zero), IR::U32(IR::Value(1u)), zero);
+		}
 		default: EXIT("invalid decoded operand used as a raw U32 source");
 	}
 }

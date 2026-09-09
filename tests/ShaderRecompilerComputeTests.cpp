@@ -14982,16 +14982,36 @@ TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
       {0xffffffffu, 107, 8, vcc_hi},
       {0xffffffffu, 127, 8, exec_hi},
       {0xffffffffu, 253, 8, 1},            // SCC is a scalar value, not a mask.
+      {0xffffffffu, 251, 8, 0},            // VCCZ summarizes the whole mask.
+      {0x00000001u, 252, 8, 0xfffffffeu},  // EXECZ is uniform across lanes.
   };
   TestCase test;
   test.name = wave_size == 64 ? "ScalarOrn2SaveexecB32Wave64"
               : threads == 32 ? "ScalarOrn2SaveexecB32Wave32"
                               : "ScalarOrn2SaveexecB32PartialWave";
   auto &code = test.code;
+  // Zero flags ignore high bits only in wave32 and include inactive low bits.
+  constexpr u32 masks[][2] = {{0, 0}, {0x80000000u, 0}, {0, 0x80000000u}};
+  for (const auto &mask : masks) {
+    AppendSMovLiteral(&code, 106, mask[0]);
+    AppendSMovLiteral(&code, 107, mask[1]);
+    AppendSMovLiteral(&code, 126, mask[0]);
+    AppendSMovLiteral(&code, 127, mask[1]);
+    code.push_back(EncodeSMovB32(20, 251));
+    code.push_back(EncodeSMovB32(21, 252));
+    code.push_back(EncodeSop1(0x04, 126, 193u));
+    const u32 zero = mask[0] == 0 && (wave_size == 32 || mask[1] == 0);
+    for (u32 reg = 20; reg <= 21; ++reg) {
+      AppendStoreSgprAtLaneDwordOffset(&code, reg, 0,
+                                      static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), threads, zero);
+    }
+  }
   for (const auto &item : cases) {
     AppendVMovU32(&code, 2, 0);
     AppendSMovLiteral(&code, 126, item.exec_lo);
     AppendSMovLiteral(&code, 127, exec_hi);
+    AppendSMovLiteral(&code, 106, 1);
     AppendSMovLiteral(&code, 107, vcc_hi);
     AppendSMovLiteral(&code, 6, 3);
     code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(0)));

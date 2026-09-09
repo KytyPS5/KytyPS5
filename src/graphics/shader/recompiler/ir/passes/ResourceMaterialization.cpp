@@ -1079,7 +1079,8 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 	if (!program.bounded_srt_reads.empty() ||
 	    std::ranges::any_of(program.info.buffers, [&](const BufferResource& buffer) {
 		    const auto* source = Source(program, buffer.source);
-		    return source != nullptr && source->inline_descriptor.has_value();
+		    return source != nullptr && (source->bounded_buffer.has_value() ||
+		                                 source->inline_descriptor.has_value());
 	    })) {
 		specialization.buffer_tables.resize(program.info.buffers.size());
 	}
@@ -1102,6 +1103,13 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 			}
 			count = static_cast<uint32_t>(materialized.inline_buffers[logical].size());
 			diagnostic_stride = inline_descriptor.selector_stride;
+		} else if (source->bounded_buffer->wave_uniform) {
+			const auto& bounded = *source->bounded_buffer;
+			if (source->dword_count != 4u || bounded.key_arg != 0u ||
+			    bounded.wave_candidates.empty() || bounded.expression) {
+				return SpecializationFail("wave-uniform buffer has invalid source metadata");
+			}
+			count = static_cast<uint32_t>(bounded.wave_candidates.size());
 		} else if (source->bounded_buffer->expression) {
 			const auto& bounded = *source->bounded_buffer;
 			if (source->dword_count != 4u || bounded.key_arg != 0u ||
@@ -1151,6 +1159,26 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 			DescriptorValue descriptor;
 			if (inline_table) {
 				descriptor = materialized.inline_buffers[logical][index];
+			} else if (source->bounded_buffer->wave_uniform) {
+				descriptor.dword_count = 4u;
+				const auto& bounded = *source->bounded_buffer;
+				for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+					const auto& candidate = bounded.wave_candidates[index][word];
+					if (candidate.immediate) {
+						descriptor.dwords[word] = candidate.value;
+						continue;
+					}
+					if (candidate.value >= program.srt_reads.size()) {
+						return SpecializationFail(
+						    "wave-uniform buffer candidate has an invalid flat SRT slot");
+					}
+					const auto flat = program.srt_reads[candidate.value].flat_offset;
+					if (flat >= snapshot.flattened_srt.size()) {
+						return SpecializationFail(
+						    "wave-uniform buffer candidate exceeds its flat SRT snapshot");
+					}
+					descriptor.dwords[word] = snapshot.flattened_srt[flat];
+				}
 			} else if (source->bounded_buffer->expression) {
 				descriptor = materialized.bounded_buffer_expressions[logical][index];
 			} else {
@@ -1989,6 +2017,24 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 				MarkCleanFlatSlots(plan, Source(plan, source.inline_descriptor->image_table->address_source),
 				                   plan.clean_flat_slots);
 			}
+		}
+	}
+	const auto mark_wave_candidate = [&](const auto& candidate) {
+		if (candidate.immediate || candidate.value >= plan.srt_reads.size()) return;
+		plan.clean_flat_slots[candidate.value] = ResourcePlan::FlatSlotClean;
+		DescriptorSource dependency;
+		dependency.dword_count = 1u;
+		dependency.dwords[0] = plan.srt_reads[candidate.value].value;
+		MarkCleanFlatSlots(plan, &dependency, plan.clean_flat_slots);
+	};
+	for (const auto& source: plan.descriptor_sources) {
+		if (source.bounded_buffer.has_value() && source.bounded_buffer->wave_uniform) {
+			for (const auto& descriptor: source.bounded_buffer->wave_candidates)
+				for (const auto& candidate: descriptor) mark_wave_candidate(candidate);
+		}
+		if (source.bounded_image.has_value() && source.bounded_image->wave_uniform) {
+			for (const auto& descriptor: source.bounded_image->wave_candidates)
+				for (const auto& candidate: descriptor) mark_wave_candidate(candidate);
 		}
 	}
 	for (const auto& source: plan.descriptor_sources) {

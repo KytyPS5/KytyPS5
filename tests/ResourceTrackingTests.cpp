@@ -172,6 +172,8 @@ bool ReadTestMemory(void *userdata, uint64_t address, uint32_t *value) {
   return true;
 }
 
+bool RejectTestMemory(void *, uint64_t, uint32_t *) { return false; }
+
 struct LinearTestMemory {
   uint64_t base = 0x1000;
   std::vector<uint32_t> words = std::vector<uint32_t>(0x2200 / 4);
@@ -2602,6 +2604,142 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
+std::unique_ptr<Fixture> MakeWaveUniformBufferPhiFixture(bool wave_uniform) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  auto fixture = std::make_unique<Fixture>(ShaderType::Compute);
+  auto *split = fixture->block;
+  auto *left = fixture->AddBlock();
+  auto *right = fixture->AddBlock();
+  auto *merge = fixture->AddBlock();
+  split->AddBranch(left);
+  split->AddBranch(right);
+  left->AddBranch(merge);
+  right->AddBranch(merge);
+  fixture->program.block_info[0].terminator.kind =
+      CFG::TerminatorKind::ConditionalBranch;
+  fixture->program.block_info[0].terminator.true_block = 1u;
+  fixture->program.block_info[0].terminator.false_block = 2u;
+  fixture->program.block_info[1].terminator.kind = CFG::TerminatorKind::Branch;
+  fixture->program.block_info[1].terminator.true_block = 3u;
+  fixture->program.block_info[2].terminator.kind = CFG::TerminatorKind::Branch;
+  fixture->program.block_info[2].terminator.true_block = 3u;
+  fixture->program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto lane = fixture->Emit(ValueOpcode::LaneId, {}, 0, split);
+  const auto even = fixture->Emit(
+      ValueOpcode::IEqual32,
+      {fixture->Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)}, 0, split),
+       Value(0u)},
+      0, split);
+  Value condition = even;
+  if (wave_uniform) {
+    const auto ballot = fixture->Emit(ValueOpcode::Ballot, {even}, 0, split);
+    const auto low = fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                   {ballot, Value(0u)}, 0, split);
+    const auto high = fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                    {ballot, Value(1u)}, 0, split);
+    condition = fixture->Emit(
+        ValueOpcode::IEqual32,
+        {fixture->Emit(ValueOpcode::BitwiseOr32, {low, high}, 0, split),
+         Value(0u)},
+        0, split);
+  }
+  fixture->program.block_info[0].condition = condition;
+
+  const auto address = fixture->Address(fixture->UserData(0u),
+                                        fixture->UserData(1u), 0x8d54u);
+  std::array<Value, 4> left_words;
+  std::array<Value, 4> right_words;
+  for (uint32_t word = 0; word < 4u; ++word) {
+    MemoryInfo left_memory;
+    left_memory.kind = ResourceKind::ScalarAddress;
+    left_memory.offset = word * sizeof(uint32_t);
+    left_words[word] = fixture->Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, Value(0u), Value(0u), Value(true)},
+        fixture->AddMemory(left_memory, 0x8d54u), left);
+    auto right_memory = left_memory;
+    right_memory.offset += 4u * sizeof(uint32_t);
+    right_words[word] = fixture->Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, Value(0u), Value(0u), Value(true)},
+        fixture->AddMemory(right_memory, 0x8d54u), right);
+  }
+  std::array<Value, 4> selected;
+  for (uint32_t word = 0; word < 4u; ++word) {
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(left, left_words[word]);
+    phi.AddPhiOperand(right, right_words[word]);
+    selected[word] = Value(&phi);
+  }
+  const auto handle = fixture->Emit(ValueOpcode::GetBufferResource,
+                                    {selected[0], selected[1], selected[2], selected[3]},
+                                    MemoryFlags{0, 0x8d54u}, merge);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  const auto loaded = fixture->Emit(
+      ValueOpcode::LoadBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+      fixture->AddMemory(memory, 0x8d54u), merge);
+  fixture->Emit(ValueOpcode::ReferenceU32, {loaded}, 0, merge);
+  return fixture;
+}
+
+void TestWaveUniformBufferPhiTable() {
+  auto fixture = MakeWaveUniformBufferPhiFixture(true);
+  fixture->PlanAndTrack();
+  Check(fixture->program.resource_tracking_complete &&
+            fixture->program.info.buffers.size() == 1u &&
+            fixture->program.memory_info.back().buffer_table == 0u,
+        "wave-uniform descriptor Phi did not become one buffer table");
+  const auto &source = fixture->program.descriptor_sources[
+      fixture->program.info.buffers[0].source];
+  Check(source.bounded_buffer.has_value(),
+        "wave-uniform descriptor Phi lost its bounded buffer source");
+  const auto handle = std::ranges::find_if(
+      *fixture->program.blocks.back(), [](const Inst &inst) {
+        return inst.GetOpcode() == ValueOpcode::GetBufferResource;
+      });
+  Check(handle != fixture->program.blocks.back()->end() &&
+            handle->Arg(0).ResolveInstruction() != nullptr &&
+            handle->Arg(0).ResolveInstruction()->GetOpcode() ==
+                ValueOpcode::SelectU32,
+        "wave-uniform descriptor Phi did not retain its live GPU selector");
+
+  TestMemory memory;
+  memory.words = {0x2000u, 4u << 16u, 8u, 0u,
+                  0x3000u, 8u << 16u, 4u, 1u};
+  std::array<uint32_t, 2> user_data{static_cast<uint32_t>(memory.base), 0u};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = RejectTestMemory,
+                           .userdata = &memory,
+                           .read_specialization_memory = ReadTestMemory};
+  auto plan = ExtractResourcePlan(fixture->program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 2u &&
+            specialization.buffer_tables.size() == 1u &&
+            specialization.buffer_tables[0].count == 2u,
+        "wave-uniform descriptor Phi candidates did not materialize");
+  const auto &table = specialization.buffer_tables[0];
+  Check(table.mapping_flat_offset + table.count <= snapshot.flattened_srt.size(),
+        "wave-uniform buffer mapping exceeds the flat snapshot");
+  for (uint32_t candidate = 0; candidate < 2u; ++candidate) {
+    const auto dense = snapshot.flattened_srt[table.mapping_flat_offset + candidate];
+    Check(dense < snapshot.buffers.size() &&
+              snapshot.buffers[dense].dwords[0] == 0x2000u + candidate * 0x1000u,
+          "wave-uniform buffer table mixed descriptor candidates");
+  }
+
+  auto divergent = MakeWaveUniformBufferPhiFixture(false);
+  BuildSrtPlan(divergent->program);
+  CheckFatal([&] { TrackResources(divergent->program); },
+             "not a valid runtime value",
+             "lane-divergent descriptor Phi was accepted as a uniform table");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -3235,8 +3373,8 @@ void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_t
   if (buffer_table) {
     Check(columns == 4u, "test descriptor table must have four columns");
     const auto source = AddBoundedSnapshotSource(fixture, {Value(0u),Value(0u),Value(0u),Value(0u)});
-    program.descriptor_sources[source].bounded_buffer =
-        DescriptorSource::BoundedBuffer{{0u, 1u, 2u, 3u}, {}, 0u};
+    program.descriptor_sources[source].bounded_buffer.emplace();
+    program.descriptor_sources[source].bounded_buffer->reads = {0u, 1u, 2u, 3u};
     program.info.buffers.push_back({.source=source});
   }
 }
@@ -4614,6 +4752,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-uniform-buffer-phi-only") == 0) {
+      TestWaveUniformBufferPhiTable();
+      std::cout << "KYTY_WAVE_UNIFORM_BUFFER_PHI_PASS\n";
+      return 0;
+    }
     if (argc == 3 && std::strcmp(argv[1], "--srt-raw-fallback-case") == 0) {
       CheckSrtRawFallbackCase(argv[2]);
       return 0;
@@ -4668,6 +4811,7 @@ int main(int argc, char** argv) {
     Run("TestBoundedMaterializationNullsForeignBufferSlots",
         TestBoundedMaterializationNullsForeignBufferSlots);
     Run("phi validation", TestPhiValidation);
+    Run("wave-uniform buffer Phi", TestWaveUniformBufferPhiTable);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

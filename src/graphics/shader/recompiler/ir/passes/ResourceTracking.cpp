@@ -634,6 +634,176 @@ private:
 		return true;
 	}
 
+	static bool WaveUniformValue(Value value, std::unordered_set<const Inst*>& visiting,
+	                             std::unordered_set<const Inst*>& complete) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (complete.contains(inst)) return true;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::ReadConst:
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane:
+			case ValueOpcode::Ballot:
+				complete.insert(inst);
+				return true;
+			case ValueOpcode::Identity:
+			case ValueOpcode::CompositeExtractU32x4:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightArithmetic32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::SLessThan32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::SLessThanEqual32:
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::SGreaterThan32:
+			case ValueOpcode::UGreaterThan32:
+			case ValueOpcode::SGreaterThanEqual32:
+			case ValueOpcode::UGreaterThanEqual32:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::LogicalXor:
+			case ValueOpcode::LogicalNot:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32: break;
+			default: return false;
+		}
+		if (!visiting.insert(inst).second) return false;
+		for (uint32_t argument = 0; argument < inst->NumArgs(); ++argument) {
+			if (!WaveUniformValue(inst->Arg(argument), visiting, complete)) {
+				visiting.erase(inst);
+				return false;
+			}
+		}
+		visiting.erase(inst);
+		complete.insert(inst);
+		return true;
+	}
+
+	static bool WaveUniformValue(Value value) {
+		std::unordered_set<const Inst*> visiting;
+		std::unordered_set<const Inst*> complete;
+		return WaveUniformValue(value, visiting, complete);
+	}
+
+	bool DecodeWaveBufferCandidate(
+	    Value value, DescriptorSource::BoundedBuffer::CandidateDword& candidate) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() != Type::U32) return false;
+			candidate.value = value.U32();
+			candidate.immediate = true;
+			return true;
+		}
+		const auto* read = value.TryInstruction();
+		const auto slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+		                          read->NumArgs() == 2u
+		                      ? read->Arg(1).Resolve()
+		                      : Value {};
+		if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+		    slot.U32() >= m_program.srt_reads.size() ||
+		    !ValidateRuntimeValue(m_program, value)) return false;
+		candidate.value = slot.U32();
+		candidate.immediate = false;
+		return true;
+	}
+
+	bool MakeWaveUniformBufferSource(Inst& handle, uint32_t& source) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
+		    handle.Parent() == nullptr) return false;
+		std::array<const Inst*, 4> phis {};
+		for (uint32_t word = 0; word < phis.size(); ++word) {
+			phis[word] = handle.Arg(word).Resolve().TryInstruction();
+			if (phis[word] == nullptr || phis[word]->GetOpcode() != ValueOpcode::Phi ||
+			    phis[word]->NumArgs() != 2u || phis[word]->NumPhiBlocks() != 2u ||
+			    phis[word]->Parent() != phis[0]->Parent()) return false;
+		}
+		for (uint32_t word = 1; word < phis.size(); ++word) {
+			for (uint32_t argument = 0; argument < 2u; ++argument) {
+				if (phis[word]->PhiBlock(argument) != phis[0]->PhiBlock(argument)) return false;
+			}
+		}
+		auto* first_arm = phis[0]->PhiBlock(0u);
+		auto* second_arm = phis[0]->PhiBlock(1u);
+		auto* merge = phis[0]->Parent();
+		if (first_arm == nullptr || second_arm == nullptr || first_arm == second_arm ||
+		    merge == nullptr || merge->ImmPredecessors().size() != 2u ||
+		    std::ranges::find(merge->ImmPredecessors(), first_arm) == merge->ImmPredecessors().end() ||
+		    std::ranges::find(merge->ImmPredecessors(), second_arm) == merge->ImmPredecessors().end() ||
+		    first_arm->ImmPredecessors().size() != 1u ||
+		    second_arm->ImmPredecessors().size() != 1u ||
+		    first_arm->ImmPredecessors().front() != second_arm->ImmPredecessors().front()) return false;
+		auto* split = first_arm->ImmPredecessors().front();
+		const auto* split_info = BlockMetadata(split);
+		const auto* first_info = BlockMetadata(first_arm);
+		const auto* second_info = BlockMetadata(second_arm);
+		const auto* merge_info = BlockMetadata(merge);
+		if (split_info == nullptr || first_info == nullptr || second_info == nullptr ||
+		    merge_info == nullptr ||
+		    split_info->terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    first_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    second_info->terminator.kind != CFG::TerminatorKind::Branch ||
+		    first_info->terminator.true_block != merge_info->id ||
+		    second_info->terminator.true_block != merge_info->id) return false;
+		uint32_t true_candidate = 0u;
+		uint32_t false_candidate = 0u;
+		if (split_info->terminator.true_block == first_info->id &&
+		    split_info->terminator.false_block == second_info->id) {
+			true_candidate = 0u;
+			false_candidate = 1u;
+		} else if (split_info->terminator.true_block == second_info->id &&
+		           split_info->terminator.false_block == first_info->id) {
+			true_candidate = 1u;
+			false_candidate = 0u;
+		} else {
+			return false;
+		}
+		const auto condition = split_info->condition.Resolve();
+		if (condition.GetType() != Type::U1 || !WaveUniformValue(condition)) return false;
+
+		std::array<std::array<DescriptorSource::BoundedBuffer::CandidateDword, 4>, 2>
+		    candidates {};
+		for (uint32_t candidate = 0; candidate < candidates.size(); ++candidate) {
+			for (uint32_t word = 0; word < phis.size(); ++word) {
+				if (!DecodeWaveBufferCandidate(phis[word]->Arg(candidate),
+				                               candidates[candidate][word])) return false;
+			}
+		}
+		auto* block = handle.Parent();
+		auto where = std::ranges::find_if(block->Instructions(),
+		    [&](const Inst& inst) { return &inst == &handle; });
+		if (where == block->Instructions().end()) return false;
+		const auto key = Value(&*block->PrependNewInst(
+		    where, ValueOpcode::SelectU32,
+		    {condition, Value(true_candidate), Value(false_candidate)}));
+		DescriptorSource descriptor;
+		descriptor.dword_count = 4u;
+		descriptor.dwords.fill(Value(0u));
+		descriptor.dwords[0] = key;
+		descriptor.bounded_buffer.emplace();
+		descriptor.bounded_buffer->wave_uniform = true;
+		descriptor.bounded_buffer->wave_candidates.assign(candidates.begin(), candidates.end());
+		descriptor.bounded_buffer->key_arg = 0u;
+		source = InternSource(descriptor);
+		if (std::ranges::none_of(m_bounded_buffers,
+		    [&](const BoundedBufferPlan& plan) { return plan.handle == &handle; })) {
+			m_bounded_buffers.push_back(
+			    {&handle, key, {Value(0u), Value(0u), Value(0u)}});
+		}
+		return true;
+	}
+
 	bool MakeBoundedSamplerExpression(Inst& handle, DescriptorSource descriptor,
 	                                  uint32_t& source, std::string& rejection) {
 		std::vector<const BoundedReadPlan*> dependencies;
@@ -1666,6 +1836,8 @@ private:
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
+		if (expected == ValueOpcode::GetBufferResource &&
+		    MakeWaveUniformBufferSource(*handle, source)) return;
 		if (expected == ValueOpcode::GetBufferResource) {
 			for (uint32_t dword = 0; dword < handle->NumArgs(); ++dword) {
 				handle->SetArg(dword, LowerRuntimeDescriptorPhi(handle->Arg(dword), *handle));

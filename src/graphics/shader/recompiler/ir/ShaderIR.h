@@ -513,13 +513,24 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct BoundedBuffer {
+		struct CandidateDword {
+			uint32_t value = 0;
+			bool immediate = true;
+
+			bool operator==(const CandidateDword&) const = default;
+		};
+
 		std::array<uint32_t, 4> reads {};
 		// Direct tables use one correlated read per descriptor DWORD. Expression tables
 		// evaluate the descriptor value graph once for every bounded selector candidate.
 		std::vector<uint32_t> dependencies;
+		// Wave-uniform control flow may choose one of a finite set of complete descriptors.
+		// The live shader key selects the corresponding pre-materialized table row.
+		std::vector<std::array<CandidateDword, 4>> wave_candidates;
 		uint32_t selector_group = UINT32_MAX;
 		uint32_t key_arg = 0;
 		bool expression = false;
+		bool wave_uniform = false;
 		bool operator==(const BoundedBuffer&) const = default;
 	};
 

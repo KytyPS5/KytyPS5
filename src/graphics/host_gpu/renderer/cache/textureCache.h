@@ -137,6 +137,9 @@ private:
 	                                                       TransferDirection direction) const;
 	[[nodiscard]] DownloadPlan        BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void TransferStencil(Image& image, GuestRange stencil, Buffer& buffer, uint64_t offset,
+	                     TransferDirection direction);
+	void PreserveStencil(ImageId depth);
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
@@ -171,10 +174,11 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
-	mutable uint32_t m_image_query_epoch      = 0;
-	bool             m_readback_linear_images = false;
+	uint64_t         m_critical_gc_memory           = 3ull * 1024 * 1024 * 1024;
+	uint64_t         m_gc_tick                      = 0;
+	mutable uint32_t m_image_query_epoch            = 0;
+	bool             m_readback_linear_images       = false;
+	bool             m_warned_stencil_reassociation = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

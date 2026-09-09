@@ -15,18 +15,6 @@
 #include "common/assert.h"
 #include "common/platform/sysDbg.h"
 
-void SysStackWalk(void** stack, int* depth) {
-	*depth = static_cast<int>(CaptureStackBackTrace(0, static_cast<DWORD>(*depth), stack, nullptr));
-}
-
-void SysStackUsagePrint(sys_dbg_stack_info_t& stack) {
-	printf("stack: (0x%" PRIx64 ", %" PRIu64 ") + (0x%" PRIx64 ", %" PRIu64 ") + (0x%" PRIx64
-	       ", %" PRIu64 ")\n",
-	       static_cast<uint64_t>(stack.reserved_addr), static_cast<uint64_t>(stack.reserved_size),
-	       static_cast<uint64_t>(stack.guard_addr), static_cast<uint64_t>(stack.guard_size),
-	       static_cast<uint64_t>(stack.commited_addr), static_cast<uint64_t>(stack.commited_size));
-}
-
 void SysStackUsage(sys_dbg_stack_info_t& s) {
 	MEMORY_BASIC_INFORMATION mbi {};
 	[[maybe_unused]] size_t  ss = VirtualQuery(&mbi, &mbi, sizeof(mbi));

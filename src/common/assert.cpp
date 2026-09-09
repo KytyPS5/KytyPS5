@@ -1,6 +1,5 @@
 #include "common/assert.h"
 
-#include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
@@ -12,25 +11,10 @@
 
 namespace Common {
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_BUILD == KYTY_BUILD_DEBUG &&                    \
-    KYTY_COMPILER == KYTY_COMPILER_CLANG
-constexpr int PRINT_STACK_FROM = 4;
-#else
-constexpr int PRINT_STACK_FROM = 2;
-#endif
-
 static std::string BuildFatalReport(const char* title, std::string_view text, const char* file,
                                     int line) {
-	DebugStack stack;
-	DebugStack::Trace(&stack);
-
-	std::string report = "--- Build ---\n" KYTY_BUILD_LABEL "\n--- Stack Trace ---\n";
-	for (int i = PRINT_STACK_FROM; i < stack.depth; i++) {
-		report += fmt::format("[{}] {:016x}\n", i - PRINT_STACK_FROM,
-		                      static_cast<uint64_t>(stack.GetAddr(i)));
-	}
-	report += fmt::format("{}\n{} in {}:{}\n", title, text, file, line);
-	return report;
+	return fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL, title, text, file,
+	                   line);
 }
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {

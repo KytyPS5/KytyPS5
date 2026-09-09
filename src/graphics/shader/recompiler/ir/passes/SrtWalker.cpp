@@ -686,6 +686,14 @@ private:
 			return false;
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+		// A V#/T# whose base pointer resolved to null is an unbound (optional) descriptor
+		// slot; on real hardware a read through it returns all-zero rather than faulting.
+		// Resolve it to 0 instead of failing the whole materialisation (which would drop the
+		// dispatch). Correct emulation, not a soft-ladder.
+		if (base == 0) {
+			result = 0;
+			return true;
+		}
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 		uint64_t   address   = 0;
 		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {

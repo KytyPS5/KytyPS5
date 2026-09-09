@@ -28,6 +28,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -962,6 +963,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	return true;
 }
 
+// Soft ladder (PPSA21564 only). A companion to the oversized-shader drop in the pipeline
+// cache: when Astro Bot's oversized GI pixel / mesh kernel is handed back as a null module,
+// its draw has no usable program. Skip that draw for this title so the frame still presents
+// (a missing GI contribution renders wrong; a device loss ends the title). Gated on TITLE_ID
+// so no other title's draws are ever skipped. Real fix: bind-time dynamic-SRT resolution.
+static bool DrawHasDroppedProgram(const DrawRenderState& state) {
+	static const bool enabled = [] {
+		std::string id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
+	}();
+	if (!enabled) {
+		return false;
+	}
+	return !state.programs.vertex || (state.ps_active && !state.programs.pixel);
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -1338,6 +1355,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	RefreshShaders(buffer, draw, true, state);
+	if (DrawHasDroppedProgram(state)) {
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
 	                     args.index_addr);
@@ -1420,6 +1441,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	RefreshShaders(buffer, draw, false, state);
+	if (DrawHasDroppedProgram(state)) {
+		ResetBindings();
+		return;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&

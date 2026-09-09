@@ -298,20 +298,23 @@ struct PipelineCache::ProgramCache {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-		// Soft ladder (PPSA21564 only). Astro Bot's title-screen GI / lighting compute kernels
-		// assemble bindless descriptors from loop-carried SRT pointers. The ~6 that cannot be
-		// materialised are already dropped upstream; a few more compile a valid but very large
-		// module that still faults the GPU at the first fully-lit frame (VK_ERROR_DEVICE_LOST,
-		// commandScheduler.cpp:388, submit ~6500). For this title only, hand back a null module
-		// for an oversized compute shader so the frame completes without their contribution.
-		// Gated hard on TITLE_ID: every other title is untouched -- Demon's Souls legitimately
-		// compiles 250k-650k-word structured compute shaders and must keep them. Real fix:
-		// bind-time dynamic-SRT resolution (flat-SRT / BDA bindless).
-		static const bool kDropOversizedCompute = [] {
+		// Soft ladder (PPSA21564 only). Astro Bot's title-screen GI / lighting kernels assemble
+		// bindless descriptors from loop-carried SRT pointers. The compute ones that cannot be
+		// materialised are already dropped upstream; a handful more (compute, pixel and mesh)
+		// compile a valid but very large module that still faults the GPU at the first
+		// fully-lit frame (VK_ERROR_DEVICE_LOST, commandScheduler.cpp:388, submit ~6500). For
+		// this title only, hand back a null module for an oversized shader so the frame
+		// completes without their contribution; renderDraw's DrawHasDroppedProgram skips the
+		// draws that lose their pixel/mesh program. Gated hard on TITLE_ID: every other title
+		// is untouched -- Demon's Souls legitimately compiles 250k-650k-word structured compute
+		// shaders and must keep them. Real fix: bind-time dynamic-SRT resolution.
+		static const bool kDropOversized = [] {
 			std::string id;
 			return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
 		}();
-		if (kDropOversizedCompute && options.stage == ShaderType::Compute &&
+		if (kDropOversized &&
+		    (options.stage == ShaderType::Compute || options.stage == ShaderType::Pixel ||
+		     options.stage == ShaderType::Mesh) &&
 		    result.spirv.size() > 40000) {
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {

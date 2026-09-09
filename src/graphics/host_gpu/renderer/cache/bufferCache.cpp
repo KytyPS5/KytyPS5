@@ -28,7 +28,35 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+// KYTY_DEFER_READBACK, parsed once. Returns the minimum GPU->CPU copy size (bytes)
+// that gets pushed onto the 1-frame-latency path; UINT64_MAX means deferral is off
+// (the default). See the strategy comment in DownloadBufferMemory().
+uint64_t ParseDeferMinCopy() {
+	const char* d = std::getenv("KYTY_DEFER_READBACK");
+	if (d == nullptr || d[0] == '\0' || d[0] == '0') {
+		return UINT64_MAX; // never defer (default)
+	}
+	if (std::strcmp(d, "all") == 0) {
+		return 0;
+	}
+	char*      end = nullptr;
+	const auto kb  = std::strtoull(d, &end, 10);
+	if (end != d && kb > 1) {
+		return kb * 1024;
+	}
+	return 2 * 1024 * 1024;
+}
+
 } // namespace
+
+uint64_t BufferCache::DeferMinCopyBytes() {
+	static const uint64_t v = ParseDeferMinCopy();
+	return v;
+}
+
+bool BufferCache::DeferredReadbackEnabled() {
+	return DeferMinCopyBytes() != UINT64_MAX;
+}
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
@@ -91,6 +119,15 @@ void BufferCache::DrainDeferredReadbacks(bool force) {
 
 void BufferCache::EnsureCurrentForCpu(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0) {
+		return;
+	}
+	// Only meaningful when 1-frame-latency readback is armed: it forces the small
+	// indirect arg / count regions current before the CP reads them CPU-side, and
+	// lands any deferred writeback for them. With synchronous readback (default) the
+	// memory-tracker fault path already keeps these ranges current, and there are
+	// never any deferred readbacks to drain - so skip the CPU<->GPU sync round-trip
+	// entirely (it was serialising every indirect draw/dispatch, ~3x fps hit on menus).
+	if (!DeferredReadbackEnabled()) {
 		return;
 	}
 	// Pull down any GPU-dirty bytes (these arg regions are small, so DownloadBufferMemory
@@ -204,21 +241,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	//   KYTY_DEFER_READBACK=1        - defer copies >= 2 MiB
 	//   KYTY_DEFER_READBACK=<KiB>    - defer copies >= <KiB>
 	//   KYTY_DEFER_READBACK=all      - defer everything
-	static const uint64_t defer_min_copy = [] () -> uint64_t {
-		const char* d = std::getenv("KYTY_DEFER_READBACK");
-		if (d == nullptr || d[0] == '\0' || d[0] == '0') {
-			return UINT64_MAX; // never defer (default)
-		}
-		if (std::strcmp(d, "all") == 0) {
-			return 0;
-		}
-		char*      end = nullptr;
-		const auto kb  = std::strtoull(d, &end, 10);
-		if (end != d && kb > 1) {
-			return kb * 1024;
-		}
-		return 2 * 1024 * 1024;
-	}();
+	const uint64_t defer_min_copy = DeferMinCopyBytes();
 
 	// The previous call's deferred batch has almost always retired by now, so this is
 	// a cheap check, not a stall. Draining before Map() guarantees the staging region

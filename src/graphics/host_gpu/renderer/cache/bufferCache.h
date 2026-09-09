@@ -46,7 +46,13 @@ public:
 	// Force [vaddr,size) fully current for an immediate CPU read (indirect draw /
 	// dispatch args, count buffers): download any GPU-dirty part and land every
 	// deferred writeback. Never leaves this range on the 1-frame-latency path.
+	// No-op unless DeferredReadbackEnabled() (synchronous readback keeps these
+	// ranges current via the fault path, so the sync round-trip is pure overhead).
 	void                   EnsureCurrentForCpu(uint64_t vaddr, uint64_t size);
+	// KYTY_DEFER_READBACK, parsed once and cached. DeferMinCopyBytes() is the min
+	// copy size pushed onto the 1-frame-latency path (UINT64_MAX == off, default).
+	static uint64_t        DeferMinCopyBytes();
+	static bool            DeferredReadbackEnabled();
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

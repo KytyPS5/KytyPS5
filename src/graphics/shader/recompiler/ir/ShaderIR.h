@@ -638,6 +638,7 @@ struct CompiledShaderInfo {
 	// Retained after CFG disposal; only a compiler-verified wave split may set this.
 	uint32_t                      compute_wave_partition_factor = 1;
 	uint32_t                      param_export_mask   = 0;
+	bool                          bounded_srt_reads_precede_writes = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };

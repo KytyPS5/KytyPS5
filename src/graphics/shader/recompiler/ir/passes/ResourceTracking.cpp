@@ -14,6 +14,54 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+bool ProveBoundedSrtReadsPrecedeWrites(const Program& program) {
+	std::vector<const Inst*> reads;
+	std::vector<const Inst*> writes;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op == ValueOpcode::ReadBoundedSrtU32) reads.push_back(&inst);
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image == ImageAccess::Write || image == ImageAccess::Atomic)
+				writes.push_back(&inst);
+		}
+	}
+	if (reads.empty() || writes.empty()) return false;
+	const auto reachable_after_edge = [](const Block* from, const Block* target) {
+		std::vector<const Block*> pending;
+		for (const auto* successor: from->ImmSuccessors()) pending.push_back(successor);
+		std::unordered_set<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == target) return true;
+			if (!visited.insert(block).second) continue;
+			for (const auto* successor: block->ImmSuccessors()) pending.push_back(successor);
+		}
+		return false;
+	};
+	for (const auto* write: writes) {
+		for (const auto* read: reads) {
+			if (write->Parent() != read->Parent()) {
+				if (reachable_after_edge(write->Parent(), read->Parent())) return false;
+				continue;
+			}
+			bool saw_write = false;
+			for (const auto& inst: *write->Parent()) {
+				if (&inst == write) saw_write = true;
+				if (&inst == read && saw_write) return false;
+			}
+			// A later write in the same block is safe only when no successor path
+			// can revisit the bounded read in another loop iteration.
+			if (reachable_after_edge(write->Parent(), read->Parent())) return false;
+		}
+	}
+	return true;
+}
+
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -204,6 +252,8 @@ public:
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
+		m_program.bounded_srt_reads_precede_writes =
+		    ProveBoundedSrtReadsPrecedeWrites(m_program);
 		m_program.resource_tracking_complete = true;
 	}
 

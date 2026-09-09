@@ -1990,6 +1990,7 @@ struct ImmutableSrtScenario {
 };
 constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"buffer-overlap", "immutable SRT snapshot overlaps writable resource"},
+    ImmutableSrtScenario{"buffer-overlap-ordered", "", true},
     ImmutableSrtScenario{"buffer-atomic-overlap", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"image-padding-overlap", "immutable SRT snapshot overlaps writable resource"},
     ImmutableSrtScenario{"range-overflow", "immutable SRT snapshot has an invalid range"},
@@ -12000,6 +12001,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     const bool image_writer = selected.starts_with("image-padding-");
     const bool buffer_writer = selected.starts_with("buffer-");
     const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint";
+    const bool ordered_overlap = selected == "buffer-overlap-ordered";
     const bool graphics = selected == "vertex-snapshot";
     constexpr uintptr_t base = 0x0000000205200000ull;
     constexpr uint64_t allocation_size = 0x20000u;
@@ -12052,7 +12054,8 @@ void CheckSampledHtileArrayClearDiscovery() {
       const uint64_t writer_size = image_writer ? image_layout.size
                                    : stride_zero_writer ? 16u
                                                         : buffer_size;
-      ResourceReadRange source{base+writer_size-(scenario.allowed ? 0u : 4u),4u};
+      ResourceReadRange source{
+          base + writer_size - (scenario.allowed && !ordered_overlap ? 0u : 4u), 4u};
       if (!image_writer && !buffer_writer) source={base+0x10000u,4u};
       if (selected == "range-overflow") source={UINT64_MAX-3u,8u};
       if (selected == "range-48bit") source={uint64_t{1}<<48u,4u};
@@ -12102,6 +12105,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       AllocateBindings(program);
       CompiledShaderInfo info{};
       info.stage=program.stage;
+      info.bounded_srt_reads_precede_writes=ordered_overlap;
       info.info=std::move(program.info);
       info.bindings=std::move(program.bindings);
       runtime.program=&info;
@@ -41938,16 +41942,25 @@ void CheckStorageBufferByteOffsetBoundary() {
 }
 
 void CheckImmutableSrtBindingAdmission() {
-  constexpr const char* name="ImmutableSrtBindingAdmission";
+  constexpr const char* name = "ImmutableSrtBindingAdmission";
   std::vector<RendererFailureCase> cases;
-  for (const auto& scenario:ImmutableSrtScenarios)
-    if (!scenario.allowed) cases.push_back({scenario.mode,scenario.diagnostic});
-  CheckRendererFailureCases(name,"--immutable-srt-binding",
-      "KYTY_IMMUTABLE_SRT_READY ","KYTY_IMMUTABLE_SRT_RETURNED ",cases);
+  size_t allowed = 0;
+  for (const auto& scenario : ImmutableSrtScenarios) {
+    if (scenario.allowed) {
+      ++allowed;
+    } else {
+      cases.push_back({scenario.mode, scenario.diagnostic});
+    }
+  }
+  CheckRendererFailureCases(name, "--immutable-srt-binding",
+                            "KYTY_IMMUTABLE_SRT_READY ",
+                            "KYTY_IMMUTABLE_SRT_RETURNED ", cases);
   VulkanHarness vulkan;
-  for (const auto& scenario:ImmutableSrtScenarios)
+  for (const auto& scenario : ImmutableSrtScenarios) {
     if (scenario.allowed) vulkan.CheckImmutableSrtBindingCase(scenario.mode);
-  std::printf("[host]    %-32s ok (%zu rejected, 3 allowed)\n",name,cases.size());
+  }
+  std::printf("[host]    %-32s ok (%zu rejected, %zu allowed)\n", name,
+              cases.size(), allowed);
 }
 #endif
 

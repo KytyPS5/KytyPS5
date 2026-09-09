@@ -203,17 +203,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	if (tile) {
-		if (volume || texture_tile) {
-			pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
-		} else {
-			pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
-		}
-		if (pitch == 0) {
-			EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
-		}
+	// PPSA28068: the linear EULA target and its sampled view must share the padded pitch.
+	if (!tile || volume || texture_tile) {
+		pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 	} else {
-		pitch = width;
+		pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
+	}
+	if (pitch == 0) {
+		EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
 	}
 
 	TileSizeOffset    mip_sizes[16] {};

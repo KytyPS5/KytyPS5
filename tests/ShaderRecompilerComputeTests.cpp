@@ -7855,8 +7855,8 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckRenderExecutorColor1DDiscovery() {
-    constexpr const char *name = "RenderExecutorColor1DDiscovery";
+  void CheckRenderExecutorColorDiscovery() {
+    constexpr const char *name = "RenderExecutorColorDiscovery";
     constexpr uintptr_t base = 0x0000000203c00000ull;
     constexpr uint32_t width = 512;
     constexpr uint32_t height = 1;
@@ -7871,25 +7871,38 @@ public:
             pitch != 0 && TileGetRenderTargetSize(
                               width, height, pitch, bytes_per_element, layout, 0),
             "1D render-target layout is unavailable");
-    const auto allocation_size =
-        std::max<uint64_t>(layout.size, allocation_alignment);
+    struct TargetCase {
+      uint32_t width, height, dimension, pitch;
+      uint64_t size;
+      Prospero::TileMode tile;
+    };
+    const std::array cases{
+        TargetCase{width, height, 0, pitch, layout.size,
+                   Prospero::TileMode::kRenderTarget},
+        // PPSA28068: the 1440x720 agreement target must alias its sampled texture.
+        TargetCase{1440, 720, 1, 1472, 0x40b000, Prospero::TileMode::kLinear},
+    };
+    constexpr uint64_t allocation_size = 0x410000;
 
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
                 0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
                 allocation_size, allocation_alignment, 0, &direct_offset) == 0,
-            "1D color direct-memory allocation failed");
+            "color direct-memory allocation failed");
     void *mapped = reinterpret_cast<void *>(base);
     Require(name, "direct mapping",
             Libs::LibKernel::Memory::KernelMapDirectMemory(
                 &mapped, allocation_size, 0x3, 0x10, direct_offset,
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
-            "1D color fixed mapping failed");
+            "color fixed mapping failed");
     std::memset(mapped, 0, allocation_size);
 
-    {
+    for (const auto &target : cases) {
+      const auto width = target.width;
+      const auto height = target.height;
+      const bool is_1d = target.dimension == 0;
       RenderContext context(m_runtime_context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
@@ -7902,8 +7915,8 @@ public:
               .channel_order = Prospero::ChannelOrder::kStandard});
       registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
       registers.SetColorAttrib3(0,
-                                {.tile_mode = Prospero::TileMode::kRenderTarget,
-                                 .dimension = 0,
+                                {.tile_mode = target.tile,
+                                 .dimension = target.dimension,
                                  .metadata_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
@@ -7924,20 +7937,63 @@ public:
           executor, scheduler.Current(), &color, 1, no_depth);
       scheduler.Current().BeginRendering(rendering);
       scheduler.Current().EndRendering();
-      Require(name, "captured 1D target",
+      Require(name, "captured color target",
               color.image_id && attachment != nullptr &&
                   rendering.color_attachments[0].image_view != nullptr &&
-                  color.desc.info.type == Prospero::ImageType::kColor1D &&
+                  color.desc.info.type == (is_1d ? Prospero::ImageType::kColor1D
+                                                  : Prospero::ImageType::kColor2D) &&
                   color.desc.info.extent == vk::Extent3D{width, height, 1} &&
                   color.desc.info.resources == ImageSubresources{1, 1} &&
-                  color.desc.info.pitch == pitch &&
-                  color.desc.info.data.size == layout.size &&
-                  color.desc.view_info.type == vk::ImageViewType::e1D &&
-                  image.backing.image_type == vk::ImageType::e1D &&
+                  color.desc.info.pitch == target.pitch &&
+                  color.desc.info.data.size == target.size &&
+                  color.desc.info.mip_layout[0].offset == 0 &&
+                  color.desc.info.mip_layout[0].size == target.size &&
+                  color.desc.view_info.type == (is_1d ? vk::ImageViewType::e1D
+                                                       : vk::ImageViewType::e2D) &&
+                  image.backing.image_type == (is_1d ? vk::ImageType::e1D
+                                                      : vk::ImageType::e2D) &&
                   rendering.width == width && rendering.height == height &&
                   rendering.num_layers == 1 &&
                   rendering.num_color_attachments == 1,
-              "dimension=0 did not create a 512x1 Vulkan attachment");
+              "color attachment lost its dimensions or padded guest layout");
+
+      if (target.tile == Prospero::TileMode::kLinear) {
+        vk::ClearValue clear{};
+        clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(base >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+                (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+            DstSel(4, 5, 6, 7) |
+                (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = true;
+        const auto sampled =
+            RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Require(name, "linear target sampled alias",
+                sampled.image_id == color.image_id &&
+                    sampled.desc.info.pitch == target.pitch &&
+                    sampled.desc.info.data.size == target.size &&
+                    sampled.desc.info.mip_layout == color.desc.info.mip_layout &&
+                    texture_cache.FindTexture(sampled.image_id, sampled.desc) != nullptr,
+                "sampling the linear agreement target created a second image");
+        Require(name, "linear target sampled contents",
+                ReadCachedTexel(name, context, sampled.image_id,
+                                {1439, 719, 0}) == std::vector<u32>{0xffff00ffu},
+                "the sampled linear target lost its GPU-written final texel");
+      }
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
@@ -7946,11 +8002,11 @@ public:
 
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
-            "1D color direct mapping release failed");
+            "color direct mapping release failed");
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
-            "1D color direct-memory allocation release failed");
+            "color direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -28325,7 +28381,7 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
-    vulkan.CheckRenderExecutorColor1DDiscovery();
+    vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckSampledDccClear();
@@ -28531,7 +28587,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  vulkan.CheckRenderExecutorColor1DDiscovery();
+  vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckSampledDccClear();

@@ -468,6 +468,7 @@ struct DescriptorSource {
 		uint32_t                  bound_source  = NoBoundSource;
 		bool                      bound_signed  = false;
 		uint32_t item_bound = 0;
+		uint32_t selector_immediate = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

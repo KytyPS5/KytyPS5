@@ -446,7 +446,7 @@ private:
 		}
 		uint32_t    material_memory_index = 0;
 		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
-		if (material_memory == nullptr || material_memory->offset != 0u ||
+		if (material_memory == nullptr ||
 		    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 			return false;
 		}
@@ -494,6 +494,7 @@ private:
 		          image_source.dwords.begin() + 4u);
 		image_source.indirect_image = DescriptorSource::IndirectImage {
 		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
+		image_source.indirect_image->selector_immediate = material_memory->offset;
 
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);

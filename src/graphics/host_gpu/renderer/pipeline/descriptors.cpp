@@ -148,7 +148,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsSubwordStorageOffset(descriptor, resource) &&
+	if ((byte_adjustment && !SupportsFormattedStorageOffset(descriptor, resource) &&
 	     !SupportsScalarStorageOffset(resource)) ||
 	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64

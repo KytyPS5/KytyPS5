@@ -4,6 +4,32 @@ This file records regression coverage deferred during fast launch bring-up. Each
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
 
+## Cooperative wave64 read-only LDS phase batching
+
+Status: CPU regression added and Vulkan neighboring coverage complete; large-module
+driver compile remains open.
+
+Observed trigger: the cooperative emitter ended every LDS instruction with a full
+workgroup rendezvous. Consecutive read-only accesses therefore created redundant phases,
+guards and cross-phase spills even though no invocation could publish a conflicting LDS
+write between them. The exact large compute module shrank from 702,611 to 697,920 words,
+but NVIDIA `vkCreateComputePipelines` still exceeded the 60-second frame watchdog.
+
+Covered tests:
+
+- One and two consecutive read-only LDS accesses emit the same number of
+  `OpControlBarrier` instructions.
+- An intervening LDS write retains both required read/write hazard boundaries.
+- Cooperative SSBO, cyclic scalar/physical address and BDA coefficient Vulkan tests
+  execute successfully on the native Windows GPU path.
+
+Remaining debt:
+
+- Factor repeated split-wave64 ballot/readlane lowering into reusable SPIR-V functions
+  without changing workgroup scratch, dynamic-uniformity or barrier semantics.
+- Ratchet exact synthetic module size and validate that bounded pipeline creation no
+  longer exceeds 60 seconds before claiming menu or gameplay progress.
+
 ## Compressed video-out metadata on a native render-target alias
 
 Status: regression test added; run against the unfixed implementation before the

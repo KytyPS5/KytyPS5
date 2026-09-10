@@ -78,6 +78,9 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// Loop-carried phi values taken on trust, inherited by any trial this walk starts.
+	std::unordered_map<const Inst*, uint64_t> m_assumed;
+	std::unordered_set<const Inst*>           m_barred;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

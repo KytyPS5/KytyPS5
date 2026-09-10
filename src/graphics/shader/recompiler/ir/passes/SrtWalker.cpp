@@ -285,7 +285,7 @@ private:
 			if (invariant.IsEmpty()) {
 				return finish(false);
 			}
-			return finish(Validate(invariant));
+			return finish(Validate(entry));
 		}
 		if (op == ValueOpcode::ReadFirstLane) {
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
@@ -544,6 +544,12 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
+	// A value assumed by the fixpoint trial answers before the memo: the whole phi web has to
+	// read as the candidate for the iteration under test.
+	if (const auto assumed = m_assumed.find(inst); assumed != m_assumed.end()) {
+		result = assumed->second;
+		return true;
+	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 	if (index >= m_context.values.size()) {
 		m_context.values.resize(m_program.evaluation_value_count);
@@ -577,7 +583,43 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-	return !value.IsEmpty() && EvaluateWide(value, result);
+	if (!value.IsEmpty()) {
+		return EvaluateWide(value, result);
+	}
+	if (m_barred.contains(&inst)) {
+		return false;
+	}
+	// Loop-carried: assume the entry value and require every operand to reproduce it, which
+	// makes it the value the phi holds on every iteration.
+	std::vector<const Inst*> web;
+	const auto entry = ResolveCyclicPhiEntry(m_program, Value(const_cast<Inst*>(&inst)), &web);
+	uint64_t   candidate = 0;
+	if (entry.IsEmpty() || !EvaluateWide(entry, candidate)) {
+		return false;
+	}
+	// A separate walk, because this one's memo already holds the operands the phi was reached
+	// through and re-entering them would read as a cycle.
+	SrtWalker trial(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator, m_active_mask);
+	// Assumptions made further up the stack stay in force for any phi reached from here.
+	trial.m_assumed = m_assumed;
+	trial.m_barred  = m_barred;
+	for (const auto* member: web) {
+		// The whole web holds the candidate on one iteration, so assume all of it at once.
+		const auto assumed = trial.m_assumed.emplace(member, candidate);
+		if (!assumed.second && assumed.first->second != candidate) {
+			return false;
+		}
+	}
+	for (const auto* member: web) {
+		for (size_t index = 0; index < member->NumArgs(); index++) {
+			uint64_t carried = 0;
+			if (!trial.EvaluateWide(member->Arg(index), carried) || carried != candidate) {
+				return false;
+			}
+		}
+	}
+	result = candidate;
+	return true;
 }
 
 bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
@@ -722,8 +764,14 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return EvaluateWide(inst.Arg(0), result);
 			}
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, &clean_active, inst.Arg(1));
+			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
+			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
+			                  inst.Arg(1));
+			// A lane-0 walk resolves selects on its own mask; outer assumptions need not hold.
+			active.m_barred = m_barred;
+			for (const auto& assumed: m_assumed) {
+				active.m_barred.insert(assumed.first);
+			}
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:

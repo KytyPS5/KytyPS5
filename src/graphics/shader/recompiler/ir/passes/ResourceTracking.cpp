@@ -771,6 +771,7 @@ private:
 		uint32_t memory_index = 0;
 		const auto* memory = ScalarReadMemory(*inst, memory_index);
 		DescriptorSource source;
+		bool             carried = false;
 		if (memory != nullptr) {
 			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
 			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
@@ -779,6 +780,7 @@ private:
 				Fail(use_pc, "scalar read has an invalid resource handle");
 			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
 			           inst->Flags<MemoryFlags>().pc);
+			carried = ReadsThroughCarriedDescriptor(*inst, source);
 			for (uint32_t word = 0; word < width; ++word)
 				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
 			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
@@ -791,8 +793,54 @@ private:
 		m_srt_visited.push_back(inst);
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		// A constant offset is not enough to hoist: a flattened slot holds one word for the whole
+		// dispatch, and a descriptor carried around a loop names a different record every
+		// iteration.
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32 || carried) return;
 		m_scalar_reads.push_back(inst);
+	}
+
+	// True when the descriptor a raw read goes through is carried around a loop, so the record it
+	// names differs per iteration. An invariant phi folds to one value and names one record.
+	bool CarriedValue(Value value, uint32_t depth, std::vector<const Inst*>& seen) const {
+		constexpr uint32_t MaxCarriedDepth = 24;
+		if (depth > MaxCarriedDepth) {
+			return false;
+		}
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(seen, inst) != seen.end()) {
+			return false;
+		}
+		seen.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			return ResolveInvariantPhi(m_program, value).IsEmpty();
+		}
+		for (uint32_t arg = 0; arg < inst->NumArgs(); arg++) {
+			if (CarriedValue(inst->Arg(arg), depth + 1, seen)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Judged on the descriptor as resolved to its native source: a join the native control flow
+	// settles is one descriptor, while one carried around a loop stays a phi.
+	bool ReadsThroughCarriedDescriptor(const Inst& read, const DescriptorSource& source) const {
+		// Only a scalar buffer read is left to the shader: its descriptor is a V# the indirect
+		// table machinery binds per record, so reading it in place is served. A raw address read
+		// has no such path - un-flattening one only costs the tracker the descriptor it resolves
+		// today, so those keep the existing behaviour.
+		if (read.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+			return false;
+		}
+		for (uint32_t word = 0; word < source.dword_count; word++) {
+			std::vector<const Inst*> seen;
+			if (CarriedValue(source.dwords[word], 0, seen)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	void PlanScalarReads() {

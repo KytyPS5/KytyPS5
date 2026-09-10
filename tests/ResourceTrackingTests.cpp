@@ -30,6 +30,15 @@ void Check(bool condition, const char *message) {
   }
 }
 
+// Upstream replaced the free EvaluateDescriptorSource with the SrtWalker class; this keeps
+// the one-source form the tests are written against.
+bool EvaluateDescriptorSource(const ResourcePlan &program, uint32_t source,
+                              const SrtRuntime &runtime, DescriptorValue &result) {
+  SrtWalker clean(program, CleanRuntime(runtime));
+  SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
+  return walker.EvaluateDescriptor(source, result);
+}
+
 template <typename F>
 void CheckTrackingRejected(F &fixture, std::string_view expected,
                            const char *message) {
@@ -2784,6 +2793,38 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
         "runtime-rooted invariant loop lost its buffer source");
 }
 
+void TestAdvancingLoopPhi() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  const auto initial = fixture.UserData(0);
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                  static_cast<uint64_t>(Type::U32));
+  const auto carried =
+      fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(4u)}, 0, loop);
+  phi.AddPhiOperand(entry, initial);
+  phi.AddPhiOperand(loop, carried);
+  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+                                   {Value(&phi), Value(0u), Value(0u), Value(0u)},
+                                   MemoryFlags{0, 16}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 16), loop);
+  fixture.PlanAndTrack();
+
+  std::array<uint32_t, 1> user_data{0x12345678u};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  Check(!EvaluateDescriptorSource(fixture.program,
+                                  fixture.program.info.buffers[0].source, runtime,
+                                  descriptor),
+        "advancing descriptor phi was evaluated to its entry value");
+}
+
 void TestInvariantLoopPhi() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -3651,6 +3692,7 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("advancing loop phi", TestAdvancingLoopPhi);
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);

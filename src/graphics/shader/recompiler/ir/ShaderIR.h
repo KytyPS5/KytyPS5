@@ -634,6 +634,8 @@ void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out = nullptr);
 Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

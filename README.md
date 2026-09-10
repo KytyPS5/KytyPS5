@@ -90,8 +90,14 @@ starting a large change.
 
 Set up the clang-format hook after cloning:
 
-```powershell
-python -m pip install pre-commit
+Install `pre-commit` using the method appropriate for your platform:
+
+- **Arch Linux / CachyOS:** `sudo pacman -S pre-commit`
+- **Other Linux / macOS / Windows:** `python -m pip install pre-commit`
+
+Then install the Git hook:
+
+```bash
 python -m pre_commit install --install-hooks
 ```
 

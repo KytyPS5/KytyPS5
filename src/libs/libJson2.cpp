@@ -124,10 +124,13 @@ static JsonValue* JsonStaticNullValue() {
 // "false" and assert on the value's type without a prior existence check, so an
 // absent key resolves to a read-only boolean-false rather than a null value.
 static JsonValue* JsonStaticAbsentValue() {
-	static JsonValue value {};
-	value.type    = JsonValueTypeBoolean;
-	value.boolean = false;
-	return &value;
+	// An absent key reads back as null. This used to return boolean-false, because an engine
+	// reading an omitted flag asserted on the value's type -- but that was a symptom of the
+	// document being discarded outright by the parser, so keys that were present read back
+	// absent too. With parsing fixed, boolean-false is actively harmful: an engine that keeps
+	// a default in place while the lookup reads null now sees a real boolean and overwrites
+	// its default with it, which trips the type assert on every non-boolean field.
+	return JsonStaticNullValue();
 }
 
 static JsonString* JsonStaticString() {

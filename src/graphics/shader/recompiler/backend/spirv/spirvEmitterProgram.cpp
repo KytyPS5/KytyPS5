@@ -448,14 +448,14 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
 }
 
-uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+uint32_t ValueEmitContext::Ballot(IR::Value predicate, bool exclude_helpers) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, ScopeSubgroup);
 	// A helper invocation is not a live guest lane: it never clears its EXEC bit, so leaving it
 	// in a wave-level ballot makes an s_cbranch_execnz loop test true forever and hangs the GPU
 	// (Astro Bot's looping composite pixel shaders). Mask helpers out of every ballot.
 	const auto live = [&](uint32_t value) {
-		if (state.helper_invocation_variable == 0) {
+		if (!exclude_helpers || state.helper_invocation_variable == 0) {
 			return value;
 		}
 		const auto helper = state.builder.AllocateId();

@@ -637,7 +637,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 				ctx.Define(inst, shuffled);
 				return true;
 			}
-			const auto ballot        = ctx.Ballot(inst.Arg(1));
+			const auto ballot        = ctx.Ballot(inst.Arg(1), false);
 			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
 			const auto can_fetch     = state.builder.AllocateId();
 			state.builder.AddFunction(

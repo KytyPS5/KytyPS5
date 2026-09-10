@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.12...4.3)
+cmake_minimum_required(VERSION 3.12...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")

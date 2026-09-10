@@ -856,13 +856,49 @@ private:
 		} else {
 			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
 				CollectScalarRead(inst->Arg(arg), use_pc);
+	}
+
+	bool CarriedValue(Value value, uint32_t depth, std::vector<const Inst*>& seen) const {
+		constexpr uint32_t MaxCarriedDepth = 24;
+		if (depth > MaxCarriedDepth) {
+			return false;
 		}
 		m_srt_visiting.pop_back();
 		m_srt_visited.push_back(inst);
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
 		m_scalar_reads.push_back(inst);
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(seen, inst) != seen.end()) {
+			return false;
+		}
+		seen.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			return ResolveInvariantPhi(m_program, value).IsEmpty();
+		}
+		for (uint32_t arg = 0; arg < inst->NumArgs(); arg++) {
+			if (CarriedValue(inst->Arg(arg), depth + 1, seen)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool ReadsThroughCarriedDescriptor(const Inst& read, const DescriptorSource& source) const {
+		// Only a scalar buffer read stays in the shader; a raw address read keeps being hoisted.
+		if (read.GetOpcode() != ValueOpcode::ReadConstBuffer) {
+			return false;
+		}
+		for (uint32_t word = 0; word < source.dword_count; word++) {
+			std::vector<const Inst*> seen;
+			if (CarriedValue(source.dwords[word], 0, seen)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	}
 
 	void PlanScalarReads() {

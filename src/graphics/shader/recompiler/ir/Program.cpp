@@ -1,14 +1,15 @@
 #include "common/assert.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
-#include <xbyak/xbyak.h>
 #include <map>
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -215,6 +216,89 @@ Value ResolveActiveU32(Value value, Value active) {
 		value = inst->Arg(1);
 	}
 	return {};
+}
+
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+	value            = value.Resolve();
+	const auto* root = value.TryInstruction();
+	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+		return {};
+	}
+	std::vector<const Inst*>        web_order {root};
+	std::unordered_set<const Inst*> web {root};
+	for (size_t index = 0; index < web_order.size(); index++) {
+		const auto* inst = web_order[index];
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			const auto* operand = inst->Arg(arg).Resolve().TryInstruction();
+			if (operand != nullptr && operand->GetOpcode() == ValueOpcode::Phi &&
+			    web.insert(operand).second) {
+				web_order.push_back(operand);
+			}
+		}
+	}
+
+	// An operand leading back into the web is loop-carried; anything else entered the loop.
+	std::unordered_map<const Inst*, bool> reaches;
+	const auto                            ReachesWeb = [&](Value operand) {
+		const auto* start = operand.Resolve().TryInstruction();
+		if (start == nullptr) {
+			return false;
+		}
+		if (const auto found = reaches.find(start); found != reaches.end()) {
+			return found->second;
+		}
+		std::vector<const Inst*>        pending {start};
+		std::unordered_set<const Inst*> seen {start};
+		bool                            found = false;
+		while (!pending.empty() && !found) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				const auto* next = inst->Arg(arg).Resolve().TryInstruction();
+				if (next == nullptr) {
+					continue;
+				}
+				if (web.contains(next)) {
+					found = true;
+					break;
+				}
+				if (seen.insert(next).second) {
+					pending.push_back(next);
+				}
+			}
+		}
+		if (!found) {
+			// The walk ran to completion, so nothing it visited reaches the web either.
+			for (const auto* inst: seen) {
+				reaches.emplace(inst, false);
+			}
+		}
+		reaches[start] = found;
+		return found;
+	};
+
+	Value entry;
+	for (const auto* inst: web_order) {
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			const auto  operand = inst->Arg(arg).Resolve();
+			const auto* source  = operand.TryInstruction();
+			if (source != nullptr && web.contains(source)) {
+				continue;
+			}
+			if (ReachesWeb(operand)) {
+				continue;
+			}
+			if (entry.IsEmpty()) {
+				entry = operand;
+			} else if (!EquivalentValue(program, entry, operand)) {
+				// A merge, not a loop: no single host binding stands for it.
+			}
+		}
+	}
+	if (web_out != nullptr) {
+		*web_out = web_order;
+	}
+	return entry;
 }
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory) {
@@ -479,7 +563,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail(fmt::format("{} has a non-buffer resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
+				// Stores and atomics through a decoded V# take any MUBUF shape; loads only the
+				// decoded ones.
 				if (memory.kind == ResourceKind::IndirectBuffer &&
+				    BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
 					            "or formatted X load");

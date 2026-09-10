@@ -550,6 +550,44 @@ float SrtWalker::Float32(uint64_t bits) {
 	return std::bit_cast<float>(static_cast<uint32_t>(bits));
 }
 
+}
+
+SrtWalker::Visit SrtWalker::BeginVisit(ResourcePlan::EvaluationContext::Entry& entry) {
+	Visit visit {++m_state->visits, VolatileRefusals(), m_state->cycle_root, DependenceScope(),
+	             false};
+	entry.generation    = m_context.generation | 1u;
+	entry.value         = visit.order;
+	m_state->cycle_root = UINT64_MAX;
+	if (visit.lane != nullptr) {
+		visit.outer_dependent = visit.lane->dependent;
+		visit.lane->dependent = false;
+	}
+	return visit;
+}
+
+void SrtWalker::EndVisit(const Visit& visit, uint32_t index, bool evaluated, uint64_t value) {
+	const auto cycle_root = m_state->cycle_root;
+	m_state->cycle_root   = std::min(visit.outer_cycle_root, cycle_root);
+	const bool dependent  = visit.lane != nullptr && visit.lane->dependent;
+	if (visit.lane != nullptr) visit.lane->dependent = visit.outer_dependent || dependent;
+	// Evaluation may grow the dense memo vector.
+	auto& memo          = m_context.values[index];
+	memo.lane_dependent = dependent;
+	if (evaluated) {
+		memo.value      = value;
+		memo.generation = m_context.generation;
+	} else if (cycle_root < visit.order || VolatileRefusals() != visit.volatile_refusals ||
+	           (dependent && m_shares_lanes)) {
+		// A path-dependent refusal (outer cycle, GPU-owned slot) is retried, not remembered.
+		memo.generation = 0;
+		return;
+	} else {
+		memo.value      = static_cast<uint64_t>(m_state->last);
+		memo.generation = m_context.generation | 2u;
+	}
+	if (dependent && m_shares_lanes) m_lane_entries.push_back(index);
+}
+
 bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
@@ -560,7 +598,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 			case Type::U32: result = value.U32(); return true;
 			case Type::U64: result = value.U64(); return true;
 			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
+			default: return Refuse(SrtRefusal::UnsupportedOperand);
 		}
 	}
 	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
@@ -569,11 +607,14 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 		return EvaluateWide(inst->Arg(1), result);
+	}
+	// A value a fixpoint trial assumes answers before the memo.
+		return true;
 	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 	if (index >= m_context.values.size()) {
@@ -616,14 +657,38 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 			if (m_reachable_blocks != nullptr &&
 			    !m_reachable_blocks->at(control->second[index])) continue;
 			uint64_t incoming = 0;
-			if (!Arg(inst, index, incoming) || (found && incoming != result)) return false;
+			if (!Arg(inst, index, incoming)) return false;
+			if (found && incoming != result) return Refuse(SrtRefusal::VaryingPhi);
 			result = incoming;
 			found = true;
 		}
-		return found;
+		return found || Refuse(SrtRefusal::UndefinedValue);
 	}
 	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-	return !value.IsEmpty() && EvaluateWide(value, result);
+	const Value phi(const_cast<Inst*>(&inst));
+	if (!value.IsEmpty()) {
+		return EvaluateWide(value, result);
+	}
+	}
+	// Loop-carried: assume the entry value and require every operand of the phi web to reproduce
+	// it.
+	}
+	// A separate memo: this walk already holds the operands the phi was reached through.
+	SrtWalker trial(*this, m_active_mask, false, m_clean_evaluator, true);
+	trial.m_assumed        = m_assumed;
+	trial.m_barred         = m_barred;
+	trial.m_suspended_lane = m_suspended_lane;
+	for (const auto* member: web) {
+		}
+	}
+	for (const auto* member: web) {
+		for (size_t index = 0; index < member->NumArgs(); index++) {
+			uint64_t carried = 0;
+			if (!trial.EvaluateWide(member->Arg(index), carried)) return false;
+		}
+	}
+	result = candidate;
+	return true;
 }
 
 bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
@@ -732,6 +797,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	return true;
 }
 
+void SrtWalker::BarAssumptions(SrtWalker& walker) const {
+	// A lane walk resolves selects on its own mask, so assumptions made above it need not hold.
+	walker.m_barred = m_barred;
+	for (const auto& assumed: m_assumed)
+		walker.m_barred.insert(assumed.first);
+}
+
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	uint64_t   a       = 0;
 	uint64_t   b       = 0;
@@ -756,9 +828,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
 				return EvaluateWide(inst.Arg(0), result);
 			}
-			SrtWalker clean_active(*this, inst.Arg(1), true);
-			SrtWalker active(*this, inst.Arg(1), false, &clean_active);
 			return active.EvaluateWide(inst.Arg(0), result);
+			result            = m_lane->lane;
 		}
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);

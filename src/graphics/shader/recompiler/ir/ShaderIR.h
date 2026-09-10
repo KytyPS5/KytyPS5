@@ -756,6 +756,7 @@ bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,
                                const DescriptorSource::IndirectDescriptor& right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
 Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

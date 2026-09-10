@@ -158,7 +158,12 @@ private:
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
+	bool                             m_isolated = false;
+	WalkState                        m_own_state;
+	WalkState*                       m_state;
 	ResourcePlan::EvaluationContext& m_context;
+	SrtRefusal                       m_refusal = SrtRefusal::None;
+	// Loop-carried phi values a fixpoint trial takes on trust, and phis no walk here may assume.
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

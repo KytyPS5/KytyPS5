@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/DynamicBuffer.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
@@ -652,6 +653,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, waterfalls);
 		IR::ConstantPropagationPass(ir.blocks);
 		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (const auto lowered = IR::LowerDynamicBufferReads(ir); lowered != 0) {
+		LOGF("%s dynamic buffer lowering: stage=%s hash=0x%016" PRIx64 " reads=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, lowered);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}

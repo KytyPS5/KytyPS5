@@ -14,6 +14,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace Libs::Controller {
@@ -128,6 +131,149 @@ private:
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
 };
+
+namespace {
+
+uint32_t ButtonNameToMask(const std::string& name) {
+	if (name == "cross") return PAD_BUTTON_CROSS;
+	if (name == "circle") return PAD_BUTTON_CIRCLE;
+	if (name == "triangle") return PAD_BUTTON_TRIANGLE;
+	if (name == "square") return PAD_BUTTON_SQUARE;
+	if (name == "l1") return PAD_BUTTON_L1;
+	if (name == "r1") return PAD_BUTTON_R1;
+	if (name == "l2") return PAD_BUTTON_L2;
+	if (name == "r2") return PAD_BUTTON_R2;
+	if (name == "l3") return PAD_BUTTON_L3;
+	if (name == "r3") return PAD_BUTTON_R3;
+	if (name == "up") return PAD_BUTTON_UP;
+	if (name == "down") return PAD_BUTTON_DOWN;
+	if (name == "left") return PAD_BUTTON_LEFT;
+	if (name == "right") return PAD_BUTTON_RIGHT;
+	if (name == "options") return PAD_BUTTON_OPTIONS;
+	if (name == "touchpad") return PAD_BUTTON_TOUCH_PAD;
+	return 0;
+}
+
+bool AxisNameToEnum(const std::string& name, Axis* axis) {
+	if (name == "left_stick_x") {
+		*axis = Axis::LeftX;
+	} else if (name == "left_stick_y") {
+		*axis = Axis::LeftY;
+	} else if (name == "right_stick_x") {
+		*axis = Axis::RightX;
+	} else if (name == "right_stick_y") {
+		*axis = Axis::RightY;
+	} else if (name == "trigger_left") {
+		*axis = Axis::TriggerLeft;
+	} else if (name == "trigger_right") {
+		*axis = Axis::TriggerRight;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+// Scripted controller-input replay for --input-script. Parses a text file of
+// "<guest_frame> button <name> <down|up>" / "<guest_frame> axis <name> <0-255>" lines (blank
+// lines and '#' comments allowed) and fires them, in frame order, through the exact same
+// SetButton/SetAxis entry points the real SDL host-input path uses (window.cpp) -- so the guest
+// sees ordinary controller input, not a special replay path. Exists because this project has no
+// way to drive a game without a physical controller attached otherwise (see workflow's Gate 2).
+class InputScriptPlayer {
+public:
+	explicit InputScriptPlayer(const std::filesystem::path& path) {
+		std::ifstream file(path);
+		if (!file.is_open()) {
+			EXIT("InputScriptPlayer: failed to open %s\n", path.string().c_str());
+		}
+
+		std::string line;
+		int         line_num = 0;
+		while (std::getline(file, line)) {
+			line_num++;
+			const auto hash = line.find('#');
+			if (hash != std::string::npos) {
+				line.resize(hash);
+			}
+
+			std::istringstream iss(line);
+			int64_t            frame = 0;
+			std::string        event_type;
+			if (!(iss >> frame >> event_type)) {
+				continue; // blank or comment-only line
+			}
+
+			ScriptEvent event;
+			event.frame = frame;
+			if (event_type == "button") {
+				std::string name;
+				std::string state;
+				iss >> name >> state;
+				event.kind   = ScriptEvent::Kind::Button;
+				event.button = ButtonNameToMask(name);
+				event.down   = (state == "down");
+				if (event.button == 0) {
+					EXIT("InputScriptPlayer: %s:%d unknown button name '%s'\n",
+					     path.string().c_str(), line_num, name.c_str());
+				}
+			} else if (event_type == "axis") {
+				std::string name;
+				int         value = 0;
+				iss >> name >> value;
+				event.kind  = ScriptEvent::Kind::Axis;
+				event.value = value;
+				if (!AxisNameToEnum(name, &event.axis)) {
+					EXIT("InputScriptPlayer: %s:%d unknown axis name '%s'\n",
+					     path.string().c_str(), line_num, name.c_str());
+				}
+			} else {
+				EXIT("InputScriptPlayer: %s:%d unknown event type '%s'\n", path.string().c_str(),
+				     line_num, event_type.c_str());
+			}
+			m_events.push_back(event);
+		}
+
+		std::stable_sort(m_events.begin(), m_events.end(),
+		                 [](const ScriptEvent& a, const ScriptEvent& b) { return a.frame < b.frame; });
+
+		LOGF("InputScriptPlayer: loaded %zu event(s) from %s\n", m_events.size(),
+		     path.string().c_str());
+	}
+
+	void Tick(int64_t frame_num) {
+		while (m_next < m_events.size() && m_events[m_next].frame <= frame_num) {
+			const auto& event = m_events[m_next];
+			if (event.kind == ScriptEvent::Kind::Button) {
+				SetButton(HOST_INPUT_CONTROLLER_ID, event.button, event.down);
+			} else {
+				SetAxis(HOST_INPUT_CONTROLLER_ID, event.axis, event.value);
+			}
+			LOGF("InputScriptPlayer: fired scheduled_frame=%" PRId64 " at guest_frame=%" PRId64
+			     "\n",
+			     event.frame, frame_num);
+			m_next++;
+		}
+	}
+
+private:
+	struct ScriptEvent {
+		enum class Kind { Button, Axis };
+
+		int64_t  frame  = 0;
+		Kind     kind   = Kind::Button;
+		uint32_t button = 0;
+		bool     down   = false;
+		Axis     axis   = Axis::LeftX;
+		int      value  = 0;
+	};
+
+	std::vector<ScriptEvent> m_events;
+	size_t                   m_next = 0;
+};
+
+InputScriptPlayer* g_input_script_player = nullptr;
+
+} // namespace
 
 static GameController* g_controller = nullptr;
 
@@ -250,10 +396,18 @@ void Initialize() {
 
 	g_controller = new GameController;
 	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
+
+	const auto script_path = Config::GetInputScriptPath();
+	if (!script_path.empty()) {
+		EXIT_IF(g_input_script_player != nullptr);
+		g_input_script_player = new InputScriptPlayer(script_path);
+	}
 }
 
 void Shutdown() {
 	EmergencyShutdown();
+	delete g_input_script_player;
+	g_input_script_player = nullptr;
 	delete g_controller;
 	g_controller = nullptr;
 }
@@ -584,6 +738,12 @@ void ResetInputState() {
 	g_controller->ResetInputState();
 }
 
+void TickInputScript(int frame_num) {
+	if (g_input_script_player != nullptr) {
+		g_input_script_player->Tick(frame_num);
+	}
+}
+
 int KYTY_SYSV_ABI PadInit() {
 	PRINT_NAME();
 
@@ -720,6 +880,15 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 
 	pad_fill_data(data, state, connected, connected_count);
 
+	static Log::RateLimit limiter {"PadReadState", 256};
+	if (limiter.Hit()) {
+		LOGF("PadReadState: buttons=0x%08" PRIx32 " lstick=(%u,%u) rstick=(%u,%u) l2=%u r2=%u "
+		     "connected=%s\n",
+		     data->buttons, data->left_stick_x, data->left_stick_y, data->right_stick_x,
+		     data->right_stick_y, data->analog_buttons_l2, data->analog_buttons_r2,
+		     connected ? "true" : "false");
+	}
+
 	return OK;
 }
 
@@ -751,6 +920,15 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 	for (int i = 0; i < ret_num; i++) {
 		pad_fill_data(&data[i], states[i], connected, connected_count);
+	}
+
+	static Log::RateLimit limiter {"PadRead", 256};
+	if (limiter.Hit() && ret_num > 0) {
+		const auto& d = data[ret_num - 1];
+		LOGF("PadRead: num=%d buttons=0x%08" PRIx32 " lstick=(%u,%u) rstick=(%u,%u) l2=%u r2=%u "
+		     "connected=%s\n",
+		     ret_num, d.buttons, d.left_stick_x, d.left_stick_y, d.right_stick_x, d.right_stick_y,
+		     d.analog_buttons_l2, d.analog_buttons_r2, connected ? "true" : "false");
 	}
 
 	return ret_num;

@@ -2054,8 +2054,8 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		return -1;
 	}
 
-	static std::atomic_uint32_t select_log_count = 0;
-	const bool log_select = select_log_count.fetch_add(1, std::memory_order_relaxed) < 64;
+	static Log::RateLimit limiter {"Select", 64};
+	const bool             log_select = limiter.Hit().has_value();
 
 	if (log_select) {
 		const auto  read0   = (readfds != nullptr ? *static_cast<const uint64_t*>(readfds) : 0);

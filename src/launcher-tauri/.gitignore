@@ -1,0 +1,14 @@
+node_modules
+dist
+dist-ssr
+*.local
+src-tauri/target
+src-tauri/gen
+_TempData
+_Textures
+_DownloadData
+
+# Internal art/sfx generation-tooling tree (manifests, candidate seeds, generation
+# provenance, raw pre-encode audio). Not read by the app; only public/art and public/sfx
+# (the final encoded assets) are. Kept out of the tree that ships.
+art/

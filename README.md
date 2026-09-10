@@ -314,6 +314,27 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 
+### How to open the new alternative UI
+
+`src/launcher-tauri` is a React + Tauri rewrite of the launcher, still in development and not
+yet part of the packaged install. Requires Node.js and a Rust toolchain (`cargo`).
+
+```bash
+cd src/launcher-tauri
+npm install       # first time only
+npm run tauri dev
+```
+
+This starts the Vite dev server and opens the Tauri window against it, with hot reload on
+frontend changes. To build a standalone package instead:
+
+```bash
+npm run tauri build
+```
+
+which produces installable artifacts (`.deb`/AppImage on Linux, matching targets on other
+platforms) under `src-tauri/target/release/bundle/`.
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors

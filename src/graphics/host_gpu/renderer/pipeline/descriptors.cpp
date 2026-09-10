@@ -28,6 +28,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
@@ -483,17 +484,18 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
-                                     bool shader_conversion, bool storage, uint32_t view_levels,
-                                     uint32_t image_layers) {
+                                     const SurfaceFormatInfo& surface_format, bool storage,
+                                     uint32_t view_levels, uint32_t image_layers) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	view.usage   = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
-	view.mapping = storage || shader_conversion
-	                   ? vk::ComponentMapping {}
-	                   : TextureGetComponentMapping(descriptor.DstSelXYZW());
+	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
+	view.mapping =
+	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	        ? vk::ComponentMapping {}
+	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
@@ -537,6 +539,43 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		default: EXIT("unsupported texture view dimension\n");
 	}
 	return view;
+}
+
+// Previously nothing in this file logged anything, even though every field below was already
+// decoded here for ordinary use -- a per-draw view of the bound T# (address/format/tile/mip
+// range) simply didn't exist. Frame-gated and rate-limited the same way renderDraw.cpp's
+// LogDrawTargetState/LogDrawInputState are, so a targeted --draw-log-frame-first/-last run
+// gets this for free without flooding an unrelated run.
+static void LogResolvedTextureIfNeeded(RenderContext& context,
+                                       const ShaderRecompiler::IR::ImageResource& resource,
+                                       const ShaderTextureResource& descriptor, bool storage) {
+	if (!graphics_debug_dump_enabled()) {
+		return;
+	}
+	const auto frame = context.GetGpu().GetFrameNum();
+	const auto first = Config::GetDrawLogFrameFirst();
+	const auto last   = Config::GetDrawLogFrameLast();
+	if ((first >= 0 && frame < first) || (last >= 0 && frame > last)) {
+		return;
+	}
+	static Log::RateLimit limiter {"ResolvedTexture", 256};
+	const auto hit = limiter.Hit();
+	if (!hit) {
+		return;
+	}
+	LOGF("ResolvedTexture[%llu]: frame=%d addr=0x%010" PRIx64 " fmt=%u tile=%u type=%u"
+	     " width=%u height=%u base_level=%u last_level=%u depth=%u dst_sel=0x%03x"
+	     " meta_compress=%s write_compress=%s meta_addr=0x%010" PRIx64 " storage=%s"
+	     " read=%s written=%s\n",
+	     *hit, frame, descriptor.Base40(), static_cast<uint32_t>(descriptor.Format()),
+	     static_cast<uint32_t>(descriptor.TileMode()), static_cast<uint32_t>(descriptor.Type()),
+	     static_cast<uint32_t>(descriptor.Width5()) + 1u,
+	     static_cast<uint32_t>(descriptor.Height5()) + 1u,
+	     static_cast<uint32_t>(descriptor.BaseLevel()), static_cast<uint32_t>(descriptor.LastLevel()),
+	     static_cast<uint32_t>(descriptor.Depth()), descriptor.DstSelXYZW(),
+	     descriptor.MetaCompress() ? "true" : "false", descriptor.WriteCompress() ? "true" : "false",
+	     descriptor.MetaAddr(), storage ? "true" : "false", resource.read ? "true" : "false",
+	     resource.written ? "true" : "false");
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
@@ -672,7 +711,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
+	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
@@ -693,6 +732,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
+	LogResolvedTextureIfNeeded(m_context, resource, descriptor, storage);
 	return {id, nullptr, std::move(desc)};
 }
 
@@ -784,6 +824,77 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	return prepared;
 }
 
+// Nothing in this file logged a resolved BUFFER descriptor before this (2026-09-10, session 23)
+// -- LogResolvedTextureIfNeeded above has covered images since the earlier ASTRO's Playroom
+// investigation, but buffers had no per-draw view at all, scalar/constant-buffer reads included
+// (there is no separate uniform-buffer path here: NativeDescriptorType maps every buffer kind to
+// eStorageBuffer). That gap is why a complete, mechanical chain from a legitimately-zero SRT
+// descriptor source down to a black pixel-shader output went unseen across 22 prior
+// investigation sessions: SrtWalker.h's EvaluateRuntimeSources contractually zeroes an inactive
+// descriptor source ("Inactive descriptors are zero"), NativeStorageBuffer below substitutes the
+// NULL_BUFFER_ID allocation for any address==0/size==0 descriptor, and the SPIR-V lowering of
+// ReadConstBuffer returns 0 in-shader for any out-of-bounds dword -- three silent stages with no
+// diagnostic anywhere along them. Frame-gated and rate-limited the same way
+// LogResolvedTextureIfNeeded is; reads directly from guest backing so the log shows what the
+// shader will actually see, not just the descriptor that points at it.
+//
+// Session 25, 2026-09-10: this originally read a fixed 8 dwords (32 bytes) regardless of the
+// buffer's real size, which was itself a silent-truncation bug of exactly the kind this
+// project's logging rule exists to catch. A 3-record/16-byte-stride (48-byte) buffer feeding
+// ASTRO's Playroom's `ps_113acd3e87a31cf0` looked all-1.0f and "clearly not the cause" for an
+// entire session, because the fixed window covered records 0-1 only -- the shader's own second
+// `S_BUFFER_LOAD_DWORDX4` reads record 2 (byte offset 32), which the log never captured. Now
+// logs up to the buffer's actual size, capped at kMaxLoggedDwords, and says so when capped.
+static void LogResolvedBufferIfNeeded(RenderContext& context, ShaderType stage, uint64_t shader_hash,
+                                      uint32_t slot, const ShaderRecompiler::IR::BufferResource& resource,
+                                      uint64_t address, uint32_t stride, uint32_t records,
+                                      uint64_t requested_size) {
+	if (!graphics_debug_dump_enabled()) {
+		return;
+	}
+	const auto frame = context.GetGpu().GetFrameNum();
+	const auto first  = Config::GetDrawLogFrameFirst();
+	const auto last   = Config::GetDrawLogFrameLast();
+	if ((first >= 0 && frame < first) || (last >= 0 && frame > last)) {
+		return;
+	}
+	if (!Config::ShaderLogHashAllowed(shader_hash)) {
+		return;
+	}
+	static Log::RateLimit limiter {"ResolvedBuffer", 256};
+	const auto hit = limiter.Hit();
+	if (!hit) {
+		return;
+	}
+	constexpr uint64_t kMaxLoggedDwords     = 64u; // 256 bytes -- generous for a real scalar/uniform buffer.
+	const bool         substituted_null_buffer = (address == 0 || requested_size == 0);
+	const uint64_t     requested_dwords        = (requested_size + 3u) / 4u;
+	const uint64_t     logged_dwords = std::min(requested_dwords, kMaxLoggedDwords);
+	const bool         truncated     = requested_dwords > kMaxLoggedDwords;
+	std::vector<uint32_t> dwords(static_cast<std::size_t>(logged_dwords), 0u);
+	const bool             dwords_valid =
+	    !substituted_null_buffer && !dwords.empty() &&
+	    Libs::LibKernel::Memory::TryReadBacking(address, dwords.data(), dwords.size() * sizeof(uint32_t));
+	std::string dwords_str;
+	for (auto dword: dwords) {
+		dwords_str += fmt::format("{:08x} ", dword);
+	}
+	if (!dwords_str.empty()) {
+		dwords_str.pop_back();
+	}
+	LOGF("ResolvedBuffer[%llu]: frame=%d stage=%s slot=%u hash=0x%016" PRIx64 " addr=0x%010" PRIx64
+	     " stride=%u records=%u size=0x%" PRIx64 " scalar=%s read=%s written=%s formatted=%s"
+	     " substituted_null_buffer=%s"
+	     " dwords=[%s]%s%s\n",
+	     *hit, frame, ShaderStageResourceName(stage), slot, shader_hash, address, stride, records,
+	     requested_size, resource.scalar ? "true" : "false", resource.read ? "true" : "false",
+	     resource.written ? "true" : "false", resource.formatted ? "true" : "false",
+	     substituted_null_buffer ? "true" : "false", dwords_str.c_str(),
+	     substituted_null_buffer ? " (substituted, contents deterministic zero)"
+	                            : dwords_valid ? "" : " (guest read failed)",
+	     truncated ? " (capped at kMaxLoggedDwords, real buffer is larger)" : "");
+}
+
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -800,6 +911,8 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		const auto records = descriptor.NumRecords();
 		// The descriptor has a 14-bit stride and 32-bit record count, so the product fits u64.
 		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		LogResolvedBufferIfNeeded(m_context, program.stage, program.shader_hash, i,
+		                          program.info.buffers[i], address, stride, records, requested_size);
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
@@ -974,12 +1087,29 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
+			auto& cache   = m_context.GetTextureCache();
+			auto& image   = cache.GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			// Session-30/31 fix (astro_playroom_issues.md): fallback consume point for the rare
+			// case ConsumeMetadataColorOperation's own TryImmediateColorClear (renderDraw.cpp)
+			// couldn't find a registered image yet at arm time -- confirmed live that this
+			// per-descriptor-commit loop is visited far too rarely on its own to be the primary
+			// consume point (Vulkan's descriptor-binding cache skips re-visiting unchanged
+			// bindings), so it is intentionally a fallback, not the main mechanism.
+			if (!image.info.data.Empty()) {
+				vk::ClearColorValue pending_clear {};
+				if (cache.TakePendingColorClear(image.info.data.address, &pending_clear)) {
+					const vk::ImageSubresourceRange full_range {
+					    vk::ImageAspectFlagBits::eColor, 0, image.info.resources.levels, 0,
+					    image.info.TransferLayers()};
+					cache.ClearImage(buffer, descriptors.images[i].image_id, full_range,
+					                 vk::ClearValue {pending_clear});
+				}
+			}
 			if (image.info.data.Empty()) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              storage ? vk::AccessFlagBits2::eShaderRead |

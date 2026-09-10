@@ -266,6 +266,20 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	// Session-32 investigation diagnostic (astro_playroom_issues.md, "0x0549ff0000 zero
+	// candidates"): the page containing that specific failing address, logged whenever any
+	// image's registration touches it -- to find out whether an image for it is ever registered
+	// at all, and if so, when relative to the EliminateFastClear arms that fail against it.
+	// Temporary; remove once the timing question is resolved.
+	static constexpr uint64_t WatchPage = 0x0549ff0000ull >> 20;
+	if (pages.first <= WatchPage && WatchPage < pages.last_exclusive) {
+		static Log::RateLimit watch_limiter {"ClearWatchRegisterImage", 64};
+		if (watch_limiter.Hit()) {
+			LOGF("ClearWatchRegisterImage: id=%u addr=0x%010" PRIx64 " size=0x%" PRIx64
+			     " levels=%u layers=%u\n", id.index, image.info.data.address, image.info.data.size,
+			     image.info.resources.levels, image.info.TransferLayers());
+		}
+	}
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		m_image_page_table[page].push_back(id);
 	}
@@ -283,6 +297,18 @@ void TextureCache::UnregisterImage(ImageId id) {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
+	}
+	// Session-32 investigation diagnostic, paired with RegisterImage's ClearWatchRegisterImage
+	// above -- see that comment. Temporary; remove once the timing question is resolved.
+	{
+		static constexpr uint64_t WatchPage = 0x0549ff0000ull >> 20;
+		if (pages.first <= WatchPage && WatchPage < pages.last_exclusive) {
+			static Log::RateLimit watch_limiter {"ClearWatchUnregisterImage", 64};
+			if (watch_limiter.Hit()) {
+				LOGF("ClearWatchUnregisterImage: id=%u addr=0x%010" PRIx64 " size=0x%" PRIx64 "\n",
+				     id.index, image.info.data.address, image.info.data.size);
+			}
+		}
 	}
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		auto* owners = m_image_page_table.Find(page);
@@ -1059,6 +1085,24 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		if (!plan.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
 			                        plan.LinearSize(), plan.tiles);
+		} else if (info.tile_mode != Prospero::TileMode::kLinear) {
+			// BuildTextureTransfer produced an empty tile list for a surface whose guest
+			// tile_mode is NOT linear -- the upload below will use the source buffer as-is,
+			// i.e. treat a tiled surface as linear with no de-swizzle. That silently produces
+			// hard-edged/skewed texture content: a wrong tiling decision that looks plausible
+			// and produces no visible error at the point it happens. Surfaced while
+			// investigating an unrelated rendering defect, not a confirmed cause of it.
+			static Log::RateLimit limiter {"TextureCache:UploadEmptyTilesNonLinear", 64};
+			if (const auto hit = limiter.Hit()) {
+				LOGF_COLOR(Log::Color::Yellow,
+				           "TextureCache::UploadImage[%llu]: empty tile list for a non-linear "
+				           "surface, uploading untiled: addr=0x%016" PRIx64 " fmt=%u tile=%u "
+				           "extent=%ux%ux%u\n",
+				           static_cast<unsigned long long>(*hit), info.data.address,
+				           static_cast<uint32_t>(info.guest_format),
+				           static_cast<uint32_t>(info.tile_mode), info.extent.width,
+				           info.extent.height, info.extent.depth);
+			}
 		}
 		if (plan.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
@@ -1154,6 +1198,18 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	}
 	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
 	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
+		// This is the ONLY place a tracked DCC fast-clear ever gets materialized into real
+		// pixels; a bind that reaches here with clear_mask==0 got no real clear this bind, full
+		// stop. Rate-limited, always-on diagnostic -- session 30's ASTRO investigation
+		// (astro_playroom_issues.md) needs exactly this to tell "never armed" from "armed but
+		// blocked by one of the other three guards" for the UI-stacking bug.
+		static Log::RateLimit limiter {"PrepareDccClearSkipped", 256};
+		if (limiter.Hit()) {
+			LOGF("PrepareDccClear: skipped addr=0x%010" PRIx64 " clear_mask=0x%08" PRIx32
+			     " levels=%u range_size=0x%" PRIx64 " fill_size=0x%" PRIx64 "\n",
+			     desc.info.metadata.range.address, metadata.clear_mask,
+			     image.info.resources.levels, desc.info.metadata.range.size, metadata.fill_size);
+		}
 		return;
 	}
 	vk::ClearValue clear {};
@@ -1482,6 +1538,21 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
+	// Session-30 diagnostic (astro_playroom_issues.md): this is the ONLY path that performs a
+	// real Vulkan clear for a guest compute-dispatch clear pattern; TrackDccFill is the fallback
+	// when this returns false, and a real run showed zero occurrences of that fallback firing.
+	// This log resolves whether this function is even reached for the affected UI targets, and
+	// if so, which of its four exit points explains the outcome -- always-on, rate-limited, not
+	// gated behind the expensive graphics-debug-dump flag for the same reason as
+	// ConsumeMetadataColorOperation's log above.
+	static Log::RateLimit limiter {"ClearImageFromBuffer", 256};
+	const auto            log_outcome = [&](const char* outcome) {
+		if (limiter.Hit()) {
+			LOGF("ClearImageFromBuffer: addr=0x%010" PRIx64 " size=0x%" PRIx64
+			     " packed_clear=0x%08" PRIx32 " outcome=%s\n", address, size, packed_clear,
+			     outcome);
+		}
+	};
 	std::scoped_lock     lock {m_lock};
 	ImageId              selected {};
 	vk::ImageAspectFlags aspect {};
@@ -1509,18 +1580,21 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			continue;
 		}
 		if (selected && selected != candidate_id) {
+			log_outcome("ambiguous_multiple_images");
 			return false;
 		}
 		selected = candidate_id;
 		aspect   = candidate;
 	}
 	if (!selected) {
+		log_outcome("no_matching_image_at_exact_address_size");
 		return false;
 	}
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
 		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
+			log_outcome("color_decode_failed");
 			return false;
 		}
 	} else {
@@ -1529,12 +1603,62 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
 		    (aspect == vk::ImageAspectFlagBits::eStencil &&
 		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
+			log_outcome("depth_stencil_decode_failed");
 			return false;
 		}
 		clear.depthStencil.stencil = stencil_clear;
 	}
 	ClearImage(command, selected,
 	           {aspect, 0, image.info.resources.levels, 0, image.info.TransferLayers()}, clear);
+	log_outcome("success_real_clear_issued");
+	return true;
+}
+
+bool TextureCache::TryImmediateColorClear(CommandBuffer& command, uint64_t address,
+                                          vk::ClearColorValue value) {
+	if (command.IsInvalid() || address == 0) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	ImageId           selected {};
+	// A render target's real backing size isn't known here (only its guest base address, from
+	// the EliminateFastClear draw's own register state) -- match by address alone, taking the
+	// only candidate whose `info.data.address` equals it exactly and skipping (not guessing)
+	// if more than one image claims that address, same ambiguity handling as
+	// ClearImageFromBuffer's exact-match loop just above.
+	const auto candidates = FindImagesInRegion(address, 1, false);
+	static Log::RateLimit try_immediate_diag_limiter {"TryImmediateColorClearAttempt", 256};
+	if (try_immediate_diag_limiter.Hit()) {
+		LOGF("TryImmediateColorClearAttempt: addr=0x%010" PRIx64 " candidates=%zu\n", address,
+		     candidates.size());
+		for (const auto id: candidates) {
+			const auto owner = m_slot_images.try_get(id);
+			LOGF("  candidate: owner=%s addr=0x%010" PRIx64 " depth_id=%s backing_image=%s\n",
+			     owner == nullptr ? "null" : "ok",
+			     owner == nullptr ? 0 : owner->info.data.address,
+			     owner != nullptr && owner->depth_id ? "true" : "false",
+			     owner != nullptr && owner->backing.image != nullptr ? "true" : "false");
+		}
+	}
+	for (const auto id: candidates) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || owner->depth_id || owner->info.data.address != address ||
+		    owner->backing.image == nullptr) {
+			continue;
+		}
+		if (selected && selected != id) {
+			return false;
+		}
+		selected = id;
+	}
+	if (!selected) {
+		return false;
+	}
+	auto& image = m_slot_images[selected];
+	ClearImage(command, selected,
+	          {vk::ImageAspectFlagBits::eColor, 0, image.info.resources.levels, 0,
+	           image.info.TransferLayers()},
+	          vk::ClearValue {value});
 	return true;
 }
 
@@ -1951,6 +2075,33 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
 	}
+	return true;
+}
+
+void TextureCache::ArmColorClear(uint64_t address, vk::ClearColorValue value) {
+	std::scoped_lock lock {m_lock};
+	m_pending_color_clears.insert_or_assign(address, value);
+	static Log::RateLimit limiter {"ArmColorClear", 256};
+	if (limiter.Hit()) {
+		LOGF("ArmColorClear: addr=0x%010" PRIx64 " value=[%f %f %f %f]\n", address,
+		     static_cast<double>(value.float32[0]), static_cast<double>(value.float32[1]),
+		     static_cast<double>(value.float32[2]), static_cast<double>(value.float32[3]));
+	}
+}
+
+bool TextureCache::TakePendingColorClear(uint64_t address, vk::ClearColorValue* out) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_pending_color_clears.find(address);
+	static Log::RateLimit limiter {"TakePendingColorClear", 256};
+	if (limiter.Hit()) {
+		LOGF("TakePendingColorClear: addr=0x%010" PRIx64 " outcome=%s pending_count=%zu\n", address,
+		     found == m_pending_color_clears.end() ? "miss" : "hit", m_pending_color_clears.size());
+	}
+	if (found == m_pending_color_clears.end()) {
+		return false;
+	}
+	*out = found->second;
+	m_pending_color_clears.erase(found);
 	return true;
 }
 

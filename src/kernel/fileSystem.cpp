@@ -28,7 +28,8 @@ namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
 
-constexpr int DESCRIPTOR_MIN = 3;
+constexpr int      DESCRIPTOR_MIN = 3;
+constexpr uint64_t DIR_BLOCK_SIZE = 512;
 
 enum class SpecialFile {
 	None,
@@ -68,7 +69,7 @@ struct File {
 	std::atomic_bool                    sync_writes;
 	SpecialFile                         special;
 	Common::Mutex                       mutex;
-	std::vector<Common::File::DirEntry> dents;
+	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
 };
 
@@ -117,6 +118,51 @@ static uint64_t AlignDown(uint64_t value, uint64_t alignment) {
 
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return (alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value);
+}
+
+static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry>& entries) {
+	std::vector<uint8_t> dirents;
+	uint64_t             offset             = 0;
+	uint64_t             last_reclen_offset = 0;
+	for (const auto& entry: entries) {
+		const auto& name = entry.name;
+		EXIT_NOT_IMPLEMENTED(name.size() > 255);
+		const auto reclen = AlignUp(8 + name.size() + 1, 4);
+		if (offset + reclen > dirents.size()) {
+			if (!dirents.empty()) {
+				auto* last_reclen =
+				    reinterpret_cast<uint16_t*>(dirents.data() + last_reclen_offset);
+				*last_reclen += static_cast<uint16_t>(dirents.size() - offset);
+			}
+			offset = dirents.size();
+			dirents.resize(offset + DIR_BLOCK_SIZE);
+		}
+		*reinterpret_cast<uint32_t*>(dirents.data() + offset) =
+		    Common::hash(name.data(), static_cast<uint32_t>(name.size()));
+		*reinterpret_cast<uint16_t*>(dirents.data() + offset + 4) = static_cast<uint16_t>(reclen);
+		dirents[offset + 6]                                       = entry.is_file ? 8 : 4;
+		dirents[offset + 7] = static_cast<uint8_t>(name.size());
+		memcpy(dirents.data() + offset + 8, name.c_str(), name.size() + 1);
+		last_reclen_offset = offset + 4;
+		offset += reclen;
+	}
+	if (!dirents.empty()) {
+		auto* last_reclen = reinterpret_cast<uint16_t*>(dirents.data() + last_reclen_offset);
+		*last_reclen += static_cast<uint16_t>(dirents.size() - offset);
+	}
+	return dirents;
+}
+
+static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
+	const auto remaining =
+	    file->dents_offset < file->dirents.size() ? file->dirents.size() - file->dents_offset : 0;
+	const auto bytes = std::min(count, remaining);
+	if (bytes != 0) {
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes);
+		memcpy(buf, file->dirents.data() + file->dents_offset, bytes);
+		file->dents_offset += bytes;
+	}
+	return bytes;
 }
 
 static int PosixToKernel(int posix_errno) {
@@ -433,15 +479,16 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
 		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
 
-		file->dents        = Common::File::GetDirEntries(file->real_name);
+		const auto entries = Common::File::GetDirEntries(file->real_name);
+		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
 		file->directory    = true;
 
 		LOGF_COLOR(Log::Color::Green, "\tOpen dir: %s, entries = %" PRIu32 ", [ok]\n",
 		           Common::PathToString(file->real_name).c_str(),
-		           static_cast<uint32_t>(file->dents.size()));
+		           static_cast<uint32_t>(entries.size()));
 
-		for (const auto& f: file->dents) {
+		for (const auto& f: entries) {
 			LOGF("\t\t%s %s\n", f.is_file ? "[file]" : "[dir ]", f.name.c_str());
 		}
 	} else {
@@ -538,11 +585,18 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-
 	EXIT_IF(!file->opened);
 
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > INT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (file->directory) {
+		Common::LockGuard lock(file->mutex);
+		const auto        bytes = ReadDirectory(file, buf, nbytes);
+		LOGF("\tRead %" PRIu64 " directory bytes from: %s\n", bytes,
+		     Common::PathToString(file->real_name).c_str());
+		return static_cast<int64_t>(bytes);
+	}
 
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
@@ -761,7 +815,7 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EPERM;
+		return KERNEL_ERROR_EBADF;
 	}
 
 	auto* file = g_files->GetFile(d);
@@ -769,8 +823,6 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_NOT_IMPLEMENTED(file->directory);
 
 	EXIT_IF(!file->opened);
 
@@ -780,38 +832,47 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	Common::LockGuard lock(file->mutex);
 
-	bool is_invalid = file->f.IsInvalid();
-
-	if (whence == 1) {
-		offset = static_cast<int64_t>(file->f.Tell()) + offset;
-		whence = 0;
-	}
-
-	if (whence == 2) {
-		offset = static_cast<int64_t>(file->f.Size()) + offset;
-		whence = 0;
-	}
-
-	EXIT_NOT_IMPLEMENTED(whence != 0);
-
-	if (offset < 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-
-	file->f.Seek(offset);
-	auto pos = static_cast<int64_t>(file->f.Tell());
-
-	EXIT_IF(pos != offset);
-
-	if (is_invalid) {
+	if (!file->directory && file->f.IsInvalid()) {
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
 	}
 
-	LOGF("\tLseek (pos = %" PRId64 ") to: %s\n", offset,
+	uint64_t base = 0;
+	switch (whence) {
+		case 0: break;
+		case 1: base = file->directory ? file->dents_offset : file->f.Tell(); break;
+		case 2: base = file->directory ? file->dirents.size() : file->f.Size(); break;
+		default: return KERNEL_ERROR_EINVAL;
+	}
+
+	uint64_t position = 0;
+	if (offset >= 0) {
+		if (base > static_cast<uint64_t>(INT64_MAX - offset)) {
+			return KERNEL_ERROR_EOVERFLOW;
+		}
+		position = base + static_cast<uint64_t>(offset);
+	} else {
+		const auto distance = uint64_t {0} - static_cast<uint64_t>(offset);
+		if (base < distance) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		position = base - distance;
+		if (position > INT64_MAX) {
+			return KERNEL_ERROR_EOVERFLOW;
+		}
+	}
+
+	if (file->directory) {
+		file->dents_offset = position;
+	} else {
+		file->f.Seek(position);
+		EXIT_IF(file->f.Tell() != position);
+	}
+
+	LOGF("\tLseek (pos = %" PRIu64 ") to: %s\n", position,
 	     Common::PathToString(file->real_name).c_str());
 
-	return pos;
+	return static_cast<int64_t>(position);
 }
 
 int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
@@ -842,9 +903,10 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	auto wt = at;
 
 	if (is_dir) {
-		stat.st_size    = 0;
+		stat.st_size =
+		    static_cast<int64_t>(PackDirents(Common::File::GetDirEntries(real_file_name)).size());
 		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
+		stat.st_blocks  = stat.st_size / 512;
 	} else {
 		stat.st_size    = static_cast<int64_t>(Common::File::Size(real_file_name));
 		stat.st_blksize = 512;
@@ -920,9 +982,9 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 	} else {
-		stat.st_size    = 0;
+		stat.st_size    = static_cast<int64_t>(file->dirents.size());
 		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
+		stat.st_blocks  = stat.st_size / 512;
 	}
 
 	SecToTimespec(&stat.st_atim, at.ToUnix());
@@ -1057,14 +1119,15 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		return KERNEL_ERROR_EBADF;
 	}
 
-	constexpr uint64_t DIR_BLOCK_SIZE   = 512;
-	constexpr uint64_t DIRENT_META_SIZE = 8;
-
 	if (!file->directory || nbytes < static_cast<int>(DIR_BLOCK_SIZE)) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
 	EXIT_IF(!file->opened);
+	Common::LockGuard lock(file->mutex);
+	if (file->dents_offset > file->dirents.size() || file->dents_offset % DIR_BLOCK_SIZE != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	LOGF("\t dir    = %s\n"
 	     "\t nbytes = %d\n"
@@ -1074,94 +1137,8 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 	if (basep != nullptr) {
 		*basep = static_cast<int64_t>(file->dents_offset);
 	}
-
-	std::vector<uint8_t> dirents;
-	dirents.reserve(
-	    std::max<size_t>(static_cast<size_t>(DIR_BLOCK_SIZE), file->dents.size() * 64u));
-
-	uint64_t next_ceiling       = 0;
-	uint64_t dirent_offset      = 0;
-	int64_t  last_reclen_offset = -1;
-
-	for (const auto& entry: file->dents) {
-		const auto& str      = entry.name;
-		auto        str_size = str.size();
-		EXIT_NOT_IMPLEMENTED(str_size > 255);
-
-		uint64_t reclen = AlignUp(DIRENT_META_SIZE + str_size + 1, 4);
-		if (dirent_offset + reclen > next_ceiling) {
-			if (last_reclen_offset >= 0) {
-				auto* last_reclen =
-				    reinterpret_cast<uint16_t*>(dirents.data() + last_reclen_offset);
-				*last_reclen = static_cast<uint16_t>(*last_reclen + (next_ceiling - dirent_offset));
-			}
-
-			dirent_offset = next_ceiling;
-			next_ceiling += DIR_BLOCK_SIZE;
-			dirents.resize(next_ceiling);
-			std::fill(dirents.begin() + static_cast<std::ptrdiff_t>(dirent_offset), dirents.end(),
-			          0);
-		}
-
-		*reinterpret_cast<uint32_t*>(dirents.data() + dirent_offset + 0) =
-		    Common::hash(str.data(), static_cast<uint32_t>(str.size()));
-		*reinterpret_cast<uint16_t*>(dirents.data() + dirent_offset + 4) =
-		    static_cast<uint16_t>(reclen);
-		*reinterpret_cast<uint8_t*>(dirents.data() + dirent_offset + 6) = (entry.is_file ? 8 : 4);
-		*reinterpret_cast<uint8_t*>(dirents.data() + dirent_offset + 7) =
-		    static_cast<uint8_t>(str_size);
-		memcpy(dirents.data() + dirent_offset + 8, str.data(), str_size);
-		dirents[dirent_offset + 8 + str_size] = '\0';
-
-		last_reclen_offset = static_cast<int64_t>(dirent_offset + 4);
-		dirent_offset += reclen;
-
-		LOGF("\t name  = %s\n", str.data());
-	}
-
-	if (last_reclen_offset >= 0) {
-		auto* last_reclen = reinterpret_cast<uint16_t*>(dirents.data() + last_reclen_offset);
-		*last_reclen      = static_cast<uint16_t>(*last_reclen + (next_ceiling - dirent_offset));
-	}
-
-	const uint64_t directory_size = next_ceiling;
-	if (file->dents_offset >= directory_size) {
-		return 0;
-	}
-
-	uint64_t bytes_written        = 0;
-	uint64_t working_offset       = file->dents_offset;
-	uint64_t dirent_buffer_offset = 0;
-	uint64_t aligned_count        = AlignDown(static_cast<uint64_t>(nbytes), DIR_BLOCK_SIZE);
-
-	while (dirent_buffer_offset < dirents.size()) {
-		const auto* normal_dirent = dirents.data() + dirent_buffer_offset;
-		uint16_t    reclen        = *reinterpret_cast<const uint16_t*>(normal_dirent + 4);
-		uint8_t     namlen        = *(normal_dirent + 7);
-
-		if (namlen == 0 || reclen == 0) {
-			break;
-		}
-
-		if (working_offset >= reclen) {
-			dirent_buffer_offset += reclen;
-			working_offset -= reclen;
-			continue;
-		}
-
-		if (bytes_written + reclen > aligned_count) {
-			break;
-		}
-
-		const auto bytes_to_copy = reclen - working_offset;
-		memcpy(buf + bytes_written, normal_dirent + working_offset, bytes_to_copy);
-		bytes_written += bytes_to_copy;
-		dirent_buffer_offset += reclen;
-		working_offset = 0;
-	}
-
-	file->dents_offset += bytes_written;
-	return static_cast<int64_t>(bytes_written);
+	return static_cast<int>(
+	    ReadDirectory(file, buf, AlignDown(static_cast<uint64_t>(nbytes), DIR_BLOCK_SIZE)));
 }
 
 int KYTY_SYSV_ABI KernelGetdents(int fd, char* buf, int nbytes) {

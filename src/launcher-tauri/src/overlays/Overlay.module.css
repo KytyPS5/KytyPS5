@@ -1,0 +1,32 @@
+/* Shared overlay entrance/exit values, verbatim from
+   ps5_tauri_ui_guidelines/01-motion-system.md's "Overlay / control-center
+   entrance": backdrop 180-220ms, panel 240-300ms with an 8-16px rise and a
+   0.985 -> 1 scale. The reference dims the home scene rather than replacing
+   it -- .backdrop only darkens, it never hides .content behind it. */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: var(--backdrop-scrim);
+  opacity: 0;
+  transition: opacity 200ms var(--ease-ui);
+}
+.backdrop.isOpen {
+  opacity: 1;
+}
+
+/* Home's Ken Burns background keeps animating underneath (it never
+   unmounts) -- a live backdrop-filter here would be exactly the case
+   GlassPanel.module.css's own comment measures at 13.3fps, so overlay
+   panels use GlassPanel's flat "light" fill, never "heavy", regardless of
+   how opaque they look. */
+.panel {
+  opacity: 0;
+  transform: translateY(12px) scale(0.985);
+  transition: opacity 240ms var(--ease-enter), transform 280ms var(--ease-enter);
+}
+.backdrop.isOpen .panel {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}

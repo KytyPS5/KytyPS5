@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawDump.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -161,6 +163,16 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 
 void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
+		if (Config::DrawDumpEnabled()) {
+			// Copy first: recording the readback below calls back into Image::Download,
+			// which itself calls this function reentrantly to actually end the render
+			// pass -- that clears CommandBuffer's live render state before we're done
+			// reading it, so iterate a snapshot instead of the live reference.
+			const RenderState state = m_command.GetRenderState();
+			if (state.num_color_attachments > 0) {
+				DumpColorAttachments(m_context, state);
+			}
+		}
 		Current().EndRendering();
 	}
 }

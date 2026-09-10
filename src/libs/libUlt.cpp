@@ -439,8 +439,8 @@ static int KYTY_SYSV_ABI UltQueuePush(void* queue, const void* data) {
 
 	std::scoped_lock lock(state->mutex);
 	if (state->capacity != 0 && state->items.size() >= state->capacity) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 32) {
+		static Log::RateLimit limiter {"UltQueueFullDroppedItem", 32};
+		if (limiter.Hit()) {
 			LOGF("\t queue full, dropping pushed item: queue=0x%016" PRIx64 " capacity=%" PRIu32
 			     " data_size=0x%016" PRIx64 "\n",
 			     reinterpret_cast<uint64_t>(queue), state->capacity, state->data_size);

@@ -209,7 +209,34 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
-	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	auto& null_buffer = GetBuffer(null_id);
+	// `NativeStorageBuffer` (descriptors.cpp) substitutes this allocation for any descriptor
+	// that resolves to address==0 or size==0 -- which includes a perfectly ordinary case: an SRT
+	// descriptor source the reachability walk marked inactive is *contractually* zero
+	// (SrtWalker.h's EvaluateRuntimeSources: "Inactive descriptors are zero"), not an error. Left
+	// unzeroed, this buffer's 16 bytes were whatever the driver's allocation happened to contain
+	// -- undefined, not guaranteed zero -- which made "is this shader reading a real zero
+	// constant buffer, or an uninitialized allocation that just happens to read zero on this
+	// GPU/driver" undecidable from observed behavior alone.
+	//
+	// CORRECTION (session 23, 2026-09-10): an earlier version of this fix unconditionally
+	// memset() the host mapping, on the mistaken assumption that this is safe for
+	// MemoryUsage::DeviceLocal the way it already is for the GDS buffer above -- it isn't: GDS
+	// uses MemoryUsage::Stream, which prefers VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+	// (streamBuffer.cpp's Buffer constructor); DeviceLocal sets no host-visibility preference at
+	// all, so on a discrete GPU (confirmed on this box's RTX 5070) VMA hands back VRAM-only
+	// memory with no host mapping, Mapped() is empty, .data() is null, and the memset
+	// null-derefs immediately -- a real, 100%-reproducible crash before the window even opens,
+	// caught by testing this exact binary. Guard on Mapped() actually being present (matches the
+	// pre-existing m_bda_pagetable_buffer right above, which is the same MemoryUsage::DeviceLocal
+	// and has never been host-memset for this same reason); when it isn't, this falls back to
+	// the original pre-fix behavior (undefined initial contents) rather than crashing -- no
+	// regression in that case, since that was already how it behaved before this session.
+	if (const auto mapped = null_buffer.Mapped(); !mapped.empty()) {
+		std::memset(mapped.data(), 0, mapped.size());
+		null_buffer.Flush(0, null_buffer.Size());
+	}
+	SetVulkanObjectNameF(m_graphics.device, null_buffer.Handle(), "Kyty.NullBuffer");
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}

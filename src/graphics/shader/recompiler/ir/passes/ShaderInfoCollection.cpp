@@ -226,14 +226,28 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 	}
 }
 
-void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& info) {
+void CollectComputeInputs(const Program& program, const ShaderComputeInputInfo* compute,
+                          ShaderInfo& info) {
+	// Ported from upstream PR #361: EmitGuestLaneId (spirvEmitterFlow.cpp) needs
+	// gl_LocalInvocationIndex to correct wave64 LaneId on 32-wide host subgroups, but that input
+	// was previously only requested for thread_ids_num>0 / tg_size_en -- a wave64 compute shader
+	// that reads LaneId without also declaring THREAD_ID_IN_GROUP would silently get an
+	// undeclared/wrong input variable. Scan for a LaneId use directly rather than trusting guest
+	// register flags that don't actually track it.
+	const bool uses_lane_id = std::any_of(
+	    program.blocks.begin(), program.blocks.end(), [](const auto* block) {
+		    return std::any_of(block->begin(), block->end(), [](const auto& inst) {
+			    return inst.GetOpcode() == ValueOpcode::LaneId;
+		    });
+	    });
 	if (compute->group_id[0] || compute->group_id[1] || compute->group_id[2]) {
 		AddInput(info, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
 	}
 	if (compute->thread_ids_num > 0) {
 		AddInput(info, StageInputKind::LocalInvocationId, 0, 3, "gl_LocalInvocationID");
 	}
-	if (compute->thread_ids_num > 0 || compute->tg_size_en) {
+	if (compute->thread_ids_num > 0 || compute->tg_size_en ||
+	    (program.wave_size == 64u && uses_lane_id)) {
 		AddInput(info, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
 	}
 	if (compute->dispatch_thread_dimensions) {
@@ -379,7 +393,7 @@ void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
-		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
+		case ShaderType::Compute: CollectComputeInputs(program, options.compute, next); break;
 		default: return Fail("unsupported shader stage for info collection");
 	}
 	CollectBuiltinInputs(program, next);

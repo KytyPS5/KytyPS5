@@ -74,7 +74,18 @@ public:
 			}
 		}
 #else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		// Guest ELF text ends up PROT_EXEC-mapped from this fd (see MapView() below), so
+		// prefer MFD_EXEC: on kernels >= 6.3 with vm.memfd_noexec_scope set to 1, a plain
+		// memfd_create(..., 0) is sealed non-executable, and at scope 2 the call is
+		// refused outright. Fall back for older kernels/headers that predate MFD_EXEC.
+		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory",
+		                                MFD_CLOEXEC | MFD_EXEC));
+		if (m_fd < 0) {
+			m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", MFD_CLOEXEC));
+		}
+		if (m_fd < 0) {
+			m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		}
 #endif
 		if (m_fd < 0) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
@@ -1147,7 +1158,16 @@ private:
 		}
 		fclose(maps);
 
-		auto reserve_range = [this](uint64_t start, uint64_t end) {
+		// Best-effort: a single sub-range can legitimately lose a race against another
+		// thread's mmap between the /proc/self/maps snapshot above and this call, so one
+		// failure here does not by itself mean the guest is unusable. What must not happen
+		// silently is ending up with *no* usable guest address space at all, or with so
+		// little of it that the emulator will fail much later at an unrelated allocation
+		// with no way to tell this is why - so failures are logged loudly and tallied.
+		bool     any_reservation_failed = false;
+		uint64_t total_reserved         = 0;
+		auto     reserve_range          = [this, &any_reservation_failed,
+                                &total_reserved](uint64_t start, uint64_t end) {
 			start = AlignUp(start, PageSize());
 			end   = AlignDown(end, PageSize());
 			if (start == 0 || end <= start) {
@@ -1167,11 +1187,17 @@ private:
 				if (ptr != MAP_FAILED) {
 					munmap(ptr, size);
 				}
+				LOGF_COLOR(Log::Color::Red,
+				           "\t guest address-space reservation failed at 0x%016" PRIx64
+				           ", size 0x%016" PRIx64 "\n",
+				           start, size);
+				any_reservation_failed = true;
 				return;
 			}
 
 			AddFreeUnlocked(start, size);
 			m_owned.emplace_back(start, size);
+			total_reserved += size;
 		};
 
 		for (const auto& [region_start, region_end]: regions) {
@@ -1198,6 +1224,16 @@ private:
 			if (current < region_end) {
 				reserve_range(current, region_end);
 			}
+		}
+
+		if (total_reserved == 0) {
+			EXIT("failed to reserve any guest address space; the emulator cannot continue\n");
+		}
+		if (any_reservation_failed) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t guest address space was only partially reserved (0x%016" PRIx64
+			           " bytes); later allocations may fail unexpectedly\n",
+			           total_reserved);
 		}
 #else
 		for (const auto& [start, end]: regions) {

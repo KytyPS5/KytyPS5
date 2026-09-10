@@ -258,7 +258,17 @@ int WaitImpl(volatile T* address, T expected, const uint32_t* timeout_micros,
 
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, timeout_micros, signal_poll);
+	if constexpr (sizeof(T) == sizeof(uint32_t)) {
+		result = WaitLinux(address, expected, timeout_micros, signal_poll);
+	} else {
+		// FUTEX_WAIT only compares the low 32 bits of the word at `address` against a
+		// 32-bit value, so a raw futex wait on a 64-bit value would miss a change
+		// confined to the high 32 bits (the low half still matches, so the kernel blocks
+		// the thread instead of returning immediately; it would only wake on the next
+		// SIGNAL_POLL_MICROS slice or an unrelated write to the low half). Use the
+		// portable, full-width-safe path instead - Wake() notifies both paths.
+		result = WaitPortable(address, expected, timeout_micros, signal_poll);
+	}
 #else
 	result = WaitPortable(address, expected, timeout_micros, signal_poll);
 #endif
@@ -284,7 +294,10 @@ int Wake(volatile void* address, int32_t count) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	return WakeLinux(address, count);
+	// A wake has no width and cannot tell which of the two wait paths above a waiter at
+	// this address used, so it must reach both; whichever one has no registered waiter at
+	// this address is a cheap no-op.
+	WakeLinux(address, count);
 #endif
 	return WakePortable(address, count);
 }

@@ -39,6 +39,10 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
+#include <array>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -69,36 +73,144 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
-static uint32_t ControllerButtonToPadButton(int button) {
-	switch (button) {
-		case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CROSS;
-		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
-		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
-		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
-		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
-		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
-		case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return Controller::PAD_BUTTON_L1;
-		case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return Controller::PAD_BUTTON_R1;
-		case SDL_CONTROLLER_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
-		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
-		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
-		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
-		default: return 0;
+namespace {
+
+// Physical-gamepad remap: each guest control ("target") resolves to whatever
+// SDL button/axis id `--gamepad-map` assigned it, defaulting to the
+// historical hardcoded Xbox-layout mapping below when unset — so an empty
+// `--gamepad-map` (the common case) behaves byte-for-byte like the old
+// switch statements this replaces.
+
+struct GamepadButtonTarget {
+	const char*              name;
+	uint32_t                 pad_button;
+	SDL_GameControllerButton default_sdl;
+};
+
+constexpr std::array GAMEPAD_BUTTON_TARGETS = {
+    GamepadButtonTarget {"Cross", Controller::PAD_BUTTON_CROSS, SDL_CONTROLLER_BUTTON_A},
+    GamepadButtonTarget {"Circle", Controller::PAD_BUTTON_CIRCLE, SDL_CONTROLLER_BUTTON_B},
+    GamepadButtonTarget {"Square", Controller::PAD_BUTTON_SQUARE, SDL_CONTROLLER_BUTTON_X},
+    GamepadButtonTarget {"Triangle", Controller::PAD_BUTTON_TRIANGLE, SDL_CONTROLLER_BUTTON_Y},
+    GamepadButtonTarget {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD, SDL_CONTROLLER_BUTTON_BACK},
+    GamepadButtonTarget {"Options", Controller::PAD_BUTTON_OPTIONS, SDL_CONTROLLER_BUTTON_START},
+    GamepadButtonTarget {"L3", Controller::PAD_BUTTON_L3, SDL_CONTROLLER_BUTTON_LEFTSTICK},
+    GamepadButtonTarget {"R3", Controller::PAD_BUTTON_R3, SDL_CONTROLLER_BUTTON_RIGHTSTICK},
+    GamepadButtonTarget {"L1", Controller::PAD_BUTTON_L1, SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+    GamepadButtonTarget {"R1", Controller::PAD_BUTTON_R1, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+    GamepadButtonTarget {"Up", Controller::PAD_BUTTON_UP, SDL_CONTROLLER_BUTTON_DPAD_UP},
+    GamepadButtonTarget {"Down", Controller::PAD_BUTTON_DOWN, SDL_CONTROLLER_BUTTON_DPAD_DOWN},
+    GamepadButtonTarget {"Left", Controller::PAD_BUTTON_LEFT, SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+    GamepadButtonTarget {"Right", Controller::PAD_BUTTON_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
+};
+
+struct GamepadAxisTarget {
+	const char*             name;
+	Controller::Axis        axis;
+	SDL_GameControllerAxis  default_sdl;
+};
+
+// L2/R2 have no separate button target: GameController::Axis() already
+// derives the digital press from the trigger axis crossing zero, so
+// remapping TriggerLeft/TriggerRight covers them.
+constexpr std::array GAMEPAD_AXIS_TARGETS = {
+    GamepadAxisTarget {"LeftStickX", Controller::Axis::LeftX, SDL_CONTROLLER_AXIS_LEFTX},
+    GamepadAxisTarget {"LeftStickY", Controller::Axis::LeftY, SDL_CONTROLLER_AXIS_LEFTY},
+    GamepadAxisTarget {"RightStickX", Controller::Axis::RightX, SDL_CONTROLLER_AXIS_RIGHTX},
+    GamepadAxisTarget {"RightStickY", Controller::Axis::RightY, SDL_CONTROLLER_AXIS_RIGHTY},
+    GamepadAxisTarget {"TriggerLeft", Controller::Axis::TriggerLeft, SDL_CONTROLLER_AXIS_TRIGGERLEFT},
+    GamepadAxisTarget {"TriggerRight", Controller::Axis::TriggerRight, SDL_CONTROLLER_AXIS_TRIGGERRIGHT},
+};
+
+class GamepadRemap {
+public:
+	GamepadRemap() {
+		m_button_map.fill(0);
+		m_axis_map.fill(Controller::Axis::AxisMax);
+
+		for (const auto& t: GAMEPAD_BUTTON_TARGETS) {
+			m_button_map.at(t.default_sdl) = t.pad_button;
+		}
+		for (const auto& t: GAMEPAD_AXIS_TARGETS) {
+			m_axis_map.at(t.default_sdl) = t.axis;
+		}
+		for (const auto& entry: Config::GetGamepadKeymap()) {
+			ApplyEntry(entry);
+		}
 	}
+
+	[[nodiscard]] uint32_t ButtonFor(int sdl_button) const {
+		return (sdl_button >= 0 && sdl_button < static_cast<int>(m_button_map.size()))
+		           ? m_button_map[static_cast<std::size_t>(sdl_button)]
+		           : 0;
+	}
+
+	[[nodiscard]] Controller::Axis AxisFor(int sdl_axis) const {
+		return (sdl_axis >= 0 && sdl_axis < static_cast<int>(m_axis_map.size()))
+		           ? m_axis_map[static_cast<std::size_t>(sdl_axis)]
+		           : Controller::Axis::AxisMax;
+	}
+
+private:
+	void ApplyEntry(const std::string& entry) {
+		const auto split = entry.find('=');
+		if (split == std::string::npos || split == 0 || split + 1 == entry.size()) {
+			return;
+		}
+		const std::string target_name = entry.substr(0, split);
+		const std::string sdl_name    = entry.substr(split + 1);
+
+		const auto button_target =
+		    std::find_if(GAMEPAD_BUTTON_TARGETS.begin(), GAMEPAD_BUTTON_TARGETS.end(),
+		                 [&](const auto& t) { return target_name == t.name; });
+		if (button_target != GAMEPAD_BUTTON_TARGETS.end()) {
+			const auto sdl_button = SDL_GameControllerGetButtonFromString(sdl_name.c_str());
+			if (sdl_button != SDL_CONTROLLER_BUTTON_INVALID) {
+				// A remap must not leave two guest controls fighting over one
+				// physical button.
+				for (auto& mapped: m_button_map) {
+					if (mapped == button_target->pad_button) {
+						mapped = 0;
+					}
+				}
+				m_button_map.at(sdl_button) = button_target->pad_button;
+			}
+			return;
+		}
+
+		const auto axis_target =
+		    std::find_if(GAMEPAD_AXIS_TARGETS.begin(), GAMEPAD_AXIS_TARGETS.end(),
+		                 [&](const auto& t) { return target_name == t.name; });
+		if (axis_target != GAMEPAD_AXIS_TARGETS.end()) {
+			const auto sdl_axis = SDL_GameControllerGetAxisFromString(sdl_name.c_str());
+			if (sdl_axis != SDL_CONTROLLER_AXIS_INVALID) {
+				for (auto& mapped: m_axis_map) {
+					if (mapped == axis_target->axis) {
+						mapped = Controller::Axis::AxisMax;
+					}
+				}
+				m_axis_map.at(sdl_axis) = axis_target->axis;
+			}
+		}
+	}
+
+	std::array<uint32_t, SDL_CONTROLLER_BUTTON_MAX>       m_button_map {};
+	std::array<Controller::Axis, SDL_CONTROLLER_AXIS_MAX> m_axis_map {};
+};
+
+const GamepadRemap& GetGamepadRemap() {
+	static const GamepadRemap remap;
+	return remap;
+}
+
+} // namespace
+
+static uint32_t ControllerButtonToPadButton(int button) {
+	return GetGamepadRemap().ButtonFor(button);
 }
 
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
-	switch (axis_id) {
-		case SDL_CONTROLLER_AXIS_LEFTX: return Controller::Axis::LeftX;
-		case SDL_CONTROLLER_AXIS_LEFTY: return Controller::Axis::LeftY;
-		case SDL_CONTROLLER_AXIS_RIGHTX: return Controller::Axis::RightX;
-		case SDL_CONTROLLER_AXIS_RIGHTY: return Controller::Axis::RightY;
-		case SDL_CONTROLLER_AXIS_TRIGGERLEFT: return Controller::Axis::TriggerLeft;
-		case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: return Controller::Axis::TriggerRight;
-		default: return Controller::Axis::AxisMax;
-	}
+	return GetGamepadRemap().AxisFor(axis_id);
 }
 
 static bool ControllerAxisIsTrigger(int axis_id) {
@@ -106,7 +218,24 @@ static bool ControllerAxisIsTrigger(int axis_id) {
 	       axis_id == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
 }
 
+// Fraction of a stick's travel to clamp to center, in the raw SDL
+// [-32768, 32767] domain, applied before controller_get_axis's rescale.
+// Never applied to the triggers: a resting-at-zero digital-press signal has
+// no "centered" concept to filter, and Ryujinx's own deadzone config is
+// stick-only for the same reason.
+static int ApplyDeadzone(int axis_value) {
+	const float deadzone = Config::GetGamepadDeadzone();
+	if (deadzone <= 0.0f) {
+		return axis_value;
+	}
+	const auto threshold = static_cast<int>(deadzone * static_cast<float>(SDL_JOYSTICK_AXIS_MAX));
+	return (axis_value > -threshold && axis_value < threshold) ? 0 : axis_value;
+}
+
 static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
+	if (!ControllerAxisIsTrigger(axis_id)) {
+		axis_value = ApplyDeadzone(axis_value);
+	}
 	return ControllerAxisIsTrigger(axis_id)
 	           ? Controller::controller_get_axis(0, SDL_JOYSTICK_AXIS_MAX, axis_value)
 	           : Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
@@ -805,6 +934,38 @@ void WindowContext::Run() {
 	}
 }
 
+// Found 2026-09-10: SIGTERM/plain `kill`/Ctrl+C had no handler at all, so the process just dies
+// -- no at_quick_exit, no atexit, nothing. GetPipelineCache().Save() (window.cpp's
+// WindowRun()/WindowFlushCaches()) only ever runs on a graceful SDL_QUIT/SDL_APP_TERMINATING
+// event or std::quick_exit(); neither fires on a bare kill. On a game whose boot alone compiles
+// tens of thousands of shader permutations (confirmed: ASTRO's Playroom, 2026-09-10 -- driver
+// shader-compile cost dominates cold-boot time), that means every non-graceful stop -- a crash
+// during development, a supervisor killing a hung instance, anything short of closing the window
+// or letting the game exit on its own -- silently throws away the entire compiled-shader/pipeline
+// cache, forcing a full from-scratch recompile on the next launch. This does the minimum needed
+// to make SIGTERM/SIGINT behave like closing the window: push a synthetic SDL_QUIT, which already
+// routes through the normal GameEventQuit -> need_exit -> WindowRun() return -> Save() path with
+// no new code on that side. SDL_PushEvent is documented thread-safe and is the standard pattern
+// for signal-driven SDL shutdown; it is not strictly POSIX async-signal-safe (it takes a lock
+// internally), a small, widely-accepted risk in exchange for a real graceful shutdown instead of
+// none at all. Does NOT help SIGKILL (-9): that can never be caught by any process, by design.
+extern "C" void HandleTerminationSignal(int /*signal*/) {
+	SDL_Event quit_event {};
+	quit_event.type = SDL_QUIT;
+	SDL_PushEvent(&quit_event);
+}
+
+static void InstallTerminationSignalHandlers() {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	std::signal(SIGTERM, HandleTerminationSignal);
+	std::signal(SIGINT, HandleTerminationSignal);
+#else
+	// SIGINT is deliverable on Windows too (Ctrl+C in a console); SIGTERM is not meaningfully
+	// generated by anything that would reach this process there.
+	std::signal(SIGINT, HandleTerminationSignal);
+#endif
+}
+
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
 	EXIT_IF(context.graphic_ctx.screen_width == 0);
@@ -822,6 +983,7 @@ static void WindowCreate(WindowContext& context) {
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}
+	InstallTerminationSignalHandlers();
 	HostInputInit();
 	InitializeSystemOverlayInput();
 
@@ -898,8 +1060,14 @@ void WindowRun() {
 }
 
 void WindowFlushCaches() {
+	// WindowRun() already saves both the driver pipeline cache and the
+	// shader disk cache (PipelineCache::Save() writes both) once the run
+	// loop exits normally. This path exists for std::at_quick_exit(), which
+	// runs no destructors and skips WindowRun()'s own return path entirely,
+	// so it is the only chance either cache gets to reach disk on a
+	// non-graceful exit.
 	if (g_window != nullptr && g_window->graphic_ctx.device != nullptr) {
-		g_window->graphic_ctx.SavePipelineCache();
+		g_window->render_context->GetPipelineCache().Save();
 	}
 }
 

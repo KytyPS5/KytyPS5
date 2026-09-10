@@ -165,11 +165,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
+	// Every real call site always passed the same vk::MemoryPropertyFlagBits::eDeviceLocal here,
+	// via a now-removed per-image VulkanMemory::property/preferred_property indirection (upstream
+	// 80a18e8 "simplify image allocation" dropped that struct as dead generality). Kept: the
+	// per-allocation priority hint, this branch's own VK_EXT_memory_priority feature, which
+	// upstream doesn't have.
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory.property);
-	alloc_info.preferredFlags =
-	    static_cast<vk::MemoryPropertyFlags::MaskType>(memory.preferred_property);
-	alloc_info.priority = MEMORY_PRIORITY_IMAGE;
+	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	alloc_info.priority      = MEMORY_PRIORITY_IMAGE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(

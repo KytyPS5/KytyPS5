@@ -30,6 +30,8 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -71,6 +73,14 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+std::string ShaderCacheSignature() {
+	// Independent of DriverCacheSignature's tag/format on purpose: a shader
+	// disk cache entry is portable SPIR-V, not an opaque driver blob, so it
+	// only needs to be rejected on an emulator/recompiler change (git
+	// revision), not a driver or GPU change the way the pipeline cache does.
+	return fmt::format("KytySC1:{}\n", KYTY_GIT_REVISION);
+}
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
@@ -100,6 +110,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
+
+// The primary SRT evaluator's memory reader (SrtWalker.cpp's `EvaluateRawRead`, used for every
+// ordinary scalar/constant-buffer read on every draw/dispatch), as opposed to
+// ReadShaderGuestMemory above which is only wired to read_specialization_memory (branch-
+// reachability evaluation at compile/specialization time, where refusing GPU-dirty ranges is
+// correct). Session 22 (2026-09-10) crashed the whole process when `.read_memory` was left
+// unset here: with no callback, SrtWalker.cpp's evaluator falls through to a bare, unvalidated
+// `std::memcpy` from a guest-computed address, and one wrong/zeroed descriptor (e.g. from a
+// non-invariant Phi) becomes a wild host pointer dereference (SIGSEGV, misattributed at the time
+// to runtimeLinker.cpp:844 -- that line is only KytyExceptionHandler's `EXIT()` call site, which
+// prints for *any* unhandled host fault; the actual fault was here, in the shader recompiler,
+// confirmed by matching the crash dump's own code bytes against the built binary). Wiring a real
+// reader turns that crash into a normal, hash-and-address-labelled materialization failure
+// (logged once per hash by the `materialize_failure_logged` check below) instead.
+bool ReadShaderGuestMemoryDirect(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr && Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -136,6 +163,21 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	                     decoded_dump.size()},
 	     }) {
 		if (size == 0) {
+			// A zero-length ".rdna2" is not "no disassembly" -- it means the decode never ran
+			// because --shader-log-direction is Silent (see options.dump_ir at the call site).
+			// Say so instead of leaving a silently-absent file that looks identical to an
+			// intentional skip.
+			if (std::string_view {suffix} == ".rdna2") {
+				static Log::RateLimit limiter {"DumpShaderOriginal:EmptyRdna2", 16};
+				if (const auto hit = limiter.Hit()) {
+					LOGF_COLOR(Log::Color::Yellow,
+					           "DumpShaderOriginal[%llu]: %s_%016" PRIx64
+					           ".rdna2 not written -- guest RDNA2 disassembly text is only "
+					           "produced when --shader-log-direction is Console or File "
+					           "(currently Silent)\n",
+					           *hit, stage_name, shader_hash);
+				}
+			}
 			continue;
 		}
 		auto path = base;
@@ -180,6 +222,422 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// ── Shader disk cache serialization ──────────────────────────────────────
+//
+// Binary encoding for exactly the fields a cache hit needs: a ProgramKey +
+// ResourceSpecialization pair (the lookup identity) and the resulting
+// CompiledShaderInfo + SPIR-V (what a hit skips recompiling). Nothing here
+// touches ShaderRecompiler::IR::Program's transient compile state (Block,
+// Value, Inst) — that is never serialized, matching the same "the plan is
+// not the whole IR" principle CompiledShaderInfo itself already applies.
+//
+// Read* functions never throw or assert on malformed input: a corrupt or
+// foreign-version file must degrade to "cache miss, recompile", the same
+// contract the driver pipeline cache above already gives a rejected blob.
+class ByteWriter {
+public:
+	explicit ByteWriter(std::vector<uint8_t>& out) : m_out(out) {}
+
+	template <typename T>
+	    requires std::is_trivially_copyable_v<T>
+	void Pod(const T& value) {
+		const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+		m_out.insert(m_out.end(), bytes, bytes + sizeof(T));
+	}
+	void U32(uint32_t v) { Pod(v); }
+	void U64(uint64_t v) { Pod(v); }
+	void I32(int32_t v) { Pod(v); }
+	void Bool(bool v) { Pod(static_cast<uint8_t>(v ? 1 : 0)); }
+	template <typename E>
+	    requires std::is_enum_v<E>
+	void Enum(E v) {
+		Pod(static_cast<std::underlying_type_t<E>>(v));
+	}
+	void Str(const std::string& s) {
+		U32(static_cast<uint32_t>(s.size()));
+		m_out.insert(m_out.end(), s.begin(), s.end());
+	}
+	template <typename T>
+	    requires std::is_trivially_copyable_v<T>
+	void PodVector(const std::vector<T>& v) {
+		U32(static_cast<uint32_t>(v.size()));
+		if (!v.empty()) {
+			const auto* bytes = reinterpret_cast<const uint8_t*>(v.data());
+			m_out.insert(m_out.end(), bytes, bytes + v.size() * sizeof(T));
+		}
+	}
+	template <typename T, typename F>
+	void Vector(const std::vector<T>& v, F&& each) {
+		U32(static_cast<uint32_t>(v.size()));
+		for (const auto& item: v) {
+			each(*this, item);
+		}
+	}
+
+private:
+	std::vector<uint8_t>& m_out;
+};
+
+class ByteReader {
+public:
+	ByteReader(const uint8_t* data, size_t size) : m_data(data), m_size(size) {}
+
+	[[nodiscard]] bool Ok() const { return m_ok; }
+
+	template <typename T>
+	    requires std::is_trivially_copyable_v<T>
+	T Pod() {
+		T value {};
+		if (m_pos + sizeof(T) > m_size) {
+			m_ok = false;
+			return value;
+		}
+		std::memcpy(&value, m_data + m_pos, sizeof(T));
+		m_pos += sizeof(T);
+		return value;
+	}
+	uint32_t U32() { return Pod<uint32_t>(); }
+	uint64_t U64() { return Pod<uint64_t>(); }
+	int32_t  I32() { return Pod<int32_t>(); }
+	bool     Bool() { return Pod<uint8_t>() != 0; }
+	template <typename E>
+	    requires std::is_enum_v<E>
+	E Enum() {
+		return static_cast<E>(Pod<std::underlying_type_t<E>>());
+	}
+	std::string Str() {
+		const auto len = U32();
+		if (!m_ok || m_pos + len > m_size) {
+			m_ok = false;
+			return {};
+		}
+		std::string s(reinterpret_cast<const char*>(m_data + m_pos), len);
+		m_pos += len;
+		return s;
+	}
+	template <typename T>
+	    requires std::is_trivially_copyable_v<T>
+	std::vector<T> PodVector() {
+		const auto    count = U32();
+		std::vector<T> v;
+		if (!m_ok || m_pos + static_cast<size_t>(count) * sizeof(T) > m_size) {
+			m_ok = false;
+			return v;
+		}
+		v.resize(count);
+		if (count != 0) {
+			std::memcpy(v.data(), m_data + m_pos, static_cast<size_t>(count) * sizeof(T));
+		}
+		m_pos += static_cast<size_t>(count) * sizeof(T);
+		return v;
+	}
+	template <typename T, typename F>
+	std::vector<T> Vector(F&& each) {
+		const auto     count = U32();
+		std::vector<T> v;
+		if (!m_ok) {
+			return v;
+		}
+		v.reserve(count);
+		for (uint32_t i = 0; i < count && m_ok; i++) {
+			v.push_back(each(*this));
+		}
+		return v;
+	}
+
+private:
+	const uint8_t* m_data;
+	size_t         m_size;
+	size_t         m_pos = 0;
+	bool           m_ok  = true;
+};
+
+void WriteBufferResource(ByteWriter& w, const ShaderRecompiler::IR::BufferResource& r) {
+	w.U32(r.source);
+	w.U32(r.first_use_pc);
+	w.U32(r.max_byte_extent);
+	w.U32(r.packed_stride);
+	w.Enum(r.descriptor_format);
+	w.U32(r.descriptor_swizzle);
+	w.U32(r.image_alias);
+	w.Bool(r.read);
+	w.Bool(r.written);
+	w.Bool(r.atomic);
+	w.Bool(r.formatted);
+	w.Bool(r.scalar);
+}
+
+ShaderRecompiler::IR::BufferResource ReadBufferResource(ByteReader& r) {
+	ShaderRecompiler::IR::BufferResource v;
+	v.source             = r.U32();
+	v.first_use_pc       = r.U32();
+	v.max_byte_extent    = r.U32();
+	v.packed_stride      = r.U32();
+	v.descriptor_format  = r.Enum<Prospero::BufferFormat>();
+	v.descriptor_swizzle = r.U32();
+	v.image_alias        = r.U32();
+	v.read                = r.Bool();
+	v.written              = r.Bool();
+	v.atomic               = r.Bool();
+	v.formatted            = r.Bool();
+	v.scalar               = r.Bool();
+	return v;
+}
+
+void WriteImageResource(ByteWriter& w, const ShaderRecompiler::IR::ImageResource& r) {
+	w.U32(r.source);
+	w.U32(r.first_use_pc);
+	w.Enum(r.resource_class);
+	w.Enum(r.numeric_class);
+	w.Enum(r.dimension);
+	w.Enum(r.mip_mode);
+	w.U32(r.mip_count);
+	w.Enum(r.conversion_format);
+	w.U32(r.shader_swizzle);
+	w.Bool(r.read);
+	w.Bool(r.written);
+	w.Bool(r.atomic);
+	w.Bool(r.depth_compare);
+	w.Bool(r.cube);
+	w.Bool(r.r128);
+	w.U32(r.indirect_root);
+	w.U32(r.indirect_mapping_offset);
+	w.U32(r.indirect_search_iterations);
+	w.PodVector(r.indirect_resources);
+}
+
+ShaderRecompiler::IR::ImageResource ReadImageResource(ByteReader& r) {
+	ShaderRecompiler::IR::ImageResource v;
+	v.source         = r.U32();
+	v.first_use_pc   = r.U32();
+	v.resource_class = r.Enum<ShaderRecompiler::IR::ImageResourceClass>();
+	v.numeric_class  = r.Enum<Prospero::TextureNumericClass>();
+	v.dimension      = r.Enum<ShaderRecompiler::Decoder::ImageDimension>();
+	v.mip_mode       = r.Enum<ShaderRecompiler::IR::ImageMipMode>();
+	v.mip_count      = r.U32();
+	v.conversion_format         = r.Enum<Prospero::BufferFormat>();
+	v.shader_swizzle            = r.U32();
+	v.read                      = r.Bool();
+	v.written                   = r.Bool();
+	v.atomic                    = r.Bool();
+	v.depth_compare             = r.Bool();
+	v.cube                      = r.Bool();
+	v.r128                      = r.Bool();
+	v.indirect_root             = r.U32();
+	v.indirect_mapping_offset   = r.U32();
+	v.indirect_search_iterations = r.U32();
+	v.indirect_resources        = r.PodVector<uint32_t>();
+	return v;
+}
+
+void WriteSamplerResource(ByteWriter& w, const ShaderRecompiler::IR::SamplerResource& r) {
+	w.U32(r.source);
+	w.U32(r.first_use_pc);
+	w.Bool(r.force_point_filtering);
+	w.Bool(r.depth_compare);
+}
+
+ShaderRecompiler::IR::SamplerResource ReadSamplerResource(ByteReader& r) {
+	ShaderRecompiler::IR::SamplerResource v;
+	v.source                = r.U32();
+	v.first_use_pc          = r.U32();
+	v.force_point_filtering = r.Bool();
+	v.depth_compare         = r.Bool();
+	return v;
+}
+
+void WriteSampledPair(ByteWriter& w, const ShaderRecompiler::IR::SampledResourcePair& r) {
+	w.U32(r.image);
+	w.U32(r.sampler);
+	w.U32(r.first_use_pc);
+}
+
+ShaderRecompiler::IR::SampledResourcePair ReadSampledPair(ByteReader& r) {
+	ShaderRecompiler::IR::SampledResourcePair v;
+	v.image        = r.U32();
+	v.sampler      = r.U32();
+	v.first_use_pc = r.U32();
+	return v;
+}
+
+void WriteStageInput(ByteWriter& w, const ShaderRecompiler::IR::StageInput& r) {
+	w.Enum(r.kind);
+	w.U32(r.location);
+	w.U32(r.component_count);
+	w.Str(r.debug_name);
+	w.Bool(r.per_vertex);
+}
+
+ShaderRecompiler::IR::StageInput ReadStageInput(ByteReader& r) {
+	ShaderRecompiler::IR::StageInput v;
+	v.kind            = r.Enum<ShaderRecompiler::IR::StageInputKind>();
+	v.location        = r.U32();
+	v.component_count = r.U32();
+	v.debug_name       = r.Str();
+	v.per_vertex       = r.Bool();
+	return v;
+}
+
+void WriteStageOutput(ByteWriter& w, const ShaderRecompiler::IR::StageOutput& r) {
+	w.Enum(r.kind);
+	w.U32(r.index);
+	w.U32(r.location);
+	w.Str(r.debug_name);
+}
+
+ShaderRecompiler::IR::StageOutput ReadStageOutput(ByteReader& r) {
+	ShaderRecompiler::IR::StageOutput v;
+	v.kind      = r.Enum<ShaderRecompiler::IR::StageOutputKind>();
+	v.index     = r.U32();
+	v.location  = r.U32();
+	v.debug_name = r.Str();
+	return v;
+}
+
+void WriteShaderInfo(ByteWriter& w, const ShaderRecompiler::IR::ShaderInfo& info) {
+	w.Vector(info.buffers, [](ByteWriter& w2, const auto& v) { WriteBufferResource(w2, v); });
+	w.Vector(info.images, [](ByteWriter& w2, const auto& v) { WriteImageResource(w2, v); });
+	w.Vector(info.samplers, [](ByteWriter& w2, const auto& v) { WriteSamplerResource(w2, v); });
+	w.Vector(info.sampled_pairs, [](ByteWriter& w2, const auto& v) { WriteSampledPair(w2, v); });
+	w.Vector(info.inputs, [](ByteWriter& w2, const auto& v) { WriteStageInput(w2, v); });
+	w.Vector(info.outputs, [](ByteWriter& w2, const auto& v) { WriteStageOutput(w2, v); });
+	w.PodVector(std::vector<uint8_t>(info.vertex_fetch_components.begin(),
+	                                 info.vertex_fetch_components.end()));
+	w.I32(info.vertex_offset_sgpr);
+	w.I32(info.instance_offset_sgpr);
+	w.Bool(info.has_bitwise_xor);
+	w.Bool(info.uses_dma);
+}
+
+bool ReadShaderInfo(ByteReader& r, ShaderRecompiler::IR::ShaderInfo& info) {
+	info.buffers = r.Vector<ShaderRecompiler::IR::BufferResource>(
+	    [](ByteReader& r2) { return ReadBufferResource(r2); });
+	info.images = r.Vector<ShaderRecompiler::IR::ImageResource>(
+	    [](ByteReader& r2) { return ReadImageResource(r2); });
+	info.samplers = r.Vector<ShaderRecompiler::IR::SamplerResource>(
+	    [](ByteReader& r2) { return ReadSamplerResource(r2); });
+	info.sampled_pairs = r.Vector<ShaderRecompiler::IR::SampledResourcePair>(
+	    [](ByteReader& r2) { return ReadSampledPair(r2); });
+	info.inputs = r.Vector<ShaderRecompiler::IR::StageInput>(
+	    [](ByteReader& r2) { return ReadStageInput(r2); });
+	info.outputs = r.Vector<ShaderRecompiler::IR::StageOutput>(
+	    [](ByteReader& r2) { return ReadStageOutput(r2); });
+	const auto fetch_components = r.PodVector<uint8_t>();
+	if (fetch_components.size() != info.vertex_fetch_components.size()) {
+		return false;
+	}
+	std::ranges::copy(fetch_components, info.vertex_fetch_components.begin());
+	info.vertex_offset_sgpr   = r.I32();
+	info.instance_offset_sgpr = r.I32();
+	info.has_bitwise_xor      = r.Bool();
+	info.uses_dma             = r.Bool();
+	return r.Ok();
+}
+
+void WriteDescriptorBinding(ByteWriter& w, const ShaderRecompiler::IR::DescriptorBinding& b) {
+	w.Enum(b.kind);
+	w.PodVector(b.resources);
+}
+
+ShaderRecompiler::IR::DescriptorBinding ReadDescriptorBinding(ByteReader& r) {
+	ShaderRecompiler::IR::DescriptorBinding b;
+	b.kind      = r.Enum<ShaderRecompiler::IR::DescriptorBindingKind>();
+	b.resources = r.PodVector<uint32_t>();
+	return b;
+}
+
+void WriteBindingLayout(ByteWriter& w, const ShaderRecompiler::IR::BindingLayout& b) {
+	w.U32(b.push_data_start_dword);
+	w.U32(b.memory_offset_dword);
+	w.U32(b.memory_offset_count);
+	w.PodVector(b.user_data_registers);
+	w.Vector(b.descriptors, [](ByteWriter& w2, const auto& v) { WriteDescriptorBinding(w2, v); });
+}
+
+ShaderRecompiler::IR::BindingLayout ReadBindingLayout(ByteReader& r) {
+	ShaderRecompiler::IR::BindingLayout b;
+	b.push_data_start_dword = r.U32();
+	b.memory_offset_dword   = r.U32();
+	b.memory_offset_count   = r.U32();
+	b.user_data_registers   = r.PodVector<uint32_t>();
+	b.descriptors           = r.Vector<ShaderRecompiler::IR::DescriptorBinding>(
+	    [](ByteReader& r2) { return ReadDescriptorBinding(r2); });
+	return b;
+}
+
+void WriteCompiledShaderInfo(ByteWriter& w, const ShaderRecompiler::IR::CompiledShaderInfo& info) {
+	w.Enum(info.stage);
+	w.U64(info.shader_hash);
+	w.U32(info.wave_size);
+	w.U32(info.user_data_base);
+	w.U32(info.user_data_count);
+	w.U32(info.scratch_dwords);
+	w.U32(info.param_export_mask);
+	WriteShaderInfo(w, info.info);
+	WriteBindingLayout(w, info.bindings);
+}
+
+bool ReadCompiledShaderInfo(ByteReader& r, ShaderRecompiler::IR::CompiledShaderInfo& info) {
+	info.stage             = r.Enum<ShaderType>();
+	info.shader_hash        = r.U64();
+	info.wave_size          = r.U32();
+	info.user_data_base     = r.U32();
+	info.user_data_count    = r.U32();
+	info.scratch_dwords     = r.U32();
+	info.param_export_mask  = r.U32();
+	if (!ReadShaderInfo(r, info.info)) {
+		return false;
+	}
+	info.bindings = ReadBindingLayout(r);
+	return r.Ok();
+}
+
+void WriteSpecialization(ByteWriter& w, const ShaderRecompiler::IR::ResourceSpecialization& s) {
+	w.Vector(s.buffers, [](ByteWriter& w2, const auto& v) {
+		w2.U32(v.packed_stride);
+		w2.Enum(v.descriptor_format);
+		w2.U32(v.descriptor_swizzle);
+	});
+	w.Vector(s.images, [](ByteWriter& w2, const auto& v) {
+		w2.Enum(v.numeric_class);
+		w2.Enum(v.dimension);
+		w2.U32(v.mip_count);
+		w2.Enum(v.conversion_format);
+		w2.U32(v.shader_swizzle);
+		w2.U32(v.indirect_root);
+		w2.U32(v.indirect_mapping_offset);
+		w2.U32(v.indirect_search_iterations);
+		w2.Bool(v.cube);
+		w2.Bool(v.fmask);
+	});
+}
+
+ShaderRecompiler::IR::ResourceSpecialization ReadSpecialization(ByteReader& r) {
+	ShaderRecompiler::IR::ResourceSpecialization s;
+	s.buffers = r.Vector<ShaderRecompiler::IR::ResourceSpecialization::Buffer>([](ByteReader& r2) {
+		ShaderRecompiler::IR::ResourceSpecialization::Buffer v;
+		v.packed_stride      = r2.U32();
+		v.descriptor_format  = r2.Enum<Prospero::BufferFormat>();
+		v.descriptor_swizzle = r2.U32();
+		return v;
+	});
+	s.images = r.Vector<ShaderRecompiler::IR::ResourceSpecialization::Image>([](ByteReader& r2) {
+		ShaderRecompiler::IR::ResourceSpecialization::Image v;
+		v.numeric_class  = r2.Enum<Prospero::TextureNumericClass>();
+		v.dimension      = r2.Enum<ShaderRecompiler::Decoder::ImageDimension>();
+		v.mip_count      = r2.U32();
+		v.conversion_format          = r2.Enum<Prospero::BufferFormat>();
+		v.shader_swizzle             = r2.U32();
+		v.indirect_root              = r2.U32();
+		v.indirect_mapping_offset    = r2.U32();
+		v.indirect_search_iterations = r2.U32();
+		v.cube                       = r2.Bool();
+		v.fmask                      = r2.Bool();
+		return v;
+	});
+	return s;
+}
+
 } // namespace
 
 struct PipelineCache::ProgramCache {
@@ -207,6 +665,33 @@ struct PipelineCache::ProgramCache {
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
+		// Set once MaterializeResources fails with a STRUCTURAL reason (currently: "Phi is not
+		// invariant across control flow" -- a resource descriptor whose value genuinely differs
+		// per incoming control-flow edge in the shader's own IR). That failure depends only on
+		// `resource_plan` (fixed once this SourceEntry exists, identical for every dispatch of
+		// this shader+static_state) and NOT on the per-call `runtime`/user_data, unlike most
+		// other MaterializeResources failure reasons -- so unlike those, retrying can never
+		// succeed. Found investigating ASTRO's Playroom, 2026-09-10: without this flag, a shader
+		// hitting this case gets a full MaterializeResources attempt on EVERY dispatch (thousands
+		// per frame for a commonly-used compute shader), which was the actual cause of sustained
+		// near-zero GPU utilization / pegged CPU / frozen frame progress observed repeatedly this
+		// session (see workflow/astro_playroom_issues.md). Only this one specific, confirmed-
+		// deterministic failure reason short-circuits -- every other reason still retries exactly
+		// as before, since those CAN legitimately depend on runtime state that changes call to
+		// call.
+		bool structurally_unmaterializable = false;
+	};
+
+	// The disk-persisted twin of Permutation: everything LoadPermutationFromDisk
+	// needs to rebuild one without ShaderRecompiler::CompileProgram. No
+	// ShaderProgram handle (that is a live Vulkan module id, meaningless
+	// across a process boundary) and no ResourcePlan (transient compiler
+	// state that TranslateProgram + ExtractResourcePlan always rebuild
+	// fresh, cache or not — see InitializeShaderDiskCache's comment).
+	struct DiskEntry {
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::CompiledShaderInfo     program;
+		std::vector<uint32_t>                        spirv;
 	};
 
 	struct ProgramKeyHash {
@@ -231,7 +716,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               std::vector<uint32_t>* out_spirv = nullptr) {
 		const char* stage_name = nullptr;
 		switch (options.stage) {
 			case ShaderType::Vertex: stage_name = "vs"; break;
@@ -249,6 +735,9 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (out_spirv != nullptr) {
+			*out_spirv = result.spirv;
+		}
 
 		vk::ShaderModuleCreateInfo create_info {};
 		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
@@ -272,6 +761,149 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// Builds a Permutation straight from cached SPIR-V, skipping
+	// ShaderRecompiler::CompileProgram entirely. `entry` must already be a
+	// disk_cache-owned entry (both call sites guarantee this — see
+	// LoadDiskCache and Get()); this only creates the live Vulkan module a
+	// serialized entry has no equivalent of.
+	Permutation LoadPermutationFromDisk(const DiskEntry& entry) {
+		vk::ShaderModuleCreateInfo create_info {};
+		create_info.codeSize    = entry.spirv.size() * sizeof(uint32_t);
+		create_info.pCode       = entry.spirv.data();
+		vk::ShaderModule module = nullptr;
+		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
+		                     "create cached shader module");
+		EXIT_IF(module == nullptr);
+
+		return {
+		    .specialization = entry.specialization,
+		    .program        = entry.program,
+		    .handle         = {.id = ++next_shader_id, .module = module},
+		};
+	}
+
+	// Loads every disk-cached permutation for this title into disk_cache
+	// (no Vulkan calls here — modules are created lazily, only for an entry
+	// a real Get() lookup actually hits this session). A missing file, a
+	// signature mismatch, a truncated file, or a corrupt entry all mean the
+	// same thing: fewer entries, no error — the recompiler behind this is
+	// always correct, just slower to reach on a cold cache.
+	void LoadDiskCache(const std::filesystem::path& path) {
+		if (!Common::File::IsFileExisting(path)) {
+			return;
+		}
+		Common::File file(path, Common::File::Mode::Read);
+		if (file.IsInvalid()) {
+			return;
+		}
+		const auto file_size = file.Size();
+		std::vector<uint8_t> blob(file_size);
+		uint32_t              read = 0;
+		file.Read(blob.data(), static_cast<uint32_t>(blob.size()), &read);
+		file.Close();
+		if (read != blob.size()) {
+			return;
+		}
+
+		const auto signature = ShaderCacheSignature();
+		if (blob.size() < signature.size() ||
+		    std::memcmp(blob.data(), signature.data(), signature.size()) != 0) {
+			PipelineCacheLog("Shader disk cache: invalidating {} (emulator version mismatch)",
+			                 Common::PathToString(path));
+			return;
+		}
+
+		ByteReader reader(blob.data() + signature.size(), blob.size() - signature.size());
+		uint32_t   loaded = 0;
+		while (reader.Ok()) {
+			const auto has_next = reader.Bool();
+			if (!reader.Ok() || !has_next) {
+				break;
+			}
+
+			ProgramKey key;
+			key.stage           = reader.Enum<ShaderType>();
+			key.hash            = reader.U64();
+			key.user_data_count = reader.U32();
+			key.code_size       = reader.U32();
+			key.static_state    = reader.PodVector<uint32_t>();
+
+			DiskEntry entry;
+			entry.specialization = ReadSpecialization(reader);
+			if (!ReadCompiledShaderInfo(reader, entry.program)) {
+				break;
+			}
+			entry.spirv = reader.PodVector<uint32_t>();
+			if (!reader.Ok() || entry.spirv.empty()) {
+				break;
+			}
+
+			disk_cache[key].push_back(std::move(entry));
+			loaded++;
+		}
+		// Cache hits skip CompilePermutation entirely, so --graphics-debug-dump/--draw-dump
+		// produce zero .spv/.rdna2/.bin output for any shader loaded from here this run. Say so
+		// up front rather than let a debug session silently see nothing for a warm cache.
+		PipelineCacheLog(
+		    "Shader disk cache: loaded {} permutation(s) from {}{}", loaded,
+		    Common::PathToString(path),
+		    loaded > 0 ? " (debug shader dumps are suppressed for cache hits -- delete this "
+		                 "file before a --graphics-debug-dump run if fresh dumps are needed)"
+		               : "");
+	}
+
+	// Writes every permutation this ProgramCache currently knows about
+	// (loaded from disk this session, or freshly compiled) back to `path`
+	// via a temp file + rename, so an interrupted exit never leaves a
+	// half-written file for the next launch to read.
+	void SaveDiskCache(const std::filesystem::path& path) const {
+		if (disk_cache.empty()) {
+			return;
+		}
+
+		std::vector<uint8_t> blob;
+		const auto            signature = ShaderCacheSignature();
+		blob.insert(blob.end(), signature.begin(), signature.end());
+
+		ByteWriter writer(blob);
+		size_t     count = 0;
+		for (const auto& [key, entries]: disk_cache) {
+			for (const auto& entry: entries) {
+				writer.Bool(true);
+				writer.Enum(key.stage);
+				writer.U64(key.hash);
+				writer.U32(key.user_data_count);
+				writer.U32(key.code_size);
+				writer.PodVector(key.static_state);
+				WriteSpecialization(writer, entry.specialization);
+				WriteCompiledShaderInfo(writer, entry.program);
+				writer.PodVector(entry.spirv);
+				count++;
+			}
+		}
+		writer.Bool(false);
+
+		if (!Common::File::CreateDirectories(path.parent_path())) {
+			PipelineCacheLog("Shader disk cache: failed to create cache directory");
+			return;
+		}
+		auto temp_path = path;
+		temp_path += ".tmp";
+		Common::File file;
+		uint32_t     written = 0;
+		if (file.Create(temp_path)) {
+			file.Write(blob.data(), static_cast<uint32_t>(blob.size()), &written);
+		}
+		const bool flushed = !file.IsInvalid() && file.Flush();
+		file.Close();
+		if (written != blob.size() || !flushed || !Common::File::RenameFile(temp_path, path)) {
+			PipelineCacheLog("Shader disk cache: failed to write {}", Common::PathToString(path));
+			return;
+		}
+		PipelineCacheLog("Shader disk cache: saved {} permutation(s) ({} bytes) to {}", count,
+		                 blob.size(), Common::PathToString(path));
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -290,17 +922,66 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		auto entry = programs.find(lookup_key);
+		// Temporary diagnostic (from the ASTRO's Playroom investigation, 2026-09-09): names why a shader is missing the
+		// in-memory cache on every call instead of hitting after the first compile. Capped per
+		// hash so a genuinely-looping miss cannot flood the log the way the unbounded version
+		// would. Prints the static key words so two "missing" calls for the same hash can be
+		// diffed by eye to see whether static_state itself is the thing changing.
+		if (entry == programs.end()) {
+			auto& miss_count = cache_miss_log_count[params.hash];
+			if (miss_count < 8) {
+				miss_count++;
+				std::string words;
+				for (const auto word: lookup_key.static_state) {
+					words += fmt::format("{:08x} ", word);
+				}
+				PipelineCacheLog(
+				    "shader cache miss #{} hash=0x{:016x} stage={} user_data_count={} "
+				    "code_size={} static_state=[{}] programs.size()={}",
+				    miss_count, params.hash, static_cast<uint32_t>(stage),
+				    lookup_key.user_data_count, lookup_key.code_size, words, programs.size());
+			}
+		}
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryDirect,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			if (entry->second.structurally_unmaterializable) {
+				// Already proven this shader's resource_plan can never materialize (see
+				// SourceEntry::structurally_unmaterializable) -- skip straight to the same
+				// "skip this draw/dispatch" outcome without re-running MaterializeResources.
+				return {};
+			}
+			std::string materialize_fail_reason;
+			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+			                                                resources, specialization,
+			                                                &materialize_fail_reason)) {
+				// Not fatal: skip this one draw/dispatch instead of aborting the emulator (see
+				// commit 6aa6e39's identical "skip, don't abort" precedent for an unsupported
+				// primitive type). Only cached as a PERMANENT failure when the reason is the
+				// confirmed-structural "Phi is not invariant" case (see
+				// SourceEntry::structurally_unmaterializable) -- every other reason leaves
+				// `entry`/its resource_plan untouched, so a later call with different user data
+				// still gets a full retry. `stage` returns falsy (ShaderProgram::operator
+				// bool()), which every caller must check before dereferencing
+				// input_info.stage.program.
+				if (materialize_fail_reason.find("Phi is not invariant") != std::string::npos) {
+					entry->second.structurally_unmaterializable = true;
+				}
+				if (materialize_failure_logged.insert(params.hash).second) {
+					PipelineCacheLog(
+					    "shader resource materialization failed, skipping this draw/dispatch: "
+					    "hash=0x{:016x} stage={}: {}",
+					    params.hash, static_cast<uint32_t>(stage), materialize_fail_reason);
+				}
+				return {};
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -349,19 +1030,75 @@ struct PipelineCache::ProgramCache {
 				options.user_data_base = 0;
 				options.wave_size      = input_info.mesh.wave_size;
 				options.scratch_dwords = input_info.mesh.scratch_size_dwords;
+			} else {
+				options.wave_size = input_info.wave_size;
 			}
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.wave_size = input_info.wave_size;
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
-			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			auto        resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			std::string materialize_fail_reason;
+			const bool  materialized = ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization, &materialize_fail_reason);
+			// Cache `resource_plan` either way (found investigating ASTRO's Playroom, 2026-09-09).
+			// TranslateProgram + ExtractResourcePlan are deterministic in `params.code` alone --
+			// a failed MaterializeResources here does not mean a *different* resource_plan would
+			// come out next time, only that `runtime` (user_data / guest memory) did not satisfy
+			// this one. Previously `entry` was left == programs.end() on failure, so the very
+			// next dispatch of this same shader re-ran the full decode/CFG/IR pipeline from raw
+			// bytecode instead of the cheap MaterializeResources-only retry the cache-hit branch
+			// above already does. For a shader materialization can never satisfy (the Astro's
+			// Playroom case: a resource Phi that is structurally non-invariant, so retrying
+			// buys nothing) and that is dispatched thousands of times a frame, that was a full
+			// shader recompile on every single dispatch -- the actual cause of the sustained
+			// near-zero GPU utilization, pegged CPU, and no forward frame progress a cold
+			// "dirty build" run showed. The retry-every-dispatch *policy* is unchanged: this
+			// only removes the redundant recompile, entry->second.resource_plan is still
+			// re-materialized fresh on every call exactly as before.
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			if (!materialized) {
+				if (materialize_fail_reason.find("Phi is not invariant") != std::string::npos) {
+					entry->second.structurally_unmaterializable = true;
+				}
+				if (materialize_failure_logged.insert(params.hash).second) {
+					PipelineCacheLog(
+					    "shader resource materialization failed, skipping this draw/dispatch: "
+					    "hash=0x{:016x} stage={}: {}",
+					    params.hash, static_cast<uint32_t>(stage), materialize_fail_reason);
+				}
+				return {};
+			}
 		}
+
+		// A disk hit skips only ShaderRecompiler::CompileProgram (the IR ->
+		// SPIR-V emission just above, in CompilePermutation) — TranslateProgram
+		// already ran unconditionally above it, exactly as it would with no
+		// disk cache at all, because `specialization` has to exist before
+		// either the in-memory or the disk lookup can happen.
+		if (const auto disk_slot = disk_cache.find(lookup_key); disk_slot != disk_cache.end()) {
+			const auto disk_hit = std::ranges::find_if(
+			    disk_slot->second,
+			    [&](const DiskEntry& e) { return e.specialization == specialization; });
+			if (disk_hit != disk_slot->second.end()) {
+				entry->second.permutations.push_back(LoadPermutationFromDisk(*disk_hit));
+				const auto& permutation = entry->second.permutations.back();
+				input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
+				permutation.program.bindings.AdvancePushData(push_data_cursor);
+				return permutation.handle;
+			}
+		}
+
+		std::vector<uint32_t> fresh_spirv;
 		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		    params, options, std::move(translated), specialization, push_data_cursor, &fresh_spirv));
+		disk_cache[lookup_key].push_back(
+		    {.specialization = std::move(specialization),
+		     .program        = entry->second.permutations.back().program,
+		     .spirv          = std::move(fresh_spirv)});
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -391,16 +1128,26 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
-	ProgramKey                                                  lookup_key;
-	vk::Device                                                  device;
-	uint64_t                                                    next_shader_id = 0;
+	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>           programs;
+	std::unordered_map<ProgramKey, std::vector<DiskEntry>, ProgramKeyHash> disk_cache;
+	ProgramKey                                                            lookup_key;
+	// Shader hashes that have already logged a materialization failure (Get() returns a falsy
+	// ShaderProgram for these instead of aborting -- see Get()'s two MaterializeResources call
+	// sites). Guarded by the same m_mutex every Get() call already holds. Not cached as a
+	// permanent failure: a later draw with different user data may still materialize fine, so
+	// this only silences the repeat LOGF, it never skips retrying MaterializeResources itself.
+	std::unordered_set<uint64_t>                                          materialize_failure_logged;
+	// Temporary diagnostic counter (from the ASTRO's Playroom investigation, 2026-09-09), see its use in Get().
+	std::unordered_map<uint64_t, int>                                     cache_miss_log_count;
+	vk::Device                                                            device;
+	uint64_t                                                              next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	InitializeShaderDiskCache();
 }
 
 PipelineCache::~PipelineCache() {
@@ -435,9 +1182,15 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	if (git_hash.ends_with("-dirty") && !Config::ForceShaderDiskCacheEnabled()) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
+	}
+	if (git_hash.ends_with("-dirty")) {
+		PipelineCacheLog(
+		    "Vulkan pipeline cache: dirty build, but --force-shader-disk-cache overrides the "
+		    "safety gate -- a cache entry may have been produced by different recompiler code "
+		    "than this tree");
 	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
@@ -506,8 +1259,43 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+void PipelineCache::InitializeShaderDiskCache() {
+	const auto title_id = PipelineCacheTitleId();
+	if (title_id.empty()) {
+		return;
+	}
+	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+		PipelineCacheLog("Shader disk cache: disabled (non-Release build)");
+		return;
+	}
+	const std::string_view git_hash     = KYTY_GIT_HASH;
+	const std::string_view git_revision = KYTY_GIT_REVISION;
+	if (git_hash == "unknown" || git_revision == "unknown") {
+		PipelineCacheLog("Shader disk cache: disabled (unknown git revision)");
+		return;
+	}
+	if (git_hash.ends_with("-dirty") && !Config::ForceShaderDiskCacheEnabled()) {
+		PipelineCacheLog("Shader disk cache: disabled (dirty build)");
+		return;
+	}
+	if (git_hash.ends_with("-dirty")) {
+		PipelineCacheLog(
+		    "Shader disk cache: dirty build, but --force-shader-disk-cache overrides the safety "
+		    "gate -- a cache entry may have been produced by different recompiler code than "
+		    "this tree");
+	}
+
+	m_shader_cache_path = std::filesystem::path("_ShaderCache") / (title_id + ".bin");
+	m_program_cache->LoadDiskCache(m_shader_cache_path);
+}
+
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+
+	if (!m_shader_cache_path.empty()) {
+		m_program_cache->SaveDiskCache(m_shader_cache_path);
+	}
+
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -701,8 +1489,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
 	if (ps_active && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		static Log::RateLimit limiter {"PipelineExecOnNoopWithDepthTest", 16};
+		if (limiter.Hit()) {
 			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
 		}
 	}

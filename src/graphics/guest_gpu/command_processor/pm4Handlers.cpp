@@ -346,8 +346,8 @@ static void HwCtxIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset
                                             [[maybe_unused]] uint32_t value) {}
 
 static void HwCtxIgnoreSpiTmpringSize(uint32_t value) {
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+	static Log::RateLimit limiter {"HwCtxIgnoreSpiTmpringSize", 4};
+	if (limiter.Hit()) {
 		LOGF("\t temporary: accepting SPI_TMPRING_SIZE = 0x%08" PRIx32 "\n", value);
 	}
 }
@@ -1280,8 +1280,8 @@ static void HwUcSetGdsOaRegister(CommandProcessor& cp, uint32_t cmd_offset, uint
 
 	const auto                   index = ucfg.GetGdsOaState().GetIndex();
 	const auto&                  oa    = ucfg.GetGdsOaCounter(index);
-	static std::atomic<uint32_t> log_count {0};
-	if (oa.IsCounterEnabled() && log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
+	static Log::RateLimit limiter {"GdsOaCounter", 128};
+	if (oa.IsCounterEnabled() && limiter.Hit()) {
 		LOGF("GDS_OA: index=%u address_bytes=0x%04" PRIx32 " space=0x%08" PRIx32
 		     " crawler=%u crawler_id=%u "
 		     "alloc_crawler=%s raw_cntl=0x%08" PRIx32 " raw_counter=0x%08" PRIx32
@@ -1941,8 +1941,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	auto* indirect_buffer =
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t                     indirect_num_dw = control & 0xfffffu;
-	static std::atomic<uint32_t> indirect_log_count {0};
-	if (indirect_log_count.fetch_add(1) < 128) {
+	static Log::RateLimit limiter {"IndirectBuffer", 128};
+	if (limiter.Hit()) {
 		LOGF("\t indirect buffer: addr=0x%016" PRIx64 ", num_dw=%" PRIu32 ", control=0x%08" PRIx32
 		     "\n",
 		     reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw, control);
@@ -2005,8 +2005,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		}
 
 		if (cmd_offset >= Pm4::CX_NUM) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			static Log::RateLimit limiter {"IndirectCxUnknownOffset", 16};
+			if (limiter.Hit()) {
 				LOGF("\t temporary: skipping unknown indirect CX extended offset = 0x%08" PRIx32
 				     ", value = 0x%08" PRIx32 "\n",
 				     cmd_offset, value);
@@ -2072,15 +2072,32 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
 		if (pfunc == nullptr) {
-			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
-			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			// See the identical CX-loop precedent above (~line 1998): an unmapped register here
+			// used to abort the whole packet (reproduced in ASTRO's Playroom, 2026-09-09, packet dword
+			// 0x179a, offset 0xca -- a merged GS+ES shader's resource-descriptor register this
+			// codebase does not yet model). Skipping and logging instead means the rest of the
+			// packet, and every later packet, still applies -- unblocking any draw/dispatch that
+			// happens to touch one unimplemented SH register among many implemented ones.
+			static Log::RateLimit limiter {"IndirectShUnknownRegister", 16};
+			if (limiter.Hit()) {
+				LOGF("\t temporary: skipping unknown indirect SH register: index=%" PRIu32
+				     "/%" PRIu32 ", regs=0x%016" PRIx64 ", offset=0x%08" PRIx32
+				     ", value=0x%08" PRIx32 "\n",
+				     i, indirect_num_dw, indirect_address, cmd_offset, value);
+				auto* dump_regs = indirect_buffer - i * 2;
+				auto  dump_count = std::min(indirect_num_dw, 16u);
+				for (uint32_t j = 0; j < dump_count; j++) {
+					LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+					     "\n",
+					     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				}
+				if (indirect_num_dw > dump_count) {
+					LOGF("\t sh_indirect[] dump capped at %" PRIu32 " of %" PRIu32
+					     " pairs, remainder not shown\n",
+					     dump_count, indirect_num_dw);
+				}
 			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2219,8 +2236,8 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
-	static std::atomic<uint32_t> pop_marker_log_count {0};
-	if (pop_marker_log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"PopMarker", 64};
+	if (limiter.Hit()) {
 		LOGF("Pop marker\n");
 	}
 
@@ -2234,8 +2251,8 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 
 	const char* str = reinterpret_cast<const char*>(buffer);
 
-	static std::atomic<uint32_t> push_marker_log_count {0};
-	if (push_marker_log_count.fetch_add(1) < 128) {
+	static Log::RateLimit limiter {"PushMarker", 128};
+	if (limiter.Hit()) {
 		LOGF("Push marker: %s\n", str);
 	}
 
@@ -3728,6 +3745,15 @@ void GraphicsInitJmpTablesShIndirect() {
 		cp.GetShCtx().SetEsShaderBase(base);
 	};
 
+	// Bit layout unknown -- see the inference note on the constant's declaration in pm4.h.
+	// Kyty's ES shader translation is driven entirely by PGM_LO_ES/HI_ES above and its own
+	// SPIR-V resource extraction, not by raw hardware resource-descriptor bits, so this is
+	// accepted and dropped the same way SPI_SHADER_PGM_RSRC4_GS/SPI_GRAPHICS_SHADER_CONTROL_GS
+	// already are (reproduced in ASTRO's Playroom, 2026-09-09).
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().gs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
@@ -3881,8 +3907,8 @@ void GraphicsInitJmpTablesUcIndirect() {
 	};
 
 	g_hw_uc_indirect_func[Pm4::GE_STEREO_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
+		static Log::RateLimit limiter {"IndirectUcGeStereoCntl", 16};
+		if (limiter.Hit()) {
 			LOGF("warning: ignoring indirect uc reg GE_STEREO_CNTL at 0x%" PRIx32
 			     ", value = 0x%08" PRIx32 "\n",
 			     cmd_offset, value);

@@ -318,10 +318,20 @@ bool InstallHandler(Handler handler) {
 		printf("sigaction() failed to install the host fault handler\n");
 		return false;
 	}
-#else
+#else // KYTY_PLATFORM_LINUX, not __APPLE__
 	struct sigaction action {};
 	action.sa_sigaction = SignalHandler;
 	sigemptyset(&action.sa_mask);
+	// The guest signal-dispatch path raises SIGRTMIN+3 on a thread to interrupt it (see
+	// SignalDispatchHostSignal() in libs/libKernel.cpp); block it while a fault is being
+	// resolved so a stop-the-world request cannot preempt the handler between the
+	// protection fix and the retry, mirroring the SIGUSR1 mask on the macOS branch above.
+	sigaddset(&action.sa_mask, SIGRTMIN + 3);
+	// SA_ONSTACK: a guest stack overflow's SIGSEGV must still be able to run this handler,
+	// which it cannot do on the thread's own exhausted stack. InitializeThreadSignalStack()
+	// gives each guest thread somewhere to receive it. The handler itself only reads/writes
+	// the interrupted thread's saved ucontext, never the alt stack's own contents, so this
+	// does not change what stack a resolved fault resumes execution on.
 	action.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
 
 	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {

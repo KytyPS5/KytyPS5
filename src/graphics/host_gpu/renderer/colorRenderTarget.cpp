@@ -20,8 +20,6 @@
 
 namespace Libs::Graphics {
 
-static std::atomic<uint32_t> g_render_color_log_count = 0;
-
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
 		case Prospero::ChannelLayout::k10_10_10_2:
@@ -59,9 +57,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
-			static std::atomic_uint log_count = 0;
-			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
-			if (log_id < 128) {
+			static Log::RateLimit limiter {"RenderColorTargetNoOutput", 128};
+			if (limiter.Hit()) {
 				LOGF("RenderColorTarget: no color output slot=%" PRIu32 " base=0x%010" PRIx64
 				     " slot_mask=0x%01" PRIx32 " target_mask=0x%08" PRIx32
 				     " rt_slice_offset=%" PRIu32 "\n",
@@ -121,9 +118,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			     render_target_slice_offset);
 	}
 	if (graphics_debug_dump_enabled()) {
-		static std::atomic_uint log_count = 0;
-		const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
-		if (log_id < 128) {
+		static Log::RateLimit limiter {"RenderColorTargetInspect", 128};
+		if (limiter.Hit()) {
 			LOGF("RenderColorTarget: inspect slot=%" PRIu32 " base=0x%010" PRIx64
 			     " mask=0x%01" PRIx32 " attrib2_width=%" PRIu32 " attrib2_height=%" PRIu32
 			     " attrib3_tile=0x%08" PRIx32 " attrib3_dim=0x%08" PRIx32 " fmt=0x%08" PRIx32
@@ -280,8 +276,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
-	auto decision_log_id = g_render_color_log_count.fetch_add(1);
-	if (decision_log_id < 128) {
+	static Log::RateLimit limiter {"RenderColorTargetDecision", 128};
+	if (limiter.Hit()) {
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
@@ -289,6 +285,21 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     view_extent.width, view_extent.height, levels, pitch,
 		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
 		     static_cast<uint32_t>(rt.info.channel_order), samples, tile ? "tiled" : "linear");
+	}
+	// Session-32 investigation diagnostic (astro_playroom_issues.md, Bug B follow-up): the
+	// 0x0549ff0000 fix (1024x1024) turned out not to be the ~3840x2160 onboarding-dialog panel
+	// the user keeps seeing stack without clearing. RenderColorTargetDecision above is rate-
+	// limited to 128 TOTAL hits across the whole run and fires ~640K times, so by the time the
+	// dialog is on screen (frame ~1500+) that cap is long exhausted -- this is a separately
+	// rate-limited, size-gated watch so a near-full-screen target still gets logged no matter how
+	// late it first appears. Temporary; remove once the dialog's real address is identified.
+	if (width >= 3000 && height >= 1800) {
+		static Log::RateLimit fullscreen_watch_limiter {"ClearWatchFullScreenTarget", 64};
+		if (fullscreen_watch_limiter.Hit()) {
+			LOGF("ClearWatchFullScreenTarget: slot=%" PRIu32 " addr=0x%010" PRIx64
+			     " extent=%ux%u dcc_enable=%s\n", rt_slot, rt.base.addr, width, height,
+			     rt.info.dcc_compression_enable ? "true" : "false");
+		}
 	}
 
 	TextureCache::ImageDesc desc {};

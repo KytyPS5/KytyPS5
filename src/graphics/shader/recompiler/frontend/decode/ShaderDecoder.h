@@ -53,6 +53,8 @@ enum class Opcode {
 	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
+	S_SUBVECTOR_LOOP_BEGIN,
+	S_SUBVECTOR_LOOP_END,
 	S_AND_SAVEEXEC_B32,
 	S_ORN2_SAVEEXEC_B32,
 	S_ANDN1_SAVEEXEC_B32,
@@ -61,6 +63,7 @@ enum class Opcode {
 	S_ANDN1_SAVEEXEC_B64,
 	S_NOT_B32,
 	S_NOT_B64,
+	S_WQM_B32,
 	S_WQM_B64,
 	S_ADD_U32,
 	S_ADDC_U32,
@@ -560,6 +563,8 @@ enum class Opcode {
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
+	IMAGE_BVH_INTERSECT_RAY,
+	IMAGE_BVH64_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -717,6 +722,12 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void DecodeProgram(std::span<const uint32_t> code, Program& program);
+// Used by DecodeFusedProgram (ShaderRecompiler.cpp) to apply DecodeProgram's own "a mid-stream
+// S_ENDPGM that something branches past is not the real end of the program" tolerance to its
+// separate front-half scan (reproduced in ASTRO's Playroom, 2026-09-09).
+bool IsControlFlowBranch(Opcode opcode);
+bool IsConditionalBranch(Opcode opcode);
+bool IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

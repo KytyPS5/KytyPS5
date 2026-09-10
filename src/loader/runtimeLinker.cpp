@@ -45,6 +45,8 @@
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 #endif
 #endif
 
@@ -780,6 +782,54 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Before this (2026-09-10, session 23): a host-side fault (a bug in KytyPS5's own code, as
+// opposed to the emulated game's) produced nothing but raw register values and 96 bytes of
+// unsymbolized code -- session 22 spent an entire investigation misattributing exactly such a
+// fault to "guest code" for lack of anything distinguishing the two, and the fault was only
+// symbolized afterward by hand-matching those raw code bytes against the build. This prints a
+// real backtrace instead, gated to when the fault pc is NOT in the guest code range (WalkGuestStack's
+// own test, reused) -- a guest-code fault already has its own guest-side stack trace via
+// WalkGuestStack/StackTrace and printing a *host* backtrace for it would be noise from wherever
+// the interpreter/JIT loop happens to be. `backtrace_symbols_fd` writes directly via `write()`
+// (no malloc), so it stays usable from a signal handler that may itself be near out-of-memory.
+// Symbol names require the binary to export them (`-rdynamic`/`-export-dynamic`); when it
+// doesn't, the printed `module+offset` from `dladdr` is exactly what this session used by hand:
+// `addr2line -f -C -e <binary> <offset>`.
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+static bool IsHostFaultPc(uint64_t pc) {
+	const uintptr_t code_start = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	return g_desired_base_addr > code_start && (pc < code_start || pc >= g_desired_base_addr);
+}
+
+static void PrintHostBacktrace(uint64_t fault_pc) {
+	Dl_info fault_info {};
+	if (dladdr(reinterpret_cast<void*>(fault_pc), &fault_info) != 0 &&
+	    fault_info.dli_fname != nullptr) {
+		std::printf("host fault: module=%s base=0x%016" PRIx64 " offset=0x%016" PRIx64 "%s%s\n",
+		            fault_info.dli_fname, reinterpret_cast<uint64_t>(fault_info.dli_fbase),
+		            fault_pc - reinterpret_cast<uint64_t>(fault_info.dli_fbase),
+		            fault_info.dli_sname != nullptr ? " symbol=" : "",
+		            fault_info.dli_sname != nullptr ? fault_info.dli_sname : "");
+	} else {
+		std::printf("host fault: pc=0x%016" PRIx64 " (module lookup failed)\n", fault_pc);
+	}
+	std::fflush(stdout);
+
+	constexpr int MAX_FRAMES = 64;
+	void*         frames[MAX_FRAMES];
+	const int     depth = backtrace(frames, MAX_FRAMES);
+	if (depth <= 0) {
+		std::printf("host backtrace: unavailable (backtrace() returned %d)\n", depth);
+		std::fflush(stdout);
+		return;
+	}
+	std::printf("host backtrace (%d frames, symbolize offsets with addr2line if unnamed):\n",
+	            depth);
+	std::fflush(stdout);
+	backtrace_symbols_fd(frames, depth, fileno(stdout));
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -837,6 +887,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("\n");
 		}
 		std::fflush(stdout);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		// This is KytyPS5's own code faulting, not the emulated game's, whenever pc falls outside
+		// the guest code range -- print what a host backtrace can tell us instead of nothing (see
+		// the comment on PrintHostBacktrace for why this was missing and what it cost).
+		if (IsHostFaultPc(info->exception_address)) {
+			PrintHostBacktrace(info->exception_address);
+		}
+#endif
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
@@ -1376,15 +1434,23 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	program->elf = std::make_unique<Elf64>();
 	program->elf->Open(elf_name);
 
-	if (program->elf->IsValid()) {
-		LoadProgramToMemory(program);
-		ParseProgramDynamicInfo(program);
-		CreateSymbolDatabase(program);
-	} else {
+	if (!program->elf->IsValid()) {
+		// Titles legitimately probe for several optional peripheral modules (e.g. a
+		// steering-wheel driver PRX per supported brand) that don't exist / aren't valid
+		// SELF/ELF images for this session and are never meant to load -- on real
+		// hardware that's just a load failure the game handles, not a fatal error. Let
+		// the caller decide: KernelLoadStartModule() returns a KERNEL_ERROR_* to the
+		// guest, PreloadAdjacentPrograms() skips it, and only the primary game
+		// executable load in emulator.cpp::LoadElf() treats a null return as fatal.
 		const auto failure = program->elf->GetBootFailure();
-		EXIT("cannot boot %s\n\t%s: %s\n", Common::PathToString(elf_name).c_str(),
+		LOGF("elf is not valid: %s\n\t%s: %s\n", Common::PathToString(elf_name).c_str(),
 		     BootFailureToString(failure).data(), BootFailureExplain(failure).data());
+		return nullptr;
 	}
+
+	LoadProgramToMemory(program);
+	ParseProgramDynamicInfo(program);
+	CreateSymbolDatabase(program);
 
 	m_programs.push_back(program_owner.release());
 
@@ -1883,7 +1949,10 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 	add_dir(root / "sce_modules");
 
 	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
+		auto* program = LoadProgram(path);
+		if (program == nullptr) {
+			continue;
+		}
 		program->fail_if_global_not_resolved = false;
 	}
 }

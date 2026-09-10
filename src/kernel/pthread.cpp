@@ -48,6 +48,8 @@
 #include <fmt/format.h>
 #include <pthread_time.h>
 #elif !defined(__APPLE__)
+#include <sched.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -2216,6 +2218,36 @@ int KYTY_SYSV_ABI PthreadAttrGetstacksize(const PthreadAttr* attr, size_t* stack
 	return OK;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+// CPU affinity was pure bookkeeping on every platform (attr_value->affinity was stored and
+// read back, but never applied to the host scheduler); this is the Linux application of it.
+// mask is a guest CPU bitmask (bit N = PS5 core N; the emulator's default is 0x7f, the 7
+// cores a game gets).
+static void ApplyGuestAffinityToHostThread(pthread_t host_thread, uint64_t guest_mask) {
+	if (guest_mask == 0) {
+		return;
+	}
+
+	const auto host_cpu_count =
+	    std::max<long>(1, static_cast<long>(sysconf(_SC_NPROCESSORS_ONLN)));
+
+	cpu_set_t cpu_set;
+	CPU_ZERO(&cpu_set);
+	for (int bit = 0; bit < static_cast<int>(sizeof(guest_mask) * 8) && bit < CPU_SETSIZE; bit++) {
+		if (((guest_mask >> bit) & 1u) != 0 && bit < host_cpu_count) {
+			CPU_SET(bit, &cpu_set);
+		}
+	}
+	if (CPU_COUNT(&cpu_set) == 0) {
+		// The mask named only cores this host does not have; leave the thread's affinity
+		// untouched rather than pin it to nothing.
+		return;
+	}
+
+	pthread_setaffinity_np(host_thread, sizeof(cpu_set), &cpu_set);
+}
+#endif
+
 int KYTY_SYSV_ABI PthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask) {
 	// PRINT_NAME();
 
@@ -2291,6 +2323,41 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 
 	return OK;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+// The PS5 SDK's priority scale runs opposite to nice: a LOWER guest_priority means a
+// HIGHER scheduling priority. Reuses the same 3-bucket thresholds already applied to the
+// Windows priority-class delta below, translated to the nearest nice() equivalent.
+static int NiceFromGuestPriority(int guest_priority) {
+	if (guest_priority <= 478) {
+		return -2;
+	}
+	if (guest_priority >= 733) {
+		return 2;
+	}
+	return 0;
+}
+
+// Raising priority (a negative nice) needs CAP_SYS_NICE or a raised RLIMIT_NICE and
+// commonly fails for an unprivileged process; that is expected, so it is logged once
+// rather than treated as an error. Lowering priority (a positive nice) never needs
+// privilege - see setpriority(2).
+static void ApplyGuestPriorityToHostThread(uint64_t host_thread_id, int guest_priority) {
+	const int nice_value = NiceFromGuestPriority(guest_priority);
+	if (nice_value == 0) {
+		return;
+	}
+	if (::setpriority(PRIO_PROCESS, static_cast<id_t>(host_thread_id), nice_value) != 0 &&
+	    nice_value < 0) {
+		static std::atomic_bool warned {false};
+		if (!warned.exchange(true)) {
+			LOGF("\t setpriority() could not raise a guest thread's scheduling priority "
+			     "(needs CAP_SYS_NICE or a raised RLIMIT_NICE); continuing at the default "
+			     "priority\n");
+		}
+	}
+}
+#endif
 
 int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param) {
 	// PRINT_NAME();
@@ -3403,6 +3470,16 @@ static void* RunThread(void* arg) {
 
 	g_pthread_self = thread;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// Threads created with an initial name (pthread_create_name_np) are never separately
+	// renamed via PthreadRename(), so without this every guest thread would show as the
+	// process name in htop/perf/gdb. thread->name was already set by PthreadCreate() before
+	// this thread was spawned, so this is race-free.
+	if (!thread->name.empty()) {
+		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
+	}
+#endif
+
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
@@ -3410,6 +3487,15 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// Applies whatever priority was requested via PthreadAttrSetschedparam() before this
+	// thread was created (the default is 700, which maps to a no-op nice of 0).
+	ApplyGuestPriorityToHostThread(thread->host_thread_id, thread->attr->guest_priority);
+	// Same for whatever affinity was requested via PthreadAttrSetaffinity() (default 0x7f,
+	// the 7 cores a PS5 game gets).
+	ApplyGuestAffinityToHostThread(pthread_self(), thread->attr->affinity);
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3584,6 +3670,12 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 
 	auto result = PthreadAttrSetaffinity(&thread->attr, mask);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (result == OK) {
+		ApplyGuestAffinityToHostThread(thread->p, mask);
+	}
+#endif
+
 	return result;
 }
 
@@ -3709,6 +3801,9 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 #endif
 
 	thread->attr->guest_priority = prio;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	ApplyGuestPriorityToHostThread(thread->host_thread_id, prio);
+#endif
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
 	return OK;
 }
@@ -3763,12 +3858,16 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 }
 
 int KYTY_SYSV_ABI PthreadEqual(Pthread thread1, Pthread thread2) {
-	static std::atomic<uint32_t> log_count {0};
+	// Cap at 128 total occurrences either way (see Log::RateLimit), but within that budget log
+	// every call with result!=0 -- a match is the interesting/rarer case -- and only the first
+	// 32 with result==0. Hit()'s own cap of 128 already implies count<128 whenever it returns,
+	// so the second half of the original `count<32 || (result && count<128)` check collapses to
+	// just `result != 0` here.
+	static Log::RateLimit limiter {"PthreadEqual", 128};
 
 	const int result = (thread1 == thread2 ? 1 : 0);
 
-	const auto count = log_count.fetch_add(1);
-	if (count < 32 || (result != 0 && count < 128)) {
+	if (const auto hit = limiter.Hit(); hit && (*hit < 32 || result != 0)) {
 		LOGF("\tPthreadEqual: t1 = 0x%016" PRIx64 ", t2 = 0x%016" PRIx64 ", result = %d\n",
 		     reinterpret_cast<uint64_t>(thread1), reinterpret_cast<uint64_t>(thread2), result);
 	}
@@ -3805,6 +3904,14 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	}
 
 	thread->name = std::string(name);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// glibc caps thread names at 16 bytes including the NUL and returns ERANGE rather than
+	// truncating, and would otherwise leave every guest thread showing as the process name
+	// in htop/perf/gdb - pthread_setname_np() is never called anywhere else in this file.
+	std::string truncated_name = thread->name.substr(0, 15);
+	pthread_setname_np(thread->p, truncated_name.c_str());
+#endif
 
 	return OK;
 }

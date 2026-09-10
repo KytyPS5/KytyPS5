@@ -16,6 +16,29 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 	return true;
 }
 
+// Wave32 sibling of EmitWqmU64 below (reproduced in ASTRO's Playroom, 2026-09-09) -- same quad-expand
+// algorithm, one 32-bit dword instead of two packed side by side, so the 64-bit constants above
+// simply become their single-dword halves.
+uint32_t EmitWqmU32(EmitterState& state, uint32_t value) {
+	const auto shifted_one = state.builder.AllocateId();
+	const auto merged_one  = state.builder.AllocateId();
+	const auto shifted_two = state.builder.AllocateId();
+	const auto merged_two  = state.builder.AllocateId();
+	const auto quad_bits   = state.builder.AllocateId();
+	const auto result      = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU32(state), shifted_one, value, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), merged_one, value, shifted_one});
+	state.builder.AddFunction(
+	    {OpShiftRightLogical, TypeU32(state), shifted_two, merged_one, ConstantU32(state, 2)});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), merged_two, merged_one, shifted_two});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), quad_bits, merged_two, ConstantU32(state, 0x11111111u)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU32(state), result, quad_bits, ConstantU32(state, 0x0000000fu)});
+	return result;
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -103,6 +126,25 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 		return bits;
 	}
 	return EmitInputComponentU32(state, kind, component);
+}
+
+uint32_t EmitGuestLaneId(EmitterState& state) {
+	// A guest wave64 may span two host wave32 subgroups. The subgroup builtin restarts at 0 for
+	// the upper half, while the flattened compute invocation index preserves the logical lane.
+	// Ported from KytyPS5 upstream PR #361 ("shader: preserve logical lane IDs for compute
+	// wave64") -- applied 2026-09-10 while investigating whether ASTRO's Playroom's "Phi is not
+	// invariant" compute-shader-skip failures (SrtWalker.cpp) are actually caused by this bug
+	// (a descriptor selector reading V_MBCNT/LaneId would see lanes 32-63 alias lanes 0-31's
+	// index, producing spurious per-"workgroup" divergence) rather than genuine per-invocation
+	// dynamic indexing.
+	if (state.stage == ShaderType::Compute && state.program.wave_size == 64u) {
+		const auto local_index = EmitLocalInvocationIndex(state);
+		const auto lane        = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), lane, local_index,
+		                           ConstantU32(state, 63)});
+		return lane;
+	}
+	return EmitSubgroupLocalInvocationId(state);
 }
 
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
@@ -583,11 +625,14 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Emit(inst, OpSelect, IR::Type::U32, {write, ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
 			return true;
 		}
+		case IR::ValueOpcode::WqmU32:
+			ctx.Define(inst, EmitWqmU32(ctx.state, ctx.Arg(inst, 0)));
+			return true;
 		case IR::ValueOpcode::WqmU64:
 			ctx.Define(inst, EmitWqmU64(ctx.state, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
+			ctx.Define(inst, EmitGuestLaneId(state));
 			return true;
 		case IR::ValueOpcode::Ballot: ctx.Define(inst, ctx.Ballot(inst.Arg(0))); return true;
 		case IR::ValueOpcode::ReadFirstLane: {

@@ -32,7 +32,7 @@ uint32_t                 render_target_first_bound_slot(const CommandBuffer& buf
 bool                     graphics_debug_dump_enabled();
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
-void                     sh_print(const char* func, const HW::Shader& uc);
+void                     sh_print(const char* func, const HW::Shader& uc, const HW::Context& context);
 std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt);
 bool                     RenderIsColorTileModeLinear(Prospero::TileMode tile_mode);
 void                     hw_print(const CommandBuffer& buffer);

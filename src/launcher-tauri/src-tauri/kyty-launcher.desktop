@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kyty PS5
+Comment=PlayStation 4/5 emulator launcher
+Exec=@EXEC@
+Icon=kyty-launcher
+Terminal=false
+Categories=Game;Emulator;
+StartupWMClass=kyty-launcher

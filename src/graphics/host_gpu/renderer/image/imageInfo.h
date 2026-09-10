@@ -426,15 +426,58 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 	       IsSupportedStandard64RenderTarget(info);
 }
 
+// `packed_hi` is only consulted for 64-bit-per-pixel formats (eR16G16B16A16Sfloat) whose clear
+// color needs two guest dwords (CB_COLORi_CLEAR_WORD0/1) to represent all four channels; every
+// existing caller passes a single dword and leaves this at its default, matching what those
+// formats' guest clear-word registers actually carry.
 [[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint32_t packed,
-                                                 vk::ClearColorValue& clear) {
+                                                 vk::ClearColorValue& clear,
+                                                 uint32_t packed_hi = 0) {
 	vk::ClearColorValue next {};
 	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
 	const auto srgb8  = [](uint32_t value) {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	// IEEE-754 binary16 -> float32. Same bit-level decode as drawDump.cpp's DecodeHalf (HDR
+	// draw-dump path); duplicated here rather than shared across translation units for a single
+	// small, self-contained function with no other dependents in this header.
+	const auto half = [](uint32_t bits16) {
+		const uint32_t sign = (bits16 & 0x8000u) << 16u;
+		uint32_t       exp  = (bits16 >> 10u) & 0x1Fu;
+		uint32_t       mant = bits16 & 0x3FFu;
+		uint32_t       out;
+		if (exp == 0) {
+			if (mant == 0) {
+				out = sign;
+			} else {
+				exp = 127u - 15u + 1u;
+				while ((mant & 0x400u) == 0u) {
+					mant <<= 1u;
+					exp--;
+				}
+				mant &= 0x3FFu;
+				out = sign | (exp << 23u) | (mant << 13u);
+			}
+		} else if (exp == 0x1Fu) {
+			out = sign | 0x7F800000u | (mant << 13u);
+		} else {
+			out = sign | ((exp - 15u + 127u) << 23u) | (mant << 13u);
+		}
+		return std::bit_cast<float>(out);
+	};
 	switch (format) {
+		// A 64bpp float target's clear needs both CB_COLORi_CLEAR_WORD dwords: word0 packs
+		// R (low 16) + G (high 16), word1 packs B (low 16) + A (high 16). Without this the clear
+		// is silently discarded (DecodePackedColorClear previously had no case for this format at
+		// all) and the target keeps stale contents -- the mechanism behind session 30's UI
+		// text-stacking defect (astro_playroom_issues.md).
+		case vk::Format::eR16G16B16A16Sfloat:
+			next.float32[0] = half(packed & 0xffffu);
+			next.float32[1] = half((packed >> 16u) & 0xffffu);
+			next.float32[2] = half(packed_hi & 0xffffu);
+			next.float32[3] = half((packed_hi >> 16u) & 0xffffu);
+			break;
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
 		// contents.

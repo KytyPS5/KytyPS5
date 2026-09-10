@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
@@ -130,20 +131,6 @@ uint32_t EmbeddedFetchDstSize(const Decoder::Instruction& inst) {
 	return inst.opcode == Decoder::Opcode::V_MAD_U64_U32 ? 2u : DecodedDstSize(inst);
 }
 
-bool EmbeddedFetchHasBranch(Decoder::Opcode opcode) {
-	switch (opcode) {
-		case Decoder::Opcode::S_SETPC_B64:
-		case Decoder::Opcode::S_BRANCH:
-		case Decoder::Opcode::S_CBRANCH_SCC0:
-		case Decoder::Opcode::S_CBRANCH_SCC1:
-		case Decoder::Opcode::S_CBRANCH_VCCZ:
-		case Decoder::Opcode::S_CBRANCH_VCCNZ:
-		case Decoder::Opcode::S_CBRANCH_EXECZ:
-		case Decoder::Opcode::S_CBRANCH_EXECNZ: return true;
-		default: return false;
-	}
-}
-
 void ClearEmbeddedFetchSgprs(std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
                              const Decoder::Operand& dst, uint32_t size) {
 	if (!IsDecodedSgpr(dst)) {
@@ -242,7 +229,10 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	EmbeddedFetchVectorLanes               vector_lanes;
 	const bool                             track_vector_lanes =
 	    std::none_of(decoded.instructions.begin(), decoded.instructions.end(),
-	                 [](const auto& inst) { return EmbeddedFetchHasBranch(inst.opcode); });
+	                 [](const auto& inst) {
+		                 return Decoder::IsDirectBranch(inst.opcode) ||
+		                        inst.opcode == Decoder::Opcode::S_SETPC_B64;
+	                 });
 
 	if (attrib_reg >= 0 && attrib_reg < static_cast<int>(sgprs.size())) {
 		sgprs[attrib_reg].type = EmbeddedFetchValueType::AttribTable;
@@ -474,8 +464,9 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
                                     std::vector<uint32_t>& joined_code) {
 	EXIT_IF(back.empty());
-	Decoder::Program result;
-	uint32_t         front_words = 0;
+	Decoder::Program  result;
+	uint32_t          front_words = 0;
+	std::vector<bool> branch_targets;
 	while (front_words < front.size()) {
 		auto& inst = result.instructions.emplace_back();
 		Decoder::DecodeInstruction(front, front_words, inst);
@@ -485,14 +476,132 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 			                     inst.src0.reg != 6u);
 			break;
 		}
-		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_ENDPGM);
+		if (Decoder::IsControlFlowBranch(inst.opcode)) {
+			const auto target_index = inst.branch_target / sizeof(uint32_t);
+			if (branch_targets.empty()) {
+				branch_targets.resize(front.size());
+			}
+			if (target_index < branch_targets.size()) {
+				branch_targets[target_index] = true;
+			}
+		}
+		if (inst.opcode == Decoder::Opcode::S_ENDPGM) {
+			// DecodeProgram (ShaderDecoder.cpp) already treats a mid-stream S_ENDPGM that some
+			// earlier instruction branches past as ordinary control flow, not the end of the
+			// program. Apply the same rule here instead of reimplementing a stricter one.
+			const auto jumped_over =
+			    front_words < front.size() && !branch_targets.empty() && branch_targets[front_words];
+			if (!jumped_over) {
+				// Not jumped over: this genuinely is the end of the front (ES) binary's reachable
+				// code, and there is no s_setpc_b64 s[6:7] handoff anywhere in it (reproduced in
+				// ASTRO's Playroom, 2026-09-09: its ES half legitimately ends here, verified
+				// against the RDNA2 ISA manual's S_CODE_END padding convention and the real GS
+				// half's own thread-index-predicated entry -- see the EXIT below and the research
+				// this diagnostic fed). Break out with an ordinary S_ENDPGM terminator; the splice
+				// below treats that the same way it treats a resolved s[6:7] handoff: overwrite the
+				// terminator with a local fallthrough branch into `back`. The genuine merged-ABI
+				// s_setpc_b64 s[6:7] in the other, already-working case has no S_GETPC_B64/S_ADD_U32
+				// idiom preceding it either (confirmed against a real decoded dump) -- it is a bare
+				// indirect branch through a register the PAL-ABI dispatch populates with the GS
+				// binary's real guest address, not something resolvable from this binary's own
+				// bytes. So neither terminator shape ever needed (or now needs) real target
+				// resolution: both are pattern-matched, then locally spliced.
+				break;
+			}
+			static Log::RateLimit limiter {"DecodeFusedProgramSkippedEndpgm", 16};
+			if (limiter.Hit()) {
+				LOGF("DecodeFusedProgram: temporary: front-half S_ENDPGM at word %u is jumped "
+				     "over (branch target), continuing scan for the s_setpc_b64 s[6:7] handoff\n",
+				     front_words - inst.word_count);
+			}
+		}
 	}
-	EXIT_IF(result.instructions.empty() ||
-	        result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64);
+	if (result.instructions.empty() ||
+	    (result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64 &&
+	     result.instructions.back().opcode != Decoder::Opcode::S_ENDPGM)) {
+		// Name what was actually decoded, not just the word count -- a bare "not found" here cost
+		// a guess-driven investigation once already (owner logging rule, 2026-09-09). Show the last
+		// few instructions leading up to the break so the real handoff shape (if any) is visible
+		// instead of re-deriving it from a second run.
+		constexpr size_t kTailInstructions = 12;
+		const auto        tail_start =
+		    result.instructions.size() > kTailInstructions
+		        ? result.instructions.end() - static_cast<ptrdiff_t>(kTailInstructions)
+		        : result.instructions.begin();
+		std::string tail_dump;
+		for (auto it = tail_start; it != result.instructions.end(); ++it) {
+			tail_dump += Decoder::InstructionToString(*it);
+			tail_dump += "\n";
+		}
+		// Diagnostic-only: show the raw words left in `front` past the point the scan gave up, so
+		// the unscanned remainder is visible instead of inferred (owner logging rule, 2026-09-09).
+		// Raw hex, not a decode: DecodeInstruction can itself EXIT (hard abort, not a C++ exception)
+		// on an encoding it doesn't recognize, and this remainder is exactly the kind of data that
+		// triggers that -- a fixed-pattern padding fill, observed in practice as repeated
+		// 0xbf9f0000 words followed by zero words, not real instructions. Decoding it as if it were
+		// code produced a second, less-specific abort instead of the diagnosis below.
+		std::string remainder_hex;
+		for (uint32_t w = front_words; w < front.size() && w < front_words + 64; w++) {
+			remainder_hex += fmt::format("{:08x} ", front[w]);
+			if ((w - front_words) % 8 == 7) {
+				remainder_hex += "\n";
+			}
+		}
+		// Evidence for the open question this diagnostic cannot answer by itself: whether an
+		// ES half that ends in a plain S_ENDPGM (no s_setpc_b64 handoff at all) can still be
+		// spliced into this GS half, or whether the GS half expects real register/LDS state
+		// only a taken handoff would have set up. Decode the back (GS) binary too, capped, and
+		// keep it in this same EXIT string -- per this repo's logging rule, a diagnostic that a
+		// config setting (--printf-direction Silent) can silence independently of the abort
+		// line is not a diagnostic. DecodeInstruction can itself EXIT on an encoding it doesn't
+		// recognize, same as the front-half remainder above, so this is best-effort and capped.
+		constexpr uint32_t kBackInstructionCap = 16;
+		std::string        back_dump;
+		uint32_t           back_words          = 0;
+		uint32_t           back_decoded_count  = 0;
+		bool               back_decode_failed  = false;
+		while (back_words < back.size() && back_decoded_count < kBackInstructionCap) {
+			Decoder::Instruction back_inst {};
+			Decoder::DecodeInstruction(back, back_words, back_inst);
+			back_dump += Decoder::InstructionToString(back_inst);
+			back_dump += "\n";
+			back_words += back_inst.word_count;
+			back_decoded_count++;
+			if (back_inst.opcode == Decoder::Opcode::S_ENDPGM) {
+				break;
+			}
+		}
+		if (back_decoded_count >= kBackInstructionCap && back_words < back.size()) {
+			back_decode_failed = true;
+		}
+		EXIT("DecodeFusedProgram: front half ended without either recognized ES->GS terminator "
+		     "(a s_setpc_b64 s[6:7] handoff, or a plain s_endpgm) after %u words scanned of %zu; "
+		     "the merged-stage handoff register may differ from s[6:7], or genuinely new "
+		     "front-half termination shape was hit. Last %zu decoded instructions:\n%s"
+		     "\nUnscanned remainder (%u..%zu), raw words%s:\n%s"
+		     "\nBack (GS) half entry, first %u decoded instructions of %zu words%s:\n%s",
+		     front_words, front.size(), result.instructions.size() - (tail_start - result.instructions.begin()),
+		     tail_dump.c_str(), front_words, front.size(),
+		     front.size() - front_words > 64 ? " (capped at 64)" : "", remainder_hex.c_str(),
+		     back_decoded_count, back.size(), back_decode_failed ? " (capped, more remain)" : "",
+		     back_dump.c_str());
+	}
 	joined_code.assign(front.begin(), front.begin() + front_words);
 	joined_code.insert(joined_code.end(), back.begin(), back.end());
-	// The merged-stage ABI passes the back shader in s[6:7]. Give that handoff an
-	// ordinary CFG edge, retaining both bodies in one register and LDS lifetime.
+	// Two front-half terminator shapes reach here (reproduced in ASTRO's Playroom, 2026-09-09), and both
+	// splice identically: overwrite the terminator's single word with a local fallthrough branch
+	// into the immediately-following (now-appended) back half, retaining both bodies in one
+	// register and LDS lifetime.
+	//   - s_setpc_b64 s[6:7]: the merged-stage ABI's ES->GS handoff. Confirmed (against a real
+	//     decoded dump of an already-working shader) to be a bare indirect branch through a
+	//     register the PAL-ABI dispatch populates with the GS binary's real guest address at
+	//     dispatch time -- there is no S_GETPC_B64/S_ADD_U32 idiom to resolve here, and the
+	//     original encoded target is never used; only the register identifies the handoff.
+	//   - s_endpgm: the ES half simply ends without ever branching (Astro's Playroom). The GS
+	//     half's own entry code does its own thread-index predication (S_BFE_U32 unpacking a
+	//     merged-wave-info field, V_MBCNT_LO/HI_U32_B32 computing the lane's wave-global thread
+	//     index) rather than expecting anything the branch form would have set up -- confirmed
+	//     against a real decoded dump of this exact shader's GS half.
 	joined_code[front_words - 1u] = 0xbf820000u; // s_branch to the following instruction
 	result.instructions.back()    = {};
 	Decoder::DecodeInstruction(joined_code, front_words - 1u, result.instructions.back());

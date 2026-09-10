@@ -512,10 +512,46 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			} else if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 			}
-			if (state.stage == ShaderType::Pixel && state.input_info.pixel->ps_no_perspective &&
-			    !flat && !input.per_vertex) {
-				state.builder.AddAnnotation(
-				    {OpDecorate, input.variable_id, DecorationNoPerspective});
+			// Per-attribute barycentric mode, recorded from this attribute's actual
+			// V_INTERP_P2_F32 VSRC operand during translation (Attribute.cpp,
+			// ShaderInfo::ps_param_interp_mode) -- falls back to the old single shader-wide
+			// ps_no_perspective flag (NoPerspective-only, never Centroid/Sample) when this
+			// attribute's interpolation was never observed through that path (e.g. read some
+			// other way). PsBarycentricMode order: PerspSample, PerspCenter, PerspCentroid,
+			// LinearSample, LinearCenter, LinearCentroid (shader.h).
+			if (state.stage == ShaderType::Pixel && !flat && !input.per_vertex) {
+				const auto mode = input.location < 32u
+				                      ? state.program.info.ps_param_interp_mode[input.location]
+				                      : UINT8_MAX;
+				if (mode != UINT8_MAX) {
+					const auto is_linear = mode >= 3u;
+					const auto is_sample = mode == 0u || mode == 3u;
+					const auto is_centroid = mode == 2u || mode == 5u;
+					if (is_linear) {
+						state.builder.AddAnnotation(
+						    {OpDecorate, input.variable_id, DecorationNoPerspective});
+					}
+					if (is_sample) {
+						// Requires VkPhysicalDeviceFeatures::sampleRateShading enabled at
+						// device-creation time to be valid at pipeline-creation, which this
+						// project does not yet request (grepped: no sampleRateShading site
+						// exists anywhere in host_gpu/). Not observed in any ASTRO's Playroom
+						// shader (PERSP_SAMPLE/LINEAR_SAMPLE never appear in this title's
+						// ps_input_ena), so left implemented-but-unexercised rather than
+						// removed; if a future title hits this and the pipeline fails to
+						// create, enable that device feature in GraphicContext's device
+						// creation alongside this capability requirement.
+						state.builder.AddAnnotation(
+						    {OpDecorate, input.variable_id, DecorationSample});
+						state.builder.RequireCapability(CapabilitySampleRateShading);
+					} else if (is_centroid) {
+						state.builder.AddAnnotation(
+						    {OpDecorate, input.variable_id, DecorationCentroid});
+					}
+				} else if (state.input_info.pixel->ps_no_perspective) {
+					state.builder.AddAnnotation(
+					    {OpDecorate, input.variable_id, DecorationNoPerspective});
+				}
 			}
 			const auto location = PixelParameterLocation(state, input.location);
 			state.builder.AddAnnotation(

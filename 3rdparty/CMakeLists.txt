@@ -31,6 +31,44 @@ FetchContent_MakeAvailable(xbyak zydis)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
 
+if(LINUX)
+	# Without the audio, Wayland, X11, udev and dbus development packages, SDL2
+	# quietly configures itself without those backends and the build still
+	# succeeds - the resulting binary just has no sound, no native Wayland
+	# video, and no gamepad hotplug. Read back what SDL2 actually detected
+	# (SDL_config.h.intermediate is written by configure_file() above, before
+	# the generator-expression step that produces the final per-config header,
+	# so it is available here at configure time) and fail loudly instead of
+	# shipping a silently degraded build.
+	set(kyty_sdl_config_intermediate "${CMAKE_CURRENT_BINARY_DIR}/SDL2/SDL_config.h.intermediate")
+	if(NOT EXISTS "${kyty_sdl_config_intermediate}")
+		message(FATAL_ERROR "SDL2 did not generate SDL_config.h.intermediate at the expected "
+		                     "path (${kyty_sdl_config_intermediate}); SDL2's build layout changed")
+	endif()
+	file(READ "${kyty_sdl_config_intermediate}" kyty_sdl_config)
+	set(kyty_sdl_required_backends
+		SDL_AUDIO_DRIVER_ALSA
+		SDL_AUDIO_DRIVER_PULSEAUDIO
+		SDL_VIDEO_DRIVER_WAYLAND
+		SDL_VIDEO_DRIVER_X11
+		SDL_UDEV_DYNAMIC
+		HAVE_DBUS_DBUS_H
+	)
+	set(kyty_sdl_missing_backends "")
+	foreach(kyty_backend ${kyty_sdl_required_backends})
+		if(NOT kyty_sdl_config MATCHES "#define ${kyty_backend}")
+			list(APPEND kyty_sdl_missing_backends "${kyty_backend}")
+		endif()
+	endforeach()
+	if(kyty_sdl_missing_backends)
+		message(FATAL_ERROR
+			"SDL2 configured without: ${kyty_sdl_missing_backends}. Install the missing "
+			"development packages (libasound2-dev libpulse-dev libwayland-dev "
+			"wayland-protocols libx11-dev libudev-dev libdbus-1-dev) and reconfigure from "
+			"a clean build directory - SDL2's checks do not re-run against a cached failure.")
+	endif()
+endif()
+
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)
 target_include_directories(Vulkan-Headers INTERFACE

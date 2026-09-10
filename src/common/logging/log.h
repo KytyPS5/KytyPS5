@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <fmt/color.h>
 #include <fmt/printf.h>
+#include <optional>
 #include <string_view>
 
 namespace Log {
@@ -59,6 +60,44 @@ bool ShouldWrite(Site& site);
 // One block naming the sites that were rate limited and how often each fired.
 // This is the part that keeps the log honest: nothing disappears silently.
 void WriteRateLimitSummary();
+
+// Named, hard-capped rate limiting for detailed multi-line diagnostic call sites (register
+// dumps, buffer contents, per-draw state) where the sampling ShouldWrite()/Site above provides
+// is not what is wanted: that mechanism keeps a thin sample forever, which is right for a line
+// that fires millions of times. These call sites are different - each occurrence is many lines
+// of real diagnostic content, so past some count the right answer is to stop outright, not
+// sample down.
+//
+// Before this, every one of these caps (~60 of them) was a bare
+//   static std::atomic<uint32_t> some_log_count = 0;
+//   if (some_log_count.fetch_add(1) < N) { LOGF(...); }
+// Once the cap was reached, the line simply stopped appearing: nothing said so at the time and
+// nothing counted it at the end, because a capped-out call never reached a LOGF at all. That is
+// exactly what let a defect investigation (ASTRO's Playroom, 2026-09-09) run for a full session
+// against a log file that had gone silent for the one frame that mattered, with no indication
+// why - the per-call-site mechanism above existed for the *sampling* problem but did nothing for
+// these hard caps, which this fixes uniformly instead of case by case.
+//
+// One instance per call site (typically `static Log::RateLimit limiter{"Name", cap};`):
+//   static Log::RateLimit limiter{"DrawTargetState", 192};
+//   if (const auto hit = limiter.Hit()) {
+//       LOGF("DrawTargetState[%llu]: ...\n", *hit, ...);
+//   }
+struct RateLimit {
+	RateLimit(const char* name_, uint64_t cap_) : name(name_), cap(cap_) {}
+
+	// Returns the 0-based occurrence index when this occurrence is still under the cap (the
+	// caller should log it now); std::nullopt once the cap has been reached. The occurrence
+	// that crosses the cap is itself returned (it is the last one logged), and triggers one
+	// follow-up "capped, N further suppressed" line - the caller does not special-case it.
+	std::optional<uint64_t> Hit();
+
+	const char*           name;
+	uint64_t              cap;
+	std::atomic<uint64_t> count      = 0;
+	std::atomic<bool>     registered = false;
+};
+
 void      Write(std::string_view text);
 void      Write(fmt::text_style style, std::string_view text);
 void      WriteFatal(std::string_view text);

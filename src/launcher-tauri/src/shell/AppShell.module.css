@@ -1,0 +1,129 @@
+.shell {
+  position: relative;
+  display: flex;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--void);
+  transform: scale(1);
+  opacity: 1;
+  transition: transform var(--t-rest) var(--ease-exit), opacity var(--t-rest) var(--ease-exit);
+}
+/* Rest mode (src/overlays/RestMode.tsx): the home scene recedes rather than
+   an overlay simply painting over it -- 01-motion-system.md's rest sequence
+   ("home darkens", "content disappears/recedes"). Deliberately the app's
+   slowest transition (--t-rest, 900ms) -- this should read as a state
+   change, not a menu closing. */
+.shell[data-dimmed="true"] {
+  transform: scale(0.98);
+  opacity: 0;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Enter-only view transition (AppShell.tsx's entrance state). Reference
+   doesn't animate view exits, only overlay exits, so there is no
+   "entering"/"exiting" pair for the outgoing view -- it just unmounts. */
+.viewSlot {
+  position: relative;
+  z-index: var(--z-content);
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity var(--t-panel) var(--ease-enter), transform var(--t-panel) var(--ease-enter);
+}
+.viewSlot[data-entrance="visible"] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ---- resize grips --------------------------------------------------------
+   Invisible hit targets calling startResizeDragging(). Required once
+   decorations:false removes the WM's own resize border -- WebKitGTK covers
+   whatever few px tao would otherwise reserve. Inert (never receive a real
+   drag) while decorations is still true; harmless to ship ahead of the flip. */
+.grip {
+  position: absolute;
+  z-index: 100;
+}
+.gripN {
+  composes: grip;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  height: 4px;
+  cursor: n-resize;
+}
+.gripS {
+  composes: grip;
+  bottom: 0;
+  left: 8px;
+  right: 8px;
+  height: 4px;
+  cursor: s-resize;
+}
+.gripE {
+  composes: grip;
+  top: 8px;
+  bottom: 8px;
+  right: 0;
+  width: 4px;
+  cursor: e-resize;
+}
+.gripW {
+  composes: grip;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 4px;
+  cursor: w-resize;
+}
+.gripNE {
+  composes: grip;
+  top: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  cursor: ne-resize;
+}
+.gripNW {
+  composes: grip;
+  top: 0;
+  left: 0;
+  width: 10px;
+  height: 10px;
+  cursor: nw-resize;
+}
+.gripSE {
+  composes: grip;
+  bottom: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  cursor: se-resize;
+}
+.gripSW {
+  composes: grip;
+  bottom: 0;
+  left: 0;
+  width: 10px;
+  height: 10px;
+  cursor: sw-resize;
+}

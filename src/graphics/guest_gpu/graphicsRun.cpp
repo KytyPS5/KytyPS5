@@ -737,8 +737,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
-			static std::atomic<uint32_t> skip_log_count {0};
-			if (skip_log_count.fetch_add(1) < 2048) {
+			static Log::RateLimit limiter {"PredicatedSkip", 2048};
+			if (limiter.Hit()) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
 				     ", packet=0x%016" PRIx64 ", cmd_id=0x%08" PRIx32 "\n",
 				     opcode, KYTY_PM4_R(packet_header), packet_dw,
@@ -746,8 +746,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			}
 			if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM &&
 			    packet_dw >= 7) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 128) {
+				static Log::RateLimit limiter {"PredicatedSkipReleaseMem", 128};
+				if (limiter.Hit()) {
 					const auto dst = packet[3] | (static_cast<uint64_t>(packet[4]) << 32u);
 					const auto val = packet[5] | (static_cast<uint64_t>(packet[6]) << 32u);
 					LOGF("\t predicated skip: R_RELEASE_MEM dst=0x%016" PRIx64
@@ -835,6 +835,19 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: {
 			m_predicate_skip = false;
 		} break;
+		case 0x01: {
+			// Z-pass (occlusion) predication: skip the following draws when a preceding
+			// occlusion query counted zero samples. Host occlusion queries are not implemented,
+			// so results are reported as always-visible -- never predicate the draw away.
+			// (graphics tutorial 10-agc_occlusion_queries reaches here.)
+			m_predicate_skip = false;
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 8) {
+				LOGF("\t z-pass predication treated as always-visible (addr=0x%016" PRIx64
+				     ", condition=%" PRIu32 ")\n",
+				     reinterpret_cast<uint64_t>(address), condition);
+			}
+		} break;
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 
@@ -845,8 +858,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				case 0x01: m_predicate_skip = (value == 0); break;
 				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
 			}
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 128) {
+			static Log::RateLimit limiter {"BoolPredication", 128};
+			if (limiter.Hit()) {
 				LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
 				     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
 				     reinterpret_cast<uint64_t>(address), value, condition,
@@ -898,8 +911,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		std::memcpy(&args, args_addr, sizeof(args));
 		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
 		    args.start_instance_location != 0u) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
+			static Log::RateLimit limiter {"PartialDrawIndirectArgs", 64};
+			if (limiter.Hit()) {
 				LOGF("\t warning: partial DrawIndirect args: vertex_count=%" PRIu32
 				     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
 				     ", start_instance=%" PRIu32 "\n",
@@ -919,8 +932,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	DrawIndexedIndirectArgs args {};
 	std::memcpy(&args, args_addr, sizeof(args));
 	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
+		static Log::RateLimit limiter {"PartialDrawIndexIndirectArgs", 64};
+		if (limiter.Hit()) {
 			LOGF("\t warning: partial DrawIndexIndirect args: index_count=%" PRIu32
 			     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
 			     ", start_instance=%" PRIu32 "\n",
@@ -944,8 +957,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	    (m_index_buffer_size != 0 ? std::min(args.index_count_per_instance, m_index_buffer_size)
 	                              : args.index_count_per_instance);
 	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+		static Log::RateLimit limiter {"DrawIndexIndirectClamped", 64};
+		if (limiter.Hit()) {
 			LOGF("\t DrawIndexIndirect: clamped index_count from %" PRIu32 " to %" PRIu32
 			     " using INDEX_BUFFER_SIZE\n",
 			     args.index_count_per_instance, index_count);
@@ -991,8 +1004,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			if (args->instance_count != 1u || args->start_vertex_location != 0u ||
 			    args->start_instance_location != 0u) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 64) {
+				static Log::RateLimit limiter {"PartialDrawIndirectMultiArgs", 64};
+				if (limiter.Hit()) {
 					LOGF("\t warning: partial DrawIndirectMulti args[%u]: vertex_count=%" PRIu32
 					     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
 					     ", start_instance=%" PRIu32 "\n",
@@ -1011,8 +1024,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
 		if (args->base_vertex_location != 0u || args->start_instance_location != 0u) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
+			static Log::RateLimit limiter {"PartialDrawIndexIndirectMultiArgs", 64};
+			if (limiter.Hit()) {
 				LOGF("\t warning: partial DrawIndexIndirectMulti args[%u]: index_count=%" PRIu32
 				     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
 				     ", start_instance=%" PRIu32 "\n",
@@ -1038,8 +1051,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
 		         : args->index_count_per_instance);
 		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			static Log::RateLimit limiter {"DrawIndexIndirectMultiClamped", 64};
+			if (limiter.Hit()) {
 				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
 				     " using INDEX_BUFFER_SIZE\n",
 				     args->index_count_per_instance, index_count);
@@ -1069,8 +1082,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		CheckBuffer();
 		frame_num = m_renderer.GetGpu().GetFrameNum();
 		if (GraphicsRunDebugDumpEnabled()) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
+			static Log::RateLimit limiter {"QueuePointDispatchDirect", 1024};
+			if (limiter.Hit()) {
 				const auto& cs = m_sh_ctx.GetCs().cs_regs;
 				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
 				LOGF("QueuePoint DispatchDirect: frame=%u submit=%" PRIu64
@@ -1301,7 +1314,16 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 							case 0x2d:
 							case 0x2f:
 							case 0x30:
-								if (event_index == 0x00 && !with_interrupt) {
+								// No `with_interrupt` restriction here, matching the
+								// 0x04/0x14/0x28 cases just above: write64's own branch on
+								// with_interrupt (captured from the enclosing scope) already
+								// picks the interrupt-aware Sync call when needed, so gating
+								// this case on `!with_interrupt` only rejected a combination
+								// the dispatch already supports. Confirmed real crash, not a
+								// guess: Astro's Playroom hits exactly this combination
+								// (eop_event_type=0x2f, cache_action=0x00, event_index=0x00,
+								// with_interrupt=true) during boot.
+								if (event_index == 0x00) {
 									write64(false);
 									return;
 								}
@@ -1389,7 +1411,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: break;
 	}
 
-	EXIT("unknown event type\n");
+	EXIT("WriteAtEndOfPipe%u: unmatched combination cache_policy=0x%08x "
+	    "event_write_dest=0x%08x eop_event_type=0x%08x cache_action=0x%08x "
+	    "event_index=0x%08x event_write_source=0x%08x interrupt_selector=0x%08x "
+	    "with_interrupt=%d\n",
+	    static_cast<unsigned>(sizeof(T) * 8u), cache_policy, event_write_dest, eop_event_type,
+	    cache_action, event_index, event_write_source, interrupt_selector,
+	    static_cast<int>(with_interrupt));
 }
 
 void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,

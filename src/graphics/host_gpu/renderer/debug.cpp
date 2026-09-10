@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <algorithm>
@@ -89,8 +90,46 @@ void uc_check(const HW::UserConfig& uc) {
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr3 != false);
 }
 
-void sh_print(const char* func, const HW::Shader& /*uc*/) {
+void sh_print(const char* func, const HW::Shader& uc, const HW::Context& context) {
 	LOGF("%s\n", func);
+
+	// Previously a stub: RSRC1/RSRC2 were consumed only by EXIT_NOT_IMPLEMENTED assertions
+	// (shader.cpp), never printed, so a per-draw view of the guest's own PS/VS register state
+	// did not exist anywhere. Every value below is labeled so it can't be misread the way
+	// "unknown sh reg at 0x...: 0x..." style dumps have cost time before.
+	const auto ps_in_control = context.GetShaderRegisters().ps_in_control;
+	const bool ps_w32_en     = ((ps_in_control >> Pm4::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT) &
+                            Pm4::SPI_PS_IN_CONTROL_PS_W32_EN_MASK) != 0;
+
+	const auto& ps       = uc.GetPs().ps_regs;
+	const auto& ps_rsrc1 = ps.rsrc1;
+	const auto& ps_rsrc2 = ps.rsrc2;
+	LOGF("\t PS: data_addr=0x%016" PRIx64 " ps_in_control=0x%08" PRIx32 " ps_w32_en=%s"
+	     " (wave_size=%u)\n"
+	     "\t     rsrc1: vgprs=%u priority=%u float_mode=0x%02x dx10_clamp=%s debug_mode=%s"
+	     " ieee_mode=%s cu_group_disable=%s fwd_progress=%s fp16_overflow=%s\n"
+	     "\t     rsrc2: scratch_en=%s user_sgpr=%u wave_cnt_en=%s extra_lds_size=%u"
+	     " raster_ordered_shading=%u shared_vgprs=%u\n",
+	     ps.data_addr, ps_in_control, ps_w32_en ? "true" : "false", ps_w32_en ? 32u : 64u,
+	     static_cast<uint32_t>(ps_rsrc1.vgprs), static_cast<uint32_t>(ps_rsrc1.priority),
+	     static_cast<uint32_t>(ps_rsrc1.float_mode), ps_rsrc1.dx10_clamp ? "true" : "false",
+	     ps_rsrc1.debug_mode ? "true" : "false", ps_rsrc1.ieee_mode ? "true" : "false",
+	     ps_rsrc1.cu_group_disable ? "true" : "false",
+	     ps_rsrc1.require_forward_progress ? "true" : "false",
+	     ps_rsrc1.fp16_overflow ? "true" : "false", ps_rsrc2.scratch_en ? "true" : "false",
+	     static_cast<uint32_t>(ps_rsrc2.user_sgpr), ps_rsrc2.wave_cnt_en ? "true" : "false",
+	     static_cast<uint32_t>(ps_rsrc2.extra_lds_size),
+	     static_cast<uint32_t>(ps_rsrc2.raster_ordered_shading),
+	     static_cast<uint32_t>(ps_rsrc2.shared_vgprs));
+
+	const auto shader_stages = context.GetShaderStages();
+	const bool vs_w32_en     = ((shader_stages >> Pm4::VGT_SHADER_STAGES_EN_VS_W32_EN_SHIFT) &
+                            Pm4::VGT_SHADER_STAGES_EN_VS_W32_EN_MASK) != 0;
+	const auto& vs = uc.GetVs();
+	LOGF("\t VS: es_data_addr=0x%016" PRIx64 " gs_data_addr=0x%016" PRIx64
+	     " shader_stages=0x%08" PRIx32 " vs_w32_en=%s (wave_size=%u)\n",
+	     vs.es_regs.data_addr, vs.gs_regs.data_addr, shader_stages, vs_w32_en ? "true" : "false",
+	     vs_w32_en ? 32u : 64u);
 }
 
 std::vector<std::string> rt_print(const char* func, const HW::RenderTarget& rt) {
@@ -625,8 +664,8 @@ static void EqaaCheck(const HW::EqaaControl& c, const HW::AaConfig& cf) {
 	if (c.max_anchor_samples != 0 || c.ps_iter_samples != 0 || c.mask_export_num_samples != 0 ||
 	    c.alpha_to_mask_num_samples != 0 || c.high_quality_intersections ||
 	    c.incoherent_eqaa_reads || c.interpolate_comp_z || c.static_anchor_associations) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
+		static Log::RateLimit limiter {"UnsupportedEqaaControls", 16};
+		if (limiter.Hit()) {
 			LOGF("\t warning: unsupported PS5 EQAA controls use native Vulkan MSAA defaults\n");
 		}
 	}
@@ -655,8 +694,8 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 
 	if (non_default_locations || cf.msaa_num_samples != 0 || cf.aa_mask_centroid_dtmn ||
 	    cf.max_sample_dist != 0 || cf.msaa_exposed_samples != 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
+		static Log::RateLimit limiter {"UnsupportedSampleLocations", 16};
+		if (limiter.Hit()) {
 			LOGF("\t warning: unsupported PS5 sample locations use native Vulkan locations: "
 			     "samples=%" PRIu8 ", exposed=%" PRIu8 ", max_dist=%" PRIu8 "\n",
 			     cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
@@ -666,8 +705,8 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 
 void LogDrawPhase(const char* draw_name, const char* phase) {
 	if (graphics_debug_dump_enabled()) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
+		static Log::RateLimit limiter {"DrawPhase", 1024};
+		if (limiter.Hit()) {
 			LOGF("DrawPhase: %s %s\n", draw_name, phase);
 		}
 	}
@@ -749,8 +788,8 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 
 	if (smc.msaa_enable) {
 
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
+		static Log::RateLimit limiter {"UnsupportedMsaaRasterControls", 16};
+		if (limiter.Hit()) {
 			LOGF("\t warning: unsupported PS5 MSAA raster controls use native Vulkan defaults\n");
 		}
 	}
@@ -764,8 +803,8 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zscale != 0.500000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zoffset != 0.500000);
 	if (vp.transform_control != 1087) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+		static Log::RateLimit limiter {"NonDefaultViewportTransformControl", 16};
+		if (limiter.Hit()) {
 			LOGF("\t warning: non-default viewport transform control = 0x%08" PRIx32
 			     ", applying enabled scale/offset bits\n",
 			     vp.transform_control);
@@ -777,8 +816,8 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_vert_clip - 59.629623f) > 0.001f);
 
 	if (vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
+		static Log::RateLimit limiter {"UnsupportedGuardBandDiscard", 16};
+		if (limiter.Hit()) {
 			LOGF("\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
 			     vp.guard_band_horz_discard, vp.guard_band_vert_discard);
 		}
@@ -889,8 +928,8 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 				           vp.clip_rect_bottom[i]}, vp.clip_rect_window_offset_enable[i]);
 			}
 		} else {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			static Log::RateLimit limiter {"UnsupportedClipRectRule", 32};
+			if (limiter.Hit()) {
 				LOGF("unsupported clip-rect rule 0x%04" PRIx16 ", leaving scissor unchanged\n",
 				     vp.clip_rect_rule);
 			}
@@ -921,8 +960,8 @@ void hw_check(const CommandBuffer& buffer) {
 
 	auto log_phase = [](const char* phase) {
 		if (graphics_debug_dump_enabled()) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+			static Log::RateLimit limiter {"HwCheckPhase", 512};
+			if (limiter.Hit()) {
 				LOGF("HwCheckPhase: %s\n", phase);
 			}
 		}
@@ -961,8 +1000,8 @@ void hw_check(const CommandBuffer& buffer) {
 	}
 	if (rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&
 	    hw.GetDepthClearValue() != 1.0f) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
+		static Log::RateLimit limiter {"NonDefaultDepthClearValue", 16};
+		if (limiter.Hit()) {
 			LOGF("\t temporary: accepting non-default depth clear value %f\n",
 			     hw.GetDepthClearValue());
 		}

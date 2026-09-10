@@ -9,8 +9,10 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
-	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit)
-	    : program(program), ir(block), current_vector_limit(vector_limit) {}
+	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
+	          const ShaderPixelInputInfo* pixel_input = nullptr)
+	    : program(program), ir(block), current_vector_limit(vector_limit), pixel_input(pixel_input) {
+	}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -212,6 +214,7 @@ private:
 	bool    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	bool    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
+	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
 	                bool negate_source, bool write_64);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
@@ -233,6 +236,7 @@ private:
 	void ScalarSelect64(const Decoder::Instruction& inst, const Decoder::Operand& false_source);
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);
+	void S_WQM_B32(const Decoder::Instruction& inst);
 	void S_WQM_B64(const Decoder::Instruction& inst);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
@@ -252,9 +256,15 @@ private:
 
 	IR::Program&    program;
 	IR::IREmitter   ir;
+	IR::U1          instruction_branch_condition;
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
+	// Non-null only for Pixel-stage translation. Lets V_INTERP_P2_F32 (Attribute.cpp) reverse-
+	// map its VSRC operand (the actual barycentric-weight VGPR) back to a PsBarycentricMode, so
+	// each interpolated attribute's real Centroid/Sample/NoPerspective qualifier can be recorded
+	// per-parameter-index instead of relying on the single shader-wide ps_no_perspective flag.
+	const ShaderPixelInputInfo* pixel_input = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

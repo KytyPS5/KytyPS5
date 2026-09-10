@@ -138,17 +138,55 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
+		// Diagnostic for the ASTRO's Playroom wedge/logo-clipping investigation (workflow/
+		// astro_playroom_issues.md): this pattern-matches the guest's "clear the stencil
+		// plane via a compute dispatch" idiom into a native vkCmdClearDepthStencilImage,
+		// which is what keeps that clear off the storage-image-write path a known NVIDIA
+		// driver bug (shadPS4 #4582) silently drops writes on for a stencil-only aspect
+		// view. A near-miss here falls through to the generic compute dispatch, which does
+		// NOT get logged by the large-workgroup/has-sampler check below (a stencil clear is
+		// neither), so it can execute completely unlogged otherwise -- log which guard
+		// failed and the actual values, rate-limited, so a mismatch is visible instead of
+		// guessed at.
+		static Log::RateLimit limiter {"ComputeImageClearNearMiss", 64};
+		const auto log_near_miss = [&](const char* site, auto&&... args) {
+			if (limiter.Hit()) {
+				LOGF_COLOR(Log::Color::Yellow,
+				           "TryConsumeComputeImageClear: rejected at %s shader=0x%016" PRIx64 "\n",
+				           site, program.shader_hash);
+				LOGF(std::forward<decltype(args)>(args)...);
+			}
+		};
 		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||
-		    input.threads_num[2] != 1)
+		    input.threads_num[2] != 1) {
+			log_near_miss("dispatch-shape",
+			              "\t mode=0x%08" PRIx32 " (want 0x41) dispatch_thread_dimensions=%u "
+			              "fill_value=%u (want <=255) threads_num_z=%u (want 1)\n",
+			              mode, input.dispatch_thread_dimensions, fill.value,
+			              input.threads_num[2]);
 			return false;
+		}
 		const auto  descriptor = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[0]);
 		const auto& resource   = program.info.images[0];
 		if (descriptor.IsNull() || descriptor.Format() != Prospero::BufferFormat::k8UInt ||
 		    descriptor.Type() != Prospero::ImageType::kColor2DArray || descriptor.MetaCompress() ||
 		    descriptor.WriteCompress() || descriptor.BaseLevel() > descriptor.LastLevel() ||
 		    descriptor.BaseLevel() > descriptor.MaxMip() ||
-		    descriptor.BaseArray5() > descriptor.Depth() || descriptor.DstSelX() != 4)
+		    descriptor.BaseArray5() > descriptor.Depth() || descriptor.DstSelX() != 4) {
+			log_near_miss(
+			    "descriptor",
+			    "\t is_null=%u format=%u (want k8UInt=%u) type=%u (want kColor2DArray=%u) "
+			    "meta_compress=%u write_compress=%u base_level=%u last_level=%u max_mip=%u "
+			    "base_array=%u depth=%u dst_sel_x=%u (want 4)\n",
+			    descriptor.IsNull(), static_cast<uint32_t>(descriptor.Format()),
+			    static_cast<uint32_t>(Prospero::BufferFormat::k8UInt),
+			    static_cast<uint32_t>(descriptor.Type()),
+			    static_cast<uint32_t>(Prospero::ImageType::kColor2DArray), descriptor.MetaCompress(),
+			    descriptor.WriteCompress(), descriptor.BaseLevel(), descriptor.LastLevel(),
+			    descriptor.MaxMip(), descriptor.BaseArray5(), descriptor.Depth(),
+			    descriptor.DstSelX());
 			return false;
+		}
 		const std::array extents {
 		    std::max(1u, (descriptor.Width5() + 1u) >> descriptor.BaseLevel()),
 		    std::max(1u, (descriptor.Height5() + 1u) >> descriptor.BaseLevel()),
@@ -160,11 +198,25 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			// final workgroup may extend beyond the selected image view.
 			if (threads == 0 || threads != fill.group_stride[axis] ||
 			    groups[axis] != (extents[axis] + threads - 1) / threads ||
-			    groups[axis] * threads > UINT32_MAX) return false;
+			    groups[axis] * threads > UINT32_MAX) {
+				log_near_miss("dispatch-groups",
+				              "\t axis=%u threads=%" PRIu64 " group_stride=%u group=%u "
+				              "extent=%u expected_group=%" PRIu64 "\n",
+				              axis, threads, fill.group_stride[axis], groups[axis], extents[axis],
+				              threads == 0 ? 0
+				                           : (static_cast<uint64_t>(extents[axis]) + threads - 1) /
+				                                 threads);
+				return false;
+			}
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
-		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
+		if (!FillSourcesDisjoint(resources.buffers, destination)) {
+			log_near_miss("fill-source-overlap",
+			              "\t destination_addr=0x%016" PRIx64 " destination_size=0x%" PRIx64 "\n",
+			              destination.address, destination.size);
+			return false;
+		}
 		std::scoped_lock lock {cache.m_lock};
 		const auto&      image = cache.GetImage(binding.image_id);
 		const auto&      view  = binding.desc.view_info;
@@ -173,7 +225,19 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
 		    view.layer_count > image.backing.layers - view.base_layer ||
 		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
-		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
+		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) {
+			log_near_miss(
+			    "target-image",
+			    "\t format=%s (want eD32SfloatS8Uint) samples=%u stencil_matches=%u "
+			    "view_base_level=%u mip_levels=%u view_base_layer=%u layers=%u "
+			    "view_layer_count=%u extents_z=%u image_extent=%ux%u wanted_extent=%ux%u\n",
+			    vk::to_string(image.backing.format).c_str(), image.info.samples,
+			    image.info.stencil == destination, view.base_level, image.backing.mip_levels,
+			    view.base_layer, image.backing.layers, view.layer_count, extents[2],
+			    std::max(1u, image.info.extent.width >> view.base_level),
+			    std::max(1u, image.info.extent.height >> view.base_level), extents[0], extents[1]);
+			return false;
+		}
 		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
 		                                       1, view.base_layer, view.layer_count};
 		vk::ClearValue clear {};
@@ -191,16 +255,16 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
 		// Track deferred DCC state while the original dispatch writes the metadata allocation.
 		cache.TrackDccFill(descriptor.Base48(), size, packed_clear);
-		static std::atomic<uint32_t> logged_metadata_clears {0};
-		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"DispatchDirectMetadataFill", 32};
+		if (limiter.Hit()) {
 			LOGF("GraphicsRenderDispatchDirect: metadata fill shader=0x%016" PRIx64
 			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 			     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
 		}
 		return false;
 	}
-	static std::atomic<uint32_t> logged_clears {0};
-	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
+	static Log::RateLimit limiter {"DispatchDirectComputeImageClear", 32};
+	if (limiter.Hit()) {
 		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
 		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
@@ -240,8 +304,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const uint32_t unknown_mode_bits = mode & ~DISPATCH_INITIATOR_KNOWN_MASK;
 	if (unknown_mode_bits != 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"DispatchDirectUnknownInitiatorBits", 32};
+		if (limiter.Hit()) {
 			LOGF("GraphicsRenderDispatchDirect: unknown dispatch initiator bits "
 			     "mode=0x%08" PRIx32 " unknown=0x%08" PRIx32 " shader=0x%016" PRIx64
 			     " groups=%ux%ux%u\n",
@@ -258,6 +322,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program) {
+		// MaterializeResources rejected this dispatch's descriptor set (ProgramCache::Get
+		// already logged the shader hash, stage and reason once) -- skip the dispatch instead
+		// of dereferencing the null input_info.stage.program below.
+		ResetBindings();
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -283,9 +354,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 	    });
 	const bool                   has_sampler = !program.info.samplers.empty();
-	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+	static Log::RateLimit limiter {"DispatchDirect", 512};
+	if ((large_workgroup || has_sampler) && limiter.Hit()) {
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
@@ -350,8 +420,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		thread_group_y       = groups_from_threads(thread_group_y, cs_regs.cs_regs.num_thread_y);
 		thread_group_z       = groups_from_threads(thread_group_z, cs_regs.cs_regs.num_thread_z);
 
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"DispatchDirectUseThreadDimensions", 32};
+		if (limiter.Hit()) {
 			LOGF("GraphicsRenderDispatchDirect: use-thread-dimensions %ux%ux%u / %ux%ux%u -> "
 			     "groups %ux%ux%u\n",
 			     old_x, old_y, old_z, std::max(cs_regs.cs_regs.num_thread_x, 1u),
@@ -362,8 +432,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"DispatchDirectZeroSizedGroups", 32};
+		if (limiter.Hit()) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
 			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
 			     thread_group_x, thread_group_y, thread_group_z, mode,

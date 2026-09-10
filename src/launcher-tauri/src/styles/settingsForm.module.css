@@ -1,0 +1,61 @@
+/* Shared settings-form primitives, extracted from Settings.module.css so
+   GameDetail.tsx's per-game Settings pane can render with the identical
+   heading/row/hint treatment as the global Emulator settings page, rather
+   than a component importing a view's own module directly. Settings.module.css
+   pulls these back in with `composes: ... from "../styles/settingsForm.module.css"`. */
+
+/* Same title style as Library's and GameDetail's own page headers (owner
+   rule, 2026-09-09: "unify title styles") -- Settings.module.css's own
+   .header wrapper adds the bottom margin this used to carry itself, since
+   the heading now sits in an icon+title row rather than standing alone. */
+.heading {
+  composes: title from "./pageHeader.module.css";
+}
+
+.blockHint {
+  margin: 5px 0 4px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+/* No hairline separators (owner rule, 2026-09-09): rows read through
+   vertical rhythm from padding alone. */
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+  padding: 20px 0;
+}
+
+.rowLabel {
+  font-size: 16px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.rowHint {
+  display: block;
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-weight: 400;
+  max-width: 480px;
+}
+
+/* One consistent gap above a follow-up action that sits below a category's
+   rows or list -- replaces each category inventing its own margin-top. */
+.actionRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.subheading {
+  margin: 20px 0 4px;
+  font-size: 14px;
+  font-weight: 400;
+  font-family: var(--font-body);
+  color: var(--text-muted);
+}

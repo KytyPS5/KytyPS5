@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -29,6 +31,94 @@ const char* StageName(ShaderType stage) {
 std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::string& message) {
 	return fmt::format("shader SRT: hash=0x{:016x} stage={} pc=0x{:08x} {}", program.shader_hash,
 	                   StageName(program.stage), pc, message);
+}
+
+// Diagnostic kept from the Astro's Playroom SRT investigation. ResolveInvariantPhi's own
+// divergence log (Program.cpp) fires for every non-invariant Phi anywhere a recursive
+// Validate/Evaluate walk happens to touch across the whole shader -- in a 127-block, 13-loop
+// compute kernel that is thousands of lines of noise, most of it from unrelated soft-fail
+// validation attempts (branch-condition reachability, flat-SRT candidate collection) that never
+// abort anything. This instead dumps the exact expression tree of the one dword that is actually
+// about to fail materialization -- DAG-aware, so a node reached twice prints a short `#id`
+// back-reference instead of re-expanding, which also terminates on a cycle. This is what found
+// the real cause (a per-workgroup-varying tile-light-array address), and is kept as permanent,
+// gated infrastructure for the next shader that fails this way; its one call site guards on
+// Log::IsSilent() first since materialization is retried every dispatch for a shader Phase D
+// lets keep running.
+std::string DumpValueTree(const ResourcePlan& program, Value value,
+                          std::unordered_map<const Inst*, uint32_t>& ids, uint32_t& budget) {
+	value = value.Resolve();
+	if (budget == 0) {
+		return "...(dump budget exhausted)";
+	}
+	budget--;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		if (value.IsImmediate()) {
+			switch (value.GetType()) {
+				case Type::U1: return fmt::format("imm_u1({})", value.U1());
+				case Type::U8: return fmt::format("imm_u8(0x{:02x})", value.U8());
+				case Type::U16: return fmt::format("imm_u16(0x{:04x})", value.U16());
+				case Type::U32: return fmt::format("imm_u32(0x{:08x})", value.U32());
+				case Type::U64: return fmt::format("imm_u64(0x{:016x})", value.U64());
+				default:
+					return fmt::format("imm(type=0x{:x})", static_cast<uint32_t>(value.GetType()));
+			}
+		}
+		return fmt::format("<non-instruction value, type=0x{:x}>",
+		                   static_cast<uint32_t>(value.GetType()));
+	}
+	if (const auto found = ids.find(inst); found != ids.end()) {
+		return fmt::format("#{}", found->second);
+	}
+	const auto id = static_cast<uint32_t>(ids.size());
+	ids.emplace(inst, id);
+	const auto op    = inst->GetOpcode();
+	std::string extra;
+	if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+		const auto index = inst->Flags<MemoryFlags>().index;
+		extra            = fmt::format(" memory_info[{}]", index);
+		if (index < program.memory_info.size()) {
+			const auto& memory = program.memory_info[index];
+			extra += fmt::format("{{resource={} sampler={} offset={} planning_only={}}}",
+			                     memory.resource, memory.sampler, memory.offset,
+			                     memory.planning_only);
+		}
+	} else if (inst->NumArgs() == 0) {
+		extra = fmt::format(" flags=0x{:x}", inst->Flags<uint64_t>());
+	}
+	if (op == ValueOpcode::Phi) {
+		std::string edges;
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			if (index != 0) {
+				edges += ", ";
+			}
+			edges += fmt::format("[block={}]", fmt::ptr(inst->PhiBlock(index)));
+			edges += DumpValueTree(program, inst->Arg(index), ids, budget);
+		}
+		return fmt::format("#{}=Phi{}({})", id, extra, edges);
+	}
+	// ReadConst is an indirection through ResourcePlan::srt_reads, not a value in its own right --
+	// EvaluateInst's own ReadConst case (above) evaluates srt_reads[slot].value instead of
+	// anything reachable from ReadConst's own Arg(0)/Arg(1). Follow that same indirection here,
+	// or the dump shows the meaningless wrapper instead of the tree that actually gets evaluated.
+	if (op == ValueOpcode::ReadConst && inst->NumArgs() == 2) {
+		const auto slot = inst->Arg(1).Resolve();
+		if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+		    slot.U32() < program.srt_reads.size()) {
+			return fmt::format(
+			    "#{}=ReadConst{} slot={} -> {}", id, extra, slot.U32(),
+			    DumpValueTree(program, program.srt_reads[slot.U32()].value, ids, budget));
+		}
+	}
+	std::string args;
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		if (index != 0) {
+			args += ", ";
+		}
+		args += DumpValueTree(program, inst->Arg(index), ids, budget);
+	}
+	return fmt::format("#{}={}{}({})", id, ValueOpcodeName(op), extra, args);
 }
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -73,11 +163,6 @@ bool IsDescriptorHandle(ValueOpcode opcode) {
 		case ValueOpcode::GetSamplerResource: return true;
 		default: return false;
 	}
-}
-
-bool IsRuntimeSelect(ValueOpcode op) {
-	return op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
-	       op == ValueOpcode::SelectF32;
 }
 
 bool IsRuntimeUniformOp(ValueOpcode op) {
@@ -467,7 +552,19 @@ public:
 		return true;
 	}
 
+	// Set once, by whichever failure happened first (deepest in the recursion, since evaluation
+	// is depth-first) -- later, shallower "a sub-evaluation failed" sites never overwrite it, so
+	// this stays the root cause rather than the outermost symptom.
+	const std::string& FailReason() const { return m_fail_reason; }
+
 private:
+	bool Fail(std::string reason) {
+		if (m_fail_reason.empty()) {
+			m_fail_reason = std::move(reason);
+		}
+		return false;
+	}
+
 	static float Float32(uint64_t bits) {
 		return std::bit_cast<float>(static_cast<uint32_t>(bits));
 	}
@@ -484,12 +581,15 @@ private:
 				case Type::U32: result = value.U32(); return true;
 				case Type::U64: result = value.U64(); return true;
 				case Type::F32: result = Float32Bits(value.F32Value()); return true;
-				default: return false;
+				default:
+					return Fail(fmt::format("unsupported immediate type {} in SRT evaluation",
+					                        static_cast<int>(value.GetType())));
 			}
 		}
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
-			return false;
+			return Fail("SRT evaluation reached a value that is neither an immediate nor an "
+			            "instruction");
 		}
 		if (!m_reserved) {
 			m_cache.reserve(m_program.value_storage.size());
@@ -505,7 +605,8 @@ private:
 			return true;
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
-			return false;
+			return Fail(fmt::format("cyclic value dependency evaluating {}",
+			                        ValueOpcodeName(inst->GetOpcode())));
 		}
 		m_visiting.push_back(inst);
 		uint64_t out = 0;
@@ -525,17 +626,227 @@ private:
 
 	bool EvaluatePhi(const Inst& inst, uint64_t& result) {
 		const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
-		return !value.IsEmpty() && EvaluateWide(value, result);
+		if (!value.IsEmpty()) {
+			return EvaluateWide(value, result);
+		}
+		if (Config::ApproximateDivergentPhiEnabled()) {
+			return EvaluateApproximateDivergentPhi(inst, result);
+		}
+		return Fail("Phi is not invariant across control flow (its incoming values differ)");
+	}
+
+	// History: 2026-09-10 tried approximating a non-invariant Phi with its first incoming edge
+	// instead of failing, to let ASTRO's Playroom's compute shaders that fail the invariance
+	// check actually run instead of being skipped. REVERTED after one test: the first
+	// APPROXIMATING hits were immediately followed by a process crash. That crash was later
+	// (session 23) found to be a KytyPS5 memory-safety bug in EvaluateWide's raw-read
+	// path -- an unvalidated `memcpy` from a guest-computed address, now fixed by wiring a
+	// validated `read_memory` reader at the real caller (pipelineCache.cpp) -- not evidence that
+	// approximating this class of value is unsafe in general. Real AMD hardware/compilers face
+	// the identical constraint: MIMG/MUBUF descriptors must be uniform SGPRs, and a divergent
+	// one is forced uniform via `v_readfirstlane_b32` (mesa/src/amd/compiler's
+	// aco_lower_to_hw_instr.cpp -- confirmed present in this session's local reference corpus,
+	// `workflow/ps5_arch_map_amd_open_stack.md`). This is that same mechanism, opt-in
+	// (`--approximate-divergent-phi`, default off -- see emulatorConfig.h's comment on the flag
+	// for the full risk framing) rather than default-on, because unlike ACO's compile-time-
+	// certain case this session has not verified every affected shader's divergent branches are
+	// actually interchangeable resource selections rather than genuine per-invocation math.
+	//
+	// Never fabricates a value: every candidate leaf is evaluated through the SAME runtime path
+	// as normal materialization (not guessed structurally), and the whole approximation is
+	// refused -- falling back to the ordinary hard failure -- if every candidate is
+	// zero/uninitialized-looking or fails to evaluate on its own terms. `m_fail_reason` is
+	// saved/restored around each trial evaluation so a rejected candidate's failure reason never
+	// masks a real, later failure (see FailReason()'s own comment on why it must stay the true
+	// root cause).
+	// Helper to check if two MemoryInfo objects differ only in the 'resource' field (base address).
+	// Used by EvaluateApproximateDivergentPhi's guard to ensure all divergent descriptor candidates
+	// are structurally equivalent except for which descriptor they resolve to.
+	bool AreMemoryInfoEquivalentExceptResource(const MemoryInfo& a, const MemoryInfo& b) {
+		// Compare all fields except 'resource'. The 'resource' field is the descriptor index that
+		// may differ across control flow branches when descriptors are interchangeable (same format,
+		// stride, element count, etc., pointing at different base addresses).
+		return a.kind == b.kind &&
+		       a.sampler == b.sampler &&
+		       a.offset == b.offset &&
+		       a.secondary_offset == b.secondary_offset &&
+		       a.dmask == b.dmask &&
+		       a.data_dwords == b.data_dwords &&
+		       a.data_bits == b.data_bits &&
+		       a.component_index == b.component_index &&
+		       a.component_count == b.component_count &&
+		       a.data_format == b.data_format &&
+		       a.number_format == b.number_format &&
+		       a.image_sample_flags == b.image_sample_flags &&
+		       a.image_dimension == b.image_dimension &&
+		       a.image_address_components == b.image_address_components &&
+		       a.image_nsa_dwords == b.image_nsa_dwords &&
+		       std::equal(std::begin(a.image_nsa_addr), std::end(a.image_nsa_addr),
+		                  std::begin(b.image_nsa_addr)) &&
+		       a.memory_segment == b.memory_segment &&
+		       a.address_is_full == b.address_is_full &&
+		       a.data_signed == b.data_signed &&
+		       a.typed == b.typed &&
+		       a.formatted == b.formatted &&
+		       a.image_has_mip == b.image_has_mip &&
+		       a.image_r128 == b.image_r128 &&
+		       a.glc == b.glc &&
+		       a.slc == b.slc &&
+		       a.idxen == b.idxen &&
+		       a.offen == b.offen &&
+		       a.planning_only == b.planning_only;
+	}
+
+	bool EvaluateApproximateDivergentPhi(const Inst& phi, uint64_t& result) {
+		constexpr size_t                MaxCandidates = 8;
+		std::vector<Value>              leaves;
+		std::vector<Value>              pending {Value(const_cast<Inst*>(&phi))};
+		std::unordered_set<const Inst*> visited_phis;
+		while (!pending.empty() && leaves.size() < MaxCandidates) {
+			const auto current = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = current.TryInstruction();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+				if (!visited_phis.insert(inst).second) {
+					continue;
+				}
+				for (size_t index = 0; index < inst->NumArgs(); index++) {
+					pending.push_back(inst->Arg(index));
+				}
+				continue;
+			}
+			if (std::ranges::find(leaves, current) == leaves.end()) {
+				leaves.push_back(current);
+			}
+		}
+
+		// Guard: reject the approximation unless all candidates are structurally equivalent
+		// except for the base address/resource field (i.e., interchangeable descriptors with
+		// same format/layout but different addresses) and none resolve to immediate zero.
+		if (!leaves.empty()) {
+			// Extract MemoryInfo for each leaf that is a runtime read (GetAddressU32/ReadConstBuffer).
+			std::vector<uint32_t> memory_info_indices;
+			for (const auto& leaf: leaves) {
+				const auto resolved = leaf.Resolve();
+				const auto* inst = resolved.TryInstruction();
+				if (inst == nullptr) {
+					// Non-instruction leaf (immediate value). Reject unless it's immediate zero,
+					// which is caught later. A divergent Phi with both immediate and instruction
+					// candidates is heterogeneous and not a simple "pick the descriptor" scenario.
+					if (!resolved.IsImmediate() || resolved.GetType() != Type::U32 || resolved.U32() != 0) {
+						static Log::RateLimit limiter {"GuardedDivergentPhiRejectedHeterogeneous", 256};
+						if (const auto hit = limiter.Hit()) {
+							LOGF("shader SRT: hash=0x%016llx divergent Phi guard REJECTED: candidate is "
+							     "non-instruction non-zero immediate [%llu]\n",
+							     static_cast<unsigned long long>(m_program.shader_hash), *hit);
+						}
+						return Fail("Phi is not invariant across control flow, and approximation was "
+						            "refused: heterogeneous candidates (mix of immediates and instructions)");
+					}
+					continue;  // Skip immediate-zero candidates; they'll be caught as rejected_zero later.
+				}
+
+				// Check if this is a runtime memory read (descriptor-based).
+				const auto op = inst->GetOpcode();
+				if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
+					// Not a memory read. Reject the approximation for heterogeneous candidates.
+					static Log::RateLimit limiter {"GuardedDivergentPhiRejectedNonMemory", 256};
+					if (const auto hit = limiter.Hit()) {
+						LOGF("shader SRT: hash=0x%016llx divergent Phi guard REJECTED: candidate is "
+						     "non-memory instruction %s [%llu]\n",
+						     static_cast<unsigned long long>(m_program.shader_hash),
+						     ValueOpcodeName(op), *hit);
+					}
+					return Fail(fmt::format(
+					    "Phi is not invariant across control flow, and approximation was refused: "
+					    "candidate is {} (not a memory read)",
+					    ValueOpcodeName(op)));
+				}
+
+				const auto index = inst->Flags<MemoryFlags>().index;
+				if (index >= m_program.memory_info.size()) {
+					// Invalid memory info index. Reject.
+					static Log::RateLimit limiter {"GuardedDivergentPhiRejectedInvalidMemory", 256};
+					if (const auto hit = limiter.Hit()) {
+						LOGF("shader SRT: hash=0x%016llx divergent Phi guard REJECTED: memory info "
+						     "index %u out of range (%zu known) [%llu]\n",
+						     static_cast<unsigned long long>(m_program.shader_hash), index,
+						     m_program.memory_info.size(), *hit);
+					}
+					return Fail(fmt::format(
+					    "Phi is not invariant across control flow, and approximation was refused: "
+					    "invalid memory-info index {}",
+					    index));
+				}
+				memory_info_indices.push_back(index);
+			}
+
+			// Verify all MemoryInfo candidates are equivalent except for resource field.
+			if (!memory_info_indices.empty()) {
+				const auto base_index = memory_info_indices[0];
+				for (size_t i = 1; i < memory_info_indices.size(); ++i) {
+					const auto current_index = memory_info_indices[i];
+					if (!AreMemoryInfoEquivalentExceptResource(m_program.memory_info[base_index],
+					                                           m_program.memory_info[current_index])) {
+						// Candidates differ in fields other than resource. Reject.
+						static Log::RateLimit limiter {
+						    "GuardedDivergentPhiRejectedStructuralDifference", 256};
+						if (const auto hit = limiter.Hit()) {
+							LOGF("shader SRT: hash=0x%016llx divergent Phi guard REJECTED: descriptors "
+							     "are not structurally equivalent (memory_info[%u] vs [%u] differ beyond "
+							     "resource field) [%llu]\n",
+							     static_cast<unsigned long long>(m_program.shader_hash), base_index,
+							     current_index, *hit);
+						}
+						return Fail(fmt::format(
+						    "Phi is not invariant across control flow, and approximation was refused: "
+						    "descriptor candidates differ structurally (memory_info[{}] vs [{}])",
+						    base_index, current_index));
+					}
+				}
+			}
+		}
+
+		uint32_t rejected_zero = 0;
+		uint32_t rejected_fail = 0;
+		for (const auto& leaf: leaves) {
+			const auto saved_fail_reason = m_fail_reason;
+			uint64_t   candidate         = 0;
+			const bool evaluated         = EvaluateWide(leaf, candidate);
+			m_fail_reason                = saved_fail_reason;
+			if (!evaluated) {
+				rejected_fail++;
+				continue;
+			}
+			if (candidate == 0) {
+				rejected_zero++;
+				continue;
+			}
+			static Log::RateLimit limiter {"ApproximatedDivergentPhi", 256};
+			if (const auto hit = limiter.Hit()) {
+				LOGF("shader SRT: hash=0x%016llx APPROXIMATING non-invariant Phi: picked first "
+				     "viable candidate of %zu (%u rejected as zero, %u rejected as "
+				     "unevaluable) [%llu]\n",
+				     static_cast<unsigned long long>(m_program.shader_hash), leaves.size(),
+				     rejected_zero, rejected_fail, *hit);
+			}
+			result = candidate;
+			return true;
+		}
+		return Fail(fmt::format("Phi is not invariant across control flow, and no approximation "
+		                        "candidate was viable ({} candidates: {} zero, {} failed to "
+		                        "evaluate)",
+		                        leaves.size(), rejected_zero, rejected_fail));
 	}
 
 	bool EvaluateExtract(const Inst& inst, uint64_t& result) {
 		const auto index = inst.Arg(1).Resolve();
 		if (!index.IsImmediate() || index.GetType() != Type::U32) {
-			return false;
+			return Fail("composite extract index is not an immediate u32");
 		}
 		const auto component = index.U32();
 		if (component >= 2u) {
-			return false;
+			return Fail(fmt::format("composite extract component {} out of range", component));
 		}
 		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
 			uint64_t packed = 0;
@@ -547,7 +858,7 @@ private:
 		}
 		const auto* source = inst.Arg(0).ResolveInstruction();
 		if (source == nullptr) {
-			return false;
+			return Fail("composite extract source is not an instruction");
 		}
 		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 			return EvaluateWide(source->Arg(component), result);
@@ -564,18 +875,20 @@ private:
 			    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
 			return true;
 		}
-		return false;
+		return Fail(fmt::format("composite extract of {} is not supported",
+		                        ValueOpcodeName(source->GetOpcode())));
 	}
 
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
-			return false;
+			return Fail(fmt::format("raw read memory-info index {} out of range ({} known)",
+			                        flags.index, m_program.memory_info.size()));
 		}
 		const auto& mem    = m_program.memory_info[flags.index];
 		const auto* handle = inst.Arg(0).ResolveInstruction();
 		if (handle == nullptr) {
-			return false;
+			return Fail("raw read descriptor handle is not an instruction");
 		}
 		uint64_t low    = 0;
 		uint64_t high   = 0;
@@ -584,16 +897,24 @@ private:
 			return false;
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+		// A V#/T# whose base pointer resolved to null is an unbound (optional) descriptor
+		// slot; on real hardware a read through it returns all-zero rather than faulting.
+		// Resolve it to 0 instead of failing the whole materialisation (which would drop the
+		// dispatch). Correct emulation, not a soft-ladder.
+		if (base == 0) {
+			result = 0;
+			return true;
+		}
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 		uint64_t   address   = 0;
 		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 			uint64_t records = 0;
 			uint64_t word3   = 0;
 			if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-				return false;
+				return Fail("constant buffer descriptor handle has an unexpected shape");
 			}
 			if (immediate < 0) {
-				return false;
+				return Fail(fmt::format("constant buffer read has a negative offset {}", immediate));
 			}
 			const auto byte_offset =
 			    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
@@ -603,22 +924,35 @@ private:
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return false;
+				return Fail(fmt::format(
+				    "constant buffer read at offset {} (aligned {}) is out of bounds (size {})",
+				    byte_offset, aligned, size));
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
 			const auto relative = (immediate & ~int64_t {3}) +
 			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 			if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-				return false;
+				return Fail(fmt::format("scalar address read overflowed: base=0x{:012x} relative={}",
+				                        base, relative));
 			}
 		}
 		uint32_t word = 0;
 		if (m_runtime.read_memory != nullptr) {
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
-				return false;
+				return Fail(fmt::format("read_memory callback rejected address 0x{:012x}", address));
 			}
 		} else {
+			// This recompiler layer has no dependency on src/kernel and cannot validate `address`
+			// itself -- `read_memory` is exactly the seam callers use to supply a checked reader
+			// (see pipelineCache.cpp's `ReadShaderGuestMemoryDirect`, wired to every real
+			// draw/dispatch). A caller that leaves `read_memory` null is asserting `address` is
+			// known-valid host memory (true for several unit tests here that read from a local
+			// buffer at a fixed address); it is NOT true in general for a value the SRT evaluator
+			// computed from guest-controlled descriptor dwords. Session 22 (2026-09-10) hit this
+			// exact gap in production -- `read_memory` was unset, a non-invariant Phi resolved to
+			// a near-null address, and this memcpy segfaulted the whole process. Do not remove the
+			// `read_memory` wiring at a real caller without understanding this comment.
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
@@ -638,7 +972,10 @@ private:
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 				if (reg < m_program.user_data_base ||
 				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
-					return false;
+					return Fail(fmt::format(
+					    "user data register {} is outside the runtime's {} provided registers "
+					    "(base {})",
+					    reg, m_runtime.user_data.size(), m_program.user_data_base));
 				}
 				result = m_runtime.user_data[reg - m_program.user_data_base];
 				return true;
@@ -654,18 +991,40 @@ private:
 			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 			case ValueOpcode::CompositeExtractU64:
 			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+			// CompositeConstructU32x2 has no dedicated case here below this comment; it and
+			// CompositeConstructU64 pack two dwords into one wide value identically, so a
+			// shader that feeds a x2-composite straight into e.g. a Phi or ReadFirstLane
+			// rather than through CompositeExtract* (the only path EvaluateExtract() covers)
+			// used to fall through to `default: break` below and fail with no diagnostic --
+			// this is the confirmed cause of the Astro's Playroom SRT evaluation crash
+			// (IsRuntimeUniformOp whitelists both CompositeConstructU32x2 and IAddCarry32 as
+			// host-evaluable at plan-build time, but neither had a case here).
+			case ValueOpcode::CompositeConstructU32x2:
 			case ValueOpcode::CompositeConstructU64:
 				if (!binary()) {
-					return false;
+					return Fail(fmt::format("{} missing an operand",
+					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				result = static_cast<uint32_t>(a) |
 				         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 				return true;
+			// Same story as above: IAddCarry32 evaluated directly (not as the operand of a
+			// CompositeExtract*) means "give me the primary destination", the low 32-bit sum --
+			// the carry-out lives in the second component, reachable only via EvaluateExtract().
+			case ValueOpcode::IAddCarry32:
+				if (!binary()) {
+					return Fail("IAddCarry32 missing an operand");
+				}
+				result = static_cast<uint32_t>(a + b);
+				return true;
 			case ValueOpcode::ReadConst: {
 				const auto slot = inst.Arg(1).Resolve();
-				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
-				    slot.U32() >= m_program.srt_reads.size()) {
-					return false;
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32) {
+					return Fail("ReadConst slot index is not an immediate u32");
+				}
+				if (slot.U32() >= m_program.srt_reads.size()) {
+					return Fail(fmt::format("ReadConst slot {} out of range ({} SRT reads planned)",
+					                        slot.U32(), m_program.srt_reads.size()));
 				}
 				if (slot.U32() < m_clean_flat_slots.size() &&
 				    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
@@ -679,7 +1038,8 @@ private:
 				if (IsRawRead(m_program, inst)) {
 					return EvaluateRawRead(inst, result);
 				}
-				break;
+				return Fail(fmt::format("{} is not a recognized raw scalar read",
+				                        ValueOpcodeName(inst.GetOpcode())));
 			case ValueOpcode::IAdd32:
 				if (binary()) {
 					result = static_cast<uint32_t>(a + b);
@@ -950,10 +1310,17 @@ private:
 			case ValueOpcode::UndefU8:
 			case ValueOpcode::UndefU16:
 			case ValueOpcode::UndefU32:
-			case ValueOpcode::UndefU64: return false;
-			default: break;
+			case ValueOpcode::UndefU64:
+				return Fail(fmt::format("{} is explicitly undefined and has no runtime value",
+				                        ValueOpcodeName(inst.GetOpcode())));
+			default:
+				// The generic sink: every opcode IsRuntimeUniformOp() accepts as host-evaluable
+				// must have a case above, or it silently fails here with no diagnostic --
+				// exactly what happened for CompositeConstructU32x2/IAddCarry32. Named so the
+				// next divergence between the two lists shows up as a message, not a gdb session.
+				return Fail(fmt::format("no runtime evaluator for opcode {}",
+				                        ValueOpcodeName(inst.GetOpcode())));
 		}
-		return false;
 	}
 
 	const ResourcePlan&                       m_program;
@@ -964,6 +1331,7 @@ private:
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
+	std::string                               m_fail_reason;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -977,13 +1345,21 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
-                                std::vector<uint8_t>& active_sources) {
-	if (!program.srt_plan_complete) {
+                                std::vector<uint8_t>& active_sources,
+                                std::string* fail_reason) {
+	const auto fail = [&](std::string reason) {
+		if (fail_reason != nullptr) {
+			*fail_reason = Diagnostic(program, 0, reason);
+		}
 		return false;
+	};
+	if (!program.srt_plan_complete) {
+		return fail("SRT plan is not complete (BuildSrtPlan was not run, or failed)");
 	}
 	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
 	    runtime.read_specialization_memory == nullptr) {
-		return false;
+		return fail("clean (specialization-invariant) flat slots were requested but no "
+		            "read_specialization_memory reader was provided");
 	}
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
@@ -1027,14 +1403,50 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	for (const auto source_index: sources) {
 		const auto* source = Source(program, source_index);
 		if (source == nullptr) {
-			return false;
+			return fail(fmt::format("descriptor source index {} is out of range ({} known)",
+			                        source_index, program.descriptor_sources.size()));
 		}
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
-					return false;
+					// Phase D (pipelineCache.cpp) deliberately retries MaterializeResources every
+					// dispatch for a shader that fails here rather than caching the failure, so
+					// this runs on every dispatch of every affected shader for as long as the
+					// game keeps running. Building the tree (up to 400 nodes, each formatted) is
+					// real work; only pay for it when logging is actually on.
+					if (!::Log::IsSilent()) {
+						std::unordered_map<const Inst*, uint32_t> ids;
+						uint32_t                                  budget = 400;
+						LOGF("shader SRT: hash=0x%016llx descriptor source %u dword %u tree: %s\n",
+						    static_cast<unsigned long long>(program.shader_hash), source_index,
+						    index, DumpValueTree(program, source->dwords[index], ids, budget).c_str());
+					}
+					return fail(fmt::format("descriptor source {} dword {}: {}", source_index,
+					                        index, evaluator.FailReason()));
+				}
+			}
+		} else {
+			// Contractually zero, not a failure (see this function's header comment: "Inactive
+			// descriptors are zero") -- the reachability walk above found no live control-flow
+			// path to whatever block declares this source, so `value` is left default-constructed.
+			// Correct, but was silent: this is one of the stages 22 sessions of the ASTRO's
+			// Playroom investigation never saw, because nothing said a descriptor had been zeroed
+			// this way. Rate-limited, not per-hit-gated on Log::IsSilent() first like the failure
+			// path above, because MaterializeResources retries every dispatch for the whole life
+			// of the affected shader and this is cheap to format either way.
+			//
+			// Checked before the rate limit, not after: this site alone fires 100,000+ times per
+			// real run across every shader hash, which exhausts the shared cap long before the
+			// one hash under investigation gets a turn. --shader-log-filter-hash lets a targeted
+			// session spend the whole budget on the hash that matters instead.
+			if (Config::ShaderLogHashAllowed(program.shader_hash)) {
+				static Log::RateLimit limiter {"SrtInactiveDescriptorSource", 256};
+				if (const auto hit = limiter.Hit()) {
+					LOGF("shader SRT: hash=0x%016llx descriptor source %u marked inactive by "
+					     "reachability walk, evaluated as zero [%llu]\n",
+					     static_cast<unsigned long long>(program.shader_hash), source_index, *hit);
 				}
 			}
 		}
@@ -1047,9 +1459,13 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
-			if (read.flat_offset >= flattened.size() ||
-			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
-				return false;
+			if (read.flat_offset >= flattened.size()) {
+				return fail(fmt::format("flat SRT slot {} is out of range ({} slots)",
+				                        read.flat_offset, flattened.size()));
+			}
+			if (!selected.Evaluate(read.value, flattened[read.flat_offset])) {
+				return fail(fmt::format("flat SRT slot {}: {}", read.flat_offset,
+				                        selected.FailReason()));
 			}
 		}
 	}
@@ -1062,6 +1478,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 }
 
 } // namespace
+
+bool IsRuntimeSelect(ValueOpcode op) {
+	return op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
+	       op == ValueOpcode::SelectF32;
+}
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
@@ -1095,9 +1516,11 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 }
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
-                              const SrtRuntime& runtime, DescriptorValue& result) {
+                              const SrtRuntime& runtime, DescriptorValue& result,
+                              std::string* fail_reason) {
 	std::vector<DescriptorValue> results;
-	if (!EvaluateDescriptorSources(program, std::span {&source, 1}, runtime, results)) {
+	if (!EvaluateDescriptorSources(program, std::span {&source, 1}, runtime, results,
+	                               fail_reason)) {
 		return false;
 	}
 	result = results.front();
@@ -1105,19 +1528,20 @@ bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
 }
 
 bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
-                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results) {
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                               std::string* fail_reason) {
 	std::vector<uint32_t> ignored;
 	std::vector<uint8_t>  active;
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, ignored, false, {},
-	                                  active);
+	                                  active, fail_reason);
 }
 
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources) {
+                            std::vector<uint8_t>& active_sources, std::string* fail_reason) {
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
-	                                  clean_flat_slots, active_sources);
+	                                  clean_flat_slots, active_sources, fail_reason);
 }
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat) {

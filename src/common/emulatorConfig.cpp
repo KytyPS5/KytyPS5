@@ -95,6 +95,20 @@ uint64_t GetLogRepeatLimit() {
 	return g_config->log_repeat_limit;
 }
 
+uint64_t GetLogFileMaxBytes() {
+	return g_config->log_file_max_bytes;
+}
+
+bool ShaderLogHashAllowed(uint64_t hash) {
+	const auto& allowed = g_config->shader_log_filter_hashes;
+	return allowed.empty() ||
+	       std::find(allowed.begin(), allowed.end(), hash) != allowed.end();
+}
+
+bool ForceShaderDiskCacheEnabled() {
+	return g_config->force_shader_disk_cache_enabled;
+}
+
 bool CommandBufferDumpEnabled() {
 	return g_config->command_buffer_dump_enabled;
 }
@@ -105,6 +119,46 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 
 bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
+}
+
+bool ValidateShaderIrEnabled() {
+	return g_config->validate_shader_ir_enabled;
+}
+
+bool ApproximateDivergentPhiEnabled() {
+	return g_config->approximate_divergent_phi_enabled;
+}
+
+bool DrawDumpEnabled() {
+	return g_config->draw_dump_enabled;
+}
+
+std::filesystem::path GetDrawDumpFolder() {
+	return g_config->draw_dump_folder;
+}
+
+int64_t GetDrawLogFrameFirst() {
+	return g_config->draw_log_frame_first;
+}
+
+int64_t GetDrawLogFrameLast() {
+	return g_config->draw_log_frame_last;
+}
+
+bool PresentDumpEnabled() {
+	return g_config->present_dump_enabled;
+}
+
+int64_t GetPresentDumpEvery() {
+	return g_config->present_dump_every;
+}
+
+std::filesystem::path GetPresentDumpFolder() {
+	return g_config->present_dump_folder;
+}
+
+std::filesystem::path GetInputScriptPath() {
+	return g_config->input_script_path;
 }
 
 OutputDirection GetPrintfDirection() {
@@ -139,6 +193,10 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool BvhStubEnabled() {
+	return g_config->bvh_stub_enabled;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
@@ -147,6 +205,14 @@ bool RedZoneProtectionEnabled() {
 
 const Keymap& GetKeymap() {
 	return g_config->keymap;
+}
+
+const Keymap& GetGamepadKeymap() {
+	return g_config->gamepad_keymap;
+}
+
+float GetGamepadDeadzone() {
+	return std::clamp(g_config->gamepad_deadzone, 0.0f, 0.95f);
 }
 
 } // namespace Config

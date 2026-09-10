@@ -1384,10 +1384,39 @@ uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
 			TileTextureBlockLayout layout {};
 			if (TileGetTextureBlockLayout(format, tile, false, layout)) {
 				pitch = AlignUp(pitch, layout.block.block_width * layout.texel_width);
+			} else {
+				// TileGetTextureBlockLayout failed for a tile mode this switch otherwise knows
+				// how to align: pitch silently falls back to the unaligned guest width. That
+				// pitch feeds bufferRowLength for every upload/download copy of this surface, so
+				// a wrong value here shows up much later as sheared/skewed texture content with
+				// no indication the actual defect was here.
+				static Log::RateLimit limiter {"TileGetTexturePitch:BlockLayoutFailed", 64};
+				if (const auto hit = limiter.Hit()) {
+					LOGF_COLOR(Log::Color::Yellow,
+					           "TileGetTexturePitch[%llu]: TileGetTextureBlockLayout failed, "
+					           "pitch left unaligned: fmt=%u width=%u tile=%u\n",
+					           static_cast<unsigned long long>(*hit),
+					           static_cast<uint32_t>(format), width,
+					           static_cast<uint32_t>(tile));
+				}
 			}
 			break;
 		}
-		default: break;
+		default: {
+			// kStandard256B (and any future tile mode not listed above) falls through here with
+			// pitch left at the raw, unaligned guest width -- silently, before this diagnostic.
+			// An unaligned pitch flowing into an upload's bufferRowLength is exactly the class
+			// of "looks plausible, is quietly wrong" defect that is expensive to track down.
+			static Log::RateLimit limiter {"TileGetTexturePitch:UnhandledTileMode", 64};
+			if (const auto hit = limiter.Hit()) {
+				LOGF_COLOR(Log::Color::Yellow,
+				           "TileGetTexturePitch[%llu]: unhandled tile mode, pitch left "
+				           "unaligned: fmt=%u width=%u tile=%u\n",
+				           static_cast<unsigned long long>(*hit), static_cast<uint32_t>(format),
+				           width, static_cast<uint32_t>(tile));
+			}
+			break;
+		}
 	}
 
 	return pitch;

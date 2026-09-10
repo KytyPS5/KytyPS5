@@ -1,0 +1,373 @@
+.root {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  z-index: 1;
+}
+
+/* Stacked explicitly above HeroBackground (position:absolute, z-index:auto)
+   -- see the comment at its usage site in Home.tsx for why this is required
+   rather than incidental. */
+.content {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Home-screen entrance stagger (01-motion-system.md's Phase E schedule:
+   background 0ms, top nav 150ms, rail 220ms, hero title 280ms, hero actions
+   340ms). AppShell's TopBar is shell chrome outside this view and has no
+   entrance of its own; these four sit inside .content and pick up the
+   stagger off AppShell.module.css's [data-entrance] on the ancestor
+   .viewSlot, rather than Home owning a second copy of that state. */
+.sectionLabel,
+.railViewport,
+.title,
+.ctaRow {
+  opacity: 0;
+  transform: translateY(8px);
+}
+:global([data-entrance="visible"]) .sectionLabel {
+  animation: home-enter var(--t-panel) var(--ease-enter) 150ms forwards;
+}
+:global([data-entrance="visible"]) .railViewport {
+  animation: home-enter var(--t-panel) var(--ease-enter) 220ms forwards;
+}
+:global([data-entrance="visible"]) .title {
+  animation: home-enter var(--t-panel) var(--ease-enter) 280ms forwards;
+}
+:global([data-entrance="visible"]) .ctaRow {
+  animation: home-enter var(--t-panel) var(--ease-enter) 340ms forwards;
+}
+@keyframes home-enter {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sectionLabel {
+  flex: none;
+  padding: 16px var(--gutter) 0;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 20px;
+  color: var(--text-primary);
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.6);
+}
+
+/* Viewport clips horizontally only -- overflow-x:auto used to force
+   overflow-y:auto too (a real bug this replaced), which needed extra bottom
+   padding just to stop the caption/growth from being clipped. Plain
+   `overflow: hidden` has no such coupling. */
+.railViewport {
+  flex: none;
+  overflow: hidden;
+  /* Top: just breathing room -- the focused tile's scale(var(--rail-grow))
+     growth is downward now (transform-origin: top center,
+     GameTile.module.css), so the top edge never needs extra clearance.
+     Bottom: room for that growth plus the PS5-style hover caption below
+     the row (GameTile.module.css .caption). */
+  padding: 12px var(--gutter) calc(var(--rail-grow-px) + 36px);
+}
+
+.railTrack {
+  display: flex;
+  /* Every slot shares a top edge (owner rule, 2026-09-09: growth happens
+     at the bottom, not the top) -- flex-start, not flex-end. */
+  align-items: flex-start;
+  gap: 8px;
+  width: max-content;
+  transform: translate3d(var(--rail-x, 0px), 0, 0);
+  transition: transform var(--t-focus) var(--ease-enter);
+}
+
+.spacer {
+  flex: 1;
+  min-height: 0;
+}
+
+/* "Gaming library" Home layout (lib/homeLayout.ts) -- a grid of bigger,
+   uniform game cards below the shortcut row, like the real PS5 all-games
+   grid. Fixed track count (not auto-fill/1fr) so a single card never
+   stretches to fill the row -- that was the bug: without an explicit track
+   size, GameCard's unstyled-width art box inflated to its parent's full
+   width, producing one giant card instead of a grid. */
+/* auto-fill, not auto-fit: a track stays sized by minmax's floor even
+   when the grid has fewer cards than columns, so one card keeps one
+   track's width instead of inflating to the whole row (the original bug
+   this grid replaced -- see git history). The two fixed-column-count
+   media queries this used to need (6/5/4 tracks at three breakpoints) are
+   gone: the track width itself is now fluid, so the browser computes
+   however many fit at any window size, down to the 1280px floor. */
+.libraryGrid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(160px, calc(12 * var(--vwx)), 280px), 1fr));
+  gap: 20px;
+  padding: var(--gutter-block) var(--gutter) var(--gutter-block);
+  scroll-padding-block: 16px;
+  align-content: start;
+}
+
+/* Staggered per-card entrance: cards fade+scale+slide in on mount,
+   staggered by index, clamped at 10 so a long list doesn't queue for
+   seconds. Plain CSS/:nth-child, matching how every other Home entrance
+   already works, below.
+   Gated by the same [data-entrance="visible"] AppShell already stamps for
+   .sectionLabel/.railViewport/.title/.ctaRow above -- same trigger, same
+   "replays each time you navigate back to Home" behavior, not a separate
+   React-mount effect. `> *`, not a GameCard-specific class: GameCard.tsx
+   has no className prop to receive one, and a plain child selector works
+   regardless (its .card root is the grid's only kind of direct child). */
+.libraryGrid > * {
+  opacity: 0;
+  transform: translateY(14px) scale(0.96);
+}
+:global([data-entrance="visible"]) .libraryGrid > * {
+  animation: library-card-enter var(--t-panel) var(--ease-enter) both;
+  animation-delay: 220ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(2) {
+  animation-delay: 250ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(3) {
+  animation-delay: 280ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(4) {
+  animation-delay: 310ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(5) {
+  animation-delay: 340ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(6) {
+  animation-delay: 370ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(7) {
+  animation-delay: 400ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(8) {
+  animation-delay: 430ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(9) {
+  animation-delay: 460ms;
+}
+:global([data-entrance="visible"]) .libraryGrid > *:nth-child(n + 10) {
+  animation-delay: 490ms;
+}
+@keyframes library-card-enter {
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.bottomRow {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 var(--gutter) var(--gutter-block);
+}
+
+.info {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: min(620px, 46vw);
+  min-width: 0;
+  /* Hides while a top-row shortcut is hovered/focused and slides back in
+     from below, bottom to top, when it reappears (owner rule, 2026-09-09),
+     for both Home layouts (this element renders in both). Opacity +
+     transform only, never display/visibility -- .info keeps its normal box
+     in .bottomRow's flex layout the whole time, so .panels (the trophy
+     strip, a sibling, untouched by this) never shifts when .info hides.
+     Home.tsx toggles .infoHidden below. */
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity var(--t-panel) var(--ease-enter), transform var(--t-panel) var(--ease-enter);
+}
+.infoHidden {
+  opacity: 0;
+  /* Positive: hidden state sits BELOW rest, so the transition back to
+     translateY(0) above moves upward, bottom to top -- was -16px (hidden
+     state above rest, entering downward) until this pass. */
+  transform: translateY(16px);
+  pointer-events: none;
+}
+
+.title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: clamp(28px, 3vw, 56px);
+  letter-spacing: -0.5px;
+  color: var(--text-primary);
+  margin: 0;
+  line-height: 1.05;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.6);
+  /* Wraps instead of eliding (owner rule, 2026-09-09) -- matches the
+     reference, which wraps its own title over two lines rather than
+     truncating. Clamped at 2 lines so a pathologically long game name
+     still cannot push the Play button off screen. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-pill);
+  padding: 3px 10px;
+}
+
+.ctaRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.playError {
+  margin-top: 10px;
+  max-width: 460px;
+  font-family: var(--font-body);
+  font-size: 12px;
+  color: var(--error);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.6);
+}
+
+.playButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 30px;
+  border-radius: var(--radius-pill);
+  border: none;
+  background: rgba(255, 255, 255, 0.95);
+  color: #000;
+  font-family: var(--font-ui);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui), transform var(--t-hover) var(--ease-ui);
+}
+.playButton:hover:not(:disabled) {
+  background: #fff;
+  transform: scale(1.03);
+}
+.playButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.playButton.stop {
+  background: var(--error);
+  color: #fff;
+}
+.playButton.stop:hover {
+  background: #ff7a7a;
+}
+
+.moreButton {
+  composes: icon-button from global;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+}
+.moreButton:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.panels {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+/* Trophy strip, reference-exact (owner rule, 2026-09-09): the ONLY thing
+   in Home's bottom-right cluster now -- hours played, recently played and
+   library stats moved out (still reachable in Library.tsx/Profile.tsx).
+   Flat, sharp-cornered, semi-transparent black, no outline -- matches the
+   real PS5 dashboard's own trophy chip rather than the app's bordered
+   --osd-bg/--osd-border panel look (that pair stays in use by
+   .shortcutTile in GameTile.module.css). See store/trophies.ts's doc for
+   why Earned is always 0 today (no unlock tracking anywhere in the
+   emulator yet). */
+.trophyOsd {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 14px 22px;
+  border-radius: 0;
+  background: var(--osd-flat-bg);
+  color: var(--text-primary);
+}
+
+.trophyIcon {
+  /* White outline glyph, matching the reference -- not the gold medal
+     color (still used by views/Trophies.tsx's per-trophy GradeBadge,
+     where gold/silver/bronze grading is the actual point). */
+  color: var(--text-primary);
+  flex: none;
+}
+
+.trophyCols {
+  display: flex;
+  gap: 20px;
+}
+
+.trophyCol {
+  display: flex;
+  flex-direction: column;
+}
+
+.trophyValue {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 22px;
+  line-height: 1.1;
+}
+
+/* Label above value (Home.tsx renders it first in each .trophyCol) --
+   the reference's own order, sentence case, no letter-spacing. */
+.trophyLabel {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.85);
+  margin: 0 0 4px;
+}
+
+.emptyBottomRow {
+  flex: none;
+  padding: 0 var(--gutter) var(--gutter-block);
+}
+
+.emptyHint {
+  color: var(--text-secondary);
+  font-family: var(--font-body);
+  font-size: 13px;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.6);
+}

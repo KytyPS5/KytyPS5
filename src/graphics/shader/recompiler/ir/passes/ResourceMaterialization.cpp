@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -8,7 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
@@ -33,9 +33,19 @@ struct MaterializedSnapshot {
 	std::vector<IndirectImage> indirect_images;
 };
 
+// Set for the duration of one MaterializeResources() call (see its ScopedFailReason below) so
+// every SpecializationFail() call along the way -- however deep, and without changing every
+// intermediate function's signature -- can report the real cause instead of a bare `false`.
+// Every use of SpecializationFail() returns immediately, so nothing here is ever overwritten:
+// there is at most one failure per MaterializeResources() call.
+thread_local std::string* g_specialization_fail_reason = nullptr;
+
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	if (g_specialization_fail_reason != nullptr) {
+		*g_specialization_fail_reason = std::string(message);
+	}
+	LOGF("shader resource specialization failed: %.*s\n", static_cast<int>(message.size()),
+	    message.data());
 	return false;
 }
 
@@ -207,15 +217,24 @@ bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynam
 bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue&                 material_value,
                               const DescriptorValue& heap_value, bool r128,
-                              const SrtRuntime& runtime, IndirectImage& result) {
+                              const SrtRuntime& runtime, IndirectImage& result,
+                              std::string* fail_reason = nullptr) {
+	const auto fail = [&](std::string reason) {
+		if (fail_reason != nullptr) {
+			*fail_reason = std::move(reason);
+		}
+		return false;
+	};
 	ShaderBufferResource material;
 	ShaderBufferResource heap;
 	if (!DecodeBufferDescriptor(material_value, material) ||
 	    !DecodeBufferDescriptor(heap_value, heap)) {
-		return false;
+		return fail("indirect image material/heap descriptor did not decode as a buffer");
 	}
 	if (material.Stride() != indirect.selector_stride) {
-		return false;
+		return fail(fmt::format("indirect image selector stride mismatch: descriptor has {}, "
+		                        "shader expects {}",
+		                        material.Stride(), indirect.selector_stride));
 	}
 
 	// S_BUFFER_LOAD ignores vector-buffer swizzle/add-thread fields. The shader computes the
@@ -227,7 +246,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
 	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 	if (probe_count > MaxIndirectImageProbes) {
-		return false;
+		return fail(fmt::format("indirect image selector would need {} probes (limit {})",
+		                        probe_count, MaxIndirectImageProbes));
 	}
 
 	std::vector<uint32_t>        keys {0u};
@@ -237,7 +257,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
 		uint32_t key = 0;
 		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key)) {
-			return false;
+			return fail(fmt::format("indirect image selector read failed at offset {}", offset));
 		}
 		if (seen.insert(key).second) {
 			keys.push_back(key);
@@ -259,7 +279,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
 			                          candidate.dwords[dword])) {
-				return false;
+				return fail(fmt::format("indirect image heap read failed for key {} dword {}",
+				                        key, dword));
 			}
 		}
 		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) {
@@ -268,7 +289,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		const auto found = std::ranges::find(next.descriptors, candidate);
 		if (found == next.descriptors.end()) {
 			if (next.descriptors.size() >= ShaderInfo::MaxImages) {
-				return false;
+				return fail(fmt::format("indirect image has more than {} distinct descriptors",
+				                        ShaderInfo::MaxImages));
 			}
 			next.descriptors.push_back(candidate);
 			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
@@ -285,18 +307,22 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& runtime,
                                 MaterializedSnapshot& snapshot) {
 	if (!program.resource_tracking_complete) {
-		return false;
+		return SpecializationFail(
+		    "resource tracking is not complete (RunResourceTracking was not run, or failed)");
 	}
 
 	if (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr) {
-		return false;
+		return SpecializationFail("shader requires reading specialization memory but the caller "
+		                          "provided no read_specialization_memory reader");
 	}
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint8_t>         active_sources;
+	std::string                  reason;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots, active_sources)) {
-		return false;
+	                            flattened_srt, program.clean_flat_slots, active_sources,
+	                            &reason)) {
+		return SpecializationFail(reason);
 	}
 
 	auto&                   next  = snapshot.resources;
@@ -329,15 +355,18 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			SrtRuntime       clean_runtime = runtime;
 			clean_runtime.read_memory      = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
-			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
-				return false;
+			std::string                  indirect_reason;
+			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables,
+			                               &indirect_reason)) {
+				return SpecializationFail(
+				    fmt::format("indirect image material/heap source: {}", indirect_reason));
 			}
 			const auto&   material = tables[0];
 			const auto&   heap     = tables[1];
 			IndirectImage table;
 			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, image.r128,
-			                              runtime, table)) {
-				return false;
+			                              runtime, table, &indirect_reason)) {
+				return SpecializationFail(indirect_reason);
 			}
 			next.images[image_index] = table.descriptors[table.candidates[0]];
 			if (table.descriptors.size() > 1u) {
@@ -874,7 +903,38 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+// Diagnostic kept from the Astro's Playroom SRT investigation. ResourceTracking.cpp logs
+// whether its own patch loops (SetFlags on handles, MemoryInfo::resource/sampler/planning_only
+// writes, the indirect-image SetArg rewiring) flip a descriptor dword's runtime-validity verdict,
+// using ValidateRuntimeValue (the exact predicate ValidateSource gates on) rather than a bare
+// ResolveInvariantPhi call on the dword's root -- ResolveInvariantPhi only inspects a value whose
+// own root opcode is Phi, so a dword with a Phi nested inside one of its arguments (the shape
+// descriptor source 9 dword 0 turned out to have) would read as trivially "invariant" without
+// this. This logs the same verdict again right here, before Clone() runs -- the only other thing
+// that runs on the IR between TrackResources returning and this function (per
+// ShaderRecompiler.cpp's pass order) is a trailing EliminateDeadCode. A dword that stayed valid
+// through TrackResources's own log but is invalid here points at that trailing pass instead. For
+// the crash that motivated this, nothing ever flipped anywhere in compile -- descriptor source 9
+// dword 0 was genuinely per-workgroup-varying, which PipelineCache::ProgramCache::Get now handles
+// as a non-fatal skip rather than an abort. Kept as a cheap (compile-time only, once per shader)
+// way to rule out an ordering bug first the next time this failure shape appears.
+void LogNonInvariantDescriptorsBeforeClone(const Program& program) {
+	for (uint32_t source_index = 0; source_index < program.descriptor_sources.size();
+	    source_index++) {
+		const auto& source = program.descriptor_sources[source_index];
+		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			if (ValidateRuntimeValue(program, source.dwords[dword])) {
+				continue;
+			}
+			LOGF("shader SRT: hash=0x%016llx ExtractResourcePlan (pre-clone): descriptor source "
+			    "%u dword %u is not runtime-valid\n",
+			    static_cast<unsigned long long>(program.shader_hash), source_index, dword);
+		}
+	}
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
+	LogNonInvariantDescriptorsBeforeClone(program);
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
@@ -886,6 +946,23 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
 	std::unordered_map<const Inst*, Inst*> cloned;
+	// Mirrors RuntimeValidator::m_active_mask / Evaluator::m_active_mask: while cloning the
+	// Arg(0) subtree of a ReadFirstLane, this holds that ReadFirstLane's own (uncloned, original
+	// tree-space) exec-mask argument. Both the compile-time validator and the runtime evaluator
+	// treat a Select whose condition equals the active mask as always taking its true branch --
+	// the lane ReadFirstLane reads from took it by construction -- and never inspect the false
+	// branch at all (the validator validates it with require_uniform=false, which skips the
+	// Phi-invariance check entirely). Cloning that branch anyway, unconditionally, was suspected
+	// as the Astro's Playroom crash's cause; it is not -- that crash was a genuinely
+	// per-workgroup-varying descriptor address, structurally unrelated to this. Confirmed by
+	// direct test (temporarily disabling this narrowing) that Evaluator::EvaluateWide's own
+	// identical active-mask check already prevents ever reaching the uncloned false branch at
+	// runtime, since it intercepts one level up, at the Select node itself, before dispatching
+	// into EvaluateInst -- so today this is redundant with that, not load-bearing. Kept anyway:
+	// it makes Clone()'s behavior match RuntimeValidator's contract on its own terms rather than
+	// depending on an accident of the evaluator's implementation, and it would become load-bearing
+	// if that evaluator-side check were ever changed or removed.
+	Value                                   active_mask;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
 		value              = value.Resolve();
 		const auto* source = value.TryInstruction();
@@ -897,6 +974,32 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			if (!invariant.IsEmpty() && invariant != value) {
 				return Clone(invariant);
 			}
+		}
+		// Never memoized under `source`: a select instruction shared between a masked and an
+		// unmasked use must be narrowed only in the masked one, so this redirects straight to
+		// the (normally memoized) true-branch clone instead of caching a decision that depends
+		// on which context reached it first.
+		if (!active_mask.IsEmpty() && IsRuntimeSelect(source->GetOpcode()) &&
+		    source->NumArgs() == 3u && source->Arg(0).Resolve() == active_mask) {
+			return Clone(source->Arg(1));
+		}
+		if (source->GetOpcode() == ValueOpcode::ReadFirstLane && source->NumArgs() == 2u) {
+			if (const auto found = cloned.find(source); found != cloned.end()) {
+				return Value(found->second);
+			}
+			auto& target =
+			    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+			cloned.emplace(source, &target);
+			const auto saved_mask = active_mask;
+			active_mask           = source->Arg(1).Resolve();
+			target.SetArg(0, Clone(source->Arg(0)));
+			active_mask = saved_mask;
+			// The mask argument itself is never numerically evaluated at runtime (the Evaluator
+			// only ever compares it structurally against a nested Select's condition), so it is
+			// cloned normally, in the enclosing (unmasked, unless this ReadFirstLane is itself
+			// nested inside another) scope.
+			target.SetArg(1, Clone(source->Arg(1)));
+			return Value(&target);
 		}
 		if (const auto found = cloned.find(source); found != cloned.end()) {
 			return Value(found->second);
@@ -968,7 +1071,16 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::string* fail_reason) {
+	struct ScopedFailReason {
+		std::string* previous;
+		explicit ScopedFailReason(std::string* target) : previous(g_specialization_fail_reason) {
+			g_specialization_fail_reason = target;
+		}
+		~ScopedFailReason() { g_specialization_fail_reason = previous; }
+	} scoped_fail_reason(fail_reason);
+
 	MaterializedSnapshot materialized;
 	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;

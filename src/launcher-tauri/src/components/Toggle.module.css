@@ -1,0 +1,78 @@
+.label {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+/* Hover indicator: a single 1px line under the whole row, offset 3px below
+   it. Positioned off the row's own bottom edge (top: 100%) rather than a
+   border, so it doesn't consume layout space or shift the row when it
+   appears. */
+.label::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  margin-top: 3px;
+  height: 1px;
+  background: transparent;
+  transition: background var(--t-hover) var(--ease-ui);
+}
+
+.track {
+  width: 38px;
+  height: 22px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border-strong);
+  position: relative;
+  flex: none;
+  transition: background var(--t-hover) var(--ease-ui), border-color var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui);
+}
+.trackOn {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  /* transform, not left -- a layout property here would relayout this
+     element's own box on every toggle, the same class of bug
+     GameTile.module.css's old width/height growth had. */
+  transition: transform var(--t-hover) var(--ease-ui), background var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui);
+}
+/* --accent is #ffffff in this theme, so a white knob on the ON track (which
+   fills with --accent) was white-on-white -- see .trackOn above. Flip the
+   knob to --void on ON, the same white-fill/near-black-content pairing
+   .pill-button.primary already uses (theme.css). */
+.trackOn .knob {
+  transform: translateX(16px);
+  background: var(--void);
+  box-shadow: none;
+}
+
+/* Hover: the single underline is the whole effect, guarded against gamepad
+   input the same way every other hover rule in this pass is (see
+   Settings.module.css's .railItem:hover comment for why). */
+:root:not([data-gamepad-active="true"]) .label:hover::after {
+  background: var(--text-primary);
+}
+
+/* Focused (gamepad/keyboard): same quiet-fill language as everywhere else
+   in this pass, not a second ring on top of the track's own hover glow. */
+.label.ps-focused {
+  background: var(--focus-fill);
+}

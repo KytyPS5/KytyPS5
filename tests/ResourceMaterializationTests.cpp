@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -265,6 +266,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  Config::Initialize();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();

@@ -71,6 +71,31 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
 }
 
+// Real fix for the narrow, verified case of the op-value/test-value split (see the long comment
+// at this function's call site below for the general limitation). Real ASTRO's Playroom data
+// (session 28, workflow/session28_five_plans.md Plan 2): fail == zpass == zfail == kReplaceOp
+// and stencil_func == eAlways. Under exactly that configuration the fix is provably correct,
+// not a heuristic: since all three possible outcomes execute the identical operation, the
+// comparison result never changes what gets written to the stencil buffer, and an always-pass
+// compare means no fragment is ever discarded by this test either -- so the single dynamic
+// reference Vulkan requires can safely be the op-value instead of the test-value, with zero
+// effect on which fragments survive to color/depth output. Falls back to `test_value` (today's
+// existing, already-correct-enough-to-ship behavior) for every other configuration -- this is
+// deliberately narrow rather than a general 2-pass/shader-export fix, which needs its own
+// design work per the op-value/test-value comment below.
+static uint8_t ResolveStencilReference(uint8_t fail, uint8_t pass, uint8_t depth_fail,
+                                       uint8_t stencil_func, uint8_t op_value,
+                                       uint8_t test_value) {
+	constexpr auto replace_op    = static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
+	const bool     uniform_outcome = fail == pass && pass == depth_fail;
+	const bool     always_passes =
+	    static_cast<vk::CompareOp>(stencil_func) == vk::CompareOp::eAlways;
+	if (uniform_outcome && always_passes && pass == replace_op) {
+		return op_value;
+	}
+	return test_value;
+}
+
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
                                                                  const DepthFormatPolicy& policy,
                                                                  bool     has_stencil,
@@ -296,28 +321,82 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
-		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
-		    (front_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
-		     sm.stencil_opval != sm.stencil_testval) ||
-		    (dc.backface_enable && back_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
-		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
-			DepthFatal("unsupported stencil compare or replacement state");
+		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
+			DepthFatal("unsupported stencil compare function");
+		}
+		// GNM's STENCIL_OP_REPLACE_OP writes a dedicated "op value" register on
+		// pass, independent of the value the stencil test compared against
+		// (STENCIL_OP_REPLACE_TEST writes the test value instead -- the two are
+		// genuinely different hardware operations, not a naming accident: see
+		// Prospero::StencilOp). Vulkan has no equivalent split; VK_STENCIL_OP_REPLACE
+		// always writes whatever single value vkCmdSetStencilReference last set, which
+		// this renderer also uses as the compare reference (stencil_dynamic_front/back
+		// below, testval only). A game asking for a distinct op value than its test
+		// value is real GNM hardware behavior that a single Vulkan reference register
+		// cannot represent -- correctly emulating it needs a second draw (or
+		// VK_EXT_shader_stencil_export) to patch just the passing fragments, which is
+		// real engineering, not a one-line fix. Until that lands, keep the game
+		// running: warn once per call site and fall back to the test value (already
+		// what stencil_dynamic_front/back below uses) -- correct everywhere except the
+		// narrow case a game relies on the op value actually differing, where affected
+		// pixels get the test value's write instead. That trade was previously a hard
+		// crash for every game hitting this path at all, Astro's Playroom included.
+		if (front_write_mask != 0 &&
+		    UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
+		    sm.stencil_opval != sm.stencil_testval &&
+		    ResolveStencilReference(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail,
+		                            dc.stencilfunc, sm.stencil_opval,
+		                            sm.stencil_testval) == sm.stencil_testval) {
+			// Real-fix design (session 28): ResolveStencilReference above already handles the
+			// one verified real configuration correctly (uniform fail/zpass/zfail outcome +
+			// always-pass compare) by using the op-value as the reference instead. This warning
+			// now only fires for configurations that DON'T match that narrow, provably-correct
+			// case -- a general fix (2-pass, or VK_EXT_shader_stencil_export) is still real
+			// engineering, not attempted here. See workflow/session28_five_plans.md Plan 2.
+			LOGF_COLOR(Log::Color::Yellow,
+			           "depthRenderTarget: unsupported stencil op-value/test-value split "
+			           "(front: op=0x%02x test=0x%02x fail=%u zpass=%u zfail=%u "
+			           "stencil_func=%u depth_func=%u depth_write=%s) -- Vulkan has no "
+			           "independent replace-write reference, falling back to the test value\n",
+			           sm.stencil_opval, sm.stencil_testval, sc.stencil_fail, sc.stencil_zpass,
+			           sc.stencil_zfail, dc.stencilfunc, dc.zfunc,
+			           r.depth_write_enable ? "true" : "false");
+		}
+		if (dc.backface_enable && back_write_mask != 0 &&
+		    UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
+		    sm.stencil_opval_bf != sm.stencil_testval_bf &&
+		    ResolveStencilReference(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf,
+		                            dc.stencilfunc_bf, sm.stencil_opval_bf,
+		                            sm.stencil_testval_bf) == sm.stencil_testval_bf) {
+			LOGF_COLOR(Log::Color::Yellow,
+			           "depthRenderTarget: unsupported stencil op-value/test-value split "
+			           "(back: op=0x%02x test=0x%02x fail=%u zpass=%u zfail=%u "
+			           "stencil_func=%u depth_func=%u depth_write=%s) -- Vulkan has no "
+			           "independent replace-write reference, falling back to the test value\n",
+			           sm.stencil_opval_bf, sm.stencil_testval_bf, sc.stencil_fail_bf,
+			           sc.stencil_zpass_bf, sc.stencil_zfail_bf, dc.stencilfunc_bf, dc.zfunc,
+			           r.depth_write_enable ? "true" : "false");
 		}
 		r.stencil_static_front = {
 		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval),
 		    ConvertStencilOp(sc.stencil_zpass, front_write_mask, sm.stencil_opval),
 		    ConvertStencilOp(sc.stencil_zfail, front_write_mask, sm.stencil_opval),
 		    static_cast<vk::CompareOp>(dc.stencilfunc)};
-		r.stencil_dynamic_front = {sm.stencil_mask, front_write_mask, sm.stencil_testval};
+		r.stencil_dynamic_front = {
+		    sm.stencil_mask, front_write_mask,
+		    ResolveStencilReference(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail,
+		                            dc.stencilfunc, sm.stencil_opval, sm.stencil_testval)};
 		if (dc.backface_enable) {
 			r.stencil_static_back = {
 			    ConvertStencilOp(sc.stencil_fail_bf, back_write_mask, sm.stencil_opval_bf),
 			    ConvertStencilOp(sc.stencil_zpass_bf, back_write_mask, sm.stencil_opval_bf),
 			    ConvertStencilOp(sc.stencil_zfail_bf, back_write_mask, sm.stencil_opval_bf),
 			    static_cast<vk::CompareOp>(dc.stencilfunc_bf)};
-			r.stencil_dynamic_back = {sm.stencil_mask_bf, back_write_mask, sm.stencil_testval_bf};
+			r.stencil_dynamic_back = {
+			    sm.stencil_mask_bf, back_write_mask,
+			    ResolveStencilReference(sc.stencil_fail_bf, sc.stencil_zpass_bf,
+			                            sc.stencil_zfail_bf, dc.stencilfunc_bf,
+			                            sm.stencil_opval_bf, sm.stencil_testval_bf)};
 		} else {
 			r.stencil_static_back  = r.stencil_static_front;
 			r.stencil_dynamic_back = r.stencil_dynamic_front;

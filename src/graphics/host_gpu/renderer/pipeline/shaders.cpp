@@ -12,11 +12,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <vector>
@@ -122,226 +125,22 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		return;
 	}
 
-	switch (fmt) {
-		case Prospero::BufferFormat::k32_32_32_32Float:
-			format = vk::Format::eR32G32B32A32Sfloat;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k32_32_32_32SInt:
-			format = vk::Format::eR32G32B32A32Sint;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k32_32_32_32UInt:
-			format = vk::Format::eR32G32B32A32Uint;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k32_32_32Float:
-			format = vk::Format::eR32G32B32Sfloat;
-			size   = 3;
-			break;
-		case Prospero::BufferFormat::k32_32_32SInt:
-			format = vk::Format::eR32G32B32Sint;
-			size   = 3;
-			break;
-		case Prospero::BufferFormat::k32_32_32UInt:
-			format = vk::Format::eR32G32B32Uint;
-			size   = 3;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16Float:
-			format = vk::Format::eR16G16B16A16Sfloat;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16SInt:
-			format = vk::Format::eR16G16B16A16Sint;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16UInt:
-			format = vk::Format::eR16G16B16A16Uint;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16SScaled:
-			format = vk::Format::eR16G16B16A16Sscaled;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16UScaled:
-			format = vk::Format::eR16G16B16A16Uscaled;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16SNorm:
-			format = vk::Format::eR16G16B16A16Snorm;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16_16_16UNorm:
-			format = vk::Format::eR16G16B16A16Unorm;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k32_32Float:
-			format = vk::Format::eR32G32Sfloat;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k32_32SInt:
-			format = vk::Format::eR32G32Sint;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k32_32UInt:
-			format = vk::Format::eR32G32Uint;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k8_8_8_8UInt:
-			format = vk::Format::eR8G8B8A8Uint;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k8_8_8_8SScaled:
-			format = vk::Format::eR8G8B8A8Sscaled;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k8_8_8_8UScaled:
-			format = vk::Format::eR8G8B8A8Uscaled;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k8_8_8_8SNorm:
-			format = vk::Format::eR8G8B8A8Snorm;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k8_8_8_8UNorm:
-			format = vk::Format::eR8G8B8A8Unorm;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k10_10_10_2UNorm:
-			format = vk::Format::eA2B10G10R10UnormPack32;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k10_10_10_2SNorm:
-			format = vk::Format::eA2B10G10R10SnormPack32;
-			size   = 4;
-			break;
-		case Prospero::BufferFormat::k16_16Float:
-			format = vk::Format::eR16G16Sfloat;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16_16SInt:
-			format = vk::Format::eR16G16Sint;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16_16UInt:
-			format = vk::Format::eR16G16Uint;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16_16SScaled:
-			format = vk::Format::eR16G16Sscaled;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16_16UScaled:
-			format = vk::Format::eR16G16Uscaled;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16_16SNorm:
-			format = vk::Format::eR16G16Snorm;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16_16UNorm:
-			format = vk::Format::eR16G16Unorm;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k32Float:
-			format = vk::Format::eR32Sfloat;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k32SInt:
-			format = vk::Format::eR32Sint;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k32UInt:
-			format = vk::Format::eR32Uint;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8_8SInt:
-			format = vk::Format::eR8G8Sint;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k8_8UInt:
-			format = vk::Format::eR8G8Uint;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k8_8SScaled:
-			format = vk::Format::eR8G8Sscaled;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k8_8UScaled:
-			format = vk::Format::eR8G8Uscaled;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k8_8SNorm:
-			format = vk::Format::eR8G8Snorm;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k8_8UNorm:
-			format = vk::Format::eR8G8Unorm;
-			size   = 2;
-			break;
-		case Prospero::BufferFormat::k16Float:
-			format = vk::Format::eR16Sfloat;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k16SInt:
-			format = vk::Format::eR16Sint;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k16UInt:
-			format = vk::Format::eR16Uint;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k16SScaled:
-			format = vk::Format::eR16Sscaled;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k16UScaled:
-			format = vk::Format::eR16Uscaled;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k16SNorm:
-			format = vk::Format::eR16Snorm;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k16UNorm:
-			format = vk::Format::eR16Unorm;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8SInt:
-			format = vk::Format::eR8Sint;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8UInt:
-			format = vk::Format::eR8Uint;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8SScaled:
-			format = vk::Format::eR8Sscaled;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8UScaled:
-			format = vk::Format::eR8Uscaled;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8SNorm:
-			format = vk::Format::eR8Snorm;
-			size   = 1;
-			break;
-		case Prospero::BufferFormat::k8UNorm:
-			format = vk::Format::eR8Unorm;
-			size   = 1;
-			break;
-		default:
-			EXIT("unknown format: fmt = %u\n", raw_format);
-			format = vk::Format::eUndefined;
-			size   = 4;
-			break;
+	// This function used to hand-copy one Vulkan format per Prospero::BufferFormat and abort on
+	// anything missing -- k11_11_10Float (reproduced in ASTRO's Playroom, 2026-09-09) was one of
+	// several packed formats already fully described elsewhere (VulkanFormat()'s own table, and
+	// ShaderRecompiler::Format::GetFormatInfo()'s bit layout) but never copied into that switch,
+	// so real vertex data kept hitting a fresh EXIT one format at a time. Landed upstream the same
+	// way independently (ae573f94): consult that same source of truth directly instead of
+	// maintaining a second, incomplete copy.
+	format = VulkanFormat(fmt);
+	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
+	if (format == vk::Format::eUndefined || size == 0) {
+		EXIT("unknown vertex format: fmt = %u\n", raw_format);
 	}
 
 	if (NarrowInputFormat(format, size, used_components)) {
-		static std::atomic<uint64_t> log_count = 0;
-		auto                         log_id    = log_count.fetch_add(1);
-		if (log_id < 32) {
+		static Log::RateLimit limiter {"VertexInputNarrowed", 32};
+		if (limiter.Hit()) {
 			LOGF("VertexInput: narrowed vertex format to %" PRIu32
 			     " component(s) for shader fetch\n",
 			     used_components);
@@ -524,13 +323,13 @@ void CreatePipelineInternal(
 		               static_cast<uint32_t>(used_components));
 
 		if (graphics_debug_dump_enabled()) {
-			static std::atomic_uint log_count = 0;
-			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
-			if (log_id < 128) {
-				LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
+			static Log::RateLimit limiter {"VertexInputState", 128};
+			if (const auto hit = limiter.Hit()) {
+				LOGF("VertexInputState[%llu]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
 				     "src_fmt=%u dst=v%u regs=%u"
 				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-				     log_id, index, input_attr[index].binding, input_attr[index].offset,
+				     static_cast<unsigned long long>(*hit), index, input_attr[index].binding,
+				     input_attr[index].offset,
 				     input_desc[input_attr[index].binding].stride,
 				     static_cast<int>(input_attr[index].format),
 				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
@@ -581,6 +380,17 @@ void CreatePipelineInternal(
 	}
 	if (static_params.cull_front) {
 		cull_mode |= vk::CullModeFlagBits::eFront;
+	}
+	// TEMPORARY diagnostic, 2026-09-10: KYTY_DEBUG_CULL_NONE=1 forces every pipeline to disable
+	// face culling entirely, to test whether the always-black draws (e.g.
+	// vs=0x98d8e293b8ff2e48/ps=0x113acd3e87a31cf0, cull_front=true cull_back=false) are being
+	// fully removed by a winding-order mismatch rather than shading to black. Baked into the
+	// pipeline at creation time (unlike depth compare, cull mode is not dynamic state here), so
+	// this only takes effect on a fresh launch, not a hot toggle. Not a real fix, remove after
+	// the experiment.
+	static const bool debug_cull_none = std::getenv("KYTY_DEBUG_CULL_NONE") != nullptr;
+	if (debug_cull_none) {
+		cull_mode = vk::CullModeFlagBits::eNone;
 	}
 
 	vk::FrontFace front_face =

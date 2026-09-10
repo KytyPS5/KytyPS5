@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 
@@ -758,6 +759,10 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
 		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
 		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::ScalarInstruction:
+			EXIT_IF(instruction_branch_condition.IsEmpty());
+			condition = instruction_branch_condition;
+			break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				EXIT("block %u reads an invalid goto variable", source.id);
@@ -1151,12 +1156,45 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
 		} else if (options.stage == ShaderType::Pixel) {
 			const auto* ps = options.pixel;
-			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr),
-				                      builtin(IR::StageInputKind::BaryCoordSmooth, 0));
-				entry_ir.SetVectorReg(
-				    static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr + 1u),
-				    builtin(IR::StageInputKind::BaryCoordSmooth, 1));
+			// Populate every barycentric VGPR pair the guest actually enabled. Was: only
+			// PerspCenter was ever populated (always from the "center" builtin), so a shader
+			// asking for PerspSample/PerspCentroid/LinearSample/LinearCentroid got real VGPR
+			// *numbers* reserved for it (ShaderCalcPsSystemInputBase counts them) but no IR ever
+			// wrote them -- an uninitialized SSA value that reads as I=J=0.
+			//
+			// All three perspective-class modes (Sample/Center/Centroid) source from the SAME
+			// gl_BaryCoordKHR builtin here, NOT three separate SPIR-V variables: a first attempt
+			// at giving each its own Centroid/Sample-decorated variable produced two Input
+			// variables both decorated BuiltIn BaryCoordKHR on any shader enabling two of these
+			// together, which SPV_KHR_fragment_shader_barycentric/Vulkan forbids outright
+			// (VUID-StandaloneSpirv-OpEntryPoint-09658 -- confirmed via the validation layer on
+			// this exact game, crashing the NVIDIA driver's shader compiler instead of merely
+			// failing validation). One VGPR pair per host BuiltIn is the representable limit;
+			// a shader enabling only one mode per class (the common case this fix targets) gets
+			// its correct value, one enabling two at once gets the same host-chosen location for
+			// both -- not fully precise, but a valid, non-crashing, non-zero result. Getting
+			// distinct sample/centroid locations simultaneously would need reconstructing them
+			// manually (e.g. via derivatives) rather than through this builtin, which is a
+			// separate, larger piece of work.
+			static constexpr struct {
+				PsBarycentricMode   mode;
+				IR::StageInputKind  kind;
+			} kBarycentricSources[] = {
+			    {PsBarycentricMode::PerspSample, IR::StageInputKind::BaryCoordSmooth},
+			    {PsBarycentricMode::PerspCenter, IR::StageInputKind::BaryCoordSmooth},
+			    {PsBarycentricMode::PerspCentroid, IR::StageInputKind::BaryCoordSmooth},
+			    {PsBarycentricMode::LinearSample, IR::StageInputKind::BaryCoordNoPerspective},
+			    {PsBarycentricMode::LinearCenter, IR::StageInputKind::BaryCoordNoPerspective},
+			    {PsBarycentricMode::LinearCentroid, IR::StageInputKind::BaryCoordNoPerspective},
+			};
+			for (const auto& source: kBarycentricSources) {
+				const auto vgpr = ps->barycentric_vgpr[static_cast<size_t>(source.mode)];
+				if (vgpr != UINT32_MAX) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(vgpr),
+					                      builtin(source.kind, 0));
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(vgpr + 1u),
+					                      builtin(source.kind, 1));
+				}
 			}
 			uint32_t reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
@@ -1194,7 +1232,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit);
+		Translator translator(result, result.blocks[typed_index], vector_limit,
+		                     options.stage == ShaderType::Pixel ? options.pixel : nullptr);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
@@ -1225,7 +1264,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 	}
-	IR::ValidateProgram(result, false);
+	if (Config::ValidateShaderIrEnabled()) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 

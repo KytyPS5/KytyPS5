@@ -358,6 +358,8 @@ constexpr uint32_t SPI_PS_INPUT_ENA       = 0x1B3;
 constexpr uint32_t SPI_PS_INPUT_ADDR      = 0x1B4;
 constexpr uint32_t SPI_INTERP_CONTROL_0   = 0x1B5;
 constexpr uint32_t SPI_PS_IN_CONTROL      = 0x1B6;
+constexpr uint32_t SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT = 15;
+constexpr uint32_t SPI_PS_IN_CONTROL_PS_W32_EN_MASK  = 0x1;
 constexpr uint32_t SPI_BARYC_CNTL         = 0x1B8;
 constexpr uint32_t SPI_TMPRING_SIZE       = 0x1BA;
 constexpr uint32_t SPI_SHADER_IDX_FORMAT  = 0x1C2;
@@ -543,6 +545,12 @@ constexpr uint32_t VGT_GS_MAX_VERT_OUT                                 = 0x2CE;
 constexpr uint32_t GE_NGG_SUBGRP_CNTL                                  = 0x2D3;
 constexpr uint32_t VGT_TESS_DISTRIBUTION                               = 0x2D4;
 constexpr uint32_t VGT_SHADER_STAGES_EN                                = 0x2D5;
+constexpr uint32_t VGT_SHADER_STAGES_EN_HS_W32_EN_SHIFT = 21;
+constexpr uint32_t VGT_SHADER_STAGES_EN_HS_W32_EN_MASK  = 0x1;
+constexpr uint32_t VGT_SHADER_STAGES_EN_GS_W32_EN_SHIFT = 22;
+constexpr uint32_t VGT_SHADER_STAGES_EN_GS_W32_EN_MASK  = 0x1;
+constexpr uint32_t VGT_SHADER_STAGES_EN_VS_W32_EN_SHIFT = 23;
+constexpr uint32_t VGT_SHADER_STAGES_EN_VS_W32_EN_MASK  = 0x1;
 constexpr uint32_t VGT_LS_HS_CONFIG                                    = 0x2D6;
 constexpr uint32_t VGT_TF_PARAM                                        = 0x2DB;
 constexpr uint32_t DB_ALPHA_TO_MASK                                    = 0x2DC;
@@ -834,6 +842,12 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0                   = 0xB2;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_3                   = 0xB5;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES                           = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES                           = 0xC9;
+// Inferred by position, not confirmed against a PS5 register reference: this codebase's own
+// GS block places RSRC1_GS immediately after PGM_LO_GS/HI_GS (0x88/0x89 -> 0x8A), and the same
+// merged-shader packet that hit this offset (reproduced in ASTRO's Playroom, 2026-09-09) writes it right
+// between RSRC1_GS/RSRC2_GS (0x8A/0x8B) and PGM_LO_ES/HI_ES's own GS-side counterparts, for a
+// shader binary agc.cpp maps onto the ES program counter. Bit layout unknown; ignored below.
+constexpr uint32_t SPI_SHADER_PGM_RSRC1_ES                        = 0xCA;
 // Private AGC registers used by shader binaries submitted through SET_SH_REG_INDIRECT.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_HS                       = 0x100;
 constexpr uint32_t SPI_SHADER_PGM_RSRC4_HS                        = 0x101;

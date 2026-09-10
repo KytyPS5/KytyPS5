@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -15,6 +16,8 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -35,6 +38,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -42,6 +46,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -84,11 +89,54 @@ uint32_t ResolveInstanceOffset(const ShaderVertexInputInfo& vs_input_info) {
 	return 0;
 }
 
-static std::atomic<uint32_t> g_draw_state_log_count   = 0;
-static std::atomic<uint32_t> g_draw_input_log_count   = 0;
-static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
+// See Log::RateLimit (common/logging/log.h) for why these are named limiters rather than the
+// bare `static std::atomic<uint32_t> ..._log_count` idiom this file used to use.
+static Log::RateLimit g_draw_state_log_limit {"DrawTargetState", 192};
+static Log::RateLimit g_draw_input_log_limit {"DrawInputState", 64};
+static Log::RateLimit g_mrt_state_log_limit {"MrtState", 32};
 
-static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
+static Log::RateLimit g_framebuffer_skip_log_limit {"DrawFramebufferSkip", 128};
+
+// Found 2026-09-10 while chasing ASTRO's Playroom's rendering defect: a real, heavy scene can
+// issue far more than 192 draws before the one actually worth inspecting even runs, so the flat
+// draw-count cap above exhausts on whichever shader happens to draw first (repeated thousands
+// of times) and every OTHER distinct shader in the same frame is invisible to
+// LogDrawTargetState -- there is no way to tell "which shaders exist and what state do they use"
+// from the log, only "the first few hundred draws in submission order". This is a SEPARATE,
+// unconditional coverage log keyed by (vs_hash, ps_hash): it fires once per distinct shader pair
+// no matter how exhausted the flat cap above is, so a scene with tens of thousands of shaders
+// still gets one line per shader that actually drew something. Capped generously (not
+// unbounded) so a pathological case (a shader hash that's actually unstable/changing per-draw)
+// can't grow this set without limit.
+static std::mutex                   g_seen_shader_pairs_mutex;
+static std::unordered_set<uint64_t> g_seen_shader_pairs;
+static Log::RateLimit g_shader_pair_coverage_log_limit {"DrawTargetStateByShaderPair", 20000};
+
+static bool FirstTimeShaderPairSeen(uint64_t vs_hash, uint64_t ps_hash) {
+	// Not a real hash function requirement here (birthday-bound collisions are fine, this
+	// only decides "log again or not"), just a cheap combine of two independently-good hashes.
+	const uint64_t key = vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull + 0x517CC1B727220A95ull);
+	std::lock_guard<std::mutex> lock(g_seen_shader_pairs_mutex);
+	if (g_seen_shader_pairs.size() >= 20000) {
+		return false;
+	}
+	return g_seen_shader_pairs.insert(key).second;
+}
+
+// True when a per-draw diagnostic at the given guest frame number should spend its
+// (independently capped, see Log::RateLimit) log budget, per --draw-log-frame-first/-last.
+// Both bounds default to -1 (unbounded) so a run with neither flag behaves exactly as before.
+static bool DrawLogFrameInWindow(int frame) {
+	const auto first = Config::GetDrawLogFrameFirst();
+	const auto last  = Config::GetDrawLogFrameLast();
+	if (first >= 0 && frame < first) {
+		return false;
+	}
+	if (last >= 0 && frame > last) {
+		return false;
+	}
+	return true;
+}
 
 static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::PolyOffset& offset,
                                                 vk::Format host_depth_format) {
@@ -122,13 +170,14 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 		return;
 	}
 
-	auto log_id = g_framebuffer_skip_log_count.fetch_add(1, std::memory_order_relaxed);
-	if (log_id >= 128) {
+	const auto hit = g_framebuffer_skip_log_limit.Hit();
+	if (!hit) {
 		return;
 	}
+	const auto log_id = static_cast<unsigned long long>(*hit);
 
 	LOGF(
-	    "DrawFramebufferSkip[%u]: %s color=%s color_addr=0x%010" PRIx64 " color_size=0x%016" PRIx64
+	    "DrawFramebufferSkip[%llu]: %s color=%s color_addr=0x%010" PRIx64 " color_size=0x%016" PRIx64
 	    " color_image=%s depth_format=%s depth_image=%s depth_vaddr_num=%d target_mask=0x%08" PRIx32
 	    " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
 	    log_id, draw_name, RenderColorTypeName(color), color.desc.info.data.address,
@@ -147,12 +196,13 @@ static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
 	const auto  cb_shader_mask = sh_regs.m_cbShaderMask;
 	const auto& bc0            = ctx.GetBlendControl(0);
 
-	auto log_id = g_mrt_state_log_count.fetch_add(1);
-	if (log_id >= 32) {
+	const auto hit = g_mrt_state_log_limit.Hit();
+	if (!hit) {
 		return;
 	}
+	const auto log_id = static_cast<unsigned long long>(*hit);
 
-	LOGF("MrtState[%u]: %s rt_mask=0x%08" PRIx32 " cb_shader_mask=0x%08" PRIx32
+	LOGF("MrtState[%llu]: %s rt_mask=0x%08" PRIx32 " cb_shader_mask=0x%08" PRIx32
 	     " blend0=%s src=%u dst=%u alpha_src=%u alpha_dst=%u sep_alpha=%s\n",
 	     log_id, draw_name, rt_mask, cb_shader_mask, bc0.enable ? "true" : "false",
 	     bc0.color_srcblend, bc0.color_destblend, bc0.alpha_srcblend, bc0.alpha_destblend,
@@ -169,7 +219,7 @@ static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
 			continue;
 		}
 
-		LOGF("MrtState[%u]: slot=%u addr=0x%010" PRIx64
+		LOGF("MrtState[%llu]: slot=%u addr=0x%010" PRIx64
 		     " target_mask=0x%x shader_mask=0x%x out_mode=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32
 		     " width=%u height=%u tile=%u"
@@ -186,21 +236,38 @@ static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
 static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& color,
                                const RenderDepthInfo& depth, const CommandBuffer& buffer,
                                const ShaderPixelInputInfo& ps_input_info, uint32_t index_count,
-                               uint32_t flags) {
+                               uint32_t flags, uint64_t vs_hash, uint64_t ps_hash) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
 	if (!color.image_id) {
 		return;
 	}
 
-	auto log_id = g_draw_state_log_count.fetch_add(1);
-	if (log_id >= 192) {
+	const auto frame = buffer.GetContext().GetGpu().GetFrameNum();
+	if (!DrawLogFrameInWindow(frame)) {
 		return;
 	}
+
+	// Two independent triggers: the flat draw-count budget (chronological sample of the first
+	// N draws), OR first time this exact (vs_hash, ps_hash) pair has drawn anything -- see
+	// g_seen_shader_pairs' comment for why the flat cap alone leaves a heavy scene's shaders
+	// almost entirely uncovered. Whichever fires supplies the log_id.
+	const auto hit             = g_draw_state_log_limit.Hit();
+	const bool first_for_pair  = FirstTimeShaderPairSeen(vs_hash, ps_hash);
+	std::optional<uint64_t> coverage_hit;
+	if (!hit && first_for_pair) {
+		coverage_hit = g_shader_pair_coverage_log_limit.Hit();
+	}
+	if (!hit && !coverage_hit) {
+		return;
+	}
+	const auto log_id = static_cast<unsigned long long>(hit ? *hit : *coverage_hit);
 
 	const auto& cc             = ctx.GetColorControl();
 	const auto& bc             = ctx.GetBlendControl(color.target_slot);
 	const auto& dc             = ctx.GetDepthControl();
+	const auto& mc             = ctx.GetModeControl();
+	const auto& sh             = ctx.GetShaderRegisters();
 	const auto& vp             = ctx.GetScreenViewport();
 	const auto& vp0            = vp.viewports[0];
 	const auto& ps_resources   = ps_input_info.stage.program->info;
@@ -213,16 +280,21 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	const auto sc     = calc_final_scissor(vp, ctx.GetScanModeControl(), extent, 0);
 
 	LOGF(
-	    "DrawTargetState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64
-	    " extent=%ux%u prim=%u index_count=%u flags=0x%08" PRIx32 " color_mask=0x%08" PRIx32
+	    "DrawTargetState[%llu]%s: frame=%d %s target=%s addr=0x%010" PRIx64
+	    " extent=%ux%u prim=%u vs=0x%016" PRIx64 " ps=0x%016" PRIx64
+	    " index_count=%u flags=0x%08" PRIx32 " color_mask=0x%08" PRIx32
+	    " cull_front=%s cull_back=%s face=%s poly_mode=%" PRIu8
 	    " cc_mode=%u cc_op=0x%02x"
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
-	    "scissor=(%d,%d)-(%d,%d)\n",
-	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
+	    "scissor=(%d,%d)-(%d,%d)"
+	    " provoking_vtx_last=%s persp_corr_dis=%s ps_input_ena=0x%08" PRIx32 "\n",
+	    log_id, (hit ? "" : "[coverage]"), frame, draw_name, RenderColorTypeName(color),
 	    color.desc.info.data.address, extent.width, extent.height,
-	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
-	    cc.mode, cc.op,
+	    static_cast<uint32_t>(ucfg.GetPrimType()), vs_hash, ps_hash, index_count, flags,
+	    ctx.GetRenderTargetMask(),
+	    mc.cull_front ? "true" : "false", mc.cull_back ? "true" : "false",
+	    mc.face ? "true" : "false", mc.poly_mode, cc.mode, cc.op,
 	    bc.enable ? "true" : "false", bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
 	    static_cast<int>(ps_resources.images.size()), static_cast<int>(sampled_images),
 	    static_cast<int>(ps_resources.images.size() - sampled_images),
@@ -230,7 +302,8 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    dc.z_enable ? "true" : "false", dc.z_write_enable ? "true" : "false", dc.zfunc,
 	    depth.depth_clear_enable ? "true" : "false", vp0.xoffset - vp0.xscale,
 	    vp0.yoffset - vp0.yscale, vp0.xscale * 2.0f, vp0.yscale * 2.0f, sc.left, sc.top, sc.right,
-	    sc.bottom);
+	    sc.bottom, mc.provoking_vtx_last ? "true" : "false", mc.persp_corr_dis ? "true" : "false",
+	    sh.ps_input_ena);
 
 	LogMrtState(draw_name, buffer, ps_input_info);
 }
@@ -238,23 +311,31 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo& color,
                               const ShaderVertexInputInfo& vs_input_info,
                               uint32_t index_type_and_size, uint32_t index_count,
-                              const void* index_addr) {
-	auto log_id = g_draw_input_log_count.fetch_add(1);
-	if (log_id >= 64) {
+                              const void* index_addr, uint32_t prim_type, uint64_t vs_hash,
+                              uint64_t ps_hash) {
+	const auto frame = buffer.GetContext().GetGpu().GetFrameNum();
+	if (!DrawLogFrameInWindow(frame)) {
 		return;
 	}
 
-	LOGF("DrawInputState[%u]: frame=%d target=%s addr=0x%010" PRIx64
+	const auto hit = g_draw_input_log_limit.Hit();
+	if (!hit) {
+		return;
+	}
+	const auto log_id = static_cast<unsigned long long>(*hit);
+
+	LOGF("DrawInputState[%llu]: frame=%d target=%s addr=0x%010" PRIx64
+	     " prim=%u vs=0x%016" PRIx64 " ps=0x%016" PRIx64
 	     " index_type=%u index_count=%u index_addr=0x%016" PRIx64
 	     " vs_resources=%d vs_buffers=%d\n",
-	     log_id, buffer.GetContext().GetGpu().GetFrameNum(), RenderColorTypeName(color),
-	     color.desc.info.data.address, index_type_and_size, index_count,
-	     reinterpret_cast<uint64_t>(index_addr), vs_input_info.resources_num,
+	     log_id, frame, RenderColorTypeName(color),
+	     color.desc.info.data.address, prim_type, vs_hash, ps_hash, index_type_and_size,
+	     index_count, reinterpret_cast<uint64_t>(index_addr), vs_input_info.resources_num,
 	     vs_input_info.buffers_num);
 
 	for (int bi = 0; bi < vs_input_info.buffers_num; bi++) {
 		const auto& b = vs_input_info.buffers[bi];
-		LOGF("DrawInputState[%u]: vb[%d] addr=0x%010" PRIx64
+		LOGF("DrawInputState[%llu]: vb[%d] addr=0x%010" PRIx64
 		     " stride=%u records=%u fetch_index=%u attr_num=%d\n",
 		     log_id, bi, b.addr, b.stride, b.num_records, b.fetch_index, b.attr_num);
 
@@ -270,7 +351,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 					std::memcpy(&raw[i], rec_bytes + i * 4u, sizeof(raw[i]));
 					std::memcpy(&flt[i], rec_bytes + i * 4u, sizeof(flt[i]));
 				}
-				LOGF("DrawInputState[%u]: vb[%d].rec[%u] stride=%u dwords=%u raw=%08" PRIx32
+				LOGF("DrawInputState[%llu]: vb[%d].rec[%u] stride=%u dwords=%u raw=%08" PRIx32
 				     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
 				     " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
 				     " f=(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f)\n",
@@ -291,7 +372,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 						const auto g8 = (packed >> 8u) & 0xffu;
 						const auto b8 = (packed >> 16u) & 0xffu;
 						const auto a8 = (packed >> 24u) & 0xffu;
-						LOGF("DrawInputState[%u]: vb[%d].rec[%u].attr[%d] dst=v%d fmt=56 "
+						LOGF("DrawInputState[%llu]: vb[%d].rec[%u].attr[%d] dst=v%d fmt=56 "
 						     "rgba8=%02" PRIx32 "%02" PRIx32 "%02" PRIx32 "%02" PRIx32
 						     " rgba=(%.3f,%.3f,%.3f,%.3f)\n",
 						     log_id, bi, rec, ai, rd.register_start, r8, g8, b8, a8,
@@ -306,7 +387,7 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 			const auto  res_index = b.attr_indices[ai];
 			const auto& r         = vs_input_info.resources[res_index];
 			const auto& rd        = vs_input_info.resources_dst[res_index];
-			LOGF("DrawInputState[%u]: attr[%d] res=%d offset=%u dst=v%d regs=%d fetch_index=%u "
+			LOGF("DrawInputState[%llu]: attr[%d] res=%d offset=%u dst=v%d regs=%d fetch_index=%u "
 			     "sharp=%08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
 			     log_id, ai, res_index, b.attr_offsets[ai], rd.register_start, rd.registers_num,
 			     rd.fetch_index, r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
@@ -333,7 +414,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
-
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -392,7 +472,16 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	vk_buffer.setBlendConstants(blend_constants.data());
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	// TEMPORARY diagnostic, 2026-09-10: KYTY_DEBUG_DEPTH_ALWAYS_PASS=1 forces every draw's depth
+	// compare to Always, to test whether the always-black-output draws (e.g.
+	// vs=0x98d8e293b8ff2e48/ps=0x113acd3e87a31cf0, which carries OpExecutionMode
+	// EarlyFragmentTests + depth_test=true + depth_write=false + depth_clear=false, i.e. its
+	// visibility depends entirely on a depth buffer some earlier pass must have written
+	// correctly) are being early-Z rejected against a stale/wrong depth buffer. Not a real fix,
+	// remove after the experiment.
+	static const bool debug_depth_always_pass = std::getenv("KYTY_DEBUG_DEPTH_ALWAYS_PASS") != nullptr;
+	vk_buffer.setDepthCompareOp(debug_depth_always_pass ? vk::CompareOp::eAlways
+	                                                    : depth.depth_compare_op);
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
@@ -532,6 +621,39 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
+		attachment.image_id     = target.image_id;
+		// Session-30 fix: consume a pending clear armed by ConsumeMetadataColorOperation's
+		// EliminateFastClear handling (renderDraw.cpp). Consume-once (TakePendingColorClear
+		// erases on hit) so this render pass clears exactly once, matching real hardware's own
+		// fast-clear-eliminate semantics -- context.cpp already reads is_clear/clear_value to
+		// pick loadOp eClear vs eLoad, previously always eLoad since nothing ever set is_clear.
+		vk::ClearColorValue pending_clear {};
+		if (cache.TakePendingColorClear(image.info.data.address, &pending_clear)) {
+			attachment.is_clear   = true;
+			attachment.clear_value = pending_clear.uint32;
+		}
+	}
+	// A stale depth target from an earlier, smaller pass must not shrink the render area for a
+	// larger colour pass. Astro Bot's title screen keeps a 1920x1080 depth attachment bound on
+	// a 3840x2160 composite pass; the render area would clamp to the 1080p corner and leave the
+	// rest of the frame holding whatever was there before ("only a square is cleared"). The
+	// guest cannot actually pair mismatched attachment sizes, so treat the depth as unbound.
+	// The same applies when the depth target is the larger one: hardware clips each attachment
+	// to its own bounds, but a Vulkan pass has a single render area, so pairing a 1024x1024
+	// colour target with a 1920x1080 depth attachment writes depth only in the 1024x1024 corner
+	// and leaves the rest of it stale. Astro Bot does exactly that -- two colour slots covering
+	// one 1024x1024 surface with complementary channel masks, over a full-size depth buffer.
+	if (depth.image_id && color_count > 0 &&
+	    (depth.desc.info.extent.width != state.width ||
+	     depth.desc.info.extent.height != state.height)) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderState: depth target %ux%u does not match colour %ux%u -- unbinding it "
+			     "for the draw\n",
+			     depth.desc.info.extent.width, depth.desc.info.extent.height, state.width,
+			     state.height);
+		}
+		depth.image_id = {};
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
@@ -648,7 +770,7 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
 	// These special modes run color-buffer metadata or decompression operations. The shader is a
@@ -656,9 +778,92 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
 	// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind;
 	// future CMask/FMask support can consume its state through the same TextureCache path.
-	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
-	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
-	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
+	const bool consumed = mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
+	                      mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	                      mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
+	// This draw is otherwise dropped with zero trace (ResetBindings(); return;) -- per this
+	// project's logging rule, a silently-consumed draw is a defect in itself until it says so.
+	// Labelled so investigation doesn't have to guess which of the three modes fired, and which
+	// render-target address(es) it targeted (cross-references RenderColorTargetInspect).
+	// Deliberately NOT gated by graphics_debug_dump_enabled(): that flag also turns on
+	// unconditional per-draw sh_print/uc_print/hw_print dumps, whose volume is what makes deep
+	// runs slow (workflow/study_tooling_perf.md); this is a single rate-limited line that a cheap
+	// run should still be able to surface.
+	if (consumed) {
+		static Log::RateLimit limiter {"ConsumeMetadataColorOperation", 256};
+		if (limiter.Hit()) {
+			const auto  mask = ctx.GetRenderTargetMask();
+			const auto& rt0  = ctx.GetRenderTarget(0);
+			LOGF("ConsumeMetadataColorOperation: dropping draw, mode=%u (%s) target_mask=0x%08" PRIx32
+			     " rt0_addr=0x%010" PRIx64 " rt0_dcc_enable=%s rt1_addr=0x%010" PRIx64 "\n", mode,
+			     mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)  ? "EliminateFastClear"
+			     : mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ? "FmaskDecompress"
+			                                                                  : "DccDecompress",
+			     mask, rt0.base.addr, rt0.info.dcc_compression_enable ? "true" : "false",
+			     ctx.GetRenderTarget(1).base.addr);
+		}
+		// Real fix (sessions 30-31, astro_playroom_issues.md): EliminateFastClear is real evidence
+		// the guest wants this target cleared to its currently-set clear-word register value --
+		// confirmed against real hardware (mesa RADV's radv_fast_clear_eliminate renders a real
+		// full-screen triangle) and a real peer emulator (shadPS4's Rasterizer::EliminateFastClear
+		// calls image.Clear() with a decoded clear value), neither of which drop the draw with
+		// zero effect the way this function previously did unconditionally. FmaskDecompress/
+		// DccDecompress stay dropped -- those are genuine no-ops for Kyty's expanded (non-DCC-
+		// compressed) image storage, per the comment above; only EliminateFastClear carries a
+		// real clear-color intent.
+		//
+		// Applied immediately, right here, on this draw's own CommandBuffer, when the target is
+		// already a registered image (TryImmediateColorClear) -- this is the common case for
+		// ASTRO's UI targets and is what a session-31 live diagnostic showed is required: they
+		// get read straight back as a sampled texture by a later compute pass rather than
+		// rebound as a color attachment, and Vulkan's descriptor-binding cache means the
+		// render-attachment/CommitBindings consume points this session tried first are visited
+		// far too rarely (7-8 times vs. 256 arms in a real run) to catch it reliably. Falls back
+		// to the address-keyed arm/consume pair (TextureCache::ArmColorClear /
+		// TakePendingColorClear, consumed by the render-attachment path in AcquireRenderTargets)
+		// only for the rare case where the image isn't registered yet.
+		if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
+			auto&      cache = buffer.GetContext().GetTextureCache();
+			const auto mask  = ctx.GetRenderTargetMask();
+			for (uint32_t slot = 0; slot < 8; slot++) {
+				if (render_target_mask_slot(mask, slot) == 0) {
+					continue;
+				}
+				const auto& rt = ctx.GetRenderTarget(slot);
+				if (rt.base.addr == 0) {
+					continue;
+				}
+				const auto format =
+				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+				                                 rt.info.channel_order);
+				vk::ClearColorValue value {};
+				const bool decoded = DecodePackedColorClear(format.format, rt.clear_word0.word0,
+				                                            value, rt.clear_word1.word1);
+				if (!decoded) {
+					continue;
+				}
+				if (!cache.TryImmediateColorClear(buffer, rt.base.addr, value)) {
+					// Session-32 fix (astro_playroom_issues.md, Bug B): live-confirmed root cause
+					// for the one target in ASTRO's 4-target rotation that never clears --
+					// ResolveRenderColorTarget is the ONLY path that creates/registers a
+					// TextureCache::Image for a color target, and it is never reached for a
+					// target that this frame touches solely through this metadata-consume path
+					// (no real draw or dispatch binds/samples/writes it). Force registration here
+					// from the same register state already in hand, then retry the immediate
+					// clear once, before falling back to the address-keyed arm/consume pair below.
+					// ignore_target_mask=true mirrors ResolveMirroredColorCopy's existing use of
+					// the same override for a different metadata scenario (renderDraw.cpp).
+					RenderColorInfo forced_target {};
+					ResolveRenderColorTarget(buffer, forced_target, 0, slot,
+					                         /*ignore_target_mask=*/true);
+					if (!cache.TryImmediateColorClear(buffer, rt.base.addr, value)) {
+						cache.ArmColorClear(rt.base.addr, value);
+					}
+				}
+			}
+		}
+	}
+	return consumed;
 }
 
 struct DrawEmitInfo {
@@ -842,10 +1047,21 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 			topology = vk::PrimitiveTopology::ePatchList;
 			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
+			// kRectListLegacy is AMD's real hardware DI_PT_RECTLIST (confirmed against Mesa's
+			// RADV primitive table, which lists it as {3 vertices consumed, 3 per primitive}):
+			// the guest submits exactly 3 vertices per rectangle and the hardware derives the
+			// 4th corner itself. It must expand exactly like kRectList above -- through the
+			// tessellation control/evaluation shaders in rectListShader.cpp, which interpolate
+			// the 4th corner from the 3 real vertices -- and NOT as a 4-vertex triangle strip,
+			// which used to invoke the guest vertex shader a 4th time on an index the guest never
+			// submitted: a real out-of-bounds guest storage-buffer read at gl_VertexIndex==3 for
+			// a 3-vertex draw, confirmed against ASTRO's Playroom's own shader bytecode.
 			if (!auto_draw) {
-				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+				EXIT("unknown primitive type: %u (kRectListLegacy is only expected from "
+				     "DrawIndexAuto)\n",
+				     static_cast<uint32_t>(ucfg.GetPrimType()));
 			}
-			topology = vk::PrimitiveTopology::eTriangleStrip;
+			topology = vk::PrimitiveTopology::ePatchList;
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
@@ -1010,29 +1226,165 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
+// Shared by every diagnostic below that wants to name a draw's shaders in a log line or a
+// --draw-dump filename (drawDump.cpp reads the same fields off RenderAttachment). A draw with no
+// active pixel shader, or whose MaterializeResources rejected its program, reports 0 rather than
+// dereferencing a null program.
+static uint64_t DrawVsShaderHash(const DrawRenderState& state) {
+	return state.vs_input_info.stage.program != nullptr
+	           ? state.vs_input_info.stage.program->shader_hash
+	           : 0u;
+}
+
+static uint64_t DrawPsShaderHash(const DrawRenderState& state) {
+	return state.ps_active && state.ps_input_info.stage.program != nullptr
+	           ? state.ps_input_info.stage.program->shader_hash
+	           : 0u;
+}
+
+static Log::RateLimit g_rect_list_flat_log_limit {"RectListFlatHazard", 128};
+
+// Diagnostic for the "rect-list tessellation expansion may mis-handle flat PS inputs" hypothesis:
+// RectListEmitter::EmitControl (rectListShader.cpp) feeds every
+// synthesized quad corner the value from vertex 0 for a flat-shaded PS input, regardless of which of
+// the 3 real vertices is the anchor for that specific rectangle. Flag every rect-list draw whose
+// pixel shader has an active flat-shaded input, so a specific --draw-dump sequence can be matched
+// against this hazard before any fix is applied.
+static void LogRectListFlatHazardIfNeeded(const CommandBuffer& buffer, const char* draw_name,
+                                          vk::PrimitiveTopology topology,
+                                          const DrawRenderState& state) {
+	// See LogDrawStateIfNeeded's comment (2026-09-10): --graphics-debug-dump's blanket gate
+	// used to sit here too, defeating this diagnostic's own frame window for exactly the same
+	// reason. DrawLogFrameInWindow + g_rect_list_flat_log_limit below already control cost.
+	if (topology != vk::PrimitiveTopology::ePatchList || !state.ps_active ||
+	    state.ps_input_info.stage.program == nullptr ||
+	    state.vs_input_info.stage.program == nullptr) {
+		return;
+	}
+
+	const auto frame = buffer.GetContext().GetGpu().GetFrameNum();
+	if (!DrawLogFrameInWindow(frame)) {
+		return;
+	}
+
+	const auto& ps_info = state.ps_input_info;
+	for (const auto& input: ps_info.stage.program->info.inputs) {
+		if (input.kind != ShaderRecompiler::IR::StageInputKind::Parameter ||
+		    !ShaderPixelParameterIsFlat(ps_info, input.location)) {
+			continue;
+		}
+		const auto hit = g_rect_list_flat_log_limit.Hit();
+		if (!hit) {
+			return;
+		}
+		LOGF("RectListFlatHazard[%llu]: frame=%d %s flat_input_location=%u vs_hash=0x%016" PRIx64
+		     " ps_hash=0x%016" PRIx64 "\n",
+		     static_cast<unsigned long long>(*hit), frame, draw_name, input.location,
+		     state.vs_input_info.stage.program->shader_hash, ps_info.stage.program->shader_hash);
+	}
+}
+
+static Log::RateLimit g_legacy_rect_draw_log_limit {"LegacyRectDraw", 128};
+
+// Announces every draw that goes through the GNM rectangle-list expansion (kRectList or
+// kRectListLegacy -- see GetDrawTopology/EmitDrawPrimitives above), so a --draw-dump sequence can
+// always be matched to the exact draw that produced it without needing to re-derive it from
+// DrawTargetState/DrawInputState. This is the diagnostic that would have made the
+// kRectListLegacy defect visible in the log from the first run, instead of requiring several
+// rounds of instrumentation to narrow down to this primitive.
+static void LogLegacyRectDrawIfNeeded(const CommandBuffer& buffer, const char* draw_name,
+                                      const HW::UserConfig& ucfg, const DrawRenderState& state,
+                                      const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+	// See LogDrawStateIfNeeded's comment (2026-09-10) for why --graphics-debug-dump's blanket
+	// gate doesn't belong here either: DrawLogFrameInWindow + g_legacy_rect_draw_log_limit
+	// below already control cost.
+	const auto prim_type = ucfg.GetPrimType();
+	if (prim_type != Prospero::PrimitiveType::kRectList &&
+	    prim_type != Prospero::PrimitiveType::kRectListLegacy) {
+		return;
+	}
+
+	const auto frame = buffer.GetContext().GetGpu().GetFrameNum();
+	if (!DrawLogFrameInWindow(frame)) {
+		return;
+	}
+
+	const auto hit = g_legacy_rect_draw_log_limit.Hit();
+	if (!hit) {
+		return;
+	}
+
+	LOGF("LegacyRectDraw[%llu]: frame=%d %s prim=%u index_count=%u instance_count=%u "
+	     "first_vertex=%u vs_buffers_num=%d param_export_mask=0x%08" PRIx32
+	     " vs_hash=0x%016" PRIx64 " ps_hash=0x%016" PRIx64 "\n",
+	     static_cast<unsigned long long>(*hit), frame, draw_name,
+	     static_cast<uint32_t>(prim_type), draw.index_count, draw.instance_count,
+	     emit.first_vertex, state.vs_input_info.buffers_num,
+	     state.vs_input_info.stage.program != nullptr
+	         ? state.vs_input_info.stage.program->param_export_mask
+	         : 0u,
+	     DrawVsShaderHash(state), DrawPsShaderHash(state));
+}
+
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
                                  const DrawRenderState& state, bool always_log,
                                  bool force_legacy_rect_log, uint32_t index_type_and_size,
                                  const void* index_addr) {
-	if (!graphics_debug_dump_enabled()) {
-		return;
-	}
-
+	// Found 2026-09-10 while chasing a live rendering defect: this used to also require
+	// --graphics-debug-dump, which ALSO unconditionally enables hw_print/sh_print/uc_print (a
+	// full, per-draw, NOT frame-windowed register dump -- see those calls in DrawIndex/DrawAuto)
+	// that turned a run with a heavy real scene into an effective hang, hours of it mistaken for
+	// a genuine emulator stall before being traced to logging cost, not a bug. LogDrawTargetState
+	// and LogDrawInputState below are already both frame-windowed (--draw-log-frame-first/-last)
+	// and independently rate-limited (Log::RateLimit); they don't need --graphics-debug-dump's
+	// blanket gate on top, and tying them to it made it impossible to get per-draw target/input
+	// state without ALSO paying for the expensive firehose. Cost control is
+	// DrawLogFrameInWindow + the named limiters, same as every other diagnostic in this file.
 	if (!always_log && !force_legacy_rect_log) {
 		return;
 	}
 
+	const auto vs_hash = DrawVsShaderHash(state);
+	const auto ps_hash = DrawPsShaderHash(state);
+
 	if (state.ps_active) {
 		LogDrawTargetState(draw.name, state.color_info[0], state.depth_info, buffer,
-		                   state.ps_input_info, draw.index_count, 0);
+		                   state.ps_input_info, draw.index_count, 0, vs_hash, ps_hash);
 	}
 	LogDrawInputState(buffer, state.color_info[0], state.vs_input_info, index_type_and_size,
-	                  draw.index_count, index_addr);
+	                  draw.index_count, index_addr,
+	                  static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()), vs_hash,
+	                  ps_hash);
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
                                const DrawEmitInfo& emit) {
+	// Invariant: this function must never ask Vulkan to run more vertex-shader invocations for a
+	// single EmitDrawPrimitives call than the guest actually submitted indices/vertices for
+	// (draw.index_count). A step here is not a place to invent an extra vertex and hope the
+	// guest's vertex shader produces something sane for an index it was never meant to see -- an
+	// out-of-bounds guest read is what real games do with that invented index (this is exactly
+	// how the kRectListLegacy defect happened, via a fabricated 4th vertex when the guest only
+	// submitted 3). Centralizing every draw call
+	// through this makes that impossible to reintroduce by accident in a future primitive type.
+	const auto emit_draw = [&](uint32_t vertex_count, uint32_t first_index) {
+		if (vertex_count > draw.index_count) {
+			EXIT("EmitDrawPrimitives: refusing to emit %u vertices for a %u-index draw "
+			     "(prim=%u indexed=%u) -- a primitive-expansion step would run the guest vertex "
+			     "shader on an index it never submitted\n",
+			     vertex_count, draw.index_count, static_cast<uint32_t>(ucfg.GetPrimType()),
+			     emit.indexed);
+		}
+		if (emit.indexed) {
+			vk_buffer.drawIndexed(vertex_count, draw.instance_count, first_index,
+			                      emit.vertex_offset, emit.first_instance);
+		} else {
+			vk_buffer.draw(vertex_count, draw.instance_count, first_index + emit.first_vertex,
+			               emit.first_instance);
+		}
+	};
+
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1040,33 +1392,28 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriList:
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
-		case Prospero::PrimitiveType::kRectList:
-			if (emit.indexed) {
-				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
-				                      emit.first_instance);
-			} else {
-				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
-				               emit.first_instance);
-			}
+			emit_draw(draw.index_count, 0);
 			break;
+		case Prospero::PrimitiveType::kRectList:
 		case Prospero::PrimitiveType::kRectListLegacy:
-			if (emit.indexed) {
-				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+			// Both are GNM rectangle-list encodings expanded by the tessellation control/
+			// evaluation shaders in rectListShader.cpp, which consume 3 real guest vertices per
+			// rectangle (patchControlPoints == 3, see pipeline/shaders.cpp) and interpolate the
+			// 4th corner themselves. A count that is not a multiple of 3 means the guest issued a
+			// malformed rect-list draw -- surface that with the actual numbers rather than
+			// silently truncating or over-reading.
+			if (draw.index_count % 3 != 0) {
+				EXIT("rect-list draw has index_count not a multiple of 3: prim=%u index_count=%u "
+				     "vs_buffers_num=%d indexed=%u\n",
+				     static_cast<uint32_t>(ucfg.GetPrimType()), draw.index_count,
+				     vs_input_info.buffers_num, emit.indexed);
 			}
-			// Sarah
-			EXIT_NOT_IMPLEMENTED(!(draw.index_count == 3 && vs_input_info.buffers_num == 0));
-			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, emit.first_instance);
+			emit_draw(draw.index_count, 0);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
-				if (emit.indexed) {
-					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
-					                      emit.first_instance);
-				} else {
-					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
-					               emit.first_instance);
-				}
+				emit_draw(4, i);
 			}
 			break;
 		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
@@ -1120,9 +1467,41 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	const auto rendering =
+	auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
+	// Debug-only (see RenderAttachment::vs_shader_hash in renderTarget.h): stamp the shader
+	// identity and guest primitive type onto every color attachment this draw targets, so
+	// --draw-dump can name a dumped PNG after the exact shader/primitive that produced it.
+	// Deliberately excluded from RenderAttachment::operator== -- see that struct's comment.
+	{
+		const auto vs_hash    = DrawVsShaderHash(state);
+		const auto ps_hash    = DrawPsShaderHash(state);
+		const auto prim_type = static_cast<uint32_t>(ucfg.GetPrimType());
+		uint64_t   tex_address[RenderAttachment::TEX_DEBUG_MAX] {};
+		uint32_t   tex_format[RenderAttachment::TEX_DEBUG_MAX] {};
+		uint32_t   tex_tile_mode[RenderAttachment::TEX_DEBUG_MAX] {};
+		if (bindings.pixel.has_value()) {
+			for (uint32_t t = 0;
+			     t < RenderAttachment::TEX_DEBUG_MAX && t < bindings.pixel->images.size(); t++) {
+				const auto& info  = bindings.pixel->images[t].desc.info;
+				tex_address[t]    = info.data.address;
+				tex_format[t]     = static_cast<uint32_t>(info.guest_format);
+				tex_tile_mode[t]  = static_cast<uint32_t>(info.tile_mode);
+			}
+		}
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			auto& attachment          = rendering.color_attachments[i];
+			attachment.vs_shader_hash = vs_hash;
+			attachment.ps_shader_hash = ps_hash;
+			attachment.prim_type      = prim_type;
+			for (uint32_t t = 0; t < RenderAttachment::TEX_DEBUG_MAX; t++) {
+				attachment.tex_address[t]   = tex_address[t];
+				attachment.tex_format[t]    = tex_format[t];
+				attachment.tex_tile_mode[t] = tex_tile_mode[t];
+			}
+		}
+	}
 
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
@@ -1248,7 +1627,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (graphics_debug_dump_enabled()) {
-		sh_print("GraphicsRenderDrawIndex():Shader:", sh_ctx);
+		sh_print("GraphicsRenderDrawIndex():Shader:", sh_ctx, buffer.GetRegisters());
 		uc_print("GraphicsRenderDrawIndex():UserConfig:", ucfg);
 		hw_print(buffer);
 
@@ -1314,9 +1693,17 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	RefreshShaders(buffer, draw, true, state);
+	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
+		// MaterializeResources rejected a descriptor set for this draw's VS or PS
+		// (ProgramCache::Get already logged the shader hash, stage and reason once) -- skip the
+		// draw instead of dereferencing a null state.*_input_info.stage.program below.
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
 	                     args.index_addr);
+	LogRectListFlatHazardIfNeeded(buffer, draw.name, topology, state);
 
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto vertex_offset =
@@ -1329,6 +1716,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.vertex_offset = vertex_offset;
 	emit.first_instance =
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
+
+	LogLegacyRectDrawIfNeeded(buffer, draw.name, ucfg, state, draw, emit);
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart, true, true, false);
@@ -1364,7 +1753,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	if (graphics_debug_dump_enabled()) {
-		sh_print("GraphicsRenderDrawIndexAuto():Shader:", sh_ctx);
+		sh_print("GraphicsRenderDrawIndexAuto():Shader:", sh_ctx, buffer.GetRegisters());
 		uc_print("GraphicsRenderDrawIndexAuto():UserConfig:", ucfg);
 		hw_print(buffer);
 
@@ -1396,14 +1785,31 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	RefreshShaders(buffer, draw, false, state);
+	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
+		// See the identical guard in DrawIndex: skip rather than dereference a null
+		// state.*_input_info.stage.program below.
+		ResetBindings();
+		return;
+	}
 
-	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
+	// Keyed on the true (non-legacy) kRectList primitive specifically, not on "topology happens
+	// to be ePatchList": both kRectList and kRectListLegacy now use ePatchList (see
+	// GetDrawTopology above), but this skip's shape -- no VS param exports at all, yet the PS
+	// declares inputs -- was characterized against kRectList's tessellation path. Re-keying to
+	// the topology alone would newly swallow kRectListLegacy draws that render correctly and
+	// always have (e.g. a procedural fullscreen-quad VS with buffers_num==0 and no PS inputs to
+	// receive, which does not even match this shape, or one that does and previously rendered
+	// fine as a 4-vertex strip) with no diagnostic explaining why they vanished.
+	const bool rect_list = ucfg.GetPrimType() == Prospero::PrimitiveType::kRectList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {
-		if (graphics_debug_dump_enabled()) {
-			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
-			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
+		static Log::RateLimit limiter {"DrawIndexAuto:SkipRectListNoExports", 128};
+		if (const auto hit = limiter.Hit()) {
+			LOGF("DrawIndexAuto[%llu]: skipping rect-list draw with no VS param exports and PS "
+			     "inputs: frame=%d ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64
+			     " gs=0x%016" PRIx64 "\n",
+			     static_cast<unsigned long long>(*hit), buffer.GetContext().GetGpu().GetFrameNum(),
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
@@ -1414,6 +1820,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	LogDrawStateIfNeeded(buffer, draw, state, false,
 	                     ucfg.GetPrimType() == Prospero::PrimitiveType::kRectListLegacy, 0,
 	                     nullptr);
+	LogRectListFlatHazardIfNeeded(buffer, draw.name, topology, state);
 
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto vertex_offset =
@@ -1424,6 +1831,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset);
 	emit.first_instance =
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
+
+	LogLegacyRectDrawIfNeeded(buffer, draw.name, ucfg, state, draw, emit);
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,

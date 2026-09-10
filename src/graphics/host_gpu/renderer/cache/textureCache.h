@@ -58,6 +58,15 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// Session-31 fix (astro_playroom_issues.md): like ClearImageFromBuffer, but matched by
+	// address alone (a render target's byte size isn't cheaply known at the EliminateFastClear
+	// call site the way a compute-dispatch buffer-fill's is) and using an already-decoded
+	// vk::ClearColorValue rather than a single packed dword. Issues the clear on `command`
+	// immediately if a real, already-registered image exists at `address`; returns false
+	// (nothing cleared) if none is registered yet -- the caller falls back to
+	// ArmColorClear/TakePendingColorClear for that case.
+	[[nodiscard]] bool TryImmediateColorClear(CommandBuffer& command, uint64_t address,
+	                                          vk::ClearColorValue value);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
@@ -69,6 +78,19 @@ public:
 	// Record deferred DCC state while the original guest dispatch writes the metadata.
 	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+
+	// Session-30 fix (astro_playroom_issues.md): a guest EliminateFastClear special draw
+	// (renderDraw.cpp's ConsumeMetadataColorOperation) is real evidence the color target at
+	// `address` should be cleared to `value` -- confirmed against real hardware/emulator
+	// behavior (mesa RADV, shadPS4) rather than assumed. TrackDccFill's compute-dispatch-fill
+	// detection never fires for this game (live-verified), so this is a separate, address-keyed
+	// arm/consume pair: armed here, consumed once by ResolveRenderColorTarget the next time this
+	// address is bound as a color attachment (sets RenderAttachment::is_clear, previously always
+	// false / dead). Consume-once matches real hardware's own fast-clear-eliminate semantics --
+	// a later real color write invalidates the pending clear automatically by never being asked
+	// again.
+	void ArmColorClear(uint64_t address, vk::ClearColorValue value);
+	[[nodiscard]] bool TakePendingColorClear(uint64_t address, vk::ClearColorValue* out);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -168,6 +190,7 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::unordered_map<uint64_t, vk::ClearColorValue> m_pending_color_clears;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

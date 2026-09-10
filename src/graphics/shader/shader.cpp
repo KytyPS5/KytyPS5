@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -218,8 +219,8 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	// EXIT_NOT_IMPLEMENTED(ps.user_sgpr != 0 && ps.user_sgpr != 4 && ps.user_sgpr != 12);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc2.wave_cnt_en != false);
 	if (ps.rsrc2.extra_lds_size != 0) {
-		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"PsExtraLdsReservation", 32};
+		if (limiter.Hit()) {
 			LOGF("\t PS extra LDS reservation = 0x%02" PRIx8 ", continuing\n",
 			     ps.rsrc2.extra_lds_size);
 		}
@@ -229,8 +230,8 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 
 	if (sh.shader_z_format != 0x00000000 && sh.shader_z_format != 0x00000001 &&
 	    !sh.db_shader_control.shader_z_export_enable) {
-		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"ShaderZFormatIgnoredExport", 32};
+		if (limiter.Hit()) {
 			LOGF("\t shader_z_format = 0x%08" PRIx32
 			     " with z export disabled, ignoring depth export format\n",
 			     sh.shader_z_format);
@@ -254,8 +255,8 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	EXIT_NOT_IMPLEMENTED((sh.baryc_cntl & ~baryc_known_mask) != 0);
 	EXIT_NOT_IMPLEMENTED((sh.baryc_cntl & baryc_persp_mask) != 0);
 	if ((sh.ps_input_ena & ps_input_linear_center) == 0 && (sh.baryc_cntl & baryc_linear_mask) != 0) {
-		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"IgnoringInactiveLinearBarycCntl", 32};
+		if (limiter.Hit()) {
 			LOGF("\t ignoring inactive linear SPI_BARYC_CNTL bits: 0x%08" PRIx32 "\n",
 			     sh.baryc_cntl & baryc_linear_mask);
 		}
@@ -281,8 +282,8 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	}
 
 	if (sh.db_shader_control.other_bits != 0x00000000) {
-		static std::atomic_uint log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		static Log::RateLimit limiter {"IgnoringUnsupportedDbShaderControlBits", 32};
+		if (limiter.Hit()) {
 			LOGF("\t temporary: ignoring unsupported DB_SHADER_CONTROL bits 0x%08" PRIx32 "\n",
 			     sh.db_shader_control.other_bits);
 		}
@@ -403,9 +404,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
 
 		if (fetch_index != 0) {
-			static std::atomic<uint64_t> log_count = 0;
-			auto                         log_id    = log_count.fetch_add(1);
-			if (log_id < 64) {
+			static Log::RateLimit limiter {"VertexAttribFetchIndex", 64};
+			if (limiter.Hit()) {
 				LOGF("\t temporary: PS5 vertex attrib semantic %u uses fetch index %u, buffer "
 				     "index %zu\n",
 				     static_cast<uint32_t>(in.semantic), fetch_index, index);
@@ -432,9 +432,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
-			static std::atomic<uint64_t> log_count      = 0;
-			auto                         log_id         = log_count.fetch_add(1);
-			if (log_id < 64) {
+			static Log::RateLimit limiter {"VertexAttribFormatMapping", 64};
+			if (limiter.Hit()) {
 				LOGF("\t PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
 				     "format %u, offset %u, buffer index %zu\n",
 				     static_cast<uint32_t>(in.semantic), static_cast<uint32_t>(format),
@@ -579,11 +578,61 @@ static void ShaderGetStaticInputInfoPS(
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
 	// flags in the hardware state and extract only the input count here.
 	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	// SPI_PS_IN_CONTROL.PS_W32_EN (bit 15): the guest requests wave32 execution for this
+	// pixel shader. Previously never read, so every pixel shader was compiled and run with
+	// wave64 EXEC semantics (CompileOptions::wave_size's default) regardless of what the
+	// guest actually programmed here.
+	ps_info.wave_size = ((sh.ps_in_control >> Pm4::SPI_PS_IN_CONTROL_PS_W32_EN_SHIFT) &
+	                      Pm4::SPI_PS_IN_CONTROL_PS_W32_EN_MASK) != 0
+	                         ? 32u
+	                         : 64u;
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
-	if ((active_inputs & 0x00000002u) != 0) {
-		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
+	// SPI_PS_INPUT_ENA/ADDR bit -> (PsBarycentricMode, vgpr count), walked in exactly the same
+	// bit order ShaderCalcPsSystemInputBase uses to reserve VGPR slots, so the two cannot drift.
+	// Was: only bit 1 (PERSP_CENTER) was ever handled here; every other enabled mode left its
+	// VGPR pair genuinely uninitialized, which reads as I=J=0 -- collapsing
+	// attr = P0 + I*(P1-P0) + J*(P2-P0) to P0 for the whole triangle (flat-per-triangle
+	// corruption on a shader that asked for a different barycentric mode). Nothing warned.
+	// Starts at VGPR 0, NOT ps_system_input_base: ps_system_input_base (computed above by
+	// ShaderCalcPsSystemInputBase) is the register AFTER all barycentric+stipple VGPRs --
+	// the base for pos_x/y/z/w/front_face/ancillary below, not for these.
+	uint32_t reg = 0;
+	static constexpr struct {
+		uint32_t          bit;
+		PsBarycentricMode mode;
+	} kBarycentricBits[] = {
+	    {0x00000001u, PsBarycentricMode::PerspSample},
+	    {0x00000002u, PsBarycentricMode::PerspCenter},
+	    {0x00000004u, PsBarycentricMode::PerspCentroid},
+	};
+	for (const auto& entry: kBarycentricBits) {
+		if ((active_inputs & entry.bit) != 0) {
+			ps_info.barycentric_vgpr[static_cast<size_t>(entry.mode)] = reg;
+			reg += 2;
+		}
+	}
+	// PERSP_PULL_MODEL (bit 3, 3 VGPRs: 1/W, I/W, J/W): its perspective-divided form has no
+	// gl_BaryCoordKHR equivalent to source from. Loud failure instead of silently leaving its
+	// VGPRs (and therefore the shader's math) undefined.
+	EXIT_NOT_IMPLEMENTED((active_inputs & 0x00000008u) != 0);
+	if ((active_inputs & 0x00000008u) != 0) {
+		reg += 3;
+	}
+	static constexpr struct {
+		uint32_t          bit;
+		PsBarycentricMode mode;
+	} kLinearBarycentricBits[] = {
+	    {0x00000010u, PsBarycentricMode::LinearSample},
+	    {0x00000020u, PsBarycentricMode::LinearCenter},
+	    {0x00000040u, PsBarycentricMode::LinearCentroid},
+	};
+	for (const auto& entry: kLinearBarycentricBits) {
+		if ((active_inputs & entry.bit) != 0) {
+			ps_info.barycentric_vgpr[static_cast<size_t>(entry.mode)] = reg;
+			reg += 2;
+		}
 	}
 	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
 		const auto& semantic = data.input_semantics[i];
@@ -652,6 +701,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.resources_num);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	key.push_back(info.wave_size);
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -697,10 +747,13 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
 	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.wave_size);
 	key.push_back(info.input_num);
 	key.push_back(info.ps_system_input_base);
 	key.push_back(info.custom_interpolation_mask);
-	key.push_back(info.ps_perspective_center_vgpr);
+	for (const auto vgpr: info.barycentric_vgpr) {
+		key.push_back(vgpr);
+	}
 	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
@@ -753,6 +806,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
+		// VGT_SHADER_STAGES_EN.VS_W32_EN: previously never read, so the plain (non-mesh) VS
+		// path always compiled with the wave64 default regardless of what the guest requested.
+		info.wave_size = ((context.GetShaderStages() >> Pm4::VGT_SHADER_STAGES_EN_VS_W32_EN_SHIFT) &
+		                   Pm4::VGT_SHADER_STAGES_EN_VS_W32_EN_MASK) != 0
+		                      ? 32u
+		                      : 64u;
 		return params;
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
@@ -762,7 +821,11 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
-	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
+	mesh.wave_size           = ((context.GetShaderStages() >>
+	                             Pm4::VGT_SHADER_STAGES_EN_GS_W32_EN_SHIFT) &
+	                            Pm4::VGT_SHADER_STAGES_EN_GS_W32_EN_MASK) != 0
+	                               ? 32u
+	                               : 64u;
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
 	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
@@ -890,7 +953,8 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	LOGF("\t input_num            = %u\n"
 	     "\t ps_system_input_base = %u\n"
 	     "\t custom_interpolation_mask = 0x%08" PRIx32 "\n"
-	     "\t ps_perspective_center_vgpr = %" PRIu32 "\n"
+	     "\t barycentric_vgpr[PerspSample/Center/Centroid,LinearSample/Center/Centroid] = "
+	     "%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 "\n"
 	     "\t ps_pos_x             = %s\n"
 	     "\t ps_pos_y             = %s\n"
 	     "\t ps_pos_z             = %s\n"
@@ -903,7 +967,13 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_early_z           = %s\n"
 	     "\t ps_execute_on_noop   = %s\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
-	     info.ps_perspective_center_vgpr, info.ps_pos_x ? "true" : "false",
+	     info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::PerspSample)],
+	     info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::PerspCenter)],
+	     info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::PerspCentroid)],
+	     info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::LinearSample)],
+	     info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::LinearCenter)],
+	     info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::LinearCentroid)],
+	     info.ps_pos_x ? "true" : "false",
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
 	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
 	     info.ps_ancillary ? "true" : "false",

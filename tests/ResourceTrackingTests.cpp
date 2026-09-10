@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -1208,6 +1209,61 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
+// Astro's Playroom SRT investigation: a real (if narrow) gap found along the way -- not the
+// crash's actual cause, which was a genuinely per-workgroup-varying descriptor address,
+// structurally unrelated to this. RuntimeValidator special-cases a Select whose condition equals
+// the exec mask of an enclosing ReadFirstLane: the false branch is provably dead for the lane
+// ReadFirstLane reads from, so it is validated with require_uniform=false, which skips
+// Phi-invariance entirely. ExtractResourcePlan's Clone() had no matching case and walked the
+// false branch unconditionally. Verified directly (temporarily disabling Clone()'s narrowing)
+// that this test passes either way today: Evaluator::EvaluateWide's own identical active-mask
+// check already intercepts one level up, at the Select itself, before ever dispatching into the
+// false branch, so Clone()'s narrowing is currently redundant with that, not load-bearing. This
+// exercises the combination and documents the contract (a Select gated by ReadFirstLane's own
+// mask must materialize regardless of its false branch) rather than proving Clone()'s narrowing
+// specifically -- it would become a real regression test if the evaluator-side check were ever
+// changed or removed.
+void TestCloneNarrowsSelectUnderReadFirstLaneMask() {
+  Fixture fixture;
+  auto *left = fixture.block;
+  auto *right = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  left->AddBranch(merge);
+  right->AddBranch(merge);
+  // Structurally non-invariant on its own: two different immediates on two different edges.
+  auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                   static_cast<uint64_t>(Type::U32));
+  phi.AddPhiOperand(left, Value(1u));
+  phi.AddPhiOperand(right, Value(2u));
+
+  const auto mask = fixture.Emit(ValueOpcode::INotEqual32,
+                                 {fixture.UserData(2), Value(0u)}, 0, merge);
+  const auto select = fixture.Emit(
+      ValueOpcode::SelectU32, {mask, fixture.UserData(0), Value(&phi)}, 0, merge);
+  const auto broadcast =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {select, mask}, 0, merge);
+  const auto handle =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {broadcast, Value(0u), Value(0u), Value(0u)}, MemoryFlags{0, 20},
+                   merge);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 20), merge);
+
+  fixture.PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+
+  std::array<uint32_t, 3> user_data{0x1000u, 0u, 1u};
+  SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a Select's never-validated false branch broke materialization of its "
+        "ReadFirstLane-guarded true branch");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -1845,6 +1901,7 @@ void TestMalformedMemoryKindsRejected() {
 } // namespace
 
 int main() {
+  Config::Initialize();
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -1865,6 +1922,8 @@ int main() {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
+    Run("clone narrows select under ReadFirstLane mask",
+        TestCloneNarrowsSelectUnderReadFirstLaneMask);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

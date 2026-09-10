@@ -22,19 +22,55 @@ Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 
 } // namespace
 
+void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) {
+	const auto zero  = IR::U32(IR::Value(0u));
+	const auto lo    = ir.GetExecLo();
+	const auto hi    = ir.GetExecHi();
+	const auto saved = ReadU32(inst.dst);
+	if (begin) {
+		const auto low_active = ir.INotEqual(lo, zero);
+		instruction_branch_condition = ir.IEqual(ir.BitwiseOr(lo, hi), zero);
+		WriteRawU32(inst.dst, ir.Select(instruction_branch_condition, saved,
+		                               ir.Select(low_active, hi, lo)));
+		// Keep the ISA assignment order: SDST may itself name an EXEC half.
+		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
+		            ir.Select(low_active, zero, ir.GetExecHi()));
+	} else {
+		const auto high_active = ir.INotEqual(hi, zero);
+		instruction_branch_condition =
+		    ir.LogicalAnd(ir.LogicalNot(high_active), ir.INotEqual(saved, zero));
+		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
+		            ir.Select(instruction_branch_condition, saved, hi));
+		WriteRawU32(inst.dst,
+		            ir.Select(instruction_branch_condition, lo, ReadU32(inst.dst)));
+		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo),
+		            ir.Select(high_active, saved,
+		                      ir.Select(instruction_branch_condition, zero, ir.GetExecLo())));
+	}
+}
+
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
 	if (!write_64) {
-		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
-		const auto old = ir.GetExecLo();
-		const auto src = ReadU32(inst.src0);
-		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
-		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		IR::U32 result;
+		// Upstream fix (32ea086, functionally identical here modulo comment/EXIT-string wording):
+		// the wave32 SAVEEXEC forms are ordinary scalar ALU bitwise ops on the raw EXEC_LO word
+		// and the raw source SGPR value -- not a per-lane mask/predicate operation. The mask-based
+		// path below (ReadMask/LogicalAnd/LogicalOr/BallotMask) is only correct for the write_64
+		// (wave64) forms; reusing it for wave32 would silently mishandle EXEC_HI (which wave32
+		// SAVEEXEC must leave untouched) and derive the new mask via ballot instead of plain
+		// bitwise arithmetic on the operand's actual bits. Confirmed against real captured
+		// S_ORN2_SAVEEXEC_B32 bytes (reproduced in ASTRO's Playroom, 2026-09-09: this opcode, 0x40, was
+		// independently reported against Black Myth: Wukong and Still Wakes the Deep on the
+		// project's missing-opcode tracking issue; this fix matches the one that resolved both).
+		const auto old    = ir.GetExecLo();
+		const auto src    = ReadU32(inst.src0);
+		const auto lhs    = negate_exec ? ir.BitwiseNot(old) : old;
+		const auto rhs    = negate_source ? ir.BitwiseNot(src) : src;
+		IR::U32    result;
 		switch (operation) {
 			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
-			default: EXIT("unsupported SAVEEXEC operation");
+			default: EXIT("S_SAVEEXEC: unsupported wave32 operation\n");
 		}
 		WriteRawU32(inst.dst, old);
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo), result);
@@ -272,6 +308,28 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 			default: break;
 		}
 	}
+}
+
+void Translator::S_WQM_B32(const Decoder::Instruction& inst) {
+	// Wave32 sibling of S_WQM_B64 below (reproduced in ASTRO's Playroom, 2026-09-09) -- same shape, one
+	// 32-bit dword instead of 64 bits, so the mask/predicate half only ever carries the low
+	// dword (matches the ExecLo/VccLo write path's `ThreadBit({value, U32(0)})` convention at
+	// Translate.cpp:636 for wave32 sources).
+	const auto result =
+	    IR::U32(ir.Emit(IR::ValueOpcode::WqmU32, {ReadOperand(inst.src0, IR::Type::U32)}));
+	WriteOperand(DestinationOperand(inst), result);
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
+		// This only ever writes one 32-bit word. Even when src0's pair-wide predicate was
+		// valid, this register's own tracked ThreadBit above hardcodes the OTHER word to 0,
+		// so it cannot stand in for a real pair-wide predicate: keep the tag invalid (the
+		// generic WriteOperand path above already set it so) rather than re-asserting the
+		// source's validity, or a later 64-bit read of this register pair would trust a
+		// stale/wrong high half instead of falling back to the real raw bits. Reproduced in
+		// ASTRO's Playroom as ScalarWqmB32MasksWave64's lane-35 mismatch, 2026-09-10.
+		ir.SetThreadBitScalarReg(dst, ThreadBit({result, IR::U32(IR::Value(0u))}));
+	}
+	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual32, {result, IR::Value(uint32_t {0})})));
 }
 
 void Translator::S_WQM_B64(const Decoder::Instruction& inst) {

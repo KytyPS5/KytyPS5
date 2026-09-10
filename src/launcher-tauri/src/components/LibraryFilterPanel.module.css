@@ -1,0 +1,99 @@
+/* Dark flyout, anchored to Library's left rail by the caller (Library.module.css's
+   .rail is position:relative; this panel positions itself relative to that). */
+.panel {
+  position: absolute;
+  top: 0;
+  left: calc(100% + 12px);
+  z-index: var(--z-ctx);
+  min-width: 260px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: var(--glass-heavy-bg);
+  backdrop-filter: var(--glass-heavy-blur);
+  -webkit-backdrop-filter: var(--glass-heavy-blur);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.6);
+  animation: panel-enter var(--t-panel) var(--ease-enter);
+}
+
+/* Used on both a real <button> (Sort by / Status / Played -- must be a real
+   focusable element for gamepad/keyboard to reach it, not a div an onClick
+   only a mouse can trigger) and a plain <div> (the Custom settings row,
+   whose own Toggle is the focusable part) -- reset the button-specific
+   properties so both look identical. */
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 20px;
+  padding: 12px 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .row:hover {
+  background: var(--glass-bg-strong);
+}
+
+.rowValue {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.subheading {
+  margin: 12px 4px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+}
+
+.submenu {
+  position: absolute;
+  top: 0;
+  left: calc(100% + 8px);
+  z-index: var(--z-ctx);
+  min-width: 200px;
+  padding: 8px;
+  border-radius: var(--radius-md);
+  background: var(--glass-heavy-bg);
+  backdrop-filter: var(--glass-heavy-blur);
+  -webkit-backdrop-filter: var(--glass-heavy-blur);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.6);
+  animation: panel-enter var(--t-panel) var(--ease-enter);
+  display: flex;
+  flex-direction: column;
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .option:hover {
+  background: var(--glass-bg-strong);
+}
+
+.check {
+  color: var(--accent);
+  flex: none;
+}

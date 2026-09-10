@@ -1,0 +1,70 @@
+/* LayoutPicker.tsx used inline `style` objects, which is why hover was never
+   possible here. Hover lights the whole card (preview + radio row), not just
+   the preview box, so both brighten together. */
+
+.card {
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.preview {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  border-radius: var(--radius-sm);
+  border: 2px solid var(--glass-border-strong);
+  box-shadow: none;
+  background: var(--bg-elevated);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui), background-color var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .card:hover .preview:not(.previewActive) {
+  background-color: var(--glass-bg-strong);
+}
+.previewActive {
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.labelRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  transition: color var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .card:hover .labelRow:not(.labelRowActive) {
+  color: var(--text-primary);
+}
+.labelRowActive {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.radio {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.radioActive {
+  border-color: var(--accent);
+}
+
+.radioDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}

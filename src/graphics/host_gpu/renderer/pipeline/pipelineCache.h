@@ -211,12 +211,22 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	std::filesystem::path         m_shader_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
 	void InitializeDriverCache();
+	// Loads the disk-cached SPIR-V for every recompiled shader this title has
+	// produced before, keyed by guest shader identity + resource
+	// specialization. This skips only ShaderRecompiler::CompileProgram
+	// (IR -> SPIR-V emission); TranslateProgram (guest decode) and resource
+	// materialization still run every launch, since the specialization a
+	// cache lookup needs is only known after they do. Save() (shared with
+	// the driver pipeline cache) writes every permutation compiled or loaded
+	// this session back to the same file.
+	void InitializeShaderDiskCache();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

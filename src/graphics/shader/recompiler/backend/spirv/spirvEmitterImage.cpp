@@ -548,7 +548,16 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 } // namespace
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto op         = inst.GetOpcode();
+	const auto op = inst.GetOpcode();
+	if (op == IR::ValueOpcode::ImageBvhIntersectRay) {
+		// Stub, inert "no intersection" semantics: 4 channels of 0xFFFFFFFF
+		// (absent-child sentinel for a box node, NaN time for a triangle node)
+		auto&      state = ctx.state;
+		const auto max   = ConstantU32(state, 0xFFFFFFFFu);
+		ctx.Define(inst, state.builder.Constant(OpConstantComposite, TypeU32Composite(state, 4),
+		                                        {max, max, max, max}));
+		return true;
+	}
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
 	if (image_info.access == IR::ImageAccess::None) {
 		return false;

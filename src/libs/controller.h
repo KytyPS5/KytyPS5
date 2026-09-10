@@ -71,6 +71,10 @@ void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void ResetInputState();
 
+// Fires any --input-script events scheduled at or before this guest-presented frame number.
+// No-op if --input-script wasn't given. Called once per presented frame from Presenter::Present.
+void TickInputScript(int frame_num);
+
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);

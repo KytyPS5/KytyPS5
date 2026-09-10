@@ -1,0 +1,148 @@
+/* Profile Overview's stat card row, matching the real PS5 profile page's
+   own shape: flat dark cards, a data-dense body, a muted footer label
+   underneath -- see plan's reference screenshot. Three cards, not the
+   reference's four: its fourth card is Friends, and this is an offline
+   emulator launcher with no friends concept, so it's omitted rather than
+   faked (same honesty rule store/trophies.ts's doc follows for Earned). */
+
+.cardRow {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 40px;
+}
+
+.card {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 22px;
+  border-radius: var(--radius-md);
+  background: var(--osd-bg);
+  border: 1px solid var(--osd-border);
+}
+
+.cardFooterLabel {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.cardFooterValue {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-top: 2px;
+}
+
+/* ---- Trophies card ------------------------------------------------- */
+
+.trophyHeader {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.trophyIcon {
+  color: var(--medal-gold);
+  flex: none;
+}
+.trophyEarnedTotal {
+  font-size: 26px;
+  font-weight: 800;
+  color: var(--text-primary);
+  letter-spacing: -0.5px;
+}
+.trophyPercent {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.trophyBar {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+.trophyBarFill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--radius-pill);
+}
+
+.medalRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.medalCol {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.medalValue {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* ---- Most played / Games cards -------------------------------------- */
+
+.mostPlayedList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mostPlayedRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.mostPlayedCover {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex: none;
+  background: var(--bg-elevated);
+}
+.mostPlayedCover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.mostPlayedName {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mostPlayedHours {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.gamesCovers {
+  display: flex;
+  gap: 8px;
+}
+.gamesCover {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex: none;
+  background: var(--bg-elevated);
+}
+.gamesCover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}

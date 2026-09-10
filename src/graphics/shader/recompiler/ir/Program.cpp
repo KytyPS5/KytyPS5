@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
@@ -15,6 +16,108 @@ namespace {
 [[noreturn]] void Fail(std::string_view message) {
 	EXIT("shader IR validation failed: %s", std::string(message).c_str());
 	std::abort();
+}
+
+bool IsRuntimeRead(ValueOpcode opcode);
+
+// Diagnostic kept from the Astro's Playroom SRT investigation: names the exact two leaf values a
+// non-invariant Phi disagreed on, and, when both are the same kind of memory read, the first
+// MemoryInfo field that differs between them. Not a bug hunt tool anymore -- the root cause
+// there was a genuinely per-workgroup-varying descriptor address (a tile-lighting shader
+// indexing a light-data array with a value only known once dispatch execution starts), which
+// PipelineCache::ProgramCache::Get now handles by skipping the draw/dispatch rather than
+// aborting. Kept as permanent, low-cost infrastructure for the next report of the same shape:
+// LogPhiDivergence below early-returns on Log::IsSilent() before doing any of this work, since
+// ResolveInvariantPhi sits on the runtime materialization retry path Phase D relies on (a known-
+// bad shader is retried every dispatch, never cached as a permanent failure).
+std::string DescribeInvariantPhiLeaf(Value value) {
+	value           = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		if (value.IsImmediate() && value.GetType() == Type::U32) {
+			return fmt::format("immediate u32 0x{:08x}", value.U32());
+		}
+		return fmt::format("non-instruction value of type 0x{:x}",
+		                   static_cast<uint32_t>(value.GetType()));
+	}
+	return fmt::format("{} (flags=0x{:016x})", ValueOpcodeName(inst->GetOpcode()),
+	                   inst->Flags<uint64_t>());
+}
+
+std::string FirstDifferingMemoryField(const MemoryInfo& a, const MemoryInfo& b) {
+	const struct {
+		const char* name;
+		bool        equal;
+	} fields[] = {
+	    {"kind", a.kind == b.kind},
+	    {"resource", a.resource == b.resource},
+	    {"sampler", a.sampler == b.sampler},
+	    {"offset", a.offset == b.offset},
+	    {"secondary_offset", a.secondary_offset == b.secondary_offset},
+	    {"dmask", a.dmask == b.dmask},
+	    {"data_dwords", a.data_dwords == b.data_dwords},
+	    {"data_bits", a.data_bits == b.data_bits},
+	    {"component_index", a.component_index == b.component_index},
+	    {"component_count", a.component_count == b.component_count},
+	    {"data_format", a.data_format == b.data_format},
+	    {"number_format", a.number_format == b.number_format},
+	    {"image_sample_flags", a.image_sample_flags == b.image_sample_flags},
+	    {"image_dimension", a.image_dimension == b.image_dimension},
+	    {"image_address_components", a.image_address_components == b.image_address_components},
+	    {"image_nsa_dwords", a.image_nsa_dwords == b.image_nsa_dwords},
+	    {"image_nsa_addr",
+	     std::equal(std::begin(a.image_nsa_addr), std::end(a.image_nsa_addr),
+	                std::begin(b.image_nsa_addr))},
+	    {"memory_segment", a.memory_segment == b.memory_segment},
+	    {"address_is_full", a.address_is_full == b.address_is_full},
+	    {"data_signed", a.data_signed == b.data_signed},
+	    {"typed", a.typed == b.typed},
+	    {"formatted", a.formatted == b.formatted},
+	    {"image_has_mip", a.image_has_mip == b.image_has_mip},
+	    {"image_r128", a.image_r128 == b.image_r128},
+	    {"glc", a.glc == b.glc},
+	    {"slc", a.slc == b.slc},
+	    {"idxen", a.idxen == b.idxen},
+	    {"offen", a.offen == b.offen},
+	    {"planning_only", a.planning_only == b.planning_only},
+	};
+	for (const auto& field: fields) {
+		if (!field.equal) {
+			return field.name;
+		}
+	}
+	return {};
+}
+
+void LogPhiDivergence(const ResourcePlan& program, Value invariant, Value current) {
+	// ResolveInvariantPhi is on the runtime materialization retry path for any shader Phase D's
+	// non-fatal fallback lets keep running (MaterializeResources is deliberately retried every
+	// dispatch, never cached as a permanent failure -- see ProgramCache::Get). Astro's Playroom's
+	// 9 affected shaders drove this to 1.5 million calls in a single 90-second run; LOGF itself
+	// is silence-gated, but the formatting work below is not, so it must bail out here first or
+	// "temporary diagnostic, cheap when logging is off" is simply false.
+	if (::Log::IsSilent()) {
+		return;
+	}
+	auto detail =
+	    fmt::format("{} vs {}", DescribeInvariantPhiLeaf(invariant), DescribeInvariantPhiLeaf(current));
+	const auto* lhs = invariant.Resolve().TryInstruction();
+	const auto* rhs = current.Resolve().TryInstruction();
+	if (lhs != nullptr && rhs != nullptr && IsRuntimeRead(lhs->GetOpcode()) &&
+	    IsRuntimeRead(rhs->GetOpcode())) {
+		const auto li = lhs->Flags<MemoryFlags>().index;
+		const auto ri = rhs->Flags<MemoryFlags>().index;
+		if (li < program.memory_info.size() && ri < program.memory_info.size()) {
+			const auto field = FirstDifferingMemoryField(program.memory_info[li], program.memory_info[ri]);
+			detail += field.empty()
+			              ? fmt::format(", memory_info[{}] == memory_info[{}] (identity differs only)",
+			                            li, ri)
+			              : fmt::format(", memory_info[{}] vs memory_info[{}] first differs in {}",
+			                            li, ri, field);
+		}
+	}
+	LOGF("shader SRT: hash=0x%016llx ResolveInvariantPhi diverged: %s\n",
+	    static_cast<unsigned long long>(program.shader_hash), detail.c_str());
 }
 
 bool IsRegisterStatePseudo(ValueOpcode opcode) {
@@ -178,6 +281,7 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 		if (invariant.IsEmpty()) {
 			invariant = current;
 		} else if (!EquivalentValue(program, invariant, current)) {
+			LogPhiDivergence(program, invariant, current);
 			return {};
 		}
 	}

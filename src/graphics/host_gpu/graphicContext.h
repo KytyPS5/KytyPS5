@@ -27,6 +27,11 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory. Both are
+	// optional and are enabled together: priority is what tells the driver
+	// which allocations to demote first, and pageable_device_local_memory is
+	// what lets it demote instead of failing the allocation outright.
+	bool                               memory_priority_ext_enabled           = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
@@ -93,19 +98,6 @@ struct GraphicContext {
 
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
-
-	// Load (and validate) the on-disk pipeline cache, then create the
-	// vk::PipelineCache. Never fails the caller: a backend without a cache
-	// renders identically, just slower on first use of each pipeline.
-	void CreatePipelineCache();
-	// Serialise the cache to disk, leaving it usable. Split out from
-	// DestroyPipelineCache() because the emulator's normal exit is
-	// std::quick_exit(), which runs no destructors - so the only chance to
-	// write the cache is before that, with the device still alive.
-	void SavePipelineCache();
-	// Serialise the cache back to disk and destroy it. Safe to call when
-	// CreatePipelineCache() was never called or failed.
-	void DestroyPipelineCache();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;

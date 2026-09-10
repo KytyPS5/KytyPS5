@@ -3,7 +3,6 @@
 #include "SDL.h"
 #include "SDL_vulkan.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/host_gpu/vulkanInstance.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -158,7 +157,7 @@ std::string BuildVulkanReport() {
 	const auto   result   = vk::createInstance(&info, nullptr, &instance);
 	if (result != vk::Result::eSuccess) {
 		report += fmt::format("  could not create a Vulkan instance: {}\n\n",
-		                      VulkanToString(result));
+		                      vk::to_string(result).c_str());
 		SDL_Vulkan_UnloadLibrary();
 		release_video();
 		return report;

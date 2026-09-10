@@ -112,6 +112,9 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// VGT_SHADER_STAGES_EN.VS_W32_EN for the plain (non-mesh) VS path; unused when
+	// mesh.threads_num[0] != 0, which carries its own wave_size instead.
+	uint32_t                wave_size            = 64;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	bool                    fetch_external      = false;
@@ -128,15 +131,35 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
+// SPI_PS_INPUT_ENA/SPI_PS_INPUT_ADDR bits 0-5: which barycentric I/J pair(s) the guest PS
+// reads as system VGPRs, and at which shading location. Order matches the bit order (and the
+// VGPR-count walk in ShaderCalcPsSystemInputBase): each enabled mode gets 2 consecutive VGPRs
+// (I then J) starting at ps_system_input_base, in this same order. PERSP_PULL_MODEL (bit 3, 3
+// VGPRs) is deliberately not represented here -- see the EXIT_NOT_IMPLEMENTED in
+// ShaderGetStaticInputInfoPS for why.
+enum class PsBarycentricMode : uint32_t {
+	PerspSample,
+	PerspCenter,
+	PerspCentroid,
+	LinearSample,
+	LinearCenter,
+	LinearCentroid,
+	Count,
+};
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
-	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
+	// Index by PsBarycentricMode. UINT32_MAX = that mode is not enabled for this shader.
+	std::array<uint32_t, static_cast<size_t>(PsBarycentricMode::Count)> barycentric_vgpr = {
+	    UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
+	// SPI_PS_IN_CONTROL.PS_W32_EN, decoded to 32 or 64.
+	uint32_t                                       wave_size                    = 64;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
@@ -271,9 +294,6 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
-// Writes every recompiled shader in the in-memory cache to disk. Called on the
-// way out; see WindowFlushCaches() for why that is not a destructor.
-void ShaderSaveDiskCache();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

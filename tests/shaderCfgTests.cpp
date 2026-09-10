@@ -5854,7 +5854,7 @@ void TestCustomVintrpMovTranslation() {
   custom_ps_info.input_num = 1;
   custom_ps_info.ps_system_input_base = 2;
   custom_ps_info.custom_interpolation_mask = 1;
-  custom_ps_info.ps_perspective_center_vgpr = 0;
+  custom_ps_info.barycentric_vgpr[static_cast<size_t>(PsBarycentricMode::PerspCenter)] = 0;
   SetIdentityInterpolatorSettings(&custom_ps_info);
   custom_ps_info.interpolator_settings[0] = 0x00000420u;
 

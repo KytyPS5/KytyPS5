@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -317,7 +318,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
-	IR::ValidateProgram(program, true);
+	if (Config::ValidateShaderIrEnabled()) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	state.stage = program.stage;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);

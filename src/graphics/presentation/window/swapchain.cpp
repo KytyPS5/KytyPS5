@@ -4,7 +4,9 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -12,6 +14,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "libs/controller.h"
 
 #include <algorithm>
 #include <deque>
@@ -781,7 +784,22 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			const auto frame_num = m_impl->renderer.GetGpu().GetFrameNum();
+			auto present_dump_finish =
+			    DumpPresentedFrame(command, m_impl->present_scheduler, frame.image, frame_num);
+			// Scripted-input replay (--input-script) ticks once per presented guest frame, the
+			// same "frame N" numbering already used throughout this project's bug reports and
+			// --present-dump/--draw-log-frame-* -- not tied to the pad-read call sites themselves,
+			// since those fire at arbitrary guest-determined times (see src/libs/controller.cpp).
+			Libs::Controller::TickInputScript(frame_num);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			if (present_dump_finish) {
+				// present_tick < CurrentTick() by the time Submit() returns (NextTick() advances
+				// the counter past it), so Wait() takes the already-submitted path and never
+				// touches CheckActive() -- see DumpPresentedFrame's header comment.
+				m_impl->present_scheduler.Wait(frame.present_tick);
+				present_dump_finish();
+			}
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

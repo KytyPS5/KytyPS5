@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -14,6 +15,51 @@ namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+
+// Diagnostic kept from the Astro's Playroom SRT investigation (see Program.cpp's
+// LogPhiDivergence for the underlying mechanism this is chasing). Uses ValidateRuntimeValue --
+// the exact predicate ValidateSource gates on -- rather than a bare ResolveInvariantPhi call on
+// the dword's root: ResolveInvariantPhi only inspects a value whose OWN root opcode is Phi, so a
+// dword like SelectU32/CompositeExtractU32x2/IAdd32 with a Phi nested in one of its arguments
+// would read as trivially "invariant" even when that nested Phi is not -- which is exactly the
+// shape descriptor source 9 dword 0 turned out to have. ValidateRuntimeValue recurses through
+// every argument at every depth, so it is the correct predicate to snapshot and compare.
+// Snapshots the verdict right before Tracker::Run's patch loops (SetFlags on handles,
+// MemoryInfo::resource/sampler/planning_only writes, the indirect-image SetArg rewiring) and
+// compares it after: a dword that flips from valid to invalid here names the mutation directly.
+// For the crash that motivated this, nothing ever flipped -- the descriptor was genuinely
+// per-workgroup-varying, not a compile/runtime ordering bug -- but the check stays as a cheap
+// (compile-time only, not on any per-dispatch path), evidenced way to rule that class out first
+// the next time a shader produces this same "Phi is not invariant" failure.
+std::vector<bool> SnapshotPhiVerdicts(const ResourcePlan& program,
+                                      const std::vector<DescriptorSource>& sources) {
+	std::vector<bool> verdicts;
+	for (const auto& source: sources) {
+		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			verdicts.push_back(ValidateRuntimeValue(program, source.dwords[dword]));
+		}
+	}
+	return verdicts;
+}
+
+void LogPhiVerdictRegressions(const ResourcePlan& program,
+                              const std::vector<DescriptorSource>& sources,
+                              const std::vector<bool>& before) {
+	size_t index = 0;
+	for (uint32_t source_index = 0; source_index < sources.size(); source_index++) {
+		const auto& source = sources[source_index];
+		for (uint32_t dword = 0; dword < source.dword_count; dword++, index++) {
+			const auto was_valid = static_cast<bool>(before[index]);
+			const auto is_valid  = ValidateRuntimeValue(program, source.dwords[dword]);
+			if (was_valid != is_valid) {
+				LOGF("shader SRT: hash=0x%016llx TrackResources patch loops flipped descriptor "
+				    "source %u dword %u runtime-validity: was %s before the patch loops, now %s\n",
+				    static_cast<unsigned long long>(program.shader_hash), source_index, dword,
+				    was_valid ? "valid" : "invalid", is_valid ? "valid" : "invalid");
+			}
+		}
+	}
+}
 
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
@@ -104,6 +150,7 @@ public:
 			}
 		}
 		LinkImageAliases();
+		const auto phi_verdicts_before_patches = SnapshotPhiVerdicts(m_program, m_sources);
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -126,6 +173,7 @@ public:
 				m_program.memory_info[index].planning_only = true;
 			}
 		}
+		LogPhiVerdictRegressions(m_program, m_sources, phi_verdicts_before_patches);
 		std::erase_if(m_program.dynamic_reads, [&](Value value) {
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),

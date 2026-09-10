@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="author" content="Hyphaed" />
+    <title>Kyty Launcher</title>
+    <!-- Dark ground before the module graph evaluates theme.css -- otherwise
+         the WebView's own default (white) paints first and the console-like
+         launch (OS window -> dark -> boot animation) flashes white in
+         between. Same value as theme.css's --void. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #050609;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <pre id="boot-error" style="position:fixed;inset:0;margin:0;padding:16px;color:#ff6b6b;background:#0a0e1a;font-size:12px;white-space:pre-wrap;z-index:99999;display:none;"></pre>
+    <script>
+      // Synchronous, before theme.css's :root default (1) would otherwise
+      // paint first -- same "no flash" reasoning as the dark ground above,
+      // applied to Settings > Appearance > Text size (lib/uiScale.ts) rather
+      // than boot color. Kept in sync with that file's own validation list.
+      (function () {
+        try {
+          var stored = localStorage.getItem('kyty.uiScale');
+          if (stored === '90' || stored === '115' || stored === '130') {
+            document.documentElement.style.setProperty('--ui-scale', (Number(stored) / 100).toString());
+          }
+        } catch (e) {
+          // Best-effort only -- theme.css's default (1) still applies.
+        }
+      })();
+      function showBootError(text) {
+        var el = document.getElementById('boot-error');
+        el.style.display = 'block';
+        el.textContent += text + "\n";
+      }
+      window.addEventListener('error', function (e) {
+        showBootError('error: ' + e.message + ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno + '\n' + (e.error && e.error.stack || ''));
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        showBootError('unhandledrejection: ' + (e.reason && (e.reason.stack || e.reason.message || e.reason)));
+      });
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

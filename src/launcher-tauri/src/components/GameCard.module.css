@@ -1,0 +1,156 @@
+/* Card idle/hover/focus/press states (PS5 clone pass) -- previously all
+   inline styles, which meant the card could only ever react to `selected`
+   (an onMouseEnter-driven prop), never express a real CSS :hover of its own.
+   Mirrors GameTile.module.css's table: idle recedes slightly, hover nudges,
+   selected/focused is the clear one. */
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.art {
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius-lg);
+  position: relative;
+  opacity: 0.78;
+  transform: scale(1);
+  border: 1.5px solid var(--glass-border);
+  box-shadow: 0 8px 20px -10px var(--shadow-color);
+  transition: opacity var(--t-hover) var(--ease-ui), transform var(--t-focus) var(--ease-enter), border-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter);
+}
+.artHasImage {
+  background: var(--bg-elevated);
+}
+.artNoImage {
+  background: linear-gradient(135deg, var(--glass-bg-strong), var(--glass-bg));
+}
+.art:hover:not(.artSelected) {
+  opacity: 0.92;
+  transform: scale(1.015);
+  border-color: var(--accent);
+}
+.artSelected {
+  opacity: 1;
+  transform: translateY(-2px) scale(1.035);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-glow), 0 12px 30px -10px var(--shadow-color);
+  z-index: 2;
+}
+.art.ps-pressed {
+  transition-duration: 70ms;
+  transform: scale(calc(1.015 * 0.965));
+}
+.artSelected.ps-pressed {
+  transform: translateY(-2px) scale(calc(1.035 * 0.965));
+}
+
+/* Moving "flux" highlight riding .art's own border, plus a soft shimmer
+   across its face, on hover, gamepad focus, or press -- any card the
+   pointer/gamepad is actually on, not gated on .artSelected (owner rule,
+   2026-09-09: "the flux-spin must be used ... when we hover into a game
+   box ... at Game Library"). Kept off a bare .artSelected with nothing else
+   live, same restrained-trigger reasoning as before: a library grid can
+   hold dozens of these and a standing selection is not transient the way a
+   hover/focus/press is, so this still isn't a permanently-spinning ring on
+   an idle grid. The sweep itself (mask, gradients, keyframes) is defined
+   once, globally, in theme.css's .flux-ring / .flux-shimmer. This is what
+   is genuinely per-card: sizing to .art's own 1.5px border and
+   var(--radius-lg) corners.
+
+   Children of .art, not siblings the way GameTile's are: .art no longer
+   clips (overflow: hidden removed -- it was clipping this ring's own -1.5px
+   band right off the card, a real bug: the ring's inset intentionally sits
+   outside the border box, but "outside" was also outside .art's clip) and
+   still transforms (scale, translateY) as one unit, so a child rides both
+   for free without GameTile's separate scale-in-lockstep transform --
+   GameTile needed siblings only because a grown rail tile has to paint over
+   its horizontal neighbor, a concern this grid layout doesn't share.
+   inset: -1.5px, not 0: a child's containing block is its parent's PADDING
+   box, not its border box, so inset: 0 here would land 1.5px inside .art's
+   actual border instead of on it; the negative inset walks back out to the
+   border's own edge (mirrored by --flux-band below, so the ring's own
+   thickness still matches). */
+.artFlux,
+.artShimmer {
+  position: absolute;
+  inset: -1.5px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-hover) var(--ease-ui);
+}
+.artFlux {
+  --flux-band: 1.5px;
+  --flux-radius: var(--radius-lg);
+}
+.artShimmer {
+  --flux-radius: var(--radius-lg);
+}
+/* Child combinator (>), not the sibling ~ GameTile's own flux uses --
+   .artFlux/.artShimmer are children of .art here (see the comment above),
+   not siblings of it. */
+.art:hover > .artFlux,
+.art.ps-focused > .artFlux,
+.art.ps-pressed > .artFlux,
+.art:hover > .artShimmer,
+.art.ps-focused > .artShimmer,
+.art.ps-pressed > .artShimmer {
+  opacity: 1;
+}
+.art:hover > .artFlux::before,
+.art.ps-focused > .artFlux::before,
+.art.ps-pressed > .artFlux::before {
+  animation: flux-spin 2.4s linear infinite;
+}
+.art:hover > .artShimmer::before,
+.art.ps-focused > .artShimmer::before,
+.art.ps-pressed > .artShimmer::before {
+  animation: flux-shimmer-sweep 5s ease-in-out infinite;
+}
+
+.placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 34px;
+  font-weight: 600;
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+/* border-radius: inherit, not .art's own overflow: hidden (removed -- see
+   .art's comment history / the flux-ring fix): the <img> is the only child
+   here that actually paints past a square corner, so it clips itself. */
+.image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.statusDot {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.35);
+}
+
+.caption {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-align: center;
+  transition: opacity var(--t-hover) var(--ease-ui);
+}
+
+/* captionMode="selected": the caption element stays in the DOM (so the grid
+   never reflows as focus moves) but is invisible until this card is
+   selected, matching the PS5 Game Library reference where only the
+   focused tile names itself. */
+.captionHidden {
+  opacity: 0;
+}

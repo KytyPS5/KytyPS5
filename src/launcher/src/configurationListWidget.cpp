@@ -773,18 +773,18 @@ void ConfigurationListWidget::remove_save_data() {
 
 	const auto save_data_dirs = GetSaveDataDirs(item->GetInfo());
 	if (save_data_dirs.isEmpty()) {
-		QMessageBox::information(this, tr("Remove save data"),
-		                         tr("No save data folder found for this game."));
+		QMessageBox::information(this, tr("Remove saved data"),
+		                         tr("No saved data found for this game."));
 		return;
 	}
 
 	const auto title =
 	    !item->GetInfo().name.isEmpty() ? item->GetInfo().name : item->GetInfo().title_id;
 	const auto text =
-	    tr("Remove save data for \"%1\"?\n\nThis will delete:\n%2\n\nThis cannot be undone.")
+	    tr("Remove saved data for \"%1\"?\n\nThis will delete:\n%2\n\nThis cannot be undone.")
 	        .arg(title, save_data_dirs.join(QLatin1Char('\n')));
 
-	if (QMessageBox::Yes != QMessageBox::question(this, tr("Remove save data"), text)) {
+	if (QMessageBox::Yes != QMessageBox::question(this, tr("Remove saved data"), text)) {
 		return;
 	}
 
@@ -797,7 +797,7 @@ void ConfigurationListWidget::remove_save_data() {
 	}
 
 	if (!failed_dirs.isEmpty()) {
-		QMessageBox::warning(this, tr("Remove save data"),
+		QMessageBox::warning(this, tr("Remove saved data"),
 		                     tr("Could not remove:\n%1").arg(failed_dirs.join(QLatin1Char('\n'))));
 	}
 }
@@ -894,7 +894,7 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	                           PatchesDialog::IsSupportedTitleId(item->GetInfo().title_id));
 	QAction* action_remove_save_data =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DialogDiscardButton),
-	                   tr("Remove save data..."), this, SLOT(remove_save_data()));
+	                   tr("Remove saved data..."), this, SLOT(remove_save_data()));
 	menu.addSeparator();
 	QAction* action_edit =
 	    menu.addAction(style()->standardIcon(QStyle::SP_FileIcon), tr("Edit game settings..."),

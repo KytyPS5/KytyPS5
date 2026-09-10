@@ -263,8 +263,8 @@ struct CommandBuffer {
 		    Config::GetPrintfDirection() == Config::OutputDirection::Silent) {
 			return;
 		}
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) >= 64) {
+		static Log::RateLimit limiter {"CommandBufferDbgDump", 64};
+		if (!limiter.Hit()) {
 			return;
 		}
 
@@ -1472,8 +1472,8 @@ int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shade
 int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"AgcGetDataPacketPayloadAddress", 64};
+	if (limiter.Hit()) {
 		LOGF("\t addr = 0x%016" PRIx64 "\n"
 		     "\t cmd  = 0x%016" PRIx64 "\n"
 		     "\t type = %d\n",
@@ -1496,8 +1496,8 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
 int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd, int type) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	const bool                   should_log = (log_count.fetch_add(1) < 64);
+	static Log::RateLimit limiter {"AgcGetDataPacketPayloadRange", 64};
+	const bool             should_log = limiter.Hit().has_value();
 	if (should_log) {
 		LOGF("\t range = 0x%016" PRIx64 "\n"
 		     "\t cmd   = 0x%016" PRIx64 "\n"
@@ -1784,8 +1784,8 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
                                       uint32_t modifier) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"AgcCbDispatch", 64};
+	if (limiter.Hit()) {
 		LOGF("\t thread_group_x = %" PRIu32 "\n"
 		     "\t thread_group_y = %" PRIu32 "\n"
 		     "\t thread_group_z = %" PRIu32 "\n"
@@ -1876,8 +1876,8 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
                                                       const uint32_t* values, uint32_t num_values) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"AgcCbSetShRegisterRangeDirect", 64};
+	if (limiter.Hit()) {
 		LOGF("\t buf        = 0x%016" PRIx64 "\n"
 		     "\t offset     = %" PRIx32 "\n"
 		     "\t values     = 0x%016" PRIx64 "\n"
@@ -2067,8 +2067,8 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
                                         uint8_t interrupt, uint32_t interrupt_ctx_id) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"AgcCbReleaseMem", 64};
+	if (limiter.Hit()) {
 		LOGF("\t action           = 0x%02" PRIx8 "\n"
 		     "\t gcr_cntl         = 0x%04" PRIx16 "\n"
 		     "\t dst              = %" PRIu8 "\n"
@@ -2999,8 +2999,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"AgcDcbEventWrite", 64};
+	if (limiter.Hit()) {
 		LOGF("\t event_type = 0x%02" PRIx8 "\n"
 		     "\t address    = 0x%016" PRIx64 "\n",
 		     event_type, reinterpret_cast<uint64_t>(address));
@@ -3062,8 +3062,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
                                          uint64_t size_bytes, uint32_t poll_cycles) {
 	PRINT_NAME();
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"AgcDcbAcquireMem", 64};
+	if (limiter.Hit()) {
 		LOGF("\t engine      = 0x%02" PRIx8 "\n"
 		     "\t cb_db_op    = 0x%08" PRIx32 "\n"
 		     "\t gcr_cntl    = 0x%08" PRIx32 "\n"
@@ -3078,8 +3078,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	static std::atomic<uint32_t> warning_log_count {0};
-	const bool                   log_warning = (warning_log_count.fetch_add(1) < 64);
+	static Log::RateLimit warning_limiter {"AgcDcbAcquireMemWarnings", 64};
+	const bool             log_warning = warning_limiter.Hit().has_value();
 	if (!no_size && (size_bytes & 0xffu) != 0) {
 		if (log_warning) {
 			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");

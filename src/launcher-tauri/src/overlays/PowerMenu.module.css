@@ -1,0 +1,62 @@
+/* Centered, not composed from Overlay.module.css's shared .panel (which
+   assumes a resting position that needs no transform of its own) -- here
+   the transform is doing double duty, both centering the menu and carrying
+   its own entrance scale, so it owns the whole property itself. */
+.panel {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: min(260px, 26vw);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  background: rgba(28, 30, 38, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.985);
+  transition: opacity 240ms var(--ease-enter), transform 280ms var(--ease-enter);
+}
+.panelOpen {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+.title {
+  padding: 6px 10px 8px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui);
+}
+.item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.item.ps-focused,
+.item:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
+  outline-color: transparent;
+  background: rgba(255, 255, 255, 0.12);
+}

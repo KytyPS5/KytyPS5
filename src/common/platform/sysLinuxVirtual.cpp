@@ -10,9 +10,11 @@
 
 #include <atomic>
 #include <map>
+#include <optional>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <utility>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -30,9 +32,84 @@
 
 namespace Common {
 
+// A page-granularity protection map, keyed by page range rather than by individual page.
+// SysVirtualAlloc/Protect/Free used to record one std::map entry per 4 KiB page under a
+// single global mutex, so a multi-megabyte mprotect() (the GPU dirty-tracking hot path,
+// via PageManager) touched thousands of tree nodes per call. Ranges are typically
+// allocated, protected and freed as a whole, so tracking them as whole ranges collapses
+// each call to O(log n + k) in the number of ranges it actually overlaps - O(log n) for
+// the common case of a fresh allocation or a protect call over an already-uniform region
+// - instead of O(pages). Adjacent same-protection ranges are not merged: the win above
+// does not need it, and merging would add complexity for no correctness benefit here.
+class PageProtMap {
+public:
+	// Assigns `prot` to every page in [lo, hi) (hi exclusive), overwriting anything
+	// already recorded there.
+	void Assign(uintptr_t lo, uintptr_t hi, int prot) {
+		if (lo >= hi) {
+			return;
+		}
+		Erase(lo, hi);
+		m_ranges.emplace(lo, Entry {hi, prot});
+	}
+
+	// Drops any recorded protection for pages in [lo, hi), trimming or splitting
+	// whatever ranges overlap it.
+	void Erase(uintptr_t lo, uintptr_t hi) {
+		if (lo >= hi) {
+			return;
+		}
+
+		auto it = m_ranges.upper_bound(lo);
+		if (it != m_ranges.begin()) {
+			auto prev = std::prev(it);
+			if (prev->second.end > lo) {
+				it = prev;
+			}
+		}
+
+		while (it != m_ranges.end() && it->first < hi) {
+			const auto entry_lo = it->first;
+			const auto entry_hi = it->second.end;
+			const auto prot     = it->second.prot;
+			it                  = m_ranges.erase(it);
+			// Neither re-insertion below can collide with an existing key: m_ranges'
+			// entries are always non-overlapping, and both new keys fall strictly
+			// inside the range this entry alone used to occupy.
+			if (entry_lo < lo) {
+				m_ranges.emplace(entry_lo, Entry {lo, prot});
+			}
+			if (entry_hi > hi) {
+				m_ranges.emplace(hi, Entry {entry_hi, prot});
+			}
+		}
+	}
+
+	// Returns the recorded protection for `page`, or nullopt if it is not tracked.
+	[[nodiscard]] std::optional<int> Query(uintptr_t page) const {
+		auto it = m_ranges.upper_bound(page);
+		if (it == m_ranges.begin()) {
+			return std::nullopt;
+		}
+		--it;
+		if (page < it->second.end) {
+			return it->second.prot;
+		}
+		return std::nullopt;
+	}
+
+private:
+	struct Entry {
+		uintptr_t end; // exclusive
+		int       prot;
+	};
+
+	std::map<uintptr_t, Entry> m_ranges;
+};
+
 static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
-static std::map<uintptr_t, int>*    g_protects = nullptr;
+static PageProtMap*                 g_protects = nullptr;
 
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
@@ -47,7 +124,7 @@ void SysVirtualInit() {
 	pthread_mutexattr_destroy(&attr);
 
 	g_allocs   = new std::map<uintptr_t, size_t>;
-	g_protects = new std::map<uintptr_t, int>;
+	g_protects = new PageProtMap;
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -163,9 +240,7 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 		record_alloc(ret_addr, size);
 		uintptr_t page_start = ret_addr >> 12u;
 		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = protect;
-		}
+		g_protects->Assign(page_start, page_end + 1, protect);
 		pthread_mutex_unlock(&g_virtual_mutex);
 	}
 
@@ -253,9 +328,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	record_alloc(ret_addr, size);
 	uintptr_t page_start = ret_addr >> 12u;
 	uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-	for (uintptr_t page = page_start; page <= page_end; page++) {
-		(*g_protects)[page] = protect;
-	}
+	g_protects->Assign(page_start, page_end + 1, protect);
 	pthread_mutex_unlock(&g_virtual_mutex);
 
 	return ret_addr;
@@ -339,9 +412,7 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 		record_alloc(ret_addr, size);
 		uintptr_t page_start = ret_addr >> 12u;
 		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = protect;
-		}
+		g_protects->Assign(page_start, page_end + 1, protect);
 		pthread_mutex_unlock(&g_virtual_mutex);
 
 		return true;
@@ -520,9 +591,7 @@ bool SysVirtualFree(uint64_t address) {
 		uintptr_t page_start = addr >> 12u;
 		uintptr_t page_end   = (addr + size - 1) >> 12u;
 		pthread_mutex_lock(&g_virtual_mutex);
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			g_protects->erase(page);
-		}
+		g_protects->Erase(page_start, page_end + 1);
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return true;
 	}
@@ -582,9 +651,7 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	if (end < alloc_end) {
 		(*g_allocs)[end] = alloc_end - end;
 	}
-	for (uintptr_t page = addr >> 12u; page <= (end - 1u) >> 12u; page++) {
-		g_protects->erase(page);
-	}
+	g_protects->Erase(addr >> 12u, ((end - 1u) >> 12u) + 1);
 	pthread_mutex_unlock(&g_virtual_mutex);
 	return true;
 }
@@ -595,8 +662,8 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	if (old_mode != nullptr) {
-		if (auto s = g_protects->find(addr >> 12u); s != g_protects->end()) {
-			*old_mode = get_protection_flag(s->second);
+		if (auto prot = g_protects->Query(addr >> 12u); prot.has_value()) {
+			*old_mode = get_protection_flag(*prot);
 		} else {
 			*old_mode = VirtualMemory::Mode::NoAccess;
 		}
@@ -608,9 +675,7 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 	if (mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
 	             get_protection_flag(mode)) == 0) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = get_protection_flag(mode);
-		}
+		g_protects->Assign(page_start, page_end + 1, get_protection_flag(mode));
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return true;
 	}

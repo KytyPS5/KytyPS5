@@ -45,6 +45,9 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if !defined(__APPLE__)
+#include <linux/memfd.h> // IWYU pragma: keep (MFD_CLOEXEC / MFD_EXEC)
+#endif
 #endif
 
 namespace Libs::LibKernel::Memory {
@@ -3501,8 +3504,8 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 	info->is_gpu_prt   = IsInPrtAperture(vaddr);
 	CopyVirtualRangeName(info->name, candidate.name);
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	static Log::RateLimit limiter {"KernelVirtualQuery", 64};
+	if (limiter.Hit()) {
 		LOGF("\t start       = 0x%016" PRIx64 "\n"
 		     "\t end         = 0x%016" PRIx64 "\n"
 		     "\t offset      = 0x%016" PRIx64 "\n"

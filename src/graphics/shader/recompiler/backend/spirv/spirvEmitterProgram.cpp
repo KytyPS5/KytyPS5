@@ -96,7 +96,9 @@ void EmitReturn(ValueEmitContext& ctx) {
 }
 
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
+	// Scalar-instruction conditions already test the full wave's raw register values.
 	if (ctx.other_half == nullptr ||
+	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
 	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
 		return ctx.Def(info.condition);
 	}
@@ -454,6 +456,18 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	    {OpGroupNonUniformBallot, ballot_type, low, scope,
 	     other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)});
 	if (other_half == nullptr) {
+		// Wave64 pixel shaders on a 32-wide host: word1 (the "other 32 logical lanes") is always
+		// zero here, since this subgroup physically has no lanes 32-63. Session 30 tried
+		// synthesizing word1 = word0 for compile-time-constant-true ballot predicates (provably
+		// exact for a fully covered primitive) and confirmed via a live per-shader diagnostic
+		// that it does not help: the real culprit shader (0x67008a703cf06422, the P0.3 diagonal-
+		// line defect) selects its result via `gl_SubgroupInvocationID < 32`, which is always
+		// true on this host, so it NEVER reads word1 in the first place -- the fix touched a
+		// value this shader's own control flow makes unreachable here. Confirms (more precisely
+		// than the prior architectural analysis could) that the real fix needs each subgroup to
+		// know which logical half of the wave64 pair it is, which session 26's
+		// study_wave64_pixel_crosslane.md already established has no portable Vulkan/SPIR-V
+		// source. See astro_playroom_issues.md session 30 for the full account.
 		return low;
 	}
 	const auto high      = state.builder.AllocateId();

@@ -430,6 +430,17 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Per-parameter-index (attr 0-31) barycentric mode actually used by this PS's
+	// V_INTERP_P1/P2_F32 instructions, recorded during translation from the VSRC operand
+	// (Attribute.cpp's V_INTERP_P2_F32). UINT8_MAX = never seen an interpolated read for this
+	// index (flat-only, unused, or default-value attribute) -- distinct from PsBarycentricMode
+	// values 0-5, which select Centroid/Sample/NoPerspective decoration for that Parameter's
+	// SPIR-V variable instead of the previous single shader-wide ps_no_perspective flag.
+	std::array<uint8_t, 32>          ps_param_interp_mode {
+	    {UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX,
+	     UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX,
+	     UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX,
+	     UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX, UINT8_MAX}};
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

@@ -47,17 +47,87 @@ static void PrintUsage() {
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
+	::printf("  --validate-shader-ir <true|false>    Recompiler IR consistency check, twice per\n"
+	         "                                       distinct shader (post-translate, pre-SPIR-V).\n"
+	         "                                       Hard-aborts on a malformed IR bug instead of\n"
+	         "                                       letting it produce wrong output silently.\n"
+	         "                                       Measured 6.64%% of sampled CPU self-time on a\n"
+	         "                                       real launch (2026-09-10) -- default true;\n"
+	         "                                       set false to trust the recompiler and skip it.\n");
+	::printf("  --approximate-divergent-phi <t|f>    EXPERIMENTAL. A shader whose descriptor\n"
+	         "                                       selection is control-flow-dependent (per-\n"
+	         "                                       invocation resource choice) normally skips\n"
+	         "                                       its whole draw/dispatch. This picks the first\n"
+	         "                                       viable candidate instead (refusing zero/\n"
+	         "                                       unevaluable ones), matching how real AMD\n"
+	         "                                       hardware/compilers force a divergent\n"
+	         "                                       descriptor uniform. Default false: unproven\n"
+	         "                                       for any specific game yet -- opt-in only.\n");
+	::printf("  --draw-dump <true|false>             Dump each color render target to a PNG\n"
+	         "                                       whenever it stops being the active\n"
+	         "                                       rendering target. Debug only; slow.\n");
+	::printf("  --draw-dump-folder <path>            Draw dump output folder.\n");
+	::printf(
+	    "  --draw-log-frame-first <n>           Only spend per-draw diagnostic log budget\n"
+	    "                                       (LogDrawTargetState/LogDrawInputState/\n"
+	    "                                       LegacyRectDraw/RenderPassBreak/ResolvedTexture),\n"
+	    "                                       and --draw-dump's PNG encoding, from guest frame\n"
+	    "                                       n onward. Default -1 (unbounded -- --draw-dump\n"
+	    "                                       then dumps every draw of the whole run, which is\n"
+	    "                                       slow on a draw-heavy scene).\n");
+	::printf(
+	    "  --draw-log-frame-last <n>            Same, upper bound (inclusive). Default -1\n"
+	    "                                       (unbounded).\n");
+	::printf(
+	    "  --present-dump <true|false>          Dump the actual presented/flipped frame (not\n"
+	    "                                       an intermediate render target) every\n"
+	    "                                       --present-dump-every guest frames. Debug only.\n");
+	::printf(
+	    "  --present-dump-every <n>             Frame interval for --present-dump. Default 300.\n");
+	::printf("  --present-dump-folder <path>         Present dump output folder.\n");
+	::printf(
+	    "  --input-script <path>                Replay scripted controller input from a text\n"
+	    "                                       file (one \"<guest_frame> <event> <args...>\"\n"
+	    "                                       line per event, e.g. \"120 button cross down\").\n"
+	    "                                       Drives the same GameController state the real\n"
+	    "                                       SDL host-input path uses, so it can push a guest\n"
+	    "                                       through UI it would otherwise sit on forever\n"
+	    "                                       unattended. Must point to an existing file.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
-	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf("  --printf-output-file <path>          Guest printf output file. Capped at\n"
+	         "                                       --log-file-max-bytes on disk (default\n"
+	         "                                       6.9 GB); wraps and overwrites from the\n"
+	         "                                       start once reached, regardless of\n"
+	         "                                       --log-repeat-limit.\n");
+	::printf(
+	    "  --log-file-max-bytes <n>             Cap for --printf-output-file, in bytes.\n"
+	    "                                       Default 6900000000 (6.9 GB). 0 disables the\n"
+	    "                                       cap for a deliberate full capture -- prints an\n"
+	    "                                       unsilenceable free-space warning on startup.\n");
+	::printf(
+	    "  --shader-log-filter-hash <hex>       Restrict per-descriptor shader diagnostics\n"
+	    "                                       (e.g. SrtInactiveDescriptorSource) to this\n"
+	    "                                       shader hash; may be repeated. Default:\n"
+	    "                                       unrestricted.\n");
+	::printf(
+	    "  --force-shader-disk-cache <true|false> Skip the \"dirty build\" check that normally\n"
+	    "                                       disables the pipeline/shader disk cache during\n"
+	    "                                       active development. Opt-in: a cache entry may\n"
+	    "                                       have been produced by different recompiler code\n"
+	    "                                       than the current dirty tree. Default: false.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --stub-bvh                          Use a stub for MIMG BVH opcodes (ray tracing is not implemented). Default: off.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
+	::printf("  --gamepad-map <Control=SdlName>       Physical-gamepad button/axis mapping\n"
+	         "                                       (SDL_GameController names); may be repeated.\n");
+	::printf("  --gamepad-deadzone <0.0-0.95>         Stick deadzone fraction. Default: 0.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 	::printf("  --diagnostics                        Print a report for bug reports, then exit.\n");
 	::printf("  --log-repeat-limit <num>             Messages one log line may write before it\n"
@@ -157,6 +227,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--stub-bvh") {
+			options.config.bvh_stub_enabled = true;
+			continue;
+		}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
 			options.config.red_zone_protection_enabled = true;
@@ -241,6 +316,31 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.log_repeat_limit = limit;
+		} else if (arg == "--log-file-max-bytes") {
+			uint64_t   max_bytes = 0;
+			const auto parsed =
+			    std::from_chars(value.data(), value.data() + value.size(), max_bytes);
+			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size()) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.log_file_max_bytes = max_bytes;
+		} else if (arg == "--shader-log-filter-hash") {
+			uint64_t   hash    = 0;
+			const auto trimmed = std::string_view(value).substr(
+			    Common::StartsWith(value, "0x") || Common::StartsWith(value, "0X") ? 2 : 0);
+			const auto parsed = std::from_chars(trimmed.data(), trimmed.data() + trimmed.size(),
+			                                     hash, 16);
+			if (parsed.ec != std::errc {} || parsed.ptr != trimmed.data() + trimmed.size()) {
+				::printf("invalid hex shader hash for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.shader_log_filter_hashes.push_back(hash);
+		} else if (arg == "--force-shader-disk-cache") {
+			if (!ParseBool(value, options.config.force_shader_disk_cache_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
@@ -285,6 +385,61 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--validate-shader-ir") {
+			if (!ParseBool(value, options.config.validate_shader_ir_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--approximate-divergent-phi") {
+			if (!ParseBool(value, options.config.approximate_divergent_phi_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--draw-dump") {
+			if (!ParseBool(value, options.config.draw_dump_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--draw-dump-folder") {
+			options.config.draw_dump_folder = value;
+		} else if (arg == "--draw-log-frame-first") {
+			int64_t    frame  = 0;
+			const auto parsed = std::from_chars(value.data(), value.data() + value.size(), frame);
+			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size()) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.draw_log_frame_first = frame;
+		} else if (arg == "--draw-log-frame-last") {
+			int64_t    frame  = 0;
+			const auto parsed = std::from_chars(value.data(), value.data() + value.size(), frame);
+			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size()) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.draw_log_frame_last = frame;
+		} else if (arg == "--present-dump") {
+			if (!ParseBool(value, options.config.present_dump_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--present-dump-every") {
+			int64_t    every  = 0;
+			const auto parsed = std::from_chars(value.data(), value.data() + value.size(), every);
+			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size()) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.present_dump_every = every;
+		} else if (arg == "--present-dump-folder") {
+			options.config.present_dump_folder = value;
+		} else if (arg == "--input-script") {
+			value = Common::FixFilenameSlash(value);
+			if (!Common::File::IsFileExisting(value)) {
+				::printf("--input-script must point to an existing file: %s\n", value.c_str());
+				return false;
+			}
+			options.config.input_script_path = value;
 		} else if (arg == "--printf-direction") {
 			if (!ParseEnum(value, options.config.printf_direction)) {
 				::printf("invalid printf direction: %s\n", value.c_str());
@@ -314,6 +469,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.keymap.push_back(value);
+		} else if (arg == "--gamepad-map") {
+			const auto split = value.find('=');
+			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
+				::printf("invalid gamepad-map: %s\n", value.c_str());
+				return false;
+			}
+			options.config.gamepad_keymap.push_back(value);
+		} else if (arg == "--gamepad-deadzone") {
+			float      deadzone = 0.0f;
+			const auto parsed = std::from_chars(value.data(), value.data() + value.size(), deadzone);
+			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size() || deadzone < 0.0f ||
+			    deadzone > 0.95f) {
+				::printf("invalid gamepad-deadzone (expected 0.0-0.95): %s\n", value.c_str());
+				return false;
+			}
+			options.config.gamepad_deadzone = deadzone;
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
@@ -324,7 +495,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		options.config.vulkan_validation_enabled = true;
 	}
 
-	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
+	return show_help || show_diagnostics || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
 int main(int argc, char* argv[]) {

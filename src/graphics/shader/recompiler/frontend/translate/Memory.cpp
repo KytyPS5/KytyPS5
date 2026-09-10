@@ -1,8 +1,11 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -1048,6 +1051,21 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: {
+			// Stub, inert "no intersection" semantics: 4 channels of 0xFFFFFFFF
+			// (absent-child sentinel for a box node, NaN time for a triangle node)
+			static std::atomic<bool> bvh_stub_warned {false};
+			if (!bvh_stub_warned.exchange(true)) {
+				LOGF("MIMG BVH intersect-ray translated with inert stub (no intersection); "
+				     "ray tracing is not implemented. Results are approximate.\n");
+			}
+			const auto memory = MemoryInfoFromDecoded(inst);
+			const auto result = ir.Emit(IR::ValueOpcode::ImageBvhIntersectRay);
+			WriteImageComponents(inst.dst, result, memory, 4u);
+			return true;
+		}
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);

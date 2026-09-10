@@ -1,0 +1,68 @@
+/* Binding chips (RemapPanel's left/right target lists). Moved out of inline
+   styles so they can carry real hover/press states, not just the selected
+   look inline styles already had -- see Settings.module.css's .railItem for
+   the same hover-guard idiom this borrows. */
+
+.chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 132px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color var(--t-hover) var(--ease-ui), background var(--t-hover) var(--ease-ui), box-shadow var(--t-focus) var(--ease-enter), transform var(--t-fast) var(--ease-ui);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  :root:not([data-gamepad-active="true"]) .chip:hover {
+    background: var(--glass-bg-strong);
+    border-color: var(--glass-border-strong);
+  }
+}
+
+.chip:active,
+.chip.ps-pressed {
+  transform: scale(0.97);
+}
+
+.chipSelected {
+  composes: chip;
+  border-color: var(--accent);
+  background: var(--glass-bg-strong);
+}
+
+.chipLabel {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.chipValue {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.chipValueEmpty {
+  composes: chipValue;
+  /* --text-muted (#62708a) is ~4.4:1 on this ground, under the 4.5:1 floor --
+     --text-secondary (#8a9bb5) clears it while still reading weaker than a
+     real binding's --text-primary. */
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chip {
+    transition: border-color var(--t-hover) var(--ease-ui), background var(--t-hover) var(--ease-ui), box-shadow var(--t-focus) var(--ease-enter);
+  }
+  .chip:active,
+  .chip.ps-pressed {
+    transform: none;
+  }
+}

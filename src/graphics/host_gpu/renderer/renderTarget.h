@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_
 
+#include "common/slotVector.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -20,8 +21,38 @@ struct RenderAttachment {
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;
 	bool                    stencil_clear = false;
+	// Debug-only: the color attachment's cache slot, so --draw-dump-folder can look the
+	// image back up (for the actual vk::Image + format) once rendering to it ends. Left
+	// default for the depth/stencil attachment, which draw-dump does not cover.
+	Common::SlotId          image_id;
+	// Debug-only, like image_id above: the last draw's shader identity and guest primitive type,
+	// so --draw-dump can name a dumped PNG after the shader/primitive that produced it instead of
+	// leaving a manual shader-hash hunt to a human. Unlike image_id, these change on every draw
+	// even while the render target stays the same, so they
+	// are deliberately excluded from operator== below -- including them would defeat
+	// CommandBuffer::BeginRendering's same-state batching check and force a new render pass per
+	// draw instead of per render-target switch.
+	uint64_t                vs_shader_hash = 0;
+	uint64_t                ps_shader_hash = 0;
+	uint32_t                prim_type      = 0;
+	// Debug-only, same rationale as above: the first few bound sampled textures' guest address,
+	// guest format, and tile mode, so a dumped PNG can be traced to the exact texture bytes that
+	// produced it without a second instrumentation pass. Was capped at 2 (missed the 3rd/4th
+	// texture of any wider composite pass entirely, with no indication anything was cut); 4
+	// keeps the sidecar CSV a fixed-width row while covering the common multi-texture blend
+	// case this investigation actually needed.
+	static constexpr uint32_t TEX_DEBUG_MAX      = 4;
+	uint64_t                tex_address[TEX_DEBUG_MAX] = {};
+	uint32_t                tex_format[TEX_DEBUG_MAX]  = {};
+	uint32_t                tex_tile_mode[TEX_DEBUG_MAX] = {};
 
-	bool operator==(const RenderAttachment&) const = default;
+	bool operator==(const RenderAttachment& other) const {
+		return image_view == other.image_view && image_layout == other.image_layout &&
+		       clear_value == other.clear_value && is_clear == other.is_clear &&
+		       has_depth == other.has_depth && depth_clear == other.depth_clear &&
+		       has_stencil == other.has_stencil && stencil_clear == other.stencil_clear &&
+		       image_id == other.image_id;
+	}
 };
 
 struct RenderState {

@@ -533,9 +533,8 @@ static int SemInitImpl(void* sem, int pshared, unsigned int value, const char* n
 		}
 	}
 
-	static std::atomic<uint32_t> log_count {0};
-	const auto                   count = log_count.fetch_add(1);
-	if (count < 32) {
+	static Log::RateLimit limiter {"PosixSemaphoreInit", 32};
+	if (limiter.Hit()) {
 		LOGF("\t POSIX semaphore init: %s, value = %u, pshared = %d\n",
 		     (name != nullptr ? name : "sem"), value, pshared);
 	}

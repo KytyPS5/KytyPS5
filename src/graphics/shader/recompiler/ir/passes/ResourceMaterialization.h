@@ -40,9 +40,12 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Resolves and specializes the immutable resource plan in one transaction. On failure both
-// destinations are unchanged.
+// destinations are unchanged. `fail_reason`, when non-null, receives a human-readable cause
+// (the specific opcode/descriptor/slot that failed) instead of the caller only learning that
+// materialization returned false.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::string* fail_reason = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

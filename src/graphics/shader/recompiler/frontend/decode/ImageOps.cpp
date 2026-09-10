@@ -194,9 +194,6 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     {0xbbu, "image_sample_c_d_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
          ImageSampleFlagOffset | ImageSampleFlagAdjust},
-    {0xe6u, "image_sample_d_cl_o_a_0xe6",
-     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
-         ImageSampleFlagAdjust},
     {0xe8u, "image_sample_cd_a",
      ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagAdjust},
     {0xe9u, "image_sample_cd_cl_a",
@@ -281,6 +278,10 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		// Ray tracing (ISA 8.2.10): opcode 230 takes a 32-bit BVH node pointer, 231 a 64-bit
+		// one. Neither uses a sampler, and both are encoded with R128=1 / DIM=0 / DMASK=0xf.
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -297,7 +298,16 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const Detail::OpcodeMap* atomic) {
+                                     const Detail::OpcodeMap* atomic, bool a16) {
+	// Ray tracing (ISA Table 48). The address registers carry the node pointer, ray extent,
+	// origin, direction and inverse direction; A16 packs direction and inverse direction into
+	// halves, which drops three registers. The 64-bit variant spends one more on the pointer.
+	if (opcode == 0xe6u) {
+		return a16 ? 8u : 11u;
+	}
+	if (opcode == 0xe7u) {
+		return a16 ? 9u : 12u;
+	}
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -405,11 +415,20 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic, a16);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	}
+	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	    inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) {
+		// Decoded so the operand shape is right (and so these stop masquerading as image
+		// samples, which sent their 128-bit BVH T# through image-descriptor resolution and
+		// dropped the whole dispatch). Traversal itself still needs the ray/box and
+		// ray/triangle intersection emitted in SPIR-V; until then drop the shader honestly.
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG BVH ray intersection is not implemented");
 	}
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

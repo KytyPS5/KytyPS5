@@ -566,6 +566,10 @@ enum class Opcode {
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
+	// MIMG 230/231. Ray/BVH-node intersection for ray tracing; no sampler, and the SGPR
+	// operand is a 128-bit BVH T# (Table 49) rather than an image T#.
+	IMAGE_BVH_INTERSECT_RAY,
+	IMAGE_BVH64_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,

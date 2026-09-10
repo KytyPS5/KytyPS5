@@ -4227,6 +4227,37 @@ void TestNewShaderDecoderArchitecture() {
             image.image_nsa_dwords == 3u,
         "single-instruction decoder lost the MIMG NSA length");
 
+  // MIMG 230/231 are the ray-tracing intersection ops, not image_sample variants. They are
+  // always encoded with R128=1 / DIM=0 / DMASK=0xf, and their address register count follows
+  // ISA Table 48: 11 for the 32-bit node pointer, 12 for the 64-bit one, three fewer when A16
+  // packs the direction and inverse direction into halves.
+  // Traversal is not emitted yet, so these report as unsupported -- but they must never come
+  // back as an image_sample variant again: that route sent the BVH T# through image-descriptor
+  // resolution and dropped every dispatch that traced a ray.
+  const uint32_t bvh_code[] = {EncodeMimg0(0xe6, 0xf, false, 0) | (1u << 15u),
+                               EncodeMimg1(4, 0, 0, 8)};
+  Instruction bvh;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh_code, 0u, bvh);
+  Check(bvh.opcode != Opcode::IMAGE_SAMPLE && bvh.opcode_id == 0xe6u && bvh.image_r128 &&
+            bvh.image_address_components == 11u &&
+            Common::ContainsStr(bvh.unsupported_reason, "BVH"),
+        "decoder did not decode MIMG 230 as image_bvh_intersect_ray");
+
+  const uint32_t bvh_a16_code[] = {EncodeMimg0(0xe6, 0xf, false, 0) | (1u << 15u),
+                                   EncodeMimg1(4, 0, 0, 8, true)};
+  Instruction bvh_a16;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh_a16_code, 0u, bvh_a16);
+  Check(bvh_a16.image_address_components == 8u,
+        "decoder ignored A16 packing on image_bvh_intersect_ray");
+
+  const uint32_t bvh64_code[] = {EncodeMimg0(0xe7, 0xf, false, 0) | (1u << 15u),
+                                 EncodeMimg1(4, 0, 0, 8)};
+  Instruction bvh64;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh64_code, 0u, bvh64);
+  Check(bvh64.opcode != Opcode::IMAGE_SAMPLE && bvh64.opcode_id == 0xe7u &&
+            bvh64.image_address_components == 12u,
+        "decoder did not decode MIMG 231 as image_bvh64_intersect_ray");
+
   const uint32_t ds_code[] = {EncodeDs0(0x36) | (1u << 17u),
                               EncodeDs1(2, 0, 1)};
   Instruction ds;

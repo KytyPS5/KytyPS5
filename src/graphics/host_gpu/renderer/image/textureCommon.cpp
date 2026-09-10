@@ -28,13 +28,13 @@ constexpr Prospero::ColorComponentMapping kRenderTargetColorMappings[4][4] = {
      Prospero::ColorMappingArgb},
 };
 
-struct RenderTargetHostFormatInfo {
+struct HostFormatInfo {
 	vk::Format                      format = vk::Format::eUndefined;
 	Prospero::ColorComponentMapping host_to_storage;
 };
 
-RenderTargetHostFormatInfo ResolveRenderTargetHostFormat(Prospero::BufferFormat guest_format,
-                                                         Prospero::ChannelOrder order) {
+HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
+                                 Prospero::ChannelOrder order) {
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k8_8_8_8UNorm:
@@ -48,14 +48,12 @@ RenderTargetHostFormatInfo ResolveRenderTargetHostFormat(Prospero::BufferFormat 
 			default: break;
 		}
 	}
+	const auto format = VulkanFormat(guest_format);
 	switch (guest_format) {
-		case Prospero::BufferFormat::k5_5_5_1UNorm:
-			return {vk::Format::eA1R5G5B5UnormPack16, Prospero::ColorMappingBgra};
+		case Prospero::BufferFormat::k5_5_5_1UNorm: return {format, Prospero::ColorMappingBgra};
 		case Prospero::BufferFormat::k1_5_5_5UNorm:
-			return {vk::Format::eR5G5B5A1UnormPack16, Prospero::ColorMappingAbgr};
-		case Prospero::BufferFormat::k4_4_4_4UNorm:
-			return {vk::Format::eR4G4B4A4UnormPack16, Prospero::ColorMappingAbgr};
-		default: return {VulkanFormat(guest_format), {}};
+		case Prospero::BufferFormat::k4_4_4_4UNorm: return {format, Prospero::ColorMappingAbgr};
+		default: return {format, {}};
 	}
 }
 
@@ -66,7 +64,7 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
                                                     Prospero::ChannelOrder  order) {
 	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
 	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
-		const auto host  = ResolveRenderTargetHostFormat(encoding.buffer_format, order);
+		const auto host  = ResolveHostFormat(encoding.buffer_format, order);
 		const auto bytes = Prospero::RenderTargetBytesPerElement(encoding.buffer_format);
 		if (host.format != vk::Format::eUndefined && bytes != 0) {
 			const auto order_mapping =
@@ -92,7 +90,11 @@ static size_t GetTextureRegionCount(uint32_t depth, uint64_t levels, bool volume
 	return count;
 }
 
-vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t s) {
+vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t                         s,
+                                                Prospero::ColorComponentMapping storage_to_host) {
+	if (s >= 4u && s <= 7u) {
+		s = static_cast<uint8_t>(4u + storage_to_host.Map(s - 4u));
+	}
 	switch (static_cast<Prospero::CompSwizzle>(s)) {
 		case Prospero::CompSwizzle::kZero: return vk::ComponentSwizzle::eZero;
 		case Prospero::CompSwizzle::kOne: return vk::ComponentSwizzle::eOne;
@@ -102,30 +104,33 @@ vk::ComponentSwizzle TextureGetComponentSwizzle(uint8_t s) {
 		case Prospero::CompSwizzle::kAlpha: return vk::ComponentSwizzle::eA;
 		default: EXIT("unknown swizzle: %d\n", static_cast<int>(s));
 	}
-	return vk::ComponentSwizzle::eIdentity;
 }
 
 } // namespace
 
-vk::ComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
+vk::ComponentMapping TextureGetComponentMapping(uint32_t                        swizzle,
+                                                Prospero::ColorComponentMapping host_to_storage) {
+	Prospero::ColorComponentMapping storage_to_host {0u};
+	for (uint32_t host = 0; host < 4u; ++host) {
+		storage_to_host.packed |= static_cast<uint8_t>(host << (host_to_storage.Map(host) * 2u));
+	}
 	vk::ComponentMapping components {};
-	components.r = TextureGetComponentSwizzle(GetDstSel(swizzle, 0));
-	components.g = TextureGetComponentSwizzle(GetDstSel(swizzle, 1));
-	components.b = TextureGetComponentSwizzle(GetDstSel(swizzle, 2));
-	components.a = TextureGetComponentSwizzle(GetDstSel(swizzle, 3));
+	components.r = TextureGetComponentSwizzle(GetDstSel(swizzle, 0), storage_to_host);
+	components.g = TextureGetComponentSwizzle(GetDstSel(swizzle, 1), storage_to_host);
+	components.b = TextureGetComponentSwizzle(GetDstSel(swizzle, 2), storage_to_host);
+	components.a = TextureGetComponentSwizzle(GetDstSel(swizzle, 3), storage_to_host);
 	return components;
 }
 
 SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
-	const auto backing_format    = Prospero::RemapTextureFormat(format);
-	const auto vk_format         = VulkanFormat(backing_format);
+	const auto backing_format = Prospero::RemapTextureFormat(format);
+	const auto host = ResolveHostFormat(backing_format, Prospero::ChannelOrder::kStandard);
 	const auto conversion_format =
 	    backing_format != format ? format : Prospero::BufferFormat::kInvalid;
-	if (vk_format != vk::Format::eUndefined) {
-		return SurfaceFormatInfo(vk_format, conversion_format);
+	if (host.format != vk::Format::eUndefined) {
+		return {host.format, conversion_format, host.host_to_storage};
 	}
 	EXIT("unknown format: fmt = %u\n", static_cast<uint32_t>(format));
-	return SurfaceFormatInfo(vk::Format::eUndefined, Prospero::BufferFormat::kInvalid);
 }
 
 namespace {

@@ -20,12 +20,9 @@ struct RenderTargetFormatInfo {
 };
 
 struct SurfaceFormatInfo {
-	explicit constexpr SurfaceFormatInfo(vk::Format format,
-	                                     Prospero::BufferFormat conversion_format)
-	    : vk_format(format), conversion_format(conversion_format) {}
-
-	vk::Format             vk_format;
-	Prospero::BufferFormat conversion_format;
+	vk::Format                      vk_format;
+	Prospero::BufferFormat          conversion_format;
+	Prospero::ColorComponentMapping host_to_storage;
 };
 
 struct TextureUploadMipLayout {
@@ -43,7 +40,8 @@ struct TextureUploadLayout {
 	TextureUploadMipLayout mips[16] = {};
 };
 
-vk::ComponentMapping   TextureGetComponentMapping(uint32_t swizzle);
+vk::ComponentMapping   TextureGetComponentMapping(uint32_t                        swizzle,
+                                                  Prospero::ColorComponentMapping host_to_storage);
 SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,

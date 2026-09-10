@@ -8506,6 +8506,138 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckPackedTextureComponents() {
+    constexpr const char *name = "PackedTextureComponents";
+    constexpr uintptr_t base = 0x0000000204200000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    struct FormatCase {
+      Prospero::BufferFormat format;
+      std::array<uint16_t, 4> words;
+      std::array<std::array<uint32_t, 4>, 4> channels;
+      std::array<uint32_t, 4> maxima;
+    };
+    // Packed format channels start at the least significant bit.
+    // PPSA24515's blue, white, and masked black exposed the 5551 reversal.
+    constexpr std::array cases{
+        FormatCase{Prospero::BufferFormat::k5_5_5_1UNorm,
+                   {0x7c00, 0x7fff, 0x8000, 0x8c41},
+                   {{{0, 0, 31, 0}, {31, 31, 31, 0}, {0, 0, 0, 1}, {1, 2, 3, 1}}},
+                   {31, 31, 31, 1}},
+        FormatCase{Prospero::BufferFormat::k4_4_4_4UNorm,
+                   {0x000f, 0x00f0, 0x0f00, 0x4321},
+                   {{{15, 0, 0, 0}, {0, 15, 0, 0}, {0, 0, 15, 0}, {1, 2, 3, 4}}},
+                   {15, 15, 15, 15}},
+    };
+    const auto argb = TextureGetComponentMapping(DstSel(5, 1, 7, 0),
+                                                 Prospero::ColorMappingArgb);
+    Require(name, "inverse mapping",
+            argb == vk::ComponentMapping{vk::ComponentSwizzle::eB,
+                vk::ComponentSwizzle::eOne, vk::ComponentSwizzle::eR,
+                vk::ComponentSwizzle::eZero},
+            "cyclic host mapping reordered output slots or descriptor constants");
+    const auto target = TextureGetRenderTargetFormat(
+        Prospero::ChannelLayout::k1_5_5_5, Prospero::ChannelType::kUNorm,
+        Prospero::ChannelOrder::kStandard);
+    Require(name, "1555 render target",
+            target.format == vk::Format::eR5G5B5A1UnormPack16 &&
+                target.export_mapping == Prospero::ColorMappingAbgr,
+            "shared format resolution changed the existing 1555 render target");
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "packed texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "packed texture mapping failed");
+    for (const auto &format : cases) {
+      std::memset(mapped, 0, allocation_size);
+      std::memcpy(mapped, format.words.data(), sizeof(format.words));
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &resources = context.GetGpuResources();
+      auto &cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+      for (const auto swizzle : {DstSel(4, 5, 6, 7), DstSel(7, 1, 4, 0)}) {
+        ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+            (static_cast<uint32_t>(format.format) << 20u) | (3u << 30u), 0,
+            swizzle | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        TestCase test;
+        test.name = name;
+        test.has_user_data = true;
+        test.image_descriptor_swizzle = swizzle;
+        std::copy_n(descriptor.fields, 8, test.user_data.begin());
+        test.user_data[50] = 16 * sizeof(uint32_t);
+        test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_LOAD,
+                        ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+        for (uint32_t pixel = 0; pixel < format.words.size(); ++pixel) {
+          AppendVMovU32(&test.code, 20, pixel);
+          AppendVMovU32(&test.code, 21, 0);
+          test.code.push_back(EncodeMimg0(0x00, 0xf));
+          test.code.push_back(EncodeMimg1(0, 20));
+          for (uint32_t channel = 0; channel < 4; ++channel) {
+            AppendStoreVgpr(&test.code, channel, pixel * 4 + channel);
+          }
+        }
+        AppendEnd(&test.code);
+        const auto compiled = CompileCase(test, SubgroupSize());
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, compiled.program.info.images.at(0), value);
+        Image sampled;
+        sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+        sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
+        scheduler.Finish();
+        auto output = CreateStorageBuffer(name, {}, 16);
+        Dispatch(test, compiled, output, nullptr, &sampled);
+        const auto actual = ReadBuffer(name, output, 16);
+        for (uint32_t pixel = 0; pixel < format.words.size(); ++pixel) {
+          for (uint32_t channel = 0; channel < 4; ++channel) {
+            const auto selector = GetDstSel(swizzle, channel);
+            const auto maximum = selector < 4 ? 1u : format.maxima[selector - 4];
+            const auto expected = selector < 4 ? selector : format.channels[pixel][selector - 4];
+            const float observed = std::bit_cast<float>(actual[pixel * 4 + channel]);
+            // Recover the source bits without testing the host's UNORM rounding precision.
+            const bool matches = maximum == 1 ? observed == expected
+                : observed >= 0.0f && observed <= 1.0f &&
+                      std::round(observed * maximum) == expected;
+            if (!matches) {
+              std::ostringstream message;
+              message << "format=" << static_cast<uint32_t>(format.format)
+                      << " swizzle=" << swizzle << " word=" << format.words[pixel]
+                      << " channel=" << channel << " expected=" << expected
+                      << " actual=" << observed;
+              Fail(name, "GPU components", message.str());
+            }
+          }
+        }
+        DestroyBuffer(&output);
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "packed texture backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckComparisonDepthTexture() {
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
@@ -25465,7 +25597,7 @@ void CheckSampledColorViews() {
           "valid PS5 sampled mappings were rejected or reserved selectors were "
           "admitted");
   const auto arbitrary = DstSel(5, 1, 7, 0);
-  const auto components = TextureGetComponentMapping(arbitrary);
+  const auto components = TextureGetComponentMapping(arbitrary, {});
   Require("SampledColorViews", "generic Vulkan component mapping",
           SelectSampledColorView(vk::Format::eR8G8B8A8Unorm,
                                  vk::Format::eR8G8B8A8Unorm,
@@ -29073,6 +29205,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPackedTextureComponents();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--error-dialog-only") == 0) {
     CheckErrorDialogLifecycle();
     return 0;
@@ -29494,6 +29631,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
   vulkan.CheckUnifiedImageViewCache();
+  vulkan.CheckPackedTextureComponents();
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

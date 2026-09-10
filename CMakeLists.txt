@@ -423,6 +423,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
+target_compile_definitions(memory_tracker_tests PRIVATE KYTY_BDA_TEST_HOOKS=1)
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
@@ -488,6 +489,7 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+target_compile_definitions(shader_recompiler_compute_tests PRIVATE KYTY_BDA_TEST_HOOKS=1)
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
@@ -533,6 +535,11 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_bda_sync_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --bda-sync Legacy)
+	add_test(NAME emulator_bda_sync_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --bda-sync Invalid)
+	set_tests_properties(emulator_bda_sync_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -588,6 +595,8 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+		add_test(NAME buffer_cache_bda_selective
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-selective-only)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS

@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/bdaTestHooks.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -100,6 +101,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include <barrier>
+#include <functional>
+#include <semaphore>
+#include <thread>
 #undef min
 #undef max
 #endif
@@ -177,6 +183,24 @@ struct BufferCacheTestAccess {
 
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
+  }
+
+  static StreamBuffer &StagingBuffer(BufferCache &cache) {
+    return cache.m_staging_buffer;
+  }
+
+  static bool BdaHintPending(const BufferCache &cache, uint64_t address) {
+    return cache.m_memory_tracker.IsBdaHintPending(address /
+                                                   TRACKER_REGION_SIZE);
+  }
+};
+
+struct GpuResourceManagerTestAccess {
+  // The invariant check without taking the mapped-range lock: callers are single-threaded
+  // test code, or a hook running inside PrepareBda, which already holds that lock shared.
+  static bool HintInvariantHolds(GpuResourceManager &resources) {
+    return resources.m_buffer_cache.CheckBdaHintInvariant(
+        resources.m_mapped_ranges);
   }
 };
 
@@ -3432,6 +3456,903 @@ public:
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
   }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  // Selective BDA discovery against the legacy full walk. Every case runs from the same guest
+  // state once per mode. At each BDA consumer boundary it reads the bytes a BDA shader would
+  // read - the registered owner's device buffer - and compares them with guest memory. Dirty
+  // bitmaps, upload lists and protection state can all agree while data arrives one consumer
+  // late, so none of them is the oracle. Guest stores are faithful: a store to a page the OS
+  // reports as protected raises the same fault the host exception path does, then retries.
+  // A non-null `only` runs just the cases whose name contains it.
+  void CheckSelectiveBdaSynchronization(const char *only = nullptr) {
+    constexpr const char *name = "SelectiveBdaSynchronization";
+    constexpr uint64_t kRegion = TRACKER_REGION_SIZE;
+    constexpr uint64_t kOwnerPage = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t kPage = TRACKER_PAGE_SIZE;
+    constexpr uintptr_t base = 0x0000000240000000ull;
+    constexpr uint64_t area = 6 * kRegion;
+    constexpr uintptr_t alias_base = 0x0000000250000000ull;
+    constexpr uint64_t alias_size = kRegion;
+    constexpr uint64_t alignment = 0x10000;
+    static_assert(base % kRegion == 0 && alias_base % kRegion == 0);
+    // Regions 0..5 of the test area share one hint word.
+    static_assert((base / kRegion) / 64 == (base / kRegion + 5) / 64);
+
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), area,
+                alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, area, 0x3, 0x10, direct_offset, alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    void *alias = reinterpret_cast<void *>(alias_base);
+    Require(name, "alias mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &alias, alias_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
+                alias == reinterpret_cast<void *>(alias_base),
+            "fixed alias mapping failed");
+
+    struct Run {
+      GpuResourceManager *resources = nullptr;
+      BufferCache *cache = nullptr;
+      std::vector<std::pair<std::string, std::vector<uint8_t>>> seen;
+    };
+    Run *run = nullptr;
+    uint32_t stamp = 1;
+
+    static std::function<bool(BdaTestHooks::Point, uint64_t)> s_hook;
+    BdaTestHooks::g_callback = [](BdaTestHooks::Point point, uint64_t value) {
+      return s_hook ? s_hook(point, value) : false;
+    };
+
+    const auto addr = [](uint64_t offset) {
+      return static_cast<uint64_t>(base) + offset;
+    };
+    const auto mode_name = [&] {
+      return run->resources->GetBdaSyncMode() == Config::BdaSyncMode::Legacy
+                 ? "legacy"
+                 : "selective";
+    };
+    const auto writable = [&](uint64_t address) {
+      MEMORY_BASIC_INFORMATION info{};
+      Require(name, "protection query",
+              VirtualQuery(reinterpret_cast<void *>(address), &info,
+                           sizeof(info)) != 0,
+              "VirtualQuery failed");
+      constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY |
+                                  PAGE_EXECUTE_READWRITE |
+                                  PAGE_EXECUTE_WRITECOPY;
+      return (info.Protect & kWritable) != 0;
+    };
+    const auto guest_write = [&](uint64_t address, const void *data,
+                                 uint64_t size) {
+      const auto *bytes = static_cast<const uint8_t *>(data);
+      for (uint64_t cursor = address; cursor < address + size;) {
+        const uint64_t page_end = (cursor & ~(kPage - 1)) + kPage;
+        const uint64_t chunk = std::min(page_end, address + size) - cursor;
+        if (!writable(cursor)) {
+          Require(name, "guest fault",
+                  run->resources->HandleFault(PageFaultAccess::Write, cursor),
+                  "a store fault on a protected page was not handled");
+          Require(name, "guest fault", writable(cursor),
+                  "the store fault left the page protected");
+        }
+        std::memcpy(reinterpret_cast<void *>(cursor), bytes + (cursor - address),
+                    chunk);
+        cursor += chunk;
+      }
+    };
+    const auto pattern = [](uint32_t seed, uint64_t size) {
+      std::vector<uint8_t> bytes(size);
+      const uint32_t mixed = seed * 2654435761u;
+      for (uint64_t i = 0; i < size; i++) {
+        bytes[i] = static_cast<uint8_t>((mixed >> ((i & 3) * 8)) ^ (i * 131) ^
+                                        (i >> 7) ^ seed);
+      }
+      return bytes;
+    };
+    const auto fill_at = [&](uint64_t address, uint64_t size) {
+      const auto bytes = pattern(stamp++, size);
+      guest_write(address, bytes.data(), size);
+    };
+    const auto fill = [&](uint64_t offset, uint64_t size) {
+      fill_at(addr(offset), size);
+    };
+    const auto map = [&](uint64_t offset, uint64_t size) {
+      run->resources->MapMemory(addr(offset), size);
+    };
+    const auto unmap = [&](uint64_t offset, uint64_t size) {
+      run->resources->UnmapMemory(addr(offset), size);
+    };
+    const auto owner_at = [&](uint64_t address, uint64_t size) {
+      const auto id = run->cache->FindBuffer(address, size);
+      Require(name, "owner registration", static_cast<bool>(id),
+              "FindBuffer did not register an owner");
+      return id;
+    };
+    const auto owner = [&](uint64_t offset, uint64_t size) {
+      return owner_at(addr(offset), size);
+    };
+    const auto hint_pending = [&](uint64_t offset) {
+      return BufferCacheTestAccess::BdaHintPending(*run->cache, addr(offset));
+    };
+    const auto invariant_holds = [&] {
+      return GpuResourceManagerTestAccess::HintInvariantHolds(*run->resources);
+    };
+    const auto consume = [&](const char *consumer) {
+      run->resources->PrepareBda();
+      if (run->resources->GetBdaSyncMode() != Config::BdaSyncMode::Legacy) {
+        Require(name, consumer, invariant_holds(),
+                "after a selective pass a CPU-dirty page of a mapped owner "
+                "has no pending hint");
+      }
+    };
+    // Bytes the registered owners' device buffers hold for [address, address + size), read
+    // without synchronising anything; empty if part of the range has no owner.
+    const auto read_device = [&](uint64_t address, uint64_t size) {
+      struct Piece {
+        vk::Buffer source;
+        uint64_t begin;
+        uint64_t bytes;
+        uint64_t out;
+        uint64_t skew;
+        uint64_t size;
+      };
+      std::vector<Piece> pieces;
+      uint64_t total = 0;
+      for (uint64_t cursor = address; cursor < address + size;) {
+        const auto id = BufferCacheTestAccess::PageOwner(*run->cache, cursor);
+        if (!id) {
+          return std::vector<uint8_t>{};
+        }
+        auto &buffer = run->cache->GetBuffer(id);
+        const uint64_t piece_end =
+            std::min(buffer.CpuAddress() + buffer.Size(), address + size);
+        const uint64_t relative = cursor - buffer.CpuAddress();
+        const uint64_t begin = relative & ~uint64_t{3};
+        const uint64_t end =
+            (piece_end - buffer.CpuAddress() + 3) & ~uint64_t{3};
+        pieces.push_back({buffer.Handle(), begin, end - begin, total,
+                          relative - begin, piece_end - cursor});
+        total += end - begin;
+        cursor = piece_end;
+      }
+      auto readback = CreateHostBuffer(
+          name, total, vk::BufferUsageFlagBits::eTransferDst, {0});
+      for (const auto &piece : pieces) {
+        const vk::BufferCopy copy{piece.begin, piece.out, piece.bytes};
+        scheduler.Current().Handle().copyBuffer(piece.source, readback.buffer, 1,
+                                                &copy);
+      }
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+          {}, 0, nullptr, 1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, readback, total / 4);
+      DestroyBuffer(&readback);
+      std::vector<uint8_t> bytes;
+      bytes.reserve(size);
+      const auto *raw = reinterpret_cast<const uint8_t *>(words.data());
+      for (const auto &piece : pieces) {
+        bytes.insert(bytes.end(), raw + piece.out + piece.skew,
+                     raw + piece.out + piece.skew + piece.size);
+      }
+      return bytes;
+    };
+    const auto expect_at = [&](uint64_t address, uint64_t size,
+                               const std::string &label) {
+      const auto device = read_device(address, size);
+      std::vector<uint8_t> guest(size);
+      Require(name, label.c_str(),
+              Libs::LibKernel::Memory::TryReadBacking(address, guest.data(),
+                                                      size),
+              "guest backing read failed");
+      Require(name, label.c_str(), !device.empty() && device == guest,
+              std::string(mode_name()) +
+                  ": BDA-visible bytes differ from guest memory at this "
+                  "consumer boundary");
+      run->seen.emplace_back(label, device);
+    };
+    const auto expect = [&](uint64_t offset, uint64_t size,
+                            const std::string &label) {
+      expect_at(addr(offset), size, label);
+    };
+    const auto record_at = [&](uint64_t address, uint64_t size,
+                               const std::string &label) {
+      run->seen.emplace_back(label, read_device(address, size));
+    };
+    const auto on_other_thread = [](auto &&work) {
+      std::thread worker(std::forward<decltype(work)>(work));
+      worker.join();
+    };
+
+    // Runs `body` once per mode from identical guest state. With `compare_modes`, every
+    // observation must also be identical between the modes.
+    const auto run_case = [&](const char *test, bool compare_modes,
+                              auto &&body) {
+      if (only != nullptr && std::strstr(test, only) == nullptr) {
+        return;
+      }
+      std::vector<std::pair<std::string, std::vector<uint8_t>>> observed[2];
+      constexpr Config::BdaSyncMode modes[2] = {Config::BdaSyncMode::Legacy,
+                                                Config::BdaSyncMode::Selective};
+      for (int m = 0; m < 2; m++) {
+        std::vector<uint8_t> zero(area, 0);
+        Libs::LibKernel::Memory::WriteBacking(base, zero.data(), area);
+        stamp = 1;
+        GpuResourceManager resources(m_runtime_context, scheduler);
+        resources.SetGpu(&gpu);
+        resources.SetBdaSyncMode(modes[m]);
+        Run current{&resources, &resources.GetBufferCache(), {}};
+        run = &current;
+        body(modes[m] == Config::BdaSyncMode::Legacy);
+        s_hook = nullptr;
+        observed[m] = std::move(current.seen);
+        resources.UnmapMemory(base, area);
+        resources.UnmapMemory(alias_base, alias_size);
+        scheduler.Finish();
+        resources.SetGpu(nullptr);
+        run = nullptr;
+      }
+      Require(name, test, !compare_modes || observed[0] == observed[1],
+              "legacy and selective made different bytes BDA-visible");
+      std::printf("[host]    %-32s ok\n", test);
+    };
+    const auto region_of = [](uint64_t offset) { return offset / kRegion; };
+
+    run_case("BDA T1 one dirty among 1000", true, [&](bool) {
+      map(0, area);
+      constexpr uint64_t count = 1000;
+      fill(0, count * kOwnerPage);
+      for (uint64_t i = 0; i < count; i++) {
+        owner(i * kOwnerPage, kOwnerPage);
+      }
+      consume("T1 initial");
+      expect(0, count * kOwnerPage, "T1 initial");
+      fill(537 * kOwnerPage + 0x1234, 1);
+      consume("T1 one dirty");
+      expect(0, count * kOwnerPage, "T1 every owner after one dirty byte");
+    });
+
+    run_case("BDA T2 adjacent owners one dirty", true, [&](bool) {
+      map(0, area);
+      fill(0x10000, 0x20000);
+      owner(0x10000, 0x10000);
+      owner(0x20000, 0x10000);
+      consume("T2 initial");
+      expect(0x10000, 0x20000, "T2 initial");
+      fill(0x18000, 64);
+      consume("T2 one dirty");
+      expect(0x10000, 0x20000, "T2 both owners");
+    });
+
+    run_case("BDA T3 two dirty owners", true, [&](bool) {
+      map(0, area);
+      fill(0x40000, 0x10000);
+      fill(2 * kRegion + 0x40000, 0x10000);
+      owner(0x40000, 0x10000);
+      owner(2 * kRegion + 0x40000, 0x10000);
+      consume("T3 initial");
+      fill(0x44000, 32);
+      fill(2 * kRegion + 0x4c000, 32);
+      consume("T3 two dirty");
+      expect(0x40000, 0x10000, "T3 first owner");
+      expect(2 * kRegion + 0x40000, 0x10000, "T3 second owner");
+    });
+
+    run_case("BDA T4 four 4K quarters", true, [&](bool) {
+      map(0, area);
+      fill(0x80000, kOwnerPage);
+      owner(0x80000, kOwnerPage);
+      consume("T4 initial");
+      for (uint64_t q = 0; q < kOwnerPage / kPage; q++) {
+        fill(0x80000 + q * kPage + 0x7, 1);
+        consume("T4 quarter");
+        expect(0x80000, kOwnerPage, "T4 quarter " + std::to_string(q));
+      }
+      for (uint64_t q = 0; q < kOwnerPage / kPage; q++) {
+        fill(0x80000 + q * kPage + 0x100, 1);
+      }
+      consume("T4 all quarters");
+      expect(0x80000, kOwnerPage, "T4 all quarters");
+    });
+
+    run_case("BDA T5 partial mapped first page", true, [&](bool) {
+      map(0, 0x100000);
+      map(0x100800, area - 0x100800);
+      fill(0x100000, 0x8000);
+      owner(0x100000, 0x8000);
+      consume("T5 initial");
+      expect(0x100800, 0x7800, "T5 initial mapped part");
+      record_at(addr(0x100000), 0x800, "T5 unmapped head");
+      fill(0x100900, 16);
+      consume("T5 write");
+      expect(0x100800, 0x7800, "T5 mapped part");
+      record_at(addr(0x100000), 0x800, "T5 unmapped head after");
+    });
+
+    run_case("BDA T6 partial mapped last page", true, [&](bool) {
+      map(0, 0x207800);
+      map(0x208000, area - 0x208000);
+      fill(0x200000, 0x8000);
+      owner(0x200000, 0x8000);
+      consume("T6 initial");
+      expect(0x200000, 0x7800, "T6 initial mapped part");
+      fill(0x207700, 16);
+      consume("T6 write");
+      expect(0x200000, 0x7800, "T6 mapped part");
+      record_at(addr(0x207800), 0x800, "T6 unmapped tail");
+    });
+
+    run_case("BDA T7 owner crossing 4M boundary", true, [&](bool) {
+      map(0, area);
+      fill(kRegion - 0x10000, 0x20000);
+      owner(kRegion - 0x10000, 0x20000);
+      consume("T7 initial");
+      fill(kRegion - 0x8000, 64);
+      consume("T7 left side");
+      expect(kRegion - 0x10000, 0x20000, "T7 whole owner");
+    });
+
+    run_case("BDA T8 dirty range crossing 4M", true, [&](bool) {
+      map(0, area);
+      fill(kRegion - 0x10000, 0x20000);
+      owner(kRegion - 0x10000, 0x20000);
+      consume("T8 initial");
+      fill(kRegion - 0x2000, 0x4000);
+      consume("T8 crossing write");
+      expect(kRegion - 0x10000, 0x20000, "T8 whole owner");
+    });
+
+    run_case("BDA T9 disjoint mapped pieces", true, [&](bool) {
+      map(0, area);
+      fill(0x300000, 0x40000);
+      owner(0x300000, 0x40000);
+      consume("T9 initial");
+      unmap(0x310000, 0x10000);
+      fill(0x304000, 64);
+      fill(0x314000, 64);
+      fill(0x328000, 64);
+      consume("T9 writes");
+      expect(0x300000, 0x10000, "T9 first mapped piece");
+      expect(0x320000, 0x20000, "T9 second mapped piece");
+      record_at(addr(0x310000), 0x10000, "T9 unmapped gap");
+    });
+
+    run_case("BDA T10 write before exchange", true, [&](bool) {
+      map(0, area);
+      fill(kRegion + 0x40000, 0x10000);
+      owner(kRegion + 0x40000, 0x10000);
+      consume("T10 initial");
+      fill(kRegion + 0x46000, 128);
+      consume("T10 ordered write");
+      expect(kRegion + 0x40000, 0x10000, "T10 owner");
+    });
+
+    run_case("BDA T11 write after exchange", false, [&](bool legacy) {
+      map(0, area);
+      const uint64_t first = 3 * kRegion + 0x40000;
+      const uint64_t other = 2 * kRegion + 0x40000; // same hint word, not in this pass
+      fill(first, 0x10000);
+      fill(other, 0x10000);
+      owner(first, 0x10000);
+      owner(other, 0x10000);
+      consume("T11 initial");
+      fill(first + 0x1000, 64); // makes region 3 part of the next pass
+      if (legacy) {
+        fill(first + 0x3000, 64);
+        fill(other + 0x3000, 64);
+        consume("T11 control");
+        expect(first, 0x10000, "T11 owner");
+        expect(other, 0x10000, "T11 other");
+        return;
+      }
+      const uint64_t word = (base / kRegion + region_of(first)) / 64;
+      bool fired = false;
+      s_hook = [&](BdaTestHooks::Point point, uint64_t value) {
+        if (point == BdaTestHooks::Point::AfterHintExchange && value == word &&
+            !fired) {
+          fired = true;
+          on_other_thread([&] {
+            fill(first + 0x3000, 64); // same region, before its snapshot
+            fill(other + 0x3000, 64); // same word, region not owned by the pass
+          });
+          Require(name, "T11 mid-pass", invariant_holds(),
+                  "invariant failed while the pass owned the word");
+        }
+        return false;
+      };
+      consume("T11 pass");
+      s_hook = nullptr;
+      Require(name, "T11", fired, "the exchange hook never fired");
+      expect(first, 0x10000, "T11 owner");
+      Require(name, "T11", hint_pending(other),
+              "a publication after the exchange was lost");
+      consume("T11 next");
+      expect(other, 0x10000, "T11 other");
+    });
+
+    run_case("BDA T12 write after snapshot", false, [&](bool legacy) {
+      map(0, area);
+      const uint64_t a = 4 * kRegion + 0x40000;
+      const uint64_t b = 4 * kRegion + 0x80000;
+      fill(a, kOwnerPage);
+      fill(b, kOwnerPage);
+      owner(a, kOwnerPage);
+      owner(b, kOwnerPage);
+      consume("T12 initial");
+      fill(a + 0x10, 16);
+      if (legacy) {
+        consume("T12 control");
+        expect(a, kOwnerPage, "T12 A");
+        fill(b + 0x10, 16);
+        consume("T12 control next");
+        expect(b, kOwnerPage, "T12 B");
+        return;
+      }
+      const uint64_t region = base / kRegion + region_of(a);
+      bool fired = false;
+      s_hook = [&](BdaTestHooks::Point point, uint64_t value) {
+        if (point == BdaTestHooks::Point::AfterDirtySnapshot &&
+            value == region && !fired) {
+          fired = true;
+          on_other_thread([&] { fill(b + 0x10, 16); });
+        }
+        return false;
+      };
+      consume("T12 pass");
+      s_hook = nullptr;
+      Require(name, "T12", fired, "the snapshot hook never fired");
+      expect(a, kOwnerPage, "T12 A");
+      Require(name, "T12", hint_pending(b),
+              "a racing publication after the snapshot was lost");
+      consume("T12 next");
+      expect(b, kOwnerPage, "T12 B");
+    });
+
+    run_case("BDA T13 same-word concurrent", true, [&](bool) {
+      map(0, area);
+      const uint64_t a = kRegion + 0x100000;
+      const uint64_t b = 2 * kRegion + 0x100000;
+      fill(a, 0x10000);
+      fill(b, 0x10000);
+      owner(a, 0x10000);
+      owner(b, 0x10000);
+      consume("T13 initial");
+      const auto first = pattern(0x1111, 256);
+      const auto second = pattern(0x2222, 256);
+      std::barrier start(2);
+      std::thread one([&] {
+        start.arrive_and_wait();
+        guest_write(addr(a + 0x2000), first.data(), first.size());
+      });
+      std::thread two([&] {
+        start.arrive_and_wait();
+        guest_write(addr(b + 0x2000), second.data(), second.size());
+      });
+      one.join();
+      two.join();
+      consume("T13 concurrent");
+      expect(a, 0x10000, "T13 A");
+      expect(b, 0x10000, "T13 B");
+    });
+
+    run_case("BDA T14 republish after exchange", false, [&](bool legacy) {
+      map(0, area);
+      const uint64_t o = 5 * kRegion + 0x40000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T14 initial");
+      fill(o + 0x1000, 64);
+      if (legacy) {
+        fill(o + 0x5000, 64);
+        consume("T14 control");
+        expect(o, 0x10000, "T14 owner");
+        return;
+      }
+      const uint64_t word = (base / kRegion + region_of(o)) / 64;
+      bool fired = false;
+      s_hook = [&](BdaTestHooks::Point point, uint64_t value) {
+        if (point == BdaTestHooks::Point::AfterHintExchange && value == word &&
+            !fired) {
+          fired = true;
+          on_other_thread([&] { fill(o + 0x5000, 64); });
+        }
+        return false;
+      };
+      consume("T14 pass");
+      s_hook = nullptr;
+      Require(name, "T14", fired, "the exchange hook never fired");
+      Require(name, "T14", hint_pending(o),
+              "the pass cleared a region republished after its exchange");
+      expect(o, 0x10000, "T14 owner");
+      consume("T14 next");
+      expect(o, 0x10000, "T14 owner next");
+    });
+
+    run_case("BDA T15 store around re-arm", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = kRegion + 0x500000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T15 initial");
+      for (const auto point : {BdaTestHooks::Point::BeforeUploadCopy,
+                               BdaTestHooks::Point::AfterUploadCopy}) {
+        fill(o + 0x100, 32);
+        bool fired = false;
+        s_hook = [&](BdaTestHooks::Point p, uint64_t value) {
+          if (p == point && value == addr(o) && !fired) {
+            fired = true;
+            // The page was just re-protected; this store faults and retries.
+            on_other_thread([&] { fill(o + 0x180, 32); });
+          }
+          return false;
+        };
+        consume("T15 racing pass");
+        s_hook = nullptr;
+        Require(name, "T15", fired, "the upload hook never fired");
+        Require(name, "T15", hint_pending(o),
+                "a store after protection re-arm left no pending hint");
+        consume("T15 next");
+        expect(o, 0x10000, "T15 owner after racing store");
+      }
+    });
+
+    run_case("BDA T16 null manager P2 window", false, [&](bool legacy) {
+      map(0, area);
+      const uint64_t o = 5 * kRegion + 0x200000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      if (legacy) {
+        consume("T16 control");
+        expect(o, 0x10000, "T16 owner");
+        return;
+      }
+      const uint64_t region = base / kRegion + region_of(o);
+      std::binary_semaphore paused{0}, release{0}, finished{0};
+      bool null_seen = false;
+      s_hook = [&](BdaTestHooks::Point point, uint64_t value) {
+        if (point == BdaTestHooks::Point::RegionHintPublished && value == region) {
+          paused.release();
+          release.acquire();
+        } else if (point == BdaTestHooks::Point::NullRegionManager &&
+                   value == region && !null_seen) {
+          null_seen = true;
+          release.release();
+          finished.acquire();
+        }
+        return false;
+      };
+      std::thread creator([&] {
+        (void)run->cache->IsRegionCpuModified(addr(o), 1);
+        finished.release();
+      });
+      paused.acquire();
+      consume("T16 pass");
+      creator.join();
+      s_hook = nullptr;
+      Require(name, "T16", null_seen,
+              "the consumer never met the hint-before-pointer window");
+      expect(o, 0x10000, "T16 owner at the same consumer");
+    });
+
+    run_case("BDA T17 owner after publication", true, [&](bool) {
+      map(0, area);
+      const uint64_t a = 2 * kRegion + 0x100000;
+      const uint64_t t = 2 * kRegion + 0x200000;
+      fill(a, kOwnerPage);
+      owner(a, kOwnerPage);
+      consume("T17 initial");
+      fill(t, 0x8000);
+      Require(name, "T17",
+              run->resources->InvalidateMemory(addr(t), 0x8000),
+              "explicit invalidation of a mapped range failed");
+      consume("T17 no owner yet");
+      owner(t, 0x8000);
+      consume("T17 owner registered");
+      expect(t, 0x8000, "T17 new owner");
+    });
+
+    run_case("BDA T18 stream-grown real span", true, [&](bool) {
+      map(0, area);
+      const uint64_t far_owner = 4 * kRegion + 0x300000;
+      fill(far_owner, kOwnerPage);
+      owner(far_owner, kOwnerPage);
+      consume("T18 region 4 tracked");
+      const uint64_t leap_target = 4 * kRegion;
+      fill(leap_target, 0x80000); // orphan pages: dirty, writable, hint consumed
+      consume("T18 orphans");
+      const uint64_t start = 4 * kRegion - 0x80000;
+      fill(start, 24 * kOwnerPage + kOwnerPage);
+      for (uint64_t k = 0; k < 24; k++) {
+        owner(start + (k + 1) * kOwnerPage - 8, 16);
+      }
+      const auto grown = BufferCacheTestAccess::PageOwner(*run->cache, addr(start));
+      Require(name, "T18",
+              grown && BufferCacheTestAccess::PageOwner(
+                           *run->cache, addr(leap_target + 0x40000)) == grown,
+              "stream growth did not extend the owner into the next region");
+      consume("T18 grown");
+      expect(leap_target, 0x80000, "T18 leap-covered pages");
+      expect(start, 24 * kOwnerPage, "T18 requested span");
+    });
+
+    run_case("BDA T19 retire and recreate", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = kRegion + 0x200000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T19 initial");
+      expect(o, 0x10000, "T19 before retirement");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(*run->cache, 0, 0);
+      for (int i = 0; i < 400 &&
+                      BufferCacheTestAccess::PageOwner(*run->cache, addr(o));
+           i++) {
+        run->cache->RunGarbageCollector();
+      }
+      Require(name, "T19", !BufferCacheTestAccess::PageOwner(*run->cache, addr(o)),
+              "garbage collection did not retire the owner");
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T19 recreated");
+      expect(o, 0x10000, "T19 recreated owner");
+    });
+
+    run_case("BDA T20 map unmap remap", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = 2 * kRegion + 0x300000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T20 initial");
+      unmap(o, 0x10000);
+      consume("T20 unmapped");
+      fill(o, 0x10000);
+      map(o, 0x10000);
+      consume("T20 remapped");
+      expect(o, 0x10000, "T20 remapped contents");
+    });
+
+    run_case("BDA T21 orphans then owner", true, [&](bool) {
+      map(0, area);
+      const uint64_t a = 3 * kRegion + 0x100000;
+      const uint64_t t = 3 * kRegion + 0x180000;
+      fill(a, kOwnerPage);
+      owner(a, kOwnerPage);
+      consume("T21 initial");
+      fill(t, 0x10000);
+      consume("T21 orphans");
+      owner(t, 0x10000);
+      consume("T21 owner registered");
+      expect(t, 0x10000, "T21 new owner");
+    });
+
+    run_case("BDA T22 GPU to CPU then store", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = kRegion + 0x300000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T22 initial");
+      (void)run->cache->ObtainBuffer(addr(o + 0x100), 16, true, false);
+      run->cache->FillBuffer(addr(o + 0x100), 16, 0xa5a5a5a5u, false);
+      fill(o + 0x100, 16); // faults on the GPU-owned page, flushes, then stores
+      consume("T22 store");
+      expect(o, 0x10000, "T22 owner");
+    });
+
+    run_case("BDA T23 fault-driven owner", true, [&](bool) {
+      map(0, area);
+      const uint64_t t = 5 * kRegion + 0x100000;
+      fill(t, 0x10000);
+      scheduler.DeferOperation(
+          [&] { (void)run->cache->FindBuffer(addr(t), 0x10000); });
+      scheduler.Finish();
+      Require(name, "T23", static_cast<bool>(BufferCacheTestAccess::PageOwner(
+                               *run->cache, addr(t))),
+              "the deferred operation did not register an owner");
+      consume("T23 deferred owner");
+      expect(t, 0x10000, "T23 owner");
+    });
+
+    run_case("BDA T24 alias differential", true, [&](bool) {
+      map(0, area);
+      run->resources->MapMemory(alias_base, alias_size);
+      const uint64_t o = 0x100000;
+      fill(o, 0x10000); // through the primary VA
+      owner_at(alias_base + o, 0x10000);
+      consume("T24 initial");
+      record_at(alias_base + o, 0x10000, "T24 alias owner initial");
+      fill(o + 0x2000, 64); // primary VA: no owner, no fault
+      consume("T24 primary write");
+      record_at(alias_base + o, 0x10000, "T24 alias owner after primary write");
+      fill_at(alias_base + o + 0x4000, 64); // alias VA: owner page faults
+      consume("T24 alias write");
+      record_at(alias_base + o, 0x10000, "T24 alias owner after alias write");
+    });
+
+    // Shared consumption semantics only: consecutive PrepareBda consumers against one global
+    // hint state. This does not drive the real graphics and compute call sites; both of them
+    // reach the same PrepareBda.
+    run_case("BDA T25 consecutive consumers", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = 3 * kRegion + 0x200000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T25 initial");
+      fill(o + 0x1000, 64);
+      consume("T25 consumer 1");
+      expect(o, 0x10000, "T25 consumer 1");
+      fill(o + 0x9000, 64);
+      consume("T25 consumer 2");
+      expect(o, 0x10000, "T25 consumer 2");
+      fill(o + 0x1000, 64);
+      consume("T25 consumer 3");
+      expect(o, 0x10000, "T25 consumer 3");
+    });
+
+    run_case("BDA T26 mode switching", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = kRegion + 0x400000;
+      fill(o, 0x10000);
+      owner(o, 0x10000);
+      consume("T26 initial");
+      fill(o + 0x100, 16);
+      run->resources->SetBdaSyncMode(Config::BdaSyncMode::Legacy);
+      consume("T26 legacy");
+      expect(o, 0x10000, "T26 legacy");
+      fill(o + 0x5100, 16);
+      run->resources->SetBdaSyncMode(Config::BdaSyncMode::Selective);
+      consume("T26 selective");
+      expect(o, 0x10000, "T26 selective");
+      fill(o + 0x9100, 16);
+      run->resources->SetBdaSyncMode(Config::BdaSyncMode::Legacy);
+      fill(o + 0xd100, 16);
+      consume("T26 legacy again");
+      expect(o, 0x10000, "T26 legacy again");
+      run->resources->SetBdaSyncMode(Config::BdaSyncMode::Selective);
+      fill(o + 0x2100, 16);
+      consume("T26 selective again");
+      expect(o, 0x10000, "T26 selective again");
+    });
+
+#if KYTY_BUILD != KYTY_BUILD_DEBUG
+    run_case("BDA T27 selective fails closed", true, [&](bool legacy) {
+      map(0, area);
+      const uint64_t a = 2 * kRegion + 0x80000;
+      const uint64_t b = 3 * kRegion + 0x80000;
+      fill(a, 0x10000);
+      fill(b, 0x10000);
+      owner(a, 0x10000);
+      owner(b, 0x10000);
+      consume("T27 initial");
+      fill(a + 0x100, 16);
+      fill(b + 0x100, 16);
+      bool fired = false;
+      s_hook = [&](BdaTestHooks::Point point, uint64_t) {
+        if (point == BdaTestHooks::Point::ForceSelectiveFailure && !fired) {
+          fired = true;
+          return true;
+        }
+        return false;
+      };
+      run->resources->PrepareBda(); // no invariant check: the pass is meant to fail
+      s_hook = nullptr;
+      Require(name, "T27", legacy || (fired && run->resources->IsBdaSelectiveDisabled()),
+              "an owner-index failure did not fail closed to the legacy walk");
+      expect(a, 0x10000, "T27 A at the failing consumer");
+      expect(b, 0x10000, "T27 B at the failing consumer");
+      fill(a + 0x200, 16);
+      consume("T27 after failure");
+      expect(a, 0x10000, "T27 A afterwards");
+    });
+#endif
+
+    run_case("BDA T28 multi-region near wrap", true, [&](bool) {
+      map(0, area);
+      const uint64_t o = kRegion - 0x100000;
+      const uint64_t size = kRegion + 0x200000; // regions 0, 1 and 2
+      fill(o, size);
+      owner(o, size);
+      consume("T28 initial");
+      auto &staging = BufferCacheTestAccess::StagingBuffer(*run->cache);
+      // Leave 6 KiB before the end: the next 4 KiB page uploads cannot all fit, so they wrap.
+      auto [tail, tail_offset] = staging.Map(staging.Size() - 0x1800, 4);
+      Require(name, "T28", tail != nullptr,
+              "failed to position the staging ring near its wrap");
+      (void)tail_offset;
+      staging.Commit();
+      fill(o + 0x1000, 64);
+      fill(kRegion + 0x1000, 64);
+      fill(2 * kRegion + 0x1000, 64);
+      consume("T28 wrap");
+      expect(o, size, "T28 owner across the wrap");
+    });
+
+    // X1: a mapped interval that begins partway through an ownerless 16 KiB caching page, with
+    // the dirty run continuing into the owned page after it. The discovery cursor starts
+    // unaligned on the orphan page and must step to the next caching-page boundary, not past it.
+    run_case("BDA X1 unaligned orphan start", true, [&](bool) {
+      map(0, area);
+      const uint64_t orphan = kRegion + 0x300000; // caching page without an owner
+      const uint64_t o = orphan + kOwnerPage;     // the owned caching page after it
+      fill(o, kOwnerPage);
+      owner(o, kOwnerPage);
+      consume("X1 initial"); // creates region 1: every page dirty except the owner's
+      unmap(orphan, kPage);  // the next mapped interval starts 4 KiB into the orphan page
+      fill(o + 0x10, 64);    // dirty run: orphan + 4 KiB up to the owner's first page
+      consume("X1 unaligned start");
+      expect(o, kOwnerPage, "X1 owner after an unaligned orphan start");
+    });
+
+    // X8: a hinted region with no RegionManager yet, whose owner has an unmapped hole. The pass
+    // must synchronise both mapped pieces through the legacy walk at this consumer, and must
+    // not synchronise the hole.
+    run_case("BDA X8 null region owner hole", true, [&](bool legacy) {
+      map(0, area);
+      const uint64_t o = 3 * kRegion + 0x100000;
+      const uint64_t hole = o + 0x10000;
+      fill(o, 0x40000);
+      owner(o, 0x40000);
+      unmap(hole, 0x10000);
+      // A pattern no other case uploads, written while the hole is unmapped.
+      const auto rewritten = pattern(0x58380001u, 0x10000);
+      guest_write(addr(hole), rewritten.data(), rewritten.size());
+      const uint64_t region = base / kRegion + region_of(o);
+      bool null_seen = false;
+      s_hook = [&](BdaTestHooks::Point point, uint64_t value) {
+        null_seen = null_seen ||
+                    (point == BdaTestHooks::Point::NullRegionManager && value == region);
+        return false;
+      };
+      consume("X8 pass");
+      s_hook = nullptr;
+      Require(name, "X8", legacy || null_seen,
+              "the selective pass never met the region without a manager");
+      expect(o, 0x10000, "X8 mapped piece before the hole");
+      expect(hole + 0x10000, 0x20000, "X8 mapped piece after the hole");
+      Require(name, "X8", read_device(addr(hole), 0x10000) != rewritten,
+              std::string(mode_name()) + ": the unmapped hole was synchronised");
+    });
+
+    BdaTestHooks::g_callback = nullptr;
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap alias",
+            Libs::LibKernel::Memory::KernelMunmap(alias_base, alias_size) == 0,
+            "alias mapping release failed");
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, area) == 0,
+            "direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               area) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+#endif
 
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
@@ -29464,6 +30385,14 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if ((argc == 2 || argc == 3) &&
+      std::strcmp(argv[1], "--bda-selective-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSelectiveBdaSynchronization(argc == 3 ? argv[2] : nullptr);
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();

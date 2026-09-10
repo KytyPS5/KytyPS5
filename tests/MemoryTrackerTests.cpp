@@ -1,9 +1,11 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/bdaTestHooks.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -907,6 +909,137 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+namespace {
+
+using Libs::Graphics::TRACKER_REGION_SIZE;
+namespace BdaHooks = Libs::Graphics::BdaTestHooks;
+
+MemoryTracker *g_bda_p2_tracker = nullptr;
+std::atomic<uint64_t> g_bda_p2_region{UINT64_MAX};
+std::atomic<bool> g_bda_p2_seen{false};
+std::atomic<bool> g_bda_p2_hint_first{false};
+
+bool BdaP2Probe(BdaHooks::Point point, uint64_t value) {
+  if (point == BdaHooks::Point::RegionHintPublished &&
+      value == g_bda_p2_region.load()) {
+    g_bda_p2_seen = true;
+    g_bda_p2_hint_first = g_bda_p2_tracker->IsBdaHintPending(value) &&
+                          g_bda_p2_tracker->FindRegion(value) == nullptr;
+  }
+  return false;
+}
+
+// P1 on every CPU-dirty route and every execution, P2 hint-before-pointer, and the
+// exchange / restore / discard / half-open publication contract of the hint words.
+void TestBdaHintPublication() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto vaddr = reinterpret_cast<uint64_t>(memory);
+  const auto region = vaddr / TRACKER_REGION_SIZE;
+  const auto word = static_cast<size_t>(region / 64);
+  const auto pending = [&] { return tracker.IsBdaHintPending(region); };
+
+  Check(!pending() && tracker.FindRegion(region) == nullptr,
+        "fresh tracker already has a hint or a manager");
+
+  g_bda_p2_tracker = &tracker;
+  g_bda_p2_region = region;
+  BdaHooks::g_callback = BdaP2Probe;
+  (void)tracker.IsRegionCpuModified(vaddr, 1); // Iterate<true> creates the region
+  BdaHooks::g_callback = nullptr;
+  Check(g_bda_p2_seen && g_bda_p2_hint_first,
+        "P2 published the manager pointer before the region hint");
+  Check(pending() && tracker.FindRegion(region) != nullptr,
+        "region creation did not leave its hint pending");
+
+  const auto bits = tracker.ConsumeBdaHintWord(word);
+  Check(((bits >> (region % 64)) & 1u) != 0 && !pending() &&
+            tracker.ConsumeBdaHintWord(word) == 0,
+        "hint exchange did not transfer the region exactly once");
+
+  tracker.ForEachUploadRange(
+      vaddr, 4 * page, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!pending(), "clearing CPU-dirty state published a hint");
+
+  tracker.InvalidateRegion(vaddr, 1, [] {});
+  Check(pending(), "InvalidateRegion did not publish");
+  (void)tracker.ConsumeBdaHintWord(word);
+  tracker.MarkRegionAsCpuModified(vaddr, 1); // already CPU-dirty
+  Check(pending(), "MarkRegionAsCpuModified on a dirty page did not publish");
+  (void)tracker.ConsumeBdaHintWord(word);
+  tracker.MarkRegionAsCpuModified(vaddr, 1);
+  Check(pending(), "a repeated CPU-dirty execution did not publish again");
+  (void)tracker.ConsumeBdaHintWord(word);
+  tracker.UntrackMemory(vaddr, 4 * page);
+  Check(pending(), "UntrackMemory did not publish");
+
+  const auto owned = tracker.ConsumeBdaHintWord(word);
+  tracker.RestoreBdaHints(word, owned);
+  Check(pending(), "RestoreBdaHints lost an owned region");
+  tracker.DiscardBdaHints();
+  Check(!pending(), "DiscardBdaHints left a hint pending");
+
+  tracker.MarkRegionAsCpuModified(vaddr, 1);
+  (void)tracker.ConsumeBdaHintWord(word);
+  tracker.MarkRegionAsCpuModified(vaddr, 1);
+  Check(pending(), "a publication after the exchange was lost");
+  tracker.DiscardBdaHints();
+
+  const uint64_t boundary = (region + 1) * TRACKER_REGION_SIZE;
+  tracker.PublishBdaHints(boundary - 1, 1);
+  Check(tracker.IsBdaHintPending(region) &&
+            !tracker.IsBdaHintPending(region + 1),
+        "the last byte before a region boundary flagged the next region");
+  tracker.DiscardBdaHints();
+  tracker.PublishBdaHints(boundary - 1, 2);
+  Check(tracker.IsBdaHintPending(region) &&
+            tracker.IsBdaHintPending(region + 1),
+        "a range crossing a region boundary missed a region");
+  tracker.DiscardBdaHints();
+  tracker.PublishBdaHints(boundary, 0);
+  Check(!tracker.IsBdaHintPending(region + 1),
+        "an empty range published a hint");
+
+  Release(memory);
+}
+
+// Two publishers hit two regions of one hint word in lock step with the consumer's exchange;
+// no round may lose either bit.
+void TestBdaHintSameWordConcurrentPublishers() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr size_t word = 300;
+  constexpr uint64_t first = word * 64 + 5;
+  constexpr uint64_t second = word * 64 + 41;
+  constexpr int rounds = 20000;
+  std::barrier sync(3);
+  const auto publisher = [&](uint64_t region) {
+    for (int i = 0; i < rounds; i++) {
+      sync.arrive_and_wait();
+      tracker.PublishBdaHints(region * TRACKER_REGION_SIZE, 1);
+      sync.arrive_and_wait();
+    }
+  };
+  std::thread a(publisher, first);
+  std::thread b(publisher, second);
+  constexpr uint64_t expected =
+      (uint64_t{1} << (first % 64)) | (uint64_t{1} << (second % 64));
+  bool lost = false;
+  for (int i = 0; i < rounds; i++) {
+    sync.arrive_and_wait();
+    sync.arrive_and_wait();
+    lost = lost || tracker.ConsumeBdaHintWord(word) != expected;
+  }
+  a.join();
+  b.join();
+  Check(!lost, "concurrent same-word publications lost a bit");
+}
+
+} // namespace
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -926,6 +1059,8 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestBdaHintPublication();
+  TestBdaHintSameWordConcurrentPublishers();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

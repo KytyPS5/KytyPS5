@@ -768,6 +768,10 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 		case CFG::BranchCondition::VccNonZero: condition = ir.AnyLane(ir.GetVcc()); break;
 		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetExec())); break;
 		case CFG::BranchCondition::ExecNonZero: condition = ir.AnyLane(ir.GetExec()); break;
+		case CFG::BranchCondition::ScalarInstruction:
+			EXIT_IF(instruction_branch_condition.IsEmpty());
+			condition = instruction_branch_condition;
+			break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				EXIT("block %u reads an invalid goto variable", source.id);

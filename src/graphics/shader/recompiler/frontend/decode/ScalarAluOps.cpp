@@ -87,6 +87,7 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
     {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
     {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT},    {0x18u, Opcode::S_WAITCNT},
     {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
+    {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
 
 constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
@@ -220,6 +221,11 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	switch (inst.opcode) {
 		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END:
+			DecodeScalarDestination(sdst, pc, inst.dst);
+			inst.branch_target = pc + 4u + static_cast<uint32_t>(imm * 4);
+			return;
 		case Opcode::S_WAITCNT: {
 			const uint32_t waitcnt = word & 0xffffu;
 			inst.dst.kind          = OperandKind::Null;

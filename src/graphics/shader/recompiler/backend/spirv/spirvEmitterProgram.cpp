@@ -96,7 +96,9 @@ void EmitReturn(ValueEmitContext& ctx) {
 }
 
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
+	// Scalar-instruction conditions already test the full wave's raw register values.
 	if (ctx.other_half == nullptr ||
+	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
 	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
 		return ctx.Def(info.condition);
 	}

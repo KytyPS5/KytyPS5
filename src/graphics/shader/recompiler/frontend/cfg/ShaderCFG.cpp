@@ -52,26 +52,6 @@ uint32_t ProgramEndPc(const Decoder::Program& program) {
 	return InstructionEndPc(program.instructions.back());
 }
 
-bool IsUnconditionalBranch(Opcode opcode) {
-	return opcode == Opcode::S_BRANCH;
-}
-
-bool IsConditionalBranch(Opcode opcode) {
-	switch (opcode) {
-		case Opcode::S_CBRANCH_SCC0:
-		case Opcode::S_CBRANCH_SCC1:
-		case Opcode::S_CBRANCH_VCCZ:
-		case Opcode::S_CBRANCH_VCCNZ:
-		case Opcode::S_CBRANCH_EXECZ:
-		case Opcode::S_CBRANCH_EXECNZ: return true;
-		default: return false;
-	}
-}
-
-bool IsBranch(Opcode opcode) {
-	return IsUnconditionalBranch(opcode) || IsConditionalBranch(opcode);
-}
-
 BranchCondition ConditionForOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::S_BRANCH: return BranchCondition::Always;
@@ -81,6 +61,8 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_CBRANCH_VCCNZ: return BranchCondition::VccNonZero;
 		case Opcode::S_CBRANCH_EXECZ: return BranchCondition::ExecZero;
 		case Opcode::S_CBRANCH_EXECNZ: return BranchCondition::ExecNonZero;
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
 	}
 }
@@ -1925,7 +1907,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
-		if (IsBranch(inst.opcode)) {
+		if (Decoder::IsDirectBranch(inst.opcode)) {
 			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
@@ -2032,11 +2014,11 @@ Graph BuildGraph(const Decoder::Program& program) {
 				block.terminator.condition  = BranchCondition::Always;
 				block.terminator.true_block = pc_to_block.at(target_info.target);
 			}
-		} else if (IsUnconditionalBranch(last.opcode)) {
+		} else if (last.opcode == Opcode::S_BRANCH) {
 			block.terminator.kind       = TerminatorKind::Branch;
 			block.terminator.condition  = BranchCondition::Always;
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
-		} else if (IsConditionalBranch(last.opcode)) {
+		} else if (Decoder::IsConditionalBranch(last.opcode)) {
 			block.terminator.kind       = TerminatorKind::ConditionalBranch;
 			block.terminator.condition  = ConditionForOpcode(last.opcode);
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
@@ -2244,6 +2226,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::VccNonZero: return "vccnz";
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
+		case BranchCondition::ScalarInstruction: return "scalar_instruction";
 		case BranchCondition::GotoVariable: return "goto_variable";
 		default: return "unknown";
 	}

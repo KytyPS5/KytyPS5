@@ -212,6 +212,7 @@ private:
 	bool    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	bool    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
+	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
 	                bool negate_source, bool write_64);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
@@ -233,7 +234,7 @@ private:
 	void ScalarSelect64(const Decoder::Instruction& inst, const Decoder::Operand& false_source);
 	void MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers);
 	void S_MOV_B64(const Decoder::Instruction& inst);
-	void S_WQM_B64(const Decoder::Instruction& inst);
+	void S_WQM(const Decoder::Instruction& inst, bool wide);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
 	void V_READFIRSTLANE_B32(const Decoder::Instruction& inst);
@@ -252,6 +253,7 @@ private:
 
 	IR::Program&    program;
 	IR::IREmitter   ir;
+	IR::U1          instruction_branch_condition;
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;

@@ -53,6 +53,8 @@ enum class Opcode {
 	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
+	S_SUBVECTOR_LOOP_BEGIN,
+	S_SUBVECTOR_LOOP_END,
 	S_AND_SAVEEXEC_B32,
 	S_OR_SAVEEXEC_B32,
 	S_XOR_SAVEEXEC_B32,
@@ -721,6 +723,8 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void DecodeProgram(std::span<const uint32_t> code, Program& program);
+bool IsConditionalBranch(Opcode opcode);
+bool IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

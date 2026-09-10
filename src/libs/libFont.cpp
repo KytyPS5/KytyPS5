@@ -745,7 +745,8 @@ static bool ttf_data_has_supported_magic(const uint8_t* data, uint32_t size) {
 	}
 
 	return (data[0] == 0x00 && data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00) ||
-	       (data[0] == 't' && data[1] == 'r' && data[2] == 'u' && data[3] == 'e');
+	       (data[0] == 't' && data[1] == 'r' && data[2] == 'u' && data[3] == 'e') ||
+	       (data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O');
 }
 
 static bool init_stb_font(FontState* font, const uint8_t* data, uint32_t size) {

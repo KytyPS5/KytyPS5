@@ -8,7 +8,6 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <execinfo.h>
 #include <pthread.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -16,56 +15,6 @@
 #if defined(__APPLE__)
 #include <libgen.h> // POSIX basename() lives here on macOS, not in <cstring>
 #endif
-
-// Avoid unwinding a guest-owned stack.
-static bool OnOwnStack() {
-	const char* probe = reinterpret_cast<const char*>(&probe);
-
-	pthread_attr_t attr {};
-#if defined(__APPLE__)
-	const auto* top  = static_cast<const char*>(pthread_get_stackaddr_np(pthread_self()));
-	const auto  size = pthread_get_stacksize_np(pthread_self());
-	(void)attr;
-	return top != nullptr && size != 0 && probe < top && probe >= top - size;
-#else
-	if (pthread_getattr_np(pthread_self(), &attr) != 0) {
-		return false;
-	}
-	void*      base = nullptr;
-	size_t     size = 0;
-	const bool ok = pthread_attr_getstack(&attr, &base, &size) == 0 && base != nullptr && size != 0;
-	pthread_attr_destroy(&attr);
-	if (!ok) {
-		return false;
-	}
-	const auto* low = static_cast<const char*>(base);
-	return probe >= low && probe < low + size;
-#endif
-}
-
-void SysStackWalk(void** stack, int* depth) {
-	if (stack == nullptr || depth == nullptr || *depth <= 0) {
-		if (depth != nullptr) {
-			*depth = 0;
-		}
-		return;
-	}
-
-	if (!OnOwnStack()) {
-		*depth = 0;
-		return;
-	}
-
-	const int n = ::backtrace(stack, *depth);
-	*depth      = (n < 0 ? 0 : n);
-}
-
-void SysStackUsagePrint(sys_dbg_stack_info_t& stack) {
-	printf("stack: (0x%" PRIx64 ", %" PRIu64 ")\n", static_cast<uint64_t>(stack.commited_addr),
-	       static_cast<uint64_t>(stack.commited_size));
-	printf("code: (0x%" PRIx64 ", %" PRIu64 ")\n", static_cast<uint64_t>(stack.code_addr),
-	       static_cast<uint64_t>(stack.code_size));
-}
 
 void SysStackUsage(sys_dbg_stack_info_t& s) {
 	pid_t pid = getpid();

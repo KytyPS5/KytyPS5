@@ -9,7 +9,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-Decoder::Operand Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
+const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
 		case 0: return inst.src0;
 		case 1: return inst.src1;
@@ -25,7 +25,7 @@ Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst
 		return destination;
 	}
 	for (uint32_t index = 0; index < std::min(inst.src_count, 3u); index++) {
-		const auto source = SourceAt(inst, index);
+		const auto& source = SourceAt(inst, index);
 		if (!source.dpp) {
 			continue;
 		}
@@ -112,7 +112,7 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	const auto mask = ir.Emit(IR::ValueOpcode::Ballot, {value});
 	return {ir.CompositeExtract(mask, 0),
-	        current_wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
+	        program.wave_size == 64u ? ir.CompositeExtract(mask, 1) : IR::U32(IR::Value(0u))};
 }
 
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
@@ -134,11 +134,15 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::Scc:
 			return ir.Select(ir.GetScc(), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
 		case Decoder::OperandKind::VccZ:
-			return ir.Select(ir.LogicalNot(ir.GetVcc()), IR::U32(IR::Value(1u)),
-			                 IR::U32(IR::Value(0u)));
-		case Decoder::OperandKind::ExecZ:
-			return ir.Select(ir.LogicalNot(ir.GetExec()), IR::U32(IR::Value(1u)),
-			                 IR::U32(IR::Value(0u)));
+		case Decoder::OperandKind::ExecZ: {
+			const bool vcc = operand.kind == Decoder::OperandKind::VccZ;
+			auto mask = vcc ? ir.GetVccLo() : ir.GetExecLo();
+			if (program.wave_size == 64u) {
+				mask = ir.BitwiseOr(mask, vcc ? ir.GetVccHi() : ir.GetExecHi());
+			}
+			const auto zero = IR::U32(IR::Value(0u));
+			return ir.Select(ir.IEqual(mask, zero), IR::U32(IR::Value(1u)), zero);
+		}
 		default: EXIT("invalid decoded operand used as a raw U32 source");
 	}
 }
@@ -440,10 +444,6 @@ void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
 	Write16Bits(operand, bits);
 }
 
-void Translator::WriteU16(const Decoder::Operand& operand, IR::U32 value) {
-	Write16Bits(operand, value);
-}
-
 IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 	return IR::U32(ReadOperand(operand, IR::Type::U32));
 }
@@ -596,16 +596,12 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 
 IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
 	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
-	const auto word = current_wave_size == 64u
+	const auto word = program.wave_size == 64u
 	                      ? ir.Select(ir.ULessThan(lane, IR::U32(IR::Value(32u))), mask[0], mask[1])
 	                      : mask[0];
 	const auto bit  = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
 	return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), IR::U32(IR::Value(1u))),
 	                    IR::U32(IR::Value(0u)));
-}
-
-IR::U1 Translator::ReadCondition(const Decoder::Operand& operand) {
-	return IR::U1(ReadOperand(operand, IR::Type::U1));
 }
 
 IR::U32 Translator::ConditionBit(const Decoder::Operand& operand) {
@@ -621,7 +617,7 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
-			const auto mask = current_wave_size == 64u
+			const auto mask = program.wave_size == 64u
 			                      ? ReadU32Pair(operand)
 			                      : std::array {ReadRawU32(operand), IR::U32(IR::Value(0u))};
 			return IR::U1(ir.Emit(
@@ -632,7 +628,7 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecHi: return ir.GetExec();
 		case Decoder::OperandKind::VccLo:
 		case Decoder::OperandKind::VccHi:
-			return current_wave_size == 32u
+			return program.wave_size == 32u
 			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
 			           : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
@@ -682,7 +678,7 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 			}
 			ir.SetScalarReg(reg, mask[0]);
 			// A wave32 VALU mask destination must not overwrite the neighboring SGPR.
-			if ((write_64 || current_wave_size == 64u) &&
+			if ((write_64 || program.wave_size == 64u) &&
 			    IR::RegIndex(reg) + 1u < IR::NumScalarRegs) {
 				const auto high = static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u);
 				ir.SetScalarReg(high, mask[1]);
@@ -700,7 +696,7 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 		}
 		case Decoder::OperandKind::VccLo:
 		case Decoder::OperandKind::VccHi: {
-			if (!write_64 && current_wave_size == 32u) {
+			if (!write_64 && program.wave_size == 32u) {
 				WriteRawU32(operand, mask[0]);
 				return mask;
 			}
@@ -762,6 +758,10 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
 		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
 		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::ScalarInstruction:
+			EXIT_IF(instruction_branch_condition.IsEmpty());
+			condition = instruction_branch_condition;
+			break;
 		case CFG::BranchCondition::GotoVariable:
 			if (source.terminator.goto_variable == UINT32_MAX) {
 				EXIT("block %u reads an invalid goto variable", source.id);
@@ -1117,7 +1117,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                        : u32(0);
 			const auto vertex = entry_ir.IMul(local, step);
 			const auto first  = entry_ir.IAdd(vertex, parity);
-			const auto second = mesh.InputPrimitiveSize() == 3u
+			const auto second = mesh.InputPrimitiveSize() >= 2u
 			                        ? entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity)
 			                        : u32(0);
 			const auto third = mesh.InputPrimitiveSize() == 3u
@@ -1198,7 +1198,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, options.wave_size);
+		Translator translator(result, result.blocks[typed_index], vector_limit);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

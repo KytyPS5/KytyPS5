@@ -238,26 +238,11 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	}
 }
 
-constexpr bool IsKnownFormat(Prospero::BufferFormat format) {
-	return GetFormatInfo(format).type != ComponentType::Unknown;
-}
-
-constexpr uint32_t GetFormatComponentCount(Prospero::BufferFormat format) {
-	return GetFormatInfo(format).component_count;
-}
-
-constexpr uint32_t GetFormatComponentByteOffset(Prospero::BufferFormat format, uint32_t component) {
-	const auto info = GetFormatInfo(format);
+constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, uint32_t component) {
 	if (component >= info.component_count) {
 		return 0;
 	}
 	return info.packed_bitfield ? 0u : info.component_bit_offset[component] / 8u;
-}
-
-constexpr bool CanUseTypedBufferLoad(Prospero::BufferFormat format) {
-	const auto info = GetFormatInfo(format);
-	return info.type != ComponentType::Unknown && !info.packed_bitfield &&
-	       info.component_bits[0] == 32u;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Format

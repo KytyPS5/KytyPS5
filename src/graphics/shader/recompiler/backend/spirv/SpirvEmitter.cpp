@@ -319,8 +319,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
-	state.stage     = program.stage;
-	state.wave_size = program.wave_size;
+	state.stage = program.stage;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
@@ -333,7 +332,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
 	DefineModule(state);
-	EmitProgram(state, program);
+	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
 	                            state.interface_variables);
 

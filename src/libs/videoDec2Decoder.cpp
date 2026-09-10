@@ -117,8 +117,7 @@ public:
 	[[nodiscard]] Result DecodeInput(const Input& input, const FrameBuffer& frame_buffer,
 	                                 Output* output) {
 		std::scoped_lock lock(m_mutex);
-		*output    = {};
-		m_draining = false;
+		*output = {};
 
 		AVPacket* packet = av_packet_alloc();
 		AVFrame*  frame  = av_frame_alloc();
@@ -200,18 +199,7 @@ public:
 			return Result::ApiFail;
 		}
 
-		if (!m_draining) {
-			const int send_result = avcodec_send_packet(m_codec, nullptr);
-			if (send_result == 0 || send_result == AVERROR_EOF) {
-				m_draining = true;
-			} else if (send_result != AVERROR(EAGAIN)) {
-				LOGF("Videodec2: flushing decoder failed: %s (%d)\n", AvErrorString(send_result),
-				     send_result);
-				av_frame_free(&frame);
-				return Result::ApiFail;
-			}
-		}
-
+		// Guest Flush collects available pictures between AUs while retaining reference frames.
 		const int receive_result = avcodec_receive_frame(m_codec, frame);
 		if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
 			av_frame_free(&frame);
@@ -232,7 +220,6 @@ public:
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
-		m_draining = false;
 		ClearPictureMetadata();
 	}
 
@@ -357,7 +344,6 @@ private:
 	Config                    m_config;
 	AVCodecContext*           m_codec    = nullptr;
 	SwsContext*               m_sws      = nullptr;
-	bool                      m_draining = false;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };

@@ -478,7 +478,6 @@ static void McCheck(const HW::ModeControl& c) {
 			logged = true;
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(c.provoking_vtx_last != false);
 	EXIT_NOT_IMPLEMENTED(c.persp_corr_dis != false);
 }
 

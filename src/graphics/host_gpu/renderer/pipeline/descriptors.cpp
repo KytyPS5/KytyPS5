@@ -404,30 +404,22 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
-struct NullImageSpec {
-	vk::Format             format;
-	Prospero::BufferFormat guest_format;
-};
-
-static NullImageSpec NullTextureSpec(const ShaderRecompiler::IR::ImageResource& resource) {
-	switch (resource.numeric_class) {
-		case Prospero::TextureNumericClass::Float:
-			return {vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float};
-		case Prospero::TextureNumericClass::Uint:
-			return {vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt};
-		case Prospero::TextureNumericClass::Sint:
-			return {vk::Format::eR32Sint, Prospero::BufferFormat::k32SInt};
-		case Prospero::TextureNumericClass::Unsupported: break;
-	}
-	EXIT("null image has unsupported numeric class\n");
-}
-
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                                                TextureCache::BindingType                  binding) {
-	const auto              spec = NullTextureSpec(resource);
 	TextureCache::ImageDesc desc {};
-	desc.info.pixel_format    = spec.format;
-	desc.info.guest_format    = spec.guest_format;
+	switch (resource.numeric_class) {
+		case Prospero::TextureNumericClass::Float:
+			desc.info.guest_format = Prospero::BufferFormat::k32Float;
+			break;
+		case Prospero::TextureNumericClass::Uint:
+			desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+			break;
+		case Prospero::TextureNumericClass::Sint:
+			desc.info.guest_format = Prospero::BufferFormat::k32SInt;
+			break;
+		default: EXIT("null image has unsupported numeric class\n");
+	}
+	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
@@ -491,17 +483,18 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
-                                     bool shader_conversion, bool storage, uint32_t view_levels,
-                                     uint32_t image_layers) {
+                                     const SurfaceFormatInfo& surface_format, bool storage,
+                                     uint32_t view_levels, uint32_t image_layers) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	view.usage   = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
-	view.mapping = storage || shader_conversion
-	                   ? vk::ComponentMapping {}
-	                   : TextureGetComponentMapping(descriptor.DstSelXYZW());
+	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
+	view.mapping =
+	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	        ? vk::ComponentMapping {}
+	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 			view.type       = vk::ImageViewType::e1D;
@@ -680,7 +673,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		PopulateTextureMipLayout(desc.info);
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
+	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
@@ -769,8 +762,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
 	PreparedBindings prepared;
-	prepared.program  = runtime.program;
-	prepared.snapshot = &runtime.resources;
+	prepared.runtime = &runtime;
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -795,9 +787,9 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
-	const auto& program  = *prepared.program;
-	const auto& snapshot = *prepared.snapshot;
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
@@ -820,9 +812,9 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
-	const auto& program   = *prepared.program;
-	const auto& snapshot  = *prepared.snapshot;
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program   = *prepared.runtime->program;
+	const auto& snapshot  = prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
 
@@ -855,9 +847,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
-	const auto& program  = *prepared.program;
-	const auto& snapshot = *prepared.snapshot;
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
@@ -915,8 +907,8 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel) {
 		FindBuffers(*bindings.pixel);
 	}
-	if (bindings.vertex.program->info.uses_dma ||
-	    (bindings.pixel && bindings.pixel->program->info.uses_dma)) {
+	if (bindings.vertex.runtime->program->info.uses_dma ||
+	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
 		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(bindings.vertex);
@@ -947,13 +939,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
 	for (const auto* prepared: prepared_bindings) {
-		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
-		        prepared->snapshot == nullptr);
-		write_count += prepared->program->bindings.descriptors.size();
-		for (const auto& binding: prepared->program->bindings.descriptors) {
+		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+		const auto& program = *prepared->runtime->program;
+		write_count += program.bindings.descriptors.size();
+		for (const auto& binding: program.bindings.descriptors) {
 			descriptor_count += NativeDescriptorCount(binding);
 		}
-		const auto shader_stage = NativeShaderStage(prepared->program->stage);
+		const auto shader_stage = NativeShaderStage(program.stage);
 		push_stages |= shader_stage;
 		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
@@ -968,7 +960,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.reserve(write_count);
 
 	for (auto* prepared: prepared_bindings) {
-		const auto& program       = *prepared->program;
+		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);

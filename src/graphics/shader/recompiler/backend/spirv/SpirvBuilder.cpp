@@ -1,6 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 
-#include "common/debug.h"
+#include "common/assert.h"
 
 #include <algorithm>
 #include <cstring>

@@ -525,6 +525,14 @@ static void* KYTY_SYSV_ABI JsonValueCtor(void* self) {
 	return self;
 }
 
+static JsonValue* KYTY_SYSV_ABI JsonValueCopyCtor(JsonValue* self, const JsonValue* src) {
+	PRINT_NAME();
+
+	JsonValueInit(self);
+	JsonValueCopy(self, src);
+	return self;
+}
+
 static JsonValue* KYTY_SYSV_ABI JsonValueTypeCtor(JsonValue* self, uint32_t type) {
 	PRINT_NAME();
 
@@ -1014,6 +1022,7 @@ LIB_DEFINE(InitNet_1_Json2) {
 	LIB_FUNC("OcAgPxcq5Vk", LibJson2::JsonMemAllocatorDtor);
 	LIB_FUNC("qBMjqyBn3OM", LibJson2::JsonValueCtor);
 	LIB_FUNC("-wa17B7TGnw", LibJson2::JsonValueCtor);
+	LIB_FUNC("fSb2oQTNrgA", LibJson2::JsonValueCopyCtor);
 	LIB_FUNC("CbrT3dwDILo", LibJson2::JsonValueTypeCtor);
 	LIB_FUNC("WTtYf+cNnXI", LibJson2::JsonValueDtor);
 	LIB_FUNC("0eUrW9JAxM0", LibJson2::JsonValueDtor);

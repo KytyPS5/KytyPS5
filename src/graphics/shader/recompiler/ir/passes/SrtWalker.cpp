@@ -281,8 +281,7 @@ private:
 				return finish(false);
 			}
 		}
-		if (op == ValueOpcode::GetBufferResource || op == ValueOpcode::GetImageResource ||
-		    op == ValueOpcode::GetSamplerResource || op == ValueOpcode::GetAddressResource) {
+		if (IsDescriptorHandle(op)) {
 			size_t expected = 4u;
 			if (op == ValueOpcode::GetImageResource) {
 				expected = 8u;

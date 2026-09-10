@@ -215,9 +215,9 @@ uint32_t EmitLogicalNotBool(EmitterState& state, uint32_t value) {
 	return ret;
 }
 
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
+F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	F32Class cls;
-	cls.bits                 = EmitBitcastF32ToU32(state, value);
+	cls.bits                 = bits;
 	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
 	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
 	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
@@ -226,6 +226,10 @@ F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
 	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
 	cls.zero = EmitCompareU32Constant(state, OpIEqual, abs_bits, 0);
 	return cls;
+}
+
+F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
+	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,

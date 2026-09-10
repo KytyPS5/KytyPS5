@@ -53,13 +53,17 @@ enum class Opcode {
 	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
+	S_SUBVECTOR_LOOP_BEGIN,
+	S_SUBVECTOR_LOOP_END,
 	S_AND_SAVEEXEC_B32,
+	S_ORN2_SAVEEXEC_B32,
 	S_ANDN1_SAVEEXEC_B32,
 	S_AND_SAVEEXEC_B64,
 	S_ORN2_SAVEEXEC_B64,
 	S_ANDN1_SAVEEXEC_B64,
 	S_NOT_B32,
 	S_NOT_B64,
+	S_WQM_B32,
 	S_WQM_B64,
 	S_ADD_U32,
 	S_ADDC_U32,
@@ -488,6 +492,8 @@ enum class Opcode {
 	DS_ADD_RTN_U32,
 	DS_SUB_U32,
 	DS_SUB_RTN_U32,
+	DS_INC_RTN_U32,
+	DS_DEC_RTN_U32,
 	DS_MIN_I32,
 	DS_MIN_RTN_I32,
 	DS_MAX_I32,
@@ -636,7 +642,6 @@ struct Operand {
 	OperandKind kind       = OperandKind::Unknown;
 	uint32_t    value      = 0;
 	int32_t     signed_val = 0;
-	float       float_val  = 0.0f;
 	uint32_t    reg        = 0;
 	uint32_t    sdwa_sel   = 6;
 	// Native 16-bit destinations use the same selector fields internally but preserve the
@@ -661,10 +666,8 @@ struct Operand {
 
 struct Instruction {
 	uint32_t       pc                          = 0;
-	uint32_t       word                        = 0;
 	uint32_t       word_count                  = 1;
 	uint32_t       raw[MaxInstructionRawWords] = {};
-	uint32_t       raw_count                   = 1;
 	Family         family                      = Family::Unknown;
 	uint32_t       opcode_id                   = 0;
 	Opcode         opcode                      = Opcode::UNKNOWN;
@@ -698,7 +701,6 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
-	int32_t        branch_offset                                = 0;
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;
@@ -720,6 +722,8 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void DecodeProgram(std::span<const uint32_t> code, Program& program);
+bool IsConditionalBranch(Opcode opcode);
+bool IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

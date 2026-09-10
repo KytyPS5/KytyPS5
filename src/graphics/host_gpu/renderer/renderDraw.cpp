@@ -334,7 +334,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
-
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -539,13 +538,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	// a 3840x2160 composite pass; the render area would clamp to the 1080p corner and leave the
 	// rest of the frame holding whatever was there before ("only a square is cleared"). The
 	// guest cannot actually pair mismatched attachment sizes, so treat the depth as unbound.
+	// The same applies when the depth target is the larger one: hardware clips each attachment
+	// to its own bounds, but a Vulkan pass has a single render area, so pairing a 1024x1024
+	// colour target with a 1920x1080 depth attachment writes depth only in the 1024x1024 corner
+	// and leaves the rest of it stale. Astro Bot does exactly that -- two colour slots covering
+	// one 1024x1024 surface with complementary channel masks, over a full-size depth buffer.
 	if (depth.image_id && color_count > 0 &&
-	    (depth.desc.info.extent.width < state.width ||
-	     depth.desc.info.extent.height < state.height)) {
+	    (depth.desc.info.extent.width != state.width ||
+	     depth.desc.info.extent.height != state.height)) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
-			LOGF("RenderState: depth target %ux%u smaller than colour %ux%u -- unbinding it for "
-			     "the draw\n",
+			LOGF("RenderState: depth target %ux%u does not match colour %ux%u -- unbinding it "
+			     "for the draw\n",
 			     depth.desc.info.extent.width, depth.desc.info.extent.height, state.width,
 			     state.height);
 		}

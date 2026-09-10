@@ -1,4 +1,4 @@
-﻿#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODE_H_
+#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODE_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODE_H_
 
 #include <cstdint>
@@ -16,36 +16,36 @@ namespace Libs::Graphics {
 // not a fixed or global address; locating that base is not implemented here.
 
 enum class BvhNodeType : uint32_t {
-Triangle = 0,
-Box16    = 4,
-Box32    = 5,
-Instance = 6,
-Aabb     = 7,
+	Triangle = 0,
+	Box16    = 4,
+	Box32    = 5,
+	Instance = 6,
+	Aabb     = 7,
 };
 
 struct BvhAabb {
-float min[3];
-float max[3];
+	float min[3];
+	float max[3];
 };
 
 struct BvhBox32Node {
-uint32_t children[4];
-BvhAabb  bounds[4];
-uint32_t flags;
+	uint32_t children[4];
+	BvhAabb  bounds[4];
+	uint32_t flags;
 };
 
 struct BvhTriangleNode {
-float    vertices[3][3];
-uint32_t triangle_id;
-uint32_t geometry_id_and_flags;
-uint32_t id;
+	float    vertices[3][3];
+	uint32_t triangle_id;
+	uint32_t geometry_id_and_flags;
+	uint32_t id;
 };
 
 // A decoded guest BVH node pointer/id: which node type it refers to, and its byte offset from
 // the start of the node pool (the accel-structure header's node-pool base is not modeled here).
 struct BvhNodeId {
-BvhNodeType type;
-uint32_t    byte_offset;
+	BvhNodeType type;
+	uint32_t    byte_offset;
 };
 
 // Sentinel value for an empty/absent child slot in a box node's children[] array. Confirmed in

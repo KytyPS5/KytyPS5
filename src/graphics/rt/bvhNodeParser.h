@@ -1,4 +1,4 @@
-﻿#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODEPARSER_H_
+#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODEPARSER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_BVHNODEPARSER_H_
 
 #include "graphics/rt/bvhNode.h"
@@ -33,10 +33,11 @@ BvhNodeId DecodeBvhNodeId(uint32_t id);
 uint32_t EncodeBvhNodeId(BvhNodeType type, uint32_t byte_offset);
 
 enum class BvhWalkResult {
-Ok,                  // Walked the full reachable tree; only box32/triangle nodes were seen.
-UnsupportedNodeType, // Stopped early: reached a node type not yet handled (box16/instance/aabb).
-OutOfBounds,         // Stopped early: a node's decoded offset fell outside `node_pool`.
-TooManyNodes,        // Stopped early: visited more nodes than MaxBvhWalkNodes, likely a cycle.
+	Ok,                  // Walked the full reachable tree; only box32/triangle nodes were seen.
+	UnsupportedNodeType, // Stopped early: reached a node type not yet handled
+	                     // (box16/instance/aabb).
+	OutOfBounds,         // Stopped early: a node's decoded offset fell outside `node_pool`.
+	TooManyNodes,        // Stopped early: visited more nodes than MaxBvhWalkNodes, likely a cycle.
 };
 
 // Safety limit on nodes visited per walk, guards against a cyclic or otherwise malformed tree
@@ -50,7 +51,7 @@ inline constexpr uint32_t MaxBvhWalkNodes = 1u << 16;
 // whatever was already collected in `out_triangles`. Iterative, not recursive, so a cyclic or
 // adversarial tree fails via TooManyNodes rather than a stack overflow.
 BvhWalkResult WalkBvhTriangles(std::span<const uint8_t> node_pool, BvhNodeId root_id,
-                                std::vector<BvhTriangleNode>& out_triangles);
+                               std::vector<BvhTriangleNode>& out_triangles);
 
 } // namespace Libs::Graphics
 

@@ -1,4 +1,4 @@
-﻿#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_ACCELSTRUCT_H_
+#ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_ACCELSTRUCT_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RT_ACCELSTRUCT_H_
 
 #include "graphics/rt/bvhNode.h"
@@ -29,13 +29,13 @@ namespace Libs::Graphics {
 // pre-integration scaffolding, and lifetime/ownership will be dictated by whatever eventually
 // wires it into the renderer. Destroy with DestroyBlasBuildResources.
 struct BlasBuildResources {
-vk::Buffer                   vertex_buffer      = nullptr;
-VmaAllocation                vertex_allocation  = nullptr;
-vk::Buffer                   scratch_buffer     = nullptr;
-VmaAllocation                scratch_allocation = nullptr;
-vk::Buffer                   backing_buffer     = nullptr;
-VmaAllocation                backing_allocation = nullptr;
-vk::AccelerationStructureKHR handle             = nullptr;
+	vk::Buffer                   vertex_buffer      = nullptr;
+	VmaAllocation                vertex_allocation  = nullptr;
+	vk::Buffer                   scratch_buffer     = nullptr;
+	VmaAllocation                scratch_allocation = nullptr;
+	vk::Buffer                   backing_buffer     = nullptr;
+	VmaAllocation                backing_allocation = nullptr;
+	vk::AccelerationStructureKHR handle             = nullptr;
 };
 
 // Packs each triangle's 3 vertex positions consecutively (9 floats per triangle: v0, v1, v2),
@@ -47,7 +47,7 @@ std::vector<float> FlattenTrianglesToVertexBuffer(std::span<const BvhTriangleNod
 // Queries how large the scratch and backing buffers must be to build a BLAS from
 // `triangle_count` un-indexed triangles. Touches the device but allocates nothing.
 vk::AccelerationStructureBuildSizesInfoKHR QueryBlasBuildSizes(vk::Device device,
-                                                                uint32_t   triangle_count);
+                                                               uint32_t   triangle_count);
 
 // Allocates the vertex/scratch/backing buffers and the acceleration structure object, uploads
 // `triangles` into the vertex buffer, and records the build command into `command_buffer`.
@@ -59,12 +59,11 @@ vk::AccelerationStructureBuildSizesInfoKHR QueryBlasBuildSizes(vk::Device device
 // The returned resources must stay valid until the recorded commands finish executing on the
 // device, and must eventually be passed to DestroyBlasBuildResources.
 BlasBuildResources RecordBlasBuild(vk::PhysicalDevice physical_device, vk::Device device,
-                                    VmaAllocator                      allocator,
-                                    vk::CommandBuffer                command_buffer,
-                                    std::span<const BvhTriangleNode> triangles);
+                                   VmaAllocator allocator, vk::CommandBuffer command_buffer,
+                                   std::span<const BvhTriangleNode> triangles);
 
 void DestroyBlasBuildResources(VmaAllocator allocator, vk::Device device,
-                                BlasBuildResources& resources);
+                               BlasBuildResources& resources);
 
 } // namespace Libs::Graphics
 

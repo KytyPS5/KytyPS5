@@ -73,7 +73,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
-	::printf("  --stub-bvh                          Use a stub for MIMG BVH opcodes (ray tracing is not implemented). Default: off.\n");
+	::printf("  --stub-bvh                          Use a stub for MIMG BVH opcodes (ray tracing "
+	         "is not implemented). Default: off.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif

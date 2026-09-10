@@ -1500,20 +1500,20 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           std::move(resources), std::move(packed_user_data)};
 }
 
-// Teste les deux chemins du flag --stub-bvh (MIMG 0xe6, IMAGE_BVH_INTERSECT_RAY).
+// Tests both paths of the --stub-bvh flag (MIMG 0xe6, IMAGE_BVH_INTERSECT_RAY).
 void CheckBvhStub() {
   constexpr const char *name = "BvhStub";
 
-  // MIMG 0xe6 extrait du log d'Astro Bot (#281).
+  // MIMG 0xe6 extracted from the Astro Bot log (#281).
   std::vector<u32> code = {0xf1989f07u, 0x00040505u, 0x4442413du,
                            0x4543403eu, 0x00004746u};
-  // Consomme VGPR 5 (composante 0 du résultat du MIMG) vers le buffer :
-  // sinon le DCE supprime le stub ImageBvhIntersectRay (résultat mort dans ce
-  // shader minimal). Dans le vrai shader d'Astro Bot le résultat est lu.
+  // Consumes VGPR 5 (component 0 of the MIMG result) into the buffer:
+  // otherwise DCE strips the ImageBvhIntersectRay stub (dead result in this
+  // minimal shader). In the real Astro Bot shader the result is read.
   AppendStoreVgpr(&code, 5, 0);
   AppendEnd(&code);
 
-  // La config est partagée sur tout le processus : capturer et restaurer.
+  // Config is shared across the whole process: capture and restore it.
   const bool original = Config::BvhStubEnabled();
   auto set_stub = [&](bool enabled) {
     Config::ConfigOptions options;
@@ -1522,8 +1522,8 @@ void CheckBvhStub() {
     Config::Load(options);
   };
 
-  // Cas 1 (stub OFF) : le décodeur doit refuser avec un motif explicite.
-  // Pas de TranslateProgram ici : une instruction UNSUPPORTED déclenche EXIT.
+  // Case 1 (stub OFF): the decoder must reject with an explicit reason.
+  // No TranslateProgram here: an UNSUPPORTED instruction triggers EXIT.
   set_stub(false);
   ShaderRecompiler::Decoder::Program decoded;
   ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
@@ -1542,19 +1542,19 @@ void CheckBvhStub() {
               std::string::npos,
           "unsupported reason must mention the --stub-bvh flag");
 
-  // Cas 2 (stub ON) : pipeline complet, l'IR doit contenir le stub.
+  // Case 2 (stub ON): full pipeline, the IR must contain the stub.
   set_stub(true);
   TestCase test;
   test.name = name;
   test.code = code;
-  test.initial = {0};  // buffer cible du store (1 dword)
+  test.initial = {0};  // target buffer for the store (1 dword)
   test.opcodes = {ShaderOpcode::IMAGE_BVH_INTERSECT_RAY};
   test.ir_counts = {{"ImageBvhIntersectRay", 1}};
   const auto compiled = CompileCase(test);
   Require(name, "stub SPIR-V", !compiled.spirv.empty(),
           "stub compilation returned empty SPIR-V");
 
-  // Restauration obligatoire : le test tourne dans le processus partagé.
+  // Restoration is mandatory: the test runs in the shared process.
   set_stub(original);
   std::printf("[host]    %-32s ok\n", name);
 }

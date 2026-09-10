@@ -92,6 +92,12 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 	}
 	if (kind == IR::StageInputKind::BaryCoordSmooth ||
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
+		// No VK_KHR_fragment_shader_barycentric (e.g. GTX 10-series): the
+		// builtin has no backing variable, so return a benign zero. Pixel
+		// varyings themselves fall back to hardware interpolation.
+		if (!state.barycentric_supported || variable == 0) {
+			return ConstantU32(state, 0);
+		}
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
@@ -171,33 +177,37 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 		state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
 		return value;
 	};
-	if (input->per_vertex) {
+	if (input->per_vertex && state.barycentric_supported) {
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
 		const auto barycentric      = InputVariableForKind(state, barycentric_kind);
-		uint32_t   sum              = 0;
-		for (uint32_t vertex = 0; vertex < 3u; vertex++) {
-			const auto pointer = state.builder.AllocateId();
-			const auto weight  = state.builder.AllocateId();
-			const auto product = state.builder.AllocateId();
-			state.builder.AddFunction({OpAccessChain,
-			                           TypePointer(state, StorageClassInput, TypeF32(state)),
-			                           pointer, barycentric, ConstantU32(state, vertex)});
-			state.builder.AddFunction({OpLoad, TypeF32(state), weight, pointer});
-			state.builder.AddFunction(
-			    {OpFMul, TypeF32(state), product, load_per_vertex(vertex), weight});
-			if (vertex == 0u) {
-				sum = product;
-			} else {
-				const auto next = state.builder.AllocateId();
-				state.builder.AddFunction({OpFAdd, TypeF32(state), next, sum, product});
-				sum = next;
+		if (barycentric != 0) {
+			uint32_t sum = 0;
+			for (uint32_t vertex = 0; vertex < 3u; vertex++) {
+				const auto pointer = state.builder.AllocateId();
+				const auto weight  = state.builder.AllocateId();
+				const auto product = state.builder.AllocateId();
+				state.builder.AddFunction({OpAccessChain,
+				                           TypePointer(state, StorageClassInput, TypeF32(state)),
+				                           pointer, barycentric, ConstantU32(state, vertex)});
+				state.builder.AddFunction({OpLoad, TypeF32(state), weight, pointer});
+				state.builder.AddFunction(
+				    {OpFMul, TypeF32(state), product, load_per_vertex(vertex), weight});
+				if (vertex == 0u) {
+					sum = product;
+				} else {
+					const auto next = state.builder.AllocateId();
+					state.builder.AddFunction({OpFAdd, TypeF32(state), next, sum, product});
+					sum = next;
+				}
 			}
+			const auto bits = state.builder.AllocateId();
+			state.builder.AddFunction({OpBitcast, TypeU32(state), bits, sum});
+			return bits;
 		}
-		const auto bits = state.builder.AllocateId();
-		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, sum});
-		return bits;
+		// Fall through to hardware interpolation when barycentrics are
+		// unavailable (e.g. GTX 10-series).
 	}
 	const auto vector    = state.builder.AllocateId();
 	const auto component = state.builder.AllocateId();
@@ -212,7 +222,13 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
                                     uint32_t mode) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
-	if (!input->per_vertex) {
+	if (input == nullptr) {
+		return ConstantU32(state, 0);
+	}
+	if (!input->per_vertex || !state.barycentric_supported) {
+		// Fallback: without PerVertexKHR varyings the exact P0/P10/P20 vertex
+		// deltas are unrecoverable; return the hardware-interpolated value so
+		// rendering can proceed on GPUs without barycentric support.
 		return EmitAttribute(ctx, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {

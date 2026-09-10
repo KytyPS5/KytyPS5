@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+﻿#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -1035,8 +1036,15 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
-					return false;
-				}
+std::fprintf(stderr,
+             "resource specialization: could not evaluate descriptor dword "
+             "%u for source %u (likely control-flow-dependent); using a "
+             "zeroed descriptor for this resource instead of failing the "
+             "whole shader\n",
+             index, source_index);
+value.dwords.fill(0u);
+break;
+}
 			}
 		}
 		evaluated.push_back(value);
@@ -1048,10 +1056,17 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
-			if (read.flat_offset >= flattened.size() ||
-			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
-				return false;
-			}
+			if (read.flat_offset >= flattened.size()) {
+return false;
+}
+if (!selected.Evaluate(read.value, flattened[read.flat_offset])) {
+std::fprintf(stderr,
+             "resource specialization: could not evaluate flat SRT slot %u "
+             "(likely control-flow-dependent); using 0 for this slot instead of "
+             "failing the whole shader\n",
+             read.flat_offset);
+flattened[read.flat_offset] = 0u;
+}
 		}
 	}
 	results = std::move(evaluated);

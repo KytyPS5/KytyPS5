@@ -1064,7 +1064,13 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 				     "ray tracing is not implemented. Results are approximate.\n");
 			}
 			const auto memory = MemoryInfoFromDecoded(inst);
-			const auto result = ir.Emit(IR::ValueOpcode::ImageBvhIntersectRay);
+			// The BVH node-pool base address is a plain runtime pointer rather than an
+			// SRT-bound descriptor, so this reads it the same way S_LOAD's raw-address path
+			// does: two consecutive SGPRs as a 64-bit address. Left unregistered with
+			// BufferAccessOf/AddressOpcodeInfoOf/ImageOpcodeInfoOf so resource tracking leaves
+			// it alone instead of trying to constant-fold a value that can vary per invocation.
+			const auto resource = GetScalarAddressResource(RawScalarLoadBase(inst.src1));
+			const auto result   = ir.Emit(IR::ValueOpcode::ImageBvhIntersectRay, {resource});
 			WriteImageComponents(inst.dst, result, memory, 4u);
 			return true;
 		}

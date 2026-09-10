@@ -34,6 +34,8 @@ public:
 	void               RunGarbageCollector();
 
 private:
+	void SynchronizeCpuImages(uint64_t vaddr, uint64_t size);
+
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;

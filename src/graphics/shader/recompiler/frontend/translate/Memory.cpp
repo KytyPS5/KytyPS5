@@ -1048,6 +1048,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);

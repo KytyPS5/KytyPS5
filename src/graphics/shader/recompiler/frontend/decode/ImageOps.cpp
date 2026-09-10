@@ -421,14 +421,13 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
 	}
-	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
-	    inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) {
-		// Decoded so the operand shape is right (and so these stop masquerading as image
-		// samples, which sent their 128-bit BVH T# through image-descriptor resolution and
-		// dropped the whole dispatch). Traversal itself still needs the ray/box and
-		// ray/triangle intersection emitted in SPIR-V; until then drop the shader honestly.
+	if ((inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	     inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) &&
+	    a16) {
+		// A16 packs ray_dir and ray_inv_dir into halves; the traversal reads them as full
+		// floats, so reject that encoding rather than misreading the ray.
 		SetUnsupported(inst, Family::MIMG, opcode,
-		               "MIMG BVH ray intersection is not implemented");
+		               "MIMG BVH ray intersection with A16 packing is not implemented");
 	}
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

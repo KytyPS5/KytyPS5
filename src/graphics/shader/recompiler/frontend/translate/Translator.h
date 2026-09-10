@@ -94,6 +94,17 @@ private:
 	bool IMAGE_STORE(const Decoder::Instruction& inst);
 	bool IMAGE_SAMPLE(const Decoder::Instruction& inst);
 	bool IMAGE_GATHER(const Decoder::Instruction& inst);
+	// Ray/BVH-node intersection (MIMG 230/231).
+	struct BvhHit {
+		IR::F32 distance;
+		IR::U32 child;
+	};
+	bool    IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
+	IR::U32 BvhNodeField(const std::array<IR::U32, 16>& node, uint32_t offset, uint32_t size);
+	IR::F32 BvhDecompressBound(IR::U32 shared_exp, IR::U32 field, bool is_min);
+	BvhHit  BvhSlab(const IR::F32 bmin[3], const IR::F32 bmax[3], const IR::F32 origin[3],
+	                const IR::F32 inv_dir[3], IR::F32 extent, IR::U32 child);
+	void    BvhSortHits(BvhHit hits[4]);
 	IR::Value LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
 	                        uint32_t pc);
 	IR::Value ExtractSharedU32(IR::Value value, uint32_t width, uint32_t index);

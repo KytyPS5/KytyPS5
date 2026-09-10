@@ -35,6 +35,27 @@ std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::stri
 
 // KYTY_SRT_DIAG=1 dumps the opcode tree of a descriptor dword that failed bind-time evaluation
 // (the "a descriptor source did not evaluate" drop). Zero cost unless the env var is set.
+// True when an address expression is carried around a loop, so it has no value before the draw.
+bool AddressReachesPhi(Value value, std::vector<const Inst*>& visited, uint32_t depth) {
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr || depth > 64u) {
+		return false;
+	}
+	if (inst->GetOpcode() == ValueOpcode::Phi) {
+		return true;
+	}
+	if (std::ranges::find(visited, inst) != visited.end()) {
+		return false;
+	}
+	visited.push_back(inst);
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		if (AddressReachesPhi(inst->Arg(index), visited, depth + 1u)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool SrtDiagEnabled() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_SRT_DIAG");
@@ -541,7 +562,14 @@ private:
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+		// A flat slot is read once before the draw, so it only works when the whole read can be
+		// evaluated then. An immediate offset is not enough: if the base address is carried
+		// around a loop -- a pointer walked by the shader, as ray-tracing kernels do over a BVH
+		// -- there is no address to read from yet, and giving it a slot only guarantees the
+		// evaluation fails later and the dispatch is dropped. Leave those as runtime reads.
+		std::vector<const Inst*> visited;
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+		    AddressReachesPhi(inst->Arg(0), visited, 0u)) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
 			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);

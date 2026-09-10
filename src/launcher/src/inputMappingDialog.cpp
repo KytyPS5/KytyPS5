@@ -1,16 +1,19 @@
 #include "inputMappingDialog.h"
 
 #include <QAbstractItemView>
+#include <QChar>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QHeaderView>
+#include <QIcon>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QSize>
 #include <QStringList>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -25,35 +28,97 @@ struct PadControl {
 	const char* id;
 	const char* label;
 	const char* default_binding;
+	const char* icon;
 };
 
 constexpr PadControl PAD_CONTROLS[] = {
-    {"Up", "D-pad Up", "Up"},
-    {"Down", "D-pad Down", "Down"},
-    {"Left", "D-pad Left", "Left"},
-    {"Right", "D-pad Right", "Right"},
-    {"LeftStickUp", "Left stick Up", "W"},
-    {"LeftStickDown", "Left stick Down", "S"},
-    {"LeftStickLeft", "Left stick Left", "A"},
-    {"LeftStickRight", "Left stick Right", "D"},
-    {"RightStickUp", "Right stick Up", "T"},
-    {"RightStickDown", "Right stick Down", "G"},
-    {"RightStickLeft", "Right stick Left", "F"},
-    {"RightStickRight", "Right stick Right", "H"},
-    {"Triangle", "Triangle", "I"},
-    {"Circle", "Circle", "L"},
-    {"Cross", "Cross", "J"},
-    {"Square", "Square", "K"},
-    {"L1", "L1", "Q"},
-    {"R1", "R1", "E"},
-    {"L2", "L2", ""},
-    {"R2", "R2", ""},
-    {"L3", "L3", "Left Shift"},
-    {"R3", "R3", "Left Ctrl"},
-    {"Options", "Options", "Return"},
-    {"TouchPad", "Touch pad left (SELECT)", "Backspace"},
-    {"TouchPadRight", "Touch pad right (START)", "Tab"},
+    {"Up", "D-pad Up", "Up", "pad/dpad_up"},
+    {"Down", "D-pad Down", "Down", "pad/dpad_down"},
+    {"Left", "D-pad Left", "Left", "pad/dpad_left"},
+    {"Right", "D-pad Right", "Right", "pad/dpad_right"},
+    {"LeftStickUp", "Left stick Up", "W", "pad/lstick_up"},
+    {"LeftStickDown", "Left stick Down", "S", "pad/lstick_down"},
+    {"LeftStickLeft", "Left stick Left", "A", "pad/lstick_left"},
+    {"LeftStickRight", "Left stick Right", "D", "pad/lstick_right"},
+    {"RightStickUp", "Right stick Up", "T", "pad/rstick_up"},
+    {"RightStickDown", "Right stick Down", "G", "pad/rstick_down"},
+    {"RightStickLeft", "Right stick Left", "F", "pad/rstick_left"},
+    {"RightStickRight", "Right stick Right", "H", "pad/rstick_right"},
+    {"Triangle", "Triangle", "I", "pad/triangle"},
+    {"Circle", "Circle", "L", "pad/circle"},
+    {"Cross", "Cross", "J", "pad/cross"},
+    {"Square", "Square", "K", "pad/square"},
+    {"L1", "L1", "Q", "pad/l1"},
+    {"R1", "R1", "E", "pad/r1"},
+    {"L2", "L2", "", "pad/l2"},
+    {"R2", "R2", "", "pad/r2"},
+    {"L3", "L3", "Left Shift", "pad/l3"},
+    {"R3", "R3", "Left Ctrl", "pad/r3"},
+    {"Options", "Options", "Return", "pad/options"},
+    {"TouchPad", "Touch pad left (SELECT)", "Backspace", "pad/touchpad"},
+    {"TouchPadRight", "Touch pad right (START)", "Tab", "pad/touchpad"},
 };
+
+QIcon InputIcon(const QString& alias) {
+	if (alias.isEmpty()) {
+		return {};
+	}
+	QIcon icon(QStringLiteral(":/input/%1.png").arg(alias));
+	return icon.isNull() ? QIcon() : icon;
+}
+
+// Maps a captured host-input name (see KeyName / mousePressEvent) to a bundled
+// key-prompt icon. Returns a null icon when nothing fits, leaving the text label.
+QIcon HostInputIcon(const QString& binding) {
+	if (binding.isEmpty()) {
+		return {};
+	}
+
+	static const QHash<QString, QString> named = {
+	    {QStringLiteral("Return"), QStringLiteral("key/return")},
+	    {QStringLiteral("Backspace"), QStringLiteral("key/backspace")},
+	    {QStringLiteral("Tab"), QStringLiteral("key/tab")},
+	    {QStringLiteral("Space"), QStringLiteral("key/space")},
+	    {QStringLiteral("Left Shift"), QStringLiteral("key/shift")},
+	    {QStringLiteral("Left Ctrl"), QStringLiteral("key/ctrl")},
+	    {QStringLiteral("Left Alt"), QStringLiteral("key/alt")},
+	    {QStringLiteral("Insert"), QStringLiteral("key/insert")},
+	    {QStringLiteral("Delete"), QStringLiteral("key/delete")},
+	    {QStringLiteral("Home"), QStringLiteral("key/home")},
+	    {QStringLiteral("End"), QStringLiteral("key/end")},
+	    {QStringLiteral("PageUp"), QStringLiteral("key/pageup")},
+	    {QStringLiteral("PageDown"), QStringLiteral("key/pagedown")},
+	    {QStringLiteral("CapsLock"), QStringLiteral("key/capslock")},
+	    {QStringLiteral("Numlock"), QStringLiteral("key/numlock")},
+	    {QStringLiteral("PrintScreen"), QStringLiteral("key/printscreen")},
+	    {QStringLiteral("Left"), QStringLiteral("key/arrow_left")},
+	    {QStringLiteral("Right"), QStringLiteral("key/arrow_right")},
+	    {QStringLiteral("Up"), QStringLiteral("key/arrow_up")},
+	    {QStringLiteral("Down"), QStringLiteral("key/arrow_down")},
+	    {QStringLiteral("Mouse:Left"), QStringLiteral("mouse/left")},
+	    {QStringLiteral("Mouse:Right"), QStringLiteral("mouse/right")},
+	    {QStringLiteral("Mouse:Middle"), QStringLiteral("mouse/middle")},
+	    {QStringLiteral("Mouse:X1"), QStringLiteral("mouse/x1")},
+	    {QStringLiteral("Mouse:X2"), QStringLiteral("mouse/x2")},
+	};
+
+	QString alias = named.value(binding);
+	if (alias.isEmpty() && binding.size() == 1) {
+		const QChar ch = binding.at(0).toLower();
+		if (ch.isLetter() || ch.isDigit()) {
+			alias = QStringLiteral("key/%1").arg(ch);
+		}
+	}
+	if (alias.isEmpty() && binding.size() >= 2 && binding.size() <= 3 &&
+	    (binding.at(0) == QLatin1Char('F') || binding.at(0) == QLatin1Char('f'))) {
+		bool      ok = false;
+		const int n  = binding.mid(1).toInt(&ok);
+		if (ok && n >= 1 && n <= 12) {
+			alias = QStringLiteral("key/f%1").arg(n);
+		}
+	}
+	return InputIcon(alias);
+}
 
 QString KeypadName(int key) {
 	if (key >= Qt::Key_0 && key <= Qt::Key_9) {
@@ -244,6 +309,7 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	m_bindings->setHeaderLabels({tr("DualSense control"), tr("Host input")});
 	m_bindings->setRootIsDecorated(false);
 	m_bindings->setSelectionMode(QAbstractItemView::SingleSelection);
+	m_bindings->setIconSize(QSize(24, 24));
 	m_bindings->header()->setSectionResizeMode(0, QHeaderView::Stretch);
 	m_bindings->header()->setSectionResizeMode(1, QHeaderView::Stretch);
 	layout->addWidget(m_bindings);
@@ -251,6 +317,7 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	for (const auto& control: PAD_CONTROLS) {
 		auto* item = new QTreeWidgetItem(m_bindings);
 		item->setText(0, tr(control.label));
+		item->setIcon(0, InputIcon(QString::fromLatin1(control.icon)));
 		item->setData(0, Qt::UserRole, QString::fromLatin1(control.id));
 		SetBinding(item, m_custom_bindings ? parsed.value(QString::fromLatin1(control.id))
 		                                   : QString::fromLatin1(control.default_binding));
@@ -342,6 +409,7 @@ void InputMappingDialog::SetBinding(QTreeWidgetItem* item, const QString& bindin
 	}
 	item->setData(BINDING_COLUMN, Qt::UserRole, binding);
 	item->setText(BINDING_COLUMN, binding.isEmpty() ? tr("None") : binding);
+	item->setIcon(BINDING_COLUMN, HostInputIcon(binding));
 	UpdateButtons();
 }
 

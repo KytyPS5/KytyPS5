@@ -338,7 +338,8 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
-	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	     (!resource.atomic || format == (resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
+	                                                       : Prospero::BufferFormat::k32UInt)));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -634,9 +635,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
-	                                     ? vk::Format::eR32Uint
-	                                     : SrgbStorageViewFormat(pixel_format);
+	const auto storage_view_format =
+	    storage && resource.atomic64 ? vk::Format::eR64Uint
+	    : storage && format == Prospero::BufferFormat::k32SInt
+	        ? vk::Format::eR32Uint
+	        : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
 	                                     : pixel_format;

@@ -547,6 +547,13 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
+		case IR::ValueOpcode::ImageAtomicSwap64: return spv::OpAtomicExchange;
+		case IR::ValueOpcode::ImageAtomicIAdd64: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicUMin64: return spv::OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicUMax64: return spv::OpAtomicUMax;
+		case IR::ValueOpcode::ImageAtomicAnd64: return spv::OpAtomicAnd;
+		case IR::ValueOpcode::ImageAtomicOr64: return spv::OpAtomicOr;
+		case IR::ValueOpcode::ImageAtomicXor64: return spv::OpAtomicXor;
 		default: return spv::OpNop;
 	}
 }
@@ -864,22 +871,30 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != spv::OpNop) {
 		const auto dimension = image.dimension;
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
-			           const auto pointer      = state.builder.AllocateId();
-			           const auto pointer_type = state.builder.Type(
-			               spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
-			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
-			                                     StorageImageDescriptorPointer(state, mem.resource),
-			                                     CoordU32(ctx, mem, *address, dimension),
-			                                     ConstantU32(state, 0));
-			           const auto old = state.builder.AllocateId();
-			           state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
-			                                     ConstantU32(state, spv::ScopeDevice),
-			                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                                     ctx.Arg(inst, 2));
-			           EmitDeviceAtomicMemoryBarrier(state);
-			           return old;
-		           }));
+		const bool wide       = image.atomic64;
+		const auto value_type = wide ? TypeU64(state) : TypeU32(state);
+		const auto texel_type = wide ? TypeScalarU64(state) : TypeU32(state);
+		const auto zero       = wide ? ConstantU64(state, 0) : ConstantU32(state, 0);
+		ctx.Define(inst, EmitValueOrDefaultIfCondition(
+		                     state, ctx.Arg(inst, 3), value_type, zero, [&]() {
+			                     const auto pointer      = state.builder.AllocateId();
+			                     const auto pointer_type = state.builder.Type(
+			                         spv::OpTypePointer, spv::StorageClassImage, texel_type);
+			                     state.builder.AddFunction(
+			                         spv::OpImageTexelPointer, pointer_type, pointer,
+			                         StorageImageDescriptorPointer(state, mem.resource),
+			                         CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0));
+			                     const auto value =
+			                         wide ? Unary(state, spv::OpBitcast, texel_type, ctx.Arg(inst, 2))
+			                              : ctx.Arg(inst, 2);
+			                     const auto old = state.builder.AllocateId();
+			                     state.builder.AddFunction(
+			                         atomic_opcode, texel_type, old, pointer,
+			                         ConstantU32(state, spv::ScopeDevice),
+			                         ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+			                     EmitDeviceAtomicMemoryBarrier(state);
+			                     return wide ? Unary(state, spv::OpBitcast, value_type, old) : old;
+		                     }));
 		return;
 	}
 	ctx.Fail(inst, "has no image SPIR-V emitter");

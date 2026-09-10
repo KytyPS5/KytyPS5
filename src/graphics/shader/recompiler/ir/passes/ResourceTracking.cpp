@@ -596,16 +596,19 @@ private:
 	}
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
-		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
+		const auto info           = ImageOpcodeInfoOf(op);
+		const auto resource_class = info.resource_class;
 		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
 		                       ? ImageMipMode::DynamicStorage
 		                       : ImageMipMode::None;
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
+		const bool wide  = info.atomic_bits == 64u;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.atomic64 == wide) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -627,13 +630,15 @@ private:
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
-		const auto access  = ImageOpcodeInfoOf(op).access;
+		const auto info    = ImageOpcodeInfoOf(op);
+		const auto access  = info.access;
 		const bool atomic  = access == ImageAccess::Atomic;
 		const bool write   = access == ImageAccess::Write || atomic;
 		image.first_use_pc = std::min(image.first_use_pc, pc);
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.atomic64     = image.atomic64 || (atomic && info.atomic_bits == 64u);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

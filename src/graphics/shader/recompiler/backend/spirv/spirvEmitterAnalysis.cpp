@@ -113,8 +113,9 @@ uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass nume
 }
 
 uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
-	uint32_t sampled = 0;
-	uint32_t format  = spv::ImageFormatUnknown;
+	uint32_t sampled     = 0;
+	uint32_t format      = spv::ImageFormatUnknown;
+	uint32_t scalar_type = ImageScalarType(state, image.numeric_class);
 	if (image.resource_class == IR::ImageResourceClass::Sampled) {
 		EXIT_IF(image.atomic);
 		sampled = 1;
@@ -124,15 +125,24 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		sampled = 2;
 		if (image.atomic) {
 			EXIT_IF(image.numeric_class != Prospero::TextureNumericClass::Uint);
-			format = spv::ImageFormatR32ui;
+			if (image.atomic64) {
+				state.builder.RequireCapability(spv::CapabilityInt64);
+				state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+				state.builder.RequireCapability(spv::CapabilityInt64ImageEXT);
+				state.builder.RequireExtension("SPV_EXT_shader_image_int64");
+				format      = spv::ImageFormatR64ui;
+				scalar_type = TypeScalarU64(state);
+			} else {
+				format = spv::ImageFormatR32ui;
+			}
 		}
 	} else {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
-	return state.builder.Type(spv::OpTypeImage, ImageScalarType(state, image.numeric_class),
-	                          info.spirv_dimension, image.depth_compare ? 1u : 0u, info.arrayed,
-	                          info.multisampled, sampled, format);
+	return state.builder.Type(spv::OpTypeImage, scalar_type, info.spirv_dimension,
+	                          image.depth_compare ? 1u : 0u, info.arrayed, info.multisampled,
+	                          sampled, format);
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {

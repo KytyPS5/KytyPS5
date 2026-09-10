@@ -1767,15 +1767,15 @@ void TestShaderInfoAndBindingLayout() {
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
-  Check(ImageBindingCount == 43u &&
+  Check(ImageBindingCount == 48u &&
             static_cast<uint32_t>(DescriptorBindingKind::Buffers) == 0u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 45u &&
-            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 46u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 47u &&
-            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 48u &&
-            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u,
+            static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Gds) == 50u &&
+            static_cast<uint32_t>(DescriptorBindingKind::BdaPagetable) == 51u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 52u &&
+            static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
+            static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -1798,13 +1798,15 @@ void TestImageBindingAbi() {
   uint32_t index = 0;
   const auto CheckBinding =
       [&](ImageResourceClass resource_class, NumericClass numeric_class,
-          Decoder::ImageDimension dimension, bool atomic, bool comparison = false) {
+          Decoder::ImageDimension dimension, bool atomic, bool comparison = false,
+          bool atomic64 = false) {
         ImageResource image;
         image.resource_class = resource_class;
         image.numeric_class = numeric_class;
         image.dimension = dimension;
         image.atomic = atomic;
         image.depth_compare = comparison;
+        image.atomic64 = atomic64;
         const auto kind = DescriptorBindingForImage(image);
         Check(kind.has_value() &&
                   static_cast<uint32_t>(*kind) == FirstImageBinding + index &&
@@ -1837,6 +1839,10 @@ void TestImageBindingAbi() {
   for (const auto dimension : storage_dimensions) {
     CheckBinding(ImageResourceClass::Storage, NumericClass::Uint, dimension,
                  true);
+  }
+  for (const auto dimension : storage_dimensions) {
+    CheckBinding(ImageResourceClass::Storage, NumericClass::Uint, dimension,
+                 true, false, true);
   }
   Check(index == ImageBindingCount, "image descriptor ABI case count changed");
 
@@ -1878,6 +1884,10 @@ void TestImageBindingAbi() {
   image.dimension = Decoder::ImageDimension::Dim2D;
   image.atomic = true;
   Check(Invalid(image), "float atomic image received a descriptor binding");
+  image.atomic = false;
+  image.numeric_class = NumericClass::Uint;
+  image.atomic64 = true;
+  Check(Invalid(image), "non-atomic 64-bit image received a descriptor binding");
 }
 
 void TestGraphicsPushConstantLayout() {

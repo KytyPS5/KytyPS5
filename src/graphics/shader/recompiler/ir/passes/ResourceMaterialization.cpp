@@ -505,7 +505,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && format != Prospero::BufferFormat::k32UInt) {
+		const auto atomic_format = base.atomic64 ? Prospero::BufferFormat::k32_32UInt
+		                                         : Prospero::BufferFormat::k32UInt;
+		if (base.atomic && format != atomic_format) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));

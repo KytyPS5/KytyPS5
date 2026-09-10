@@ -361,6 +361,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	usage.usage = image.usage;
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
+	} else if (normalized.format != image.format &&
+	           (image.usage & vk::ImageUsageFlagBits::eStorage)) {
+		usage.usage = vk::ImageUsageFlagBits::eStorage;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {

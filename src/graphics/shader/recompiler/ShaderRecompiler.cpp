@@ -691,6 +691,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.vertex  = vertex;
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
+	info_options.barycentric_supported = options.barycentric_supported;
 	IR::CollectShaderInfo(ir, info_options);
 	IR::AllocateBindings(ir, push_data_start_dword);
 	Spirv::AnalyzeProgramRequirements(ir);
@@ -704,7 +705,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	auto spirv = Spirv::EmitProgram(ir, options.input_info, options.barycentric_supported);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

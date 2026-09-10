@@ -505,15 +505,16 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 		}
 		if (input.kind == IR::StageInputKind::Parameter) {
-			const auto flat = PixelParameterIsFlat(state, input.location);
-			if (input.per_vertex) {
+			const auto flat       = PixelParameterIsFlat(state, input.location);
+			const auto per_vertex = input.per_vertex && state.barycentric_supported;
+			if (per_vertex) {
 				state.builder.AddAnnotation(
 				    {OpDecorate, input.variable_id, DecorationPerVertexKHR});
 			} else if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 			}
 			if (state.stage == ShaderType::Pixel && state.input_info.pixel->ps_no_perspective &&
-			    !flat && !input.per_vertex) {
+			    !flat && !per_vertex) {
 				state.builder.AddAnnotation(
 				    {OpDecorate, input.variable_id, DecorationNoPerspective});
 			}
@@ -703,7 +704,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
 	}
 	const bool fragment_barycentric =
-	    state.stage == ShaderType::Pixel &&
+	    state.barycentric_supported && state.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
 		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
 		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
@@ -800,7 +801,7 @@ void DefineModule(EmitterState& state) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
 					const auto components = VertexParameterComponentCount(input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);
-				} else if (input.per_vertex) {
+				} else if (input.per_vertex && state.barycentric_supported) {
 					const auto array_type = state.builder.Type(
 					    OpTypeArray, {TypeF32Vector(state, 4), ConstantU32(state, 3)});
 					ptr_type = TypePointer(state, StorageClassInput, array_type);

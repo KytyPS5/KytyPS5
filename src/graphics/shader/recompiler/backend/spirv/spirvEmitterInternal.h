@@ -359,6 +359,9 @@ struct EmitterState {
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
 	const IR::SpirvRequirements&                     requirements;
+	// False when the host GPU lacks VK_KHR_fragment_shader_barycentric.
+	// Pixel varyings then use standard hardware interpolation.
+	bool                                             barycentric_supported = true;
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;

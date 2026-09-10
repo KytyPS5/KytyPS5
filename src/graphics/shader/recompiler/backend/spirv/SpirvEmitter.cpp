@@ -304,7 +304,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+                                  ShaderStageInputInfo input_info,
+                                  bool barycentric_supported) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -319,7 +320,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
-	state.stage = program.stage;
+	state.stage                 = program.stage;
+	state.barycentric_supported = barycentric_supported;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

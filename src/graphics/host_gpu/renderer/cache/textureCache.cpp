@@ -134,6 +134,11 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	    view_info.level_count, view_info.base_layer, view_info.layer_count);
 }
 
+[[nodiscard]] bool CanTransferStencil(const ImageInfo& info) {
+	// Raw buffer copies cannot decode Hi-Stencil or initialize multisampled images.
+	return info.samples == 1 && !info.metadata.stencil_compressed;
+}
+
 [[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
                                                                 uint64_t         slice_stride) {
 	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
@@ -343,6 +348,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	PreserveStencil(id);
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -951,7 +957,7 @@ struct TextureCache::DownloadPlan {
 
 TextureCache::TextureTransferPlan
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
-                                    TransferDirection direction) const {
+                                   TransferDirection direction) const {
 	const auto& info             = image.info;
 	const bool  upload           = direction == TransferDirection::Upload;
 	const bool  render_target    = binding == BindingType::RenderTarget;
@@ -1036,7 +1042,7 @@ TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
-	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
+	const auto  upload = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
 		}
@@ -1067,8 +1073,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		return;
 	}
 
-	if (info.samples != 1 || image.backing.samples != 1 ||
-	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
+	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
@@ -1108,6 +1114,65 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+void TextureCache::TransferStencil(Image& image, GuestRange stencil, Buffer& buffer,
+                                   uint64_t offset, TransferDirection direction) {
+	auto info            = image.info;
+	info.data            = stencil;
+	info.bytes_per_block = 1;
+	// PS5 stores stencil separately, with its own one-byte depth-tile pitch.
+	if (info.IsTiled()) {
+		info.pitch = TileGetDepthPitch(info.extent.width, 1, 0);
+	}
+	EXIT_IF(info.resources.levels != 1 || info.resources.layers == 0 ||
+	        stencil.size % info.resources.layers != 0);
+	const auto slice_size = stencil.size / info.resources.layers;
+	EXIT_IF(static_cast<uint64_t>(info.pitch) * info.extent.height > slice_size);
+	auto copies = BuildDepthCopies(info, slice_size);
+	for (auto& copy: copies) {
+		copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
+	}
+	const bool          upload = direction == TransferDirection::Upload;
+	TileManager::Result linear {buffer.Handle(), offset, stencil.size};
+	if (info.IsTiled()) {
+		const auto tiles = BuildDepthTiles(info);
+		if (!upload) {
+			m_tiler.TileImage(image, copies, buffer.Handle(), offset, stencil.size, stencil.size,
+			                  tiles);
+			return;
+		}
+		linear = m_tiler.Detile(buffer.Handle(), offset, stencil.size, stencil.size, tiles);
+	}
+	for (auto& copy: copies) {
+		copy.bufferOffset += linear.offset;
+	}
+	if (upload) {
+		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+	} else {
+		image.Download(copies, linear.buffer, linear.offset, linear.size);
+	}
+}
+
+void TextureCache::PreserveStencil(ImageId depth_id) {
+	auto& depth = m_slot_images[depth_id];
+	if (depth.depth_id || !depth.info.HasStencil() || !CanTransferStencil(depth.info)) {
+		return;
+	}
+	const auto stencil = depth.info.stencil;
+	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
+		auto& record = m_slot_images[id];
+		if (record.depth_id != depth_id || record.info.data != stencil || record.IsCpuDirty() ||
+		    record.IsBufferModified()) {
+			continue;
+		}
+		// Publish stencil writes before retiring the image.
+		auto [buffer, offset] =
+		    m_buffer_cache.ObtainBuffer(stencil.address, stencil.size, true, false);
+		EXIT_IF(buffer == nullptr);
+		TransferStencil(depth, stencil, *buffer, offset, TransferDirection::Download);
+		record.MarkBufferModified();
+	}
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -1120,7 +1185,13 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		return;
 	}
-	if (image.info.samples > 1) {
+	const auto& target = image.depth_id ? m_slot_images[image.depth_id] : image;
+	// Multisampled images cannot be initialized with a buffer-to-image copy.
+	if (target.info.samples > 1) {
+		return;
+	}
+	if (image.depth_id &&
+	    (!CanTransferStencil(target.info) || image.info.data != target.info.stencil)) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
@@ -1130,7 +1201,12 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		if (image.depth_id) {
+			TransferStencil(m_slot_images[image.depth_id], image.info.data, *source, source_offset,
+			                TransferDirection::Upload);
+		} else {
+			UploadImage(image, *source, source_offset);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1236,7 +1312,23 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
-	record.depth_id = depth_id;
+	const bool unsupported_pair = depth.info.stencil != stencil || record.info.data != stencil ||
+	                              (record.depth_id && record.depth_id != depth_id) ||
+	                              record.backing.image != nullptr;
+	record.depth_id             = depth_id;
+	if (unsupported_pair) {
+		// TODO(stencil): preserve GPU-written contents across pairing changes.
+		if (!m_warned_stencil_reassociation) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: stencil reassociation is unsupported; "
+			           "depth=0x%016" PRIx64 ", stencil=0x%016" PRIx64
+			           "; continuing without stencil upload (further warnings suppressed)\n",
+			           depth.info.data.address, stencil.address);
+			m_warned_stencil_reassociation = true;
+		}
+		return;
+	}
+	RefreshImage(association);
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -1526,7 +1618,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	} else {
 		uint8_t stencil_clear = 0;
 		if ((aspect == vk::ImageAspectFlagBits::eDepth &&
-		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
+		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear,
+		                             clear.depthStencil.depth)) ||
 		    (aspect == vk::ImageAspectFlagBits::eStencil &&
 		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
 			return false;
@@ -1540,7 +1633,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
-	auto& image = m_slot_images[id];
+	auto&      image   = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -1560,6 +1653,25 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 		InitializeImage(id);
 		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
 			EXIT("TextureCache: image clear retained guest ownership\n");
+		}
+	}
+	std::vector<ImageId> stencil_associations;
+	if ((range.aspectMask & vk::ImageAspectFlagBits::eStencil) && image.info.stencil.Valid()) {
+		const bool full_stencil = range.baseMipLevel == 0 &&
+		                          range.levelCount == image.info.resources.levels &&
+		                          range.baseArrayLayer == 0 && range.layerCount == layers;
+		for (const auto association:
+		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+			auto& stencil = m_slot_images[association];
+			if (stencil.depth_id != id || stencil.info.data != image.info.stencil) {
+				continue;
+			}
+			TrackImage(association);
+			// Partial clears must retain guest writes outside the cleared subresources.
+			if (!full_stencil) {
+				RefreshImage(association);
+			}
+			stencil_associations.push_back(association);
 		}
 	}
 	command.EndRendering();
@@ -1609,6 +1721,14 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
+	for (const auto association: stencil_associations) {
+		auto& stencil = m_slot_images[association];
+		// The native clear supersedes the pending stencil upload on the next binding.
+		stencil.ClearBufferModified();
+		if (stencil.IsCpuDirty()) {
+			stencil.RefreshComplete();
+		}
+	}
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
@@ -1717,7 +1837,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
+	auto&            image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!m_texture_cache.SafeToDownload(image)) {
 		return false;
@@ -1826,7 +1946,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.depth_id || !image.Overlaps(address, size)) {
+		if (!image.Overlaps(address, size)) {
 			continue;
 		}
 		if (image.IsGpuModified()) {
@@ -2005,23 +2125,37 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered) {
+				continue;
+			}
+			// Rotate retained entries so they cannot monopolize subsequent bounded scans.
+			if (owner->depth_id) {
+				TouchImage(*owner);
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
+				// Buffer dirtiness may predate image writes; blocked readback does not prove
+				// these pixels are stale. Keep them until invalidation or safe readback.
+				if (!safe && owner->SafeToDownload()) {
+					TouchImage(*owner);
+					continue;
+				}
 				if (safe && owner->info.IsTiled()) {
+					TouchImage(*owner);
 					continue;
 				}
 				if (safe && !pressured) {
+					TouchImage(*owner);
 					continue;
 				}
 				if (safe && !TryDownloadImage(id)) {
+					TouchImage(*owner);
 					continue;
 				}
 				owner->ClearGpuModified();
 			}
-			DeleteImage(id);
+			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

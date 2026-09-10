@@ -224,10 +224,11 @@ struct TextureCacheTestAccess {
 
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
-                                         uint64_t tick, uint64_t pressure) {
+                                         uint64_t tick, uint64_t pressure,
+                                         uint64_t critical = UINT64_MAX) {
     cache.m_trigger_gc_memory = 0;
     cache.m_pressure_gc_memory = pressure;
-    cache.m_critical_gc_memory = UINT64_MAX;
+    cache.m_critical_gc_memory = critical;
     cache.m_gc_tick = tick;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
@@ -5788,6 +5789,92 @@ public:
       }
       DestroyBuffer(&stencil_readback);
 
+      // A native stencil clear must supersede the earlier guest buffer write,
+      // including when a partial clear must first preserve the untouched layer.
+      {
+        auto desc = MakeLinearDesc(
+            base + 0x3c0000, 32, vk::Format::eD32SfloatS8Uint,
+            Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+            {4, 1, 1}, 2, 4, 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.stencil = {base + 0x3c2000, 8};
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
+                                vk::ImageAspectFlagBits::eStencil;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        std::memset(memory + 0x3c0000, 0, 32);
+        std::memset(memory + 0x3c2000, 0x11, 8);
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindDepthTarget(id, desc);
+        for (const bool cpu_write : {false, true}) {
+          for (const bool partial : {false, true}) {
+            if (cpu_write) {
+              resources.GetBufferCache().ReadMemory(desc.info.stencil.address, 8);
+              std::memset(memory + 0x3c2000, 0x22, 8);
+            } else {
+              (void)resources.GetBufferCache().ObtainBuffer(
+                  desc.info.stencil.address, 8, true);
+              resources.GetBufferCache().FillBuffer(
+                  desc.info.stencil.address, 8, 0x22222222u, false);
+            }
+            if (partial) {
+              vk::ClearValue clear{};
+              clear.depthStencil.stencil = 0x33;
+              TextureCacheTestAccess::ClearImage(
+                  texture_cache, command, id,
+                  {vk::ImageAspectFlagBits::eStencil, 0, 1, 1, 1}, clear);
+            } else {
+              Require(name, "optimized stencil clear accepted",
+                      texture_cache.ClearImageFromBuffer(
+                          command, desc.info.stencil.address, 8, 0x33333333u),
+                      "optimized stencil buffer fill was rejected");
+            }
+            (void)texture_cache.FindDepthTarget(id, desc);
+            auto readback = CreateHostBuffer(
+                name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
+            vk::BufferImageCopy copy{};
+            copy.imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 2};
+            copy.imageExtent = {4, 1, 1};
+            texture_cache.GetImage(id).Download(
+                std::span{&copy, 1}, readback.buffer, 0, 8);
+            HostReadBarrier(readback.buffer, 8, vk::PipelineStageFlagBits::eTransfer,
+                            vk::AccessFlagBits::eTransferWrite);
+            scheduler.Finish();
+            Require(name, "stencil clear survives depth rebind",
+                    ReadBuffer(name, readback, 2) ==
+                        std::vector<u32>{partial ? 0x22222222u : 0x33333333u,
+                                         0x33333333u},
+                    "stencil refresh undid the clear or lost the untouched layer");
+            DestroyBuffer(&readback);
+          }
+        }
+        // Pressure retirement must preserve stencil as well as the depth plane.
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            texture_cache, std::array{id}, 81, 0);
+        texture_cache.RunGarbageCollector();
+        Require(name, "stencil pressure retirement",
+                !texture_cache.FindImageFromRange(desc.info.data.address, 32, false),
+                "the linear depth/stencil image was not retired under pressure");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        const auto recreated = texture_cache.FindImage(desc);
+        (void)texture_cache.FindDepthTarget(recreated, desc);
+        auto readback = CreateHostBuffer(
+            name, 8, vk::BufferUsageFlagBits::eTransferDst, {});
+        vk::BufferImageCopy copy{};
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 2};
+        copy.imageExtent = {4, 1, 1};
+        texture_cache.GetImage(recreated).Download(
+            std::span{&copy, 1}, readback.buffer, 0, 8);
+        HostReadBarrier(readback.buffer, 8, vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "stencil contents survive pressure retirement",
+                ReadBuffer(name, readback, 2) ==
+                    std::vector<u32>{0x22222222u, 0x33333333u},
+                "recreated depth/stencil image uploaded stale stencil backing");
+        DestroyBuffer(&readback);
+      }
+
       constexpr uint64_t partial_image_offset = 0xa000;
       constexpr uint64_t partial_buffer_offset = 0xa010;
       constexpr uint64_t partial_clean_offset = 0xa020;
@@ -7598,6 +7685,48 @@ public:
               "recursive association deletion stopped LRU traversal or "
               "exceeded the ten-entry deletion budget");
 
+      // Retained images must not monopolize the bounded GC scan, even under
+      // critical pressure. The last entry is clean and can be reclaimed.
+      for (const uint64_t critical : {UINT64_MAX, uint64_t{0}}) {
+        constexpr uint64_t offset = 0x360000;
+        constexpr uint64_t stride = 0x1000;
+        std::array<ImageId, 41> oldest{};
+        for (size_t index = 0; index < oldest.size(); index++) {
+          const auto address = base + offset + index * stride;
+          auto desc = MakeLinearDesc(
+              address, 4, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+              Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+          if (index + 1 < oldest.size()) {
+            auto [buffer, buffer_offset] =
+                resources.GetBufferCache().ObtainBuffer(address, 4, true);
+            buffer->Fill(buffer_offset, 4, 0x11111111u);
+          }
+          oldest[index] = texture_cache.FindImage(desc);
+          if (index + 1 < oldest.size()) {
+            Require(name, "blocked GC image clear",
+                    texture_cache.ClearImageFromBuffer(
+                        command, address, 4, 0x33333333u),
+                    "failed to prepare a rendered image over older dirty buffer bytes");
+          }
+        }
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            texture_cache, oldest, 161, 0, critical);
+        for (uint32_t cycle = 0; cycle < 3; cycle++) {
+          texture_cache.RunGarbageCollector();
+        }
+        Require(name, "GC progresses past retained images",
+                !texture_cache.FindImageFromRange(
+                    base + offset + 40 * stride, 4, false),
+                "forty retained images prevented collection of a later clean image");
+        for (size_t index = 0; index < 40; index++) {
+          Require(name, "GC retains ambiguous image contents",
+                  texture_cache.FindImageFromRange(
+                      base + offset + index * stride, 4, false) == oldest[index],
+                  "GC gained progress by discarding potentially newer image contents");
+        }
+        texture_cache.UnmapMemory(base + offset, oldest.size() * stride);
+      }
+
       constexpr uint64_t large_offset = 0x400000;
       constexpr uint32_t large_width = 4096;
       constexpr uint32_t large_height = 2047;
@@ -9100,6 +9229,7 @@ public:
 
     {
       RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -13749,9 +13879,26 @@ private:
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    u32 extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> available_extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(
+                  nullptr, &extension_count, available_extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    const bool khr_derivatives = std::ranges::any_of(
+        available_extensions, [](const auto &extension) {
+          return std::strcmp(extension.extensionName,
+                             VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0;
+        });
+    // The NV predecessor uses the same feature structure on older Vulkan drivers.
+    const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-        VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
+        khr_derivatives ? VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+                        : VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,

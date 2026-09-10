@@ -104,7 +104,7 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                   uint32_t first, uint32_t components) {
 	const bool cube = ctx.state.program.info.images.at(mem.resource).cube;
-	auto x = AddressF32(ctx, mem, address, first);
+	auto       x    = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
 	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
 	                                                   : ZeroF32(ctx.state);
@@ -190,13 +190,13 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 		uint32_t   packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
 		                        ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
 		const auto scalar    = [&](uint32_t index) {
-			if (dref) return value;
-			const auto component = gather ? index : DmaskComponent(mem.dmask, index);
-			const auto result    = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction({OpCompositeExtract,
-			                               ImageScalarType(ctx.state, value_class), result, value,
-			                               component});
-			return result;
+            if (dref) return value;
+            const auto component = gather ? index : DmaskComponent(mem.dmask, index);
+            const auto result    = ctx.state.builder.AllocateId();
+            ctx.state.builder.AddFunction({OpCompositeExtract,
+                                           ImageScalarType(ctx.state, value_class), result, value,
+                                           component});
+            return result;
 		};
 		for (uint32_t word = 0; word < mem.data_dwords; word++) {
 			const auto low_index  = word * 2u;
@@ -210,11 +210,11 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 				const auto high_bits = SampledComponentBits(ctx, high, value_class);
 				const auto mask      = ConstantU32(ctx.state, 0xffffu);
 				packed[word]         = Binary(
-				    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
-				    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low_bits, mask),
-				    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high_bits, mask),
-				           ConstantU32(ctx.state, 16u)));
+                    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+                    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low_bits, mask),
+                    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+				                   Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high_bits, mask),
+				                   ConstantU32(ctx.state, 16u)));
 			} else {
 				const auto pair = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(
@@ -548,7 +548,16 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 } // namespace
 
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto op         = inst.GetOpcode();
+	const auto op = inst.GetOpcode();
+	if (op == IR::ValueOpcode::ImageBvhIntersectRay) {
+		// Stub: inert "no intersection" semantics, 4 channels of 0xFFFFFFFF
+		// (missing child pointer for a box node / NaN time for a triangle node)
+		auto&      state = ctx.state;
+		const auto max   = ConstantU32(state, 0xFFFFFFFFu);
+		ctx.Define(inst, state.builder.Constant(OpConstantComposite, TypeU32Composite(state, 4),
+		                                        {max, max, max, max}));
+		return true;
+	}
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
 	if (image_info.access == IR::ImageAccess::None) {
 		return false;
@@ -783,8 +792,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		auto       low      = ConstantU32(state, 0u);
 		auto       high     = LoadMapping(mapping);
 		auto       selected = ConstantU32(state, 0u);
-		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
-		     iteration++) {
+		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations; iteration++) {
 			const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
 			const auto mid =
 			    Binary(state, OpShiftRightLogical, TypeU32(state),

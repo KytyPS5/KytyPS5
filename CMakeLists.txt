@@ -455,6 +455,26 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(bvh_node_parser_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BvhNodeParserTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/rt/bvhNodeParser.cpp"
+)
+target_link_libraries(bvh_node_parser_tests fmt::fmt)
+target_include_directories(bvh_node_parser_tests PRIVATE ${inc_headers})
+
+add_executable(bvh_accel_struct_device_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BvhAccelStructDeviceTests.cpp"
+)
+target_link_libraries(bvh_accel_struct_device_tests Vulkan::Headers)
+target_include_directories(bvh_accel_struct_device_tests PRIVATE ${inc_headers})
+
+add_executable(accel_struct_builder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AccelStructBuilderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/rt/accelStruct.cpp"
+)
+target_link_libraries(accel_struct_builder_tests Vulkan::Headers fmt::fmt)
+target_include_directories(accel_struct_builder_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -543,6 +563,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME bvh_node_parser COMMAND $<TARGET_FILE:bvh_node_parser_tests>)
+	add_test(NAME accel_struct_flatten COMMAND $<TARGET_FILE:accel_struct_builder_tests> --flatten-only)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
@@ -601,6 +623,8 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		bvh_node_parser_tests
+		accel_struct_builder_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

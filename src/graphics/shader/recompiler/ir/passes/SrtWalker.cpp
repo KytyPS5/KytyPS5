@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -323,9 +324,8 @@ public:
 						                        (op == ValueOpcode::ReadConstBuffer &&
 						                         kind == ResourceKind::ScalarAddress);
 						if (crosswired) {
-							Fail(flags.pc,
-							     fmt::format("{} has incompatible scalar memory metadata",
-							                 ValueOpcodeName(op)));
+							Fail(flags.pc, fmt::format("{} has incompatible scalar memory metadata",
+							                           ValueOpcodeName(op)));
 						}
 					}
 				}
@@ -508,7 +508,7 @@ private:
 			return false;
 		}
 		m_visiting.push_back(inst);
-		uint64_t out = 0;
+		uint64_t   out       = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
@@ -599,9 +599,9 @@ private:
 			    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
 			const auto aligned = byte_offset & ~uint64_t {3};
 			const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-			const auto size = stride == 0u
-			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+			const auto size    = stride == 0u
+			                         ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+			                         : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
 				return false;
 			}
@@ -977,7 +977,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
-                                std::vector<uint8_t>& active_sources) {
+                                std::vector<uint8_t>&    active_sources) {
 	if (!program.srt_plan_complete) {
 		return false;
 	}
@@ -1034,7 +1034,14 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
-					return false;
+					std::fprintf(stderr,
+					             "resource specialization: could not evaluate descriptor dword "
+					             "%u for source %u (likely control-flow-dependent); using a "
+					             "zeroed descriptor for this resource instead of failing the "
+					             "whole shader\n",
+					             index, source_index);
+					value.dwords.fill(0u);
+					break;
 				}
 			}
 		}
@@ -1044,16 +1051,23 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
-			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
-			                      clean_flat_slots[read.flat_offset] != 0u;
-			auto&      selected = clean ? clean_evaluator : evaluator;
-			if (read.flat_offset >= flattened.size() ||
-			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
+			const bool clean = read.flat_offset < clean_flat_slots.size() &&
+			                   clean_flat_slots[read.flat_offset] != 0u;
+			auto& selected = clean ? clean_evaluator : evaluator;
+			if (read.flat_offset >= flattened.size()) {
 				return false;
+			}
+			if (!selected.Evaluate(read.value, flattened[read.flat_offset])) {
+				std::fprintf(stderr,
+				             "resource specialization: could not evaluate flat SRT slot %u "
+				             "(likely control-flow-dependent); using 0 for this slot instead of "
+				             "failing the whole shader\n",
+				             read.flat_offset);
+				flattened[read.flat_offset] = 0u;
 			}
 		}
 	}
-	results = std::move(evaluated);
+	results        = std::move(evaluated);
 	active_sources = std::move(active);
 	if (evaluate_flat) {
 		flat = std::move(flattened);
@@ -1077,11 +1091,11 @@ void BuildSrtPlan(Program& program) {
 }
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results) {
+                           const SrtRuntime& runtime, std::span<uint32_t> results) {
 	if (values.size() != results.size()) {
 		return false;
 	}
-	auto clean = runtime;
+	auto clean        = runtime;
 	clean.read_memory = runtime.read_specialization_memory != nullptr
 	                        ? runtime.read_specialization_memory
 	                        : +[](void*, uint64_t, uint32_t*) { return false; };

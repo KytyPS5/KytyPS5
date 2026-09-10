@@ -25,19 +25,6 @@ bool HasLiteral(const Instruction& inst) {
 	       inst.src3.kind == OperandKind::LiteralConstant;
 }
 
-bool IsControlFlowBranch(Opcode opcode) {
-	switch (opcode) {
-		case Opcode::S_BRANCH:
-		case Opcode::S_CBRANCH_SCC0:
-		case Opcode::S_CBRANCH_SCC1:
-		case Opcode::S_CBRANCH_VCCZ:
-		case Opcode::S_CBRANCH_VCCNZ:
-		case Opcode::S_CBRANCH_EXECZ:
-		case Opcode::S_CBRANCH_EXECNZ: return true;
-		default: return false;
-	}
-}
-
 void ApplyLiteral(Operand& operand, uint32_t literal) {
 	if (operand.kind == OperandKind::LiteralConstant) {
 		operand.value      = literal;
@@ -197,6 +184,24 @@ std::string FormatExp(const Instruction& inst) {
 }
 
 } // namespace
+
+bool IsConditionalBranch(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::S_CBRANCH_SCC0:
+		case Opcode::S_CBRANCH_SCC1:
+		case Opcode::S_CBRANCH_VCCZ:
+		case Opcode::S_CBRANCH_VCCNZ:
+		case Opcode::S_CBRANCH_EXECZ:
+		case Opcode::S_CBRANCH_EXECNZ:
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END: return true;
+		default: return false;
+	}
+}
+
+bool IsDirectBranch(Opcode opcode) {
+	return opcode == Opcode::S_BRANCH || IsConditionalBranch(opcode);
+}
 
 const char* ImageDimensionToString(ImageDimension dimension) {
 	switch (dimension) {
@@ -389,7 +394,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
 
-		if (IsControlFlowBranch(inst.opcode)) {
+		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
@@ -482,6 +487,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_BITSET0_B64:
 		case Opcode::S_BITSET1_B64:
 		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
@@ -532,6 +538,11 @@ std::string InstructionToString(const Instruction& inst) {
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END:
+			return WithUnsupportedReason(inst, fmt::format(
+			    "0x{:08x}: {} {}, 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
+			    OperandToString(inst.dst), inst.branch_target));
 		case Opcode::EXP: return WithUnsupportedReason(inst, FormatExp(inst));
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:

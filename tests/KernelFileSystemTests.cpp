@@ -1,8 +1,10 @@
+#include "SDL.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "graphics/presentation/window/windowInternal.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -15,8 +17,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
@@ -120,6 +125,109 @@ void CheckMountRoot(const std::filesystem::path &root) {
       Check(FileSystem::KernelClose(fd) == OK, "close mounted root");
     }
   }
+  FileSystem::Umount("/app0");
+}
+
+void CheckDirectoryStream(const std::filesystem::path &root) {
+  const auto directory = root / "directory-stream";
+  Check(std::filesystem::create_directory(directory),
+        "create seek fixture directory");
+  for (int i = 0; i < 48; ++i) {
+    Common::File fixture;
+    Check(fixture.Create(directory / ("directory-entry-" + std::to_string(i))),
+          "create enough entries to cross directory blocks");
+    fixture.Close();
+  }
+  FileSystem::Mount(directory, "/app0");
+  const int fd = FileSystem::KernelOpen("/app0/", 0, 0);
+  Check(fd >= 3, "open directory as read-only asset");
+  const auto end = FileSystem::KernelLseek(fd, 0, 2);
+  Check(end > 512 && end % 512 == 0,
+        "directory SEEK_END uses padded stream size");
+  FileSystem::FileStat stat{};
+  Check(FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == end &&
+            stat.st_blksize == 512,
+        "directory stat agrees with seek and enumeration");
+  Check(FileSystem::KernelStat("/app0/", &stat) == OK && stat.st_size == end &&
+            stat.st_blocks == end / 512,
+        "path and descriptor directory stat agree");
+  Check(FileSystem::KernelLseek(fd, 0, 0) == 0,
+        "rewind directory for asset read");
+  std::vector<char> raw(static_cast<size_t>(end));
+  Check(FileSystem::KernelRead(fd, raw.data(), raw.size()) == end &&
+            FileSystem::KernelRead(fd, raw.data(), 1) == 0,
+        "raw directory read reaches EOF");
+  Check(FileSystem::KernelLseek(fd, -end, 1) == 0,
+        "directory SEEK_CUR uses the position advanced by read");
+
+  std::array<char, 512> block{};
+  int64_t base = -1;
+  for (int64_t offset = 0; offset < end; offset += block.size()) {
+    Check(FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
+                                          &base) == block.size() &&
+              base == offset &&
+              std::memcmp(block.data(), raw.data() + offset, block.size()) == 0,
+          "directory enumeration shares raw bytes and reports each block "
+          "position");
+    for (size_t pos = 0; pos < block.size();) {
+      Check(block.size() - pos >= 8, "directory record header fits");
+      uint16_t length = 0;
+      std::memcpy(&length, block.data() + pos + 4, sizeof(length));
+      const auto name_length = static_cast<uint8_t>(block[pos + 7]);
+      Check(length >= 9 + name_length && length <= block.size() - pos &&
+                block[pos + 8 + name_length] == '\0',
+            "directory entries remain complete within every block");
+      pos += length;
+    }
+  }
+  Check(FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
+                                        &base) == 0 &&
+            base == end,
+        "directory enumeration reports EOF position");
+  Check(FileSystem::KernelLseek(fd, 512, 0) == 512 &&
+            FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
+                                            &base) == block.size() &&
+            base == 512 &&
+            std::memcmp(block.data(), raw.data() + 512, block.size()) == 0,
+        "restore and reread a directory enumeration position");
+
+  const auto position = FileSystem::KernelLseek(fd, 0, 1);
+  Check(
+      FileSystem::KernelLseek(fd, 0, 9) ==
+              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+          FileSystem::KernelLseek(fd, -1, 0) ==
+              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+          FileSystem::KernelLseek(fd, std::numeric_limits<int64_t>::min(), 1) ==
+              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+          FileSystem::KernelLseek(fd, std::numeric_limits<int64_t>::max(), 1) ==
+              Libs::LibKernel::KERNEL_ERROR_EOVERFLOW &&
+          FileSystem::KernelLseek(fd, 0, 1) == position,
+      "invalid and overflowing directory seeks preserve the position");
+  Check(FileSystem::KernelLseek(fd, -19, 2) == end - 19 &&
+            FileSystem::KernelRead(fd, block.data(), block.size()) == 19 &&
+            std::memcmp(block.data(), raw.data() + end - 19, 19) == 0,
+        "raw directory reads support byte positions and stop at EOF");
+  Check(FileSystem::KernelLseek(fd, 1, 0) == 1 &&
+            FileSystem::KernelGetdents(fd, block.data(), block.size()) ==
+                Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelLseek(fd, 0, 1) == 1,
+        "directory enumeration rejects an incomplete record position");
+  Check(FileSystem::KernelLseek(fd, 512, 2) == end + 512 &&
+            FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
+                                            &base) ==
+                Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelLseek(fd, 0, 1) == end + 512,
+        "directory enumeration rejects a position beyond EOF");
+  Check(FileSystem::KernelRead(
+            fd, block.data(),
+            static_cast<size_t>(std::numeric_limits<int>::max()) + 1) ==
+                Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+            FileSystem::KernelLseek(fd, 0, 1) == end + 512,
+        "oversized read fails without changing the directory position");
+  Check(FileSystem::KernelClose(fd) == OK, "close directory stream");
+  Check(FileSystem::KernelLseek(fd, 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "seek rejects a closed descriptor");
   FileSystem::Umount("/app0");
 }
 
@@ -267,15 +375,26 @@ int main() {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
+  Check(SDL_InitSubSystem(SDL_INIT_VIDEO) == 0, "initialize Vulkan test video");
+  auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
+  graphics->graphic_ctx.screen_width = 64;
+  graphics->graphic_ctx.screen_height = 64;
+  graphics->window = SDL_CreateWindow("KernelFileSystemTests", 0, 0, 64, 64,
+                                      SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Check(graphics->window != nullptr, "create hidden Vulkan test window");
+  graphics->CreateVulkan();
+
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
+  graphics.reset();
   subsystems.Destroy();
 
   std::printf("KernelFileSystemTests: all cases passed\n");

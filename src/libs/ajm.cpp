@@ -657,6 +657,16 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 	}
 
 	AjmDecodeResult result = decoder->MakeResult();
+	if ((flags & AJM_FLAG_SIDEBAND_GAPLESS) != 0) {
+		if (sideband_input == nullptr || sideband_input_size < AJM_SIDEBAND_GAPLESS_SIZE) {
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
+		state->gapless.Set(*static_cast<const AjmSidebandGaplessDecode*>(sideband_input),
+		                   (flags & AJM_FLAG_CONTROL_RESET) != 0);
+		sideband_input = static_cast<const uint8_t*>(sideband_input) + AJM_SIDEBAND_GAPLESS_SIZE;
+		sideband_input_size -= AJM_SIDEBAND_GAPLESS_SIZE;
+	}
 	if ((flags & AJM_FLAG_CONTROL_RESET) != 0) {
 		state->gapless.Reset();
 		decoder->Reset();

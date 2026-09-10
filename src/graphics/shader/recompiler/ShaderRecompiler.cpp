@@ -130,20 +130,6 @@ uint32_t EmbeddedFetchDstSize(const Decoder::Instruction& inst) {
 	return inst.opcode == Decoder::Opcode::V_MAD_U64_U32 ? 2u : DecodedDstSize(inst);
 }
 
-bool EmbeddedFetchHasBranch(Decoder::Opcode opcode) {
-	switch (opcode) {
-		case Decoder::Opcode::S_SETPC_B64:
-		case Decoder::Opcode::S_BRANCH:
-		case Decoder::Opcode::S_CBRANCH_SCC0:
-		case Decoder::Opcode::S_CBRANCH_SCC1:
-		case Decoder::Opcode::S_CBRANCH_VCCZ:
-		case Decoder::Opcode::S_CBRANCH_VCCNZ:
-		case Decoder::Opcode::S_CBRANCH_EXECZ:
-		case Decoder::Opcode::S_CBRANCH_EXECNZ: return true;
-		default: return false;
-	}
-}
-
 void ClearEmbeddedFetchSgprs(std::array<EmbeddedFetchSgprInfo, 108>& sgprs,
                              const Decoder::Operand& dst, uint32_t size) {
 	if (!IsDecodedSgpr(dst)) {
@@ -242,7 +228,10 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	EmbeddedFetchVectorLanes               vector_lanes;
 	const bool                             track_vector_lanes =
 	    std::none_of(decoded.instructions.begin(), decoded.instructions.end(),
-	                 [](const auto& inst) { return EmbeddedFetchHasBranch(inst.opcode); });
+	                 [](const auto& inst) {
+		                 return Decoder::IsDirectBranch(inst.opcode) ||
+		                        inst.opcode == Decoder::Opcode::S_SETPC_B64;
+	                 });
 
 	if (attrib_reg >= 0 && attrib_reg < static_cast<int>(sgprs.size())) {
 		sgprs[attrib_reg].type = EmbeddedFetchValueType::AttribTable;

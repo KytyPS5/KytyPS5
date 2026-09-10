@@ -26,6 +26,7 @@ namespace SystemService {
 [[maybe_unused]] constexpr int PARAM_ID_GAME_PARENTAL_LEVEL = 7;
 [[maybe_unused]] constexpr int PARAM_ID_CC_ENABLE           = 100;
 [[maybe_unused]] constexpr int PARAM_ID_SCREEN_READER       = 208;
+constexpr int                  PARAM_ID_LANG_PS5            = 400; // PPSA01325
 [[maybe_unused]] constexpr int PARAM_ID_ENTER_BUTTON_ASSIGN = 1000;
 
 [[maybe_unused]] constexpr int PARAM_DATE_FORMAT_YYYYMMDD = 0;
@@ -96,7 +97,8 @@ static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 	int v = 0;
 
 	switch (param_id) {
-		case PARAM_ID_LANG: v = static_cast<int>(Config::GetConsoleLanguage()); break;
+		case PARAM_ID_LANG:
+		case PARAM_ID_LANG_PS5: v = static_cast<int>(Config::GetConsoleLanguage()); break;
 		case PARAM_ID_DATE_FORMAT: v = PARAM_DATE_FORMAT_DDMMYYYY; break;
 		case PARAM_ID_TIME_FORMAT: v = PARAM_TIME_FORMAT_24HOUR; break;
 		case PARAM_ID_TIME_ZONE: v = +180; break;

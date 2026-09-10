@@ -312,9 +312,11 @@ struct PipelineCache::ProgramCache {
 			std::string id;
 			return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
 		}();
-		if (kDropOversized &&
-		    (options.stage == ShaderType::Compute || options.stage == ShaderType::Pixel ||
-		     options.stage == ShaderType::Mesh) &&
+		// Compute is no longer capped here: these were dropped because their descriptors could
+		// not resolve and the dispatch ran on garbage, not because of their size -- Demon's
+		// Souls runs 250k-650k-word compute shaders on the same path. With loop-carried reads
+		// kept out of the flat SRT plan they resolve properly, so let them submit.
+		if (kDropOversized && options.stage == ShaderType::Pixel &&
 		    result.spirv.size() > 40000) {
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {

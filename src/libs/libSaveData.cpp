@@ -404,6 +404,25 @@ static int load_memory(const std::filesystem::path& directory, SaveDataMemory* m
 	return OK;
 }
 
+static int64_t get_save_data_mtime(const std::filesystem::path& directory) {
+	// Approximate the save's modification time using the newest file timestamp,
+	// including files in subdirectories. In-place writes do not update the parent
+	// directory's timestamp, so its timestamp alone would miss those changes.
+	// Some games require a nonzero modification time to load an existing save.
+	int64_t mtime = 0;
+	for (const auto& entry: Common::File::GetDirEntries(directory)) {
+		if (entry.name == "." || entry.name == "..") {
+			continue;
+		}
+		const auto path = directory / entry.name;
+		const auto timestamp =
+		    entry.is_file ? static_cast<int64_t>(Common::File::GetLastWriteTimeUTC(path).ToUnix())
+		                  : get_save_data_mtime(path);
+		mtime = std::max(mtime, timestamp);
+	}
+	return mtime;
+}
+
 static void queue_save_data_event(uint32_t type, int32_t user_id,
                                   const SceSaveDataTitleId* title_id,
                                   const SceSaveDataDirName* dir_name, int32_t error_code = OK) {
@@ -575,6 +594,8 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		              dir_list[i].c_str());
 		if (result->params != nullptr) {
 			result->params[i] = {};
+			result->params[i].mtime =
+			    get_save_data_mtime(std::filesystem::path(root) / dir_list[i]);
 		}
 		if (result->infos != nullptr) {
 			auto& info = result->infos[i];

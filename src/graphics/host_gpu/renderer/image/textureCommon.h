@@ -1,9 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_RENDERER_IMAGE_TEXTURECOMMON_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_RENDERER_IMAGE_TEXTURECOMMON_H_
 
-#include "common/abi.h"
-#include "common/common.h"
-#include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -48,13 +46,13 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
                                                     Prospero::ChannelOrder  order);
 TextureUploadLayout    TextureCalcUploadLayout(Prospero::BufferFormat format, uint32_t width,
                                                uint32_t height, uint32_t levels, uint32_t depth,
-                                               Prospero::TileMode tile, uint64_t upload_size,
+                                               Prospero::TileMode tile_mode, uint64_t upload_size,
                                                bool allow_depth_tile, bool volume_texture,
                                                const char* owner);
 std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout);
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
-                              std::vector<GpuTileInfo>& infos);
+                              std::vector<GpuTileInfo>& out_tile_infos);
 
 } // namespace Libs::Graphics
 

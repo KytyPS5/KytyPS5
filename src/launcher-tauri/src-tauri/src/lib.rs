@@ -168,8 +168,15 @@ fn run_game(
             app_data_dir: app_data_dir(&app),
             game_path: info.game_path.clone(),
         };
-        supervisor::spawn(&spec).map_err(|e| e.to_string())?;
+        // Record the start *before* handing off. Both processes do a
+        // read-modify-write of the same playtime.json, and the supervisor's
+        // matching `record_stop` fires the moment the emulator exits --
+        // which can be almost immediately, if the game crashes on launch.
+        // Writing the start first means the supervisor always reads a file
+        // that already has this session's `play_count` bump in it, instead
+        // of racing this process and losing whichever write lands second.
         let _ = playtime::record_start(&app_data_dir(&app), &info.game_path);
+        supervisor::spawn(&spec).map_err(|e| e.to_string())?;
         app.exit(0);
         return Ok(());
     }
@@ -655,6 +662,7 @@ pub fn run() {
             poll_gamepad_state,
             list_audio_sinks,
             set_audio_output_sink,
+            bluetooth::bluetooth_adapter_state,
             bluetooth::list_bluetooth_devices,
             bluetooth::scan_bluetooth_devices,
             bluetooth::pair_bluetooth_device,

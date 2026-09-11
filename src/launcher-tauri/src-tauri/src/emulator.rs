@@ -81,8 +81,18 @@ pub fn find_terminal() -> Option<(PathBuf, Vec<String>)> {
     None
 }
 
+/// The per-OS half of the dev build layout: CMake configures into
+/// `_Build/<os>/`, so the `install/` tree to probe for is named after the
+/// platform this launcher was built for, not always `linux`.
+#[cfg(target_os = "linux")]
+const BUILD_INSTALL_DIR: &str = "_Build/linux/install";
+#[cfg(windows)]
+const BUILD_INSTALL_DIR: &str = "_Build/windows/install";
+#[cfg(target_os = "macos")]
+const BUILD_INSTALL_DIR: &str = "_Build/macos/install";
+
 /// Find `kyty_emulator` next to the app binary, its parent, walking up to a
-/// `_Build/linux/install/kyty_emulator` (the local dev build layout), or on
+/// `_Build/<os>/install/kyty_emulator` (the local dev build layout), or on
 /// `$PATH`.
 pub fn discover_emulator(app_binary_dir: &Path) -> Option<PathBuf> {
     let candidate = app_binary_dir.join(EMULATOR_EXE);
@@ -98,7 +108,7 @@ pub fn discover_emulator(app_binary_dir: &Path) -> Option<PathBuf> {
 
     let mut dir = app_binary_dir.to_path_buf();
     for _ in 0..8 {
-        let candidate = dir.join("_Build/linux/install").join(EMULATOR_EXE);
+        let candidate = dir.join(BUILD_INSTALL_DIR).join(EMULATOR_EXE);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -451,6 +461,11 @@ mod tests {
         info.host_input_mapping = vec!["Cross=J".to_string(), "Circle=L".to_string()];
 
         let args = build_args(&info, None, &[], 0.0);
+        // `--game` is built with `Path::join`, so its separator is the host's
+        // (`\` on Windows). That is the correct thing to hand the emulator on
+        // each platform; only this literal expectation is POSIX-shaped, so
+        // normalize rather than assert one platform's spelling everywhere.
+        let expected_game = Path::new("/games/Astro").join("eboot.bin").to_string_lossy().to_string();
         assert_eq!(
             args,
             vec![
@@ -471,7 +486,7 @@ mod tests {
                 "--spirv-debug-printf", "false",
                 "--keymap", "Cross=J",
                 "--keymap", "Circle=L",
-                "--game", "/games/Astro/eboot.bin",
+                "--game", expected_game.as_str(),
             ]
         );
     }

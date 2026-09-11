@@ -21,12 +21,34 @@ regex = "1.12"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 dirs = "5"
 gilrs = { version = "0.11.2", features = ["serde"] }
-bluer = { version = "0.17.4", features = ["bluetoothd"] }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "rt"] }
 futures-util = "0.3"
+tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = { version = "2.0", features = ["v2_38"] }
+# Bluetooth has no cross-platform backend: every portable Rust crate is
+# BLE-only, and the devices this panel targets (DualSense pads, headsets)
+# pair over Bluetooth Classic instead. So each OS gets its native stack --
+# BlueZ here, WinRT below, IOBluetooth on macOS. See bluetooth.rs.
+bluer = { version = "0.17.4", features = ["bluetoothd"] }
 
-[dev-dependencies]
-tempfile = "3"
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString"] }
+objc2-io-bluetooth = { version = "0.3", features = [
+    "IOBluetoothDevice",
+    "IOBluetoothDevicePair",
+    "IOBluetoothHostController",
+    "Bluetooth",
+    "IOBluetoothDeviceInquiry",
+] }

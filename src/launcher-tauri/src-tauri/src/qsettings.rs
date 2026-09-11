@@ -83,6 +83,16 @@ impl IniDocument {
         self.0.entry(section.to_string()).or_default().insert(key.to_string(), raw_value);
     }
 
+    /// Drop a single key, leaving the rest of its section alone. Needed for
+    /// settings that are meant to be *absent* rather than written as a
+    /// falsy value, so that a Kyty.ini the Qt launcher wrote round-trips
+    /// through this one byte-for-byte.
+    pub fn remove(&mut self, section: &str, key: &str) {
+        if let Some(entries) = self.0.get_mut(section) {
+            entries.remove(key);
+        }
+    }
+
     pub fn remove_section(&mut self, section: &str) {
         self.0.remove(section);
     }

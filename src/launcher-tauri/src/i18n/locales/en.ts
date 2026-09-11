@@ -174,6 +174,8 @@ export interface Catalog {
       scan: string;
       scanning: string;
       noDevices: string;
+      noAdapter: string;
+      poweredOff: string;
       connect: string;
       disconnect: string;
       forget: string;
@@ -510,6 +512,8 @@ const en: Catalog = {
       scan: "Scan for devices",
       scanning: "Scanning…",
       noDevices: "No devices found yet.",
+      noAdapter: "No Bluetooth adapter was found on this system.",
+      poweredOff: "Bluetooth is switched off. Turn it on in your system settings, then reopen this page.",
       connect: "Connect",
       disconnect: "Disconnect",
       forget: "Forget",

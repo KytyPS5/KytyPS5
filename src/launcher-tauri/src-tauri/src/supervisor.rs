@@ -21,6 +21,7 @@
 //! relaunches a fresh instance of the real launcher, and exits.
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -45,8 +46,25 @@ pub struct SupervisedLaunch {
 /// returns `Ok`, so nothing here can depend on the current process still
 /// being alive afterward.
 pub fn spawn(spec: &SupervisedLaunch) -> std::io::Result<()> {
-    let spec_path = std::env::temp_dir().join(format!("kyty-supervise-{}.json", std::process::id()));
-    std::fs::write(&spec_path, serde_json::to_string(spec)?)?;
+    // The spec names an executable and its arguments, and the supervisor
+    // runs whatever it finds there -- so writing it to a predictable path
+    // in a world-writable /tmp would be handing any other local account a
+    // way to pre-create that path (as a symlink, to redirect this write; or
+    // as a file, to choose the binary that then gets executed). `tempfile`
+    // creates with O_EXCL under a random name, mode 0600 on Unix, which
+    // closes both: the create fails outright if anything is already there,
+    // and nothing but this user can read or replace it afterwards.
+    let mut file = tempfile::Builder::new()
+        .prefix("kyty-supervise-")
+        .suffix(".json")
+        .tempfile()?;
+    file.write_all(serde_json::to_string(spec)?.as_bytes())?;
+    file.flush()?;
+
+    // The supervisor is a separate process that outlives this one, so the
+    // file has to survive this `TempFile` being dropped; the supervisor
+    // deletes it itself as soon as it has read it.
+    let spec_path = file.into_temp_path().keep().map_err(|e| e.error)?;
 
     let exe = std::env::current_exe()?;
     Command::new(exe).arg(SUPERVISE_FLAG).arg(&spec_path).spawn()?;

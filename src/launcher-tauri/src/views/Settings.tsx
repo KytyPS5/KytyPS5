@@ -378,6 +378,11 @@ interface BtDevice {
   connected: boolean;
 }
 
+interface BtAdapter {
+  present: boolean;
+  powered: boolean;
+}
+
 /** Pairing has no capture-overlay equivalent -- there is no button chord to
  * catch, so this is a plain list + async action buttons, the same shape as
  * FoldersCategory just above. Loading `list_bluetooth_devices` on mount
@@ -390,6 +395,9 @@ function BluetoothCategory() {
   const [scanning, setScanning] = useState(false);
   const [busyAddress, setBusyAddress] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
+  // `null` while the first adapter query is still in flight, so the panel
+  // does not flash "no Bluetooth adapter" before it knows either way.
+  const [adapter, setAdapter] = useState<BtAdapter | null>(null);
 
   const refresh = async () => {
     try {
@@ -400,8 +408,19 @@ function BluetoothCategory() {
     }
   };
 
+  const refreshAdapter = async () => {
+    try {
+      setAdapter(await invoke<BtAdapter>("bluetooth_adapter_state"));
+    } catch {
+      setAdapter({ present: false, powered: false });
+    }
+  };
+
   useEffect(() => {
-    void refresh();
+    void (async () => {
+      await refreshAdapter();
+      await refresh();
+    })();
   }, []);
 
   const scan = async () => {
@@ -491,12 +510,29 @@ function BluetoothCategory() {
       <p className={styles.blockHint}>{t("settings.bluetooth.description")}</p>
 
       <div className={styles.actionRow}>
-        <button type="button" className="pill-button" disabled={scanning} onClick={() => void scan()}>
+        <button
+          type="button"
+          className="pill-button"
+          disabled={scanning || adapter?.powered === false}
+          onClick={() => void scan()}
+        >
           {scanning ? t("settings.bluetooth.scanning") : t("settings.bluetooth.scan")}
         </button>
       </div>
 
-      {loadError && <p className={styles.blockHint}>{t("settings.bluetooth.noDevices")}</p>}
+      {/* An adapter that is missing and one that is switched off both yield
+          an empty device list, so say which it is rather than leaving the
+          user to guess why scanning finds nothing. */}
+      {adapter !== null && !adapter.present && (
+        <p className={styles.blockHint}>{t("settings.bluetooth.noAdapter")}</p>
+      )}
+      {adapter?.present && !adapter.powered && (
+        <p className={styles.blockHint}>{t("settings.bluetooth.poweredOff")}</p>
+      )}
+
+      {loadError && adapter?.powered && (
+        <p className={styles.blockHint}>{t("settings.bluetooth.noDevices")}</p>
+      )}
 
       {paired.length > 0 && (
         <>

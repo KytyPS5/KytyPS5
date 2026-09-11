@@ -637,11 +637,14 @@ void EmitBarrier(EmitterState& state) {
 		return;
 	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto memory = state.lds_storage_class == spv::StorageClassStorageBuffer
-	                        ? spv::MemorySemanticsUniformMemoryMask
-	                        : spv::MemorySemanticsWorkgroupMemoryMask;
-	const auto semantics = tessellation ? spv::MemorySemanticsMaskNone
-	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
+	// s_barrier also orders buffer traffic; LDS in a storage buffer is uniform memory itself.
+	const auto lds_memory = state.lds_storage_class == spv::StorageClassStorageBuffer
+	                            ? spv::MemorySemanticsMaskNone
+	                            : spv::MemorySemanticsWorkgroupMemoryMask;
+	const auto semantics  = tessellation ? spv::MemorySemanticsMaskNone
+	                                     : spv::MemorySemanticsAcquireReleaseMask | lds_memory |
+	                                          spv::MemorySemanticsUniformMemoryMask;
+
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }

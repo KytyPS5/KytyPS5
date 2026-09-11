@@ -57,12 +57,27 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
-struct BufferDefinition {
-	uint32_t variable             = 0;
-	uint32_t type                 = 0;
-	uint32_t element_type         = 0;
-	uint32_t pointer_type         = 0;
-	uint32_t element_pointer_type = 0;
+struct SpirvRequirements {
+	bool bvh                          = false;
+	bool subgroup_ballot              = false;
+	bool subgroup_barrier             = false;
+	bool subgroup_shuffle             = false;
+	bool subgroup_local_invocation_id = false;
+	bool compute_derivatives          = false;
+	bool image_gather_extended        = false;
+	bool function_lds                 = false;
+	bool function_scratch             = false;
+	bool pixel_valid_mask             = false;
+	bool buffer_int64_atomics         = false;
+	bool buffer_u8                    = false;
+	bool buffer_u16                   = false;
+	bool shared_int64_atomics         = false;
+	// A genuine glc buffer load or store is present, so the Coherent alias is declared.
+	bool coherent_buffers             = false;
+	bool float64                      = false;
+	// The first guest feature the backend cannot express; the program is refused, not emitted.
+	const char*     refusal      = nullptr;
+	const IR::Inst* refused_inst = nullptr;
 };
 
 struct ImageDefinition {
@@ -108,7 +123,12 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
-	std::array<BufferDefinition, 4>                  storage_buffers {};
+	uint32_t                                         storage_buffer_variable = 0;
+	// Alias of the same set and binding, decorated Coherent; only glc accesses use it.
+	uint32_t                                 storage_buffer_coherent_variable = 0;
+	uint32_t                                         storage_buffer_u8_variable = 0;
+	uint32_t                                         storage_buffer_u16_variable = 0;
+	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -183,6 +203,9 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
+uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32);
+uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
+uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -424,7 +447,12 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// glc=1: only storage buffers and raw pointers have a cache to bypass.
+	bool             coherent         = false;
 };
+
+// True when the guest access asked to bypass the caches that are not device coherent.
+bool CoherentBufferAccess(const IR::MemoryInfo& mem);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
@@ -458,7 +486,7 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
 
 uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
-                             uint32_t scope);
+                             uint32_t scope, uint32_t semantics = spv::MemorySemanticsMaskNone);
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 

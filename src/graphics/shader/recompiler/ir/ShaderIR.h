@@ -71,6 +71,8 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	// glc read as a cache hint; false on an atomic, where the bit names the return value.
+	bool                    cache_bypass                                          = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;

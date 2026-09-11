@@ -120,23 +120,28 @@ uint32_t TypeFunction(EmitterState& state) {
 	return state.function_type;
 }
 
-uint32_t StorageBufferType(EmitterState& state, BufferDefinition& buffer, uint32_t bits = 32) {
-	if (buffer.type == 0) {
-		if (bits == 32u) {
-			buffer.element_type = TypeU32(state);
-		} else if (bits == 64u) {
-			buffer.element_type = TypeU64(state);
-		} else {
-			buffer.element_type = state.builder.Type(spv::OpTypeInt, bits, 0);
-		}
-		const auto array = state.builder.DecoratedType(
-		    spv::OpTypeRuntimeArray,
-		    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}}, buffer.element_type);
-		buffer.type = state.builder.DecoratedType(
-		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
-	}
-	return buffer.type;
+uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits) {
+	return bits == 32u   ? TypeU32(state)
+	       : bits == 64u ? TypeU64(state)
+	                     : state.builder.Type(spv::OpTypeInt, bits, 0);
+}
+
+uint32_t StorageRuntimeArrayType(EmitterState& state, uint32_t bits) {
+	return state.builder.DecoratedType(
+	    spv::OpTypeRuntimeArray,
+	    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}},
+	    TypeStorageBufferElement(state, bits));
+}
+
+uint32_t StorageBufferType(EmitterState& state, uint32_t bits) {
+	return state.builder.DecoratedType(spv::OpTypeStruct,
+	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
+	                                   StorageRuntimeArrayType(state, bits));
+}
+
+uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, bits));
 }
 
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
@@ -270,22 +275,54 @@ void DefineDescriptors(EmitterState& state) {
 			    spv::OpTypeArray, type,
 			    ConstantU32(state, counts[index]));
 		};
-		switch (kind) {
-			case IR::DescriptorBindingKind::Buffers: {
-				const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
-				constexpr std::array names {"buffers_u8", "buffers_u16", "buffers", "buffers_u64"};
-				for (uint32_t alias = 0; alias < used.size(); ++alias) {
-					if (!used[alias]) continue;
-					auto& buffer = state.storage_buffers[alias];
-					const auto type = StorageBufferType(state, buffer, 8u << alias);
-					buffer.variable = Define(ArrayType(type), names[alias]);
-					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
-						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
+		switch (binding.kind) {
+			case IR::DescriptorBindingKind::Buffers:
+				state.storage_buffer_variable =
+				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				// Coherent can only decorate a whole variable, so glc needs a second one on this binding.
+				if (state.requirements.coherent_buffers) {
+					state.storage_buffer_coherent_variable =
+					    Define(ArrayType(StorageBufferType(state)), "buffers_coherent");
+					state.builder.AddAnnotation(spv::OpDecorate,
+					                            state.storage_buffer_coherent_variable,
+					                            spv::DecorationCoherent);
+				}
+				if (state.requirements.buffer_u8) {
+					state.storage_buffer_u8_variable =
+					    Define(ArrayType(StorageBufferType(state, 8)), "buffers_u8");
+				}
+				if (state.requirements.buffer_u16) {
+					state.storage_buffer_u16_variable =
+					    Define(ArrayType(StorageBufferType(state, 16)), "buffers_u16");
+				}
+				if (state.requirements.buffer_int64_atomics) {
+					state.storage_buffer_u64_variable =
+					    Define(ArrayType(StorageBufferType(state, 64)), "buffers_u64");
+				}
+				// Every variable reaching the one Buffers binding must declare Aliased, once each.
+				if (state.storage_buffer_coherent_variable != 0 ||
+				    state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
+				    state.storage_buffer_u64_variable != 0) {
+					for (const auto variable:
+					     {state.storage_buffer_variable, state.storage_buffer_coherent_variable,
+					      state.storage_buffer_u8_variable, state.storage_buffer_u16_variable,
+					      state.storage_buffer_u64_variable}) {
+						if (variable != 0) {
+							state.builder.AddAnnotation(spv::OpDecorate, variable,
+							                            spv::DecorationAliased);
+						}
 					}
+				}
+				if (state.requirements.coherent_buffers) {
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (info.coherent_buffers) {
-						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
+					for (const auto variable:
+					     {state.storage_buffer_variable, state.storage_buffer_u8_variable,
+					      state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
+						if (variable != 0) {
+							state.builder.AddAnnotation(spv::OpDecorate, variable,
+							                            spv::DecorationCoherent);
+						}
 					}
 				}
 				break;

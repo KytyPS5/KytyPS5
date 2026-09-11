@@ -79,6 +79,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -884,8 +885,8 @@ void AppendBufferLoadDword(std::vector<u32> *code, u32 dst_vgpr,
 }
 
 void AppendBufferLoadOpcode(std::vector<u32> *code, u32 opcode, u32 dst_vgpr,
-                            u32 address_vgpr) {
-  code->push_back(EncodeMubuf0(opcode));
+                            u32 address_vgpr, bool glc = false) {
+  code->push_back(EncodeMubuf0(opcode, 0, false, true, glc));
   code->push_back(EncodeMubuf1(dst_vgpr, 0, address_vgpr));
 }
 
@@ -36480,6 +36481,154 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
 }
 
+// glc=1 asks for memory the rest of the device can see, which a spin on
+// a sibling workgroup's status word needs; glc=0 traffic must stay plain.
+void CheckGlcBufferAccessIsCoherent() {
+  using O = ShaderOpcode;
+  constexpr const char *name = "GlcBufferAccessIsCoherent";
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendBufferLoadOpcode(&code, 0x0cu, 2, 1, /*glc=*/true);
+  AppendBufferLoadOpcode(&code, 0x0cu, 3, 1, /*glc=*/false);
+  AppendVMovU32(&code, 31, 0);
+  AppendBufferStoreOpcode(&code, 0x1cu, 2, 31, /*glc=*/true);
+  AppendVMovU32(&code, 31, 4);
+  AppendBufferStoreOpcode(&code, 0x1cu, 3, 31, /*glc=*/false);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = std::move(code);
+  test.initial.assign(8, 0);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compile_only = true;
+
+  const auto compiled = CompileCase(test);
+  ValidateSpirv(name, compiled.spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "SPIR-V disassembly", tools.Disassemble(compiled.spirv, &text),
+          "failed to disassemble the glc buffer shader");
+  Require(name, "coherent alias",
+          CountText(text, "OpDecorate %buffers_coherent Coherent") == 1 &&
+              CountText(text, "Coherent") == 1,
+          "the glc accesses must reach a second, Coherent-decorated alias of "
+          "the buffer descriptor array, as the GLSL450 memory model gives "
+          "Volatile alone no cross-workgroup visibility");
+  Require(name, "alias shares the binding",
+          CountText(text, "OpDecorate %buffers_coherent DescriptorSet 0") == 1 &&
+              CountText(text, "OpDecorate %buffers DescriptorSet 0") == 1 &&
+              CountText(text, "OpDecorate %buffers_coherent Binding 0") == 1 &&
+              CountText(text, "OpDecorate %buffers Binding 0") == 1,
+          "the alias must consume no extra descriptor slot: same set, same "
+          "binding as the plain buffer descriptor array");
+  Require(name, "aliasing declared",
+          CountText(text, "OpDecorate %buffers Aliased") == 1 &&
+              CountText(text, "OpDecorate %buffers_coherent Aliased") == 1,
+          "two variables reaching one binding must both declare Aliased");
+  // Buffer pointers take two access-chain steps; follow each to its root.
+  std::map<std::string, std::string> pointer_root;
+  size_t coherent_volatile_loads = 0;
+  size_t coherent_volatile_stores = 0;
+  size_t plain_loads = 0;
+  size_t plain_stores = 0;
+  size_t misrouted = 0;
+  std::istringstream disassembly(text);
+  for (std::string line; std::getline(disassembly, line);) {
+    std::vector<std::string> words;
+    std::istringstream tokens(line);
+    for (std::string word; tokens >> word;) {
+      words.push_back(word);
+    }
+    if (words.size() >= 5 && words[1] == "=" && words[2] == "OpAccessChain") {
+      const auto &base = words[4];
+      const auto known = pointer_root.find(base);
+      pointer_root[words[0]] = known != pointer_root.end() ? known->second : base;
+      continue;
+    }
+    const bool is_volatile =
+        std::find(words.begin(), words.end(), "Volatile") != words.end();
+    const bool is_load = words.size() >= 5 && words[1] == "=" && words[2] == "OpLoad";
+    const bool is_store = words.size() >= 2 && words[0] == "OpStore";
+    if (!is_load && !is_store) {
+      continue;
+    }
+    const auto &pointer = is_load ? words[4] : words[1];
+    const auto root = pointer_root.find(pointer);
+    if (root == pointer_root.end()) {
+      continue;
+    }
+    if (root->second == "%buffers_coherent") {
+      if (!is_volatile) {
+        misrouted++;
+      } else if (is_load) {
+        coherent_volatile_loads++;
+      } else {
+        coherent_volatile_stores++;
+      }
+    } else if (root->second == "%buffers") {
+      if (is_volatile) {
+        misrouted++;
+      } else if (is_load) {
+        plain_loads++;
+      } else {
+        plain_stores++;
+      }
+    }
+  }
+  Require(name, "only glc is volatile", CountText(text, "Volatile") == 2,
+          "exactly the glc load and the glc store may carry the Volatile "
+          "memory operand");
+  Require(name, "glc load reaches the coherent alias",
+          coherent_volatile_loads == 1,
+          "the glc=1 buffer load must be the one load routed through the "
+          "Coherent alias, found " + std::to_string(coherent_volatile_loads));
+  Require(name, "glc store reaches the coherent alias",
+          coherent_volatile_stores == 1,
+          "the glc=1 buffer store must be the one store routed through the "
+          "Coherent alias, found " + std::to_string(coherent_volatile_stores));
+  Require(name, "glc=0 traffic stays on the plain variable",
+          plain_loads >= 1 && plain_stores >= 1 && misrouted == 0,
+          "glc=0 accesses must stay on the undecorated variable and stay "
+          "plain: the guest's ISA marks its bulk traffic glc=0 deliberately");
+
+  // glc on an atomic selects the return value and says nothing about caches.
+  std::vector<u32> atomic_code;
+  AppendVMovU32(&atomic_code, 1, 0);
+  AppendVMovU32(&atomic_code, 5, 1);
+  AppendBufferStoreOpcode(&atomic_code, 0x32, 5, 1, /*glc=*/true);
+  AppendStoreVgpr(&atomic_code, 5, 0);
+  AppendEnd(&atomic_code);
+
+  TestCase atomic_test;
+  atomic_test.name = name;
+  atomic_test.code = std::move(atomic_code);
+  atomic_test.initial.assign(8, 0);
+  atomic_test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD,
+                         O::S_ENDPGM};
+  atomic_test.compile_only = true;
+
+  const auto atomic_compiled = CompileCase(atomic_test);
+  ValidateSpirv(name, atomic_compiled.spirv);
+  std::string atomic_text;
+  Require(name, "SPIR-V disassembly",
+          tools.Disassemble(atomic_compiled.spirv, &atomic_text),
+          "failed to disassemble the glc atomic shader");
+  Require(name, "glc atomic still returns its value",
+          CountText(atomic_text, "OpAtomicIAdd") == 1,
+          "the glc=1 atomic must still be emitted and still return its "
+          "pre-operation value");
+  Require(name, "glc atomic earns no coherence",
+          CountText(atomic_text, "Coherent") == 0 &&
+              CountText(atomic_text, "Volatile") == 0,
+          "glc on an atomic selects the pre-operation return value; it must "
+          "not make the buffer descriptor array device-coherent and so change "
+          "the cache policy of every unrelated access in the shader");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -44601,6 +44750,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--glc-coherent-only") == 0) {
+    CheckGlcBufferAccessIsCoherent();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -44712,6 +44865,8 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
+  CheckGlcBufferAccessIsCoherent();
+  CheckEmissionRefusalIsSoft();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();

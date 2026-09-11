@@ -189,6 +189,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
+				// Must match the emitter's predicate, or a module can use the alias undeclared.
+				if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic &&
+				    Emitter::CoherentBufferAccess(memory)) {
+					requirements.coherent_buffers = true;
+				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					requirements.coherent_buffers |= memory.coherent;
 					if (memory.resource >= program.info.buffers.size()) {

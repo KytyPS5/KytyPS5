@@ -1,6 +1,13 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstring>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+bool CoherentBufferAccess(const IR::MemoryInfo& mem) {
+	// Not mem.glc: the frontend already dropped the bit on atomics, where it has no cache meaning.
+	return mem.cache_bypass;
+}
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.program.bindings.UsesPushData()) {
@@ -207,16 +214,19 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
-			const auto bits = mem.kind == IR::ResourceKind::Buffer
-			                      ? IR::StorageBufferElementBits(state.program, mem) : 32u;
-			auto* buffer = &state.storage_buffers[2];
-			if (bits == 8u) {
-				buffer = &state.storage_buffers[0];
-			} else if (bits == 16u) {
-				buffer = &state.storage_buffers[1];
-			}
-			access = PrepareStorageBufferResourceAccess(state, mem, *buffer);
+			// glc=1 takes the Coherent alias as whole dwords; glc=0 its element width's variable.
+			const auto coherent =
+			    CoherentBufferAccess(mem) && state.storage_buffer_coherent_variable != 0;
+			const auto bits = coherent || mem.kind != IR::ResourceKind::Buffer
+			                      ? 32u : StorageBufferElementBits(state.program, mem);
+			const auto variable = coherent      ? state.storage_buffer_coherent_variable
+			                      : bits == 8u  ? state.storage_buffer_u8_variable
+			                      : bits == 16u ? state.storage_buffer_u16_variable
+			                                    : state.storage_buffer_variable;
+			access = PrepareStorageBufferResourceAccess(
+			    state, mem, variable, TypeStorageBufferPointer(state, bits));
 			access.element_bits = bits;
+			access.coherent     = CoherentBufferAccess(mem);
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
@@ -412,7 +422,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 }
 
 uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
-                             uint32_t scope) {
+                             uint32_t scope, uint32_t semantics) {
 	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
 	const auto old    = ctx.state.builder.AllocateId();
 	const bool wide   = inst.GetType() == IR::Type::U64;
@@ -420,15 +430,16 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	if (opcode == spv::OpAtomicCompareExchange) {
 		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		// An unequal compare-exchange performs no store, so its semantics carry no release.
 		ctx.state.builder.AddFunction(
 		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
-		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
+		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, semantics),
 		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
 	} else {
 		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(opcode, type, old, pointer,
 		                              ConstantU32(ctx.state, scope),
-		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
+		                              ConstantU32(ctx.state, semantics), value);
 	}
 	return old;
 }

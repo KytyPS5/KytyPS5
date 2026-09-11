@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -316,14 +317,24 @@ struct PipelineCache::ProgramCache {
 		// not resolve and the dispatch ran on garbage, not because of their size -- Demon's
 		// Souls runs 250k-650k-word compute shaders on the same path. With loop-carried reads
 		// kept out of the flat SRT plan they resolve properly, so let them submit.
-		if (kDropOversized && options.stage == ShaderType::Pixel &&
-		    result.spirv.size() > 40000) {
+		// The size cap is the last piece of the compute-era soft ladder. Compute was un-capped
+		// once loop-carried SRT reads resolved properly; the same may now hold for pixel, and
+		// every shader dropped here silently deletes all of its draws (DrawHasDroppedProgram),
+		// which reads on screen as large chunks of missing geometry. KYTY_PS_OVERSIZE_CAP
+		// overrides the word threshold so both behaviours can be A/B'd on one binary; 0 disables
+		// the drop entirely.
+		static const size_t kPixelOversizeCap = []() -> size_t {
+			const char* v = std::getenv("KYTY_PS_OVERSIZE_CAP");
+			return v == nullptr ? size_t {40000} : static_cast<size_t>(std::strtoull(v, nullptr, 10));
+		}();
+		if (kDropOversized && options.stage == ShaderType::Pixel && kPixelOversizeCap != 0 &&
+		    result.spirv.size() > kPixelOversizeCap) {
 			static std::atomic<uint32_t> logged {0};
-			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("PipelineCache: dropping oversized %s shader hash=0x%016" PRIx64
-				     " words=%zu (PPSA21564 degraded bindless SRT -> device loss)\n",
-				     stage_name, options.shader_hash, result.spirv.size());
-			}
+			const auto dropped = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
+			LOGF("PipelineCache: dropping oversized %s shader hash=0x%016" PRIx64
+			     " words=%zu (PPSA21564 degraded bindless SRT -> device loss) [dropped=%" PRIu32
+			     "]\n",
+			     stage_name, options.shader_hash, result.spirv.size(), dropped);
 			return {
 			    .specialization = std::move(specialization),
 			    .program        = std::move(result.program).TakeCompiledInfo(),

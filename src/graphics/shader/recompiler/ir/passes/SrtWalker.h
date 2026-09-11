@@ -5,6 +5,10 @@
 
 #include <span>
 
+#ifdef KYTY_SRT_TEST_HOOKS
+#include <memory_resource>
+#endif
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
@@ -46,6 +50,14 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);
+
+#ifdef KYTY_SRT_TEST_HOOKS
+namespace SrtTestHooks {
+// Test builds only: evaluators created on the calling thread take their memo storage from
+// `resource` instead of the thread's pool; nullptr restores the pool.
+void SetMemoResource(std::pmr::memory_resource* resource);
+} // namespace SrtTestHooks
+#endif
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

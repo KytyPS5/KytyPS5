@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <chrono>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -142,8 +143,15 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto wait_start = std::chrono::steady_clock::now();
+	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result == vk::Result::eErrorDeviceLost) {
+		// A hung shader keeps the wait pending for the whole TDR budget; an illegal access
+		// tears the device down at once. The elapsed time tells the two apart.
+		LOGF("device lost after waiting %lld ms on the timeline semaphore\n" ,
+		     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                std::chrono::steady_clock::now() - wait_start)
+		                                .count()));
 		ReportCheckpoints(m_graphics);
 		ReportDeviceFault(m_graphics);
 	}

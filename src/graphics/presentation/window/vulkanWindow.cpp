@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -928,8 +929,20 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		// A validation error normally aborts, which is right for a clean run but useless while
+		// hunting a specific GPU fault: the first unrelated finding (e.g. the wave-lockstep LDS
+		// race the recompiler emits for guest shaders) kills the session before the interesting
+		// one is reached. KYTY_VALIDATION_FATAL=0 downgrades every validation error to a log
+		// line so a run can be driven past known findings.
+		static const bool validation_fatal = [] {
+			const char* v = std::getenv("KYTY_VALIDATION_FATAL");
+			return v == nullptr || v[0] != '0';
+		}();
+		if (validation_fatal) {
+			EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
+			           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		}
+		skip = false;
 	}
 
 	if (!skip) {

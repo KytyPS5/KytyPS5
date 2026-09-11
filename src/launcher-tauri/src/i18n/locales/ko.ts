@@ -72,7 +72,6 @@ const ko: DeepPartial<Catalog> = {
         particles: "파티클 필드",
         waves: "기하학적 파동",
         aurora: "오로라 글로우",
-        deepspace: "딥 스페이스",
       },
     },
     launch: {

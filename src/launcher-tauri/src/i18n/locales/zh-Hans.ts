@@ -72,7 +72,6 @@ const zhHans: DeepPartial<Catalog> = {
         particles: "粒子场",
         waves: "几何波纹",
         aurora: "极光辉光",
-        deepspace: "深邃太空",
       },
     },
     launch: {

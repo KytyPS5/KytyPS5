@@ -145,7 +145,7 @@ export interface Catalog {
     background: {
       title: string;
       description: string;
-      themes: { nebula: string; particles: string; waves: string; aurora: string; deepspace: string; custom: string };
+      themes: { nebula: string; particles: string; waves: string; aurora: string; custom: string };
       layout: { title: string; standard: string; library: string };
       displayMode: { title: string; full: string; window: string };
       textSize: { title: string; small: string; standard: string; large: string; extraLarge: string };
@@ -466,7 +466,6 @@ const en: Catalog = {
         particles: "Particle Field",
         waves: "Geometric Waves",
         aurora: "Aurora Glow",
-        deepspace: "Deep Space",
         custom: "Custom",
       },
       layout: {

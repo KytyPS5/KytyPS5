@@ -72,7 +72,6 @@ const tr: DeepPartial<Catalog> = {
         particles: "Parçacık Alanı",
         waves: "Geometrik Dalgalar",
         aurora: "Aurora Parıltısı",
-        deepspace: "Derin Uzay",
       },
     },
     launch: {

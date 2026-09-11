@@ -72,7 +72,6 @@ const id: DeepPartial<Catalog> = {
         particles: "Medan Partikel",
         waves: "Gelombang Geometris",
         aurora: "Cahaya Aurora",
-        deepspace: "Antariksa Dalam",
       },
     },
     launch: {

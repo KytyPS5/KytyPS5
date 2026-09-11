@@ -72,7 +72,6 @@ const nl: DeepPartial<Catalog> = {
         particles: "Deeltjesveld",
         waves: "Geometrische Golven",
         aurora: "Aurora Gloed",
-        deepspace: "Diepe Ruimte",
       },
     },
     launch: {

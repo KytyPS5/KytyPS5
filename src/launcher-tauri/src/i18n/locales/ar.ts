@@ -72,7 +72,6 @@ const ar: DeepPartial<Catalog> = {
         particles: "حقل الجسيمات",
         waves: "أمواج هندسية",
         aurora: "توهج الشفق",
-        deepspace: "الفضاء السحيق",
       },
     },
     launch: {

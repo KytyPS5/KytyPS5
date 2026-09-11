@@ -95,7 +95,6 @@ const es: DeepPartial<Catalog> = {
         particles: "Campo de Partículas",
         waves: "Ondas Geométricas",
         aurora: "Resplandor de Aurora",
-        deepspace: "Espacio Profundo",
         custom: "Personalizado",
       },
       layout: {

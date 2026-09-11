@@ -72,7 +72,6 @@ const ru: DeepPartial<Catalog> = {
         particles: "Поле Частиц",
         waves: "Геометрические Волны",
         aurora: "Сияние Авроры",
-        deepspace: "Глубокий Космос",
       },
     },
     launch: {

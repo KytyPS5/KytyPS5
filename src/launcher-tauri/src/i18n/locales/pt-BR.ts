@@ -72,7 +72,6 @@ const ptBR: DeepPartial<Catalog> = {
         particles: "Campo de Partículas",
         waves: "Ondas Geométricas",
         aurora: "Brilho de Aurora",
-        deepspace: "Espaço Profundo",
       },
     },
     launch: {

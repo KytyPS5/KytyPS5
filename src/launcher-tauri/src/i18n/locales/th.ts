@@ -72,7 +72,6 @@ const th: DeepPartial<Catalog> = {
         particles: "สนามอนุภาค",
         waves: "คลื่นเรขาคณิต",
         aurora: "แสงออโรรา",
-        deepspace: "ห้วงอวกาศลึก",
       },
     },
     launch: {

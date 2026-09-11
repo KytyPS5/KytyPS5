@@ -72,7 +72,6 @@ const pl: DeepPartial<Catalog> = {
         particles: "Pole Cząstek",
         waves: "Fale Geometryczne",
         aurora: "Blask Zorzy",
-        deepspace: "Głęboka Przestrzeń",
       },
     },
     launch: {

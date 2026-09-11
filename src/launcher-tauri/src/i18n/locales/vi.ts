@@ -72,7 +72,6 @@ const vi: DeepPartial<Catalog> = {
         particles: "Trường Hạt",
         waves: "Sóng Hình Học",
         aurora: "Ánh Cực Quang",
-        deepspace: "Không Gian Sâu Thẳm",
       },
     },
     launch: {

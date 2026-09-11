@@ -72,7 +72,6 @@ const ja: DeepPartial<Catalog> = {
         particles: "パーティクルフィールド",
         waves: "ジオメトリックウェーブ",
         aurora: "オーロラグロー",
-        deepspace: "ディープスペース",
       },
     },
     launch: {

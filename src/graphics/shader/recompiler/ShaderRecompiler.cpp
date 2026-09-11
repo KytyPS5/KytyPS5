@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <fmt/format.h>
@@ -562,7 +563,31 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		const auto unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-		if (!CFG::Structurize(cfg)) {
+		// Structurize can report success while still leaving a conditional branch without a
+		// merge block. The emitter then writes OpBranchConditional with no OpSelectionMerge in
+		// front of it, which is invalid SPIR-V ("Selection must be structured") -- and nothing
+		// catches it unless --shader-validation is on, so the module ships and the driver is
+		// free to do anything with it. Astro Bot's GI compute kernels all come out that way.
+		// Treat a missing merge as a structurize failure and take the dispatcher fallback,
+		// which handles unstructured control flow correctly.
+		const auto unmerged_selection = [](const CFG::Graph& graph) {
+			return std::ranges::any_of(graph.blocks, [](const CFG::BasicBlock& block) {
+				return block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+				       !block.terminator.loop_header &&
+				       block.terminator.merge_block == UINT32_MAX;
+			});
+		};
+		// Opt-in: taking the dispatcher for these costs roughly 65x frame time on Astro Bot
+		// (frame 1652 -> 25 over the same wall clock), because the fallback rewrites the whole
+		// program as a state machine. Off by default, so today's behaviour and speed are
+		// unchanged; KYTY_STRICT_STRUCTURED=1 trades the speed for valid SPIR-V. The real fix
+		// is to give CFG::Structurize the merge blocks it is failing to compute, after which
+		// this guard should never fire.
+		static const bool strict_structured = [] {
+			const char* v = std::getenv("KYTY_STRICT_STRUCTURED");
+			return v != nullptr && v[0] != '0';
+		}();
+		if (!CFG::Structurize(cfg) || (strict_structured && unmerged_selection(cfg))) {
 			dispatcher_fallback      = true;
 			dispatcher_reason        = cfg.unsupported_reason;
 			const auto failure_kind  = cfg.failure_kind;

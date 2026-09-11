@@ -17,7 +17,7 @@ static void AppendInstructionWords(std::vector<uint32_t>& section, const uint32_
 	}
 	const auto opcode     = words[0];
 	const auto word_count = static_cast<uint32_t>(words_num);
-	section.push_back((word_count << 16u) | opcode);
+	section.push_back((word_count << spv::WordCountShift) | opcode);
 	section.insert(section.end(), words + 1, words + words_num);
 }
 
@@ -36,15 +36,17 @@ void Builder::RequireVersion(uint32_t version) {
 	m_version = std::max(m_version, version);
 }
 
-void Builder::RequireCapability(uint32_t capability) {
+void Builder::RequireCapability(spv::Capability capability) {
 	if (m_required_capabilities.insert(capability).second) {
-		AddCapability({capability});
+		AppendInstruction(m_capabilities, spv::OpCapability, {capability});
 	}
 }
 
 void Builder::RequireExtension(const char* name) {
 	if (m_required_extensions.emplace(name).second) {
-		AddExtension(name);
+		std::vector<uint32_t> operands;
+		AppendString(operands, name);
+		AppendInstruction(m_extensions, spv::OpExtension, operands);
 	}
 }
 
@@ -54,15 +56,17 @@ uint32_t Builder::Import(const char* name) {
 	}
 	const auto id = AllocateId();
 	m_import_ids.emplace(name, id);
-	AddExtInstImport(id, name);
+	std::vector<uint32_t> operands = {id};
+	AppendString(operands, name);
+	AppendInstruction(m_ext_inst_imports, spv::OpExtInstImport, operands);
 	return id;
 }
 
-uint32_t Builder::Type(uint32_t opcode, std::initializer_list<uint32_t> operands) {
+uint32_t Builder::Type(spv::Op opcode, std::initializer_list<uint32_t> operands) {
 	return Type(opcode, std::vector<uint32_t>(operands));
 }
 
-uint32_t Builder::Type(uint32_t opcode, const std::vector<uint32_t>& operands) {
+uint32_t Builder::Type(spv::Op opcode, const std::vector<uint32_t>& operands) {
 	std::vector<uint32_t> key;
 	key.reserve(operands.size() + 2u);
 	key.push_back(opcode);
@@ -79,7 +83,7 @@ uint32_t Builder::Type(uint32_t opcode, const std::vector<uint32_t>& operands) {
 	return id;
 }
 
-uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t> operands,
+uint32_t Builder::DecoratedType(spv::Op opcode, std::initializer_list<uint32_t> operands,
                                 std::initializer_list<TypeAnnotation> annotations) {
 	if (annotations.size() == 0) {
 		return Type(opcode, operands);
@@ -108,12 +112,12 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
 	return id;
 }
 
-uint32_t Builder::Constant(uint32_t opcode, uint32_t type,
+uint32_t Builder::Constant(spv::Op opcode, uint32_t type,
                            std::initializer_list<uint32_t> operands) {
 	return Constant(opcode, type, std::vector<uint32_t>(operands));
 }
 
-uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands) {
+uint32_t Builder::Constant(spv::Op opcode, uint32_t type, const std::vector<uint32_t>& operands) {
 	std::vector<uint32_t> key;
 	key.reserve(operands.size() + 2u);
 	key.push_back(opcode);
@@ -130,14 +134,15 @@ uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const std::vector<uin
 	return id;
 }
 
-uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class) {
+uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class) {
 	const auto id = AllocateId();
 	DefineGlobalVariable(id, pointer_type, storage_class);
 	return id;
 }
 
-void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class) {
-	AddType({59u, pointer_type, id, storage_class});
+void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
+                                   spv::StorageClass storage_class) {
+	AppendInstruction(m_declarations, spv::OpVariable, {pointer_type, id, storage_class});
 }
 
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
@@ -156,49 +161,33 @@ void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
 	}
 }
 
-void Builder::AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+void Builder::AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
                                 const std::vector<uint32_t>& operands) {
 	const uint32_t word_count = static_cast<uint32_t>(operands.size() + 1u);
-	section.push_back((word_count << 16u) | opcode);
+	section.push_back((word_count << spv::WordCountShift) | opcode);
 	section.insert(section.end(), operands.begin(), operands.end());
 }
 
-void Builder::AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+void Builder::AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
                                 std::initializer_list<uint32_t> operands) {
 	const uint32_t word_count = static_cast<uint32_t>(operands.size() + 1u);
-	section.push_back((word_count << 16u) | opcode);
+	section.push_back((word_count << spv::WordCountShift) | opcode);
 	section.insert(section.end(), operands.begin(), operands.end());
-}
-
-void Builder::AddCapability(std::initializer_list<uint32_t> operands) {
-	AppendInstruction(m_capabilities, 17u, operands);
-}
-
-void Builder::AddExtension(const char* name) {
-	std::vector<uint32_t> operands;
-	AppendString(operands, name);
-	AppendInstruction(m_extensions, 10u, operands);
-}
-
-void Builder::AddExtInstImport(uint32_t id, const char* name) {
-	std::vector<uint32_t> operands = {id};
-	AppendString(operands, name);
-	AppendInstruction(m_ext_inst_imports, 11u, operands);
 }
 
 void Builder::AddMemoryModel(std::initializer_list<uint32_t> operands) {
-	AppendInstruction(m_memory_model, 14u, operands);
+	AppendInstruction(m_memory_model, spv::OpMemoryModel, operands);
 }
 
-void Builder::AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,
-                            const std::vector<uint32_t>& interfaces) {
+void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_point,
+                            const char* name, const std::vector<uint32_t>& interfaces) {
 	std::vector<uint32_t> operands = {execution_model, entry_point};
 	AppendString(operands, name);
 	operands.insert(operands.end(), interfaces.begin(), interfaces.end());
 	if (m_version >= 0x00010400u) {
 		for (size_t offset = 0; offset < m_declarations.size();) {
-			const auto count = m_declarations[offset] >> 16u;
-			if ((m_declarations[offset] & 0xffffu) == 59u) {
+			const auto count = m_declarations[offset] >> spv::WordCountShift;
+			if ((m_declarations[offset] & spv::OpCodeMask) == spv::OpVariable) {
 				const auto id = m_declarations[offset + 2u];
 				if (std::find(interfaces.begin(), interfaces.end(), id) == interfaces.end()) {
 					operands.push_back(id);
@@ -207,25 +196,21 @@ void Builder::AddEntryPoint(uint32_t execution_model, uint32_t entry_point, cons
 			offset += count;
 		}
 	}
-	AppendInstruction(m_entry_points, 15u, operands);
+	AppendInstruction(m_entry_points, spv::OpEntryPoint, operands);
 }
 
 void Builder::AddExecutionMode(std::initializer_list<uint32_t> operands) {
-	AppendInstruction(m_execution_modes, 16u, operands);
+	AppendInstruction(m_execution_modes, spv::OpExecutionMode, operands);
 }
 
 void Builder::AddName(uint32_t target, const char* name) {
 	std::vector<uint32_t> operands = {target};
 	AppendString(operands, name);
-	AppendInstruction(m_debug, 5u, operands);
+	AppendInstruction(m_debug, spv::OpName, operands);
 }
 
 void Builder::AddAnnotation(std::initializer_list<uint32_t> words) {
 	AppendInstructionWords(m_annotations, words.begin(), words.size());
-}
-
-void Builder::AddType(std::initializer_list<uint32_t> words) {
-	AppendInstructionWords(m_declarations, words.begin(), words.size());
 }
 
 void Builder::AddFunction(std::initializer_list<uint32_t> words) {
@@ -237,16 +222,18 @@ void Builder::AddFunction(const std::vector<uint32_t>& words) {
 }
 
 DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {
-	std::vector<uint32_t> words {245u, type, result};
+	std::vector<uint32_t> words {spv::OpPhi, type, result};
 	words.resize(words.size() + incoming_count * 2u);
-	const DeferredPhi phi {m_functions.size(), incoming_count};
+	const DeferredPhi phi {m_functions.size()};
 	AddFunction(words);
 	m_unpatched_phi_incomings += incoming_count;
 	return phi;
 }
 
 void Builder::PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent) {
-	EXIT_IF(incoming >= phi.incoming_count || value == 0 || parent == 0);
+	const auto incoming_count =
+	    ((m_functions.at(phi.word_offset) >> spv::WordCountShift) - 3u) / 2u;
+	EXIT_IF(incoming >= incoming_count || value == 0 || parent == 0);
 	const auto value_word  = phi.word_offset + 3u + incoming * 2u;
 	const auto parent_word = value_word + 1u;
 	EXIT_IF(m_functions.at(value_word) != 0 || m_functions.at(parent_word) != 0);
@@ -264,7 +251,7 @@ std::vector<uint32_t> Builder::Build() const {
 	               m_debug.size() + m_annotations.size() + m_declarations.size() +
 	               m_functions.size());
 
-	module.push_back(0x07230203u);
+	module.push_back(spv::MagicNumber);
 	module.push_back(m_version);
 	module.push_back(0u);
 	module.push_back(m_next_id);

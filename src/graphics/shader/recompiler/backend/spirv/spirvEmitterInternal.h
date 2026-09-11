@@ -17,297 +17,13 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
-
-enum : uint32_t {
-	ExecutionModelVertex                     = 0,
-	ExecutionModelFragment                   = 4,
-	ExecutionModelGLCompute                  = 5,
-	ExecutionModeOriginUpperLeft             = 7,
-	ExecutionModeEarlyFragmentTests          = 9,
-	ExecutionModeDepthReplacing              = 12,
-	ExecutionModeLocalSize                   = 17,
-	ExecutionModeSignedZeroInfNanPreserve    = 4461,
-	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
-	AddressingModelLogical                   = 0,
-	AddressingModelPhysicalStorageBuffer64   = 5348,
-	MemoryModelGLSL450                       = 1,
-	CapabilityShader                         = 1,
-	CapabilityInt64                          = 11,
-	CapabilityInt64Atomics                   = 12,
-	CapabilityImageGatherExtended            = 25,
-	CapabilityClipDistance                   = 32,
-	CapabilityCullDistance                   = 33,
-	CapabilitySampleRateShading              = 35,
-	CapabilitySampled1D                      = 43,
-	CapabilityImage1D                        = 44,
-	CapabilityImageQuery                     = 50,
-	CapabilityStorageImageWriteWithoutFormat = 56,
-	CapabilityGroupNonUniform                = 61,
-	CapabilityGroupNonUniformBallot          = 64,
-	CapabilityGroupNonUniformShuffle         = 65,
-	CapabilityShaderLayer                    = 69,
-	CapabilityShaderViewportIndex            = 70,
-	CapabilitySignedZeroInfNanPreserve       = 4466,
-	CapabilityFragmentBarycentricKHR         = 5284,
-	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
-	CapabilityPhysicalStorageBufferAddresses = 5347,
-	StorageClassUniformConstant              = 0,
-	StorageClassInput                        = 1,
-	StorageClassOutput                       = 3,
-	StorageClassWorkgroup                    = 4,
-	StorageClassPrivate                      = 6,
-	StorageClassFunction                     = 7,
-	StorageClassPushConstant                 = 9,
-	StorageClassImage                        = 11,
-	StorageClassStorageBuffer                = 12,
-	StorageClassPhysicalStorageBuffer        = 5349,
-	FunctionControlNone                      = 0,
-	SelectionControlNone                     = 0,
-	LoopControlNone                          = 0,
-};
-
-enum : uint32_t {
-	DecorationBlock         = 2,
-	DecorationBuiltIn       = 11,
-	DecorationNoPerspective = 13,
-	DecorationFlat          = 14,
-	DecorationAliased       = 20,
-	DecorationLocation      = 30,
-	DecorationArrayStride   = 6,
-	DecorationBinding       = 33,
-	DecorationDescriptorSet = 34,
-	DecorationOffset        = 35,
-	DecorationPerVertexKHR  = 5285,
-};
-
-enum : uint32_t {
-	BuiltInPosition                  = 0,
-	BuiltInPointSize                 = 1,
-	BuiltInClipDistance              = 3,
-	BuiltInCullDistance              = 4,
-	BuiltInLayer                     = 9,
-	BuiltInViewportIndex              = 10,
-	BuiltInFragCoord                 = 15,
-	BuiltInFrontFacing               = 17,
-	BuiltInSampleId                  = 18,
-	BuiltInSampleMask                = 20,
-	BuiltInFragDepth                 = 22,
-	BuiltInWorkgroupId               = 26,
-	BuiltInLocalInvocationId         = 27,
-	BuiltInGlobalInvocationId        = 28,
-	BuiltInLocalInvocationIndex      = 29,
-	BuiltInSubgroupLocalInvocationId = 41,
-	BuiltInVertexIndex               = 42,
-	BuiltInInstanceIndex             = 43,
-	BuiltInBaryCoordKHR              = 5286,
-	BuiltInBaryCoordNoPerspKHR       = 5287,
-};
-
-enum : uint32_t {
-	Dim1D              = 0,
-	Dim3D              = 2,
-	Dim2D              = 1,
-	ImageFormatUnknown = 0,
-	ImageFormatRgba32f = 1,
-	ImageFormatR32ui   = 33,
-};
-
-enum : uint32_t {
-	ImageOperandsBiasMask         = 0x00000001u,
-	ImageOperandsLodMask          = 0x00000002u,
-	ImageOperandsGradMask         = 0x00000004u,
-	ImageOperandsOffsetMask       = 0x00000010u,
-	ImageOperandsConstOffsetsMask = 0x00000020u,
-	ImageOperandsSampleMask       = 0x00000040u,
-};
-
-enum : uint32_t {
-	ScopeDevice                    = 1,
-	ScopeWorkgroup                 = 2,
-	ScopeSubgroup                  = 3,
-	MemorySemanticsNone            = 0,
-	MemorySemanticsAcquireRelease  = 0x00000008u,
-	MemorySemanticsUniformMemory   = 0x00000040u,
-	MemorySemanticsWorkgroupMemory = 0x00000100u,
-	MemorySemanticsImageMemory     = 0x00000800u,
-};
-
-enum : uint32_t {
-	OpExtInst                      = 12,
-	OpTypeVoid                     = 19,
-	OpTypeBool                     = 20,
-	OpTypeInt                      = 21,
-	OpTypeFloat                    = 22,
-	OpTypeVector                   = 23,
-	OpTypeImage                    = 25,
-	OpTypeSampler                  = 26,
-	OpTypeSampledImage             = 27,
-	OpTypeArray                    = 28,
-	OpTypeRuntimeArray             = 29,
-	OpTypeStruct                   = 30,
-	OpTypePointer                  = 32,
-	OpTypeFunction                 = 33,
-	OpConstantTrue                 = 41,
-	OpConstantFalse                = 42,
-	OpConstant                     = 43,
-	OpConstantComposite            = 44,
-	OpUndef                        = 1,
-	OpFunction                     = 54,
-	OpFunctionParameter            = 55,
-	OpFunctionEnd                  = 56,
-	OpFunctionCall                 = 57,
-	OpVariable                     = 59,
-	OpImageTexelPointer            = 60,
-	OpLoad                         = 61,
-	OpStore                        = 62,
-	OpAccessChain                  = 65,
-	OpArrayLength                  = 68,
-	OpDecorate                     = 71,
-	OpMemberDecorate               = 72,
-	OpVectorShuffle                = 79,
-	OpCompositeConstruct           = 80,
-	OpCompositeExtract             = 81,
-	OpCopyObject                   = 83,
-	OpSampledImage                 = 86,
-	OpImageSampleImplicitLod       = 87,
-	OpImageSampleExplicitLod       = 88,
-	OpImageSampleDrefImplicitLod   = 89,
-	OpImageSampleDrefExplicitLod   = 90,
-	OpImageFetch                   = 95,
-	OpImageGather                  = 96,
-	OpImageDrefGather              = 97,
-	OpImageWrite                   = 99,
-	OpImageQuerySizeLod            = 103,
-	OpImageQueryLod                = 105,
-	OpImageQuerySize               = 104,
-	OpImageQueryLevels             = 106,
-	OpConvertFToU                  = 109,
-	OpConvertFToS                  = 110,
-	OpConvertSToF                  = 111,
-	OpConvertUToF                  = 112,
-	OpUConvert                     = 113,
-	OpConvertUToPtr                = 120,
-	OpBitcast                      = 124,
-	OpSNegate                      = 126,
-	OpFNegate                      = 127,
-	OpIAdd                         = 128,
-	OpFAdd                         = 129,
-	OpISub                         = 130,
-	OpFSub                         = 131,
-	OpIMul                         = 132,
-	OpFMul                         = 133,
-	OpUDiv                         = 134,
-	OpUMod                         = 137,
-	OpFDiv                         = 136,
-	OpIAddCarry                    = 149,
-	OpUMulExtended                 = 151,
-	OpSMulExtended                 = 152,
-	OpAny                          = 154,
-	OpAll                          = 155,
-	OpLogicalNotEqual              = 165,
-	OpLogicalOr                    = 166,
-	OpLogicalAnd                   = 167,
-	OpLogicalNot                   = 168,
-	OpSelect                       = 169,
-	OpIEqual                       = 170,
-	OpINotEqual                    = 171,
-	OpUGreaterThan                 = 172,
-	OpSGreaterThan                 = 173,
-	OpUGreaterThanEqual            = 174,
-	OpSGreaterThanEqual            = 175,
-	OpULessThan                    = 176,
-	OpSLessThan                    = 177,
-	OpULessThanEqual               = 178,
-	OpSLessThanEqual               = 179,
-	OpFOrdEqual                    = 180,
-	OpFUnordEqual                  = 181,
-	OpFOrdNotEqual                 = 182,
-	OpFUnordNotEqual               = 183,
-	OpFOrdLessThan                 = 184,
-	OpFUnordLessThan               = 185,
-	OpFOrdGreaterThan              = 186,
-	OpFUnordGreaterThan            = 187,
-	OpFOrdLessThanEqual            = 188,
-	OpFUnordLessThanEqual          = 189,
-	OpFOrdGreaterThanEqual         = 190,
-	OpFUnordGreaterThanEqual       = 191,
-	OpShiftRightLogical            = 194,
-	OpShiftRightArithmetic         = 195,
-	OpShiftLeftLogical             = 196,
-	OpBitwiseOr                    = 197,
-	OpBitwiseXor                   = 198,
-	OpBitwiseAnd                   = 199,
-	OpNot                          = 200,
-	OpBitFieldInsert               = 201,
-	OpBitFieldSExtract             = 202,
-	OpBitFieldUExtract             = 203,
-	OpBitReverse                   = 204,
-	OpBitCount                     = 205,
-	OpControlBarrier               = 224,
-	OpMemoryBarrier                = 225,
-	OpAtomicLoad                   = 227,
-	OpAtomicExchange               = 229,
-	OpAtomicCompareExchange        = 230,
-	OpAtomicIAdd                   = 234,
-	OpAtomicISub                   = 235,
-	OpAtomicSMin                   = 236,
-	OpAtomicUMin                   = 237,
-	OpAtomicSMax                   = 238,
-	OpAtomicUMax                   = 239,
-	OpAtomicAnd                    = 240,
-	OpAtomicOr                     = 241,
-	OpAtomicXor                    = 242,
-	OpPhi                          = 245,
-	OpLoopMerge                    = 246,
-	OpSelectionMerge               = 247,
-	OpLabel                        = 248,
-	OpBranch                       = 249,
-	OpBranchConditional            = 250,
-	OpSwitch                       = 251,
-	OpKill                         = 252,
-	OpReturn                       = 253,
-	OpReturnValue                  = 254,
-	OpGroupNonUniformBallot        = 339,
-	OpGroupNonUniformBallotFindLSB = 343,
-	OpGroupNonUniformShuffle       = 345,
-};
-
-enum : uint32_t {
-	MemoryAccessAlignedMask = 0x2,
-};
-
-enum : uint32_t {
-	GlslRoundEven       = 2,
-	GlslTrunc           = 3,
-	GlslFAbs            = 4,
-	GlslFloor           = 8,
-	GlslCeil            = 9,
-	GlslFract           = 10,
-	GlslSin             = 13,
-	GlslCos             = 14,
-	GlslExp2            = 29,
-	GlslLog2            = 30,
-	GlslSqrt            = 31,
-	GlslInverseSqrt     = 32,
-	GlslFMin            = 37,
-	GlslFMax            = 40,
-	GlslFClamp          = 43,
-	GlslLdexp           = 53,
-	GlslFma             = 50,
-	GlslPackSnorm2x16   = 56,
-	GlslPackUnorm2x16   = 57,
-	GlslPackHalf2x16    = 58,
-	GlslUnpackUnorm2x16 = 61,
-	GlslUnpackHalf2x16  = 62,
-	GlslFindILsb        = 73,
-	GlslFindUMsb        = 75,
-};
 
 struct InputBinding {
 	IR::StageInputKind kind            = IR::StageInputKind::VertexIndex;
@@ -339,27 +55,41 @@ struct ImageDimensionInfo {
 };
 
 constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
-    {ImageDimension::Dim1D, Dim1D, 1, 1, 0, 0},
-    {ImageDimension::Dim1DArray, Dim1D, 2, 1, 1, 0},
-    {ImageDimension::Dim2D, Dim2D, 2, 2, 0, 0},
-    {ImageDimension::Dim2DArray, Dim2D, 3, 2, 1, 0},
-    {ImageDimension::Dim3D, Dim3D, 3, 3, 0, 0},
-    {ImageDimension::Dim2DMsaa, Dim2D, 2, 2, 0, 1},
-    {ImageDimension::Dim2DMsaaArray, Dim2D, 3, 2, 1, 1},
+    {ImageDimension::Dim1D, spv::Dim1D, 1, 1, 0, 0},
+    {ImageDimension::Dim1DArray, spv::Dim1D, 2, 1, 1, 0},
+    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0},
+    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0},
+    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0},
+    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1},
+    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1},
 }};
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+struct SpirvRequirements {
+	bool subgroup_ballot              = false;
+	bool subgroup_shuffle             = false;
+	bool subgroup_local_invocation_id = false;
+	bool compute_derivatives          = false;
+	bool image_gather_extended        = false;
+	bool function_lds                 = false;
+	bool function_scratch             = false;
+	bool pixel_valid_mask             = false;
+	bool buffer_int64_atomics         = false;
+};
+
+SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_), requirements(*program_.spirv_requirements) {}
+	      program(program_), input_info(input_info_),
+	      requirements(AnalyzeProgramRequirements(program_)) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
-	const IR::SpirvRequirements&                     requirements;
-	ShaderType                                       stage                   = ShaderType::Unknown;
+	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
@@ -409,7 +139,6 @@ uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
-uint32_t TypeDeviceAddress(EmitterState& state);
 uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
@@ -420,21 +149,20 @@ uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
-uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t pointee);
+uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferPointer(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state);
 uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
 uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
-uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
-uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
-uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
+uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
+uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
-	state.builder.AddFunction({OpLabel, label});
+	state.builder.AddFunction({spv::OpLabel, label});
 }
 
 inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
@@ -453,7 +181,7 @@ inline uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint
 inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition,
                             uint32_t true_value, uint32_t false_value) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelect, type, result, condition, true_value, false_value});
+	state.builder.AddFunction({spv::OpSelect, type, result, condition, true_value, false_value});
 	return result;
 }
 
@@ -528,7 +256,6 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
                                          uint32_t components);
 
-bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
 
 void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program);
 
@@ -570,7 +297,7 @@ uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
 
-uint32_t ExecutionModelForStage(ShaderType stage);
+spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -780,11 +507,11 @@ template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
-	state.builder.AddFunction({OpBranchConditional, condition, then_label, merge_label});
+	state.builder.AddFunction({spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone});
+	state.builder.AddFunction({spv::OpBranchConditional, condition, then_label, merge_label});
 	EmitLabel(state, then_label);
 	fn();
-	state.builder.AddFunction({OpBranch, merge_label});
+	state.builder.AddFunction({spv::OpBranch, merge_label});
 	EmitLabel(state, merge_label);
 }
 
@@ -795,19 +522,19 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
-	state.builder.AddFunction({OpBranchConditional, condition, then_label, else_label});
+	state.builder.AddFunction({spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone});
+	state.builder.AddFunction({spv::OpBranchConditional, condition, then_label, else_label});
 	EmitLabel(state, then_label);
 	const auto then_value = fn();
-	state.builder.AddFunction({OpBranch, then_exit});
+	state.builder.AddFunction({spv::OpBranch, then_exit});
 	EmitLabel(state, then_exit);
-	state.builder.AddFunction({OpBranch, merge_label});
+	state.builder.AddFunction({spv::OpBranch, merge_label});
 	EmitLabel(state, else_label);
-	state.builder.AddFunction({OpBranch, merge_label});
+	state.builder.AddFunction({spv::OpBranch, merge_label});
 	EmitLabel(state, merge_label);
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpPhi, type, value, then_value, then_exit, default_value, else_label});
+	    {spv::OpPhi, type, value, then_value, then_exit, default_value, else_label});
 	return value;
 }
 
@@ -819,12 +546,12 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
-	const auto scope = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
-			case IR::ResourceKind::Lds: return MemorySemanticsWorkgroupMemory;
-			case IR::ResourceKind::Image: return MemorySemanticsImageMemory;
-			default: return MemorySemanticsUniformMemory;
+			case IR::ResourceKind::Lds: return spv::MemorySemanticsWorkgroupMemoryMask;
+			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
+			default: return spv::MemorySemanticsUniformMemoryMask;
 		}
 	}();
 	const auto preheader = state.builder.AllocateId();
@@ -834,27 +561,30 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto initial   = state.builder.AllocateId();
 	const auto observed  = state.builder.AllocateId();
 	const auto exchanged = state.builder.AllocateId();
-	state.builder.AddFunction({OpBranch, preheader});
+	state.builder.AddFunction({spv::OpBranch, preheader});
 	EmitLabel(state, preheader);
-	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
-	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
-	state.builder.AddFunction({OpBranch, header});
+	state.builder.AddFunction({spv::OpAtomicLoad, TypeU32(state), initial, pointer,
+	                           ConstantU32(state, scope),
+	                           ConstantU32(state, spv::MemorySemanticsMaskNone)});
+	state.builder.AddFunction({spv::OpBranch, header});
 	EmitLabel(state, header);
 	state.builder.AddFunction(
-	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
+	    {spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
 	const auto next = desired(observed);
-	state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
-	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
-	                           ConstantU32(state, MemorySemanticsNone), next, observed});
+	state.builder.AddFunction({spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+	                           ConstantU32(state, scope),
+	                           ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                           ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed});
 	const auto success = state.builder.AllocateId();
-	state.builder.AddFunction({OpIEqual, TypeBool(state), success, exchanged, observed});
-	state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
-	state.builder.AddFunction({OpBranchConditional, success, merge, cont});
+	state.builder.AddFunction({spv::OpIEqual, TypeBool(state), success, exchanged, observed});
+	state.builder.AddFunction({spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone});
+	state.builder.AddFunction({spv::OpBranchConditional, success, merge, cont});
 	EmitLabel(state, cont);
-	state.builder.AddFunction({OpBranch, header});
+	state.builder.AddFunction({spv::OpBranch, header});
 	EmitLabel(state, merge);
-	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
-	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
+	state.builder.AddFunction(
+	    {spv::OpMemoryBarrier, ConstantU32(state, scope),
+	     ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory)});
 	return observed;
 }
 

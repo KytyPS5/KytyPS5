@@ -338,13 +338,12 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
-		options.scratch_dwords = input_info.scratch_size_dwords;
+
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
 			if (stage == ShaderType::Mesh) {
 				options.user_data_base = 0;
 				options.wave_size      = input_info.mesh.wave_size;
-				options.scratch_dwords = input_info.mesh.scratch_size_dwords;
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;

@@ -6,19 +6,19 @@
 #include <initializer_list>
 #include <map>
 #include <set>
+#include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 struct TypeAnnotation {
-	uint32_t              opcode = 0;
+	spv::Op               opcode = spv::OpNop;
 	std::vector<uint32_t> operands;
 };
 
 struct DeferredPhi {
 	size_t word_offset    = 0;
-	size_t incoming_count = 0;
 };
 
 class Builder {
@@ -29,22 +29,21 @@ public:
 
 	uint32_t AllocateId();
 	void     RequireVersion(uint32_t version);
-	void     RequireCapability(uint32_t capability);
+	void     RequireCapability(spv::Capability capability);
 	void     RequireExtension(const char* name);
 	uint32_t Import(const char* name);
-	uint32_t Type(uint32_t opcode, std::initializer_list<uint32_t> operands = {});
-	uint32_t Type(uint32_t opcode, const std::vector<uint32_t>& operands);
-	uint32_t DecoratedType(uint32_t opcode, std::initializer_list<uint32_t> operands,
+	uint32_t Type(spv::Op opcode, std::initializer_list<uint32_t> operands = {});
+	uint32_t Type(spv::Op opcode, const std::vector<uint32_t>& operands);
+	uint32_t DecoratedType(spv::Op opcode, std::initializer_list<uint32_t> operands,
 	                       std::initializer_list<TypeAnnotation> annotations);
-	uint32_t Constant(uint32_t opcode, uint32_t type,
-	                  std::initializer_list<uint32_t> operands = {});
-	uint32_t Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands);
-	uint32_t DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class);
-	void     DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class);
+	uint32_t Constant(spv::Op opcode, uint32_t type, std::initializer_list<uint32_t> operands = {});
+	uint32_t Constant(spv::Op opcode, uint32_t type, const std::vector<uint32_t>& operands);
+	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
+	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, spv::StorageClass storage_class);
 
 	void        AddMemoryModel(std::initializer_list<uint32_t> operands);
-	void        AddEntryPoint(uint32_t execution_model, uint32_t entry_point, const char* name,
-	                          const std::vector<uint32_t>& interfaces);
+	void AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_point, const char* name,
+	                   const std::vector<uint32_t>& interfaces);
 	void        AddExecutionMode(std::initializer_list<uint32_t> operands);
 	void        AddName(uint32_t target, const char* name);
 	void        AddAnnotation(std::initializer_list<uint32_t> words);
@@ -56,15 +55,11 @@ public:
 	[[nodiscard]] std::vector<uint32_t> Build() const;
 
 private:
-	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+	static void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
 	                              const std::vector<uint32_t>& operands);
-	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
+	static void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
 	                              std::initializer_list<uint32_t> operands);
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
-	void        AddCapability(std::initializer_list<uint32_t> operands);
-	void        AddExtension(const char* name);
-	void        AddExtInstImport(uint32_t id, const char* name);
-	void        AddType(std::initializer_list<uint32_t> words);
 
 	uint32_t                                  m_next_id = 1;
 	uint32_t                                  m_version = 0;
@@ -78,7 +73,7 @@ private:
 	std::vector<uint32_t>                     m_annotations;
 	std::vector<uint32_t>                     m_declarations;
 	std::vector<uint32_t>                     m_functions;
-	std::set<uint32_t>                        m_required_capabilities;
+	std::set<spv::Capability>                 m_required_capabilities;
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;

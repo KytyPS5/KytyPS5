@@ -434,18 +434,6 @@ struct ShaderInfo {
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
-struct SpirvRequirements {
-	bool subgroup_ballot              = false;
-	bool subgroup_shuffle             = false;
-	bool subgroup_local_invocation_id = false;
-	bool compute_derivatives          = false;
-	bool image_gather_extended        = false;
-	bool function_lds                 = false;
-	bool function_scratch             = false;
-	bool pixel_valid_mask             = false;
-	bool buffer_int64_atomics         = false;
-};
-
 struct BlockInfo {
 	uint32_t        id       = 0;
 	uint32_t        start_pc = 0;
@@ -561,7 +549,6 @@ struct Program: ResourcePlan {
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
 
-	std::optional<SpirvRequirements> spirv_requirements;
 };
 
 std::string ProgramToString(const Program& program);

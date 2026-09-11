@@ -160,7 +160,7 @@ void AppendPacket(std::vector<uint32_t>& buffer, Rng& rng) {
 
 void FuzzTheWalker() {
 	auto& renderer = *static_cast<RenderContext*>(AllocateInaccessiblePage());
-	CommandProcessor cp(renderer);
+	CommandProcessor cp(renderer, 0);
 
 	constexpr uint32_t ITERATIONS = 20000;
 	uint64_t           packets    = 0;
@@ -179,8 +179,7 @@ void FuzzTheWalker() {
 		Check(!buffer.empty(), "the generated buffer is not empty");
 
 		Pm4Execution execution;
-		const auto   result =
-		    cp.Process(execution, buffer.data(), static_cast<uint32_t>(buffer.size()));
+		const auto   result = cp.Process(execution, buffer);
 
 		// Every opcode generated here consumes its packet and returns, so the
 		// walker must reach the end of the buffer rather than suspend on a wait.
@@ -198,13 +197,11 @@ void FuzzTheWalker() {
 		AppendPacket(buffer, rng);
 	}
 	Pm4Execution first;
-	Check(cp.Process(first, buffer.data(), static_cast<uint32_t>(buffer.size())) ==
-	          Pm4ProcessResult::Complete,
+	Check(cp.Process(first, buffer) == Pm4ProcessResult::Complete,
 	      "the dirtying buffer is consumed");
 	cp.Reset();
 	Pm4Execution second;
-	Check(cp.Process(second, buffer.data(), static_cast<uint32_t>(buffer.size())) ==
-	          Pm4ProcessResult::Complete,
+	Check(cp.Process(second, buffer) == Pm4ProcessResult::Complete,
 	      "the same buffer is consumed identically after a reset");
 
 	std::printf("Pm4FuzzTests: walker: %u buffers, %llu packets\n", ITERATIONS,
@@ -266,6 +263,38 @@ ChildResult RunIsolated(F&& body) {
 	return survived ? ChildResult::Survived : ChildResult::Died;
 }
 
+// Some registers have a field the emulator deliberately does not implement and
+// guards with EXIT_NOT_IMPLEMENTED rather than silently ignoring (correct: a
+// silently-dropped render-control bit is a worse failure than a loud one). A
+// fully random payload sets a single-bit field like that on most rounds, so
+// the fuzzer needs to keep it out of the generated payload, the same way
+// FIXED_PACKETS' payload_mask keeps IT_CLEAR_STATE inside its handler's
+// accepted range. Keyed by (opcode, offset); returns all-bits-set (no
+// masking) for every register not listed here.
+uint32_t RegisterPayloadMask(uint32_t opcode, uint32_t offset) {
+	if (opcode == Pm4::IT_SET_CONTEXT_REG && offset == Pm4::DB_RENDER_CONTROL) {
+		// DB_RENDER_CONTROL_COPY_DEPTH_TO_COLOR (bit 2) and
+		// DB_RENDER_CONTROL_COPY_STENCIL_TO_COLOR (bit 3): neither copy-to-color
+		// path is implemented, and DecodeRenderControl EXITs if either is set.
+		return ~((1u << 2) | (1u << 3));
+	}
+	if (opcode == Pm4::IT_SET_SH_REG) {
+		// HwShIgnoreUserAccumulator (all four SPI/COMPUTE *_USER_ACCUM_0 blocks,
+		// 4 registers each) EXITs if a word carries any bit outside the low 7 -
+		// real hardware's per-register accumulator field is that narrow, this
+		// isn't an unimplemented-path guard, it's the field width. A random
+		// word almost always sets a higher bit, so every one of these 16
+		// registers needs the same mask, not just the one this fuzz run
+		// happened to name.
+		constexpr uint32_t base[] = {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
+		                             Pm4::SPI_SHADER_USER_ACCUM_LSHS_0, Pm4::COMPUTE_USER_ACCUM_0};
+		for (auto b: base) {
+			if (offset >= b && offset < b + 4) return 0x7Fu;
+		}
+	}
+	return 0xFFFFFFFFu;
+}
+
 template <class Table>
 void FuzzRegisterTable(const Table& table, uint32_t opcode, const char* what) {
 	constexpr uint32_t PAYLOAD_DW = 8;
@@ -284,7 +313,7 @@ void FuzzRegisterTable(const Table& table, uint32_t opcode, const char* what) {
 		auto& renderer = *static_cast<RenderContext*>(AllocateInaccessiblePage());
 
 		const auto probe = RunIsolated([&] {
-			CommandProcessor cp(renderer);
+			CommandProcessor cp(renderer, 0);
 			cp.Reset();
 			const uint32_t zeros[PAYLOAD_DW] = {};
 			table[offset](cp, cmd_id, offset, zeros, PAYLOAD_DW);
@@ -296,14 +325,15 @@ void FuzzRegisterTable(const Table& table, uint32_t opcode, const char* what) {
 			continue;
 		}
 
-		const auto fuzz = RunIsolated([&] {
-			CommandProcessor cp(renderer);
+		const auto payload_mask = RegisterPayloadMask(opcode, offset);
+		const auto fuzz         = RunIsolated([&] {
+			CommandProcessor cp(renderer, 0);
 			Rng              rng(0x5EEDu + opcode * 131u + offset);
 			for (uint32_t round = 0; round < ROUNDS; round++) {
 				cp.Reset();
 				uint32_t payload[PAYLOAD_DW];
 				for (auto& word: payload) {
-					word = rng.Word();
+					word = rng.Word() & payload_mask;
 				}
 				const auto consumed = table[offset](cp, cmd_id, offset, payload, PAYLOAD_DW);
 

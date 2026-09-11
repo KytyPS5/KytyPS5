@@ -568,6 +568,9 @@ const IR::Inst* ValueEmitContext::ImageAddress(IR::Value value) {
 }
 
 const IR::MemoryInfo& ValueEmitContext::Memory(const IR::Inst& inst) const {
+	if (&inst == memory_override_inst) {
+		return *memory_override;
+	}
 	return state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
 }
 

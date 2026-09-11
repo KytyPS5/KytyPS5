@@ -399,7 +399,9 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 }
 
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	EXIT_IF(new_width == 0 || new_height == 0);
+	// SDL may report a zero client area while minimizing. Preserve the last
+	// usable size; presentation waits for the surface to become drawable again.
+	if (new_width == 0 || new_height == 0) return;
 	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;

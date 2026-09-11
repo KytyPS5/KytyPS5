@@ -190,13 +190,15 @@ struct ImageViewInfo {
 	uint32_t             layer_count = 1;
 	vk::ComponentMapping mapping     = {};
 	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
+	float                min_lod     = 0.0f;
 
 	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
 		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
 		       base_level == rhs.base_level && level_count == rhs.level_count &&
 		       base_layer == rhs.base_layer && layer_count == rhs.layer_count &&
 		       mapping.r == rhs.mapping.r && mapping.g == rhs.mapping.g &&
-		       mapping.b == rhs.mapping.b && mapping.a == rhs.mapping.a && usage == rhs.usage;
+		       mapping.b == rhs.mapping.b && mapping.a == rhs.mapping.a && usage == rhs.usage &&
+		       min_lod == rhs.min_lod;
 	}
 };
 

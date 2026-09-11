@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
+#include <functional>
 #include <map>
 #include <new>
 #include <unordered_map>
@@ -182,6 +183,91 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 		}
 	}
 	return invariant;
+}
+
+// Structured early exits can merge an uninitialized descriptor with a loaded one.
+// Keep only incoming edges that can actually reach this resource instruction.
+static bool PhiEdgeReaches(const Program& program, const Block* owner, const Block* predecessor,
+                           uint32_t pc) {
+	std::unordered_map<const Inst*, Value> incoming;
+	for (const auto& inst: *owner) {
+		if (inst.GetOpcode() != ValueOpcode::Phi) continue;
+		for (size_t i = 0; i < inst.NumArgs(); ++i) {
+			if (inst.PhiBlock(i) == predecessor) incoming.emplace(&inst, inst.Arg(i));
+		}
+	}
+	std::function<std::optional<bool>(Value, uint32_t)> Boolean =
+	    [&](Value value, uint32_t depth) -> std::optional<bool> {
+		value = value.Resolve();
+		if (value.IsImmediate() && value.GetType() == Type::U1) return value.U1();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth >= 64) return {};
+		if (const auto it = incoming.find(inst); it != incoming.end())
+			return Boolean(it->second, depth + 1);
+		const auto op = inst->GetOpcode();
+		if (op != ValueOpcode::LogicalNot && op != ValueOpcode::LogicalAnd &&
+		    op != ValueOpcode::LogicalOr && op != ValueOpcode::SelectU1)
+			return {};
+		const auto left = Boolean(inst->Arg(0), depth + 1);
+		if (op == ValueOpcode::LogicalNot) return left ? std::optional<bool>(!*left) : std::nullopt;
+		if (op == ValueOpcode::SelectU1)
+			return left ? Boolean(inst->Arg(*left ? 1 : 2), depth + 1) : std::nullopt;
+		const auto right = Boolean(inst->Arg(1), depth + 1);
+		if (op == ValueOpcode::LogicalAnd) {
+			if (left == false || right == false) return false;
+			if (left && right) return *left && *right;
+		} else {
+			if (left == true || right == true) return true;
+			if (left && right) return *left || *right;
+		}
+		return {};
+	};
+	const auto owner_index =
+	    std::distance(program.blocks.begin(), std::ranges::find(program.blocks, owner));
+	std::vector<uint32_t> pending {program.block_info[owner_index].id};
+	std::vector<uint32_t> visited;
+	while (!pending.empty()) {
+		const auto id = pending.back();
+		pending.pop_back();
+		if (std::ranges::find(visited, id) != visited.end()) continue;
+		visited.push_back(id);
+		const auto block = std::ranges::find(program.block_info, id, &BlockInfo::id);
+		if (block == program.block_info.end()) return true;
+		if (pc >= block->start_pc && pc < block->end_pc) return true;
+		const auto& term = block->terminator;
+		if (term.kind == CFG::TerminatorKind::Return) continue;
+		if (term.kind != CFG::TerminatorKind::Branch &&
+		    term.kind != CFG::TerminatorKind::ConditionalBranch)
+			return true;
+		const auto condition = term.kind == CFG::TerminatorKind::ConditionalBranch
+		                           ? Boolean(block->condition, 0)
+		                           : std::optional<bool>(true);
+		if (condition != false) pending.push_back(term.true_block);
+		if (condition != true) pending.push_back(term.false_block);
+		// A new iteration could select different incoming PHI values.
+		if (std::ranges::find(pending, program.block_info[owner_index].id) != pending.end())
+			return true;
+	}
+	return false;
+}
+
+Value ResolveResourcePhi(const Program& program, Value value, uint32_t pc, uint32_t depth) {
+	value           = value.Resolve();
+	const auto* phi = value.TryInstruction();
+	if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || depth >= 64) return value;
+	const auto* owner = phi->Parent();
+	if (owner == nullptr || std::ranges::find(program.blocks, owner) == program.blocks.end())
+		return value;
+	Value result;
+	for (size_t i = 0; i < phi->NumArgs(); ++i) {
+		if (!PhiEdgeReaches(program, owner, phi->PhiBlock(i), pc)) continue;
+		const auto candidate = phi->Arg(i).Resolve();
+		if (result.IsEmpty())
+			result = candidate;
+		else if (!EquivalentValue(program, result, candidate))
+			return value;
+	}
+	return result.IsEmpty() ? value : ResolveResourcePhi(program, result, pc, depth + 1);
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
@@ -683,6 +769,7 @@ std::string ProgramToString(const Program& program) {
 					text += value_string(inst.Arg(index));
 				}
 			}
+
 			text +=
 			    fmt::format(" ({}; uses={})\n", TypeName(Value(const_cast<Inst*>(&inst)).GetType()),
 			                inst.UseCount());

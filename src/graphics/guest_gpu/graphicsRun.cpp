@@ -164,8 +164,16 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	Submission   submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
-	submission.commands          = draw_commands;
-	submission.constant_commands = constant_commands;
+	submission.owned_commands    = std::make_unique<uint32_t[]>(draw_commands.size());
+	std::memcpy(submission.owned_commands.get(), draw_commands.data(), draw_commands.size_bytes());
+	submission.commands = {submission.owned_commands.get(), draw_commands.size()};
+	if (!constant_commands.empty()) {
+		submission.owned_constant_commands = std::make_unique<uint32_t[]>(constant_commands.size());
+		std::memcpy(submission.owned_constant_commands.get(), constant_commands.data(),
+		            constant_commands.size_bytes());
+		submission.constant_commands = {submission.owned_constant_commands.get(),
+		                                constant_commands.size()};
+	}
 	submission.reset_processor   = m_graphics_done;
 	m_graphics_done              = false;
 	Enqueue(std::move(submission));
@@ -181,7 +189,13 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
-	submission.commands = commands;
+	// The submitted ACB packets belong to the queue until they have been consumed.
+	// Retaining the caller's temporary packet span lets later submissions overwrite
+	// registers and commands while this queue is waiting. Indirect-buffer addresses
+	// inside these packets still refer to guest memory and are resolved at execution.
+	submission.owned_commands = std::make_unique<uint32_t[]>(commands.size());
+	std::memcpy(submission.owned_commands.get(), commands.data(), commands.size_bytes());
+	submission.commands = {submission.owned_commands.get(), commands.size()};
 	Enqueue(std::move(submission));
 }
 
@@ -677,12 +691,21 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	                                        : Pm4ProcessResult::Blocked;
 }
 
-void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands) {
+void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
+	auto& execution = *g_current_execution;
+	if (chain) {
+		// A chain replaces the rest of the calling stream. Keep its current packet
+		// until it has completed so suspended children retain normal resume bookkeeping.
+		auto& caller = execution.m_buffer_stack.back();
+		EXIT_IF(caller.offset_dw >= caller.commands.size());
+		const auto packet_words = KYTY_PM4_LEN(caller.commands[caller.offset_dw]);
+		EXIT_IF(packet_words > caller.commands.size() - caller.offset_dw);
+		caller.commands = caller.commands.first(caller.offset_dw + packet_words);
+	}
 	if (commands.empty()) {
 		return;
 	}
-	auto&      execution  = *g_current_execution;
 	const auto stop_depth = execution.m_buffer_stack.size();
 	execution.m_buffer_stack.push_back({commands});
 	ProcessPm4(execution, stop_depth);
@@ -720,7 +743,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
-		if (packet_header == 0x80000000u) {
+		// AGC also encodes a header-only NOP with the type-3 count field set to -1.
+		if (packet_header == 0x80000000u ||
+		    packet_header == KYTY_PM4(1, Pm4::IT_NOP, Pm4::R_ZERO)) {
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
@@ -1058,6 +1083,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	// COMPUTE_SHADER_EN gates execution, including any resource preparation.
+	if ((mode & 1u) == 0u) {
+		return;
+	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1129,18 +1158,28 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
+	EXIT_NOT_IMPLEMENTED((mode & 1u) != 0u && m_dispatch_indirect_args_base_addr == 0);
+	DispatchIndirectAddress(m_dispatch_indirect_args_base_addr + data_offset, mode);
+}
+
+void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode) {
+	if ((mode & 1u) == 0u) {
+		return;
+	}
 	struct DispatchIndirectArgs {
 		uint32_t thread_group_x;
 		uint32_t thread_group_y;
 		uint32_t thread_group_z;
 	};
 
-	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
-
-	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
-
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+	// Snapshot all dimensions after making GPU writes visible. A host pointer read
+	// only faults when its page is protected; it does not establish coherence for
+	// the entire argument range (which can also cross a page boundary).
+	DispatchIndirectArgs args {};
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &args, sizeof(args), true)) {
+		EXIT("cannot read indirect dispatch arguments at 0x%016" PRIx64 "\n", args_addr);
+	}
+	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
@@ -1211,6 +1250,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
+		// A release label permits the CPU and other queues to reuse preceding resources.
+		// Publishing it while that work is only recorded exposes incomplete GPU writes.
+		SynchronizeGpu();
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1261,6 +1303,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					SynchronizeGpu();
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1349,6 +1392,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			break;
 		case 0x04:
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
+				SynchronizeGpu();
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
 				std::memcpy(dst, &clock, sizeof(clock));
@@ -1542,6 +1586,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	SynchronizeGpu();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
@@ -1568,6 +1613,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	SynchronizeGpu();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,

@@ -563,6 +563,26 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	return OK;
 }
 
+static uint32_t ReadGuestFile(Common::File& file, void* destination, uint32_t size) {
+	// Host kernel I/O cannot invoke our guest page-fault handler. In particular,
+	// ReadFile returns ERROR_NOACCESS when GPU tracking protects a destination
+	// page, even if it was writable at invalidation time. Copy in user space so
+	// a concurrent GPU protection change is handled like any other guest write.
+	std::vector<uint8_t> staging(std::min(size, 256u * 1024u));
+	uint32_t             total = 0;
+	while (total < size) {
+		const auto requested = std::min(size - total, static_cast<uint32_t>(staging.size()));
+		uint32_t   received  = 0;
+		file.Read(staging.data(), requested, &received);
+		if (received != 0) {
+			std::memcpy(static_cast<uint8_t*>(destination) + total, staging.data(), received);
+			total += received;
+		}
+		if (received < requested) break;
+	}
+	return total;
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
@@ -615,8 +635,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const uint32_t bytes_read = ReadGuestFile(file->f, buf, static_cast<uint32_t>(nbytes));
 
 	file->mutex.Unlock();
 
@@ -740,9 +759,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
-	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	const uint32_t bytes_read = ReadGuestFile(file->f, buf, static_cast<uint32_t>(nbytes));
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();

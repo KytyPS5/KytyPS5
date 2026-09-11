@@ -54,6 +54,8 @@ private:
 		SubmissionType            type     = SubmissionType::Graphics;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
+		std::unique_ptr<uint32_t[]> owned_commands;
+		std::unique_ptr<uint32_t[]> owned_constant_commands;
 		std::span<const uint32_t> constant_commands;
 		Pm4Execution              command_execution;
 		Pm4Execution              constant_execution;

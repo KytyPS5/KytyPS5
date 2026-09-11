@@ -236,10 +236,21 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 	});
 }
 
+uint32_t BufferSubwordOffset(EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	return Binary(state, OpBitwiseAnd, TypeU32(state), state.memory_byte_offsets[index],
+	              ConstantU32(state, 3u));
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		return BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
-		                         ctx.Arg(inst, 3));
+		const auto address =
+		    BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3));
+		// The resource accessor adds the whole-word part of the binding offset.
+		// Preserve its low bytes here, before computing word indices and subword shifts.
+		return Binary(ctx.state, OpIAdd, TypeU32(ctx.state), address,
+		              BufferSubwordOffset(ctx.state, mem));
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
@@ -651,7 +662,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
 		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		                                     BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1),
+		                                                       ctx.Arg(inst, 2), ctx.Arg(inst, 3)),
+		                                     resource.byte_offset);
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(
@@ -1040,8 +1053,118 @@ void DefineGetBdaPointer(EmitterState& state) {
 }
 
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state             = ctx.state;
-	const auto op                = inst.GetOpcode();
+	auto&      state = ctx.state;
+	const auto op    = inst.GetOpcode();
+	// Planning reads have no runtime buffer binding to look up.
+	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::ReadConstBuffer) &&
+	    ctx.Memory(inst).planning_only) {
+		return true;
+	}
+	if (IR::BufferAccessOf(op) != IR::BufferAccess::None && ctx.memory_override == nullptr) {
+		const auto& memory = ctx.Memory(inst);
+		const auto& buffer = ctx.state.program.info.buffers.at(memory.resource);
+		if (buffer.indirect_root == memory.resource) {
+			const auto* handle = inst.Arg(0).ResolveInstruction();
+			if (handle == nullptr || state.flattened_srt_variable == 0 ||
+			    buffer.indirect_resources.size() < 2u || buffer.indirect_search_iterations == 0) {
+				ctx.Fail(inst, "has no indirect buffer runtime mapping");
+			}
+			const auto key = ctx.Def(handle->Arg(0));
+			// Load any spilled operands before splitting control flow so every case dominates its
+			// uses.
+			for (size_t arg = 1; arg < inst.NumArgs(); ++arg) {
+				ctx.Arg(inst, arg);
+			}
+			const auto LoadMapping = [&](uint32_t index) {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+				                           pointer, state.flattened_srt_variable,
+				                           ConstantU32(state, 0), index});
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+				return value;
+			};
+			const auto mapping  = ConstantU32(state, buffer.indirect_mapping_offset);
+			auto       low      = ConstantU32(state, 0u);
+			auto       high     = LoadMapping(mapping);
+			auto       selected = ConstantU32(state, 0u);
+			for (uint32_t iteration = 0; iteration < buffer.indirect_search_iterations;
+			     ++iteration) {
+				const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
+				const auto mid    = Binary(state, OpShiftRightLogical, TypeU32(state),
+				                           Binary(state, OpIAdd, TypeU32(state), low, high),
+				                           ConstantU32(state, 1u));
+				const auto probe =
+				    Select(state, TypeU32(state), active, mid, ConstantU32(state, 0u));
+				const auto entry = Binary(state, OpIAdd, TypeU32(state), mapping,
+				                          Binary(state, OpIAdd, TypeU32(state),
+				                                 Binary(state, OpShiftLeftLogical, TypeU32(state),
+				                                        probe, ConstantU32(state, 1u)),
+				                                 ConstantU32(state, 1u)));
+				const auto mapped_key = LoadMapping(entry);
+				const auto candidate  = LoadMapping(
+				    Binary(state, OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+				const auto equal = Binary(state, OpIEqual, TypeBool(state), mapped_key, key);
+				selected = Select(state, TypeU32(state),
+				                  Binary(state, OpLogicalAnd, TypeBool(state), active, equal),
+				                  candidate, selected);
+				const auto less = Binary(state, OpULessThan, TypeBool(state), mapped_key, key);
+				low =
+				    Select(state, TypeU32(state),
+				           Binary(state, OpLogicalAnd, TypeBool(state), active, less),
+				           Binary(state, OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+				high = Select(state, TypeU32(state),
+				              Binary(state, OpLogicalAnd, TypeBool(state), active,
+				                     Unary(state, OpLogicalNot, TypeBool(state), less)),
+				              mid, high);
+			}
+			const auto            merge = state.builder.AllocateId();
+			std::vector<uint32_t> labels(buffer.indirect_resources.size());
+			for (auto& label: labels) {
+				label = state.builder.AllocateId();
+			}
+			std::vector<uint32_t> branch {OpSwitch, selected, labels[0]};
+			for (uint32_t candidate = 1; candidate < labels.size(); ++candidate) {
+				branch.push_back(candidate);
+				branch.push_back(labels[candidate]);
+			}
+			state.builder.AddFunction({OpSelectionMerge, merge, SelectionControlNone});
+			state.builder.AddFunction(branch);
+			const bool            has_result = inst.GetType() != IR::Type::Void;
+			std::vector<uint32_t> phi;
+			if (has_result) {
+				phi = {OpPhi, ctx.TypeId(inst.GetType()), state.builder.AllocateId()};
+			}
+			IR::Inst access(op, inst.Flags<uint64_t>());
+			for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+				access.SetArg(arg, inst.Arg(arg));
+			}
+			auto candidate_memory    = memory;
+			ctx.memory_override_inst = &access;
+			ctx.memory_override      = &candidate_memory;
+			for (uint32_t candidate = 0; candidate < labels.size(); ++candidate) {
+				EmitLabel(state, labels[candidate]);
+				candidate_memory.resource = buffer.indirect_resources[candidate];
+				if (!EmitValueMemory(ctx, access)) {
+					ctx.Fail(inst, "unsupported indirect buffer access");
+				}
+				if (has_result) {
+					phi.push_back(ctx.definitions.at(&access));
+					phi.push_back(state.current_label);
+					ctx.definitions.erase(&access);
+				}
+				state.builder.AddFunction({OpBranch, merge});
+			}
+			ctx.memory_override      = nullptr;
+			ctx.memory_override_inst = nullptr;
+			EmitLabel(state, merge);
+			if (has_result) {
+				state.builder.AddFunction(phi);
+				ctx.Define(inst, phi[2]);
+			}
+			return true;
+		}
+	}
 	const auto buffer_components = IR::BufferComponentCount(op);
 	if (buffer_components > 1u) {
 		const auto access = IR::BufferAccessOf(op);
@@ -1063,10 +1186,6 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		return true;
 	}
-	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::ReadConstBuffer) &&
-	    ctx.Memory(inst).planning_only) {
-		return true;
-	}
 	if (op == IR::ValueOpcode::ReadConst) {
 		if (state.flattened_srt_variable == 0) {
 			ctx.Fail(inst, "requires the flattened SRT descriptor");
@@ -1082,8 +1201,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ReadConstBuffer) {
 		auto mem = ctx.Memory(inst);
 		mem.kind = IR::ResourceKind::ScalarBuffer;
-		const auto address =
+		const auto relative_address =
 		    Binary(state, OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
+		const auto address = Binary(state, OpIAdd, TypeU32(state), relative_address,
+		                            BufferSubwordOffset(state, mem));
 		const auto index =
 		    Binary(state, OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 		const auto access    = PrepareMemoryResourceAccess(state, mem);

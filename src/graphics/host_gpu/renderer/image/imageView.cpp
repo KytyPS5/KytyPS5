@@ -4,6 +4,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -351,6 +354,18 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
+	if (!std::isfinite(normalized.min_lod) || normalized.min_lod < 0.0f) {
+		EXIT("invalid image view minimum LOD\n");
+	}
+	// Guest minimum LOD is relative to the view; Vulkan uses the underlying
+	// image's mip indices. Clamp it to the levels actually exposed by this view.
+	normalized.min_lod =
+	    std::clamp(normalized.min_lod, static_cast<float>(normalized.base_level),
+	               static_cast<float>(normalized.base_level + normalized.level_count - 1u));
+	if (normalized.min_lod <= static_cast<float>(normalized.base_level)) normalized.min_lod = 0.0f;
+	if (normalized.min_lod != 0.0f && !m_graphics.image_view_min_lod_enabled) {
+		EXIT("image minimum LOD requires VK_EXT_image_view_min_lod support\n");
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;
@@ -358,6 +373,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};
+	vk::ImageViewMinLodCreateInfoEXT min_lod {};
+	min_lod.minLod = normalized.min_lod;
+	if (normalized.min_lod != 0.0f) usage.pNext = &min_lod;
 	usage.usage = image.usage;
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;

@@ -71,6 +71,16 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
+std::vector<uint32_t> ReadIndirectRegisterPairs(uint64_t address, uint32_t count) {
+	std::vector<uint32_t> pairs(static_cast<size_t>(count) * 2);
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(address, pairs.data(),
+	                                               pairs.size() * sizeof(uint32_t), true)) {
+		EXIT("cannot read indirect register pairs: address=0x%016" PRIx64 " count=%u\n", address,
+		     count);
+	}
+	return pairs;
+}
+
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
 	return eop_event_type != 0x28u ||
 	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
@@ -1331,18 +1341,8 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		struct DispatchIndirectArgs {
-			uint32_t thread_group_x;
-			uint32_t thread_group_y;
-			uint32_t thread_group_z;
-		};
-
-		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(
-		    buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-		uint32_t mode = buffer[2];
-
-		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+		const uint64_t args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
+		cp.DispatchIndirectAddress(args_addr, buffer[2]);
 
 		return 3;
 	}
@@ -1471,8 +1471,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	EXIT_NOT_IMPLEMENTED(payload_dw != 13);
 
-	auto* compare_addr = reinterpret_cast<const volatile uint64_t*>(
-	    (buffer[1] & 0xfffffff8u) | (static_cast<uint64_t>(buffer[2]) << 32u));
+	// Conditional IB comparisons accept dword-aligned addresses. Clearing bit 2
+	// selects the preceding value when the guest puts a predicate at +4.
+	auto* compare_addr   = reinterpret_cast<const void*>((buffer[1] & 0xfffffffcu) |
+	                                                     (static_cast<uint64_t>(buffer[2]) << 32u));
 	uint64_t mask        = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;
@@ -1489,7 +1491,9 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	uint64_t comparison = 0;
+	std::memcpy(&comparison, compare_addr, sizeof(comparison));
+	const bool take_then = TestWaitRegMemValue(comparison, reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1931,6 +1935,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
 
 	const uint32_t control = buffer[2];
+	const bool     chain   = (control & (1u << 20u)) != 0;
 
 	const uint32_t control_flags = control & 0x0fe00000u;
 	if (control_flags != 0x0f200000u) {
@@ -1949,6 +1954,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	if (indirect_num_dw == 0) {
+		if (chain) cp.ProcessIndirectBuffer({}, true);
 		return 3;
 	}
 	if (indirect_buffer == nullptr) {
@@ -1959,7 +1965,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, chain);
 
 	return 3;
 }
@@ -1971,8 +1977,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -1981,6 +1987,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// Make every pair visible before applying registers: a handler can flush GPU
+	// work or run completion callbacks that change the original guest allocation.
+	const auto pairs =
+	    ReadIndirectRegisterPairs(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
+	indirect_buffer = pairs.data();
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2033,8 +2044,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2044,6 +2055,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto pairs            = ReadIndirectRegisterPairs(indirect_address, indirect_num_dw);
+	indirect_buffer             = pairs.data();
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
@@ -2096,8 +2109,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
+	                                      (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2106,6 +2119,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto pairs =
+	    ReadIndirectRegisterPairs(reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw);
+	indirect_buffer = pairs.data();
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

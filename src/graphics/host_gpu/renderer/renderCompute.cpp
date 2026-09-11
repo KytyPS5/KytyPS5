@@ -220,6 +220,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
+	// Empty indirect dispatches may retain registers for resources that will never
+	// be accessed. Check work size before specialization or clear fast paths.
+	// This is also valid when dimensions are thread counts: zero stays zero.
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		return;
+	}
+
 	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
@@ -256,8 +263,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_program            = m_context.GetPipelineCache().GetComputeProgram(
+	    cs_regs, sh_regs, input_info, {thread_group_x, thread_group_y, thread_group_z});
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -338,9 +345,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	if (use_thread_dimensions) {
 		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
-			return (threads == 0
-			            ? 0u
-			            : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
+			const auto divisor = std::max(group_size, 1u);
+			return threads / divisor + (threads % divisor != 0);
 		};
 
 		const uint32_t old_x = thread_group_x;
@@ -361,15 +367,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
-			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
-			     thread_group_x, thread_group_y, thread_group_z, mode,
-			     sh_ctx.GetCs().cs_regs.data_addr);
-		}
-		return;
+	const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	if (thread_group_x > limits.maxComputeWorkGroupCount[0] ||
+	    thread_group_y > limits.maxComputeWorkGroupCount[1] ||
+	    thread_group_z > limits.maxComputeWorkGroupCount[2]) {
+		EXIT("unsupported compute dispatch: shader=0x%016" PRIx64
+		     " groups=%ux%ux%u local=%ux%ux%u mode=0x%08" PRIx32 "\n",
+		     program.shader_hash, thread_group_x, thread_group_y, thread_group_z,
+		     input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2], mode);
 	}
 
 	buffer.EndRendering();

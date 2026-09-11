@@ -24,12 +24,14 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -97,11 +99,93 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::Flush();
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+// One preparation can evaluate the same SRT words through descriptor, predicate, and
+// flattened-value evaluators. Snapshot clean blocks once for this preparation only.
+// Dirty or partially mapped blocks fall back to the exact requested word so a read
+// never forces an unrelated GPU resource to synchronize.
+struct ShaderGuestReadCache {
+	static constexpr uint64_t BlockSize = 256;
+	static constexpr size_t   MaxBlocks = 4096;
+	struct Block {
+		uint64_t                       address;
+		std::array<uint8_t, BlockSize> bytes;
+	};
+	struct Slot {
+		uint32_t generation = 0;
+		uint32_t index      = 0;
+	};
+	std::array<Slot, MaxBlocks * 2>        slots {};
+	std::vector<Block>                     blocks;
+	std::unordered_map<uint64_t, uint32_t> words;
+	uint32_t                               generation = 0;
+
+	void Reset() {
+		// Retain storage, but never retain guest values between preparations.
+		blocks.clear();
+		words.clear();
+		if (++generation == 0) {
+			slots.fill({});
+			generation = 1;
+		}
+	}
+
+	Slot& FindSlot(uint64_t address) {
+		auto index =
+		    static_cast<size_t>(XXH3_64bits(&address, sizeof(address))) & (slots.size() - 1);
+		while (slots[index].generation == generation &&
+		       blocks[slots[index].index].address != address) {
+			index = (index + 1) & (slots.size() - 1);
+		}
+		return slots[index];
+	}
+};
+
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, uint32_t* value) {
+	if (value == nullptr) return false;
+	auto&      cache  = *static_cast<ShaderGuestReadCache*>(userdata);
+	const auto base   = address & ~(ShaderGuestReadCache::BlockSize - 1u);
+	const auto offset = address - base;
+	if (offset <= ShaderGuestReadCache::BlockSize - sizeof(*value)) {
+		const auto& slot = cache.FindSlot(base);
+		if (slot.generation == cache.generation) {
+			std::memcpy(value, cache.blocks[slot.index].bytes.data() + offset, sizeof(*value));
+			return true;
+		}
+	}
+	if (const auto found = cache.words.find(address); found != cache.words.end()) {
+		*value = found->second;
+		return true;
+	}
+	if (offset <= ShaderGuestReadCache::BlockSize - sizeof(*value) &&
+	    cache.blocks.size() < ShaderGuestReadCache::MaxBlocks) {
+		std::array<uint8_t, ShaderGuestReadCache::BlockSize> block;
+		if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, block.data(), block.size())) {
+			std::memcpy(value, block.data() + offset, sizeof(*value));
+			auto& slot = cache.FindSlot(base);
+			slot       = {cache.generation, static_cast<uint32_t>(cache.blocks.size())};
+			cache.blocks.push_back({base, std::move(block)});
+			return true;
+		}
+	}
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value), true)) {
+		return false;
+	}
+	cache.words.emplace(address, *value);
+	return true;
 }
 
+bool ReadShaderGuestRange(void*, uint64_t address, void* data, uint64_t size) {
+	const bool read = Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size, true);
+	return read;
+}
+
+bool IsShaderMemoryMapped(void*, uint64_t address, uint64_t size) {
+	// Query backing mappings without synchronizing dirty contents. Mapped descriptors
+	// must still use the checked reader, which waits for preceding GPU writes.
+	std::array<uint8_t, 32> probe {};
+	return size != 0 && size <= probe.size() &&
+	       Libs::LibKernel::Memory::TryReadBacking(address, probe.data(), size);
+}
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -201,12 +285,12 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
-		std::vector<Permutation>           permutations;
+		// ShaderStageRuntime and prepared bindings retain pointers to program metadata.
+		// Appending a new resource specialization must not move existing entries.
+		std::deque<Permutation> permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -273,8 +357,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	                  std::array<uint32_t, 3> workgroup_count = {}) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
@@ -293,10 +377,16 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		read_cache.Reset();
+		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemory,
+		    .userdata                   = &read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_specialization_range  = ReadShaderGuestRange,
+		    .is_memory_mapped           = IsShaderMemoryMapped,
+		    .workgroup_count            = workgroup_count,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -393,6 +483,7 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	ShaderGuestReadCache                                        read_cache;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -621,12 +712,22 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               std::array<uint32_t, 3>      dispatch_dimensions) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	if (input_info.dispatch_thread_dimensions) {
+		const std::array local {regs.cs_regs.num_thread_x, regs.cs_regs.num_thread_y,
+		                        regs.cs_regs.num_thread_z};
+		for (size_t axis = 0; axis < dispatch_dimensions.size(); ++axis) {
+			const auto divisor = std::max(local[axis], 1u);
+			dispatch_dimensions[axis] =
+			    dispatch_dimensions[axis] / divisor + (dispatch_dimensions[axis] % divisor != 0);
+		}
+	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	return m_program_cache->Get(params, input_info, push_data_cursor, dispatch_dimensions);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

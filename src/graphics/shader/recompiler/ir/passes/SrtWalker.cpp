@@ -454,9 +454,12 @@ class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
-	          Value active_mask = {})
+	          Value active_mask = {}, uint32_t lane_depth = 0, size_t initial_capacity = 0,
+	          UniformValueCache* cache = nullptr)
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_lane_depth(lane_depth), m_initial_capacity(initial_capacity),
+	      m_cache(cache != nullptr ? cache->values : m_cache_storage) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -492,8 +495,12 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
+			const auto capacity =
+			    m_initial_capacity == 0
+			        ? m_program.value_storage.size()
+			        : std::min(m_initial_capacity, m_program.value_storage.size());
+			if (m_cache.empty()) m_cache.reserve(capacity);
+			m_visiting.reserve(capacity);
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
@@ -603,7 +610,8 @@ private:
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return false;
+				result = 0;
+				return true;
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
@@ -646,8 +654,13 @@ private:
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
+				// A loop-carried lane value can return to this instruction through a Phi.
+				// Nested active-lane evaluators have separate caches, so bound that recursion.
+				if (m_lane_depth >= 16u) {
+					return false;
+				}
 				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1));
+				                 inst.Arg(1), m_lane_depth + 1u, m_initial_capacity);
 				return active.EvaluateWide(inst.Arg(0), result);
 			}
 			case ValueOpcode::BitCastU32F32:
@@ -961,7 +974,10 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
+	uint32_t                                   m_lane_depth       = 0;
+	size_t                                     m_initial_capacity = 0;
+	std::unordered_map<const Inst*, uint64_t>  m_cache_storage;
+	std::unordered_map<const Inst*, uint64_t>& m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };
@@ -990,13 +1006,18 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	Evaluator            clean_evaluator(program, clean_runtime);
 	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	std::vector<uint8_t> active;
+	std::vector<uint8_t> active_flat;
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
+		active_flat.assign(program.srt_reads.size(), 1u);
 	}
 	if (evaluate_flat && !program.control_flow.empty()) {
 		for (const auto& block: program.control_flow) {
 			for (const auto source: block.sources) {
 				active.at(source) = 0u;
+			}
+			for (const auto slot: block.flat_slots) {
+				active_flat.at(slot) = 0u;
 			}
 		}
 		std::vector<uint8_t>  visited(program.control_flow.size());
@@ -1011,6 +1032,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			const auto& block = program.control_flow[index];
 			for (const auto source: block.sources) {
 				active[source] = 1u;
+			}
+			for (const auto slot: block.flat_slots) {
+				active_flat[slot] = 1u;
 			}
 			uint32_t condition = 0;
 			// A missing clean reader must never fall through to the evaluator's raw-memory path.
@@ -1044,6 +1068,10 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
+			if (read.flat_offset >= flattened.size()) return false;
+			// Descriptor evaluation already follows reachable blocks. Apply the same
+			// reachability to shader constants, leaving unused slots at zero.
+			if (!active_flat[read.flat_offset]) continue;
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
@@ -1077,7 +1105,8 @@ void BuildSrtPlan(Program& program) {
 }
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results) {
+                           const SrtRuntime& runtime, std::span<uint32_t> results,
+                           UniformValueCache* cache) {
 	if (values.size() != results.size()) {
 		return false;
 	}
@@ -1085,7 +1114,10 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	clean.read_memory = runtime.read_specialization_memory != nullptr
 	                        ? runtime.read_specialization_memory
 	                        : +[](void*, uint64_t, uint32_t*) { return false; };
-	Evaluator evaluator(program, clean);
+	// Selector enumeration often requests only one leaf or a four-word buffer
+	// handle. Do not allocate space for the entire shader for each small walk;
+	// these containers still grow normally if the dependency graph is larger.
+	Evaluator evaluator(program, clean, {}, nullptr, {}, 0, 64, cache);
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (!evaluator.Evaluate(values[i], results[i])) {
 			return false;

@@ -90,20 +90,25 @@ struct ExportInfo {
 };
 
 struct BufferResource {
-	static constexpr uint32_t NoImageAlias = UINT32_MAX;
+	static constexpr uint32_t NoImageAlias     = UINT32_MAX;
+	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
-	uint32_t               source             = 0;
-	uint32_t               first_use_pc       = 0;
-	uint32_t               max_byte_extent    = 0;
-	uint32_t               packed_stride      = 0;
-	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
-	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
-	uint32_t               image_alias        = NoImageAlias;
-	bool                   read               = false;
-	bool                   written            = false;
-	bool                   atomic             = false;
-	bool                   formatted          = false;
-	bool                   scalar             = false;
+	uint32_t               source                     = 0;
+	uint32_t               first_use_pc               = 0;
+	uint32_t               max_byte_extent            = 0;
+	uint32_t               packed_stride              = 0;
+	Prospero::BufferFormat descriptor_format          = Prospero::BufferFormat::kInvalid;
+	uint32_t               descriptor_swizzle         = DstSel(4, 5, 6, 7);
+	uint32_t               image_alias                = NoImageAlias;
+	uint32_t               indirect_root              = NoIndirectBuffer;
+	uint32_t               indirect_mapping_offset    = 0;
+	uint32_t               indirect_search_iterations = 0;
+	std::vector<uint32_t>  indirect_resources;
+	bool                   read      = false;
+	bool                   written   = false;
+	bool                   atomic    = false;
+	bool                   formatted = false;
+	bool                   scalar    = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -414,8 +419,9 @@ struct BindingLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxImages       = 64;
+	// Descriptor tables can expose more buffers than the hardware's SGPR slots.
+	static constexpr uint32_t MaxBuffers      = 128;
+	static constexpr uint32_t MaxImages       = 128; // Includes GPU-indexed descriptor candidates.
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
@@ -456,19 +462,38 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
+	struct IndexRange {
+		Value                                   value;
+		Value                                   begin;
+		Value                                   end;
+		std::vector<std::pair<Value, uint32_t>> bound_limits;
+		bool                                    operator==(const IndexRange&) const = default;
+	};
+	struct IndirectBuffer {
+		Value                   byte_offset;
+		uint32_t                immediate_offset = 0;
+		std::vector<IndexRange> index_ranges;
+
+		bool operator==(const IndirectBuffer&) const = default;
+	};
 	struct IndirectImage {
 		uint32_t material_source = 0;
 		uint32_t heap_source     = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t key_arg         = 0;
+		Value                   direct_offset;
+		bool                    direct_address = false;
+		std::vector<IndexRange> index_ranges;
+		uint32_t                immediate_offset = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
-	std::array<Value, 8>         dwords {};
-	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	std::array<Value, 8>          dwords {};
+	uint32_t                      dword_count = 0;
+	std::optional<IndirectImage>  indirect_image;
+	std::optional<IndirectBuffer> indirect_buffer;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -485,6 +510,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> flat_slots;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -570,6 +596,7 @@ void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+Value ResolveResourcePhi(const Program& program, Value value, uint32_t pc, uint32_t depth = 0);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

@@ -138,6 +138,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return SimpleInteger(inst, IR::ValueOpcode::IMul32, IR::Type::U32, false, false, false);
 		case O::S_MUL_HI_U32:
 			return SimpleInteger(inst, IR::ValueOpcode::UMulHi, IR::Type::U32, false, false, false);
+		case O::S_MUL_HI_I32:
+			return SimpleInteger(inst, IR::ValueOpcode::SMulHi, IR::Type::U32, false, false, false);
 		case O::S_AND_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitwiseAnd32, IR::Type::U32, false, false,
 			                     true);

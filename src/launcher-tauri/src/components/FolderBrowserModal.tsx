@@ -46,8 +46,8 @@ export function FolderBrowserModal({
           </button>
           <button
             className="pill-button primary"
-            disabled={!result}
-            onClick={() => result && onPick(result.path)}
+            disabled={!result || result.isVirtual}
+            onClick={() => result && !result.isVirtual && onPick(result.path)}
           >
             {t("folderBrowser.selectFolder")}
           </button>
@@ -70,7 +70,7 @@ export function FolderBrowserModal({
             textAlign: "right",
           }}
         >
-          {result?.path ?? "…"}
+          {result ? (result.isVirtual ? "This PC" : result.path) : "…"}
         </span>
       </div>
 

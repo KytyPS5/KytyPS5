@@ -346,3 +346,51 @@
   outline-color: var(--accent);
   box-shadow: 0 0 14px var(--accent-glow);
 }
+
+/* Profile avatar. Was a 14-line inline style object repeated per row, which
+   could not carry a hover/focus state and drifted from ProfileView's own
+   copy of the same circle; one class, sized by the caller. */
+.profileAvatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--glass-bg-strong);
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 14px;
+}
+
+/* The "add a profile" row. Separated from the list above it by a rule, so a
+   text field and a button do not read as one more profile entry. */
+.profileCreateRow {
+  composes: row;
+  gap: 10px;
+  border-top: 1px solid var(--glass-border);
+  margin-top: 6px;
+  padding-top: 16px;
+}
+
+.profileNameField {
+  flex: 1;
+  max-width: 260px;
+}
+
+/* Inline delete confirmation, same shape as GameDetail's remove-save-data
+   step: destructive actions in this app ask once, in place, rather than
+   opening a modal or firing on the first click. */
+.profileConfirmRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.profileConfirmText {
+  font-size: 12px;
+  color: var(--text-secondary);
+}

@@ -92,6 +92,9 @@ export interface BrowseResult {
   parent: string | null;
   home: string;
   entries: BrowseEntry[];
+  /** True for the Windows drive list, which is not a real directory and so
+   * cannot itself be picked. */
+  isVirtual: boolean;
 }
 
 export interface PatchEntry {

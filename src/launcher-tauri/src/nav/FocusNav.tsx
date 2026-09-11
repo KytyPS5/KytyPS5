@@ -633,8 +633,13 @@ export function FocusNavProvider({
     columnAnchorXRef.current = null;
 
     // Remember the outgoing view's focus (by its own declared key) before
-    // clearing, so returning to it later can restore it.
-    const outgoingKey = focusedRef.current?.dataset.focusKey;
+    // clearing, so returning to it later can restore it. Controls inside
+    // global chrome (the TopBar) are excluded: they sit in every view
+    // rather than belonging to the one being left, so recording one would
+    // make the chrome button used to navigate away become that view's
+    // remembered focus for good.
+    const outgoing = focusedRef.current;
+    const outgoingKey = outgoing?.closest("[data-focus-chrome]") ? undefined : outgoing?.dataset.focusKey;
     if (outgoingKey) focusMemoRef.current.set(prevResetKeyRef.current, outgoingKey);
 
     if (focusedRef.current) focusedRef.current.classList.remove("ps-focused");

@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Terminal } from "lucide-react";
+import { Copy, FolderOpen, Terminal, Trash2 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { useStore } from "../store/observable";
-import { isRunningStore, lastExitCodeStore, logLinesStore, runningGameStore, stopGame } from "../store/run";
+import { clearLogs, isRunningStore, lastExitCodeStore, logLinesStore, runningGameStore, stopGame } from "../store/run";
 import { gamesStore } from "../store/library";
 import { GlassPanel } from "../components/GlassPanel";
 import { useT } from "../i18n";
@@ -22,6 +24,11 @@ export function LogsView() {
     await navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const openLogsFolder = async () => {
+    const dir = await invoke<string>("get_logs_dir");
+    await openPath(dir);
   };
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -79,6 +86,14 @@ export function LogsView() {
             <button className="pill-button" onClick={() => void copyLogs()} disabled={lines.length === 0}>
               <Copy size={14} /> {t("console.copyLogs")}
             </button>
+            {/* The session files, which outlive this pane -- what a user
+                attaches to a bug report rather than retyping an error. */}
+            <button className="pill-button" onClick={() => void openLogsFolder()}>
+              <FolderOpen size={14} /> {t("console.openLogsFolder")}
+            </button>
+            <button className="pill-button" onClick={clearLogs} disabled={lines.length === 0}>
+              <Trash2 size={14} /> {t("console.clear")}
+            </button>
             {running && (
               <button className="pill-button" onClick={() => void stopGame()}>
                 ■ {t("console.stopButton")}
@@ -91,6 +106,7 @@ export function LogsView() {
           <div
             ref={scrollRef}
             data-scroll-region
+            data-selectable
             style={{
               flex: 1,
               overflowY: "auto",

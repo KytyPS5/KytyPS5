@@ -202,7 +202,7 @@ impl Default for Configuration {
             printf_output_file: "_kyty.txt".to_string(),
             profiler_direction: ProfilerDirection::default(),
             renderdoc_enabled: false,
-            bvh_stub_enabled: true,
+            bvh_stub_enabled: false,
             host_input_mapping: Vec::new(),
             elf: "eboot.bin".to_string(),
             title_id: String::new(),
@@ -262,7 +262,18 @@ impl Configuration {
         doc.set(section, &k("printf_output_file"), encode_string(&self.printf_output_file));
         doc.set(section, &k("profiler_direction"), self.profiler_direction.as_ini_text().to_string());
         doc.set(section, &k("renderdoc_enabled"), encode_bool(self.renderdoc_enabled));
-        doc.set(section, &k("bvh_stub_enabled"), encode_bool(self.bvh_stub_enabled));
+        // Written only when switched on. This key is a launcher-tauri
+        // addition that the Qt launcher knows nothing about, so emitting it
+        // unconditionally would inject a foreign line into every Kyty.ini
+        // this launcher touches -- including files the user goes back and
+        // forth to the Qt launcher with. Off is the default, so absent and
+        // `false` mean the same thing on load; leaving it out keeps a
+        // Qt-written file byte-identical through a load/save cycle.
+        if self.bvh_stub_enabled {
+            doc.set(section, &k("bvh_stub_enabled"), encode_bool(true));
+        } else {
+            doc.remove(section, &k("bvh_stub_enabled"));
+        }
         doc.set(section, &k("host_input_mapping"), encode_string_list(&self.host_input_mapping));
         doc.set(section, &k("elf"), encode_string(&self.elf));
     }

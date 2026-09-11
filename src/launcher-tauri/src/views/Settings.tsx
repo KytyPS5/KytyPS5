@@ -10,7 +10,17 @@ import { ImageBrowserModal } from "../components/ImageBrowserModal";
 import { Dropdown } from "../components/Dropdown";
 import { Toggle } from "../components/Toggle";
 import { ControllerRemapEditor } from "../components/InputMappingDialog";
-import { useAudioSettings, setSfxEnabled, setSfxVolume, setOutputSink, listAudioSinks, type AudioSink } from "../lib/audioSettings";
+import {
+  useAudioSettings,
+  setSfxEnabled,
+  setSfxVolume,
+  setOutputSink,
+  setInputSource,
+  listAudioSinks,
+  listAudioSources,
+  audioSelectionSupported,
+  type AudioSink,
+} from "../lib/audioSettings";
 import { playSfx } from "../lib/sfx";
 import { LayoutPicker } from "../components/LayoutPicker";
 import { cssUrl } from "../lib/cssUrl";
@@ -312,16 +322,36 @@ function GamepadCategory() {
 function AudioCategory() {
   const settings = useAudioSettings();
   const [sinks, setSinks] = useState<AudioSink[]>([]);
+  const [sources, setSources] = useState<AudioSink[]>([]);
+  // Whether picking a device actually routes anything. False on Windows,
+  // which has no per-process routing a launcher can apply to a child.
+  const [selectable, setSelectable] = useState(true);
+  const [selectError, setSelectError] = useState<string | null>(null);
   const t = useT();
 
   useEffect(() => {
     void listAudioSinks().then(setSinks);
+    void listAudioSources().then(setSources);
+    void audioSelectionSupported().then(setSelectable);
   }, []);
 
-  const outputOptions = [
+  const withDefault = (devices: AudioSink[]) => [
     { value: "", label: t("settings.audio.systemDefault") },
-    ...sinks.map((s) => ({ value: s.name, label: s.description })),
+    ...devices.map((d) => ({ value: d.name, label: d.description })),
   ];
+  const outputOptions = withDefault(sinks);
+  const inputOptions = withDefault(sources);
+
+  // Clearing back to the system default always works, so an error only ever
+  // comes from picking a real device on a platform that cannot honour it.
+  const applyDevice = async (apply: Promise<void>) => {
+    try {
+      await apply;
+      setSelectError(null);
+    } catch (e) {
+      setSelectError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   return (
     <>
@@ -361,12 +391,30 @@ function AudioCategory() {
           <Dropdown
             ariaLabel={t("settings.audio.outputDevice")}
             value={settings.outputSink ?? ""}
-            onChange={(v) => void setOutputSink(v || null)}
+            onChange={(v) => void applyDevice(setOutputSink(v || null))}
             options={outputOptions}
           />
         </div>
       </div>
-      {sinks.length === 0 && <p className={styles.blockHint}>{t("settings.audio.noDevicesFound")}</p>}
+
+      <div className={styles.row}>
+        <span className={styles.rowLabel}>{t("settings.audio.inputDevice")}</span>
+        <div style={{ width: 260 }}>
+          <Dropdown
+            ariaLabel={t("settings.audio.inputDevice")}
+            value={settings.inputSource ?? ""}
+            onChange={(v) => void applyDevice(setInputSource(v || null))}
+            options={inputOptions}
+          />
+        </div>
+      </div>
+
+      {sinks.length === 0 && sources.length === 0 && <p className={styles.blockHint}>{t("settings.audio.noDevicesFound")}</p>}
+      {/* Stated up front rather than only after a failed pick: the devices
+          listed above are real, but on Windows choosing one cannot move a
+          game's audio. */}
+      {!selectable && <p className={styles.blockHint}>{t("settings.audio.routingUnsupported")}</p>}
+      {selectError && <p className={styles.blockHint}>{selectError}</p>}
     </>
   );
 }
@@ -376,6 +424,11 @@ interface BtDevice {
   name: string;
   paired: boolean;
   connected: boolean;
+}
+
+interface BtAdapter {
+  present: boolean;
+  powered: boolean;
 }
 
 /** Pairing has no capture-overlay equivalent -- there is no button chord to
@@ -390,6 +443,9 @@ function BluetoothCategory() {
   const [scanning, setScanning] = useState(false);
   const [busyAddress, setBusyAddress] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
+  // `null` while the first adapter query is still in flight, so the panel
+  // does not flash "no Bluetooth adapter" before it knows either way.
+  const [adapter, setAdapter] = useState<BtAdapter | null>(null);
 
   const refresh = async () => {
     try {
@@ -400,8 +456,19 @@ function BluetoothCategory() {
     }
   };
 
+  const refreshAdapter = async () => {
+    try {
+      setAdapter(await invoke<BtAdapter>("bluetooth_adapter_state"));
+    } catch {
+      setAdapter({ present: false, powered: false });
+    }
+  };
+
   useEffect(() => {
-    void refresh();
+    void (async () => {
+      await refreshAdapter();
+      await refresh();
+    })();
   }, []);
 
   const scan = async () => {
@@ -491,12 +558,29 @@ function BluetoothCategory() {
       <p className={styles.blockHint}>{t("settings.bluetooth.description")}</p>
 
       <div className={styles.actionRow}>
-        <button type="button" className="pill-button" disabled={scanning} onClick={() => void scan()}>
+        <button
+          type="button"
+          className="pill-button"
+          disabled={scanning || adapter?.powered === false}
+          onClick={() => void scan()}
+        >
           {scanning ? t("settings.bluetooth.scanning") : t("settings.bluetooth.scan")}
         </button>
       </div>
 
-      {loadError && <p className={styles.blockHint}>{t("settings.bluetooth.noDevices")}</p>}
+      {/* An adapter that is missing and one that is switched off both yield
+          an empty device list, so say which it is rather than leaving the
+          user to guess why scanning finds nothing. */}
+      {adapter !== null && !adapter.present && (
+        <p className={styles.blockHint}>{t("settings.bluetooth.noAdapter")}</p>
+      )}
+      {adapter?.present && !adapter.powered && (
+        <p className={styles.blockHint}>{t("settings.bluetooth.poweredOff")}</p>
+      )}
+
+      {loadError && adapter?.powered && (
+        <p className={styles.blockHint}>{t("settings.bluetooth.noDevices")}</p>
+      )}
 
       {paired.length > 0 && (
         <>
@@ -635,6 +719,10 @@ function ProfileCategory() {
   const [newName, setNewName] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  // Deleting a profile cannot be undone, so it asks first -- in place, the
+  // same two-step GameDetail's remove-save-data uses, rather than firing on
+  // the first click of a trash icon.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const submitNew = () => {
     const name = newName.trim();
@@ -655,6 +743,12 @@ function ProfileCategory() {
     <>
       <p className={styles.blockHint}>{t("profile.description")}</p>
 
+      {/* Three unlabelled groups ran together before: the profile list, the
+          field that creates one, and the preferences that belong to
+          whichever profile is active. The headings say which settings follow
+          the active profile rather than the app. */}
+      <h3 className={styles.subheading}>{t("profile.profilesHeading")}</h3>
+
       {profiles.map((p: LauncherProfile) => {
         const isActive = p.id === active?.id;
         return (
@@ -664,31 +758,19 @@ function ProfileCategory() {
               className={isActive ? styles.profileRowActive : styles.profileRow}
               onClick={() => !isActive && void setActiveProfile(p.id)}
             >
-              <div
-                style={{
-                  width: 34,
-                  height: 34,
-                  borderRadius: "50%",
-                  flex: "none",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  background: "var(--glass-bg-strong)",
-                  color: "var(--text-primary)",
-                  fontFamily: "var(--font-display)",
-                  fontWeight: 800,
-                  fontSize: 14,
-                }}
-              >
-                {p.name.slice(0, 1).toUpperCase()}
-              </div>
+              <div className={styles.profileAvatar}>{p.name.slice(0, 1).toUpperCase()}</div>
               {renamingId === p.id ? (
                 <input
                   autoFocus
                   type="text"
                   value={renameDraft}
                   onChange={(e) => setRenameDraft(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && submitRename(p.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") submitRename(p.id);
+                    // Escape abandons the edit. Without this the only way
+                    // out of a rename was to commit it.
+                    if (e.key === "Escape") setRenamingId(null);
+                  }}
                   onBlur={() => submitRename(p.id)}
                   style={{ maxWidth: 220 }}
                 />
@@ -701,45 +783,68 @@ function ProfileCategory() {
                 </span>
               )}
             </div>
-            <div style={{ display: "flex", gap: 4 }}>
-              <button
-                type="button"
-                className="icon-button"
-                title={t("profile.rename")}
-                onClick={() => {
-                  setRenamingId(p.id);
-                  setRenameDraft(p.name);
-                }}
-              >
-                <Pencil size={15} />
-              </button>
-              <button
-                type="button"
-                className="icon-button"
-                title={profiles.length <= 1 ? t("profile.cannotDeleteLast") : t("profile.delete")}
-                disabled={profiles.length <= 1}
-                onClick={() => void deleteProfile(p.id)}
-              >
-                <Trash2 size={15} />
-              </button>
-            </div>
+            {confirmDeleteId === p.id ? (
+              <div className={styles.profileConfirmRow}>
+                <span className={styles.profileConfirmText}>{t("profile.confirmDelete", { name: p.name })}</span>
+                <button type="button" className="pill-button" onClick={() => setConfirmDeleteId(null)}>
+                  {t("common.cancel")}
+                </button>
+                <button
+                  type="button"
+                  className="pill-button primary"
+                  onClick={() => {
+                    setConfirmDeleteId(null);
+                    void deleteProfile(p.id);
+                  }}
+                >
+                  {t("profile.delete")}
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 4 }}>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title={t("profile.rename")}
+                  onClick={() => {
+                    setRenamingId(p.id);
+                    setRenameDraft(p.name);
+                  }}
+                >
+                  <Pencil size={15} />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title={profiles.length <= 1 ? t("profile.cannotDeleteLast") : t("profile.delete")}
+                  disabled={profiles.length <= 1}
+                  onClick={() => setConfirmDeleteId(p.id)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            )}
           </div>
         );
       })}
 
-      <div className={styles.row} style={{ gap: 10 }}>
+      <div className={styles.profileCreateRow}>
         <input
           type="text"
+          className={styles.profileNameField}
           placeholder={t("profile.namePlaceholder")}
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submitNew()}
-          style={{ flex: 1, maxWidth: 260 }}
         />
-        <button className="pill-button" onClick={submitNew}>
+        {/* Disabled on an empty field: the button silently did nothing
+            before, which reads as a broken control rather than a refusal. */}
+        <button className="pill-button" disabled={!newName.trim()} onClick={submitNew}>
           {t("profile.newProfile")}
         </button>
       </div>
+
+      {active && <h3 className={styles.subheading}>{t("profile.preferencesHeading", { name: active.name })}</h3>}
 
       {active && (
         <div className={styles.row}>

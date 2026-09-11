@@ -25,6 +25,57 @@ pub struct BrowseResult {
     pub parent: Option<String>,
     pub home: String,
     pub entries: Vec<BrowseEntry>,
+    /// True for the Windows drive list, which is a made-up level rather than
+    /// a real directory: it has no path you could hand to the emulator, so
+    /// the UI keeps its "select this folder" action disabled while it shows.
+    pub is_virtual: bool,
+}
+
+/// Stand-in path for "the level above a drive root" on Windows, i.e. what
+/// Explorer calls This PC. `C:\` has no parent, so without this there is no
+/// way to get from one drive to another in the browser.
+#[cfg(windows)]
+pub const DRIVE_ROOT: &str = "::drives";
+
+/// Trim a canonicalized path back to its ordinary spelling. `canonicalize`
+/// on Windows hands back the verbatim `\\?\C:\Users\you` form, which is
+/// correct but is not what anyone recognizes as their own path, and is not
+/// a spelling every program accepts as an argument. UNC paths canonicalize
+/// to `\\?\UNC\server\share` and come back as `\\server\share`.
+///
+/// Shared with scanner.rs, which canonicalizes game folders and would
+/// otherwise carry the prefix into `--game`, into playtime.json's keys and
+/// into the UI.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
+/// Every drive letter currently mounted, in the shape the browser lists
+/// folders in. Probing A-Z with a `is_dir` check keeps this dependency-free;
+/// the alternative is `GetLogicalDrives` through a winapi crate, which is a
+/// lot of surface for 26 stat calls.
+#[cfg(windows)]
+fn drive_entries() -> Vec<BrowseEntry> {
+    (b'A'..=b'Z')
+        .map(|letter| format!("{}:\\", letter as char))
+        .filter(|root| Path::new(root).is_dir())
+        .map(|root| BrowseEntry {
+            name: root.clone(),
+            path: root,
+            is_dir: true,
+            looks_like_game: false,
+        })
+        .collect()
 }
 
 /// `file_extensions`, when given, also lists files whose extension matches
@@ -32,6 +83,29 @@ pub struct BrowseResult {
 /// browse for an image instead of a folder.
 pub fn browse_folder(path: Option<&str>, file_extensions: Option<&[String]>) -> Result<BrowseResult, String> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+
+    // The drive list, either asked for outright or as the Windows opening
+    // view: a games library usually lives on some other drive than the one
+    // the home folder is on, so starting at This PC saves walking up out of
+    // `C:\Users\<name>` every time. If no drive can be listed at all, fall
+    // through to the home folder rather than showing an empty picker.
+    #[cfg(windows)]
+    {
+        let wants_drive_root = path == Some(DRIVE_ROOT) || path.map_or(true, |p| p.is_empty());
+        if wants_drive_root {
+            let entries = drive_entries();
+            if !entries.is_empty() {
+                return Ok(BrowseResult {
+                    path: DRIVE_ROOT.to_string(),
+                    parent: None,
+                    home: display_path(&home),
+                    entries,
+                    is_virtual: true,
+                });
+            }
+        }
+    }
+
     let target = match path {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => home.clone(),
@@ -39,7 +113,7 @@ pub fn browse_folder(path: Option<&str>, file_extensions: Option<&[String]>) -> 
 
     let target = target.canonicalize().unwrap_or(target);
     if !target.is_dir() {
-        return Err(format!("{} is not a folder.", target.display()));
+        return Err(format!("{} is not a folder.", display_path(&target)));
     }
 
     let wanted_ext = |p: &Path| -> bool {
@@ -59,14 +133,14 @@ pub fn browse_folder(path: Option<&str>, file_extensions: Option<&[String]>) -> 
                     name: e.file_name().to_string_lossy().to_string(),
                     looks_like_game: path.join("eboot.bin").is_file(),
                     is_dir: true,
-                    path: path.to_string_lossy().to_string(),
+                    path: display_path(&path),
                 })
             } else if wanted_ext(&path) {
                 Some(BrowseEntry {
                     name: e.file_name().to_string_lossy().to_string(),
                     looks_like_game: false,
                     is_dir: false,
-                    path: path.to_string_lossy().to_string(),
+                    path: display_path(&path),
                 })
             } else {
                 None
@@ -79,19 +153,31 @@ pub fn browse_folder(path: Option<&str>, file_extensions: Option<&[String]>) -> 
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
-    let parent = parent_of(&target).map(|p| p.to_string_lossy().to_string());
-
     Ok(BrowseResult {
-        path: target.to_string_lossy().to_string(),
-        parent,
-        home: home.to_string_lossy().to_string(),
+        path: display_path(&target),
+        parent: parent_of(&target),
+        home: display_path(&home),
         entries,
+        is_virtual: false,
     })
 }
 
-fn parent_of(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    (parent != path).then(|| parent.to_path_buf())
+fn parent_of(path: &Path) -> Option<String> {
+    match path.parent() {
+        Some(parent) if parent != path => Some(display_path(parent)),
+        // Already at a filesystem root. On Windows that is a drive root, and
+        // the level above it is the drive list; on Unix `/` really is the top.
+        _ => {
+            #[cfg(windows)]
+            {
+                Some(DRIVE_ROOT.to_string())
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +198,49 @@ mod tests {
         assert!(astro.looks_like_game);
         let empty = result.entries.iter().find(|e| e.name == "Empty").unwrap();
         assert!(!empty.looks_like_game);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn display_path_trims_the_verbatim_prefix() {
+        assert_eq!(display_path(Path::new(r"\\?\C:\Users\you")), r"C:\Users\you");
+        assert_eq!(display_path(Path::new(r"\\?\UNC\server\share")), r"\\server\share");
+        assert_eq!(display_path(Path::new(r"C:\Users\you")), r"C:\Users\you");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn drive_root_is_the_parent_of_a_drive() {
+        assert_eq!(parent_of(Path::new(r"C:\")).as_deref(), Some(DRIVE_ROOT));
+        assert_eq!(parent_of(Path::new(r"C:\Users")).as_deref(), Some(r"C:\"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn opens_on_the_drive_list_when_no_path_is_given() {
+        for path in [None, Some("")] {
+            let result = browse_folder(path, None).unwrap();
+            assert!(result.is_virtual, "{path:?} should open This PC, not the home folder");
+            assert!(!result.entries.is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn opens_on_the_home_folder_when_no_path_is_given() {
+        let result = browse_folder(None, None).unwrap();
+        assert!(!result.is_virtual);
+        assert_eq!(result.path, result.home);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn drive_list_is_virtual_and_lists_mounted_drives() {
+        let result = browse_folder(Some(DRIVE_ROOT), None).unwrap();
+        assert!(result.is_virtual);
+        assert!(result.parent.is_none());
+        assert!(!result.entries.is_empty(), "expected at least one mounted drive");
+        assert!(result.entries.iter().all(|e| e.is_dir));
     }
 
     #[test]

@@ -81,8 +81,18 @@ pub fn find_terminal() -> Option<(PathBuf, Vec<String>)> {
     None
 }
 
+/// The per-OS half of the dev build layout: CMake configures into
+/// `_Build/<os>/`, so the `install/` tree to probe for is named after the
+/// platform this launcher was built for, not always `linux`.
+#[cfg(target_os = "linux")]
+const BUILD_INSTALL_DIR: &str = "_Build/linux/install";
+#[cfg(windows)]
+const BUILD_INSTALL_DIR: &str = "_Build/windows/install";
+#[cfg(target_os = "macos")]
+const BUILD_INSTALL_DIR: &str = "_Build/macos/install";
+
 /// Find `kyty_emulator` next to the app binary, its parent, walking up to a
-/// `_Build/linux/install/kyty_emulator` (the local dev build layout), or on
+/// `_Build/<os>/install/kyty_emulator` (the local dev build layout), or on
 /// `$PATH`.
 pub fn discover_emulator(app_binary_dir: &Path) -> Option<PathBuf> {
     let candidate = app_binary_dir.join(EMULATOR_EXE);
@@ -98,7 +108,7 @@ pub fn discover_emulator(app_binary_dir: &Path) -> Option<PathBuf> {
 
     let mut dir = app_binary_dir.to_path_buf();
     for _ in 0..8 {
-        let candidate = dir.join("_Build/linux/install").join(EMULATOR_EXE);
+        let candidate = dir.join(BUILD_INSTALL_DIR).join(EMULATOR_EXE);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -339,6 +349,30 @@ pub fn launch_external_terminal(
     Ok(())
 }
 
+/// `kyty_emulator` is a console subsystem program, so launching it from a
+/// windowed process makes Windows allocate a console window for it. Every
+/// line it prints is already captured -- streamed to the in-app console and
+/// teed to the session log, or redirected wholesale to the session log
+/// under the supervisor -- so that window shows nothing the launcher has
+/// not already got, and for anyone just playing a game it is pure noise.
+///
+/// There is no setting for it: a user who wants a live terminal picks
+/// "External terminal" as the launch mode, which is what that mode is for.
+/// No effect off Windows, where a GUI-launched child inherits no terminal
+/// to begin with.
+pub fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 pub struct RunState {
     pub child: Mutex<Option<Child>>,
 }
@@ -372,26 +406,40 @@ pub fn spawn_in_app(
     interpreter: &Path,
     args: &[String],
     working_dir: &Path,
+    session_log: Option<crate::logs::SessionLog>,
 ) -> std::io::Result<()> {
-    let mut child = Command::new(interpreter)
+    let mut command = Command::new(interpreter);
+    command
         .args(args)
         .current_dir(working_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command.spawn()?;
 
+    // Each reader tees to two places: the in-app console, which is live but
+    // lost when the app closes, and the session file, which is what a user
+    // can actually attach to a bug report.
     if let Some(stdout) = child.stdout.take() {
         let app = app.clone();
+        let log = session_log.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(log) = log.as_ref() {
+                    log.write_line("stdout", &line);
+                }
                 let _ = app.emit("emulator-log", LogLine { stream: "stdout", line });
             }
         });
     }
     if let Some(stderr) = child.stderr.take() {
         let app = app.clone();
+        let log = session_log.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(log) = log.as_ref() {
+                    log.write_line("stderr", &line);
+                }
                 let _ = app.emit("emulator-log", LogLine { stream: "stderr", line });
             }
         });
@@ -451,6 +499,11 @@ mod tests {
         info.host_input_mapping = vec!["Cross=J".to_string(), "Circle=L".to_string()];
 
         let args = build_args(&info, None, &[], 0.0);
+        // `--game` is built with `Path::join`, so its separator is the host's
+        // (`\` on Windows). That is the correct thing to hand the emulator on
+        // each platform; only this literal expectation is POSIX-shaped, so
+        // normalize rather than assert one platform's spelling everywhere.
+        let expected_game = Path::new("/games/Astro").join("eboot.bin").to_string_lossy().to_string();
         assert_eq!(
             args,
             vec![
@@ -471,7 +524,7 @@ mod tests {
                 "--spirv-debug-printf", "false",
                 "--keymap", "Cross=J",
                 "--keymap", "Circle=L",
-                "--game", "/games/Astro/eboot.bin",
+                "--game", expected_game.as_str(),
             ]
         );
     }

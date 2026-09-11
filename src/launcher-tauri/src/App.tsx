@@ -31,6 +31,11 @@ export type ViewId = "home" | "library" | "settings" | "logs" | "profile" | "exi
 export default function App() {
   const [view, setView] = useState<ViewId>("home");
   const [selectedGamePath, setSelectedGamePath] = useState<string | null>(null);
+  // Which view the game-detail pane was opened from. The pane itself always
+  // lives inside Library, but Home's "View details" jumps straight into it
+  // without the user ever seeing the Library grid -- so backing out of it
+  // has to return to Home, not strand them in a grid they never opened.
+  const [detailOrigin, setDetailOrigin] = useState<ViewId>("library");
   const [dataReady, setDataReady] = useState(false);
   // null = not yet known. BootController reads this only once, at mount
   // (its own useState initializer), so nothing renders below until this
@@ -71,14 +76,15 @@ export default function App() {
   // leaving the view at all, mirroring the real PS5's own "circle backs out
   // one level at a time" behavior.
   const handleBack = useCallback(() => {
-    setView((current) => {
-      if (current === "library" && selectedGamePath) {
-        setSelectedGamePath(null);
-        return current;
-      }
-      return current === "home" ? current : "home";
-    });
-  }, [selectedGamePath]);
+    if (view === "library" && selectedGamePath) {
+      setSelectedGamePath(null);
+      // Opened from Home, so the grid was never a step the user took --
+      // going "up one level" from here means Home itself.
+      if (detailOrigin === "home") setView("home");
+      return;
+    }
+    if (view !== "home") setView("home");
+  }, [view, selectedGamePath, detailOrigin]);
 
   // "menu" (was TRIANGLE): opens the control center overlay over the live
   // scene (ps5_tauri_ui_guidelines/03's "control-center / quick-menu
@@ -117,12 +123,21 @@ export default function App() {
               onNavigate={setView}
               onViewDetails={(path) => {
                 setSelectedGamePath(path);
+                setDetailOrigin("home");
                 setView("library");
               }}
             />
           )}
           {view === "library" && (
-            <LibraryView selectedGamePath={selectedGamePath} onSelectGame={setSelectedGamePath} onNavigate={setView} />
+            <LibraryView
+              selectedGamePath={selectedGamePath}
+              onSelectGame={(path) => {
+                // Picked out of the grid, so the grid is where back returns.
+                setDetailOrigin("library");
+                setSelectedGamePath(path);
+              }}
+              onNavigate={setView}
+            />
           )}
           {view === "settings" && <SettingsView />}
           {view === "logs" && <LogsView />}

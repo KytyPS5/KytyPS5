@@ -163,6 +163,7 @@ export function LibraryView({
               type="button"
               data-focusable
               data-focus-key="library-rail-filter"
+              data-flyout-trigger
               className={`icon-button ${filterOpen || hasActiveFilters(filters) ? "active" : ""}`}
               title={t("library.filters.button")}
               aria-label={t("library.filters.button")}

@@ -34,7 +34,7 @@ export function TopBar({ view, onNavigate, onBack }: { view: ViewId; onNavigate:
   };
 
   return (
-    <div className={styles.bar}>
+    <div className={styles.bar} data-focus-chrome>
       {/* No brand mark here anymore -- it's the OS app icon now (see
          src-tauri/icons), not a clickable in-window control. Home shows
          nothing in this slot (there's nowhere further "back" to go); every

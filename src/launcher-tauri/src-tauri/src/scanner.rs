@@ -150,8 +150,15 @@ fn existing_asset(game_dir: &Path, relative: &str) -> Option<String> {
     path.is_file().then(|| path.to_string_lossy().to_string())
 }
 
+/// `canonicalize` resolves symlinks and relative segments, which is what
+/// makes two spellings of the same game folder dedupe to one entry. On
+/// Windows it also returns the verbatim `\\?\F:\Games` form, and that
+/// spelling then reaches the emulator as `--game`, becomes the key in
+/// playtime.json and shows up in the UI, so trim it straight back off.
 fn normalize_dir(dir: &Path) -> PathBuf {
-    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
+    let canonical = dir.canonicalize();
+    let resolved = canonical.as_deref().unwrap_or(dir);
+    PathBuf::from(crate::browse::display_path(resolved))
 }
 
 /// Scan every configured game folder for `eboot.bin`, mirroring the

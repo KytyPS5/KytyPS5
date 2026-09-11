@@ -42,9 +42,20 @@ export function ensureRunListeners(): Promise<void> {
   return listenersReady;
 }
 
+/** Wipes the console. Only ever called from the Console page's own Clear
+ * button -- starting a game deliberately does not, so output from the run
+ * that just crashed is still there when the launcher comes back. */
+export function clearLogs(): void {
+  logLinesStore.set([]);
+}
+
 export async function runGame(info: Configuration, titleId: string): Promise<void> {
   await ensureRunListeners();
-  logLinesStore.set([]);
+  // A separator rather than a wipe: the previous run's output is usually
+  // the reason the user is looking at this page at all.
+  if (logLinesStore.get().length > 0) {
+    logLinesStore.update((lines) => [...lines, { stream: "stdout", line: "" }, { stream: "stdout", line: `--- ${info.name || info.gamePath} ---` }]);
+  }
   lastExitCodeStore.set(null);
   runningGameStore.set(info.gamePath);
   isRunningStore.set(true);

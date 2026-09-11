@@ -6,6 +6,7 @@ mod compatibility;
 mod config;
 mod emulator;
 mod first_seen;
+mod logs;
 mod gamepad;
 mod patches;
 mod playtime;
@@ -67,8 +68,38 @@ fn emulator_binary(app: &tauri::AppHandle, state: &AppState) -> Result<PathBuf, 
     Err("Could not find kyty_emulator".to_string())
 }
 
+/// Where this launcher keeps its own files: prefs, play history, trophy and
+/// art caches, and the session logs.
+///
+/// Deliberately not Tauri's `app_data_dir()`, which names the folder after
+/// the bundle identifier -- `io.github.kytyps5.launcher`. That is the right
+/// convention for something nobody opens by hand, but the Console page now
+/// tells people to go and fetch a log out of it, and Kyty already has an
+/// obvious home: `Kyty.ini` lives in `<config>/Kyty/`, so this sits beside
+/// it as `<config>/Kyty/Launcher/`.
+///
+/// Anything already written under the old identifier folder is moved across
+/// the first time this runs, so upgrading keeps play counts and settings.
 fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
-    app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Kyty")
+        .join("Launcher");
+
+    if !dir.exists() {
+        if let Ok(legacy) = app.path().app_data_dir() {
+            if legacy.is_dir() {
+                if let Some(parent) = dir.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // A rename across the same volume is atomic and cheap. If it
+                // fails (different volume, file in use), fall through and
+                // just start fresh in the new location rather than failing.
+                let _ = std::fs::rename(&legacy, &dir);
+            }
+        }
+    }
+    dir
 }
 
 // ---- Settings (Kyty.ini) --------------------------------------------------
@@ -164,20 +195,40 @@ fn run_game(
             interpreter: binary,
             args,
             working_dir: dir,
-            log_path: app_data_dir(&app).join("emulator-session.log"),
+            log_path: logs::new_session_path(&app_data_dir(&app))
+                .unwrap_or_else(|| app_data_dir(&app).join("emulator-session.log")),
             app_data_dir: app_data_dir(&app),
             game_path: info.game_path.clone(),
         };
-        supervisor::spawn(&spec).map_err(|e| e.to_string())?;
+        // Record the start *before* handing off. Both processes do a
+        // read-modify-write of the same playtime.json, and the supervisor's
+        // matching `record_stop` fires the moment the emulator exits --
+        // which can be almost immediately, if the game crashes on launch.
+        // Writing the start first means the supervisor always reads a file
+        // that already has this session's `play_count` bump in it, instead
+        // of racing this process and losing whichever write lands second.
         let _ = playtime::record_start(&app_data_dir(&app), &info.game_path);
+        supervisor::spawn(&spec).map_err(|e| e.to_string())?;
         app.exit(0);
         return Ok(());
     }
 
     let result = match launcher_prefs.launch_mode {
         prefs::LaunchMode::InApp => {
-            emulator::spawn_in_app(app.clone(), state.run_state.clone(), &binary, &args, &dir)
-                .map_err(|e| e.to_string())
+            let session_log = logs::new_session_path(&app_data_dir(&app))
+                .and_then(|path| logs::SessionLog::create(&path));
+            if let Some(log) = session_log.as_ref() {
+                log.write_header(&info.game_path, &args);
+            }
+            emulator::spawn_in_app(
+                app.clone(),
+                state.run_state.clone(),
+                &binary,
+                &args,
+                &dir,
+                session_log,
+            )
+            .map_err(|e| e.to_string())
         }
         prefs::LaunchMode::Terminal => {
             emulator::launch_external_terminal(&binary, &args, &dir).map_err(|e| e.to_string())
@@ -188,6 +239,15 @@ fn run_game(
         let _ = playtime::record_start(&app_data_dir(&app), &info.game_path);
     }
     result
+}
+
+/// Absolute path of the session-log folder, for the Console page's "open
+/// logs folder" action -- the thing a user attaches to a bug report.
+#[tauri::command]
+fn get_logs_dir(app: tauri::AppHandle) -> String {
+    let dir = logs::logs_dir(&app_data_dir(&app));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().to_string()
 }
 
 #[tauri::command]
@@ -549,16 +609,35 @@ fn poll_gamepad_state(state: State<AppState>) -> Vec<NativeGamepadState> {
         .collect()
 }
 
-// ---- Audio output device ------------------------------------------------------
+// ---- Audio devices ------------------------------------------------------------
 
 #[tauri::command]
-fn list_audio_sinks() -> Vec<audio::AudioSink> {
-    audio::list_sinks()
+fn list_audio_sinks() -> Vec<audio::AudioDevice> {
+    audio::list_devices(audio::Direction::Output)
+}
+
+/// Microphones and other capture endpoints, for games that record input.
+#[tauri::command]
+fn list_audio_sources() -> Vec<audio::AudioDevice> {
+    audio::list_devices(audio::Direction::Input)
 }
 
 #[tauri::command]
 fn set_audio_output_sink(sink: Option<String>) -> Result<(), String> {
-    audio::set_output_sink(sink)
+    audio::set_device(audio::Direction::Output, sink)
+}
+
+#[tauri::command]
+fn set_audio_input_source(source: Option<String>) -> Result<(), String> {
+    audio::set_device(audio::Direction::Input, source)
+}
+
+/// False where the OS gives a launcher no way to route a child process's
+/// audio (Windows). The Audio page shows an explanation instead of a
+/// picker that would quietly do nothing.
+#[tauri::command]
+fn audio_selection_supported() -> bool {
+    audio::selection_is_supported()
 }
 
 // THROWAWAY — diagnosing the "Run does not launch" report. Removed once fixed.
@@ -630,6 +709,7 @@ pub fn run() {
             stop_game,
             is_game_running,
             is_resumed_launch,
+            get_logs_dir,
             get_play_history,
             get_library_stats,
             record_play_stop,
@@ -654,7 +734,11 @@ pub fn run() {
             list_gamepad_names,
             poll_gamepad_state,
             list_audio_sinks,
+            list_audio_sources,
             set_audio_output_sink,
+            set_audio_input_source,
+            audio_selection_supported,
+            bluetooth::bluetooth_adapter_state,
             bluetooth::list_bluetooth_devices,
             bluetooth::scan_bluetooth_devices,
             bluetooth::pair_bluetooth_device,

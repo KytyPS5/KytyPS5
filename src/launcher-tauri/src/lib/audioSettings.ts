@@ -12,10 +12,13 @@ export interface AudioSettings {
   sfxEnabled: boolean;
   sfxVolume: number;
   outputSink: string | null;
+  /** Capture device a game records from. Same "store the id, display the
+   * name" rule as outputSink; `null` means the system default. */
+  inputSource: string | null;
 }
 
 const STORAGE_KEY = "kyty.audioSettings";
-const DEFAULT_SETTINGS: AudioSettings = { sfxEnabled: true, sfxVolume: 1, outputSink: null };
+const DEFAULT_SETTINGS: AudioSettings = { sfxEnabled: true, sfxVolume: 1, outputSink: null, inputSource: null };
 
 function readStored(): AudioSettings {
   try {
@@ -26,6 +29,7 @@ function readStored(): AudioSettings {
       sfxEnabled: typeof parsed.sfxEnabled === "boolean" ? parsed.sfxEnabled : DEFAULT_SETTINGS.sfxEnabled,
       sfxVolume: typeof parsed.sfxVolume === "number" ? Math.min(1, Math.max(0, parsed.sfxVolume)) : DEFAULT_SETTINGS.sfxVolume,
       outputSink: typeof parsed.outputSink === "string" ? parsed.outputSink : null,
+      inputSource: typeof parsed.inputSource === "string" ? parsed.inputSource : null,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -72,12 +76,22 @@ export async function setOutputSink(sink: string | null): Promise<void> {
   await invoke("set_audio_output_sink", { sink });
 }
 
-/** Re-applies the persisted sink choice to the current process -- call once
- * at app startup, since PULSE_SINK does not survive a relaunch on its own
- * (it is a process environment variable, not a system setting). */
+/** The capture half of setOutputSink: sets PULSE_SOURCE, which a game
+ * launched afterwards inherits. */
+export async function setInputSource(source: string | null): Promise<void> {
+  persist({ ...audioSettingsStore.get(), inputSource: source });
+  await invoke("set_audio_input_source", { source });
+}
+
+/** Re-applies the persisted device choices to the current process -- call
+ * once at app startup, since PULSE_SINK/PULSE_SOURCE do not survive a
+ * relaunch on their own (they are process environment variables, not system
+ * settings). Failures are swallowed: a device that has since been unplugged
+ * should leave the app running on the default, not break startup. */
 export async function reapplyStoredOutputSink(): Promise<void> {
-  const sink = audioSettingsStore.get().outputSink;
-  if (sink) await invoke("set_audio_output_sink", { sink }).catch(() => undefined);
+  const { outputSink, inputSource } = audioSettingsStore.get();
+  if (outputSink) await invoke("set_audio_output_sink", { sink: outputSink }).catch(() => undefined);
+  if (inputSource) await invoke("set_audio_input_source", { source: inputSource }).catch(() => undefined);
 }
 
 export interface AudioSink {
@@ -87,4 +101,15 @@ export interface AudioSink {
 
 export async function listAudioSinks(): Promise<AudioSink[]> {
   return invoke<AudioSink[]>("list_audio_sinks").catch(() => []);
+}
+
+export async function listAudioSources(): Promise<AudioSink[]> {
+  return invoke<AudioSink[]>("list_audio_sources").catch(() => []);
+}
+
+/** False where the OS gives a launcher no way to route a child process's
+ * audio (Windows) -- the picker is then informational, and the page says so
+ * rather than pretending a choice took effect. */
+export async function audioSelectionSupported(): Promise<boolean> {
+  return invoke<boolean>("audio_selection_supported").catch(() => false);
 }

@@ -900,8 +900,8 @@ void AppendBufferLoadDword(std::vector<u32> *code, u32 dst_vgpr,
 }
 
 void AppendBufferLoadOpcode(std::vector<u32> *code, u32 opcode, u32 dst_vgpr,
-                            u32 address_vgpr) {
-  code->push_back(EncodeMubuf0(opcode));
+                            u32 address_vgpr, bool glc = false) {
+  code->push_back(EncodeMubuf0(opcode, 0, false, true, glc));
   code->push_back(EncodeMubuf1(dst_vgpr, 0, address_vgpr));
 }
 
@@ -42594,6 +42594,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
 }
 
+// `accesses` DWORD stores through the record a lane key selects from a buffer table.
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -51650,6 +51651,9 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--glc-coherent-only") == 0) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {

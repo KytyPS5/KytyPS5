@@ -64,6 +64,7 @@ struct SpirvRequirements {
 	const char*     refusal      = nullptr;
 	const IR::Inst* refused_inst = nullptr;
 };
+
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 struct BufferDefinition {
 	uint32_t variable             = 0;

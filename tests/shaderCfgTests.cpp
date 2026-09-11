@@ -1848,10 +1848,13 @@ void TestShaderStageBarriers() {
       RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
   Check(SpirvContainsOpcode(result.spirv, 224),
         "SPIR-V binary does not contain OpControlBarrier");
+  // AcquireRelease | WorkgroupMemory | UniformMemory: s_barrier orders buffer traffic too.
   Check(
       std::find(result.spirv.begin(), result.spirv.end(), 264u) !=
+      std::find(result.spirv.begin(), result.spirv.end(), 328u) !=
           result.spirv.end(),
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
+      "SPIR-V barrier does not order workgroup and buffer memory with acquire-release");
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto vertex_result =

@@ -204,6 +204,9 @@ uint32_t BdaDwordPointer(EmitterState& state, uint32_t bda, bool coherent) {
 	return pointer;
 }
 
+uint32_t BdaAccessMask(bool coherent) {
+	return spv::MemoryAccessAlignedMask |
+	       (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
@@ -232,9 +235,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask |
-		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
-		                          alignment);
+		                          BdaAccessMask(coherent), alignment);
 		return value;
 	});
 }

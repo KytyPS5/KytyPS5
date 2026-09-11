@@ -222,6 +222,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
+				// A planning-only read is never emitted; its resource is still a register.
 				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");

@@ -40,7 +40,7 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 }
 
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
-	const auto value_type = ctx.TypeId(type);
+	const auto value_type = TypeId(ctx.state, type);
 	return value_type == 0 ? 0 : TypePointer(ctx.state, spv::StorageClassFunction, value_type);
 }
 
@@ -243,14 +243,22 @@ decltype(auto) Arg(ValueEmitContext& ctx, const IR::Inst& inst, size_t index) {
 	}
 }
 
-template <typename Return, typename... Args>
-void Invoke(Return (*emit)(ValueEmitContext&, Args...), ValueEmitContext& ctx,
-            const IR::Inst& inst) {
+template <typename Context, typename Return, typename... Args>
+void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::Inst& inst) {
 	// A full instruction keeps metadata and predicated/lane operand loads lazy.
+	static_assert(std::is_same_v<Context, ValueEmitContext> ||
+	              std::is_same_v<Context, EmitterState>);
+	auto& context = [&]() -> Context& {
+		if constexpr (std::is_same_v<Context, EmitterState>)
+			return ctx.state;
+		else
+			return ctx;
+	}();
 	constexpr bool has_inst = (std::is_same_v<Args, const IR::Inst&> || ...);
 	[&]<size_t... I>(std::index_sequence<I...>) {
+		static_assert(((!std::is_same_v<Args, const IR::Inst&> || I == 0) && ...));
 		const auto call = [&] {
-			return emit(ctx, Arg<Args>(ctx, inst, I - (has_inst && I != 0))...);
+			return emit(context, Arg<Args>(ctx, inst, I - (has_inst && I != 0))...);
 		};
 		if constexpr (std::is_void_v<Return>) {
 			call();
@@ -274,7 +282,7 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
                                const IR::Inst& inst) {
 	if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
-		const auto type = ctx.TypeId(inst.GetType());
+		const auto type = TypeId(ctx.state, inst.GetType());
 		if (type == 0 || inst.NumArgs() == 0) {
 			ctx.Fail(inst, "has no native SPIR-V representation");
 		}
@@ -295,7 +303,7 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                                const IR::Inst& inst) {
 	if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
-		const auto type = ctx.TypeId(inst.GetType());
+		const auto type = TypeId(ctx.state, inst.GetType());
 		if (type == 0) {
 			ctx.Fail(inst, "cannot be loaded by the dispatcher");
 		}
@@ -425,7 +433,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 
 } // namespace
 
-uint32_t ValueEmitContext::TypeId(IR::Type type) const {
+uint32_t TypeId(EmitterState& state, IR::Type type) {
 	switch (type) {
 		case IR::Type::U1: return TypeBool(state);
 		case IR::Type::U8:
@@ -470,7 +478,7 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 				return loaded->second.second;
 			}
 			const auto id = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpLoad, TypeId(inst->GetType()), id, found->second});
+			state.builder.AddFunction({spv::OpLoad, TypeId(state, inst->GetType()), id, found->second});
 			dispatcher_block_loads.insert_or_assign(inst, std::pair {state.current_label, id});
 			return id;
 		}
@@ -536,7 +544,7 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
-	const auto type  = TypeId(inst.Arg(index).GetType());
+	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
@@ -574,7 +582,7 @@ uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
 	if (const auto found = definitions.find(&inst); found != definitions.end()) {
 		if (found->second != value) {
 			state.builder.AddFunction(
-			    {spv::OpCopyObject, TypeId(inst.GetType()), found->second, value});
+			    {spv::OpCopyObject, TypeId(state, inst.GetType()), found->second, value});
 		}
 		return found->second;
 	}

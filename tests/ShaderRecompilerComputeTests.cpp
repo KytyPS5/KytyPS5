@@ -16687,6 +16687,44 @@ TestCase VectorVop3LshlrevB64Captured() {
   return test;
 }
 
+TestCase VectorDynamicU64ShiftEdges() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorDynamicU64ShiftEdges";
+  test.initial = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u};
+  test.expected = test.initial;
+  auto& code = test.code;
+  for (const uint64_t source : {uint64_t{0}, uint64_t{1},
+                               uint64_t{0x8000000000000000ull},
+                               uint64_t{0xffffffffffffffffull},
+                               uint64_t{0x0123456789abcdefull}}) {
+    AppendVMovLiteral(&code, 4, static_cast<u32>(source));
+    AppendVMovLiteral(&code, 5, static_cast<u32>(source >> 32u));
+    for (u32 index = 0; index < test.initial.size(); ++index) {
+      // A buffer load prevents the constant-shift specialization.
+      AppendVMovU32(&code, 30, index * sizeof(u32));
+      AppendBufferLoadDword(&code, 3, 30);
+      for (const bool left : {true, false}) {
+        AppendVop3(&code, left ? 0x2ff : 0x300, 33, Vgpr(3), Vgpr(4));
+        const auto amount = test.initial[index] & 63u;
+        const auto expected = left ? source << amount : source >> amount;
+        const auto output = static_cast<u32>(test.expected.size());
+        AppendStoreVgpr(&code, 33, output);
+        AppendStoreVgpr(&code, 34, output + 1u);
+        test.expected.push_back(static_cast<u32>(expected));
+        test.expected.push_back(static_cast<u32>(expected >> 32u));
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64,
+                  O::V_LSHRREV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftLeftLogical", "OpShiftRightLogical", "OpSelect"};
+  test.forbidden_spirv = {"OpTypeInt 64"};
+  return test;
+}
+
 TestCase VectorVop3IntegerOps() {
   using O = ShaderOpcode;
 
@@ -24745,6 +24783,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
+  AddCase(VectorDynamicU64ShiftEdges);
   AddCase(ScalarConditionalMoveB64);
   AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);

@@ -25,12 +25,6 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	return ConstantU32(state, 0);
 }
 
-uint32_t EmitAddU32(EmitterState& state, uint32_t lhs, uint32_t rhs) {
-	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpIAdd, TypeU32(state), ret, lhs, rhs});
-	return ret;
-}
-
 uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction({opcode, TypeU32(state), ret, lhs, rhs});
@@ -191,14 +185,6 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction({spv::OpBitcast, TypeI32(state), ret, value});
-	return ret;
-}
-
-uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t true_value,
-                              uint32_t false_value) {
-	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpSelect, TypeF32(state), ret, condition, true_value, false_value});
 	return ret;
 }
 

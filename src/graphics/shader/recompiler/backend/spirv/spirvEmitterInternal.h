@@ -165,6 +165,23 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.builder.AddFunction({spv::OpLabel, label});
 }
 
+uint32_t TypeId(EmitterState& state, IR::Type type);
+
+// Shared instruction construction; typed aliases add no forwarding functions.
+template <spv::Op opcode, IR::Type type, typename... Args>
+uint32_t EmitNative(EmitterState& state, Args... args) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({opcode, TypeId(state, type), result, args...});
+	return result;
+}
+
+uint32_t GlslStd450(EmitterState& state);
+
+template <GLSLstd450 opcode, IR::Type type, typename... Args>
+uint32_t EmitGlsl(EmitterState& state, Args... args) {
+	return EmitNative<spv::OpExtInst, type>(state, GlslStd450(state), opcode, args...);
+}
+
 inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({opcode, type, result, value});
@@ -172,14 +189,14 @@ inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint3
 }
 
 inline uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs,
-                            uint32_t rhs) {
+                       uint32_t rhs) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({opcode, type, result, lhs, rhs});
 	return result;
 }
 
-inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition,
-                            uint32_t true_value, uint32_t false_value) {
+inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition, uint32_t true_value,
+                       uint32_t false_value) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction({spv::OpSelect, type, result, condition, true_value, false_value});
 	return result;
@@ -195,7 +212,6 @@ struct ValueEmitContext {
 	uint32_t              FirstLane(uint32_t ballot);
 	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);
-	uint32_t              TypeId(IR::Type type) const;
 	uint32_t              Define(const IR::Inst& inst, uint32_t value);
 	uint32_t              ResourceIndex(IR::Value value, IR::ValueOpcode opcode);
 	const IR::Inst*       ImageAddress(IR::Value value);
@@ -313,8 +329,6 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
-uint32_t GlslStd450(EmitterState& state);
-
 void AllocateInputVariables(EmitterState& state);
 
 void AllocateOutputVariables(EmitterState& state);
@@ -330,7 +344,7 @@ void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name
 
 void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
-void DefineModule(EmitterState& state);
+void     DefineModule(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state);
 void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -365,7 +379,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 
-uint32_t EmitAddU32(EmitterState& state, uint32_t lhs, uint32_t rhs);
+inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs);
 
@@ -390,10 +404,9 @@ struct MemoryResourceAccess {
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
 
-MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
-                                                         const IR::MemoryInfo& mem,
-                                                         uint32_t variable,
-                                                         uint32_t pointer_type);
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
+                                                        const IR::MemoryInfo& mem,
+                                                        uint32_t variable, uint32_t pointer_type);
 
 uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
                                 uint32_t raw_index);
@@ -404,14 +417,13 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
 
-uint32_t EmitStorageBufferElementPointer(EmitterState& state,
-                                         const MemoryResourceAccess& access, uint32_t index,
-                                         uint32_t pointer_type);
+uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                         uint32_t index, uint32_t pointer_type);
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
 
-uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t true_value,
-                              uint32_t false_value);
+inline constexpr auto EmitTBufferSelectF32 =
+    EmitNative<spv::OpSelect, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 
 bool IsSignedFormatComponent(Format::ComponentType type);
 
@@ -427,20 +439,14 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control);
 
-uint32_t EmitSelectValueU32(EmitterState& state, uint32_t cond, uint32_t true_value,
-                            uint32_t false_value);
-
-void EmitShiftLeftLogicalU64Values(EmitterState& state, uint32_t low, uint32_t high, uint32_t shift,
-                                   uint32_t& out_low, uint32_t& out_high);
-
-void EmitShiftRightLogicalU64Values(EmitterState& state, uint32_t low, uint32_t high,
-                                    uint32_t shift, uint32_t& out_low, uint32_t& out_high);
+inline constexpr auto EmitSelectValueU32 =
+    EmitNative<spv::OpSelect, IR::Type::U32, uint32_t, uint32_t, uint32_t>;
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
 
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
 
-uint32_t EmitOrU32(EmitterState& state, uint32_t lhs, uint32_t rhs);
+inline constexpr auto EmitOrU32 = EmitNative<spv::OpBitwiseOr, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
                                 uint32_t constant);
@@ -453,17 +459,19 @@ uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 
 uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
-uint32_t EmitBitcastF32ToU32(EmitterState& state, uint32_t value);
+inline constexpr auto EmitBitcastF32ToU32 = EmitNative<spv::OpBitcast, IR::Type::U32, uint32_t>;
 
-uint32_t EmitBitcastU32ToF32(EmitterState& state, uint32_t value);
+inline constexpr auto EmitBitcastU32ToF32 = EmitNative<spv::OpBitcast, IR::Type::F32, uint32_t>;
 
-uint32_t EmitAndU32(EmitterState& state, uint32_t lhs, uint32_t rhs);
+inline constexpr auto EmitAndU32 = EmitNative<spv::OpBitwiseAnd, IR::Type::U32, uint32_t, uint32_t>;
 
-uint32_t EmitLogicalAndBool(EmitterState& state, uint32_t lhs, uint32_t rhs);
+inline constexpr auto EmitLogicalAndBool =
+    EmitNative<spv::OpLogicalAnd, IR::Type::U1, uint32_t, uint32_t>;
 
-uint32_t EmitLogicalOrBool(EmitterState& state, uint32_t lhs, uint32_t rhs);
+inline constexpr auto EmitLogicalOrBool =
+    EmitNative<spv::OpLogicalOr, IR::Type::U1, uint32_t, uint32_t>;
 
-uint32_t EmitLogicalNotBool(EmitterState& state, uint32_t value);
+inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
@@ -476,15 +484,15 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
-uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value);
+inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 
-uint32_t EmitFNegateValue(EmitterState& state, uint32_t value);
+inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F32, uint32_t>;
 
-uint32_t EmitFAbsValue(EmitterState& state, uint32_t value);
+inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, uint32_t>;
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 

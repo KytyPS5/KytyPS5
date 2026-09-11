@@ -16,29 +16,7 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 	return true;
 }
 
-uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
-	const auto shifted_one = state.builder.AllocateId();
-	const auto merged_one  = state.builder.AllocateId();
-	const auto shifted_two = state.builder.AllocateId();
-	const auto merged_two  = state.builder.AllocateId();
-	const auto quad_bits   = state.builder.AllocateId();
-	const auto result      = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpShiftRightLogical, TypeU64(state), shifted_one, value,
-	                           ConstantU64(state, 0x0000000100000001ull)});
-	state.builder.AddFunction({spv::OpBitwiseOr, TypeU64(state), merged_one, value, shifted_one});
-	state.builder.AddFunction({spv::OpShiftRightLogical, TypeU64(state), shifted_two, merged_one,
-	                           ConstantU64(state, 0x0000000200000002ull)});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseOr, TypeU64(state), merged_two, merged_one, shifted_two});
-	state.builder.AddFunction({spv::OpBitwiseAnd, TypeU64(state), quad_bits, merged_two,
-	                           ConstantU64(state, 0x1111111111111111ull)});
-	state.builder.AddFunction({spv::OpIMul, TypeU64(state), result, quad_bits,
-	                           ConstantU64(state, 0x0000000f0000000full)});
-	return result;
-}
-
-uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t component) {
-	auto& state = ctx.state;
+uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}
@@ -155,8 +133,7 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	return result;
 }
 
-uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
-	auto&       state = ctx.state;
+uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -217,7 +194,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
 	if (!input->per_vertex) {
-		return EmitAttribute(ctx, attr, chan);
+		return EmitAttribute(ctx.state, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {
 		const auto pointer = state.builder.AllocateId();
@@ -427,6 +404,26 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
+	const auto shifted_one = state.builder.AllocateId();
+	const auto merged_one  = state.builder.AllocateId();
+	const auto shifted_two = state.builder.AllocateId();
+	const auto merged_two  = state.builder.AllocateId();
+	const auto quad_bits   = state.builder.AllocateId();
+	const auto result      = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpShiftRightLogical, TypeU64(state), shifted_one, value,
+	                           ConstantU64(state, 0x0000000100000001ull)});
+	state.builder.AddFunction({spv::OpBitwiseOr, TypeU64(state), merged_one, value, shifted_one});
+	state.builder.AddFunction({spv::OpShiftRightLogical, TypeU64(state), shifted_two, merged_one,
+	                           ConstantU64(state, 0x0000000200000002ull)});
+	state.builder.AddFunction(
+	    {spv::OpBitwiseOr, TypeU64(state), merged_two, merged_one, shifted_two});
+	state.builder.AddFunction({spv::OpBitwiseAnd, TypeU64(state), quad_bits, merged_two,
+	                           ConstantU64(state, 0x1111111111111111ull)});
+	state.builder.AddFunction({spv::OpIMul, TypeU64(state), result, quad_bits,
+	                           ConstantU64(state, 0x0000000f0000000full)});
+	return result;
+}
 
 void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
@@ -523,8 +520,7 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 
 void EmitVoid(ValueEmitContext&) {}
 
-void EmitBarrier(ValueEmitContext& ctx) {
-	auto&      state = ctx.state;
+void EmitBarrier(EmitterState& state) {
 	const auto semantics =
 	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
 	state.builder.AddFunction({spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
@@ -547,8 +543,7 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
-uint32_t EmitGetUserData(ValueEmitContext& ctx, IR::ScalarReg reg) {
-	auto& state = ctx.state;
+uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 
 	uint32_t dword = 0;
 	if (!UserDataDwordIndex(state, reg, dword)) {
@@ -559,13 +554,12 @@ uint32_t EmitGetUserData(ValueEmitContext& ctx, IR::ScalarReg reg) {
 }
 
 uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) {
-	return EmitBuiltinU32(ctx, static_cast<IR::StageInputKind>(kind.U32()), index.U32());
+	return EmitBuiltinU32(ctx.state, static_cast<IR::StageInputKind>(kind.U32()), index.U32());
 }
 
-uint32_t EmitUndefU1(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
+uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpUndef, ctx.TypeId(inst.GetType()), result});
+	state.builder.AddFunction({spv::OpUndef, TypeId(state, inst.GetType()), result});
 	return result;
 }
 
@@ -582,23 +576,15 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto can_fetch     = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {spv::OpLogicalAnd, TypeBool(state), can_fetch, target.valid, source_active});
-	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx, can_fetch, shuffled,
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, can_fetch, shuffled,
 	                                                ConstantU32(state, 0));
 }
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
 	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
-	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx, write, ctx.Arg(inst, 0), ctx.Arg(inst, 1));
-}
-
-uint32_t EmitWqmU64(ValueEmitContext& ctx, uint32_t value) {
-	return EmitWqmU64(ctx.state, value);
-}
-
-uint32_t EmitLaneId(ValueEmitContext& ctx) {
-	auto& state = ctx.state;
-	return EmitSubgroupLocalInvocationId(state);
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
+	                                                ctx.Arg(inst, 1));
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
@@ -620,7 +606,8 @@ uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto hit   = state.builder.AllocateId();
 	state.builder.AddFunction({spv::OpIEqual, TypeBool(state), hit,
 	                           EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2)});
-	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx, hit, ctx.Arg(inst, 1), ctx.Arg(inst, 0));
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, hit, ctx.Arg(inst, 1),
+	                                                ctx.Arg(inst, 0));
 }
 
 uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -671,7 +658,7 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitAttribute(ctx, inst.Arg(0).U32(), inst.Arg(1).U32());
+	return EmitAttribute(ctx.state, inst.Arg(0).U32(), inst.Arg(1).U32());
 }
 
 uint32_t EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -683,7 +670,6 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	// runtime descriptor evaluator supplies the mapped shader base for host-side planning.
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
-
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Fail(inst, "must be lowered before SPIR-V emission");

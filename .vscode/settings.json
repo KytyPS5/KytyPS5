@@ -10,7 +10,11 @@
     "cmake.configureSettings": {
         "CMAKE_C_COMPILER": "clang-cl",
         "CMAKE_CXX_COMPILER": "clang-cl",
-        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.0/msvc2022_64"
-    }
+        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.0/msvc2022_64",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+    },
+    "C_Cpp.default.intelliSenseMode": "windows-clang-x64",
+    "C_Cpp.default.compilerPath": "${env:ProgramFiles}/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/_Build/windows/compile_commands.json",
+    "C_Cpp.default.cppStandard": "c++20"
 }
-

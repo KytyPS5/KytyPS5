@@ -377,8 +377,6 @@ struct PthreadAttrPrivate {
 	pthread_attr_t p;
 };
 
-struct PthreadCondPrivate;
-
 struct PthreadGuestData {
 	int32_t thread_id;
 	uint8_t reserved[4092];
@@ -402,7 +400,7 @@ struct PthreadPrivate {
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
 	uint64_t              cond_sequence = 0;
-	PthreadCondPrivate*   waiting_cond  = nullptr;
+	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
@@ -457,8 +455,6 @@ struct PthreadCondPrivate {
 	uint8_t                 reserved[256];
 	std::string             name;
 	std::mutex              m;
-	std::condition_variable cv;
-	uint64_t                sequence = 0;
 	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
 	std::vector<Pthread>    waiters;
 };
@@ -467,77 +463,40 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
-	thread->waiting_cond = cond;
 	cond->waiters.push_back(thread);
 }
 
-static bool CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
+static void CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
-	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
-	if (it == cond->waiters.end()) {
-		return false;
-	}
-
-	cond->waiters.erase(it);
-	if (thread->waiting_cond == cond) {
-		thread->waiting_cond = nullptr;
-	}
-	return true;
+	std::erase(cond->waiters, thread);
 }
 
-static bool CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
+static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 
 	if (thread == nullptr) {
 		if (cond->waiters.empty()) {
-			return false;
+			return;
 		}
 		thread = cond->waiters.front();
 	}
 
 	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
 	if (it == cond->waiters.end()) {
-		return false;
+		return;
 	}
 
 	cond->waiters.erase(it);
-	if (thread->waiting_cond == cond) {
-		thread->waiting_cond = nullptr;
-	}
 	thread->cond_sequence++;
-	return true;
-}
-
-static void CondClearWaiters(PthreadCondPrivate* cond) {
-	EXIT_IF(cond == nullptr);
-
-	for (auto* thread: cond->waiters) {
-		if (thread != nullptr && thread->waiting_cond == cond) {
-			thread->waiting_cond = nullptr;
-		}
-	}
-	cond->waiters.clear();
+	// Notify while holding cond->m so the selected waiter cannot exit and be freed first.
+	thread->cond_cv.notify_one();
 }
 
 void PthreadWakeForSignal(Pthread thread) {
-	if (thread == nullptr) {
-		return;
-	}
-
-	auto* cond = thread->waiting_cond;
-	if (cond == nullptr) {
-		return;
-	}
-
-	bool notify = false;
-	{
-		std::lock_guard lock(cond->m);
-		notify = (thread->waiting_cond == cond);
-	}
-	if (notify) {
-		cond->cv.notify_all();
+	if (thread != nullptr) {
+		thread->cond_cv.notify_one();
 	}
 }
 
@@ -2777,27 +2736,13 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		if (!(*cond)->waiters.empty()) {
-			(*cond)->sequence++;
-			CondClearWaiters(*cond);
-			notify = true;
-		}
+	std::lock_guard lock((*cond)->m);
+	for (auto* thread: (*cond)->waiters) {
+		thread->cond_sequence++;
+		thread->cond_cv.notify_one();
 	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond broadcast: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	(*cond)->waiters.clear();
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
@@ -2881,23 +2826,9 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		notify = CondWakeWaiter(*cond, nullptr);
-	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond signal: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	std::lock_guard lock((*cond)->m);
+	CondWakeWaiter(*cond, nullptr);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
@@ -2914,23 +2845,9 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		notify = CondWakeWaiter(*cond, thread);
-	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond signalto: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	std::lock_guard lock((*cond)->m);
+	CondWakeWaiter(*cond, thread);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
@@ -2959,7 +2876,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -2972,9 +2888,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
-	auto       ready    = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -2990,7 +2904,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 			                            ? remaining
 			                            : std::chrono::steady_clock::duration(
 			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			cond_value->cv.wait_for(cond_lock, poll);
+			thread->cond_cv.wait_for(cond_lock, poll);
 
 			if (!ready()) {
 				cond_lock.unlock();
@@ -3051,7 +2965,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3063,9 +2976,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
 		const auto now = std::chrono::steady_clock::now();
@@ -3078,7 +2989,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		                            ? remaining
 		                            : std::chrono::steady_clock::duration(
 		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		cond_value->cv.wait_for(cond_lock, poll);
+		thread->cond_cv.wait_for(cond_lock, poll);
 
 		if (!ready()) {
 			cond_lock.unlock();
@@ -3130,7 +3041,6 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3142,12 +3052,10 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
-		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 		if (!ready()) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();

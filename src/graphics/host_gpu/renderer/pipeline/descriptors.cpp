@@ -586,8 +586,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
+		// A depth-comparison (shadow) fetch must land on a depth image even when the slot is
+		// empty: a Dref sample against a colour image is illegal and loses the device
+		// (VUID-vkCmd*-None-06479). Storage images are never depth-compared.
+		auto       desc = NullTextureDesc(resource,
+		                                  storage ? TextureCache::BindingType::Storage
+		                                          : TextureCache::BindingType::Texture,
+		                                  !storage && resource.depth_compare);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
 	}
@@ -701,7 +706,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (m_unrepresentable_textures.insert(address).second) {
 			LOGF("TextureCache: %s, bound as null\n", report.c_str());
 		}
-		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		// Same rule as the null-descriptor path above: keep a shadow fetch on a depth image.
+		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture,
+		                                  resource.depth_compare);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
 	}

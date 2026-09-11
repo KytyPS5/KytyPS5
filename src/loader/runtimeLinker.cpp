@@ -39,14 +39,14 @@
 #endif
 #include <windows.h>
 #else
+#include <dlfcn.h>
+#include <execinfo.h>
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
-#include <dlfcn.h>
-#include <execinfo.h>
 #endif
 #endif
 

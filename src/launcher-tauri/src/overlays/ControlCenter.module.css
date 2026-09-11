@@ -1,0 +1,77 @@
+.panel {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  width: min(300px, 30vw);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  /* GlassPanel's "light" flat fill, not "heavy" -- this floats over the
+     still-animating Home hero (Ken Burns never stops underneath), the exact
+     case a live backdrop-filter measured at 13.3fps
+     (GlassPanel.module.css). */
+  background: rgba(20, 22, 30, 0.86);
+  border: 1px solid var(--glass-light-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 60px -16px var(--shadow-color);
+}
+
+.title {
+  padding: 8px 10px 4px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui), transform var(--t-hover) var(--ease-ui);
+}
+.item:hover {
+  background: rgba(255, 255, 255, 0.075);
+}
+.item.ps-focused,
+.item:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
+  outline-color: transparent;
+  background: rgba(255, 255, 255, 0.1);
+  transform: translateX(2px);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  margin-bottom: 4px;
+  border-radius: 6px;
+  background: var(--osd-bg);
+  border: 1px solid var(--osd-border);
+}
+
+.rowLabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -1,0 +1,134 @@
+/* PS5-style Game Library: titled header, a vertical icon rail (Search,
+   Sort/Filter), an "All: N" / "Sort by: ..." line, and a caption-less
+   square cover grid where only the selected tile names itself. */
+
+.page {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Same ground Settings.module.css uses (.scrim), so the two screens read as
+   one dashboard rather than two different treatments. */
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 900px 700px at 8% 0%, rgba(255, 205, 155, 0.07) 0%, transparent 60%), linear-gradient(180deg, rgba(5, 8, 18, 0.9) 0%, rgba(5, 8, 18, 0.86) 100%);
+}
+
+.body {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: var(--gutter-block) var(--gutter);
+  gap: clamp(20px, calc(2 * var(--vwx)), 32px);
+}
+
+/* Shared with GameDetail's and Settings' own page titles -- owner rule,
+   2026-09-09: "unify title styles", no icon next to a page title (see
+   styles/pageHeader.module.css). */
+.title {
+  composes: title from "../styles/pageHeader.module.css";
+  flex: none;
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: clamp(20px, calc(2.4 * var(--vwx)), 40px);
+}
+
+.rail {
+  position: relative;
+  flex: none;
+  width: 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.countRow {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: clamp(12px, 1.2 * var(--vwx), 20px);
+  min-height: 30px;
+}
+
+.countLabel {
+  font-size: 13.5px;
+  color: var(--text-secondary);
+}
+
+/* Read-only summary text, not a control -- see its use in Library.tsx. */
+.sortButton {
+  font-size: 13.5px;
+  color: var(--text-secondary);
+}
+
+.searchField {
+  flex: 1;
+  max-width: 340px;
+}
+
+/* Padding is symmetric and sized to clear a selected card's own growth
+   (GameCard.module.css .artSelected: scale(1.035) + translateY(-2px) + a 4px
+   accent-glow ring), not the old 4px 8px 16px 2px -- that asymmetric padding
+   was smaller than the ring on the left/top than on the right/bottom, so the
+   leftmost column and top row of selected cards got visibly shaved (real
+   bug, screenshot-caught). margin-inline pulls the extra padding back out of
+   .body's own var(--gutter) so the grid's cards stay optically aligned with
+   the title/count row above, instead of the grid visibly indenting past
+   them. */
+.grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(120px, 11 * var(--vwx), 168px), 1fr));
+  gap: clamp(14px, 1.4 * var(--vwx), 22px);
+  align-content: start;
+  padding: 12px 12px 20px;
+  margin-inline: -12px;
+}
+
+.hint {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* Opening a game replaces the grid with GameDetail full-screen (owner rule,
+   2026-09-09: feels far more fluid than a docked side panel that reflows the
+   grid every time a selection opens/closes) -- GameDetail owns its own
+   page/scrim/header (GameDetail.module.css), so this is just the focus-scope
+   anchor and entrance animation. */
+.fullDetail {
+  height: 100%;
+  animation: panel-enter var(--t-panel) var(--ease-enter);
+}
+
+.emptyState {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 40px;
+  text-align: center;
+}

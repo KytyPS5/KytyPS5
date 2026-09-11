@@ -1,0 +1,757 @@
+/* Kyty Launcher theme — a dark, PS5-dashboard-inspired visual language
+   (glass cards, translucent pill controls, generous rounding, full-bleed
+   game art). Not affiliated with, endorsed by, or sponsored by Sony
+   Interactive Entertainment; "PS5" and "PlayStation" are trademarks of Sony
+   Interactive Entertainment and are not implied to be used here beyond
+   describing compatibility with the hardware this emulator targets. No
+   Sony/PlayStation logos, button glyphs, or fonts are used anywhere in this
+   UI — see components/InputMappingDialog.tsx for the deliberate text-label
+   convention this extends.
+
+   Token-only: every color a component uses is one of these custom
+   properties, never a literal hex — this file is the single place the
+   palette lives. Component-specific layout/animation lives in co-located
+   *.module.css files next to each component; this file holds only shared
+   primitives and global tokens. Dark-only, matching the real PS5 dashboard
+   (no light mode).
+
+   Fonts are self-hosted via @fontsource (imported in main.tsx) — no runtime
+   network fetch, unlike the reference this UI is modeled on. See main.tsx
+   for the licensing rationale (SIL OFL substitute for the reference's own
+   unlicensed SST-derived family). One family, Inter, carries every role
+   (owner decision, PS5 clone pass): the reference itself is a single
+   humanist grotesque with hierarchy carried by weight/size/tracking, not by
+   mixing display faces -- see Home.module.css's .title and
+   Settings.module.css's .heading for the weight corrections that replaced
+   Saira's heavier default. */
+
+:root {
+  color-scheme: dark;
+  /* Settings > Appearance > Text size (lib/uiScale.ts). Applied via `zoom`,
+     not a rem-wide refactor or transform:scale -- see that file's doc
+     comment for why. Default 1 renders identically to no zoom at all. */
+  --ui-scale: 1;
+  zoom: var(--ui-scale);
+
+  /* ---- responsive basis ---------------------------------------------
+     `zoom` above scales the whole document, px and vw alike, so plain `vw`
+     (and any @media breakpoint) over-reports how much room is actually
+     left once uiScale.ts applies 115% or 130% text size: at 130%, 10vw of
+     *layout* space is only 7.7vw of the real, unscaled window. --vwx
+     corrects for that -- "1% of the real window width" at every scale --
+     so fluid tokens below stay true to the actual viewport instead of the
+     zoomed-out one. Layout tokens replace literal px gutters/widths that
+     used to be scattered across views/shell/overlays; each clamp()'s
+     floor is the smallest value that still reads correctly at the 1280px
+     window-width floor (tauri.conf.json minWidth), its ceiling the value
+     the design already shipped at 1440-1920px before this pass. */
+  --vwx: calc(1vw / var(--ui-scale));
+  --gutter: clamp(20px, calc(2.8 * var(--vwx)), 56px);
+  --gutter-block: clamp(16px, calc(2 * var(--vwx)), 40px);
+  --rail-tile: clamp(84px, calc(7.8 * var(--vwx)), 132px);
+  --rail-grow: 1.42;
+  --rail-grow-px: calc(var(--rail-tile) * 0.42);
+  --settings-rail: clamp(200px, calc(20 * var(--vwx)), 320px);
+
+  /* ---- fonts ------------------------------------------------------ */
+  --font-display: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Cantarell", sans-serif;
+  --font-ui: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "Cantarell", sans-serif;
+  --font-sans: var(--font-body);
+
+  /* ---- motion -------------------------------------------------------
+     Guideline-derived timing/easing tokens (ps5_tauri_ui_guidelines/00). Use
+     these instead of a literal duration/curve at any new or edited call
+     site; theme.css's own pre-existing rules below are repointed onto them. */
+  --ease-enter: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-ui: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --t-fast: 120ms;
+  --t-hover: 180ms;
+  --t-focus: 220ms;
+  --t-panel: 280ms;
+  --t-scene: 500ms;
+  --t-rest: 900ms;
+
+  /* ---- layers --------------------------------------------------------
+     04-tauri-implementation.md's z-index scale. Every stacking context in
+     the app should reference one of these rather than a bare literal. */
+  --z-bg: 0;
+  --z-scrim: 1;
+  --z-content: 10;
+  --z-nav: 20;
+  --z-ctx: 30;
+  --z-overlay: 40;
+  --z-modal: 50;
+  --z-boot: 60;
+  --z-grain: 70;
+
+  /* ---- surfaces ----------------------------------------------------
+     --void is the true page black behind full-bleed art screens (Home,
+     Library). --bg/--bg-elevated/--panel are for chrome that sits on top
+     of, or beside, art — navbars, sidebars, form panels. */
+  --void: #050810;
+  --bg: #0a0e1a;
+  --bg-elevated: #1e2433;
+  --panel: #141824;
+
+  /* Chrome glass — small UI elements (pills, buttons, cards) */
+  --glass-bg: rgba(255, 255, 255, 0.05);
+  --glass-bg-strong: rgba(255, 255, 255, 0.09);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-strong: rgba(255, 255, 255, 0.18);
+
+  /* Dashboard glass — floating panels over art. Two weights: light for
+     panels over an already-blurred hero background (no backdrop-filter
+     needed there, see HeroBackground), heavy for modals and the sidebar
+     over unpredictable content. */
+  --glass-light-bg: rgba(255, 255, 255, 0.15);
+  --glass-light-border: rgba(255, 255, 255, 0.2);
+  --glass-light-blur: blur(20px);
+  --glass-heavy-bg: rgba(10, 14, 26, 0.8);
+  --glass-heavy-blur: blur(24px);
+
+  /* Flat translucent fill, no blur -- for chrome sitting over the Home hero
+     (which is already pre-blurred art on an animating crossfade; see
+     GlassPanel.module.css's measurement note). Shared by the Home shortcut
+     tiles (GameTile.module.css) so they read as one surface. */
+  --osd-bg: rgba(5, 8, 18, 0.75);
+  --osd-border: rgba(255, 255, 255, 0.1);
+
+  /* Darker, borderless flat fill for the Home trophy strip specifically --
+     the reference PS5 dashboard's own trophy chip is a plain dark rectangle
+     with no outline, distinct from --osd-bg/--osd-border's bordered-panel
+     look (still used by .shortcutTile), so this is a separate token rather
+     than a restyle of that shared one. */
+  --osd-flat-bg: rgba(0, 0, 0, 0.55);
+
+  --text-primary: #ffffff;
+  --text-secondary: #8a9bb5;
+  --text-muted: #62708a;
+  --text-on-accent: #ffffff;
+
+  --accent: #ffffff;
+  --accent-cyan: #00d4ff;
+  --accent-glow: rgba(255, 255, 255, 0.32);
+
+  /* ---- hover / focus state tokens ------------------------------------
+     Previously three copies of the same literal (Settings.module.css's
+     .railItem.ps-focused, Toggle.module.css's .label.ps-focused, and the
+     focus-visible ring on .pill-button/.icon-button), plus no hover
+     language at all on .pill-button that a person could actually see.
+     One place now, so a future state change is one edit instead of a
+     hunt. --focus-ring-dark is the exception the white pill-button.primary
+     needs: --accent is #ffffff (see above), so the normal white ring is
+     invisible on a white fill -- same problem Toggle.module.css's
+     trackOn .knob already solved by flipping to --void instead of
+     --accent, applied here as a token instead of a one-off fix. */
+  --hover-fill: rgba(255, 255, 255, 0.14);
+  --hover-border: rgba(255, 255, 255, 0.32);
+  --focus-fill: rgba(255, 255, 255, 0.075);
+  --focus-ring: rgba(255, 255, 255, 0.9);
+  --focus-ring-dark: var(--void);
+
+  --success: #00e676;
+  --warning: #f5a623;
+  --error: #ff5c5c;
+  --info: #00d4ff;
+
+  /* Trophy grade colors (views/Trophies.tsx's GradeBadge, the Home/Profile
+     trophy OSD) -- Bronze used to fall back to --accent, which is #ffffff
+     (white buttons everywhere, see .pill-button.primary's comment), so
+     bronze trophies rendered as plain white badges. Named tokens instead of
+     four more literal hexes wandering into component files. */
+  --medal-platinum: #b9d4dd;
+  --medal-gold: #f5c542;
+  --medal-silver: #c7ccd1;
+  --medal-bronze: #d08a52;
+
+  --border: #1e2d45;
+  --shadow-color: rgba(0, 0, 0, 0.6);
+
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-pill: 999px;
+  --radius-card: 10px;
+  --radius-modal: 24px;
+
+  --backdrop-scrim: rgba(8, 10, 16, 0.8);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  position: relative;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+  color: inherit;
+}
+
+button {
+  font-family: var(--font-ui);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-display);
+  line-height: 1.1;
+  margin: 0;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--glass-border-strong);
+  border-radius: var(--radius-pill);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ---- film grain --------------------------------------------------------
+   A static, pre-rendered tileable PNG (public/art/grain.png), NOT the
+   reference's per-frame feTurbulence SVG filter — WebKitGTK (Tauri's Linux
+   renderer) rasterizes SVG filters on the CPU, full-viewport, every frame.
+   This is a plain image paint: cheap, and it never repaints on its own. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-grain);
+  pointer-events: none;
+  opacity: 0.038;
+  background-image: url("/art/grain.png");
+  background-repeat: repeat;
+  background-size: 180px 180px;
+}
+
+/* ---- gamepad cursor hiding ----------------------------------------------
+   FocusNav.tsx's setPointerHidden sets this attribute on any gamepad input
+   (a d-pad/stick move, a scroll tick, confirm/back/menu -- not only when
+   focus actually moves) -- gamepad input and a visible mouse arrow are
+   mutually exclusive at the UI level (owner rule, 2026-09-09): the real
+   pointer must never show while a controller is what's actually driving.
+   Any real mouse movement clears this immediately, from every state
+   including an open overlay/modal (see FocusNav's mousemove listener). */
+:root[data-gamepad-active="true"],
+:root[data-gamepad-active="true"] * {
+  cursor: none !important;
+}
+
+/* ---- shared primitives ------------------------------------------------ */
+
+.glass-panel {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.pill-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 20px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--glass-border-strong);
+  background: var(--glass-bg-strong);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  /* Always-present, always-transparent outline, same convention as the
+     [data-focusable] base rule below -- gives .ps-focused's outline-color
+     a real value to transition FROM instead of popping in flat. A plain
+     <button> matches FOCUSABLE_SELECTOR (FocusNav.tsx) and does receive
+     .ps-focused, but previously carried no outline geometry of its own
+     (only [data-focusable] declared width/offset), so colouring it
+     painted nothing -- this was the actual cause of "Add folder" reading
+     as unreachable by pad; the pad was already landing on it. */
+  outline: 1.5px solid transparent;
+  outline-offset: -2px;
+  transition: background var(--t-hover) var(--ease-ui), border-color var(--t-hover) var(--ease-ui), transform var(--t-fast) var(--ease-ui), outline-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter);
+}
+/* Guarded against gamepad input (theme.css hides the OS cursor under
+   [data-gamepad-active="true"], but WebKit keeps applying :hover to
+   whatever the parked cursor sits over) -- moves two channels, not one,
+   plus a lift, so it reads as a real state change under the mouse. */
+:root:not([data-gamepad-active="true"]) .pill-button:hover {
+  background: var(--hover-fill);
+  border-color: var(--hover-border);
+  transform: translateY(-1px);
+}
+.pill-button:active,
+.pill-button.ps-pressed {
+  transform: scale(0.97);
+}
+.pill-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+.pill-button:focus-visible,
+.pill-button.ps-focused {
+  outline-color: var(--accent);
+  box-shadow: 0 0 14px var(--accent-glow);
+}
+
+/* White fill, black text -- the real PS5's own primary-action look (see
+   Home.module.css's .playButton, the app's most prominent CTA, which
+   already used this instead of blue). Never a filled blue button anywhere
+   in this UI (owner rule, 2026-09-09) -- accent blue is reserved for
+   borders/rings/text on an otherwise dark or transparent surface (the
+   focus ring, .railItemActive, selection ring), never a button fill. */
+.pill-button.primary {
+  background: rgba(255, 255, 255, 0.95);
+  border-color: rgba(255, 255, 255, 0.95);
+  color: #000;
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.5);
+}
+/* The old 0.95 -> 1.0 hover was a single, near-imperceptible alpha step.
+   Full white plus the same lift and a deeper shadow reads as a real state
+   change without inverting the button's colour. */
+:root:not([data-gamepad-active="true"]) .pill-button.primary:hover {
+  background: #fff;
+  border-color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px -6px rgba(0, 0, 0, 0.6);
+}
+/* A white ring on a white fill is invisible -- --accent is #ffffff (see
+   :root above), which is exactly why this button read as unreachable by
+   pad even once the base .ps-focused rule above had real geometry. Dark
+   ring instead (owner decision), drawn inset via outline-offset:-2px from
+   the base .pill-button rule, plus a matching inset box-shadow so it
+   still reads at the pill's rounded corners; the drop shadow stays so the
+   button keeps its lift off the page. (0,3,0) beats .pill-button.primary's
+   own (0,2,0) box-shadow above regardless of source order. */
+.pill-button.primary:focus-visible,
+.pill-button.primary.ps-focused {
+  outline-color: var(--focus-ring-dark);
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.5), 0 0 0 2px var(--focus-ring-dark) inset;
+}
+
+/* Shared range-slider primitive -- the app's only input[type=range] styling,
+   covering both call sites (Settings' gamepad deadzone and audio effects
+   volume) so they read as one control. Callers set --range-fill (a
+   percentage string, e.g. "40%") inline per-value; this rule only draws the
+   track/thumb. White fill, matching .pill-button.primary's "no filled blue
+   control anywhere" rule above. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(to right, var(--accent) 0 var(--range-fill, 0%), var(--glass-bg-strong) var(--range-fill, 0%) 100%);
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-bg-strong);
+}
+input[type="range"]::-moz-range-progress {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  transition: transform var(--t-fast) var(--ease-ui), box-shadow var(--t-fast) var(--ease-ui);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  transition: transform var(--t-fast) var(--ease-ui), box-shadow var(--t-fast) var(--ease-ui);
+}
+input[type="range"]:hover::-webkit-slider-thumb,
+input[type="range"]:hover::-moz-range-thumb {
+  transform: scale(1.1);
+}
+input[type="range"]:active::-webkit-slider-thumb,
+input[type="range"]:active::-moz-range-thumb {
+  transform: scale(0.94);
+}
+input[type="range"]:focus-visible::-webkit-slider-thumb,
+input[type="range"]:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.35);
+}
+input[type="range"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+@media (prefers-reduced-motion: reduce) {
+  input[type="range"]::-webkit-slider-thumb,
+  input[type="range"]::-moz-range-thumb {
+    transition: box-shadow var(--t-fast) var(--ease-ui);
+  }
+  input[type="range"]:hover::-webkit-slider-thumb,
+  input[type="range"]:active::-webkit-slider-thumb,
+  input[type="range"]:hover::-moz-range-thumb,
+  input[type="range"]:active::-moz-range-thumb {
+    transform: none;
+  }
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  /* Same always-present transparent outline as .pill-button above, for the
+     same reason: without it .ps-focused had a colour but no geometry to
+     colour. */
+  outline: 1.5px solid transparent;
+  outline-offset: -2px;
+  transition: background var(--t-hover) var(--ease-ui), color var(--t-hover) var(--ease-ui), outline-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter);
+}
+:root:not([data-gamepad-active="true"]) .icon-button:hover {
+  background: var(--hover-fill);
+  color: var(--text-primary);
+}
+.icon-button:active,
+.icon-button.ps-pressed {
+  transform: scale(0.97);
+}
+.icon-button:focus-visible,
+.icon-button.ps-focused {
+  outline-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+.icon-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.icon-button.active {
+  background: var(--accent-glow);
+  color: var(--accent);
+}
+
+input[type="text"],
+input[type="search"],
+input[type="number"] {
+  height: 38px;
+  padding: 0 14px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--glass-border-strong);
+  background: var(--glass-bg);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--t-hover) var(--ease-ui), background var(--t-hover) var(--ease-ui);
+}
+input[type="text"]:focus,
+input[type="search"]:focus,
+input[type="number"]:focus {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+}
+
+select {
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--glass-border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+}
+.status-dot.in-game { background: var(--success); }
+.status-dot.main-menu { background: var(--info); }
+.status-dot.logo { background: var(--warning); }
+.status-dot.doesnt-boot { background: var(--error); }
+.status-dot.unknown { background: var(--text-muted); }
+
+/* ---- gamepad / keyboard spatial focus ring -----------------------------
+   Applied by FocusNav to the currently focused element via the .ps-focused
+   marker class.
+
+   Split by element class (PS5 clone pass, owner decision): the reference
+   does not use one uniform ring for every control. A media card reads as
+   focused mostly through scale + brightness (see GameTile.module.css /
+   GameCard.module.css's own [data-focusable].ps-focused overrides); a
+   settings row reads through a quiet fill + a tiny translate (see
+   Settings.module.css's .railItem.ps-focused). This block is only the
+   fallback for anything that declares [data-focusable] without its own
+   component-level focus treatment (plain buttons, chips, etc.) -- a plain,
+   crisp, thin-bordered box with no bloom and no infinite animation, per the
+   owner's own PS5 reference screenshot. No !important: a component's own
+   focus rule is allowed to win by specificity, on purpose, instead of
+   fighting this one. No border-radius is set here either, left for each
+   element's own class to declare, so a card keeps its own larger rounding
+   and a plain row keeps its own. Selection state (persistently selected,
+   not currently focused) never uses this class or animates -- see
+   LayoutPicker.tsx's own selection ring and Settings.module.css's
+   .railItemActive for that separate, static language. */
+[data-focusable] {
+  transition: border-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter), outline-color var(--t-focus) var(--ease-enter), transform var(--t-fast) var(--ease-enter);
+  /* Always-present, always-transparent outline (not just added by
+     .ps-focused below) so the transition above has a real start value to
+     animate FROM -- an outline that only exists once .ps-focused is
+     applied has no prior color to crossfade from and would pop in flat. */
+  outline: 1.5px solid transparent;
+  outline-offset: -2px;
+}
+
+.ps-focused {
+  /* outline, not border: border participates in layout (a width change
+     reflows the box and every rect a repeat-held nav step reads via
+     getBoundingClientRect -- exactly the kind of moving-target geometry
+     nav/FocusNav.tsx's findNearest works to avoid elsewhere). outline never
+     affects box size or position, and outline-offset:-2px keeps it drawn
+     inside the box so it is never clipped by a card's own
+     overflow:hidden the way a positive offset could be. Each focusable's
+     own border (GameTile's 2px, most others' 1px) is untouched and keeps
+     transitioning its own color exactly as before. */
+  outline-color: var(--accent);
+  box-shadow: 0 0 14px var(--accent-glow);
+  position: relative;
+}
+
+/* ---- universal keyboard focus fallback ---------------------------------
+   FocusNav drives .ps-focused, but a real Tab key (FocusNav has no Tab
+   handling of its own) still moves native focus independently, and until
+   now most module-styled clickables (.railItem, .themeCard, .customThumb,
+   Dropdown's .option, Toggle's .label, both browser-modal row lists) had
+   no :focus-visible rule at all -- native tab focus was invisible on them.
+   One shared fallback instead of adding a bespoke ring to each.
+
+   :where() keeps this at zero specificity on purpose: any component's own
+   :focus-visible rule (Settings.module.css's .railItem, GameDetail.module.css's
+   rail items, PowerMenu/ControlCenter's .item, Dropdown's .trigger) wins
+   outright regardless of load order, no !important and no source-order
+   fight needed to preserve those deliberate substitutions. No gamepad
+   guard here (contrast .pill-button:hover etc above): :focus-visible only
+   matches focus that followed keyboard-like interaction in the first
+   place, so it does not fire from a parked, hidden gamepad cursor the way
+   :hover does. */
+:where(:focus-visible) {
+  outline: 1.5px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Short compression feedback on gamepad confirm (FocusNav's setFocus/confirm
+   path). A class, not the old string-concatenated inline transform -- CSS
+   composes this with whatever transform the element's own state (e.g. a
+   focused rail tile's scale(1.42)) already applies, instead of one clobbering
+   the other. */
+.ps-pressed {
+  transition: transform 70ms var(--ease-ui);
+  transform: scale(0.985);
+}
+
+/* ---- shared "flux" selection effect -------------------------------------
+   A moving highlight riding an element's own border, plus a soft diagonal
+   shimmer across its face, for the "this is the thing you're on" language
+   (first written for the Home rail's shortcut tiles then generalized here).
+   One shared definition here instead of a separate copy per component
+   that wants it.
+
+   Global classes (literal className strings like "icon-button" /
+   "status-dot" elsewhere in this app), not CSS-module classes, so any
+   component can add them as plain sibling divs without importing anything.
+   Usage, inside a position:relative (or already-positioned) ancestor the
+   same size as the element being highlighted:
+
+     <div class="flux-ring" />
+     <div class="flux-shimmer" />
+
+   Both start fully inert (mask/gradient shaped, but not animating and not
+   visible) -- a CALLER's own hover/press/focus/selected rule is what turns
+   them on, by setting opacity: 1 and (only there, not here) starting the
+   flux-spin / flux-shimmer-sweep keyframes below. That split matters at
+   scale: a rail or grid can hold dozens of these siblings, and only the
+   one actually shown should ever be animating -- not every hidden one in
+   the list. --flux-band (ring thickness) and --flux-radius (corner
+   rounding) default to a 2px ring on --radius-card; a caller with a
+   different border width or radius overrides one or both. Position,
+   sizing-to-the-target and the show/hide transition are also the caller's
+   job (they know their own box and which state means "selected"), which
+   is why neither position nor a transform/opacity default lives here.
+   --flux-band / --flux-radius are read with fallbacks (var(x, default)),
+   not declared here, matching .flux-shimmer below -- a caller that sets its
+   own --flux-band on the same class (GameCard.module.css's .artFlux, for a
+   1.5px ring on --radius-lg instead of this file's 2px/--radius-card) needs
+   its value to win outright, not tie on specificity with whichever of the
+   two rules the browser loaded last. main.tsx now imports this file BEFORE
+   App (fixed: it previously imported it after every component CSS module,
+   so an equal-specificity declaration here was winning ties it should have
+   lost) -- the caller's own override wins as intended now, this fallback
+   pattern is what makes that possible rather than what was undermining it. */
+.flux-ring {
+  border-radius: var(--flux-radius, var(--radius-card));
+  padding: var(--flux-band, 2px);
+  overflow: hidden;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+/* The oversized (inset: -50%) conic-gradient square spins under the fixed
+   mask above -- rotating the masked ring itself instead would turn a
+   rounded rectangle into a diamond at 45deg, corners spilling out past the
+   element's own bounds (a real bug caught in this file's own history).
+   -50% on each side gives ~200% width/height, comfortably past the ~141%
+   (sqrt(2)) a square needs to keep every corner of a rotating fill covered. */
+.flux-ring::before {
+  content: "";
+  position: absolute;
+  inset: -50%;
+  background: conic-gradient(rgba(255, 255, 255, 0.95) 0deg, transparent 55deg, transparent 305deg, rgba(255, 255, 255, 0.95) 360deg);
+}
+@keyframes flux-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A single soft diagonal highlight sweeping across the element's face, on
+   its own slower/offset cycle from the ring above, a shimmer line layered
+   over the spinning border, not a full-box angular wedge (that would just
+   be the conic-gradient again, unmasked). */
+.flux-shimmer {
+  border-radius: var(--flux-radius, var(--radius-card));
+  overflow: hidden;
+}
+.flux-shimmer::before {
+  content: "";
+  position: absolute;
+  top: -150%;
+  left: -60%;
+  width: 45%;
+  height: 400%;
+  transform: rotate(20deg);
+  background: linear-gradient(to right, transparent 0%, rgba(255, 255, 255, 0.16) 50%, transparent 100%);
+  opacity: 0;
+}
+@keyframes flux-shimmer-sweep {
+  0%,
+  100% {
+    transform: translateX(-40%) rotate(20deg);
+    opacity: 0;
+  }
+  15%,
+  50% {
+    opacity: 1;
+  }
+  70% {
+    transform: translateX(220%) rotate(20deg);
+    opacity: 0;
+  }
+}
+
+/* Shared panel-entrance keyframe (01-motion-system.md's "Context panel"
+   row: 240-320ms, --ease-enter) -- global on purpose, not scoped to one CSS
+   module, so any component that pops a pane in (GameDetail's tab panes,
+   which have no controlled open/close state to drive a class-based
+   transition) can reference it directly via an inline `animation`. */
+@keyframes panel-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes ps-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ---- perf degradation switch --------------------------------------------
+   Set by lib/perf.ts after a boot-time frame-time probe. Components that
+   use live backdrop-filter should also provide a flat-fill fallback under
+   this attribute — see GlassPanel.module.css for the pattern. */
+:root[data-perf="low"] .glass-panel {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.92);
+}
+
+/* ---- reduced motion ------------------------------------------------------
+   Global opt-out (00-overview.md), replacing the old single-selector carve
+   -out that covered only the focus ring. Everything with real duration --
+   the hero crossfade + Ken Burns, the rail translate, the boot sequence, the
+   overlay/modal entrances, rest mode -- collapses to a near-instant snap. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

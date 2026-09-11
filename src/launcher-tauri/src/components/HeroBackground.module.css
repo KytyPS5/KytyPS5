@@ -1,0 +1,93 @@
+.root {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: var(--void);
+  z-index: var(--z-bg);
+}
+
+/* The selected dashboard background (Settings > Background) -- always
+   painted, no opacity transition. This is the floor every other layer sits
+   on; --void above is now visible only if this image itself fails to load
+   (background.ts's useVerifiedBaseUrl guards that by falling back to the
+   default theme). Shares the hero layers' Ken Burns pan so a hero crossfade
+   on top of it never looks like two different motions. */
+.base {
+  position: absolute;
+  inset: -6%;
+  background-size: cover;
+  background-position: center;
+  animation: hero-kenburns 42s ease-in-out infinite alternate;
+  will-change: transform;
+}
+
+.layer {
+  position: absolute;
+  inset: -6%; /* headroom for the pan/zoom below, so it never reveals an edge */
+  background-size: cover;
+  background-position: center;
+  opacity: 0;
+  /* Plain opacity transition, not framer-motion AnimatePresence -- this is
+     exactly the mechanism the Step 0b perf spike measured at 62.6fps.
+     AnimatePresence mode="wait" unmounts the outgoing layer before mounting
+     the incoming one (a fade-to-empty, not a crossfade); this never
+     unmounts either layer. */
+  transition: opacity var(--t-scene) var(--ease-ui);
+  /* Slow continuous pan/zoom ("Ken Burns"), transform-only -- the same
+     compositor-cheap property class the Step 0b spike measured safe.
+     Never animate this via `filter` or `background-position`; a transform
+     never triggers a repaint, only a compositor re-layer. */
+  animation: hero-kenburns 42s ease-in-out infinite alternate;
+  will-change: transform;
+}
+.layerActive {
+  composes: layer;
+  opacity: 1;
+}
+
+@keyframes hero-kenburns {
+  from {
+    transform: scale(1) translate(0, 0);
+  }
+  to {
+    transform: scale(1.08) translate(-1.5%, -1%);
+  }
+}
+
+/* Two directional scrims, verbatim from the reference (HomeDashboard.jsx:455-466). */
+.scrimRight {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to right, rgba(5, 8, 18, 0.88) 0%, rgba(5, 8, 18, 0.55) 40%, rgba(5, 8, 18, 0.15) 75%, rgba(5, 8, 18, 0.05) 100%);
+}
+.scrimTop {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(5, 8, 18, 0.85) 0%, rgba(5, 8, 18, 0.2) 35%, transparent 65%);
+}
+
+.vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, transparent 55%, rgba(0, 0, 0, 0.42) 100%);
+  pointer-events: none;
+}
+
+/* Two slots crossfading OPACITY, mirroring .layer/.layerActive above --
+   not a single element whose `background` (a radial-gradient string)
+   itself transitioned, which animated a non-compositor property across
+   the full viewport on every accent change (every hover): gradient
+   interpolation is a per-frame full-viewport repaint, not a compositor
+   re-layer the way an opacity crossfade between two already-painted
+   layers is. See HeroBackground.tsx for the slot-swap logic. */
+.accentRadial {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity var(--t-scene) var(--ease-ui);
+  pointer-events: none;
+}
+.accentRadialActive {
+  composes: accentRadial;
+  opacity: 1;
+}

@@ -327,8 +327,15 @@ struct PipelineCache::ProgramCache {
 			const char* v = std::getenv("KYTY_PS_OVERSIZE_CAP");
 			return v == nullptr ? size_t {40000} : static_cast<size_t>(std::strtoull(v, nullptr, 10));
 		}();
-		if (kDropOversized && options.stage == ShaderType::Pixel && kPixelOversizeCap != 0 &&
-		    result.spirv.size() > kPixelOversizeCap) {
+		// Debug companion to the cap: drop pixel shaders *below* this size too, so a single
+		// oversized shader can be isolated (min < size <= cap keeps exactly one band alive).
+		static const size_t kPixelUndersizeCap = []() -> size_t {
+			const char* v = std::getenv("KYTY_PS_UNDERSIZE_CAP");
+			return v == nullptr ? size_t {0} : static_cast<size_t>(std::strtoull(v, nullptr, 10));
+		}();
+		if (kDropOversized && options.stage == ShaderType::Pixel &&
+		    ((kPixelOversizeCap != 0 && result.spirv.size() > kPixelOversizeCap) ||
+		     (kPixelUndersizeCap != 0 && result.spirv.size() < kPixelUndersizeCap))) {
 			static std::atomic<uint32_t> logged {0};
 			const auto dropped = logged.fetch_add(1, std::memory_order_relaxed) + 1u;
 			LOGF("PipelineCache: dropping oversized %s shader hash=0x%016" PRIx64

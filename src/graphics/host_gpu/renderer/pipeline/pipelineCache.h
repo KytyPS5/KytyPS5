@@ -113,6 +113,9 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+	// Null when the driver cache is disabled, which Vulkan accepts as "no cache".
+	[[nodiscard]] vk::PipelineCache DriverCache() const { return m_driver_cache; }
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
@@ -181,7 +184,8 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	bool                                  m_driver_cache_dirty = false;
+	uint64_t                              m_build_hash         = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;

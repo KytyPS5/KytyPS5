@@ -30,9 +30,11 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -74,6 +76,52 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 		case 2: return vk::PolygonMode::eFill;
 		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
 	}
+}
+
+uint64_t EmulatorBinaryHash() {
+	std::filesystem::path exe;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// wmain leaves the narrow program path uninitialized; _get_pgmptr would abort.
+	wchar_t* program = nullptr;
+	if (_get_wpgmptr(&program) == 0 && program != nullptr) {
+		exe = std::filesystem::path(program);
+	}
+#else
+	std::error_code error;
+	exe = std::filesystem::read_symlink("/proc/self/exe", error);
+	if (error) {
+		exe.clear();
+	}
+#endif
+	if (exe.empty()) {
+		return 0;
+	}
+	Common::File file(exe, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return 0;
+	}
+	auto* state = XXH3_createState();
+	if (state == nullptr) {
+		return 0;
+	}
+	XXH3_64bits_reset(state);
+	std::vector<uint8_t> buffer(1024u * 1024u);
+	uint64_t             remaining = file.Size();
+	bool                 ok        = remaining != 0;
+	while (ok && remaining != 0) {
+		const auto chunk = static_cast<uint32_t>(std::min<uint64_t>(remaining, buffer.size()));
+		uint32_t   read  = 0;
+		file.Read(buffer.data(), chunk, &read);
+		ok = read == chunk;
+		XXH3_64bits_update(state, buffer.data(), read);
+		remaining -= read;
+	}
+	const auto hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
+	if (!ok) {
+		return 0;
+	}
+	return hash == 0 ? 1 : hash;
 }
 
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
@@ -185,6 +233,8 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// A VkPipelineCache cannot evict, so past this size the blob on disk stops growing.
+constexpr uint64_t MaxDriverCacheBytes = uint64_t {1} << 30u;
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -364,7 +414,6 @@ struct PipelineCache::ProgramCache {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
 	}
 
@@ -586,7 +635,9 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_build_hash = EmulatorBinaryHash();
+
+	const std::filesystem::path folder("_PipelineCache");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -674,6 +725,15 @@ void PipelineCache::Save() {
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+		if (result == vk::Result::eSuccess && size > MaxDriverCacheBytes) {
+			static bool reported = false;
+			if (!std::exchange(reported, true)) {
+				PipelineCacheLog("Vulkan pipeline cache: not saving, {} bytes is over the {} byte "
+				                 "budget (the file already on disk is kept)",
+				                 size, MaxDriverCacheBytes);
+			}
+			return;
+		}
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
@@ -1090,7 +1150,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 

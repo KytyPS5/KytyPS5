@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <algorithm>
@@ -114,7 +116,8 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 
 	vk::Pipeline pipeline = nullptr;
 	RequireVulkanSuccess(
-	    m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+	    m_graphics.device.createGraphicsPipelines(
+	        m_scheduler.Context().GetPipelineCache().DriverCache(), 1, &create, nullptr, &pipeline),
 	    "create color-to-MS-depth pipeline");
 	m_pipelines.push_back({key, pipeline});
 	return pipeline;

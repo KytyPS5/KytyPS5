@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
@@ -61,8 +63,10 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	vk::ComputePipelineCreateInfo pipeline_info {};
 	pipeline_info.stage  = stage;
 	pipeline_info.layout = m_fault_process_pipeline_layout;
+	// RenderContext declares the pipeline cache before the BufferCache that owns this manager.
 	const auto result = m_graphics.device.createComputePipelines(
-	    nullptr, 1, &pipeline_info, nullptr, &m_fault_process_pipeline);
+	    m_scheduler.Context().GetPipelineCache().DriverCache(), 1, &pipeline_info, nullptr,
+	    &m_fault_process_pipeline);
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");

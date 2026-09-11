@@ -14,11 +14,12 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
-#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,14 @@
 #include <limits>
 
 namespace Libs::Graphics {
+
+namespace {
+
+vk::PipelineCache HelperPipelineCache(CommandScheduler& scheduler) {
+	return scheduler.Context().GetPipelineCache().DriverCache();
+}
+
+} // namespace
 
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
@@ -238,8 +247,8 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 	create.stage          = stage;
 	create.layout         = m_pipeline_layout;
 	vk::Pipeline pipeline = nullptr;
-	const auto   result =
-	    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+	const auto   result = m_graphics.device.createComputePipelines(HelperPipelineCache(m_scheduler),
+	                                                               1, &create, nullptr, &pipeline);
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create TileManager pipeline");
 	return pipeline;

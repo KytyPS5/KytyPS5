@@ -323,6 +323,42 @@ struct PipelineCache::ProgramCache {
 		// which reads on screen as large chunks of missing geometry. KYTY_PS_OVERSIZE_CAP
 		// overrides the word threshold so both behaviours can be A/B'd on one binary; 0 disables
 		// the drop entirely.
+		// Skip one named shader instead of a whole size band. The size cap can only keep
+		// shaders below a threshold, so a single bad shader sitting between two good ones
+		// cannot be dropped on its own -- and dropping the band with it deletes geometry that
+		// would have rendered fine. KYTY_PS_SKIP_HASH=<hex list, comma separated> names them.
+		static const std::vector<uint64_t> kSkipHashes = [] {
+			std::vector<uint64_t> list;
+			const char*           v = std::getenv("KYTY_PS_SKIP_HASH");
+			if (v == nullptr) {
+				return list;
+			}
+			for (const char* cursor = v; *cursor != ' ';) {
+				char*      end   = nullptr;
+				const auto value = std::strtoull(cursor, &end, 16);
+				if (end == cursor) {
+					break;
+				}
+				if (value != 0) {
+					list.push_back(value);
+				}
+				cursor = (*end == ',') ? end + 1 : end;
+			}
+			return list;
+		}();
+		if (options.stage == ShaderType::Pixel &&
+		    std::ranges::find(kSkipHashes, options.shader_hash) != kSkipHashes.end()) {
+			static std::atomic<uint32_t> skipped {0};
+			if (skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("PipelineCache: skipping pixel shader hash=0x%016" PRIx64 " by request\n",
+				     options.shader_hash);
+			}
+			return {
+			    .specialization = std::move(specialization),
+			    .program        = std::move(result.program).TakeCompiledInfo(),
+			    .handle         = {.id = ++next_shader_id, .module = nullptr},
+			};
+		}
 		static const size_t kPixelOversizeCap = []() -> size_t {
 			const char* v = std::getenv("KYTY_PS_OVERSIZE_CAP");
 			return v == nullptr ? size_t {40000} : static_cast<size_t>(std::strtoull(v, nullptr, 10));

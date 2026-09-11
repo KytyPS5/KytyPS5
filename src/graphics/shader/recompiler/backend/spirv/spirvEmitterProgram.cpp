@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
 
@@ -6,7 +6,9 @@
 #include <bit>
 #include <functional>
 #include <optional>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -227,12 +229,46 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 	}
 }
 
-void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (EmitValueFlow(ctx, inst) || EmitValueAlu(ctx, inst) || EmitValueMemory(ctx, inst) ||
-	    EmitValueImage(ctx, inst)) {
-		return;
+template <typename T>
+decltype(auto) Arg(ValueEmitContext& ctx, const IR::Inst& inst, size_t index) {
+	if constexpr (std::is_same_v<T, const IR::Inst&>) {
+		return inst;
+	} else if constexpr (std::is_same_v<T, IR::Value>) {
+		return inst.Arg(index);
+	} else if constexpr (std::is_same_v<T, IR::ScalarReg>) {
+		return inst.Arg(index).ScalarRegister();
+	} else {
+		static_assert(std::is_same_v<T, uint32_t>);
+		return ctx.Def(inst.Arg(index));
 	}
-	ctx.Fail(inst, "has no direct SPIR-V emitter");
+}
+
+template <typename Return, typename... Args>
+void Invoke(Return (*emit)(ValueEmitContext&, Args...), ValueEmitContext& ctx,
+            const IR::Inst& inst) {
+	// A full instruction keeps metadata and predicated/lane operand loads lazy.
+	constexpr bool has_inst = (std::is_same_v<Args, const IR::Inst&> || ...);
+	[&]<size_t... I>(std::index_sequence<I...>) {
+		const auto call = [&] {
+			return emit(ctx, Arg<Args>(ctx, inst, I - (has_inst && I != 0))...);
+		};
+		if constexpr (std::is_void_v<Return>) {
+			call();
+		} else {
+			static_assert(std::is_same_v<Return, uint32_t>);
+			ctx.Define(inst, call());
+		}
+	}(std::index_sequence_for<Args...> {});
+}
+
+void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	switch (inst.GetOpcode()) {
+#define VALUE_OPCODE(name, ...)                                                                    \
+	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
+#include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
+#undef VALUE_OPCODE
+		default: ctx.Fail(inst, "has no direct SPIR-V emitter");
+	}
 }
 
 void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
@@ -532,16 +568,6 @@ uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 	const auto id = state.builder.AllocateId();
 	definitions.emplace(&inst, id);
 	return id;
-}
-
-uint32_t ValueEmitContext::Emit(const IR::Inst& inst, uint32_t opcode, IR::Type type,
-                                std::initializer_list<uint32_t> args) {
-	const auto type_id = TypeId(type);
-	const auto result  = Result(inst);
-	std::vector<uint32_t> words {opcode, type_id, result};
-	words.insert(words.end(), args.begin(), args.end());
-	state.builder.AddFunction(words);
-	return result;
 }
 
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {

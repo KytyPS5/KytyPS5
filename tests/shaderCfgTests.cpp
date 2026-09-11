@@ -8689,8 +8689,14 @@ void TestNewShaderRecompilerDispatcherSpillsU32x3() {
       definition.Emit(IR::ValueOpcode::CompositeConstructU32x3,
                       {IR::Value(1u), IR::Value(2u), IR::Value(3u)});
   IR::IREmitter use(program.blocks[2]);
-  use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(2u)});
-  use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(1u)});
+  const auto high =
+      use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(2u)});
+  const auto middle =
+      use.Emit(IR::ValueOpcode::CompositeExtractU32x3, {vector, IR::Value(1u)});
+  // Composite indices stay literal; arithmetic immediates become constant IDs.
+  // Resolving either arithmetic input must reuse the same dispatcher load.
+  const auto sum = use.Emit(IR::ValueOpcode::IAdd32, {high, IR::Value(7u)});
+  use.Emit(IR::ValueOpcode::IAdd32, {sum, middle});
 
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     options.input_info);

@@ -196,8 +196,6 @@ struct ValueEmitContext {
 	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);
 	uint32_t              TypeId(IR::Type type) const;
-	uint32_t              Emit(const IR::Inst& inst, uint32_t opcode, IR::Type type,
-	                           std::initializer_list<uint32_t> args);
 	uint32_t              Define(const IR::Inst& inst, uint32_t value);
 	uint32_t              ResourceIndex(IR::Value value, IR::ValueOpcode opcode);
 	const IR::Inst*       ImageAddress(IR::Value value);
@@ -489,14 +487,6 @@ uint32_t EmitFNegateValue(EmitterState& state, uint32_t value);
 uint32_t EmitFAbsValue(EmitterState& state, uint32_t value);
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
-
-bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst);
-
-bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst);
-
-bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
-
-bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
 void EmitProgram(EmitterState& state);
 

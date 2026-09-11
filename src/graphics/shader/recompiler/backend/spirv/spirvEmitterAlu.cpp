@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <array>
 
@@ -277,402 +277,364 @@ uint32_t EmitPackHalf(EmitterState& state, uint32_t src) {
 
 } // namespace
 
-bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
+uint32_t EmitConvertU16U32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitNative<spv::OpBitwiseAnd, IR::Type::U16>(ctx, arg0, ConstantU32(state, 0xffffu));
+}
+
+uint32_t EmitConvertU8U32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitNative<spv::OpBitwiseAnd, IR::Type::U8>(ctx, arg0, ConstantU32(state, 0xffu));
+}
+
+uint32_t EmitConvertF16F32(ValueEmitContext& ctx, uint32_t arg0) {
 	auto&      state = ctx.state;
-	const auto op    = inst.GetOpcode();
-	const auto unary = [&](uint32_t spirv, IR::Type type) {
-		ctx.Emit(inst, spirv, type, {ctx.Arg(inst, 0)});
-		return true;
-	};
-	const auto binary = [&](uint32_t spirv, IR::Type type) {
-		ctx.Emit(inst, spirv, type, {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
-		return true;
-	};
-	const auto ext_unary = [&](uint32_t ext) {
-		ctx.Define(inst, EmitExt(state, TypeF32(state), ext, {ctx.Arg(inst, 0)}));
-		return true;
-	};
-	switch (op) {
-		case IR::ValueOpcode::BitCastU16F16:
-		case IR::ValueOpcode::BitCastF16U16:
-		case IR::ValueOpcode::ConvertU32U16:
-		case IR::ValueOpcode::ConvertU32U8:
-		case IR::ValueOpcode::BitCastU32F32: return unary(spv::OpBitcast, IR::Type::U32);
-		case IR::ValueOpcode::BitCastF32U32: return unary(spv::OpBitcast, IR::Type::F32);
-		case IR::ValueOpcode::ConvertU16U32:
-			ctx.Emit(inst, spv::OpBitwiseAnd, IR::Type::U16,
-			         {ctx.Arg(inst, 0), ConstantU32(state, 0xffffu)});
-			return true;
-		case IR::ValueOpcode::ConvertU8U32:
-			ctx.Emit(inst, spv::OpBitwiseAnd, IR::Type::U8,
-			         {ctx.Arg(inst, 0), ConstantU32(state, 0xffu)});
-			return true;
-		case IR::ValueOpcode::ConvertF16F32: {
-			const auto pair = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
-			                           ctx.Arg(inst, 0), ConstantF32(state, 0)});
-			ctx.Define(inst, EmitPackHalf(state, pair));
-			return true;
-		}
-		case IR::ValueOpcode::ConvertF32F16:
-			ctx.Define(inst, EmitF16BitsToF32(state, ctx.Arg(inst, 0)));
-			return true;
-		case IR::ValueOpcode::ConvertS32F32:
-			ctx.Define(inst, EmitF32ToU32(state, ctx.Arg(inst, 0), true));
-			return true;
-		case IR::ValueOpcode::ConvertU32F32:
-			ctx.Define(inst, EmitF32ToU32(state, ctx.Arg(inst, 0), false));
-			return true;
-		case IR::ValueOpcode::ConvertF32S32: {
-			const auto signed_value =
-			    Unary(state, spv::OpBitcast, TypeI32(state), ctx.Arg(inst, 0));
-			ctx.Emit(inst, spv::OpConvertSToF, IR::Type::F32, {signed_value});
-			return true;
-		}
-		case IR::ValueOpcode::ConvertF32U32: return unary(spv::OpConvertUToF, IR::Type::F32);
-		case IR::ValueOpcode::CompositeConstructU64:
-			ctx.Emit(inst, spv::OpCompositeConstruct, IR::Type::U64,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
-			return true;
-		case IR::ValueOpcode::CompositeConstructU32x2:
-			ctx.Emit(inst, spv::OpCompositeConstruct, IR::Type::U32x2,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
-			return true;
-		case IR::ValueOpcode::CompositeConstructU32x3:
-			ctx.Emit(inst, spv::OpCompositeConstruct, IR::Type::U32x3,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
-			return true;
-		case IR::ValueOpcode::CompositeConstructF32x2:
-			ctx.Emit(inst, spv::OpCompositeConstruct, IR::Type::F32x2,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
-			return true;
-		case IR::ValueOpcode::CompositeConstructU32x4:
-			ctx.Emit(inst, spv::OpCompositeConstruct, IR::Type::U32x4,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3)});
-			return true;
-		case IR::ValueOpcode::CompositeExtractU64:
-		case IR::ValueOpcode::CompositeExtractU32x2:
-		case IR::ValueOpcode::CompositeExtractU32x3:
-		case IR::ValueOpcode::CompositeExtractU32x4:
-			ctx.Emit(inst, spv::OpCompositeExtract, IR::Type::U32,
-			         {ctx.Arg(inst, 0), inst.Arg(1).U32()});
-			return true;
-		case IR::ValueOpcode::PackHalf2x16:
-			ctx.Define(inst,
-			           EmitExt(state, TypeU32(state), GLSLstd450PackHalf2x16, {ctx.Arg(inst, 0)}));
-			return true;
-		case IR::ValueOpcode::PackSnorm2x16:
-			ctx.Define(inst,
-			           EmitExt(state, TypeU32(state), GLSLstd450PackSnorm2x16, {ctx.Arg(inst, 0)}));
-			return true;
-		case IR::ValueOpcode::PackUnorm2x16:
-			ctx.Define(inst,
-			           EmitExt(state, TypeU32(state), GLSLstd450PackUnorm2x16, {ctx.Arg(inst, 0)}));
-			return true;
-		case IR::ValueOpcode::PackFloat2x16Rtz: {
-			const auto low = EmitF32ToF16RtzBits(state, ctx.Arg(inst, 0));
-			const auto high =
-			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-			           EmitF32ToF16RtzBits(state, ctx.Arg(inst, 1)), ConstantU32(state, 16));
-			ctx.Define(inst, Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high));
-			return true;
-		}
-		case IR::ValueOpcode::FPAbs32:
-			ctx.Define(inst, EmitFAbsValue(state, ctx.Arg(inst, 0)));
-			return true;
-		case IR::ValueOpcode::FPNeg32:
-			ctx.Define(inst, EmitFNegateValue(state, ctx.Arg(inst, 0)));
-			return true;
-		case IR::ValueOpcode::FPSaturate32:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450FClamp,
-			                         {ctx.Arg(inst, 0), ConstantF32(state, 0),
-			                          ConstantF32(state, 0x3f800000u)}));
-			return true;
-		case IR::ValueOpcode::BitFieldInsert:
-			ctx.Emit(inst, spv::OpBitFieldInsert, IR::Type::U32,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3)});
-			return true;
-		case IR::ValueOpcode::BitFieldUExtract:
-			ctx.Emit(inst, spv::OpBitFieldUExtract, IR::Type::U32,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
-			return true;
-		case IR::ValueOpcode::BitFieldSExtract:
-			ctx.Emit(inst, spv::OpBitFieldSExtract, IR::Type::U32,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
-			return true;
-		case IR::ValueOpcode::SelectU1:
-			ctx.Emit(inst, spv::OpSelect, IR::Type::U1,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
-			return true;
-		case IR::ValueOpcode::SelectU32:
-			ctx.Emit(inst, spv::OpSelect, IR::Type::U32,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
-			return true;
-		case IR::ValueOpcode::SelectF32:
-			ctx.Emit(inst, spv::OpSelect, IR::Type::F32,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)});
-			return true;
-		case IR::ValueOpcode::IAdd32: return binary(spv::OpIAdd, IR::Type::U32);
-		case IR::ValueOpcode::ISub32: return binary(spv::OpISub, IR::Type::U32);
-		case IR::ValueOpcode::IMul32: return binary(spv::OpIMul, IR::Type::U32);
-		case IR::ValueOpcode::UDiv32: return binary(spv::OpUDiv, IR::Type::U32);
-		case IR::ValueOpcode::IAdd64:
-			ctx.Define(inst, EmitAdd64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::ISub64:
-			ctx.Define(inst, EmitSub64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::IMul64:
-			ctx.Define(inst, EmitMul64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::IAddCarry32:
-			ctx.Emit(inst, spv::OpIAddCarry, IR::Type::U32x2, {ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
-			return true;
-		case IR::ValueOpcode::SMulHi:
-			ctx.Define(inst, EmitMulHigh(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), true));
-			return true;
-		case IR::ValueOpcode::UMulHi:
-			ctx.Define(inst, EmitMulHigh(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
-			return true;
-		case IR::ValueOpcode::IAbs32: {
-			const auto value = ctx.Arg(inst, 0);
-			const auto neg   = Unary(state, spv::OpSNegate, TypeU32(state), value);
-			const auto negative =
-			    Binary(state, spv::OpSLessThan, TypeBool(state), value, ConstantU32(state, 0));
-			ctx.Define(inst, Select(state, TypeU32(state), negative, neg, value));
-			return true;
-		}
-		case IR::ValueOpcode::ShiftLeftLogical32:
-			return binary(spv::OpShiftLeftLogical, IR::Type::U32);
-		case IR::ValueOpcode::ShiftRightLogical32:
-			return binary(spv::OpShiftRightLogical, IR::Type::U32);
-		case IR::ValueOpcode::ShiftRightArithmetic32:
-			return binary(spv::OpShiftRightArithmetic, IR::Type::U32);
-		case IR::ValueOpcode::ShiftLeftLogical64:
-			ctx.Define(inst,
-			           inst.Arg(1).Resolve().IsImmediate()
-			               ? EmitConstantShift64(state, spv::OpShiftLeftLogical, ctx.Arg(inst, 0),
-			                                     inst.Arg(1).Resolve().U32())
-			               : EmitShift64(state, spv::OpShiftLeftLogical, ctx.Arg(inst, 0),
-			                             ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::ShiftRightLogical64:
-			ctx.Define(inst,
-			           inst.Arg(1).Resolve().IsImmediate()
-			               ? EmitConstantShift64(state, spv::OpShiftRightLogical, ctx.Arg(inst, 0),
-			                                     inst.Arg(1).Resolve().U32())
-			               : EmitShift64(state, spv::OpShiftRightLogical, ctx.Arg(inst, 0),
-			                             ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::ShiftRightArithmetic64:
-			ctx.Define(inst,
-			           inst.Arg(1).Resolve().IsImmediate()
-			               ? EmitConstantShift64(state, spv::OpShiftRightArithmetic,
-			                                     ctx.Arg(inst, 0), inst.Arg(1).Resolve().U32())
-			               : EmitShift64(state, spv::OpShiftRightArithmetic, ctx.Arg(inst, 0),
-			                             ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::BitwiseAnd32: return binary(spv::OpBitwiseAnd, IR::Type::U32);
-		case IR::ValueOpcode::BitwiseOr32: return binary(spv::OpBitwiseOr, IR::Type::U32);
-		case IR::ValueOpcode::BitwiseXor32: return binary(spv::OpBitwiseXor, IR::Type::U32);
-		case IR::ValueOpcode::BitwiseNot32: return unary(spv::OpNot, IR::Type::U32);
-		case IR::ValueOpcode::BitwiseAnd64:
-			ctx.Define(inst, Binary(state, spv::OpBitwiseAnd, TypeU64(state), ctx.Arg(inst, 0),
-			                        ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::BitReverse32: return unary(spv::OpBitReverse, IR::Type::U32);
-		case IR::ValueOpcode::BitCount32: return unary(spv::OpBitCount, IR::Type::U32);
-		case IR::ValueOpcode::BitCount64: {
-			const auto pair =
-			    ExtractPair(state, Unary(state, spv::OpBitCount, TypeU64(state), ctx.Arg(inst, 0)));
-			ctx.Define(inst, Binary(state, spv::OpIAdd, TypeU32(state), pair.low, pair.high));
-			return true;
-		}
-		case IR::ValueOpcode::FindILsb32: {
-			const auto value =
-			    EmitExt(state, TypeI32(state), GLSLstd450FindILsb, {ctx.Arg(inst, 0)});
-			ctx.Define(inst, Unary(state, spv::OpBitcast, TypeU32(state), value));
-			return true;
-		}
-		case IR::ValueOpcode::FindUMsb32: {
-			const auto value =
-			    EmitExt(state, TypeI32(state), GLSLstd450FindUMsb, {ctx.Arg(inst, 0)});
-			ctx.Define(inst, Unary(state, spv::OpBitcast, TypeU32(state), value));
-			return true;
-		}
-		case IR::ValueOpcode::FindUMsb64:
-			ctx.Define(inst, EmitFindMsb64(state, ctx.Arg(inst, 0)));
-			return true;
-		case IR::ValueOpcode::SMin32:
-			ctx.Define(inst, EmitMinMaxI32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
-			return true;
-		case IR::ValueOpcode::SMax32:
-			ctx.Define(inst, EmitMinMaxI32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), true));
-			return true;
-		case IR::ValueOpcode::UMin32:
-			ctx.Define(inst, EmitMinMaxU32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
-			return true;
-		case IR::ValueOpcode::UMax32:
-			ctx.Define(inst, EmitMinMaxU32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), true));
-			return true;
-		case IR::ValueOpcode::SMinTri32:
-			ctx.Define(inst, EmitMinMax3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                             ctx.Arg(inst, 2), true, false));
-			return true;
-		case IR::ValueOpcode::SMaxTri32:
-			ctx.Define(inst, EmitMinMax3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                             ctx.Arg(inst, 2), true, true));
-			return true;
-		case IR::ValueOpcode::UMinTri32:
-			ctx.Define(inst, EmitMinMax3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                             ctx.Arg(inst, 2), false, false));
-			return true;
-		case IR::ValueOpcode::UMaxTri32:
-			ctx.Define(inst, EmitMinMax3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                             ctx.Arg(inst, 2), false, true));
-			return true;
-		case IR::ValueOpcode::SMedTri32:
-			ctx.Define(inst,
-			           EmitMed3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), true));
-			return true;
-		case IR::ValueOpcode::UMedTri32:
-			ctx.Define(
-			    inst, EmitMed3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2), false));
-			return true;
-		case IR::ValueOpcode::SLessThan32: return binary(spv::OpSLessThan, IR::Type::U1);
-		case IR::ValueOpcode::ULessThan32: return binary(spv::OpULessThan, IR::Type::U1);
-		case IR::ValueOpcode::IEqual32: return binary(spv::OpIEqual, IR::Type::U1);
-		case IR::ValueOpcode::SLessThanEqual32: return binary(spv::OpSLessThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::ULessThanEqual32: return binary(spv::OpULessThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::SGreaterThan32: return binary(spv::OpSGreaterThan, IR::Type::U1);
-		case IR::ValueOpcode::UGreaterThan32: return binary(spv::OpUGreaterThan, IR::Type::U1);
-		case IR::ValueOpcode::INotEqual32: return binary(spv::OpINotEqual, IR::Type::U1);
-		case IR::ValueOpcode::SGreaterThanEqual32:
-			return binary(spv::OpSGreaterThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::UGreaterThanEqual32:
-			return binary(spv::OpUGreaterThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::IEqual64:
-			ctx.Define(inst, CompareEqual64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
-			return true;
-		case IR::ValueOpcode::INotEqual64:
-			ctx.Define(inst, CompareEqual64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), true));
-			return true;
-		case IR::ValueOpcode::ULessThan64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  spv::OpULessThan, spv::OpULessThan));
-			return true;
-		case IR::ValueOpcode::SLessThan64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  spv::OpSLessThan, spv::OpULessThan));
-			return true;
-		case IR::ValueOpcode::UGreaterThan64:
-			ctx.Define(inst, CompareOrdered64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                                  spv::OpUGreaterThan, spv::OpUGreaterThan));
-			return true;
-		case IR::ValueOpcode::LogicalOr: return binary(spv::OpLogicalOr, IR::Type::U1);
-		case IR::ValueOpcode::LogicalAnd: return binary(spv::OpLogicalAnd, IR::Type::U1);
-		case IR::ValueOpcode::LogicalXor: return binary(spv::OpLogicalNotEqual, IR::Type::U1);
-		case IR::ValueOpcode::LogicalNot: return unary(spv::OpLogicalNot, IR::Type::U1);
-		case IR::ValueOpcode::FPOrdEqual32: return binary(spv::OpFOrdEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPUnordEqual32: return binary(spv::OpFUnordEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPOrdNotEqual32: return binary(spv::OpFOrdNotEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPUnordNotEqual32: return binary(spv::OpFUnordNotEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPOrdLessThan32: return binary(spv::OpFOrdLessThan, IR::Type::U1);
-		case IR::ValueOpcode::FPUnordLessThan32: return binary(spv::OpFUnordLessThan, IR::Type::U1);
-		case IR::ValueOpcode::FPOrdGreaterThan32:
-			return binary(spv::OpFOrdGreaterThan, IR::Type::U1);
-		case IR::ValueOpcode::FPUnordGreaterThan32:
-			return binary(spv::OpFUnordGreaterThan, IR::Type::U1);
-		case IR::ValueOpcode::FPOrdLessThanEqual32:
-			return binary(spv::OpFOrdLessThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPUnordLessThanEqual32:
-			return binary(spv::OpFUnordLessThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPOrdGreaterThanEqual32:
-			return binary(spv::OpFOrdGreaterThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPUnordGreaterThanEqual32:
-			return binary(spv::OpFUnordGreaterThanEqual, IR::Type::U1);
-		case IR::ValueOpcode::FPIsNan32:
-			ctx.Emit(inst, spv::OpFUnordNotEqual, IR::Type::U1,
-			         {ctx.Arg(inst, 0), ctx.Arg(inst, 0)});
-			return true;
-		case IR::ValueOpcode::FPCmpClass32:
-			ctx.Define(inst, EmitClassMaskF32(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::FPAdd32: return binary(spv::OpFAdd, IR::Type::F32);
-		case IR::ValueOpcode::FPSub32: return binary(spv::OpFSub, IR::Type::F32);
-		case IR::ValueOpcode::FPMul32: return binary(spv::OpFMul, IR::Type::F32);
-		case IR::ValueOpcode::FPFma32:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450Fma,
-			                         {ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)}));
-			return true;
-		case IR::ValueOpcode::FPMin32:
-			ctx.Define(inst, EmitMinMaxF32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), false));
-			return true;
-		case IR::ValueOpcode::FPMax32:
-			ctx.Define(inst, EmitMinMaxF32Value(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), true));
-			return true;
-		case IR::ValueOpcode::FPMinTri32:
-			ctx.Define(inst, EmitFMinMax3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                              ctx.Arg(inst, 2), false));
-			return true;
-		case IR::ValueOpcode::FPMaxTri32:
-			ctx.Define(inst, EmitFMinMax3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
-			                              ctx.Arg(inst, 2), true));
-			return true;
-		case IR::ValueOpcode::FPMedTri32:
-			ctx.Define(inst,
-			           EmitFMed3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)));
-			return true;
-		case IR::ValueOpcode::FPRecip32: {
-			const auto source = EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0));
-			ctx.Define(inst, Binary(state, spv::OpFDiv, TypeF32(state),
-			                        ConstantF32(state, 0x3f800000u), source));
-			return true;
-		}
-		case IR::ValueOpcode::FPRecipIFlag32:
-			// Integer-to-float inputs used by IFLAG cannot be denormal.
-			ctx.Define(inst, Binary(state, spv::OpFDiv, TypeF32(state),
-			                        ConstantF32(state, 0x3f800000u), ctx.Arg(inst, 0)));
-			return true;
-		case IR::ValueOpcode::FPRecipSqrt32:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
-			return true;
-		case IR::ValueOpcode::FPSqrt:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
-			return true;
-		case IR::ValueOpcode::FPSin:
-		case IR::ValueOpcode::FPCos: {
-			auto source = EmitTrigCycleF32(state, ctx.Arg(inst, 0), op == IR::ValueOpcode::FPSin);
-			source =
-			    Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
-			ctx.Define(inst, EmitExt(state, TypeF32(state),
-			                         op == IR::ValueOpcode::FPSin ? GLSLstd450Sin : GLSLstd450Cos,
-			                         {source}));
-			return true;
-		}
-		case IR::ValueOpcode::FPExp2:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450Exp2,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
-			return true;
-		case IR::ValueOpcode::FPLog2:
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450Log2,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
-			return true;
-		case IR::ValueOpcode::FPLdexp: {
-			const auto exponent = Unary(state, spv::OpBitcast, TypeI32(state), ctx.Arg(inst, 1));
-			ctx.Define(inst, EmitExt(state, TypeF32(state), GLSLstd450Ldexp,
-			                         {ctx.Arg(inst, 0), exponent}));
-			return true;
-		}
-		case IR::ValueOpcode::FPRoundEven32: return ext_unary(GLSLstd450RoundEven);
-		case IR::ValueOpcode::FPFloor32: return ext_unary(GLSLstd450Floor);
-		case IR::ValueOpcode::FPCeil32: return ext_unary(GLSLstd450Ceil);
-		case IR::ValueOpcode::FPTrunc32: return ext_unary(GLSLstd450Trunc);
-		case IR::ValueOpcode::FPFract32: return ext_unary(GLSLstd450Fract);
-		default: return false;
-	}
+	const auto pair  = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0, ConstantF32(state, 0)});
+	return EmitPackHalf(state, pair);
+}
+
+uint32_t EmitConvertF32F16(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitF16BitsToF32(state, arg0);
+}
+
+uint32_t EmitConvertS32F32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitF32ToU32(state, arg0, true);
+}
+
+uint32_t EmitConvertU32F32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitF32ToU32(state, arg0, false);
+}
+
+uint32_t EmitConvertF32S32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto&      state        = ctx.state;
+	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);
+	return EmitNative<spv::OpConvertSToF, IR::Type::F32>(ctx, signed_value);
+}
+
+uint32_t EmitCompositeExtractU64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
+	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(ctx, arg0, arg1.U32());
+}
+
+uint32_t EmitPackHalf2x16(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeU32(state), GLSLstd450PackHalf2x16, {arg0});
+}
+
+uint32_t EmitPackSnorm2x16(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeU32(state), GLSLstd450PackSnorm2x16, {arg0});
+}
+
+uint32_t EmitPackUnorm2x16(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeU32(state), GLSLstd450PackUnorm2x16, {arg0});
+}
+
+uint32_t EmitPackFloat2x16Rtz(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto&      state = ctx.state;
+	const auto low   = EmitF32ToF16RtzBits(state, arg0);
+	const auto high  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                          EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));
+	return Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+}
+
+uint32_t EmitFPAbs32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitFAbsValue(state, arg0);
+}
+
+uint32_t EmitFPNeg32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitFNegateValue(state, arg0);
+}
+
+uint32_t EmitFPSaturate32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+}
+
+uint32_t EmitIAdd64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitAdd64(state, arg0, arg1);
+}
+
+uint32_t EmitISub64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitSub64(state, arg0, arg1);
+}
+
+uint32_t EmitIMul64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMul64(state, arg0, arg1);
+}
+
+uint32_t EmitSMulHi(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMulHigh(state, arg0, arg1, true);
+}
+
+uint32_t EmitUMulHi(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMulHigh(state, arg0, arg1, false);
+}
+
+uint32_t EmitIAbs32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto&      state = ctx.state;
+	const auto value = arg0;
+	const auto neg   = Unary(state, spv::OpSNegate, TypeU32(state), value);
+	const auto negative =
+	    Binary(state, spv::OpSLessThan, TypeBool(state), value, ConstantU32(state, 0));
+	return Select(state, TypeU32(state), negative, neg, value);
+}
+
+uint32_t EmitShiftLeftLogical64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
+	auto& state = ctx.state;
+	return arg1.Resolve().IsImmediate()
+	           ? EmitConstantShift64(state, spv::OpShiftLeftLogical, arg0, arg1.Resolve().U32())
+	           : EmitShift64(state, spv::OpShiftLeftLogical, arg0, ctx.Def(arg1));
+}
+
+uint32_t EmitShiftRightLogical64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
+	auto& state = ctx.state;
+	return arg1.Resolve().IsImmediate()
+	           ? EmitConstantShift64(state, spv::OpShiftRightLogical, arg0, arg1.Resolve().U32())
+	           : EmitShift64(state, spv::OpShiftRightLogical, arg0, ctx.Def(arg1));
+}
+
+uint32_t EmitShiftRightArithmetic64(ValueEmitContext& ctx, uint32_t arg0, IR::Value arg1) {
+	auto& state = ctx.state;
+	return arg1.Resolve().IsImmediate()
+	           ? EmitConstantShift64(state, spv::OpShiftRightArithmetic, arg0, arg1.Resolve().U32())
+	           : EmitShift64(state, spv::OpShiftRightArithmetic, arg0, ctx.Def(arg1));
+}
+
+uint32_t EmitBitwiseAnd64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return Binary(state, spv::OpBitwiseAnd, TypeU64(state), arg0, arg1);
+}
+
+uint32_t EmitBitCount64(ValueEmitContext& ctx, uint32_t arg0) {
+	auto&      state = ctx.state;
+	const auto pair  = ExtractPair(state, Unary(state, spv::OpBitCount, TypeU64(state), arg0));
+	return Binary(state, spv::OpIAdd, TypeU32(state), pair.low, pair.high);
+}
+
+uint32_t EmitFindILsb32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto&      state = ctx.state;
+	const auto value = EmitExt(state, TypeI32(state), GLSLstd450FindILsb, {arg0});
+	return Unary(state, spv::OpBitcast, TypeU32(state), value);
+}
+
+uint32_t EmitFindUMsb32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto&      state = ctx.state;
+	const auto value = EmitExt(state, TypeI32(state), GLSLstd450FindUMsb, {arg0});
+	return Unary(state, spv::OpBitcast, TypeU32(state), value);
+}
+
+uint32_t EmitFindUMsb64(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitFindMsb64(state, arg0);
+}
+
+uint32_t EmitSMin32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMinMaxI32Value(state, arg0, arg1, false);
+}
+
+uint32_t EmitSMax32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMinMaxI32Value(state, arg0, arg1, true);
+}
+
+uint32_t EmitUMin32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMinMaxU32Value(state, arg0, arg1, false);
+}
+
+uint32_t EmitUMax32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMinMaxU32Value(state, arg0, arg1, true);
+}
+
+uint32_t EmitSMinTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitMinMax3(state, arg0, arg1, arg2, true, false);
+}
+
+uint32_t EmitSMaxTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitMinMax3(state, arg0, arg1, arg2, true, true);
+}
+
+uint32_t EmitUMinTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitMinMax3(state, arg0, arg1, arg2, false, false);
+}
+
+uint32_t EmitUMaxTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitMinMax3(state, arg0, arg1, arg2, false, true);
+}
+
+uint32_t EmitSMedTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitMed3(state, arg0, arg1, arg2, true);
+}
+
+uint32_t EmitUMedTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitMed3(state, arg0, arg1, arg2, false);
+}
+
+uint32_t EmitIEqual64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return CompareEqual64(state, arg0, arg1, false);
+}
+
+uint32_t EmitINotEqual64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return CompareEqual64(state, arg0, arg1, true);
+}
+
+uint32_t EmitULessThan64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return CompareOrdered64(state, arg0, arg1, spv::OpULessThan, spv::OpULessThan);
+}
+
+uint32_t EmitSLessThan64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return CompareOrdered64(state, arg0, arg1, spv::OpSLessThan, spv::OpULessThan);
+}
+
+uint32_t EmitUGreaterThan64(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThan);
+}
+
+uint32_t EmitFPIsNan32(ValueEmitContext& ctx, uint32_t arg0) {
+	return EmitNative<spv::OpFUnordNotEqual, IR::Type::U1>(ctx, arg0, arg0);
+}
+
+uint32_t EmitFPCmpClass32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitClassMaskF32(state, arg0, arg1);
+}
+
+uint32_t EmitFPFma32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Fma, {arg0, arg1, arg2});
+}
+
+uint32_t EmitFPMin32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMinMaxF32Value(state, arg0, arg1, false);
+}
+
+uint32_t EmitFPMax32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto& state = ctx.state;
+	return EmitMinMaxF32Value(state, arg0, arg1, true);
+}
+
+uint32_t EmitFPMinTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitFMinMax3(state, arg0, arg1, arg2, false);
+}
+
+uint32_t EmitFPMaxTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitFMinMax3(state, arg0, arg1, arg2, true);
+}
+
+uint32_t EmitFPMedTri32(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	auto& state = ctx.state;
+	return EmitFMed3(state, arg0, arg1, arg2);
+}
+
+uint32_t EmitFPRecip32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto&      state  = ctx.state;
+	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+}
+
+uint32_t EmitFPRecipIFlag32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	// Integer-to-float inputs used by IFLAG cannot be denormal.
+	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), arg0);
+}
+
+uint32_t EmitFPRecipSqrt32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
+	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+}
+
+uint32_t EmitFPSqrt(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
+	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+}
+
+uint32_t EmitFPExp2(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Exp2,
+	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+}
+
+uint32_t EmitFPLog2(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Log2,
+	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+}
+
+uint32_t EmitFPLdexp(ValueEmitContext& ctx, uint32_t arg0, uint32_t arg1) {
+	auto&      state    = ctx.state;
+	const auto exponent = Unary(state, spv::OpBitcast, TypeI32(state), arg1);
+	return EmitExt(state, TypeF32(state), GLSLstd450Ldexp, {arg0, exponent});
+}
+
+uint32_t EmitFPRoundEven32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450RoundEven, {arg0});
+}
+
+uint32_t EmitFPFloor32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Floor, {arg0});
+}
+
+uint32_t EmitFPCeil32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Ceil, {arg0});
+}
+
+uint32_t EmitFPTrunc32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Trunc, {arg0});
+}
+
+uint32_t EmitFPFract32(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state = ctx.state;
+	return EmitExt(state, TypeF32(state), GLSLstd450Fract, {arg0});
+}
+
+uint32_t EmitFPSin(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state  = ctx.state;
+	auto  source = EmitTrigCycleF32(state, arg0, true);
+	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
+	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
+}
+
+uint32_t EmitFPCos(ValueEmitContext& ctx, uint32_t arg0) {
+	auto& state  = ctx.state;
+	auto  source = EmitTrigCycleF32(state, arg0, false);
+	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
+	return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

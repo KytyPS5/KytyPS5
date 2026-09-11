@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 
@@ -426,7 +426,9 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 	return converted;
 }
 
-void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
+} // namespace
+
+void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
 	const auto  exec  = ctx.Arg(inst, 1);
@@ -515,179 +517,176 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
-} // namespace
+uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
+	return value;
+}
 
-bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto& state = ctx.state;
-	switch (inst.GetOpcode()) {
-		case IR::ValueOpcode::Identity: ctx.Define(inst, ctx.Arg(inst, 0)); return true;
-		case IR::ValueOpcode::Void:
-		case IR::ValueOpcode::Reference:
-		case IR::ValueOpcode::ReferenceU32:
-		case IR::ValueOpcode::ControlNop:
-		case IR::ValueOpcode::Waitcnt:
-		case IR::ValueOpcode::Sendmsg:
-		case IR::ValueOpcode::TtraceData:
-		case IR::ValueOpcode::InstPrefetch: return true;
-		case IR::ValueOpcode::Barrier: {
-			const auto semantics =
-			    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
-			state.builder.AddFunction(
-			    {spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
-			     ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, semantics)});
-			return true;
-		}
-		case IR::ValueOpcode::MeshAllocate: EmitMeshAllocate(ctx, inst); return true;
-		case IR::ValueOpcode::MeshDrawParameter: {
-			const auto index = inst.Arg(0).U32();
-			if (state.program.stage != ShaderType::Mesh ||
-			    index >= IR::PushData::MeshDrawDwordCount) {
-				ctx.Fail(inst, "invalid mesh draw parameter");
-			}
-			const auto pointer = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpAccessChain, TypePushConstantElementPointer(state),
-			                           pointer, state.push_constant_variable, ConstantU32(state, 0),
-			                           ConstantU32(state, index)});
-			state.builder.AddFunction({spv::OpLoad, TypeU32(state), ctx.Result(inst), pointer});
-			return true;
-		}
-		case IR::ValueOpcode::GetUserData: {
-			const auto reg   = inst.Arg(0).ScalarRegister();
-			uint32_t   dword = 0;
-			if (!UserDataDwordIndex(state, reg, dword)) {
-				ctx.Define(inst, ConstantU32(state, 0));
-			} else {
-				ctx.Define(inst, EmitShaderDataDwordLoad(state, dword));
-			}
-			return true;
-		}
-		case IR::ValueOpcode::GetBuiltin:
-			ctx.Define(inst, EmitBuiltinU32(ctx, static_cast<IR::StageInputKind>(inst.Arg(0).U32()),
-			                                inst.Arg(1).U32()));
-			return true;
-		case IR::ValueOpcode::UndefU1:
-		case IR::ValueOpcode::UndefU8:
-		case IR::ValueOpcode::UndefU16:
-		case IR::ValueOpcode::UndefU32:
-		case IR::ValueOpcode::UndefU64:
-			state.builder.AddFunction({spv::OpUndef, ctx.TypeId(inst.GetType()), ctx.Result(inst)});
-			return true;
-		case IR::ValueOpcode::DppMoveU32: {
-			const auto flags    = inst.Flags<IR::DppMoveFlags>();
-			const auto target   = EmitDppTargetLane(state, flags.control);
-			const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
-			if (flags.fetch_inactive) {
-				ctx.Define(inst, shuffled);
-				return true;
-			}
-			const auto ballot        = ctx.Ballot(inst.Arg(1));
-			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
-			const auto can_fetch     = state.builder.AllocateId();
-			state.builder.AddFunction(
-			    {spv::OpLogicalAnd, TypeBool(state), can_fetch, target.valid, source_active});
-			ctx.Emit(inst, spv::OpSelect, IR::Type::U32,
-			         {can_fetch, shuffled, ConstantU32(state, 0)});
-			return true;
-		}
-		case IR::ValueOpcode::DppUpdateU32: {
-			const auto flags = inst.Flags<IR::DppMoveFlags>();
-			const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
-			ctx.Emit(inst, spv::OpSelect, IR::Type::U32,
-			         {write, ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
-			return true;
-		}
-		case IR::ValueOpcode::WqmU64:
-			ctx.Define(inst, EmitWqmU64(ctx.state, ctx.Arg(inst, 0)));
-			return true;
-		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
-			return true;
-		case IR::ValueOpcode::Ballot: ctx.Define(inst, ctx.Ballot(inst.Arg(0))); return true;
-		case IR::ValueOpcode::ReadFirstLane: {
-			const auto ballot = ctx.Ballot(inst.Arg(1));
-			const auto lane   = ctx.FirstLane(ballot);
-			ctx.Define(inst, ctx.Shuffle(inst, 0, lane));
-			return true;
-		}
-		case IR::ValueOpcode::ReadLane:
-			ctx.Define(inst, ctx.Shuffle(inst, 0, ctx.Arg(inst, 1)));
-			return true;
-		case IR::ValueOpcode::WriteLane: {
-			const auto hit = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpIEqual, TypeBool(state), hit,
-			                           EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2)});
-			ctx.Emit(inst, spv::OpSelect, IR::Type::U32, {hit, ctx.Arg(inst, 1), ctx.Arg(inst, 0)});
-			return true;
-		}
-		case IR::ValueOpcode::Permlane16U32: {
-			const auto flags     = inst.Flags<IR::PermlaneFlags>();
-			const auto subid     = EmitSubgroupLocalInvocationId(state);
-			const auto row       = state.builder.AllocateId();
-			const auto row_value = state.builder.AllocateId();
-			const auto lane      = state.builder.AllocateId();
-			const auto lane8     = state.builder.AllocateId();
-			const auto shift     = state.builder.AllocateId();
-			const auto upper     = state.builder.AllocateId();
-			const auto selected  = state.builder.AllocateId();
-			const auto shifted   = state.builder.AllocateId();
-			const auto index     = state.builder.AllocateId();
-			const auto target    = state.builder.AllocateId();
-			state.builder.AddFunction(
-			    {spv::OpBitwiseAnd, TypeU32(state), row, subid, ConstantU32(state, 0xfffffff0u)});
-			if (flags.x16) {
-				state.builder.AddFunction(
-				    {spv::OpBitwiseXor, TypeU32(state), row_value, row, ConstantU32(state, 16)});
-			} else {
-				state.builder.AddFunction({spv::OpCopyObject, TypeU32(state), row_value, row});
-			}
-			state.builder.AddFunction(
-			    {spv::OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 15)});
-			state.builder.AddFunction(
-			    {spv::OpBitwiseAnd, TypeU32(state), lane8, lane, ConstantU32(state, 7)});
-			state.builder.AddFunction(
-			    {spv::OpShiftLeftLogical, TypeU32(state), shift, lane8, ConstantU32(state, 2)});
-			state.builder.AddFunction(
-			    {spv::OpUGreaterThanEqual, TypeBool(state), upper, lane, ConstantU32(state, 8)});
-			state.builder.AddFunction({spv::OpSelect, TypeU32(state), selected, upper,
-			                           ctx.Arg(inst, 2), ctx.Arg(inst, 1)});
-			state.builder.AddFunction(
-			    {spv::OpShiftRightLogical, TypeU32(state), shifted, selected, shift});
-			state.builder.AddFunction(
-			    {spv::OpBitwiseAnd, TypeU32(state), index, shifted, ConstantU32(state, 15)});
-			state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), target, row_value, index});
-			const auto shuffled = ctx.Shuffle(inst, 0, target);
-			uint32_t result = shuffled;
-			if (!flags.fetch_inactive) {
-				const auto source_exec = ctx.Shuffle(inst, 3, target);
-				result = state.builder.AllocateId();
-				state.builder.AddFunction({spv::OpSelect, TypeU32(state), result, source_exec,
-				                           shuffled, ConstantU32(state, 0)});
-			}
-			ctx.Define(inst, result);
-			return true;
-		}
-		case IR::ValueOpcode::GetAttribute:
-			ctx.Define(inst, EmitAttribute(ctx, inst.Arg(0).U32(), inst.Arg(1).U32()));
-			return true;
-		case IR::ValueOpcode::GetInterpolationParameter:
-			ctx.Define(inst, EmitInterpolationParameter(ctx, inst.Arg(0).U32(), inst.Arg(1).U32(),
-			                                            inst.Arg(2).U32()));
-			return true;
-		case IR::ValueOpcode::SetAttribute: EmitExport(ctx, inst); return true;
-		case IR::ValueOpcode::GetShaderBase:
-			// Guest S_GETPC values stay shader-relative in SPIR-V, matching the runtime ABI. The
-			// runtime descriptor evaluator supplies the mapped shader base for host-side planning.
-			ctx.Define(inst, ctx.Def(IR::Value(uint64_t {0})));
-			return true;
-		case IR::ValueOpcode::GetSrtResource:
-		case IR::ValueOpcode::GetBufferResource:
-		case IR::ValueOpcode::GetAddressResource:
-		case IR::ValueOpcode::GetScratchResource:
-		case IR::ValueOpcode::GetImageResource:
-		case IR::ValueOpcode::GetSamplerResource:
-		case IR::ValueOpcode::MakeImageAddress: return true;
-		default: return false;
+void EmitVoid(ValueEmitContext&) {}
+
+void EmitBarrier(ValueEmitContext& ctx) {
+	auto&      state = ctx.state;
+	const auto semantics =
+	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
+	state.builder.AddFunction({spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
+	                           ConstantU32(state, spv::ScopeWorkgroup),
+	                           ConstantU32(state, semantics)});
+}
+
+uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	const auto index  = inst.Arg(0).U32();
+	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
+		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+	                           state.push_constant_variable, ConstantU32(state, 0),
+	                           ConstantU32(state, index)});
+	state.builder.AddFunction({spv::OpLoad, TypeU32(state), result, pointer});
+	return result;
+}
+
+uint32_t EmitGetUserData(ValueEmitContext& ctx, IR::ScalarReg reg) {
+	auto& state = ctx.state;
+
+	uint32_t dword = 0;
+	if (!UserDataDwordIndex(state, reg, dword)) {
+		return ConstantU32(state, 0);
+	} else {
+		return EmitShaderDataDwordLoad(state, dword);
+	}
+}
+
+uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) {
+	return EmitBuiltinU32(ctx, static_cast<IR::StageInputKind>(kind.U32()), index.U32());
+}
+
+uint32_t EmitUndefU1(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpUndef, ctx.TypeId(inst.GetType()), result});
+	return result;
+}
+
+uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state    = ctx.state;
+	const auto flags    = inst.Flags<IR::DppMoveFlags>();
+	const auto target   = EmitDppTargetLane(state, flags.control);
+	const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
+	if (flags.fetch_inactive) {
+		return shuffled;
+	}
+	const auto ballot        = ctx.Ballot(inst.Arg(1));
+	const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
+	const auto can_fetch     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {spv::OpLogicalAnd, TypeBool(state), can_fetch, target.valid, source_active});
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx, can_fetch, shuffled,
+	                                                ConstantU32(state, 0));
+}
+
+uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto flags = inst.Flags<IR::DppMoveFlags>();
+	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx, write, ctx.Arg(inst, 0), ctx.Arg(inst, 1));
+}
+
+uint32_t EmitWqmU64(ValueEmitContext& ctx, uint32_t value) {
+	return EmitWqmU64(ctx.state, value);
+}
+
+uint32_t EmitLaneId(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	return EmitSubgroupLocalInvocationId(state);
+}
+
+uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
+	return ctx.Ballot(predicate);
+}
+
+uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto ballot = ctx.Ballot(inst.Arg(1));
+	const auto lane   = ctx.FirstLane(ballot);
+	return ctx.Shuffle(inst, 0, lane);
+}
+
+uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+}
+
+uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto hit   = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpIEqual, TypeBool(state), hit,
+	                           EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2)});
+	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx, hit, ctx.Arg(inst, 1), ctx.Arg(inst, 0));
+}
+
+uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state     = ctx.state;
+	const auto flags     = inst.Flags<IR::PermlaneFlags>();
+	const auto subid     = EmitSubgroupLocalInvocationId(state);
+	const auto row       = state.builder.AllocateId();
+	const auto row_value = state.builder.AllocateId();
+	const auto lane      = state.builder.AllocateId();
+	const auto lane8     = state.builder.AllocateId();
+	const auto shift     = state.builder.AllocateId();
+	const auto upper     = state.builder.AllocateId();
+	const auto selected  = state.builder.AllocateId();
+	const auto shifted   = state.builder.AllocateId();
+	const auto index     = state.builder.AllocateId();
+	const auto target    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {spv::OpBitwiseAnd, TypeU32(state), row, subid, ConstantU32(state, 0xfffffff0u)});
+	if (flags.x16) {
+		state.builder.AddFunction(
+		    {spv::OpBitwiseXor, TypeU32(state), row_value, row, ConstantU32(state, 16)});
+	} else {
+		state.builder.AddFunction({spv::OpCopyObject, TypeU32(state), row_value, row});
+	}
+	state.builder.AddFunction(
+	    {spv::OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 15)});
+	state.builder.AddFunction(
+	    {spv::OpBitwiseAnd, TypeU32(state), lane8, lane, ConstantU32(state, 7)});
+	state.builder.AddFunction(
+	    {spv::OpShiftLeftLogical, TypeU32(state), shift, lane8, ConstantU32(state, 2)});
+	state.builder.AddFunction(
+	    {spv::OpUGreaterThanEqual, TypeBool(state), upper, lane, ConstantU32(state, 8)});
+	state.builder.AddFunction(
+	    {spv::OpSelect, TypeU32(state), selected, upper, ctx.Arg(inst, 2), ctx.Arg(inst, 1)});
+	state.builder.AddFunction({spv::OpShiftRightLogical, TypeU32(state), shifted, selected, shift});
+	state.builder.AddFunction(
+	    {spv::OpBitwiseAnd, TypeU32(state), index, shifted, ConstantU32(state, 15)});
+	state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), target, row_value, index});
+	const auto shuffled = ctx.Shuffle(inst, 0, target);
+	uint32_t   result   = shuffled;
+	if (!flags.fetch_inactive) {
+		const auto source_exec = ctx.Shuffle(inst, 3, target);
+		result                 = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {spv::OpSelect, TypeU32(state), result, source_exec, shuffled, ConstantU32(state, 0)});
+	}
+	return result;
+}
+
+uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitAttribute(ctx, inst.Arg(0).U32(), inst.Arg(1).U32());
+}
+
+uint32_t EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitInterpolationParameter(ctx, inst.Arg(0).U32(), inst.Arg(1).U32(), inst.Arg(2).U32());
+}
+
+uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
+	// Guest S_GETPC values stay shader-relative in SPIR-V, matching the runtime ABI. The
+	// runtime descriptor evaluator supplies the mapped shader base for host-side planning.
+	return ctx.Def(IR::Value(uint64_t {0}));
+}
+
+
+void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.Fail(inst, "must be lowered before SPIR-V emission");
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

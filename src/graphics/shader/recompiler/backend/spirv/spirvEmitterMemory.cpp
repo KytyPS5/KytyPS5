@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
@@ -1044,7 +1044,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction({spv::OpFunctionEnd});
 }
 
-bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+void EmitMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state             = ctx.state;
 	const auto op                = inst.GetOpcode();
 	const auto buffer_components = IR::BufferComponentCount(op);
@@ -1052,11 +1052,11 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto access = IR::BufferAccessOf(op);
 		if (access == IR::BufferAccess::Read) {
 			ctx.Define(inst, LoadWideBuffer(ctx, inst, buffer_components));
-			return true;
+			return;
 		}
 		if (access == IR::BufferAccess::Write) {
 			StoreWideBuffer(ctx, inst, buffer_components);
-			return true;
+			return;
 		}
 	}
 	const auto shared_components = IR::SharedComponentCount(op);
@@ -1066,23 +1066,23 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		} else {
 			StoreWideShared(ctx, inst, shared_components);
 		}
-		return true;
+		return;
 	}
 	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::ReadConstBuffer) &&
 	    ctx.Memory(inst).planning_only) {
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::ReadConst) {
 		if (state.flattened_srt_variable == 0) {
 			ctx.Fail(inst, "requires the flattened SRT descriptor");
-			return true;
+			return;
 		}
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction({spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 		                           pointer, state.flattened_srt_variable, ConstantU32(state, 0),
 		                           ctx.Arg(inst, 1)});
-		ctx.Emit(inst, spv::OpLoad, IR::Type::U32, {pointer});
-		return true;
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(ctx, pointer));
+		return;
 	}
 	if (op == IR::ValueOpcode::ReadConstBuffer) {
 		auto mem = ctx.Memory(inst);
@@ -1101,13 +1101,13 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                EmitMemoryElementPointer(state, access, element)});
 			           return value;
 		           }));
-		return true;
+		return;
 	}
 	const auto address_info = IR::AddressOpcodeInfoOf(op);
 	const bool load_address = address_info.access == IR::AddressAccess::Read;
 	if (load_address && ctx.Memory(inst).kind != IR::ResourceKind::Scratch) {
 		ctx.Define(inst, LoadBda(ctx, inst, ctx.Memory(inst), address_info.data_bits));
-		return true;
+		return;
 	}
 	const bool load_buffer  = op == IR::ValueOpcode::LoadBufferU8 ||
 	                          op == IR::ValueOpcode::LoadBufferU16 ||
@@ -1127,7 +1127,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		else
 			value = LoadWord(ctx, inst, mem);
 		ctx.Define(inst, value);
-		return true;
+		return;
 	}
 	const bool store_address = address_info.access == IR::AddressAccess::Write;
 	const bool store_buffer  = op == IR::ValueOpcode::StoreBufferU8 ||
@@ -1146,35 +1146,35 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			StoreSubword(ctx, inst, mem, 16);
 		else
 			StoreWord(ctx, inst, mem);
-		return true;
+		return;
 	}
 	const auto atomic_opcode = SpirvAtomicOpcode(op);
 	if (atomic_opcode != 0 && inst.GetType() == IR::Type::U64) {
 		ctx.Define(inst, EmitBufferAtomic64(ctx, inst, ctx.Memory(inst)));
-		return true;
+		return;
 	}
 	if (atomic_opcode != 0) {
 		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst)));
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {
 		ctx.Define(inst, FloatAtomic(ctx, inst, ctx.Memory(inst),
 		                             op == IR::ValueOpcode::BufferAtomicFMax32));
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::SharedAtomicInc32 || op == IR::ValueOpcode::SharedAtomicDec32) {
 		const auto replacement = op == IR::ValueOpcode::SharedAtomicInc32
 		                             ? AtomicIncrement : AtomicDecrement;
 		ctx.Define(inst, EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement));
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32) {
 		SharedFloatAtomic(ctx, inst, ctx.Memory(inst), op == IR::ValueOpcode::SharedAtomicFMax32);
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::DataAppend || op == IR::ValueOpcode::DataConsume) {
 		ctx.Define(inst, AppendConsume(ctx, inst, op == IR::ValueOpcode::DataAppend));
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::SwizzleU32 || op == IR::ValueOpcode::BpermuteU32) {
 		uint32_t source = ctx.Arg(inst, 0);
@@ -1197,9 +1197,9 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
 		}
 		ctx.Define(inst, EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2)));
-		return true;
+		return;
 	}
-	return false;
+	ctx.Fail(inst, "has no memory SPIR-V emitter");
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

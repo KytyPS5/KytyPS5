@@ -1,5 +1,5 @@
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
@@ -556,23 +556,19 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 
 } // namespace
 
-bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
+void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
-	if (image_info.access == IR::ImageAccess::None) {
-		return false;
-	}
 	auto&       state     = ctx.state;
 	const auto& mem       = ctx.Memory(inst);
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
-	if (address == nullptr) return true;
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		ctx.Define(inst, QueryDimensions(ctx, mem, *address));
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
@@ -594,7 +590,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction({spv::OpCompositeConstruct, TypeU32Vector(state, 4), result,
 		                           values[0], values[1], values[2], values[3]});
 		ctx.Define(inst, result);
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
 		const auto  dimension      = image.dimension;
@@ -623,7 +619,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
 			                            false, mem);
 		        }));
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::ImageWrite) {
 		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
@@ -637,7 +633,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
 			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
 		});
-		return true;
+		return;
 	}
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
 		const auto  dimension      = image.dimension;
@@ -648,7 +644,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
-			return true;
+			return;
 		}
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components);
@@ -658,16 +654,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
-					return true;
+					return;
 				}
 				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
 				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
 				                              numeric_class, false, mem, true));
-				return true;
+				return;
 			}
 			if (dimension == ImageDimension::Dim1DArray) {
 				ctx.Fail(inst, "has an unsupported 1D-array gather");
-				return true;
+				return;
 			}
 			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
@@ -709,7 +705,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
 			                              result_numeric_class, false, mem, true));
-			return true;
+			return;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
@@ -770,7 +766,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				result = UnpackImageTexel(ctx, mem, sample);
 			}
 			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
-			return true;
+			return;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
 		const auto* source = image.source < state.program.descriptor_sources.size()
@@ -779,13 +775,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
 		    source->indirect_image->key_arg >= handle->NumArgs()) {
 			ctx.Fail(inst, "has invalid indirect image key provenance");
-			return true;
+			return;
 		}
 		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
 		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
-			return true;
+			return;
 		}
 		const auto LoadMapping = [&](uint32_t index) {
 			const auto pointer = state.builder.AllocateId();
@@ -867,7 +863,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			result = UnpackImageTexel(ctx, mem, result);
 		}
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
-		return true;
+		return;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != 0u) {
@@ -888,9 +884,9 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			           EmitDeviceAtomicMemoryBarrier(state);
 			           return old;
 		           }));
-		return true;
+		return;
 	}
-	return false;
+	ctx.Fail(inst, "has no image SPIR-V emitter");
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

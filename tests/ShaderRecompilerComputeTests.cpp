@@ -364,7 +364,7 @@ struct TextureCacheTestAccess {
   }
 
   static bool TryDownload(TextureCache &cache, ImageId id) {
-    return cache.TryDownloadImage(id);
+    return cache.DownloadImageMemory(id);
   }
 
   static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {

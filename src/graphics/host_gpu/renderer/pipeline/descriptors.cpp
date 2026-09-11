@@ -800,6 +800,22 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else if (resource.depth_compare) {
+		// The descriptor looked depth-capable, but the address resolved to a colour image --
+		// the title re-used this memory as a colour surface, or an earlier non-compare binding
+		// registered it that way. Sampling it with depth comparison is illegal and loses the
+		// device (VUID-vkCmd*-None-06479), and the format policy above cannot see this because
+		// it runs before the cache lookup. Fall back to the depth null image, same as the other
+		// shadow-slot fallbacks.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("descriptors: depth-compare fetch resolved to colour image (format %u, guest %u)"
+			     " -- binding null depth image\n",
+			     static_cast<uint32_t>(image->info.pixel_format), static_cast<uint32_t>(format));
+		}
+		auto       depth_null = NullTextureDesc(resource, TextureCache::BindingType::Texture, true);
+		const auto depth_id   = texture_cache.FindImage(depth_null);
+		return {depth_id, nullptr, std::move(depth_null)};
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());

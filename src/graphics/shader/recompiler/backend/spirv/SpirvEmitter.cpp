@@ -321,12 +321,6 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
-	state.inputs.reserve(program.info.inputs.size());
-	state.outputs.reserve(program.info.outputs.size());
-	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
-	CopyProgramInputsAndOutputs(state, program);
-	AllocateInputVariables(state);
-	AllocateOutputVariables(state);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

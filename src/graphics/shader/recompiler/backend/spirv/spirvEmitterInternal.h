@@ -25,22 +25,13 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-struct InputBinding {
-	IR::StageInputKind kind            = IR::StageInputKind::VertexIndex;
-	uint32_t           location        = 0;
-	uint32_t           component_count = 1;
-	uint32_t           variable_id     = 0;
-	std::string        debug_name;
-	bool               per_vertex = false;
+struct InputBinding : IR::StageInput {
+	uint32_t variable_id = 0;
 };
 
-struct OutputBinding {
-	IR::StageOutputKind kind        = IR::StageOutputKind::Parameter;
-	uint32_t            index       = 0;
-	uint32_t            location    = 0;
-	uint32_t            variable_id = 0;
-	std::string         debug_name;
-	uint32_t            mesh_data_variable = 0;
+struct OutputBinding : IR::StageOutput {
+	uint32_t variable_id        = 0;
+	uint32_t mesh_data_variable = 0;
 };
 
 using ImageDimension = Decoder::ImageDimension;
@@ -124,8 +115,6 @@ struct EmitterState {
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
-	uint32_t                   clip_distance_count                   = 0;
-	uint32_t                   cull_distance_count                   = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
@@ -267,11 +256,6 @@ uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-uint32_t VertexParameterInputPointerType(EmitterState& state, VertexInputScalarKind kind,
-                                         uint32_t components);
-
-
-void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
@@ -328,21 +312,6 @@ uint32_t ConstantBool(EmitterState& state, bool value);
 uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
-
-void AllocateInputVariables(EmitterState& state);
-
-void AllocateOutputVariables(EmitterState& state);
-
-uint32_t BuiltInForInput(IR::StageInputKind kind);
-
-void AddInputAnnotationsAndNames(EmitterState& state);
-
-void AddOutputAnnotationsAndNames(EmitterState& state);
-
-void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name,
-                        IR::DescriptorBindingKind kind);
-
-void AddDescriptorAnnotationsAndNames(EmitterState& state);
 
 void     DefineModule(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state);

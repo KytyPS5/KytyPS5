@@ -30,16 +30,6 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
-void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program) {
-	for (const auto& input: program.info.inputs) {
-		state.inputs.push_back({input.kind, input.location, input.component_count, 0,
-		                        input.debug_name, input.per_vertex});
-	}
-	for (const auto& output: program.info.outputs) {
-		state.outputs.push_back({output.kind, output.index, output.location, 0, output.debug_name});
-	}
-}
-
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
 	if (exp.kind == IR::ExportTargetKind::Position && exp.index == 0) {
 		return state.per_vertex_variable;

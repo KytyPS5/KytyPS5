@@ -52,3 +52,5 @@ objc2-io-bluetooth = { version = "0.3", features = [
     "Bluetooth",
     "IOBluetoothDeviceInquiry",
 ] }
+# CoreAudio device enumeration for audio.rs -- see that file's doc comment.
+coreaudio-rs = "0.14"

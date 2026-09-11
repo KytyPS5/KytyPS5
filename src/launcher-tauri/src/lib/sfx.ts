@@ -11,11 +11,18 @@
 
 import { audioSettingsStore } from "./audioSettings";
 
+// AAC/.m4a, not Ogg/Opus: Safari/WKWebView has never reliably supported
+// Ogg/Opus playback, so on macOS every one of these would fail
+// HTMLAudioElement.play() silently by design (this file's own "never let
+// audio failure break navigation" contract below), leaving the whole app
+// silent with nothing surfaced to the user. AAC/.m4a is supported by
+// WebKitGTK, WebView2 and WKWebView alike, so this removes the platform
+// gap entirely rather than branching on it.
 const FILES = {
-  nav: "/sfx/nav_move.ogg",
-  confirm: "/sfx/confirm.ogg",
-  back: "/sfx/back.ogg",
-  boot: "/sfx/boot.ogg",
+  nav: "/sfx/nav_move.m4a",
+  confirm: "/sfx/confirm.m4a",
+  back: "/sfx/back.m4a",
+  boot: "/sfx/boot.m4a",
 } as const;
 
 export type SfxName = keyof typeof FILES;

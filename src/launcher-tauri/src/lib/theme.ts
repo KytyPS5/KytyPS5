@@ -30,6 +30,10 @@ export const THEMES: DashboardTheme[] = [
   { id: "particles", label: "Particle Field", url: "/art/themes/theme_particles.jpg", accent: "#00d4ff" },
   { id: "waves", label: "Geometric Waves", url: "/art/themes/theme_waves.jpg", accent: "#0070d1" },
   { id: "aurora", label: "Aurora Glow", url: "/art/themes/theme_aurora.jpg", accent: "#00e6c8" },
+  // The art (public/art/themes/theme_deepspace.jpg) and every locale's
+  // "Deep Space" label (i18n/locales/*.ts's settings.background.themes.
+  // deepspace) already existed; only this entry was missing.
+  { id: "deepspace", label: "Deep Space", url: "/art/themes/theme_deepspace.jpg", accent: "#4a5ce0" },
 ];
 
 const STORAGE_KEY = "kyty.dashboardTheme";

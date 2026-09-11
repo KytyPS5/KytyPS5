@@ -16,6 +16,10 @@
 //!   Settings UI, or to an app that selects its own endpoint -- which
 //!   kyty_emulator does not, and which no command-line flag exposes. So the
 //!   list is real and selection reports plainly that it cannot take effect.
+//! - macOS: same story as Windows -- CoreAudio enumerates real devices
+//!   (`coreaudio-rs`'s `macos_helpers`) but has no per-process output
+//!   override analogous to `PULSE_SINK`, only a system-wide default this
+//!   app deliberately never touches (see `selection_is_supported` below).
 //!
 //! Enumeration shells out to `pactl` on Linux rather than taking a
 //! dependency, following the same convention as lib.rs's system_color_scheme
@@ -41,7 +45,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn pactl_noun(self) -> &'static str {
         match self {
             Direction::Output => "sinks",
@@ -49,11 +53,19 @@ impl Direction {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn env_var(self) -> &'static str {
         match self {
             Direction::Output => "PULSE_SINK",
             Direction::Input => "PULSE_SOURCE",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn coreaudio_scope(self) -> coreaudio::audio_unit::Scope {
+        match self {
+            Direction::Output => coreaudio::audio_unit::Scope::Output,
+            Direction::Input => coreaudio::audio_unit::Scope::Input,
         }
     }
 }
@@ -61,7 +73,7 @@ impl Direction {
 /// Best-effort everywhere: an empty list is a normal answer (no audio
 /// hardware, `pactl` missing, not on PulseAudio), and the frontend already
 /// treats it as one by falling back to just "System default".
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn list_devices(direction: Direction) -> Vec<AudioDevice> {
     let Ok(output) = std::process::Command::new("pactl")
         .args(["-f", "json", "list", direction.pactl_noun()])
@@ -136,11 +148,30 @@ pub fn list_devices(direction: Direction) -> Vec<AudioDevice> {
     })
 }
 
+/// CoreAudio device ids are stable within a boot but are plain integers
+/// with no inherent display form, so the id itself (stringified) is the
+/// `name`/identifier and `get_device_name` supplies the description --
+/// same split as the Linux pactl backend's name/description pair.
+#[cfg(target_os = "macos")]
+pub fn list_devices(direction: Direction) -> Vec<AudioDevice> {
+    use coreaudio::audio_unit::macos_helpers::{get_audio_device_ids_for_scope, get_device_name};
+
+    let Ok(ids) = get_audio_device_ids_for_scope(direction.coreaudio_scope()) else {
+        return Vec::new();
+    };
+    ids.into_iter()
+        .filter_map(|id| {
+            let description = get_device_name(id).ok()?;
+            Some(AudioDevice { name: id.to_string(), description })
+        })
+        .collect()
+}
+
 /// `device` is validated against `list_devices`'s own output before being
 /// set, since it becomes part of an environment the emulator inherits --
 /// this rejects an arbitrary or stale frontend-supplied string rather than
 /// setting the variable to whatever it happens to be.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn set_device(direction: Direction, device: Option<String>) -> Result<(), String> {
     let variable = direction.env_var();
     match device {
@@ -173,11 +204,27 @@ pub fn set_device(_direction: Direction, device: Option<String>) -> Result<(), S
     }
 }
 
+/// CoreAudio has no per-process output override analogous to `PULSE_SINK`
+/// (see this module's doc comment), so selecting a device here cannot
+/// retarget the emulator's own audio -- same disclosed gap as Windows,
+/// reported the same way rather than silently doing nothing.
+#[cfg(target_os = "macos")]
+pub fn set_device(_direction: Direction, device: Option<String>) -> Result<(), String> {
+    match device {
+        None => Ok(()),
+        Some(_) => Err(
+            "macOS cannot route one app's audio from another. Assign the device to kyty_emulator \
+             in System Settings > Sound, or via Audio MIDI Setup."
+                .to_string(),
+        ),
+    }
+}
+
 /// Whether picking a device here actually changes where audio goes. The
 /// Audio page reads this to decide between a working picker and an
 /// explanation, instead of offering a control that quietly does nothing.
 pub fn selection_is_supported() -> bool {
-    cfg!(not(windows))
+    cfg!(target_os = "linux")
 }
 
 #[cfg(test)]

@@ -35,7 +35,11 @@ function useMaxResolution(): { width: number; height: number } {
   useEffect(() => {
     void currentMonitor()
       .then((m) => {
-        if (m) setMax({ width: m.size.width, height: m.size.height });
+        // m.size is physical pixels; dividing by scaleFactor is what makes
+        // this the logical resolution the game should actually render at —
+        // without it, "native resolution" on a HiDPI Windows display or a
+        // Retina Mac is 2x (or more) what the screen logically shows.
+        if (m) setMax({ width: Math.round(m.size.width / m.scaleFactor), height: Math.round(m.size.height / m.scaleFactor) });
       })
       .catch(() => {
         // Not running inside a real Tauri window — keep the fallback.

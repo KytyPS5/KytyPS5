@@ -11,4 +11,10 @@ _DownloadData
 # Internal art/sfx generation-tooling tree (manifests, candidate seeds, generation
 # provenance, raw pre-encode audio). Not read by the app; only public/art and public/sfx
 # (the final encoded assets) are. Kept out of the tree that ships.
-art/
+#
+# Leading slash matters: a bare `art/` matches a directory of that name at
+# ANY depth, so it silently swallowed public/art/ too -- every dashboard
+# background, theme thumbnail, and the boot logo never got committed. This
+# anchors it to this .gitignore's own directory, matching what the comment
+# above always said it meant.
+/art/

@@ -11,8 +11,10 @@
 #include "graphics/host_gpu/vulkanDiagnostics.h"
 #include "kytyGitVersion.h"
 
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 
 using namespace Common;
@@ -477,10 +479,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 			options.config.gamepad_keymap.push_back(value);
 		} else if (arg == "--gamepad-deadzone") {
-			float      deadzone = 0.0f;
-			const auto parsed = std::from_chars(value.data(), value.data() + value.size(), deadzone);
-			if (parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size() || deadzone < 0.0f ||
-			    deadzone > 0.95f) {
+			// Not std::from_chars: Apple's libc++ marks the floating-point overloads
+			// unavailable before macOS 26 (a real SDK availability annotation, not a
+			// deployment-target guard we can raise around it), and this needs to build
+			// on the macOS 15 CI runner. strtof carries none of that restriction and is
+			// available everywhere else this project targets; every other from_chars
+			// call in this file parses an integer, which macOS has always supported.
+			errno          = 0;
+			char*      end = nullptr;
+			const auto deadzone = std::strtof(value.c_str(), &end);
+			if (end == value.c_str() || errno == ERANGE || end != value.c_str() + value.size() ||
+			    deadzone < 0.0f || deadzone > 0.95f) {
 				::printf("invalid gamepad-deadzone (expected 0.0-0.95): %s\n", value.c_str());
 				return false;
 			}

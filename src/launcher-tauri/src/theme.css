@@ -196,6 +196,22 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   position: relative;
+  /* This is a dashboard driven by a gamepad, not a document: dragging
+     across a game title or a settings label only ever produced a stray blue
+     highlight that then had to be clicked away, and a double-click on a
+     tile selected its caption. Real text entry is exempted below. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Anywhere the user genuinely types or copies: the config fields, the
+   emulator log pane, anything explicitly marked selectable. */
+input,
+textarea,
+[contenteditable="true"],
+[data-selectable] {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 button,

@@ -37,12 +37,16 @@ pub struct BrowseResult {
 #[cfg(windows)]
 pub const DRIVE_ROOT: &str = "::drives";
 
-/// Paths for display and for navigating back in. `canonicalize` on Windows
-/// hands back the verbatim `\\?\C:\Users\you` form, which is correct but is
-/// not what anyone recognizes as their own path, so trim it back to the
-/// ordinary spelling. UNC paths canonicalize to `\\?\UNC\server\share` and
-/// come back as `\\server\share`.
-fn display_path(path: &Path) -> String {
+/// Trim a canonicalized path back to its ordinary spelling. `canonicalize`
+/// on Windows hands back the verbatim `\\?\C:\Users\you` form, which is
+/// correct but is not what anyone recognizes as their own path, and is not
+/// a spelling every program accepts as an argument. UNC paths canonicalize
+/// to `\\?\UNC\server\share` and come back as `\\server\share`.
+///
+/// Shared with scanner.rs, which canonicalizes game folders and would
+/// otherwise carry the prefix into `--game`, into playtime.json's keys and
+/// into the UI.
+pub fn display_path(path: &Path) -> String {
     let text = path.to_string_lossy().to_string();
     #[cfg(windows)]
     {

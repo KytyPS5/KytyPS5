@@ -9,22 +9,6 @@
   border-radius: var(--radius-sm);
 }
 
-/* Hover indicator: a single 1px line under the whole row, offset 3px below
-   it. Positioned off the row's own bottom edge (top: 100%) rather than a
-   border, so it doesn't consume layout space or shift the row when it
-   appears. */
-.label::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 100%;
-  margin-top: 3px;
-  height: 1px;
-  background: transparent;
-  transition: background var(--t-hover) var(--ease-ui);
-}
-
 .track {
   width: 38px;
   height: 22px;
@@ -64,11 +48,15 @@
   box-shadow: none;
 }
 
-/* Hover: the single underline is the whole effect, guarded against gamepad
+/* Hover: the track itself brightens. There used to be a 1px underline under
+   the whole row as well, but a row-based Toggle carries no inline caption
+   (Settings.tsx passes only ariaLabel), so the label box is just the 38px
+   track and that line read as a stray dash floating under the switch. The
+   track is the control; lighting it is enough. Guarded against gamepad
    input the same way every other hover rule in this pass is (see
    Settings.module.css's .railItem:hover comment for why). */
-:root:not([data-gamepad-active="true"]) .label:hover::after {
-  background: var(--text-primary);
+:root:not([data-gamepad-active="true"]) .label:hover .track {
+  border-color: var(--text-primary);
 }
 
 /* Focused (gamepad/keyboard): same quiet-fill language as everywhere else

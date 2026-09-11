@@ -6,6 +6,7 @@ mod compatibility;
 mod config;
 mod emulator;
 mod first_seen;
+mod logs;
 mod gamepad;
 mod patches;
 mod playtime;
@@ -67,8 +68,38 @@ fn emulator_binary(app: &tauri::AppHandle, state: &AppState) -> Result<PathBuf, 
     Err("Could not find kyty_emulator".to_string())
 }
 
+/// Where this launcher keeps its own files: prefs, play history, trophy and
+/// art caches, and the session logs.
+///
+/// Deliberately not Tauri's `app_data_dir()`, which names the folder after
+/// the bundle identifier -- `io.github.kytyps5.launcher`. That is the right
+/// convention for something nobody opens by hand, but the Console page now
+/// tells people to go and fetch a log out of it, and Kyty already has an
+/// obvious home: `Kyty.ini` lives in `<config>/Kyty/`, so this sits beside
+/// it as `<config>/Kyty/Launcher/`.
+///
+/// Anything already written under the old identifier folder is moved across
+/// the first time this runs, so upgrading keeps play counts and settings.
 fn app_data_dir(app: &tauri::AppHandle) -> PathBuf {
-    app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Kyty")
+        .join("Launcher");
+
+    if !dir.exists() {
+        if let Ok(legacy) = app.path().app_data_dir() {
+            if legacy.is_dir() {
+                if let Some(parent) = dir.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // A rename across the same volume is atomic and cheap. If it
+                // fails (different volume, file in use), fall through and
+                // just start fresh in the new location rather than failing.
+                let _ = std::fs::rename(&legacy, &dir);
+            }
+        }
+    }
+    dir
 }
 
 // ---- Settings (Kyty.ini) --------------------------------------------------
@@ -164,7 +195,8 @@ fn run_game(
             interpreter: binary,
             args,
             working_dir: dir,
-            log_path: app_data_dir(&app).join("emulator-session.log"),
+            log_path: logs::new_session_path(&app_data_dir(&app))
+                .unwrap_or_else(|| app_data_dir(&app).join("emulator-session.log")),
             app_data_dir: app_data_dir(&app),
             game_path: info.game_path.clone(),
         };
@@ -183,8 +215,20 @@ fn run_game(
 
     let result = match launcher_prefs.launch_mode {
         prefs::LaunchMode::InApp => {
-            emulator::spawn_in_app(app.clone(), state.run_state.clone(), &binary, &args, &dir)
-                .map_err(|e| e.to_string())
+            let session_log = logs::new_session_path(&app_data_dir(&app))
+                .and_then(|path| logs::SessionLog::create(&path));
+            if let Some(log) = session_log.as_ref() {
+                log.write_header(&info.game_path, &args);
+            }
+            emulator::spawn_in_app(
+                app.clone(),
+                state.run_state.clone(),
+                &binary,
+                &args,
+                &dir,
+                session_log,
+            )
+            .map_err(|e| e.to_string())
         }
         prefs::LaunchMode::Terminal => {
             emulator::launch_external_terminal(&binary, &args, &dir).map_err(|e| e.to_string())
@@ -195,6 +239,15 @@ fn run_game(
         let _ = playtime::record_start(&app_data_dir(&app), &info.game_path);
     }
     result
+}
+
+/// Absolute path of the session-log folder, for the Console page's "open
+/// logs folder" action -- the thing a user attaches to a bug report.
+#[tauri::command]
+fn get_logs_dir(app: tauri::AppHandle) -> String {
+    let dir = logs::logs_dir(&app_data_dir(&app));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().to_string()
 }
 
 #[tauri::command]
@@ -637,6 +690,7 @@ pub fn run() {
             stop_game,
             is_game_running,
             is_resumed_launch,
+            get_logs_dir,
             get_play_history,
             get_library_stats,
             record_play_stop,

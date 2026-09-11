@@ -82,6 +82,7 @@ pub fn run(spec_path: &str) {
     let log_file = std::fs::File::create(&spec.log_path).ok();
     let mut cmd = Command::new(&spec.interpreter);
     cmd.args(&spec.args).current_dir(&spec.working_dir);
+    crate::emulator::hide_console(&mut cmd);
     if let Some(out) = log_file.as_ref().and_then(|f| f.try_clone().ok()) {
         cmd.stdout(Stdio::from(out));
     }

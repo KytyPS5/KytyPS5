@@ -296,6 +296,8 @@ export interface Catalog {
     title: string;
     stopButton: string;
     copyLogs: string;
+    openLogsFolder: string;
+    clear: string;
     copiedToClipboard: string;
     lastRunExited: string;
     notRunning: string;
@@ -654,6 +656,8 @@ const en: Catalog = {
     title: "Emulator console",
     stopButton: "Stop",
     copyLogs: "Copy logs",
+    openLogsFolder: "Open logs folder",
+    clear: "Clear",
     copiedToClipboard: "Logs copied to clipboard",
     lastRunExited: "Last run exited with code {code}",
     notRunning: "Not running",

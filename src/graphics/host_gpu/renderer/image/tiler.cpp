@@ -18,6 +18,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +28,14 @@
 #include <limits>
 
 namespace Libs::Graphics {
+
+namespace {
+
+vk::PipelineCache HelperPipelineCache(CommandScheduler& scheduler) {
+	return scheduler.Context().GetPipelineCache().DriverCache();
+}
+
+} // namespace
 
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
@@ -251,8 +261,8 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	vk::ComputePipelineCreateInfo create {};
 	create.stage  = stage;
 	create.layout = m_pipeline_layout;
-	const auto result =
-	    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_pipelines[slot]);
+	const auto result = m_graphics.device.createComputePipelines(
+	    HelperPipelineCache(m_scheduler), 1, &create, nullptr, &m_pipelines[slot]);
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create TileManager pipeline");
 	return m_pipelines[slot];
@@ -463,8 +473,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 		vk::ComputePipelineCreateInfo create {};
 		create.stage  = stage;
 		create.layout = m_pipeline_layout;
-		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+		const auto result = m_graphics.device.createComputePipelines(
+		    HelperPipelineCache(m_scheduler), 1, &create, nullptr, &pipeline);
 		m_graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create D16 conversion pipeline");
 	}
@@ -607,8 +617,8 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 		vk::ComputePipelineCreateInfo create {};
 		create.stage  = stage;
 		create.layout = m_pipeline_layout;
-		const auto result =
-		    m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &m_color_transform);
+		const auto result = m_graphics.device.createComputePipelines(
+		    HelperPipelineCache(m_scheduler), 1, &create, nullptr, &m_color_transform);
 		m_graphics.device.destroyShaderModule(module, nullptr);
 		RequireVulkanSuccess(result, "create color transform pipeline");
 	}

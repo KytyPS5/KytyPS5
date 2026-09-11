@@ -718,9 +718,10 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 		create.pColorBlendState    = &blend;
 		create.pDynamicState       = &dynamic;
 		create.layout              = m_overlay_layout;
-		RequireVulkanSuccess(
-		    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_overlay_pipeline),
-		    "create video-out overlay pipeline");
+		RequireVulkanSuccess(device.createGraphicsPipelines(
+		                         m_window.render_context->GetPipelineCache().DriverCache(), 1,
+		                         &create, nullptr, &m_overlay_pipeline),
+		                     "create video-out overlay pipeline");
 		device.destroyShaderModule(fragment, nullptr);
 		device.destroyShaderModule(vertex, nullptr);
 	}

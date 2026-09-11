@@ -29,6 +29,11 @@ enum class OutputDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+// How PrepareBda finds CPU-dirty buffers. Selective visits only owners of dirty pages in hinted
+// regions; Legacy walks every mapped owner; SelectiveChecked adds a full invariant check after
+// every selective pass and aborts on a violation.
+enum class BdaSyncMode { Selective, Legacy, SelectiveChecked };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -48,6 +53,7 @@ struct ConfigOptions {
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	PresentMode            present_mode                = PresentMode::Fifo;
+	BdaSyncMode            bda_sync_mode               = BdaSyncMode::Selective;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
@@ -81,6 +87,7 @@ uint32_t GetScreenHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 PresentMode GetPresentMode();
+BdaSyncMode GetBdaSyncMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();

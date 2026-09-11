@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -31,6 +32,11 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// BDA synchronisation mode; GPU thread only, safe to switch at any consumer boundary.
+	void SetBdaSyncMode(Config::BdaSyncMode mode) noexcept { m_bda_sync_mode = mode; }
+	[[nodiscard]] Config::BdaSyncMode GetBdaSyncMode() const noexcept { return m_bda_sync_mode; }
+	// True once a selective pass failed closed; PrepareBda then stays on the legacy walk.
+	[[nodiscard]] bool IsBdaSelectiveDisabled() const noexcept { return m_bda_selective_failed; }
 	void               RunGarbageCollector();
 
 private:
@@ -42,6 +48,10 @@ private:
 	RangeSet                  m_mapped_ranges;
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
+	Config::BdaSyncMode       m_bda_sync_mode         = Config::BdaSyncMode::Selective;
+	bool                      m_bda_selective_failed  = false;
+
+	friend struct GpuResourceManagerTestAccess;
 };
 
 } // namespace Libs::Graphics

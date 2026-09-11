@@ -51,6 +51,8 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Fifo.\n");
+	::printf("  --bda-sync <value>                   Selective, Legacy, or SelectiveChecked.\n"
+	         "                                       Default: Selective.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
@@ -233,6 +235,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--bda-sync") {
+			if (!ParseEnum(value, options.config.bda_sync_mode)) {
+				::printf("invalid BDA sync mode: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu") {

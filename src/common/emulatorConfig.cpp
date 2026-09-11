@@ -47,6 +47,10 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
+BdaSyncMode GetBdaSyncMode() {
+	return g_config->bda_sync_mode;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }

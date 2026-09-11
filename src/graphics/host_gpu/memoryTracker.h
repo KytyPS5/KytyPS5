@@ -16,6 +16,10 @@
 
 namespace Libs::Graphics {
 
+// Hint publication runs inside the guest write-fault path: it must be one lock-free atomic RMW,
+// never a hidden mutex.
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -29,6 +33,78 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+
+	// --- Selective BDA discovery ------------------------------------------------------------
+	// One hint bit per 4 MiB region meaning "this region MAY hold CPU-dirty data that
+	// PrepareBda must examine". It is a conservative index over RegionManager's CPU-dirty
+	// bitmap, which remains the only truth: a false positive costs one empty snapshot, a false
+	// negative is a coherency bug.
+	//
+	// Contract, at every completed publication boundary: if a CPU-dirty page lies inside a
+	// mapped registered buffer and legacy PrepareBda would have to synchronise it before the
+	// current BDA consumer, then its region's hint is pending, or responsibility for that
+	// region has been consumed by the PrepareBda pass executing right now (it exchanged the
+	// hint and has not finished the region). Completion: a write ordered before a BDA consumer
+	// is examined and synchronised before that consumer proceeds; leaving it pending "for next
+	// time" is not enough. Genuinely racing writes keep the legacy semantics.
+	//
+	// Publications:
+	//   P1  RegionManager::ChangeState<Cpu, true>: under the region lock, every execution
+	//   P2  GetOrCreateRegion: the hint before the manager pointer (a new region is all-dirty)
+	//   P3  BufferCache registration: every region of the actual registered span
+	//   P4  GpuResourceManager::MapMemory: under the exclusive mapped-range lock
+	// Consumption exchanges each word once per pass and never clears a completed region again.
+	static constexpr size_t BDA_HINT_WORDS = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE / 64;
+
+	// P3/P4: flag every region intersecting the half-open range [vaddr, vaddr + size).
+	void PublishBdaHints(uint64_t vaddr, uint64_t size) noexcept;
+	// Takes ownership of one word's pending regions for the running pass.
+	[[nodiscard]] uint64_t ConsumeBdaHintWord(size_t word) noexcept;
+	// Makes regions a pass owned but did not complete pending again (fail-closed paths).
+	void RestoreBdaHints(size_t word, uint64_t bits) noexcept;
+	// Legacy walk: drops every pending hint before a full scan answers them.
+	void                         DiscardBdaHints() noexcept;
+	[[nodiscard]] bool           IsBdaHintPending(uint64_t region) const noexcept;
+	[[nodiscard]] RegionManager* FindRegion(uint64_t region) const noexcept {
+		return m_regions[region].load(std::memory_order_acquire);
+	}
+	// Copy of the region's CPU-dirty bitmap taken under its lock. Discovery input only.
+	[[nodiscard]] RegionBits SnapshotCpuDirty(RegionManager& manager);
+
+	// Invariant checker (tests, --bda-sync SelectiveChecked). In every region of the range, a
+	// CPU-dirty page, or a missing manager (all-dirty by construction), requires a pending
+	// hint unless `owned(region)` says the running pass owns the region. The hint is read
+	// under the region lock, which P1 holds while it publishes, so the check cannot race into
+	// a false failure.
+	template <typename Owned>
+	[[nodiscard]] bool BdaHintsCoverCpuDirty(uint64_t vaddr, uint64_t size, Owned&& owned) {
+		CheckNotInUploadCallback();
+		ValidateRange(vaddr, size);
+		uint64_t remaining = size;
+		uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+		uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+		while (remaining != 0) {
+			const auto bytes = std::min(TRACKER_REGION_SIZE - offset, remaining);
+			if (!owned(index)) {
+				auto* manager = m_regions[index].load(std::memory_order_acquire);
+				if (manager == nullptr) {
+					if (!IsBdaHintPending(index)) {
+						return false;
+					}
+				} else {
+					std::scoped_lock lock(manager->lock);
+					if (manager->IsModified<DirtySource::Cpu>(offset, bytes) &&
+					    !IsBdaHintPending(index)) {
+						return false;
+					}
+				}
+			}
+			remaining -= bytes;
+			offset = 0;
+			index++;
+		}
+		return true;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -176,6 +252,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_bda_hints;
 };
 
 } // namespace Libs::Graphics

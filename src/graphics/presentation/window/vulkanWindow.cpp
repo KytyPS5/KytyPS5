@@ -1189,6 +1189,7 @@ void WindowContext::CreateVulkan() {
 	}
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
+	render_context->GetGpuResources().SetBdaSyncMode(Config::GetBdaSyncMode());
 	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
 	presenter = std::make_unique<Presenter>(*this);
 }

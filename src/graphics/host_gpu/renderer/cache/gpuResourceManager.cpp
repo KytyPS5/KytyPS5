@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 namespace Libs::Graphics {
@@ -48,6 +49,10 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
+		// P4: the new mapping can expose CPU-dirty pages of registered owners (for example
+		// after an unmap invalidated them). Published under the exclusive lock, so no checker
+		// holding the shared lock can observe the mapping without its hints.
+		m_buffer_cache.PublishBdaHints(vaddr, size);
 	}
 }
 
@@ -77,9 +82,22 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void GpuResourceManager::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	if (m_bda_sync_mode == Config::BdaSyncMode::Legacy || m_bda_selective_failed) {
+		m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+	} else if (!m_buffer_cache.SynchronizeBdaSelective(m_mapped_ranges)) {
+		// Fail closed. The pass has made every obligation it had not completed pending again;
+		// answer this consumer with the legacy walk and stay on it.
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+		EXIT("selective BDA sync: the buffer page table disagrees with the registered owners\n");
+#else
+		LOGF("selective BDA sync: owner index inconsistency; switching to the legacy walk\n");
+		m_bda_selective_failed = true;
+		m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+#endif
+	} else if (m_bda_sync_mode == Config::BdaSyncMode::SelectiveChecked &&
+	           !m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges)) {
+		EXIT("selective BDA sync: a CPU-dirty page of a mapped owner has no pending hint\n");
+	}
 	m_fault_process_pending = true;
 }
 

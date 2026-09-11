@@ -71,8 +71,11 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	// `bda_hint_word` is required: P1 and P2 publish into it for every region.
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr,
+	              std::atomic<uint64_t>& bda_hint_word)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr), m_bda_hint_word(bda_hint_word),
+	      m_bda_hint_mask(uint64_t {1} << ((cpu_addr / TRACKER_REGION_SIZE) % 64u)) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -84,6 +87,15 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+
+	// Selective BDA discovery: mark this region as possibly holding CPU-dirty pages that
+	// PrepareBda must examine. See MemoryTracker for the contract.
+	void PublishBdaHint() const noexcept {
+		m_bda_hint_word.fetch_or(m_bda_hint_mask, std::memory_order_release);
+	}
+
+	// Caller holds `lock`.
+	[[nodiscard]] const RegionBits& CpuDirtyBits() const noexcept { return m_cpu_dirty; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -109,6 +121,13 @@ public:
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			// P1: this is the only setter of CPU-dirty truth after construction. Publish on
+			// every execution (not only clean -> dirty), after the bits changed and while the
+			// caller still holds `lock`, so a locked snapshot or check never sees the new dirty
+			// bits without the hint.
+			PublishBdaHint();
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateCpuProtection<!enable>();
@@ -204,6 +223,10 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+
+	// Selective BDA discovery: the hint word this region shares with 63 others, and its bit.
+	std::atomic<uint64_t>& m_bda_hint_word;
+	uint64_t               m_bda_hint_mask;
 };
 
 } // namespace Libs::Graphics

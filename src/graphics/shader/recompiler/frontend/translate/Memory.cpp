@@ -111,11 +111,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_sample_flags       = decoded.image_sample_flags;
 	memory.image_dimension          = decoded.image_dimension;
 	memory.image_address_components = decoded.image_address_components;
-	memory.image_nsa_dwords         = decoded.image_nsa_dwords;
-	for (uint32_t index = 0; index < Decoder::MaxImageNsaAddressComponents; index++) {
-		memory.image_nsa_addr[index] = decoded.image_nsa_addr[index];
-	}
-	memory.memory_segment = decoded.memory_segment;
 	memory.address_is_full =
 	    memory.kind == ResourceKind::Flat ||
 	    (memory.kind == ResourceKind::Global && decoded.src1.kind == Decoder::OperandKind::Vgpr);
@@ -125,8 +120,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
-	memory.glc           = decoded.glc;
-	memory.slc           = decoded.slc;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);

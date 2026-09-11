@@ -954,9 +954,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			break;
 		default: break; // ValidateTranslateOptions rejects unsupported stages.
 	}
-	result.dispatcher_fallback = options.dispatcher_fallback;
-	result.cfg_failure_kind    = options.cfg_failure_kind;
-	result.fallback_reason     = options.fallback_reason;
+	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
+	result.cfg_failure_kind    = cfg.failure_kind;
+	result.fallback_reason     = cfg.unsupported_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;

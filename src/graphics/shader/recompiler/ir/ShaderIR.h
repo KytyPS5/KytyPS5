@@ -57,17 +57,12 @@ struct MemoryInfo {
 	uint32_t                image_sample_flags       = 0;
 	Decoder::ImageDimension image_dimension          = Decoder::ImageDimension::Unknown;
 	uint32_t                image_address_components = 0;
-	uint32_t                image_nsa_dwords         = 0;
-	uint32_t                image_nsa_addr[Decoder::MaxImageNsaAddressComponents] = {};
-	uint32_t                memory_segment                                        = 0;
 	bool                    address_is_full                                       = false;
 	bool                    data_signed                                           = false;
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
-	bool                    glc                                                   = false;
-	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    planning_only                                         = false;
@@ -540,9 +535,8 @@ struct Program: ResourcePlan {
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
-	// Decoded MIMG/VMEM metadata carries details such as RDNA2 NSA address registers and
-	// storage-image swizzles. Typed memory instructions carry a dense index into these shader-local
-	// tables until those fields are consumed by emission.
+	// Typed memory and export instructions reference shader-local metadata by dense index.
+	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
 	std::vector<Value>            dynamic_reads;
 	bool                          shader_info_complete = false;

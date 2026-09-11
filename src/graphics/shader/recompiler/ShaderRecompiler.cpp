@@ -53,8 +53,7 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase,
-                           const std::string& reason) {
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
@@ -68,7 +67,7 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
-	     static_cast<uint64_t>(cfg.back_edges.size()), reason.c_str());
+	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
 }
 
 enum class EmbeddedFetchValueType {
@@ -550,27 +549,22 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
-	bool        dispatcher_fallback = false;
-	std::string dispatcher_reason;
 	if (cfg.irreducible) {
-		dispatcher_fallback = true;
-		dispatcher_reason   = cfg.unsupported_reason;
-		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+		LogDispatcherFallback(options, cfg, "build");
 	} else {
 		const auto unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		if (!CFG::Structurize(cfg)) {
-			dispatcher_fallback      = true;
-			dispatcher_reason        = cfg.unsupported_reason;
 			const auto failure_kind  = cfg.failure_kind;
 			const auto failure_block = cfg.failure_block;
-			LogDispatcherFallback(options, cfg, "structurize", dispatcher_reason);
+			LogDispatcherFallback(options, cfg, "structurize");
+			auto failure_reason    = std::move(cfg.unsupported_reason);
 			cfg                    = unstructured_cfg;
 			cfg.unsupported        = true;
 			cfg.failure_kind       = failure_kind;
 			cfg.failure_block      = failure_block;
-			cfg.unsupported_reason = dispatcher_reason;
+			cfg.unsupported_reason = std::move(failure_reason);
 		} else {
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
@@ -594,16 +588,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage               = options.stage,
-	    .wave_size           = options.wave_size,
-	    .shader_hash         = options.shader_hash,
-	    .user_data_base      = options.user_data_base,
-	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
-	    .dispatcher_fallback = dispatcher_fallback,
-	    .cfg_failure_kind    = cfg.failure_kind,
-	    .fallback_reason = dispatcher_reason.empty() ? cfg.unsupported_reason : dispatcher_reason,
-	    .input_info      = options.input_info,
-	    .embedded_fetch  = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .stage            = options.stage,
+	    .wave_size        = options.wave_size,
+	    .shader_hash      = options.shader_hash,
+	    .user_data_base   = options.user_data_base,
+	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
+	    .input_info       = options.input_info,
+	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);

@@ -168,6 +168,13 @@ pub struct Configuration {
     pub bvh_stub_enabled: bool,
     pub host_input_mapping: Vec<String>,
     pub elf: String,
+    /// Audio output device selection, passed as --audio-output-device to emulator.
+    /// Empty string means system default. Device name/id must match SDL2 enumeration.
+    #[serde(default)]
+    pub audio_output_device: String,
+    /// Audio input device selection for game recording. Empty string means system default.
+    #[serde(default)]
+    pub audio_input_device: String,
 
     // Not persisted to Kyty.ini — derived fresh from sce_sys/param.json on
     // every scan, exactly like the Qt launcher's Configuration::title_id /
@@ -205,6 +212,8 @@ impl Default for Configuration {
             bvh_stub_enabled: false,
             host_input_mapping: Vec::new(),
             elf: "eboot.bin".to_string(),
+            audio_output_device: String::new(),
+            audio_input_device: String::new(),
             title_id: String::new(),
             game_version: String::new(),
             firmware_ver: String::new(),
@@ -235,6 +244,8 @@ impl Configuration {
         self.renderdoc_enabled = other.renderdoc_enabled;
         self.bvh_stub_enabled = other.bvh_stub_enabled;
         self.host_input_mapping = other.host_input_mapping.clone();
+        self.audio_output_device = other.audio_output_device.clone();
+        self.audio_input_device = other.audio_input_device.clone();
     }
 
     fn write_into(&self, doc: &mut IniDocument, section: &str, prefix: &str) {
@@ -276,6 +287,8 @@ impl Configuration {
         }
         doc.set(section, &k("host_input_mapping"), encode_string_list(&self.host_input_mapping));
         doc.set(section, &k("elf"), encode_string(&self.elf));
+        doc.set(section, &k("audio_output_device"), encode_string(&self.audio_output_device));
+        doc.set(section, &k("audio_input_device"), encode_string(&self.audio_input_device));
     }
 
     fn read_from(doc: &IniDocument, section: &str, prefix: &str) -> Self {
@@ -353,6 +366,12 @@ impl Configuration {
             c.elf = decode_string(v);
         } else {
             c.elf = "eboot.bin".to_string();
+        }
+        if let Some(v) = get("audio_output_device") {
+            c.audio_output_device = decode_string(v);
+        }
+        if let Some(v) = get("audio_input_device") {
+            c.audio_input_device = decode_string(v);
         }
         c
     }

@@ -56,6 +56,8 @@ static void PrintUsage() {
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
+	::printf("  --audio-output-device <name>         Audio output device. Default: system default.\n");
+	::printf("  --audio-input-device <name>          Audio input device. Default: system default.\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
@@ -314,6 +316,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.keymap.push_back(value);
+		} else if (arg == "--audio-output-device") {
+			options.config.audio_output_device = value;
+		} else if (arg == "--audio-input-device") {
+			options.config.audio_input_device = value;
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;

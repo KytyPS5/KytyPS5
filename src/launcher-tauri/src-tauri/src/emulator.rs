@@ -166,6 +166,14 @@ pub fn build_args(
     args.push(info.vblank_frequency.to_string());
     args.push("--console-language".to_string());
     args.push(info.console_language.to_string());
+    if !info.audio_output_device.is_empty() {
+        args.push("--audio-output-device".to_string());
+        args.push(info.audio_output_device.clone());
+    }
+    if !info.audio_input_device.is_empty() {
+        args.push("--audio-input-device".to_string());
+        args.push(info.audio_input_device.clone());
+    }
     args.push("--vulkan-validation".to_string());
     args.push(bool_arg(info.vulkan_validation_enabled).to_string());
     args.push("--shader-validation".to_string());

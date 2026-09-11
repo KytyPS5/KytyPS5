@@ -3,6 +3,7 @@
 #include "SDL.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -129,7 +130,7 @@ private:
 	static uint32_t        BytesPerSample(Format format);
 	static uint32_t        OutputChannels(const PortOut& port);
 	static SDL_AudioFormat SdlFormat(Format format);
-	static bool            OpenSdlDevice(PortOut* port);
+	static bool            OpenSdlDevice(PortOut* port, const char* device_name = nullptr);
 	static void            CloseSdlDevice(PortOut* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
@@ -228,7 +229,7 @@ SDL_AudioFormat Audio::SdlFormat(Format format) {
 	return FormatIsFloat(format) ? AUDIO_F32SYS : AUDIO_S16SYS;
 }
 
-bool Audio::OpenSdlDevice(PortOut* port) {
+bool Audio::OpenSdlDevice(PortOut* port, const char* device_name) {
 	EXIT_IF(port == nullptr);
 
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
@@ -246,16 +247,18 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	SDL_AudioSpec obtained {};
 
 	port->audio_device =
-	    SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+	    SDL_OpenAudioDevice(device_name, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
 	if (port->audio_device == 0) {
-		LOGF("AudioOut: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+		LOGF("AudioOut: SDL_OpenAudioDevice failed for device \"%s\": %s\n",
+		     device_name != nullptr ? device_name : "default", SDL_GetError());
 		return false;
 	}
 
 	port->audio_spec = obtained;
 	SDL_PauseAudioDevice(port->audio_device, 0);
 
-	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x)\n", obtained.freq,
+	LOGF("AudioOut: opened SDL device \"%s\" (%d Hz, %u ch, format 0x%04x)\n",
+	     device_name != nullptr ? device_name : "default", obtained.freq,
 	     obtained.channels, obtained.format);
 	return true;
 }
@@ -445,7 +448,8 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			}
 
 			if (type != AUDIO_OUT_PORT_TYPE_VIBRATION) {
-				OpenSdlDevice(&port);
+				const auto& device_name = Config::GetAudioOutputDevice();
+				OpenSdlDevice(&port, device_name.empty() ? nullptr : device_name.c_str());
 			}
 
 			return Id::Create(id);

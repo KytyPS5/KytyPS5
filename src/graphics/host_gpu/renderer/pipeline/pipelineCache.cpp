@@ -507,6 +507,8 @@ struct PipelineCache::ProgramCache {
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {

@@ -560,9 +560,11 @@ void EmitVoid(ValueEmitContext&) {}
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	// A guest s_barrier also separates buffer traffic, not just LDS: UniformMemory too.
 	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
 	                                       : spv::MemorySemanticsAcquireReleaseMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask;
+	                                             spv::MemorySemanticsWorkgroupMemoryMask |
+	                                             spv::MemorySemanticsUniformMemoryMask;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }

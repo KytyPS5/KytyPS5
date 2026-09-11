@@ -609,16 +609,35 @@ fn poll_gamepad_state(state: State<AppState>) -> Vec<NativeGamepadState> {
         .collect()
 }
 
-// ---- Audio output device ------------------------------------------------------
+// ---- Audio devices ------------------------------------------------------------
 
 #[tauri::command]
-fn list_audio_sinks() -> Vec<audio::AudioSink> {
-    audio::list_sinks()
+fn list_audio_sinks() -> Vec<audio::AudioDevice> {
+    audio::list_devices(audio::Direction::Output)
+}
+
+/// Microphones and other capture endpoints, for games that record input.
+#[tauri::command]
+fn list_audio_sources() -> Vec<audio::AudioDevice> {
+    audio::list_devices(audio::Direction::Input)
 }
 
 #[tauri::command]
 fn set_audio_output_sink(sink: Option<String>) -> Result<(), String> {
-    audio::set_output_sink(sink)
+    audio::set_device(audio::Direction::Output, sink)
+}
+
+#[tauri::command]
+fn set_audio_input_source(source: Option<String>) -> Result<(), String> {
+    audio::set_device(audio::Direction::Input, source)
+}
+
+/// False where the OS gives a launcher no way to route a child process's
+/// audio (Windows). The Audio page shows an explanation instead of a
+/// picker that would quietly do nothing.
+#[tauri::command]
+fn audio_selection_supported() -> bool {
+    audio::selection_is_supported()
 }
 
 // THROWAWAY — diagnosing the "Run does not launch" report. Removed once fixed.
@@ -715,7 +734,10 @@ pub fn run() {
             list_gamepad_names,
             poll_gamepad_state,
             list_audio_sinks,
+            list_audio_sources,
             set_audio_output_sink,
+            set_audio_input_source,
+            audio_selection_supported,
             bluetooth::bluetooth_adapter_state,
             bluetooth::list_bluetooth_devices,
             bluetooth::scan_bluetooth_devices,

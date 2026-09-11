@@ -165,8 +165,10 @@ export interface Catalog {
       sfxEnabled: string;
       sfxVolume: string;
       outputDevice: string;
+      inputDevice: string;
       systemDefault: string;
       noDevicesFound: string;
+      routingUnsupported: string;
     };
     bluetooth: {
       title: string;
@@ -284,6 +286,9 @@ export interface Catalog {
     delete: string;
     active: string;
     cannotDeleteLast: string;
+    confirmDelete: string;
+    profilesHeading: string;
+    preferencesHeading: string;
     trophyCount: string;
   };
   profileView: {
@@ -505,8 +510,11 @@ const en: Catalog = {
       sfxEnabled: "UI sound effects",
       sfxVolume: "Effects volume ({percent}%)",
       outputDevice: "Output device",
+      inputDevice: "Input device",
       systemDefault: "System default",
       noDevicesFound: "No audio devices found.",
+      routingUnsupported:
+        "Windows cannot route one app's audio from another, so these devices are listed for reference only. To send a game to a specific device, assign kyty_emulator in Windows Settings > System > Sound > Volume mixer.",
     },
     bluetooth: {
       title: "Bluetooth",
@@ -644,6 +652,9 @@ const en: Catalog = {
     delete: "Delete",
     active: "Active",
     cannotDeleteLast: "At least one profile must remain.",
+    confirmDelete: "Delete {name}?",
+    profilesHeading: "Profiles",
+    preferencesHeading: "{name}'s preferences",
     trophyCount: "{count} trophies",
   },
   profileView: {

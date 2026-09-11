@@ -52,6 +52,17 @@ export function LibraryFilterPanel({
   }, []);
 
   useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target || !rootRef.current) return;
+      if (rootRef.current.contains(target) || target.closest("[data-flyout-trigger]")) return;
+      onClose();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [onClose]);
+
+  useEffect(() => {
     if (!submenu || !submenuRef.current) return;
     const root = submenuRef.current;
     pushFocusScope(root, () => setSubmenu(null));

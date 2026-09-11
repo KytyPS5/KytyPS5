@@ -589,10 +589,20 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::TtraceData:
 		case IR::ValueOpcode::InstPrefetch: return true;
 		case IR::ValueOpcode::Barrier: {
-			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
-			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
-			                           ConstantU32(state, ScopeWorkgroup),
-			                           ConstantU32(state, semantics)});
+			// Vulkan only allows a Workgroup execution/memory scope in stages that actually have
+			// a workgroup: compute, mesh and tessellation control. A guest s_barrier can appear
+			// in a vertex shader too (GCN uses it for the LS->HS handoff), and emitting a
+			// workgroup barrier there produces invalid SPIR-V -- spirv-val rejects it with
+			// VUID-StandaloneSpirv-OpControlBarrier-04682. Fall back to a subgroup barrier,
+			// which is legal everywhere and still orders the wave.
+			const bool workgroup =
+			    state.stage == ShaderType::Compute || state.stage == ShaderType::Mesh;
+			const auto scope     = workgroup ? ScopeWorkgroup : ScopeSubgroup;
+			const auto semantics = MemorySemanticsAcquireRelease | (workgroup
+			                                                           ? MemorySemanticsWorkgroupMemory
+			                                                           : MemorySemanticsSubgroupMemory);
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, scope),
+			                           ConstantU32(state, scope), ConstantU32(state, semantics)});
 			return true;
 		}
 		case IR::ValueOpcode::MeshAllocate: EmitMeshAllocate(ctx, inst); return true;

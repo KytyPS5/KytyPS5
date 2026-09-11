@@ -135,6 +135,7 @@ enum : uint32_t {
 	MemorySemanticsNone            = 0,
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
+	MemorySemanticsSubgroupMemory  = 0x00000080u,
 	MemorySemanticsWorkgroupMemory = 0x00000100u,
 	MemorySemanticsImageMemory     = 0x00000800u,
 };

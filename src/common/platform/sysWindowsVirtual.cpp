@@ -45,18 +45,6 @@ static DWORD GetProtectionFlag(VirtualMemory::Mode mode) {
 	return protect;
 }
 
-static VirtualMemory::Mode GetProtectionFlag(DWORD mode) {
-	switch (mode) {
-		case PAGE_NOACCESS: return VirtualMemory::Mode::NoAccess;
-		case PAGE_READONLY: return VirtualMemory::Mode::Read;
-		case PAGE_READWRITE: return VirtualMemory::Mode::ReadWrite;
-		case PAGE_EXECUTE: return VirtualMemory::Mode::Execute;
-		case PAGE_EXECUTE_READ: return VirtualMemory::Mode::ExecuteRead;
-		case PAGE_EXECUTE_READWRITE: return VirtualMemory::Mode::ExecuteReadWrite;
-		default: return VirtualMemory::Mode::NoAccess;
-	}
-}
-
 void SysVirtualInit() {}
 
 uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
@@ -328,16 +316,12 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	return current - address == size && SysVirtualFree(address);
 }
 
-bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                       VirtualMemory::Mode* old_mode) {
+bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {
 		printf("VirtualProtect() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
 		return false;
-	}
-	if (old_mode != nullptr) {
-		*old_mode = GetProtectionFlag(old_protect);
 	}
 	return true;
 }

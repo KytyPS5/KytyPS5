@@ -19,8 +19,7 @@ bool     SysVirtualReserveFixed(uint64_t address, uint64_t size);
 bool     SysVirtualDecommit(uint64_t address, uint64_t size);
 bool     SysVirtualFree(uint64_t address);
 bool     SysVirtualFreeRange(uint64_t address, uint64_t size);
-bool     SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                           VirtualMemory::Mode* old_mode = nullptr);
+bool     SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode);
 bool     SysVirtualFlushInstructionCache(uint64_t address, uint64_t size);
 
 } // namespace Common

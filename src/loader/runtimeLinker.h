@@ -177,8 +177,12 @@ public:
 
 	static uint64_t ReadFromElf(Program* program, uint64_t vaddr);
 	Program*        FindProgramByAddr(uint64_t vaddr);
-	Program*        FindProgramById(int32_t id);
-	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
+	// Same lookup, but never blocks: returns nullptr when the linker lock is already held.
+	// Safe to call from the host exception handler, which may run on a thread that faulted
+	// while holding it.
+	Program* TryFindProgramByAddr(uint64_t vaddr);
+	Program* FindProgramById(int32_t id);
+	Program* FindProgramByFileName(const std::filesystem::path& elf_name);
 
 	static uint8_t* TlsGetAddr(Program* program);
 	static void     DeleteTls(Program* program, int thread_id);
@@ -195,6 +199,7 @@ private:
 	void        PreloadAdjacentPrograms();
 
 	Program* FindProgram(const ModuleId& m, const LibraryId& l);
+	Program* FindProgramByAddrNoLock(uint64_t vaddr);
 
 	static const ModuleId*  FindModule(const Program& program, const std::string& id);
 	static const LibraryId* FindLibrary(const Program& program, const std::string& id);

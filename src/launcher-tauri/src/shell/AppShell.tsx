@@ -10,11 +10,18 @@ import styles from "./AppShell.module.css";
 export function AppShell({
   view,
   onNavigate,
+  onBack,
   dimmed,
   children,
 }: {
   view: ViewId;
   onNavigate: (v: ViewId) => void;
+  /** TopBar's chevron uses this instead of a fixed onNavigate("home") --
+   * App.tsx's handleBack already knows the one hierarchical exception
+   * (Library with a game selected steps back to the grid, not Home), so
+   * the chevron and the gamepad/keyboard back action agree instead of the
+   * chevron always jumping past that level. */
+  onBack: () => void;
   /** Rest mode (src/overlays/RestMode.tsx): the home scene recedes rather
    * than the overlay simply painting over it -- 01-motion-system.md's rest
    * sequence names this explicitly ("home darkens", "content recedes"). */
@@ -41,7 +48,7 @@ export function AppShell({
       <ResizeGrips onGrip={startResizeDragging} />
 
       <div className={styles.main}>
-        <TopBar view={view} onNavigate={onNavigate} />
+        <TopBar view={view} onNavigate={onNavigate} onBack={onBack} />
         <div className={styles.content}>
           {/* One shell-level background, mounted once and never unmounted
              across navigation -- views used to each own a HeroBackground

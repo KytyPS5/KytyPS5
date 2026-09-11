@@ -95,7 +95,7 @@ export default function App() {
   return (
     <BootController dataReady={dataReady}>
       <FocusNavProvider resetKey={view} onBack={handleBack} onMenu={handleMenu}>
-        <AppShell view={view} onNavigate={setView} dimmed={restMode}>
+        <AppShell view={view} onNavigate={setView} onBack={handleBack} dimmed={restMode}>
           {view === "home" && (
             <HomeView
               onNavigate={setView}

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
-import { ChevronLeft, FolderOpen, Play, Save as SaveIcon, Square, SlidersHorizontal, Trophy, Wrench } from "lucide-react";
+import { FolderOpen, Play, Save as SaveIcon, Square, SlidersHorizontal, Trophy, Wrench } from "lucide-react";
 import type { Configuration, CompatibilityMap, GameEntry, GameStatus, KytyConfig, PatchStatus } from "../types";
 import { useStore } from "../store/observable";
 import { isRunningStore, runningGameStore, runGame, stopGame } from "../store/run";
@@ -32,17 +32,11 @@ export function GameDetail({
   compatibility,
   compatibilityIsLocal,
   onRescanCompatibility,
-  onBack,
 }: {
   game: GameEntry;
   compatibility: CompatibilityMap;
   compatibilityIsLocal: boolean;
   onRescanCompatibility: () => void;
-  /** Returns to the Library grid -- this is now a full screen (Library.tsx
-   * swaps the grid out for it), not a docked side panel, so it needs its own
-   * explicit way back for a mouse user (gamepad/keyboard back already
-   * returns here via the focus scope Library.tsx pushes around this). */
-  onBack: () => void;
 }) {
   const backdrop = useGameArt(game);
   const t = useT();
@@ -96,9 +90,10 @@ export function GameDetail({
       <div className={styles.scrim} />
       <div className={styles.body}>
         <div className={styles.header}>
-          <button type="button" className="icon-button" onClick={onBack} title={t("common.back")} aria-label={t("common.back")}>
-            <ChevronLeft size={20} strokeWidth={2} />
-          </button>
+          {/* No back button here anymore -- it duplicated TopBar's chevron,
+             which used to always navigate Home and so couldn't return to
+             the Library grid from here; now that it routes through
+             App.tsx's onBack (shell/TopBar.tsx), it's the only one. */}
           <div className={styles.headerIcon}>
             {backdrop ? <img className={styles.headerIconImage} src={backdrop} alt="" /> : game.config.name.slice(0, 1).toUpperCase()}
           </div>

@@ -11,7 +11,7 @@ import { useT } from "../i18n";
 import { useActiveProfile } from "../lib/profiles";
 import styles from "./TopBar.module.css";
 
-export function TopBar({ view, onNavigate }: { view: ViewId; onNavigate: (v: ViewId) => void }) {
+export function TopBar({ view, onNavigate, onBack }: { view: ViewId; onNavigate: (v: ViewId) => void; onBack: () => void }) {
   const clock = useClock();
   const t = useT();
   const running = useStore(isRunningStore);
@@ -38,14 +38,19 @@ export function TopBar({ view, onNavigate }: { view: ViewId; onNavigate: (v: Vie
       {/* No brand mark here anymore -- it's the OS app icon now (see
          src-tauri/icons), not a clickable in-window control. Home shows
          nothing in this slot (there's nowhere further "back" to go); every
-         other view shows the chevron. */}
+         other view shows the chevron. Routes through App.tsx's onBack, not
+         a fixed onNavigate("home") -- Game Settings used to need its own
+         second back arrow next to the game art (GameDetail.tsx) precisely
+         because this one only ever went Home, skipping past the Library
+         grid; onBack already knows that one hierarchical step, so this is
+         now the only back control and GameDetail's own button is gone. */}
       {view !== "home" && (
         <button
           type="button"
           className={styles.backButton}
-          onClick={() => onNavigate("home")}
-          title={t("nav.home")}
-          aria-label={t("nav.home")}
+          onClick={onBack}
+          title={t("common.back")}
+          aria-label={t("common.back")}
         >
           <ChevronLeft size={22} strokeWidth={2} />
         </button>

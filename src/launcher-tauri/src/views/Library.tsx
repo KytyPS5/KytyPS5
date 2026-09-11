@@ -132,7 +132,6 @@ export function LibraryView({
           compatibility={compatibility}
           compatibilityIsLocal={compatibilityIsLocal}
           onRescanCompatibility={rescanCompatibility}
-          onBack={() => onSelectGame(null)}
         />
       </div>
     );

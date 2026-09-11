@@ -152,7 +152,15 @@ void CommandScheduler::ResetOcclusionPool() {
 	// Slot numbering restarts each recording; the pool must be reset outside a render pass, which
 	// BeginCommand always is. Anything still pending from the previous recording has already been
 	// drained (DrainOcclusionBeforeReuse), so reusing slot 0 here is safe.
-	if (m_occlusion_pool == nullptr || m_command.IsInvalid()) {
+	if (m_command.IsInvalid()) {
+		return;
+	}
+	// Create the pool here rather than on first use. SampleOcclusion only runs inside a render
+	// pass, where vkCmdResetQueryPool is illegal, so a pool created there missed this recording's
+	// reset entirely and its very first vkCmdBeginQuery hit an unreset query -- undefined results
+	// and a validation error. Creating it on the reset path means every pool is always reset
+	// before it is used.
+	if (!EnsureOcclusionPool() || m_occlusion_pool == nullptr) {
 		return;
 	}
 	m_command.Handle().resetQueryPool(m_occlusion_pool, 0, OcclusionQuerySlots);

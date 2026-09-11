@@ -22,17 +22,29 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
+#include <stop_token>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+
+// windows.h, pulled in by the Vulkan headers, redirects this to its own ANSI entry point.
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
 
 namespace Libs::Graphics {
 
@@ -60,15 +72,99 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+// Fingerprints the running binary: a rebuilt emitter emits different SPIR-V without the git
+// revision changing. 0 means the binary could not be read.
+uint64_t EmulatorBinaryHash() {
+	std::filesystem::path exe;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	char* program = nullptr;
+	if (_get_pgmptr(&program) == 0 && program != nullptr) {
+		exe = std::filesystem::path(program);
+	}
+#else
+	std::error_code error;
+	exe = std::filesystem::read_symlink("/proc/self/exe", error);
+	if (error) {
+		exe.clear();
+	}
+#endif
+	if (exe.empty()) {
+		return 0;
+	}
+	Common::File file(exe, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return 0;
+	}
+	auto* state = XXH3_createState();
+	if (state == nullptr) {
+		return 0;
+	}
+	XXH3_64bits_reset(state);
+	std::vector<uint8_t> buffer(1024u * 1024u);
+	uint64_t             remaining = file.Size();
+	bool                 ok        = remaining != 0;
+	while (ok && remaining != 0) {
+		const auto chunk = static_cast<uint32_t>(std::min<uint64_t>(remaining, buffer.size()));
+		uint32_t   read  = 0;
+		file.Read(buffer.data(), chunk, &read);
+		ok = read == chunk;
+		XXH3_64bits_update(state, buffer.data(), read);
+		remaining -= read;
+	}
+	const auto hash = XXH3_64bits_digest(state);
+	XXH3_freeState(state);
+	if (!ok) {
+		return 0;
+	}
+	return hash == 0 ? 1 : hash;
+}
+
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties,
+                                 uint64_t                            build_hash) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	return fmt::format("KytyPC2:{}:{:016x}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	                   build_hash, properties.vendorID, properties.deviceID,
+	                   properties.driverVersion, uuid);
+}
+
+// Each build keys its own file; keep one older file so alternating builds still hit. These blobs
+// run to hundreds of megabytes, so the rest go.
+void PruneDriverCaches(const std::filesystem::path& folder, const std::string& title_id,
+                       const std::string& keep) {
+	constexpr size_t KeepMax = 2;
+	if (!Common::File::IsDirectoryExisting(folder)) {
+		return;
+	}
+	const auto                                                      prefix = title_id + "-";
+	const auto                                                      legacy = title_id + ".bin";
+	std::vector<std::pair<Common::DateTime, std::filesystem::path>> others;
+	for (const auto& entry: Common::File::GetDirEntries(folder)) {
+		if (!entry.is_file || entry.name == keep || !entry.name.ends_with(".bin")) {
+			continue;
+		}
+		if (entry.name == legacy) {
+			// Unfingerprinted name written before this keying: no build can load it now.
+			Common::File::DeleteFile(folder / entry.name);
+			continue;
+		}
+		if (!entry.name.starts_with(prefix)) {
+			continue;
+		}
+		auto path = folder / entry.name;
+		others.emplace_back(Common::File::GetLastWriteTimeUTC(path), std::move(path));
+	}
+	if (others.size() < KeepMax) {
+		return;
+	}
+	std::ranges::sort(others, [](const auto& a, const auto& b) { return a.first > b.first; });
+	for (size_t i = KeepMax - 1; i < others.size(); i++) {
+		Common::File::DeleteFile(others[i].second);
+	}
 }
 
 std::string PipelineCacheTitleId() {
@@ -175,6 +271,163 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// A pipeline creation still inside the driver after this long is pathological: a healthy one
+// returns at once, while the SILENT HILL 2 loading-screen stall runs past a minute.
+constexpr std::chrono::nanoseconds PipelineStallThreshold = std::chrono::seconds {5};
+constexpr std::chrono::nanoseconds PipelineStallRepeat    = std::chrono::seconds {15};
+
+struct PipelineCreationSlot {
+	std::atomic<bool> claimed {false};
+	// Non-zero only while the plain fields below are valid: published last, cleared first.
+	std::atomic<int64_t> start_ns {0};
+	std::atomic<int64_t> reported_ns {0};
+	bool                 compute  = false;
+	uint64_t             hash[2]  = {};
+	uint32_t             words[2] = {};
+};
+
+// Creations are serialized by PipelineCache::m_mutex; the table only has to cover other callers.
+constexpr size_t      PipelineCreationSlotCount = 32;
+PipelineCreationSlot  g_pipeline_slots[PipelineCreationSlotCount];
+std::atomic<uint64_t> g_pipelines_completed {0};
+std::atomic<uint32_t> g_pipelines_in_flight {0};
+std::atomic<bool>     g_pipeline_summary_printed {false};
+
+int64_t PipelineNowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+// printf, not LOGF: the log stream is Silent in an ordinary run and this has to be visible there.
+void PrintPipelineStallLine(bool compute, const uint64_t hash[2], const uint32_t words[2],
+                            const char* phase, int64_t elapsed_ns) {
+	const double seconds = static_cast<double>(elapsed_ns) / 1e9;
+	if (compute) {
+		std::printf("PipelineStall: compute pipeline %s after %.1fs cs=0x%016" PRIx64
+		            " spirv_words=%" PRIu32 "\n",
+		            phase, seconds, hash[0], words[0]);
+	} else {
+		std::printf("PipelineStall: graphics pipeline %s after %.1fs vs=0x%016" PRIx64
+		            " spirv_words=%" PRIu32 " ps=0x%016" PRIx64 " spirv_words=%" PRIu32 "\n",
+		            phase, seconds, hash[0], words[0], hash[1], words[1]);
+	}
+	std::fflush(stdout);
+}
+
+// Printed once, ahead of the first stall line: a stuck compile and an idle emulator look the same
+// from outside, and this line is what tells them apart.
+void PrintPipelineStallSummary() {
+	if (g_pipeline_summary_printed.exchange(true)) {
+		return;
+	}
+	std::printf("PipelineStall: %" PRIu64 " pipeline creations completed, %" PRIu32 " in flight\n",
+	            g_pipelines_completed.load(std::memory_order_relaxed),
+	            g_pipelines_in_flight.load(std::memory_order_relaxed));
+	std::fflush(stdout);
+}
+
+void SweepPipelineCreations() {
+	const auto now = PipelineNowNs();
+	for (auto& slot: g_pipeline_slots) {
+		const auto start = slot.start_ns.load(std::memory_order_acquire);
+		if (start == 0) {
+			continue;
+		}
+		const auto elapsed = now - start;
+		if (elapsed < PipelineStallThreshold.count()) {
+			continue;
+		}
+		const auto reported = slot.reported_ns.load(std::memory_order_relaxed);
+		if (reported != 0 && elapsed - reported < PipelineStallRepeat.count()) {
+			continue;
+		}
+		const bool     compute = slot.compute;
+		const uint64_t hash[2] {slot.hash[0], slot.hash[1]};
+		const uint32_t words[2] {slot.words[0], slot.words[1]};
+		// The slot may have been freed and reclaimed while it was read; a new start says so.
+		if (slot.start_ns.load(std::memory_order_acquire) != start) {
+			continue;
+		}
+		slot.reported_ns.store(elapsed, std::memory_order_relaxed);
+		PrintPipelineStallSummary();
+		PrintPipelineStallLine(compute, hash, words, "still running", elapsed);
+	}
+}
+
+class PipelineStallWatchdog {
+public:
+	PipelineStallWatchdog(): m_thread([](std::stop_token token) { Run(token); }) {}
+	KYTY_CLASS_NO_COPY(PipelineStallWatchdog);
+
+private:
+	static void Run(std::stop_token token) {
+		std::mutex                  mutex;
+		std::condition_variable_any wake;
+		std::unique_lock            lock(mutex);
+		while (!wake.wait_for(lock, token, std::chrono::seconds {1},
+		                      [&token] { return token.stop_requested(); })) {
+			SweepPipelineCreations();
+		}
+	}
+
+	std::jthread m_thread;
+};
+
+void EnsurePipelineStallWatchdog() {
+	static PipelineStallWatchdog watchdog;
+	(void)watchdog;
+}
+
+// Costs a slot claim and two clock reads; a healthy creation prints nothing.
+class PipelineCreationTimer {
+public:
+	PipelineCreationTimer(bool compute, uint64_t hash0, uint32_t words0, uint64_t hash1,
+	                      uint32_t words1)
+	    : m_compute(compute), m_hash {hash0, hash1}, m_words {words0, words1},
+	      m_start(PipelineNowNs()) {
+		g_pipelines_in_flight.fetch_add(1, std::memory_order_relaxed);
+		for (auto& slot: g_pipeline_slots) {
+			if (slot.claimed.load(std::memory_order_relaxed) ||
+			    slot.claimed.exchange(true, std::memory_order_acquire)) {
+				continue;
+			}
+			slot.compute  = compute;
+			slot.hash[0]  = hash0;
+			slot.hash[1]  = hash1;
+			slot.words[0] = words0;
+			slot.words[1] = words1;
+			slot.reported_ns.store(0, std::memory_order_relaxed);
+			slot.start_ns.store(m_start, std::memory_order_release);
+			m_slot = &slot;
+			break;
+		}
+	}
+
+	~PipelineCreationTimer() {
+		const auto elapsed = PipelineNowNs() - m_start;
+		if (m_slot != nullptr) {
+			m_slot->start_ns.store(0, std::memory_order_release);
+			m_slot->claimed.store(false, std::memory_order_release);
+		}
+		g_pipelines_in_flight.fetch_sub(1, std::memory_order_relaxed);
+		g_pipelines_completed.fetch_add(1, std::memory_order_relaxed);
+		if (elapsed >= PipelineStallThreshold.count()) {
+			PrintPipelineStallSummary();
+			PrintPipelineStallLine(m_compute, m_hash, m_words, "finished", elapsed);
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(PipelineCreationTimer);
+
+private:
+	PipelineCreationSlot* m_slot = nullptr;
+	bool                  m_compute;
+	uint64_t              m_hash[2];
+	uint32_t              m_words[2];
+	int64_t               m_start;
+};
+
 } // namespace
 
 struct PipelineCache::ProgramCache {
@@ -257,7 +510,10 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id          = ++next_shader_id,
+		                       .module      = module,
+		                       .hash        = options.shader_hash,
+		                       .spirv_words = static_cast<uint32_t>(result.spirv.size())},
 		};
 	}
 
@@ -394,6 +650,7 @@ struct PipelineCache::ProgramCache {
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();
 }
 
@@ -423,18 +680,22 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
+	m_build_hash = EmulatorBinaryHash();
+	if (m_build_hash == 0) {
+		// Without a fingerprint the only key left is the git revision, which identifies a clean
+		// build and nothing else.
+		const std::string_view git_hash     = KYTY_GIT_HASH;
+		const std::string_view git_revision = KYTY_GIT_REVISION;
+		if (git_hash == "unknown" || git_revision == "unknown" || git_hash.ends_with("-dirty")) {
+			PipelineCacheLog("Vulkan pipeline cache: disabled (build cannot be identified)");
+			return;
+		}
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	const std::filesystem::path folder("_PipelineCache");
+	const auto                  name = fmt::format("{}-{:016x}.bin", title_id, m_build_hash);
+	PruneDriverCaches(folder, title_id, name);
+	m_driver_cache_path     = folder / name;
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -446,7 +707,8 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto   signature =
+		    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_build_hash);
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -502,8 +764,30 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	if (!WriteDriverCacheLocked()) {
+		return;
+	}
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
+
+// Written mid-run and kept alive: a session that never reaches a clean exit still leaves its
+// compiles on disk.
+void PipelineCache::MaybeSaveDriverCacheLocked() {
 	if (m_driver_cache == nullptr) {
 		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_save < DriverCacheSavePeriod) {
+		return;
+	}
+	m_last_save = now;
+	(void)WriteDriverCacheLocked();
+}
+
+bool PipelineCache::WriteDriverCacheLocked() {
+	if (m_driver_cache == nullptr) {
+		return false;
 	}
 
 	size_t               size = 0;
@@ -526,15 +810,15 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_build_hash);
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -551,12 +835,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -792,8 +1075,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	{
+		PipelineCreationTimer timer(false, vertex_program.hash, vertex_program.spirv_words,
+		                            ps_active ? pixel_program.hash : 0,
+		                            ps_active ? pixel_program.spirv_words : 0);
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -801,6 +1089,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	MaybeSaveDriverCacheLocked();
 
 	return *iter->second;
 }
@@ -824,13 +1113,18 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	{
+		PipelineCreationTimer timer(true, compute_program.hash, compute_program.spirv_words, 0, 0);
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	MaybeSaveDriverCacheLocked();
 
 	return *iter->second;
 }

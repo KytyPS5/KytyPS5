@@ -14,6 +14,40 @@ namespace {
 // driver exposes it, reports the GPU addresses that faulted and any vendor-specific detail --
 // the only practical way to find a shader that walks off its resources, since GPU-assisted
 // validation shuts itself down once the device is already gone.
+// With VK_NV_device_diagnostic_checkpoints the driver remembers the markers the GPU last
+// passed. renderDraw tags every draw with its pixel shader hash, so the newest marker names
+// the draw that was in flight when the device died.
+void ReportCheckpoints(const GraphicContext& graphics) {
+	if (!graphics.nv_diagnostics_enabled || graphics.queue == nullptr) {
+		return;
+	}
+	auto* get_data = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(
+	    graphics.device.getProcAddr("vkGetQueueCheckpointDataNV"));
+	if (get_data == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	get_data(graphics.queue, &count, nullptr);
+	if (count == 0) {
+		LOGF("device checkpoints: none reported\n");
+		return;
+	}
+	std::vector<VkCheckpointDataNV> data(count);
+	for (auto& entry: data) {
+		entry.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+		entry.pNext = nullptr;
+	}
+	get_data(graphics.queue, &count, data.data());
+	LOGF("--- Device checkpoints (%u) --- newest marker is the draw that was executing\n",
+	     count);
+	for (uint32_t i = 0; i < count; i++) {
+		LOGF("  checkpoint[%u]: stage=0x%08x ps_hash=0x%016llx\n", i,
+		     static_cast<uint32_t>(data[i].stage),
+		     static_cast<unsigned long long>(
+		         reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker)));
+	}
+}
+
 void ReportDeviceFault(const GraphicContext& graphics) {
 	if (!graphics.device_fault_enabled) {
 		LOGF("device fault: VK_EXT_device_fault is not enabled, no detail available\n");
@@ -110,6 +144,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result == vk::Result::eErrorDeviceLost) {
+		ReportCheckpoints(m_graphics);
 		ReportDeviceFault(m_graphics);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

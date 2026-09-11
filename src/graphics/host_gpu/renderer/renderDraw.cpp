@@ -456,6 +456,23 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
 }
 
+// Debug aid for a lost device. With VK_NV_device_diagnostic_checkpoints the driver keeps the
+// markers the GPU last passed, so tagging every draw with its pixel shader hash tells us which
+// draw was executing when the device died -- something neither GPU-assisted validation nor
+// VK_EXT_device_fault reports on NVIDIA. No-op unless KYTY_NV_DIAGNOSTICS enabled the extension.
+static void SetGpuCheckpoint(CommandBuffer& buffer, uint64_t marker) {
+	const auto& graphics = buffer.GetGraphics();
+	if (!graphics.nv_diagnostics_enabled || buffer.IsInvalid()) {
+		return;
+	}
+	static auto* set_checkpoint = reinterpret_cast<PFN_vkCmdSetCheckpointNV>(
+	    graphics.device.getProcAddr("vkCmdSetCheckpointNV"));
+	if (set_checkpoint == nullptr) {
+		return;
+	}
+	set_checkpoint(buffer.Handle(), reinterpret_cast<const void*>(static_cast<uintptr_t>(marker)));
+}
+
 struct DrawRenderState {
 	RenderDepthInfo       depth_info;
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
@@ -1254,6 +1271,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	SetGpuCheckpoint(buffer, state.ps_input_info.stage.program != nullptr
+	                             ? state.ps_input_info.stage.program->shader_hash
+	                             : 0u);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {

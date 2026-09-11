@@ -775,6 +775,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
 	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV nv_diagnostics {};
+	if (graphics.nv_diagnostics_enabled) {
+		nv_diagnostics.sType = vk::StructureType::eDeviceDiagnosticsConfigCreateInfoNV;
+		nv_diagnostics.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+		                       vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+		                       vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableAutomaticCheckpoints;
+		nv_diagnostics.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext    = &nv_diagnostics;
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (graphics.device_fault_enabled) {
 		device_fault.sType        = vk::StructureType::ePhysicalDeviceFaultFeaturesEXT;
@@ -1184,6 +1193,23 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// Optional, debug-only and opt-in: KYTY_NV_DIAGNOSTICS=1 turns on NVIDIA's device
+		// diagnostics. The driver already writes a crash dump on device loss, but without this
+		// the dump is an empty shell; with it, it carries shader debug info, resource tracking
+		// and automatic checkpoints, which Nsight Graphics can open to name the faulting shader.
+		// Not enabled by default -- it costs performance on every submit.
+		{
+			const char* want = std::getenv("KYTY_NV_DIAGNOSTICS");
+			if (want != nullptr && want[0] != '0' &&
+			    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME) &&
+			    HasExtension(available_extensions,
+			                 VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+				graphic_ctx.nv_diagnostics_enabled = true;
+				LOGF("NVIDIA device diagnostics enabled (crash dumps will carry shader info)\n");
+			}
 		}
 		// Optional, debug-only: lets a lost device report which GPU addresses faulted
 		// (MasterSemaphore::Wait dumps it). Costs nothing when the driver does not expose it.

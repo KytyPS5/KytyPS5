@@ -552,19 +552,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (cfg.irreducible) {
 		LogDispatcherFallback(options, cfg, "build");
 	} else {
-		const auto unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		if (!CFG::Structurize(cfg)) {
-			const auto failure_kind  = cfg.failure_kind;
-			const auto failure_block = cfg.failure_block;
 			LogDispatcherFallback(options, cfg, "structurize");
-			auto failure_reason    = std::move(cfg.unsupported_reason);
-			cfg                    = unstructured_cfg;
-			cfg.unsupported        = true;
-			cfg.failure_kind       = failure_kind;
-			cfg.failure_block      = failure_block;
-			cfg.unsupported_reason = std::move(failure_reason);
 		} else {
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));

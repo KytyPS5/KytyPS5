@@ -8624,6 +8624,45 @@ void TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),
+      EncodeSopp(0x02, 0xfffeu), // semantic loop header, no exit/merge
+      0xbf810000u,              // unreachable decoder terminator
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = CFG::BuildGraph(decoded);
+  const auto original = graph;
+  Check(graph.natural_loops.size() == 1u && !graph.irreducible,
+        "failed structurization fixture must have one reducible loop");
+  Check(!CFG::Structurize(graph) && graph.unsupported &&
+            graph.failure_kind == CFG::FailureKind::StructuredControlFlow &&
+            !graph.unsupported_reason.empty(),
+        "loop without a merge did not retain its structurization failure");
+  Check(graph.failure_block == UINT32_MAX,
+        "failed structurization exposed a discarded synthetic block ID");
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            CfgInstructionCoverage(original, decoded.instructions.size()),
+        "failed structurization changed instruction coverage");
+  auto topology = graph;
+  topology.unsupported = original.unsupported;
+  topology.failure_kind = original.failure_kind;
+  topology.failure_block = original.failure_block;
+  topology.unsupported_reason = original.unsupported_reason;
+  Check(CFG::GraphToString(topology) == CFG::GraphToString(original),
+        "failed structurization changed CFG topology or analyses");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(result.program.dispatcher_fallback &&
+            result.program.cfg_failure_kind == graph.failure_kind &&
+            result.program.fallback_reason == graph.unsupported_reason,
+        "compiler did not consume CFG failure diagnostics directly");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
   const uint32_t shader[] = {
       EncodeSopp(0x05, 2),       // entry -> B, fallthrough A
@@ -13047,6 +13086,7 @@ int main() {
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
+  TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerPlanningOnlyLoads();

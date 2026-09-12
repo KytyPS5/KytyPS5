@@ -568,7 +568,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	// A metadata surface is only cleared by a fill that actually covers whole slices of it; the
+	// registry outlives the guest allocation, and a wrongly marked slice discards depth contents
+	// the guest expected to keep.
+	(void)m_texture_cache.ClearMetaSlices(vaddr, size);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);

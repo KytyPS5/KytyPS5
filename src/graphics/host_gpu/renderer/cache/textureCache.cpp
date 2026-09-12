@@ -828,7 +828,18 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
+	const auto carried_meta =
+	    cached.info.HasMetadata() && cached.info.metadata.kind == ImageMetadataKind::Htile
+	        ? m_surface_metas.find(cached.info.metadata.range.address)
+	        : m_surface_metas.end();
+	const bool carry_meta      = carried_meta != m_surface_metas.end() &&
+	                             carried_meta->second.type == MetaDataInfo::Type::HTile;
+	const auto carried_address = carry_meta ? carried_meta->first : 0;
+	const auto carried_info    = carry_meta ? carried_meta->second : MetaDataInfo {};
 	FreeImage(cached_id);
+	if (carry_meta) {
+		m_surface_metas.insert_or_assign(carried_address, carried_info);
+	}
 	return replacement_id;
 }
 
@@ -1552,9 +1563,28 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		const auto [entry, inserted] = m_surface_metas.emplace(
+		    desc.info.metadata.range.address,
+		    MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
+		                  .range_size = desc.info.metadata.range.size,
+		                  .slices     = desc.info.resources.layers,
+		                  .clear_mask = MetaSliceMask::FromBits32(image.info.htile_clear_mask)});
+		if (!inserted) {
+			// Keep whatever clear state the surface has accumulated, but describe the binding
+			// that is live now: a recycled base address would otherwise carry the footprint of
+			// a freed allocation, which no coverage test could trust. A layered view only spans
+			// up to its last bound layer, so the same slice size keeps the widest footprint.
+			auto&      meta       = entry->second;
+			const auto range_size = desc.info.metadata.range.size;
+			const auto slices     = desc.info.resources.layers;
+			const bool same_slices =
+			    meta.slices != 0 && slices != 0 && meta.range_size % meta.slices == 0 &&
+			    range_size % slices == 0 && meta.range_size / meta.slices == range_size / slices;
+			if (!same_slices || slices > meta.slices) {
+				meta.range_size = range_size;
+				meta.slices     = slices;
+			}
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1985,10 +2015,27 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	}
 }
 
+std::map<uint64_t, TextureCache::MetaDataInfo>::iterator
+TextureCache::FindMetaContaining(uint64_t address) {
+	auto found = m_surface_metas.upper_bound(address);
+	if (found == m_surface_metas.begin()) {
+		return m_surface_metas.end();
+	}
+	--found;
+	const auto size = std::max<uint64_t>(found->second.range_size, 1);
+	return address - found->first < size ? found : m_surface_metas.end();
+}
+
+bool TextureCache::IsWithinMeta(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = FindMetaContaining(address);
+	return found != m_surface_metas.end() && size <= found->second.range_size &&
+	       address - found->first <= found->second.range_size - size;
+}
+
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	return found != m_surface_metas.end();
+	return FindMetaContaining(address) != m_surface_metas.end();
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
@@ -1997,7 +2044,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found->second.clear_mask.Test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2006,8 +2053,71 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask = MetaSliceMask::All();
 	return true;
+}
+
+bool TextureCache::ClearMetaSlices(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = FindMetaContaining(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	auto& info = found->second;
+	if (info.range_size == 0 || info.slices == 0 || info.range_size % info.slices != 0) {
+		// Nothing to measure the write against, so it is not evidence of a clear.
+		return false;
+	}
+	const auto offset = address - found->first;
+	if (offset == 0 && size >= info.range_size) {
+		info.clear_mask = MetaSliceMask::All();
+		return true;
+	}
+	const auto slice_size = info.range_size / info.slices;
+	if (offset % slice_size != 0) {
+		// Starts inside a slice: not a clear this registry can represent.
+		return false;
+	}
+	// IsMetaCleared and TouchMeta only answer for the first 32 slices.
+	const auto first   = offset / slice_size;
+	const auto slices  = std::min<uint64_t>(info.slices, 32);
+	const auto covered = first < slices ? std::min<uint64_t>(size / slice_size, slices - first) : 0;
+	if (covered == 0) {
+		// Shorter than a single slice: either the guest is writing something else that
+		// happens to start here, or it is clearing a fragment this registry cannot represent.
+		// Spending a slice on that would discard live depth.
+		return false;
+	}
+	for (uint64_t slice = first; slice < first + covered; slice++) {
+		info.clear_mask.Assign(static_cast<uint32_t>(slice), true);
+	}
+	return true;
+}
+
+void TextureCache::DiscardMetaClears(uint64_t address, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       found = FindMetaContaining(address);
+	if (found == m_surface_metas.end()) {
+		return;
+	}
+	auto&      info   = found->second;
+	const auto offset = address - found->first;
+	if (info.range_size == 0 || size > info.range_size - offset) {
+		// A binding past the surface is a pool spanning it, not a store aimed at the metadata.
+		return;
+	}
+	if (info.slices == 0 || info.range_size % info.slices != 0) {
+		info.clear_mask = {};
+		return;
+	}
+	const auto slice_size = info.range_size / info.slices;
+	const auto last       = (offset + size - 1) / slice_size;
+	for (auto slice = offset / slice_size; slice <= last; slice++) {
+		info.clear_mask.Assign(static_cast<uint32_t>(slice), false);
+	}
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
@@ -2016,11 +2126,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
-	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
-	} else {
-		found->second.clear_mask &= ~(1u << slice);
-	}
+	found->second.clear_mask.Assign(slice, is_clear);
 	return true;
 }
 

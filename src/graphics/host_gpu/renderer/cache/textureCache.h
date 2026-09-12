@@ -31,6 +31,59 @@ class RenderExecutor;
 class TextureCache;
 struct TextureCacheTestAccess;
 
+// Per-slice clear state; a fill marks every slice, bindings consume them one at a time.
+class MetaSliceMask {
+public:
+	[[nodiscard]] static MetaSliceMask All() {
+		MetaSliceMask mask;
+		mask.m_rest = true;
+		return mask;
+	}
+	// UINT32_MAX marks every slice; any other value marks only the slices it names.
+	[[nodiscard]] static MetaSliceMask FromBits32(uint32_t bits) {
+		if (bits == UINT32_MAX) {
+			return All();
+		}
+		MetaSliceMask mask;
+		if (bits != 0) {
+			mask.m_words.push_back(bits);
+		}
+		return mask;
+	}
+
+	[[nodiscard]] bool Any() const noexcept {
+		if (m_rest) {
+			return true;
+		}
+		for (const auto word: m_words) {
+			if (word != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+	[[nodiscard]] bool Test(uint32_t slice) const noexcept {
+		const auto word = slice / 64u;
+		return word < m_words.size() ? ((m_words[word] >> (slice % 64u)) & 1u) != 0 : m_rest;
+	}
+	void Assign(uint32_t slice, bool cleared) {
+		const auto word = slice / 64u;
+		if (word >= m_words.size()) {
+			if (cleared == m_rest) {
+				return;
+			}
+			m_words.resize(word + 1u, m_rest ? UINT64_MAX : 0u);
+		}
+		const auto bit = uint64_t {1} << (slice % 64u);
+		m_words[word]  = cleared ? (m_words[word] | bit) : (m_words[word] & ~bit);
+	}
+
+private:
+	std::vector<uint64_t> m_words;
+	// State of every slice past the explicit words.
+	bool m_rest = false;
+};
+
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
@@ -76,9 +129,17 @@ public:
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
+	// Inside a registered metadata surface, not only at its base: layers are cleared one by one.
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	[[nodiscard]] bool IsWithinMeta(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// A CP-DMA fill or a compute clear landing on a metadata surface: marks only the whole,
+	// slice-aligned slices the write covers. A marked slice discards the attachment contents at
+	// load, so an address match on its own is not enough to spend it.
+	[[nodiscard]] bool ClearMetaSlices(uint64_t address, uint64_t size);
+	// A shader store inside a metadata surface supersedes the pending clears it can reach.
+	void               DiscardMetaClears(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -96,8 +157,17 @@ private:
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
 		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		// Footprint of the registered metadata surface, so a writer that touches only part
+		// of it cannot be mistaken for one that cleared the whole thing. The registry is
+		// keyed by base address alone and outlives the guest allocation, so a matching base
+		// on its own proves nothing about what a writer covered.
+		uint64_t      range_size = 0;
+		uint32_t      slices     = 0;
+		MetaSliceMask clear_mask = MetaSliceMask::All();
 	};
+
+	// The registered surface whose footprint holds the address. Caller holds m_lock.
+	std::map<uint64_t, MetaDataInfo>::iterator FindMetaContaining(uint64_t address);
 
 	struct OverlapResult {
 		ImageId image;

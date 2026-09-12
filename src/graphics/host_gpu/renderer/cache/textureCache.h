@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -56,6 +57,10 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+
+	// Called once per presented frame. Image staleness is judged against this rather than against
+	// the queue submission counter, which this title advances dozens of times inside one frame.
+	void AdvanceFrame() noexcept { m_frame_index.fetch_add(1, std::memory_order_relaxed); }
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -166,6 +171,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	std::atomic<uint64_t>                             m_frame_index {0};
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;

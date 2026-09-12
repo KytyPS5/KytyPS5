@@ -810,9 +810,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
-	const auto current_tick = m_scheduler.CurrentTick();
+	const auto current_frame = m_frame_index.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	    current_frame - std::min(current_frame, cached.frame_accessed_last) > NumFramesBeforeRemoval;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1338,7 +1338,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
-		image.tick_accessed_last = m_scheduler.CurrentTick();
+		image.tick_accessed_last  = m_scheduler.CurrentTick();
+		image.frame_accessed_last = m_frame_index.load(std::memory_order_relaxed);
 		TouchImage(image);
 	}
 	MaterializeDccClear(result, desc, metadata_base_layer);

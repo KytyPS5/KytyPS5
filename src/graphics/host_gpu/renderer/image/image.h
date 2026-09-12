@@ -149,7 +149,10 @@ public:
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	// Counted in presented frames, not queue submissions: this title submits dozens of command
+	// buffers per frame, so a submission count cannot tell "used a moment ago" from "long dead".
+	uint64_t         frame_accessed_last = 0;
+	size_t           lru_id              = 0;
 
 private:
 	friend struct ImageTestAccess;

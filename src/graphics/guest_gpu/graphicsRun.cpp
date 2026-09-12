@@ -77,7 +77,7 @@ private:
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {

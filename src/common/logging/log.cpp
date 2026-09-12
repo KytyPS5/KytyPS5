@@ -152,9 +152,9 @@ void WriteFatal(fmt::text_style style, std::string_view text) {
 void Initialize() {
 	g_initialized = true;
 	switch (Config::GetPrintfDirection()) {
-		case Config::OutputDirection::Silent: g_direction = Direction::Silent; break;
-		case Config::OutputDirection::Console: g_direction = Direction::Console; break;
-		case Config::OutputDirection::File: g_direction = Direction::File; break;
+		case Config::LogDirection::Silent: g_direction = Direction::Silent; break;
+		case Config::LogDirection::Console: g_direction = Direction::Console; break;
+		case Config::LogDirection::File: g_direction = Direction::File; break;
 	}
 	g_output_file =
 	    (g_direction == Direction::File ? Config::GetPrintfOutputFile() : std::filesystem::path {});

@@ -371,7 +371,7 @@ int main() {
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
   Config::ConfigOptions options;
-  options.printf_direction = Config::OutputDirection::Silent;
+  options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 

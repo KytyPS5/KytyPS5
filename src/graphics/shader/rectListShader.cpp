@@ -55,7 +55,7 @@ class RectListEmitter {
 public:
 	RectListEmitter(const std::vector<Parameter>& parameters_, spv::ExecutionModel model)
 	    : parameters(parameters_) {
-		builder.AddMemoryModel({spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
 		void_type       = Type(spv::OpTypeVoid);
 		uint_type       = Type(spv::OpTypeInt, 32u, 0u);
@@ -65,9 +65,10 @@ public:
 		function_type   = Type(spv::OpTypeFunction, void_type);
 
 		per_vertex_type = builder.DecoratedType(
-		    spv::OpTypeStruct, {vec4_float_type},
+		    spv::OpTypeStruct,
 		    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
-		     {spv::OpDecorate, {spv::DecorationBlock}}});
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    vec4_float_type);
 
 		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
 		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
@@ -188,11 +189,11 @@ public:
 private:
 	template <typename... Args>
 	uint32_t Type(spv::Op opcode, Args... operands) {
-		return builder.Type(opcode, {operands...});
+		return builder.Type(opcode, operands...);
 	}
 
 	uint32_t Constant(uint32_t type, uint32_t value) {
-		return builder.Constant(spv::OpConstant, type, {value});
+		return builder.Constant(spv::OpConstant, type, value);
 	}
 
 	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
@@ -206,20 +207,20 @@ private:
 	template <typename... Args>
 	uint32_t Result(spv::Op opcode, uint32_t type, Args... operands) {
 		const auto id = builder.AllocateId();
-		builder.AddFunction({opcode, type, id, operands...});
+		builder.AddFunction(opcode, type, id, operands...);
 		return id;
 	}
 
 	template <typename... Args>
 	uint32_t ResultWithoutType(spv::Op opcode, Args... operands) {
 		const auto id = builder.AllocateId();
-		builder.AddFunction({opcode, id, operands...});
+		builder.AddFunction(opcode, id, operands...);
 		return id;
 	}
 
 	template <typename... Args>
 	void Emit(spv::Op opcode, Args... operands) {
-		builder.AddFunction({opcode, operands...});
+		builder.AddFunction(opcode, operands...);
 	}
 
 	template <typename... Args>
@@ -242,7 +243,7 @@ private:
 	}
 
 	void Decorate(uint32_t target, spv::Decoration decoration, uint32_t value) {
-		builder.AddAnnotation({spv::OpDecorate, target, decoration, value});
+		builder.AddAnnotation(spv::OpDecorate, target, decoration, value);
 	}
 
 	void DefineEntry(spv::ExecutionModel model) {
@@ -250,11 +251,11 @@ private:
 		builder.RequireCapability(spv::CapabilityTessellation);
 		main = Result(spv::OpFunction, void_type, spv::FunctionControlMaskNone, function_type);
 		if (model == spv::ExecutionModelTessellationControl) {
-			builder.AddExecutionMode({main, spv::ExecutionModeOutputVertices, 4u});
+			builder.AddExecutionMode(main, spv::ExecutionModeOutputVertices, 4u);
 		} else {
-			builder.AddExecutionMode({main, spv::ExecutionModeQuads});
-			builder.AddExecutionMode({main, spv::ExecutionModeSpacingEqual});
-			builder.AddExecutionMode({main, spv::ExecutionModeVertexOrderCw});
+			builder.AddExecutionMode(main, spv::ExecutionModeQuads);
+			builder.AddExecutionMode(main, spv::ExecutionModeSpacingEqual);
+			builder.AddExecutionMode(main, spv::ExecutionModeVertexOrderCw);
 		}
 		DefineInputs(model);
 		DefineOutputs(model);
@@ -296,10 +297,10 @@ private:
 			gl_out     = AddInterface(spv::StorageClassOutput, Array(per_vertex_type, 4u));
 			tess_inner = AddInterface(spv::StorageClassOutput, Array(float_type, 2u));
 			Decorate(tess_inner, spv::DecorationBuiltIn, spv::BuiltInTessLevelInner);
-			builder.AddAnnotation({spv::OpDecorate, tess_inner, spv::DecorationPatch});
+			builder.AddAnnotation(spv::OpDecorate, tess_inner, spv::DecorationPatch);
 			tess_outer = AddInterface(spv::StorageClassOutput, Array(float_type, 4u));
 			Decorate(tess_outer, spv::DecorationBuiltIn, spv::BuiltInTessLevelOuter);
-			builder.AddAnnotation({spv::OpDecorate, tess_outer, spv::DecorationPatch});
+			builder.AddAnnotation(spv::OpDecorate, tess_outer, spv::DecorationPatch);
 		} else {
 			gl_out = AddInterface(spv::StorageClassOutput, per_vertex_type);
 		}

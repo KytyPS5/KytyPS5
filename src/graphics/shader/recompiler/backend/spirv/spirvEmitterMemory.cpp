@@ -17,11 +17,11 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
 	const auto shuffled = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-	                           ConstantU32(state, spv::ScopeSubgroup), source, target});
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
+	                          ConstantU32(state, spv::ScopeSubgroup), source, target);
 	const auto source_exec = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-	                           ConstantU32(state, spv::ScopeSubgroup), exec, target});
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
+	                          ConstantU32(state, spv::ScopeSubgroup), exec, target);
 	const auto source_active =
 	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
@@ -107,9 +107,9 @@ uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, ui
 }
 
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(
-	    spv::OpConstant, TypeScalarU64(state),
-	    {static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u)});
+	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
+	                              static_cast<uint32_t>(value),
+	                              static_cast<uint32_t>(value >> 32u));
 }
 
 uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high) {
@@ -153,8 +153,8 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 
 uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           state.fault_buffer_variable, ConstantU32(state, 0), index});
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.fault_buffer_variable, ConstantU32(state, 0), index);
 	return pointer;
 }
 
@@ -166,16 +166,16 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
 	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpLoad, TypeU32(state), value, pointer});
-	state.builder.AddFunction(
-	    {spv::OpStore, pointer, Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit)});
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	state.builder.AddFunction(spv::OpStore, pointer,
+	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
 uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 	auto&      state  = ctx.state;
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpFunctionCall, TypeScalarU64(state), result, state.bda_pointer_function, address});
+	state.builder.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), result,
+	                          state.bda_pointer_function, address);
 	return result;
 }
 
@@ -186,11 +186,12 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantDeviceAddress(state, 0));
 	return EmitValueOrZeroIfCondition(state, present, [&]() {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda});
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction({spv::OpLoad, TypeU32(state), value, pointer,
-		                           spv::MemoryAccessAlignedMask, sizeof(uint32_t)});
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          bda);
+		const auto         value     = state.builder.AllocateId();
+		constexpr uint32_t alignment = sizeof(uint32_t);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, alignment);
 		return value;
 	});
 }
@@ -306,7 +307,7 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction({spv::OpLoad, TypeU32(ctx.state), value, pointer});
+	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer);
 	return value;
 }
 
@@ -401,11 +402,11 @@ uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const IR::MemoryInfo& mem
 		const auto source_value =
 		    type == TypeI32(ctx.state) ? Unary(ctx.state, spv::OpBitcast, type, raw) : raw;
 		const auto extracted = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(
-		    {IsSignedFormatComponent(info.type) ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract,
-		     type, extracted, source_value,
-		     ConstantU32(ctx.state, info.component_bit_offset[component]),
-		     ConstantU32(ctx.state, bits)});
+		ctx.state.builder.AddFunction(IsSignedFormatComponent(info.type) ? spv::OpBitFieldSExtract
+		                                                                 : spv::OpBitFieldUExtract,
+		                              type, extracted, source_value,
+		                              ConstantU32(ctx.state, info.component_bit_offset[component]),
+		                              ConstantU32(ctx.state, bits));
 		raw = type == TypeI32(ctx.state)
 		          ? Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), extracted)
 		          : extracted;
@@ -465,8 +466,8 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	};
 	if (mem.kind == IR::ResourceKind::Scratch) {
 		const auto old = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction({spv::OpLoad, TypeU32(ctx.state), old, pointer});
-		ctx.state.builder.AddFunction({spv::OpStore, pointer, merge(old)});
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), old, pointer);
+		ctx.state.builder.AddFunction(spv::OpStore, pointer, merge(old));
 	} else {
 		AtomicUpdate(ctx.state, pointer, mem.kind, merge);
 	}
@@ -495,15 +496,15 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		ctx.state.builder.AddFunction(
-		    {spv::OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
+		ctx.state.builder.AddFunction(spv::OpStore,
+		                              EmitMemoryElementPointer(ctx.state, resource, index), data);
 	});
 }
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(
-	    {spv::OpStore, EmitMemoryElementPointer(ctx.state, resource, index), data});
+	ctx.state.builder.AddFunction(spv::OpStore,
+	                              EmitMemoryElementPointer(ctx.state, resource, index), data);
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -538,7 +539,7 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	});
 }
 
-uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
+spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
 		case IR::ValueOpcode::BufferAtomicSwap32:
@@ -563,7 +564,7 @@ uint32_t SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
-		default: return 0;
+		default: return spv::OpNop;
 	}
 }
 
@@ -574,15 +575,14 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(
-		    {spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
-		     ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
-		     ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator});
+		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
+		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
+		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
 	} else {
 		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction({SpirvAtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old,
-		                               pointer, ConstantU32(ctx.state, scope),
-		                               ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
-		                               value});
+		ctx.state.builder.AddFunction(SpirvAtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old,
+		                              pointer, ConstantU32(ctx.state, scope),
+		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
 	}
 	return old;
 }
@@ -782,8 +782,8 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			EmitIfCondition(state, plan.in_bounds, [&]() {
 				for (uint32_t component = 0; component < components; component++) {
 					const auto data = state.builder.AllocateId();
-					state.builder.AddFunction(
-					    {spv::OpCompositeExtract, TypeU32(state), data, composite, component});
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
+					                          composite, component);
 					StoreFormattedInBounds(ctx, mem, plan, component, data);
 				}
 			});
@@ -791,8 +791,8 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		}
 		for (uint32_t component = 0; component < components; component++) {
 			const auto data = state.builder.AllocateId();
-			state.builder.AddFunction(
-			    {spv::OpCompositeExtract, TypeU32(state), data, composite, component});
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
+			                          component);
 			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
 		}
 	});
@@ -851,49 +851,49 @@ void DefineGetBdaPointer(EmitterState& state) {
 		return;
 	}
 	const auto type            = TypeScalarU64(state);
-	const auto function_type   = state.builder.Type(spv::OpTypeFunction, {type, type});
+	const auto function_type   = state.builder.Type(spv::OpTypeFunction, type, type);
 	state.bda_pointer_function = state.builder.AllocateId();
 	const auto address         = state.builder.AllocateId();
 	const auto entry_label     = state.builder.AllocateId();
 	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
-	state.builder.AddFunction({spv::OpFunction, type, state.bda_pointer_function,
-	                           spv::FunctionControlMaskNone, function_type});
-	state.builder.AddFunction({spv::OpFunctionParameter, type, address});
+	state.builder.AddFunction(spv::OpFunction, type, state.bda_pointer_function,
+	                          spv::FunctionControlMaskNone, function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, address,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
-	                           entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
-	                           page});
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
+	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
+	                          page);
 	const auto base = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpLoad, type, base, entry_pointer});
+	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
 	const auto missing =
 	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone});
-	state.builder.AddFunction({spv::OpBranchConditional, missing, fault_label, available_label});
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
-	state.builder.AddFunction({spv::OpBranch, merge_label});
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);
 	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
 	                              ConstantDeviceAddress(state, BufferCache::CACHING_PAGESIZE - 1));
 	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
-	state.builder.AddFunction({spv::OpBranch, merge_label});
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpPhi, type, result, ConstantDeviceAddress(state, 0),
-	                           fault_label, available, available_label});
-	state.builder.AddFunction({spv::OpReturnValue, result});
-	state.builder.AddFunction({spv::OpFunctionEnd});
+	state.builder.AddFunction(spv::OpPhi, type, result, ConstantDeviceAddress(state, 0),
+	                          fault_label, available, available_label);
+	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -905,8 +905,8 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (mem.kind == IR::ResourceKind::Lds) {
 			const auto semantics =
 			    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
-			ctx.state.builder.AddFunction({spv::OpMemoryBarrier, ConstantU32(ctx.state, scope),
-			                               ConstantU32(ctx.state, semantics)});
+			ctx.state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(ctx.state, scope),
+			                              ConstantU32(ctx.state, semantics));
 		} else {
 			EmitDeviceAtomicMemoryBarrier(ctx.state);
 		}
@@ -932,11 +932,11 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                 ctx.Arg(inst, inst.NumArgs() - 2));
 			        const auto old   = state.builder.AllocateId();
 			        state.builder.AddFunction(
-			            {SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
-			             EmitStorageBufferElementPointer(state, resource, index,
-			                                             TypeStorageBufferU64ElementPointer(state)),
-			             ConstantU32(state, spv::ScopeDevice),
-			             ConstantU32(state, spv::MemorySemanticsMaskNone), value});
+			            SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
+			            EmitStorageBufferElementPointer(state, resource, index,
+			                                            TypeStorageBufferU64ElementPointer(state)),
+			            ConstantU32(state, spv::ScopeDevice),
+			            ConstantU32(state, spv::MemorySemanticsMaskNone), value);
 			        EmitDeviceAtomicMemoryBarrier(state);
 			        return Unary(state, spv::OpBitcast, TypeU64(state), old);
 		        });
@@ -959,11 +959,11 @@ void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
 		EmitIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    ctx.state.builder.AddFunction(
-			        {spv::OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 1)});
+			    ctx.state.builder.AddFunction(spv::OpStore, ctx.scratch_u32_variable,
+			                                  ctx.Arg(inst, 1));
 			    const auto data = ctx.state.builder.AllocateId();
-			    ctx.state.builder.AddFunction(
-			        {spv::OpLoad, TypeU32(ctx.state), data, ctx.scratch_u32_variable});
+			    ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), data,
+			                                  ctx.scratch_u32_variable);
 			    AtomicUpdate(
 			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
 			        mem.kind, [&](uint32_t old) {
@@ -1006,8 +1006,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto low    = state.builder.AllocateId();
 	const auto high   = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), low, ballot, 0});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), high, ballot, 1});
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
 	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
@@ -1033,17 +1033,17 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                 AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state), value,
-		     EmitMemoryElementPointer(state, access, index),
-		     ConstantU32(state, mem.kind == IR::ResourceKind::Gds ? spv::ScopeDevice
-		                                                          : spv::ScopeWorkgroup),
-		     ConstantU32(state, spv::MemorySemanticsMaskNone), count});
+		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),
+		                          value, EmitMemoryElementPointer(state, access, index),
+		                          ConstantU32(state, mem.kind == IR::ResourceKind::Gds
+		                                                 ? spv::ScopeDevice
+		                                                 : spv::ScopeWorkgroup),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), count);
 		return value;
 	});
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                           ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane});
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
 	return result;
 }
 
@@ -1053,9 +1053,9 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           state.flattened_srt_variable, ConstantU32(state, 0),
-	                           ctx.Arg(inst, 1)});
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.flattened_srt_variable, ConstantU32(state, 0),
+	                          ctx.Arg(inst, 1));
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
@@ -1131,7 +1131,7 @@ uint32_t EmitSharedIncDec(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
-	state.builder.AddFunction({spv::OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 0)});
+	state.builder.AddFunction(spv::OpStore, ctx.scratch_u32_variable, ctx.Arg(inst, 0));
 	const auto source = EmitNative<spv::OpLoad, IR::Type::U32>(state, ctx.scratch_u32_variable);
 	const auto target = EmitDsSwizzleTargetLane(state, EmitSubgroupLocalInvocationId(state),
 	                                            inst.Arg(1).IsImmediate() ? inst.Arg(1).U32() : 0);

@@ -10025,11 +10025,120 @@ void TestNewShaderRecompilerAuxPositionExports() {
         "PA_CL_VS_OUT_CNTL is absent from the vertex shader cache key");
 }
 
+void TestTypedSpirvSerialization() {
+  // Parameters exercise runtime enums, which cannot narrow implicitly to a
+  // uint32_t initializer list when the enum uses the Windows signed ABI.
+  const auto check_serialization = [](spv::StorageClass storage_class,
+                                      spv::FunctionControlMask control,
+                                      spv::Decoration decoration,
+                                      GLSLstd450 glsl_opcode,
+                                      int32_t signed_literal,
+                                      uint32_t high_bit_literal) {
+    ShaderRecompiler::Spirv::Builder builder;
+    builder.RequireCapability(spv::CapabilityShader);
+    const auto glsl = builder.Import("GLSL.std.450");
+    builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+    const auto void_type = builder.Type(spv::OpTypeVoid);
+    const std::vector<uint32_t> uint_operands{32u, 0u};
+    const auto uint_type = builder.Type(spv::OpTypeInt, uint_operands);
+    Check(uint_type == builder.Type(spv::OpTypeInt, 32u, 0u) &&
+              uint_type == builder.Type(spv::OpTypeInt,
+                                        std::span<const uint32_t>{uint_operands}),
+          "typed, vector and span type operands produced different declarations");
+    const auto float_type = builder.Type(spv::OpTypeFloat, 32u);
+    const auto vector_type = builder.Type(spv::OpTypeVector, uint_type, 2u);
+    const auto pointer_type =
+        builder.Type(spv::OpTypePointer, storage_class, uint_type);
+    const auto function_type = builder.Type(spv::OpTypeFunction, void_type);
+    const auto all_bits =
+        builder.Constant(spv::OpConstant, uint_type, signed_literal);
+    Check(all_bits == builder.Constant(spv::OpConstant, uint_type, UINT32_MAX),
+          "signed and unsigned constant operands produced different declarations");
+    const auto high_bit =
+        builder.Constant(spv::OpConstant, uint_type, high_bit_literal);
+    const auto one = builder.Constant(spv::OpConstant, float_type, 0x3f800000u);
+    const std::vector<uint32_t> components{all_bits, high_bit};
+    const auto constant_vector = builder.Constant(
+        spv::OpConstantComposite, vector_type,
+        std::span<const uint32_t>{components});
+    Check(constant_vector == builder.Constant(spv::OpConstantComposite,
+                                              vector_type, components),
+          "vector and span constant operands produced different declarations");
+    const auto variable =
+        builder.DefineGlobalVariable(pointer_type, storage_class);
+    const auto function = builder.AllocateId();
+    const auto label = builder.AllocateId();
+    const auto absolute = builder.AllocateId();
+    const auto constructed = builder.AllocateId();
+    const auto shuffled = builder.AllocateId();
+    const auto loaded = builder.AllocateId();
+    builder.AddEntryPoint(spv::ExecutionModelGLCompute, function, "main", {});
+    builder.AddExecutionMode(function, spv::ExecutionModeLocalSize, 1u, 2u, 3u);
+    builder.AddAnnotation(spv::OpDecorate, one, decoration);
+    builder.AddFunction(spv::OpFunction, void_type, function, control,
+                        function_type);
+    const std::vector<uint32_t> label_words{248u, label};
+    builder.AddFunction(label_words);
+    builder.AddFunction(spv::OpExtInst, float_type, absolute, glsl, glsl_opcode,
+                        one);
+    builder.AddFunction(spv::OpCompositeConstruct, vector_type, constructed,
+                        components);
+    const std::array<uint32_t, 2> selectors{1u, 2u};
+    builder.AddFunction(spv::OpVectorShuffle, vector_type, shuffled,
+                        constant_vector, constructed,
+                        std::span<const uint32_t>{selectors});
+    builder.AddFunction(spv::OpLoad, uint_type, loaded, variable,
+                        spv::MemoryAccessAlignedMask, 4u);
+    builder.AddFunction(std::vector<uint32_t>{});
+    const std::array<uint32_t, 1> return_words{253u};
+    builder.AddFunction(std::span<const uint32_t>{return_words});
+    builder.AddFunction(spv::OpFunctionEnd);
+
+    // Literal headers and enum values keep this independent of the builder's
+    // instruction word counts, operand conversion and range flattening.
+    const std::vector<uint32_t> expected{
+        0x07230203u, 0x00010300u, 0u, loaded + 1u, 0u,
+        0x00020011u, 1u, // OpCapability Shader
+        0x0006000bu, glsl, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0u,
+        0x0003000eu, 0u, 1u, // OpMemoryModel Logical GLSL450
+        0x0005000fu, 5u, function, 0x6e69616du, 0u,
+        0x00060010u, function, 17u, 1u, 2u, 3u,
+        0x00030047u, one, 0u, // OpDecorate RelaxedPrecision
+        0x00020013u, void_type,
+        0x00040015u, uint_type, 32u, 0u,
+        0x00030016u, float_type, 32u,
+        0x00040017u, vector_type, uint_type, 2u,
+        0x00040020u, pointer_type, 6u, uint_type,
+        0x00030021u, function_type, void_type,
+        0x0004002bu, uint_type, all_bits, 0xffffffffu,
+        0x0004002bu, uint_type, high_bit, 0x80000000u,
+        0x0004002bu, float_type, one, 0x3f800000u,
+        0x0005002cu, vector_type, constant_vector, all_bits, high_bit,
+        0x0004003bu, pointer_type, variable, 6u,
+        0x00050036u, void_type, function, 0u, function_type,
+        0x000200f8u, label,
+        0x0006000cu, float_type, absolute, glsl, 4u, one,
+        0x00050050u, vector_type, constructed, all_bits, high_bit,
+        0x0007004fu, vector_type, shuffled, constant_vector, constructed, 1u, 2u,
+        0x0006003du, uint_type, loaded, variable, 2u, 4u,
+        0x000100fdu,
+        0x00010038u,
+    };
+    const auto binary = builder.Build();
+    Check(binary == expected,
+          "typed SPIR-V serialization changed instruction words or operand order");
+    CheckSpirvBinaryValidates(binary);
+  };
+  check_serialization(spv::StorageClassPrivate, spv::FunctionControlMaskNone,
+                      spv::DecorationRelaxedPrecision, GLSLstd450FAbs, -1,
+                      0x80000000u);
+}
+
 void TestDeferredSpirvPhiPatching() {
   ShaderRecompiler::Spirv::Builder builder;
-  const auto type = builder.Type(spv::OpTypeInt, {32u, 0u});
-  const auto zero = builder.Constant(spv::OpConstant, type, {0u});
-  const auto one = builder.Constant(spv::OpConstant, type, {1u});
+  const auto type = builder.Type(spv::OpTypeInt, 32u, 0u);
+  const auto zero = builder.Constant(spv::OpConstant, type, 0u);
+  const auto one = builder.Constant(spv::OpConstant, type, 1u);
   const auto left = builder.AllocateId();
   const auto right = builder.AllocateId();
   const auto result = builder.AllocateId();
@@ -10080,35 +10189,36 @@ void TestDemandDrivenSpirvDeclarations() {
   using ShaderRecompiler::Spirv::Builder;
 
   Builder declarations;
-  const auto uint_type = declarations.Type(spv::OpTypeInt, {32u, 0u});
-  Check(uint_type == declarations.Type(spv::OpTypeInt, {32u, 0u}),
+  const auto uint_type = declarations.Type(spv::OpTypeInt, 32u, 0u);
+  Check(uint_type == declarations.Type(spv::OpTypeInt, 32u, 0u),
         "structural type interning returned different IDs");
-  const auto zero = declarations.Constant(spv::OpConstant, uint_type, {0u});
-  Check(zero == declarations.Constant(spv::OpConstant, uint_type, {0u}),
+  const auto zero = declarations.Constant(spv::OpConstant, uint_type, 0u);
+  Check(zero == declarations.Constant(spv::OpConstant, uint_type, 0u),
         "constant interning returned different IDs");
   Check(declarations.Import("GLSL.std.450") ==
             declarations.Import("GLSL.std.450"),
         "extended-instruction import was duplicated");
   declarations.RequireCapability(spv::CapabilityShader);
   declarations.RequireCapability(spv::CapabilityShader);
-  const auto plain_array =
-      declarations.Type(spv::OpTypeArray, {uint_type, zero});
+  const auto plain_array = declarations.Type(spv::OpTypeArray, uint_type, zero);
   const auto decorated_array = declarations.DecoratedType(
-      spv::OpTypeArray, {uint_type, zero},
-      {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}});
+      spv::OpTypeArray,
+      {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}},
+      uint_type, zero);
   Check(decorated_array ==
             declarations.DecoratedType(
-                spv::OpTypeArray, {uint_type, zero},
+                spv::OpTypeArray,
                 {{spv::OpDecorate,
-                  {spv::DecorationArrayStride, sizeof(uint32_t)}}}),
+                  {spv::DecorationArrayStride, sizeof(uint32_t)}}},
+                uint_type, zero),
         "decorated type interning returned different IDs");
   Check(plain_array != decorated_array,
         "decorated and undecorated aggregate types were aliased");
-  Check(declarations.DecoratedType(spv::OpTypeArray, {uint_type, zero}, {}) ==
+  Check(declarations.DecoratedType(spv::OpTypeArray, {}, uint_type, zero) ==
             plain_array,
         "empty decorated type request bypassed structural interning");
   const auto ptr = declarations.Type(spv::OpTypePointer,
-                                     {spv::StorageClassFunction, uint_type});
+                                     spv::StorageClassFunction, uint_type);
   Check(declarations.DefineGlobalVariable(ptr, spv::StorageClassFunction) !=
             declarations.DefineGlobalVariable(ptr, spv::StorageClassFunction),
         "distinct variables were structurally interned");
@@ -13020,6 +13130,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestSpirvRequirementsAnalysis();
+  TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
   TestSpirvEmissionOwnsRequirements();

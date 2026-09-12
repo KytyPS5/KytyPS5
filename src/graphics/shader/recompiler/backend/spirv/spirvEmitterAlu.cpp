@@ -12,14 +12,14 @@ struct Pair {
 
 Pair ExtractPair(EmitterState& state, uint32_t value) {
 	Pair result {state.builder.AllocateId(), state.builder.AllocateId()};
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), result.low, value, 0});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), result.high, value, 1});
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.low, value, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.high, value, 1);
 	return result;
 }
 
 uint32_t MakePair(EmitterState& state, uint32_t low, uint32_t high) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpCompositeConstruct, TypeU64(state), result, low, high});
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low, high);
 	return result;
 }
 
@@ -31,7 +31,7 @@ uint32_t CompareEqual64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_va
 }
 
 uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
-                          uint32_t high_compare, uint32_t low_compare) {
+                          spv::Op high_compare, spv::Op low_compare) {
 	const auto lhs         = ExtractPair(state, lhs_value);
 	const auto rhs         = ExtractPair(state, rhs_value);
 	const auto high_equal  = Binary(state, spv::OpIEqual, TypeBool(state), lhs.high, rhs.high);
@@ -51,10 +51,10 @@ uint32_t EmitMulHigh(EmitterState& state, uint32_t lhs, uint32_t rhs, bool signe
 		rhs_operand = Unary(state, spv::OpBitcast, TypeI32(state), rhs);
 	}
 	const auto extended = state.builder.AllocateId();
-	state.builder.AddFunction({signed_value ? spv::OpSMulExtended : spv::OpUMulExtended, pair_type,
-	                           extended, lhs_operand, rhs_operand});
+	state.builder.AddFunction(signed_value ? spv::OpSMulExtended : spv::OpUMulExtended, pair_type,
+	                          extended, lhs_operand, rhs_operand);
 	const auto high = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpCompositeExtract, operand_type, high, extended, 1});
+	state.builder.AddFunction(spv::OpCompositeExtract, operand_type, high, extended, 1);
 	return signed_value ? Unary(state, spv::OpBitcast, TypeU32(state), high) : high;
 }
 
@@ -96,7 +96,7 @@ uint32_t EmitShift64(EmitterState& state, spv::Op opcode, uint32_t value, uint32
 	                Select(state, TypeU32(state), at_least_32, fill, high));
 }
 
-uint32_t EmitConstantShift64(EmitterState& state, uint32_t opcode, uint32_t value, uint32_t shift) {
+uint32_t EmitConstantShift64(EmitterState& state, spv::Op opcode, uint32_t value, uint32_t shift) {
 	shift &= 63u;
 	if (shift == 0u) {
 		return value;
@@ -173,10 +173,10 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	const auto converted_raw = state.builder.AllocateId();
 	if (signed_value) {
 		const auto converted_i = state.builder.AllocateId();
-		state.builder.AddFunction({spv::OpConvertFToS, TypeI32(state), converted_i, trunc});
-		state.builder.AddFunction({spv::OpBitcast, TypeU32(state), converted_raw, converted_i});
+		state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), converted_i, trunc);
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), converted_raw, converted_i);
 	} else {
-		state.builder.AddFunction({spv::OpConvertFToU, TypeU32(state), converted_raw, trunc});
+		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
 	}
 	const auto nan = EmitClassifyF32(state, src).nan;
 	if (signed_value) {
@@ -218,10 +218,10 @@ uint32_t EmitFindUMsb64(EmitterState& state, uint32_t value) {
 	const auto pair   = ExtractPair(state, value);
 	const auto high_i = state.builder.AllocateId();
 	const auto low_i  = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpExtInst, TypeI32(state), high_i, GlslStd450(state), GLSLstd450FindUMsb, pair.high});
-	state.builder.AddFunction(
-	    {spv::OpExtInst, TypeI32(state), low_i, GlslStd450(state), GLSLstd450FindUMsb, pair.low});
+	state.builder.AddFunction(spv::OpExtInst, TypeI32(state), high_i, GlslStd450(state),
+	                          GLSLstd450FindUMsb, pair.high);
+	state.builder.AddFunction(spv::OpExtInst, TypeI32(state), low_i, GlslStd450(state),
+	                          GLSLstd450FindUMsb, pair.low);
 	const auto high = Unary(state, spv::OpBitcast, TypeU32(state), high_i);
 	const auto low  = Unary(state, spv::OpBitcast, TypeU32(state), low_i);
 	const auto high_nonzero =
@@ -260,9 +260,9 @@ uint32_t EmitIAdd64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value)
 	const auto low_pair = state.builder.AllocateId();
 	const auto low      = state.builder.AllocateId();
 	const auto carry    = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpIAddCarry, TypeU32Pair(state), low_pair, lhs.low, rhs.low});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), low, low_pair, 0});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), carry, low_pair, 1});
+	state.builder.AddFunction(spv::OpIAddCarry, TypeU32Pair(state), low_pair, lhs.low, rhs.low);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, low_pair, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), carry, low_pair, 1);
 	const auto high0 = Binary(state, spv::OpIAdd, TypeU32(state), lhs.high, rhs.high);
 	const auto high  = Binary(state, spv::OpIAdd, TypeU32(state), high0, carry);
 	return MakePair(state, low, high);
@@ -278,8 +278,8 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
 	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0, ConstantF32(state, 0)});
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
+	                          ConstantF32(state, 0));
 	return EmitPackHalf2x16(state, pair);
 }
 

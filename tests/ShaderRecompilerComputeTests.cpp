@@ -1603,30 +1603,29 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
   Builder b;
   const auto void_type = b.Type(spv::OpTypeVoid);
-  const auto uint_type = b.Type(spv::OpTypeInt, {32, 0});
-  const auto int_type = b.Type(spv::OpTypeInt, {32, 1});
-  const auto float_type = b.Type(spv::OpTypeFloat, {32});
-  const auto vec2_type = b.Type(spv::OpTypeVector, {float_type, 2});
-  const auto vec4_type = b.Type(spv::OpTypeVector, {float_type, 4});
+  const auto uint_type = b.Type(spv::OpTypeInt, 32, 0);
+  const auto int_type = b.Type(spv::OpTypeInt, 32, 1);
+  const auto float_type = b.Type(spv::OpTypeFloat, 32);
+  const auto vec2_type = b.Type(spv::OpTypeVector, float_type, 2);
+  const auto vec4_type = b.Type(spv::OpTypeVector, float_type, 4);
   const auto per_vertex_type =
-      b.DecoratedType(spv::OpTypeStruct, {vec4_type},
-                      {{spv::OpDecorate, {spv::DecorationBlock}},
+      b.DecoratedType(spv::OpTypeStruct, {{spv::OpDecorate, {spv::DecorationBlock}},
                        {spv::OpMemberDecorate,
-                        {0, spv::DecorationBuiltIn, spv::BuiltInPosition}}});
+                        {0, spv::DecorationBuiltIn, spv::BuiltInPosition}}}, vec4_type);
   const auto ptr_input_vec2 =
-      b.Type(spv::OpTypePointer, {spv::StorageClassInput, vec2_type});
+      b.Type(spv::OpTypePointer, spv::StorageClassInput, vec2_type);
   const auto ptr_input_vec4 =
-      b.Type(spv::OpTypePointer, {spv::StorageClassInput, vec4_type});
+      b.Type(spv::OpTypePointer, spv::StorageClassInput, vec4_type);
   const auto ptr_output_vec4 =
-      b.Type(spv::OpTypePointer, {spv::StorageClassOutput, vec4_type});
+      b.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4_type);
   const auto ptr_output_per_vertex =
-      b.Type(spv::OpTypePointer, {spv::StorageClassOutput, per_vertex_type});
-  const auto func_type = b.Type(spv::OpTypeFunction, {void_type});
-  const auto const_u32_0 = b.Constant(spv::OpConstant, uint_type, {0});
+      b.Type(spv::OpTypePointer, spv::StorageClassOutput, per_vertex_type);
+  const auto func_type = b.Type(spv::OpTypeFunction, void_type);
+  const auto const_u32_0 = b.Constant(spv::OpConstant, uint_type, 0);
   const auto const_f32_0 =
-      b.Constant(spv::OpConstant, float_type, {0x00000000u});
+      b.Constant(spv::OpConstant, float_type, 0x00000000u);
   const auto const_f32_w =
-      b.Constant(spv::OpConstant, float_type, {std::bit_cast<u32>(clip_w)});
+      b.Constant(spv::OpConstant, float_type, std::bit_cast<u32>(clip_w));
   const auto in_pos =
       b.DefineGlobalVariable(ptr_input_vec2, spv::StorageClassInput);
   const auto in_color =
@@ -1640,15 +1639,14 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   std::vector<u32> interfaces = {in_pos, in_color, per_vertex, out_color};
   if (layered) {
     instance = b.DefineGlobalVariable(
-        b.Type(spv::OpTypePointer, {spv::StorageClassInput, int_type}),
+        b.Type(spv::OpTypePointer, spv::StorageClassInput, int_type),
         spv::StorageClassInput);
     layer = b.DefineGlobalVariable(
-        b.Type(spv::OpTypePointer, {spv::StorageClassOutput, int_type}),
+        b.Type(spv::OpTypePointer, spv::StorageClassOutput, int_type),
         spv::StorageClassOutput);
-    b.AddAnnotation({spv::OpDecorate, instance, spv::DecorationBuiltIn,
-                     spv::BuiltInInstanceIndex});
-    b.AddAnnotation(
-        {spv::OpDecorate, layer, spv::DecorationBuiltIn, spv::BuiltInLayer});
+    b.AddAnnotation(spv::OpDecorate, instance, spv::DecorationBuiltIn,
+                     spv::BuiltInInstanceIndex);
+    b.AddAnnotation(spv::OpDecorate, layer, spv::DecorationBuiltIn, spv::BuiltInLayer);
     b.RequireVersion(0x00010500u);
     b.RequireCapability(spv::CapabilityShaderLayer);
     interfaces.insert(interfaces.end(), {instance, layer});
@@ -1663,32 +1661,32 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   const auto position_ptr = b.AllocateId();
 
   b.RequireCapability(spv::CapabilityShader);
-  b.AddMemoryModel({spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+  b.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
   b.AddEntryPoint(spv::ExecutionModelVertex, main, "main", interfaces);
-  b.AddAnnotation({spv::OpDecorate, in_pos, spv::DecorationLocation, 0});
-  b.AddAnnotation({spv::OpDecorate, in_color, spv::DecorationLocation, 1});
-  b.AddAnnotation({spv::OpDecorate, out_color, spv::DecorationLocation, 0});
+  b.AddAnnotation(spv::OpDecorate, in_pos, spv::DecorationLocation, 0);
+  b.AddAnnotation(spv::OpDecorate, in_color, spv::DecorationLocation, 1);
+  b.AddAnnotation(spv::OpDecorate, out_color, spv::DecorationLocation, 0);
 
-  b.AddFunction({spv::OpFunction, void_type, main, spv::FunctionControlMaskNone,
-                 func_type});
-  b.AddFunction({spv::OpLabel, label});
-  b.AddFunction({spv::OpLoad, vec2_type, pos2, in_pos});
-  b.AddFunction({spv::OpLoad, vec4_type, color4, in_color});
-  b.AddFunction({spv::OpCompositeExtract, float_type, pos_x, pos2, 0});
-  b.AddFunction({spv::OpCompositeExtract, float_type, pos_y, pos2, 1});
-  b.AddFunction({spv::OpCompositeConstruct, vec4_type, position, pos_x, pos_y,
-                 const_f32_0, const_f32_w});
-  b.AddFunction({spv::OpAccessChain, ptr_output_vec4, position_ptr, per_vertex,
-                 const_u32_0});
-  b.AddFunction({spv::OpStore, position_ptr, position});
-  b.AddFunction({spv::OpStore, out_color, color4});
+  b.AddFunction(spv::OpFunction, void_type, main, spv::FunctionControlMaskNone,
+                 func_type);
+  b.AddFunction(spv::OpLabel, label);
+  b.AddFunction(spv::OpLoad, vec2_type, pos2, in_pos);
+  b.AddFunction(spv::OpLoad, vec4_type, color4, in_color);
+  b.AddFunction(spv::OpCompositeExtract, float_type, pos_x, pos2, 0);
+  b.AddFunction(spv::OpCompositeExtract, float_type, pos_y, pos2, 1);
+  b.AddFunction(spv::OpCompositeConstruct, vec4_type, position, pos_x, pos_y,
+                 const_f32_0, const_f32_w);
+  b.AddFunction(spv::OpAccessChain, ptr_output_vec4, position_ptr, per_vertex,
+                 const_u32_0);
+  b.AddFunction(spv::OpStore, position_ptr, position);
+  b.AddFunction(spv::OpStore, out_color, color4);
   if (layered) {
     const auto index = b.AllocateId();
-    b.AddFunction({spv::OpLoad, int_type, index, instance});
-    b.AddFunction({spv::OpStore, layer, index});
+    b.AddFunction(spv::OpLoad, int_type, index, instance);
+    b.AddFunction(spv::OpStore, layer, index);
   }
-  b.AddFunction({spv::OpReturn});
-  b.AddFunction({spv::OpFunctionEnd});
+  b.AddFunction(spv::OpReturn);
+  b.AddFunction(spv::OpFunctionEnd);
   return b.Build();
 }
 

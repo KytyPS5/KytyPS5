@@ -4,35 +4,35 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), ret, value, ConstantU32(state, mask)});
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), ret, value,
+	                          ConstantU32(state, mask));
 	return ret;
 }
 
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpShiftRightLogical, TypeU32(state), ret, value, ConstantU32(state, shift)});
+	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), ret, value,
+	                          ConstantU32(state, shift));
 	return ret;
 }
 
-uint32_t EmitCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
+uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t value,
                                 uint32_t constant) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, TypeBool(state), ret, value, ConstantU32(state, constant)});
+	state.builder.AddFunction(opcode, TypeBool(state), ret, value, ConstantU32(state, constant));
 	return ret;
 }
 
 uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpISub, TypeU32(state), ret, ConstantU32(state, constant), value});
+	state.builder.AddFunction(spv::OpISub, TypeU32(state), ret, ConstantU32(state, constant),
+	                          value);
 	return ret;
 }
 
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto bits = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpBitcast, TypeU32(state), bits, f32});
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, f32);
 
 	const auto sign = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
 	const auto exp  = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 23), 0xffu);
@@ -43,13 +43,12 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto normal_mant    = EmitShiftRightConstant(state, mant, 13);
 	const auto normal_payload = state.builder.AllocateId();
 	const auto normal         = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpISub, TypeU32(state), half_exp, exp, ConstantU32(state, 112)});
-	state.builder.AddFunction(
-	    {spv::OpShiftLeftLogical, TypeU32(state), normal_exp, half_exp, ConstantU32(state, 10)});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseOr, TypeU32(state), normal_payload, normal_exp, normal_mant});
-	state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), normal, sign, normal_payload});
+	state.builder.AddFunction(spv::OpISub, TypeU32(state), half_exp, exp, ConstantU32(state, 112));
+	state.builder.AddFunction(spv::OpShiftLeftLogical, TypeU32(state), normal_exp, half_exp,
+	                          ConstantU32(state, 10));
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), normal_payload, normal_exp,
+	                          normal_mant);
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), normal, sign, normal_payload);
 
 	const auto mant_with_hidden = EmitOrU32(state, mant, ConstantU32(state, 0x00800000u));
 	const auto raw_sub_shift    = EmitSubConstantMinusU32(state, 126, exp);
@@ -61,9 +60,9 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	    EmitSelectValueU32(state, exp_gt_112, ConstantU32(state, 14), sub_shift_low);
 	const auto sub_mant  = state.builder.AllocateId();
 	const auto subnormal = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpShiftRightLogical, TypeU32(state), sub_mant, mant_with_hidden, sub_shift});
-	state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), subnormal, sign, sub_mant});
+	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), sub_mant, mant_with_hidden,
+	                          sub_shift);
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), subnormal, sign, sub_mant);
 
 	const auto nan_payload =
 	    EmitOrU32(state, EmitShiftRightConstant(state, mant, 13), ConstantU32(state, 0x0200u));
@@ -86,18 +85,18 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state), cond, lhs, rhs});
-	state.builder.AddFunction({spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs});
+	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
+	                          cond, lhs, rhs);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs);
 	return ret;
 }
 
 uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {max_value ? spv::OpSGreaterThan : spv::OpSLessThan, TypeBool(state), cond, lhs, rhs});
-	state.builder.AddFunction({spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs});
+	state.builder.AddFunction(max_value ? spv::OpSGreaterThan : spv::OpSLessThan, TypeBool(state),
+	                          cond, lhs, rhs);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs);
 	return ret;
 }
 
@@ -184,8 +183,8 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
 	const auto numeric_cond = state.builder.AllocateId();
-	state.builder.AddFunction({max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-	                           TypeBool(state), numeric_cond, lhs, rhs});
+	state.builder.AddFunction(max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
+	                          TypeBool(state), numeric_cond, lhs, rhs);
 	const auto ordered_bits =
 	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
 
@@ -209,18 +208,18 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	const auto flush     = state.builder.AllocateId();
 	const auto selected  = state.builder.AllocateId();
 	const auto ret       = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpBitcast, TypeU32(state), bits, value});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), sign_bits, bits, ConstantU32(state, 0x80000000u)});
-	state.builder.AddFunction(
-	    {spv::OpINotEqual, TypeBool(state), non_zero, abs_bits, ConstantU32(state, 0)});
-	state.builder.AddFunction(
-	    {spv::OpULessThan, TypeBool(state), subnormal, abs_bits, ConstantU32(state, 0x00800000u)});
-	state.builder.AddFunction({spv::OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal});
-	state.builder.AddFunction({spv::OpSelect, TypeU32(state), selected, flush, sign_bits, bits});
-	state.builder.AddFunction({spv::OpBitcast, TypeF32(state), ret, selected});
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
+	                          ConstantU32(state, 0x7fffffffu));
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), sign_bits, bits,
+	                          ConstantU32(state, 0x80000000u));
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), non_zero, abs_bits,
+	                          ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), subnormal, abs_bits,
+	                          ConstantU32(state, 0x00800000u));
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), flush, non_zero, subnormal);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, flush, sign_bits, bits);
+	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
 	return ret;
 }
 
@@ -232,35 +231,35 @@ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signe
 	const auto finite       = state.builder.AllocateId();
 	const auto large_finite = state.builder.AllocateId();
 	const auto reduced      = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpExtInst, TypeF32(state), fract, GlslStd450(state), GLSLstd450Fract, src});
-	state.builder.AddFunction({spv::OpBitcast, TypeU32(state), bits, src});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
-	state.builder.AddFunction({spv::OpUGreaterThanEqual, TypeBool(state), large, abs_bits,
-	                           ConstantU32(state, 0x4b000000u)});
-	state.builder.AddFunction(
-	    {spv::OpULessThan, TypeBool(state), finite, abs_bits, ConstantU32(state, 0x7f800000u)});
-	state.builder.AddFunction({spv::OpLogicalAnd, TypeBool(state), large_finite, large, finite});
-	state.builder.AddFunction(
-	    {spv::OpSelect, TypeF32(state), reduced, large_finite, ConstantF32(state, 0), fract});
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state),
+	                          GLSLstd450Fract, src);
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, src);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
+	                          ConstantU32(state, 0x7fffffffu));
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), large, abs_bits,
+	                          ConstantU32(state, 0x4b000000u));
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), finite, abs_bits,
+	                          ConstantU32(state, 0x7f800000u));
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), large_finite, large, finite);
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), reduced, large_finite,
+	                          ConstantF32(state, 0), fract);
 	if (!preserve_signed_zero) {
 		return reduced;
 	}
 	const auto zero = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpIEqual, TypeBool(state), zero, abs_bits, ConstantU32(state, 0)});
-	state.builder.AddFunction({spv::OpSelect, TypeF32(state), ret, zero, src, reduced});
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), zero, abs_bits,
+	                          ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), ret, zero, src, reduced);
 	return ret;
 }
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
 	const auto unpacked = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),
-	                           GLSLstd450UnpackHalf2x16, bits});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeF32(state), ret, unpacked, 0});
+	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),
+	                          GLSLstd450UnpackHalf2x16, bits);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), ret, unpacked, 0);
 	return ret;
 }
 

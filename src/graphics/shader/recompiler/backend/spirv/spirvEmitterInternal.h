@@ -151,7 +151,7 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
-	state.builder.AddFunction({spv::OpLabel, label});
+	state.builder.AddFunction(spv::OpLabel, label);
 }
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
@@ -160,7 +160,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type);
 template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, TypeId(state, type), result, args...});
+	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
 	return result;
 }
 
@@ -171,23 +171,23 @@ uint32_t EmitGlsl(EmitterState& state, Args... args) {
 	return EmitNative<spv::OpExtInst, type>(state, GlslStd450(state), opcode, args...);
 }
 
-inline uint32_t Unary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t value) {
+inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t value) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, value});
+	state.builder.AddFunction(opcode, type, result, value);
 	return result;
 }
 
-inline uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs,
+inline uint32_t Binary(EmitterState& state, spv::Op opcode, uint32_t type, uint32_t lhs,
                        uint32_t rhs) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, result, lhs, rhs});
+	state.builder.AddFunction(opcode, type, result, lhs, rhs);
 	return result;
 }
 
 inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition, uint32_t true_value,
                        uint32_t false_value) {
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpSelect, type, result, condition, true_value, false_value});
+	state.builder.AddFunction(spv::OpSelect, type, result, condition, true_value, false_value);
 	return result;
 }
 
@@ -350,7 +350,7 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
-uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs);
+uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
@@ -417,7 +417,7 @@ uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t sh
 
 inline constexpr auto EmitOrU32 = EmitNative<spv::OpBitwiseOr, IR::Type::U32, uint32_t, uint32_t>;
 
-uint32_t EmitCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
+uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t value,
                                 uint32_t constant);
 
 uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_t value);
@@ -474,11 +474,11 @@ template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone});
-	state.builder.AddFunction({spv::OpBranchConditional, condition, then_label, merge_label});
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
 	EmitLabel(state, then_label);
 	fn();
-	state.builder.AddFunction({spv::OpBranch, merge_label});
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 }
 
@@ -489,19 +489,19 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
 	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone});
-	state.builder.AddFunction({spv::OpBranchConditional, condition, then_label, else_label});
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, else_label);
 	EmitLabel(state, then_label);
 	const auto then_value = fn();
-	state.builder.AddFunction({spv::OpBranch, then_exit});
+	state.builder.AddFunction(spv::OpBranch, then_exit);
 	EmitLabel(state, then_exit);
-	state.builder.AddFunction({spv::OpBranch, merge_label});
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, else_label);
-	state.builder.AddFunction({spv::OpBranch, merge_label});
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpPhi, type, value, then_value, then_exit, default_value, else_label});
+	state.builder.AddFunction(spv::OpPhi, type, value, then_value, then_exit, default_value,
+	                          else_label);
 	return value;
 }
 
@@ -528,30 +528,29 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto initial   = state.builder.AllocateId();
 	const auto observed  = state.builder.AllocateId();
 	const auto exchanged = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpBranch, preheader});
+	state.builder.AddFunction(spv::OpBranch, preheader);
 	EmitLabel(state, preheader);
-	state.builder.AddFunction({spv::OpAtomicLoad, TypeU32(state), initial, pointer,
-	                           ConstantU32(state, scope),
-	                           ConstantU32(state, spv::MemorySemanticsMaskNone)});
-	state.builder.AddFunction({spv::OpBranch, header});
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), initial, pointer,
+	                          ConstantU32(state, scope),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, header);
-	state.builder.AddFunction(
-	    {spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged,
+	                          cont);
 	const auto next = desired(observed);
-	state.builder.AddFunction({spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
-	                           ConstantU32(state, scope),
-	                           ConstantU32(state, spv::MemorySemanticsMaskNone),
-	                           ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed});
+	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+	                          ConstantU32(state, scope),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed);
 	const auto success = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpIEqual, TypeBool(state), success, exchanged, observed});
-	state.builder.AddFunction({spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone});
-	state.builder.AddFunction({spv::OpBranchConditional, success, merge, cont});
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), success, exchanged, observed);
+	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, success, merge, cont);
 	EmitLabel(state, cont);
-	state.builder.AddFunction({spv::OpBranch, header});
+	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, merge);
-	state.builder.AddFunction(
-	    {spv::OpMemoryBarrier, ConstantU32(state, scope),
-	     ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory)});
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
+	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
 	return observed;
 }
 

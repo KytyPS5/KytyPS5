@@ -7,27 +7,27 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 		dword_index += state.program.bindings.push_data_start_dword;
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction({spv::OpAccessChain, TypePushConstantElementPointer(state),
-		                           pointer, state.push_constant_variable, ConstantU32(state, 0),
-		                           ConstantU32(state, dword_index)});
-		state.builder.AddFunction({spv::OpLoad, TypeU32(state), value, pointer});
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword_index));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	}
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction({spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                           pointer, state.shader_data_storage_variable,
-		                           ConstantU32(state, 0), ConstantU32(state, dword_index)});
-		state.builder.AddFunction({spv::OpLoad, TypeU32(state), value, pointer});
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.shader_data_storage_variable,
+		                          ConstantU32(state, 0), ConstantU32(state, dword_index));
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	}
 	return ConstantU32(state, 0);
 }
 
-uint32_t EmitBinaryU32(EmitterState& state, uint32_t opcode, uint32_t lhs, uint32_t rhs) {
+uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, TypeU32(state), ret, lhs, rhs});
+	state.builder.AddFunction(opcode, TypeU32(state), ret, lhs, rhs);
 	return ret;
 }
 
@@ -88,12 +88,12 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
 	MemoryResourceAccess access {.kind = mem.kind};
 	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                           ConstantU32(state, array_index)});
+	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
+	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
 	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
+	                          access.object_pointer, 0);
 	return access;
 }
 
@@ -139,8 +139,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
 	access.length = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
+	                          access.object_pointer, 0);
 	return access;
 }
 
@@ -152,7 +152,7 @@ uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess&
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index) {
 	const auto in_bounds = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpULessThan, TypeBool(state), in_bounds, index, access.length});
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
 	return in_bounds;
 }
 
@@ -165,8 +165,8 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		    : ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr
 		        ? spv::StorageClassWorkgroup
 		        : spv::StorageClassFunction;
-		state.builder.AddFunction({spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
-		                           pointer, access.object_pointer, index});
+		state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
+		                          pointer, access.object_pointer, index);
 		return pointer;
 	}
 	return EmitStorageBufferElementPointer(state, access, index,
@@ -177,14 +177,14 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
-	                           ConstantU32(state, 0), index});
+	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
+	                          ConstantU32(state, 0), index);
 	return pointer;
 }
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpBitcast, TypeI32(state), ret, value});
+	state.builder.AddFunction(spv::OpBitcast, TypeI32(state), ret, value);
 	return ret;
 }
 
@@ -218,10 +218,10 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 
 	const auto mantissa_f32 = state.builder.AllocateId();
 	const auto subnormal    = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpConvertUToF, TypeF32(state), mantissa_f32, mantissa});
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), mantissa_f32, mantissa);
 	state.builder.AddFunction(
-	    {spv::OpFMul, TypeF32(state), subnormal, mantissa_f32,
-	     ConstantF32Value(state, std::ldexp(1.0f, 1 - 15 - static_cast<int>(mantissa_bits)))});
+	    spv::OpFMul, TypeF32(state), subnormal, mantissa_f32,
+	    ConstantF32Value(state, std::ldexp(1.0f, 1 - 15 - static_cast<int>(mantissa_bits))));
 
 	const auto zero_exp    = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 0);
 	const auto special_exp = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 31);
@@ -238,22 +238,22 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 		case Format::ComponentType::Sint: return raw;
 		case Format::ComponentType::Uscaled: {
 			const auto value = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpConvertUToF, TypeF32(state), value, raw});
+			state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), value, raw);
 			return EmitBitcastF32ToU32(state, value);
 		}
 		case Format::ComponentType::Sscaled: {
 			const auto signed_raw = EmitTBufferBitcastU32ToI32(state, raw);
 			const auto value      = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpConvertSToF, TypeF32(state), value, signed_raw});
+			state.builder.AddFunction(spv::OpConvertSToF, TypeF32(state), value, signed_raw);
 			return EmitBitcastF32ToU32(state, value);
 		}
 		case Format::ComponentType::Unorm: {
 			const auto value      = state.builder.AllocateId();
 			const auto normalized = state.builder.AllocateId();
 			const auto max_value  = static_cast<float>((1u << bits) - 1u);
-			state.builder.AddFunction({spv::OpConvertUToF, TypeF32(state), value, raw});
-			state.builder.AddFunction({spv::OpFDiv, TypeF32(state), normalized, value,
-			                           ConstantF32Value(state, max_value)});
+			state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), value, raw);
+			state.builder.AddFunction(spv::OpFDiv, TypeF32(state), normalized, value,
+			                          ConstantF32Value(state, max_value));
 			return EmitBitcastF32ToU32(state, normalized);
 		}
 		case Format::ComponentType::Snorm: {
@@ -262,11 +262,11 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 			const auto normalized = state.builder.AllocateId();
 			const auto clamped    = state.builder.AllocateId();
 			const auto max_value  = static_cast<float>((1u << (bits - 1u)) - 1u);
-			state.builder.AddFunction({spv::OpConvertSToF, TypeF32(state), value, signed_raw});
-			state.builder.AddFunction({spv::OpFDiv, TypeF32(state), normalized, value,
-			                           ConstantF32Value(state, max_value)});
-			state.builder.AddFunction({spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
-			                           GLSLstd450FMax, normalized, ConstantF32Value(state, -1.0f)});
+			state.builder.AddFunction(spv::OpConvertSToF, TypeF32(state), value, signed_raw);
+			state.builder.AddFunction(spv::OpFDiv, TypeF32(state), normalized, value,
+			                          ConstantF32Value(state, max_value));
+			state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+			                          GLSLstd450FMax, normalized, ConstantF32Value(state, -1.0f));
 			return EmitBitcastF32ToU32(state, clamped);
 		}
 		case Format::ComponentType::Float:
@@ -284,8 +284,8 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
 	const auto semantics =
 	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask;
-	state.builder.AddFunction({spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
-	                           ConstantU32(state, semantics)});
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, semantics));
 }
 
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
@@ -300,7 +300,7 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 		const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
 		                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
 		const auto negative_key = state.builder.AllocateId();
-		state.builder.AddFunction({spv::OpNot, TypeU32(state), negative_key, bits});
+		state.builder.AddFunction(spv::OpNot, TypeU32(state), negative_key, bits);
 		const auto positive_key =
 		    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
 		return OrderedBits {
@@ -313,8 +313,8 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 	    state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
 	    EmitLogicalAndBool(state, source_class.zero, old_class.zero));
 	const auto compare = state.builder.AllocateId();
-	state.builder.AddFunction({max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
-	                           compare, source_class.key, old_class.key});
+	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
+	                          compare, source_class.key, old_class.key);
 	return EmitSelectValueU32(
 	    state, EmitLogicalAndBool(state, EmitLogicalNotBool(state, unordered), compare), source,
 	    old);
@@ -342,17 +342,17 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 		const auto perm   = state.builder.AllocateId();
 		const auto base   = state.builder.AllocateId();
 		const auto target = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {spv::OpBitwiseAnd, TypeU32(state), lane2, subid, ConstantU32(state, 3)});
-		state.builder.AddFunction(
-		    {spv::OpShiftLeftLogical, TypeU32(state), shift, lane2, ConstantU32(state, 1)});
-		state.builder.AddFunction(
-		    {spv::OpShiftRightLogical, TypeU32(state), perm0, ConstantU32(state, control), shift});
-		state.builder.AddFunction(
-		    {spv::OpBitwiseAnd, TypeU32(state), perm, perm0, ConstantU32(state, 3)});
-		state.builder.AddFunction(
-		    {spv::OpBitwiseAnd, TypeU32(state), base, subid, ConstantU32(state, 0xfffffffcu)});
-		state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), target, base, perm});
+		state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane2, subid,
+		                          ConstantU32(state, 3));
+		state.builder.AddFunction(spv::OpShiftLeftLogical, TypeU32(state), shift, lane2,
+		                          ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), perm0,
+		                          ConstantU32(state, control), shift);
+		state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), perm, perm0,
+		                          ConstantU32(state, 3));
+		state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), base, subid,
+		                          ConstantU32(state, 0xfffffffcu));
+		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, base, perm);
 		return target;
 	}
 
@@ -362,17 +362,17 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 	const auto xored  = state.builder.AllocateId();
 	const auto base   = state.builder.AllocateId();
 	const auto target = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), lane, subid, ConstantU32(state, 31)});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), masked, lane, ConstantU32(state, control & 0x1fu)});
-	state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), ored, masked,
-	                           ConstantU32(state, (control >> 5u) & 0x1fu)});
-	state.builder.AddFunction({spv::OpBitwiseXor, TypeU32(state), xored, ored,
-	                           ConstantU32(state, (control >> 10u) & 0x1fu)});
-	state.builder.AddFunction(
-	    {spv::OpBitwiseAnd, TypeU32(state), base, subid, ConstantU32(state, 0xffffffe0u)});
-	state.builder.AddFunction({spv::OpBitwiseOr, TypeU32(state), target, base, xored});
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane, subid,
+	                          ConstantU32(state, 31));
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), masked, lane,
+	                          ConstantU32(state, control & 0x1fu));
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), ored, masked,
+	                          ConstantU32(state, (control >> 5u) & 0x1fu));
+	state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), xored, ored,
+	                          ConstantU32(state, (control >> 10u) & 0x1fu));
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), base, subid,
+	                          ConstantU32(state, 0xffffffe0u));
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, base, xored);
 	return target;
 }
 

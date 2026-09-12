@@ -17,11 +17,11 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	const auto inactive    = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpLogicalNot, TypeBool(state), inactive, active});
-	state.builder.AddFunction({spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone});
-	state.builder.AddFunction({spv::OpBranchConditional, inactive, kill_label, merge_label});
+	state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), inactive, active);
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, inactive, kill_label, merge_label);
 	EmitLabel(state, kill_label);
-	state.builder.AddFunction({spv::OpKill});
+	state.builder.AddFunction(spv::OpKill);
 	EmitLabel(state, merge_label);
 }
 
@@ -32,10 +32,10 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 
 	const auto mask_value = state.builder.AllocateId();
 	const auto active     = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpLoad, TypeU32(state), mask_value, state.pixel_valid_mask_variable});
-	state.builder.AddFunction(
-	    {spv::OpINotEqual, TypeBool(state), active, mask_value, ConstantU32(state, 0)});
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), mask_value,
+	                          state.pixel_valid_mask_variable);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, mask_value,
+	                          ConstantU32(state, 0));
 	EmitKillIfBoolFalse(state, active);
 }
 
@@ -75,8 +75,8 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 		}
 		for (size_t index = 0; index < phi.NumArgs(); index++) {
 			if (phi.PhiBlock(index) == from) {
-				ctx.state.builder.AddFunction(
-				    {spv::OpStore, dispatcher.spills[ctx.half].at(&phi), ctx.Def(phi.Arg(index))});
+				ctx.state.builder.AddFunction(spv::OpStore, dispatcher.spills[ctx.half].at(&phi),
+				                              ctx.Def(phi.Arg(index)));
 				break;
 			}
 		}
@@ -94,7 +94,7 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
-	ctx.state.builder.AddFunction({spv::OpReturn});
+	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
 uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
@@ -108,16 +108,16 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	const auto low    = ctx.state.builder.AllocateId();
 	const auto high   = ctx.state.builder.AllocateId();
 	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0});
-	ctx.state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1});
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
 	const auto kind     = info.terminator.condition;
 	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
 	                      kind == CFG::BranchCondition::VccZero ||
 	                      kind == CFG::BranchCondition::SccZero;
 	const auto combined =
 	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-	ctx.state.builder.AddFunction({zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                               result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u)});
+	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
+	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
 	return result;
 }
 
@@ -130,14 +130,14 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
-				ctx.state.builder.AddFunction({spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont),
-				                               spv::LoopControlMaskNone});
+				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont),
+				                              spv::LoopControlMaskNone);
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
 		           term.merge_block != UINT32_MAX) {
 			if (const auto* merge = TargetBlock(program, term.merge_block); merge != nullptr) {
-				ctx.state.builder.AddFunction(
-				    {spv::OpSelectionMerge, ctx.Label(merge), spv::SelectionControlMaskNone});
+				ctx.state.builder.AddFunction(spv::OpSelectionMerge, ctx.Label(merge),
+				                              spv::SelectionControlMaskNone);
 			}
 		}
 	};
@@ -150,7 +150,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				return;
 			}
 			emit_merge();
-			ctx.state.builder.AddFunction({spv::OpBranch, ctx.Label(target)});
+			ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(target));
 			return;
 		}
 		case CFG::TerminatorKind::ConditionalBranch: {
@@ -162,8 +162,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			}
 			const auto condition = BranchCondition(ctx, info);
 			emit_merge();
-			ctx.state.builder.AddFunction({spv::OpBranchConditional, condition,
-			                               ctx.Label(true_block), ctx.Label(false_block)});
+			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
+			                              ctx.Label(true_block), ctx.Label(false_block));
 			return;
 		}
 		default: EmitReturn(ctx); return;
@@ -192,10 +192,9 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction({spv::OpSelect, TypeU32(ctx.state), selected,
-			                               BranchCondition(ctx, info),
-			                               ConstantU32(ctx.state, term.true_block),
-			                               ConstantU32(ctx.state, term.false_block)});
+			ctx.state.builder.AddFunction(
+			    spv::OpSelect, TypeU32(ctx.state), selected, BranchCondition(ctx, info),
+			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
 			return selected;
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
@@ -214,12 +213,10 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 				for (size_t index = 0; index < std::min(values.size(), targets.size()); index++) {
 					const auto match = ctx.state.builder.AllocateId();
 					const auto next  = ctx.state.builder.AllocateId();
-					ctx.state.builder.AddFunction({spv::OpIEqual, TypeBool(ctx.state), match,
-					                               selector,
-					                               ConstantU32(ctx.state, values[index])});
-					ctx.state.builder.AddFunction({spv::OpSelect, TypeU32(ctx.state), next, match,
-					                               ConstantU32(ctx.state, targets[index]),
-					                               selected});
+					ctx.state.builder.AddFunction(spv::OpIEqual, TypeBool(ctx.state), match,
+					                              selector, ConstantU32(ctx.state, values[index]));
+					ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), next, match,
+					                              ConstantU32(ctx.state, targets[index]), selected);
 					selected = next;
 				}
 			}
@@ -307,15 +304,15 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 		if (type == 0) {
 			ctx.Fail(inst, "cannot be loaded by the dispatcher");
 		}
-		ctx.state.builder.AddFunction(
-		    {spv::OpLoad, type, ctx.Result(inst), dispatcher.spills[ctx.half].at(&inst)});
+		ctx.state.builder.AddFunction(spv::OpLoad, type, ctx.Result(inst),
+		                              dispatcher.spills[ctx.half].at(&inst));
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
 	if (const auto found = dispatcher.spills[ctx.half].find(&inst);
 	    found != dispatcher.spills[ctx.half].end()) {
-		ctx.state.builder.AddFunction(
-		    {spv::OpStore, found->second, ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)))});
+		ctx.state.builder.AddFunction(spv::OpStore, found->second,
+		                              ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst))));
 	}
 }
 
@@ -362,7 +359,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
-	ctx.state.builder.AddFunction({spv::OpBranch, ctx.Label(program.blocks.front())});
+	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
@@ -377,31 +374,31 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
 	auto&       state = ctx.state;
 	const auto* entry = state.program.blocks.front();
-	state.builder.AddFunction({spv::OpBranch, ctx.Label(entry)});
+	state.builder.AddFunction(spv::OpBranch, ctx.Label(entry));
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
 	const auto initial_pc =
 	    EmitDispatcherNextPc(ctx, dispatcher, entry, state.program.block_info.front());
 	const auto initial_parent = state.current_label;
-	state.builder.AddFunction({spv::OpBranch, dispatcher.header_label});
+	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 
 	EmitLabel(state, dispatcher.header_label);
 	const auto pc      = state.builder.AllocateId();
 	const auto next_pc = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
-	                           dispatcher.continue_label});
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
+	                          dispatcher.continue_label);
 	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpIEqual, TypeBool(state), done, pc, ConstantU32(ctx.state, UINT32_MAX)});
-	state.builder.AddFunction({spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
-	                           spv::LoopControlMaskNone});
-	state.builder.AddFunction(
-	    {spv::OpBranchConditional, done, dispatcher.merge_label, dispatcher.select_label});
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	                          ConstantU32(ctx.state, UINT32_MAX));
+	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
+	                          spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
+	                          dispatcher.select_label);
 
 	EmitLabel(state, dispatcher.select_label);
-	state.builder.AddFunction(
-	    {spv::OpSelectionMerge, dispatcher.after_switch_label, spv::SelectionControlMaskNone});
+	state.builder.AddFunction(spv::OpSelectionMerge, dispatcher.after_switch_label,
+	                          spv::SelectionControlMaskNone);
 	std::vector<uint32_t> words {spv::OpSwitch, pc, dispatcher.after_switch_label};
 	for (size_t index = 1; index < state.program.blocks.size(); index++) {
 		words.push_back(state.program.block_info[index].id);
@@ -420,13 +417,13 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		                                           state.program.block_info[index]);
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
-		state.builder.AddFunction({spv::OpBranch, dispatcher.after_switch_label});
+		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
 	}
 	EmitLabel(state, dispatcher.after_switch_label);
 	state.builder.AddFunction(next_pc_words);
-	state.builder.AddFunction({spv::OpBranch, dispatcher.continue_label});
+	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
-	state.builder.AddFunction({spv::OpBranch, dispatcher.header_label});
+	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);
 }
@@ -478,7 +475,8 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 				return loaded->second.second;
 			}
 			const auto id = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpLoad, TypeId(state, inst->GetType()), id, found->second});
+			state.builder.AddFunction(spv::OpLoad, TypeId(state, inst->GetType()), id,
+			                          found->second);
 			dispatcher_block_loads.insert_or_assign(inst, std::pair {state.current_label, id});
 			return id;
 		}
@@ -498,9 +496,9 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	     other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)});
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
+	                          other_half == nullptr || half == 0 ? Def(predicate)
+	                                                             : other_half->Def(predicate));
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -508,20 +506,20 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto low_word  = state.builder.AllocateId();
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                           half == 1 ? Def(predicate) : other_half->Def(predicate)});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), low_word, low, 0});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), high_word, high, 0});
-	state.builder.AddFunction({spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
-	                           ConstantU32(state, 0), ConstantU32(state, 0)});
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
+	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
+	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
+	                          ConstantU32(state, 0), ConstantU32(state, 0));
 	return ballot;
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	if (other_half == nullptr) {
 		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction({spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
-		                           ConstantU32(state, spv::ScopeSubgroup), ballot});
+		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
+		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
 		return result;
 	}
 	const auto low        = state.builder.AllocateId();
@@ -530,16 +528,16 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	const auto high_first = state.builder.AllocateId();
 	const auto low_active = state.builder.AllocateId();
 	const auto result     = state.builder.AllocateId();
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), low, ballot, 0});
-	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), high, ballot, 1});
-	state.builder.AddFunction(
-	    {spv::OpExtInst, TypeU32(state), low_first, GlslStd450(state), GLSLstd450FindILsb, low});
-	state.builder.AddFunction(
-	    {spv::OpExtInst, TypeU32(state), high_first, GlslStd450(state), GLSLstd450FindILsb, high});
-	state.builder.AddFunction(
-	    {spv::OpINotEqual, TypeBool(state), low_active, low, ConstantU32(state, 0)});
-	state.builder.AddFunction({spv::OpSelect, TypeU32(state), result, low_active, low_first,
-	                           EmitAddU32(state, high_first, ConstantU32(state, 32))});
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), low_first, GlslStd450(state),
+	                          GLSLstd450FindILsb, low);
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), high_first, GlslStd450(state),
+	                          GLSLstd450FindILsb, high);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), low_active, low,
+	                          ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, low_active, low_first,
+	                          EmitAddU32(state, high_first, ConstantU32(state, 32)));
 	return result;
 }
 
@@ -548,8 +546,8 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
-		state.builder.AddFunction(
-		    {spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), lane});
+		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
+		                          lane);
 		return low;
 	}
 	const auto physical_lane =
@@ -557,15 +555,14 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto high          = state.builder.AllocateId();
 	const auto in_high       = state.builder.AllocateId();
 	const auto value         = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {spv::OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0), physical_lane});
-	state.builder.AddFunction(
-	    {spv::OpGroupNonUniformShuffle, type, high, scope, HalfArg(inst, index, 1), physical_lane});
-	state.builder.AddFunction(
-	    {spv::OpINotEqual, TypeBool(state), in_high,
-	     EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32)),
-	     ConstantU32(state, 0)});
-	state.builder.AddFunction({spv::OpSelect, type, value, in_high, high, low});
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
+	                          HalfArg(inst, index, 0), physical_lane);
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,
+	                          HalfArg(inst, index, 1), physical_lane);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), in_high,
+	                          EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32)),
+	                          ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpSelect, type, value, in_high, high, low);
 	return value;
 }
 
@@ -581,8 +578,8 @@ uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
 	if (const auto found = definitions.find(&inst); found != definitions.end()) {
 		if (found->second != value) {
-			state.builder.AddFunction(
-			    {spv::OpCopyObject, TypeId(state, inst.GetType()), found->second, value});
+			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()),
+			                          found->second, value);
 		}
 		return found->second;
 	}
@@ -718,28 +715,28 @@ void EmitProgram(EmitterState& state) {
 			break;
 		}
 	}
-	state.builder.AddFunction({spv::OpFunction, TypeVoid(state),
-	                           state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
-	                           spv::FunctionControlMaskNone, TypeFunction(state)});
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
+	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
+	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
-		    {spv::OpVariable,
-		     TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
-		     state.lds_variable, spv::StorageClassFunction});
+		    spv::OpVariable,
+		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
+		    state.lds_variable, spv::StorageClassFunction);
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
-			state.builder.AddFunction({spv::OpVariable,
-			                           TypeU32ArrayPointer(state, spv::StorageClassFunction,
-			                                               state.program.scratch_dwords),
-			                           state.scratch_variable[half], spv::StorageClassFunction});
+			state.builder.AddFunction(
+			    spv::OpVariable,
+			    TypeU32ArrayPointer(state, spv::StorageClassFunction, state.program.scratch_dwords),
+			    state.scratch_variable[half], spv::StorageClassFunction);
 		}
 	}
 	if (state.pixel_valid_mask_variable != 0) {
-		state.builder.AddFunction({spv::OpVariable,
-		                           TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
-		                           state.pixel_valid_mask_variable, spv::StorageClassFunction});
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
@@ -748,27 +745,27 @@ void EmitProgram(EmitterState& state) {
 				for (const auto& inst: *block) {
 					if (const auto found = dispatcher->spills[half].find(&inst);
 					    found != dispatcher->spills[half].end()) {
-						state.builder.AddFunction({spv::OpVariable,
-						                           SpillPointerType(lane, inst.GetType()),
-						                           found->second, spv::StorageClassFunction});
+						state.builder.AddFunction(spv::OpVariable,
+						                          SpillPointerType(lane, inst.GetType()),
+						                          found->second, spv::StorageClassFunction);
 					}
 				}
 			}
 		}
 		if (lane.scratch_u32_variable != 0) {
-			state.builder.AddFunction(
-			    {spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
-			     lane.scratch_u32_variable, spv::StorageClassFunction});
+			state.builder.AddFunction(spv::OpVariable,
+			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {spv::OpArrayLength, TypeU32(state), state.gds_length, state.gds_variable, 0});
+		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
+		                          state.gds_variable, 0);
 	}
 	if (state.pixel_valid_mask_variable != 0) {
-		state.builder.AddFunction(
-		    {spv::OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
+		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
+		                          ConstantU32(state, 1));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
@@ -778,7 +775,7 @@ void EmitProgram(EmitterState& state) {
 	} else {
 		EmitStructuredFunction(ctx);
 	}
-	state.builder.AddFunction({spv::OpFunctionEnd});
+	state.builder.AddFunction(spv::OpFunctionEnd);
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}

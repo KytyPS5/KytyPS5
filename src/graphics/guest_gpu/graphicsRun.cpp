@@ -427,7 +427,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
-	auto& buffer_cache = GetGpuResources().GetBufferCache();
+	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
@@ -603,11 +603,11 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			if (progressed) {
 				if (complete) {
-					m_renderer.GetGpuResources().RunGarbageCollector();
+					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
 			} else if (complete) {
-				m_renderer.GetGpuResources().RunGarbageCollector();
+				m_renderer.RunGarbageCollector();
 			}
 			break;
 		}
@@ -629,16 +629,16 @@ bool GuestGpu::Process(Submission& submission) {
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
-					m_renderer.GetGpuResources().RunGarbageCollector();
+					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
 			} else if (complete) {
-				m_renderer.GetGpuResources().RunGarbageCollector();
+				m_renderer.RunGarbageCollector();
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
-			m_renderer.GetGpuResources().RunGarbageCollector();
+			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 	}

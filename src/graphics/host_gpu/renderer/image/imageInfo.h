@@ -82,9 +82,6 @@ struct ImageInfo {
 	[[nodiscard]] constexpr bool IsVolume() const noexcept {
 		return type == Prospero::ImageType::kColor3D;
 	}
-	[[nodiscard]] constexpr bool IsLayered() const noexcept {
-		return !IsVolume() && resources.layers > 1;
-	}
 	[[nodiscard]] constexpr uint32_t TransferLayers() const noexcept {
 		return IsVolume() ? extent.depth : resources.layers;
 	}
@@ -342,14 +339,6 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	}
 }
 
-[[nodiscard]] inline constexpr bool
-CanUseVideoOutNativeWithoutUpload(VideoOutCompression compression, bool render_target,
-                                  bool gpu_modified, bool guest_modified) noexcept {
-	return compression != VideoOutCompression::Uncompressed &&
-	       compression != VideoOutCompression::Unsupported && !guest_modified &&
-	       (render_target || gpu_modified);
-}
-
 struct VideoOutPixelFormatInfo {
 	vk::Format             format            = vk::Format::eUndefined;
 	Prospero::BufferFormat guest_format      = Prospero::BufferFormat::kInvalid;
@@ -398,32 +387,6 @@ inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {
 		}
 	}
 	return false;
-}
-
-[[nodiscard]] inline constexpr bool
-IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
-	return tile_mode == Prospero::TileMode::kRenderTarget;
-}
-
-[[nodiscard]] inline constexpr bool IsSupportedStandard64RenderTarget(const ImageInfo& info) {
-	if (info.tile_mode != Prospero::TileMode::kStandard64KB || info.data.address == 0 ||
-	    (info.data.address & 0xffffu) != 0 || info.extent.width == 0 || info.extent.height == 0 ||
-	    info.bytes_per_block != 4 || info.resources.levels != 1 || info.resources.layers != 1 ||
-	    info.samples != 1) {
-		return false;
-	}
-	const auto expected_pitch =
-	    (static_cast<uint64_t>(info.extent.width) + 127u) & ~uint64_t {127u};
-	const auto padded_height =
-	    (static_cast<uint64_t>(info.extent.height) + 127u) & ~uint64_t {127u};
-	return expected_pitch <= UINT32_MAX && info.pitch == expected_pitch &&
-	       expected_pitch <= UINT64_MAX / padded_height / info.bytes_per_block &&
-	       info.data.size == expected_pitch * padded_height * info.bytes_per_block;
-}
-
-[[nodiscard]] inline constexpr bool IsTiledRenderTarget(const ImageInfo& info) noexcept {
-	return info.tile_mode == Prospero::TileMode::kRenderTarget ||
-	       IsSupportedStandard64RenderTarget(info);
 }
 
 [[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint32_t packed,

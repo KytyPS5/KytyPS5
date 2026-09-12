@@ -111,56 +111,43 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			UpdateCpuProtection<!enable>();
+			UpdateProtection<!enable, false>();
 		} else {
-			UpdateGpuProtection<enable>();
+			UpdateProtection<enable, true>();
 		}
 	}
 
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		RegionBits mask(GetBits<source>(), start, end);
+		auto&      bits         = GetBits<source>();
+		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
-			GetBits<source>().UnsetRange(start, end);
+			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				UpdateProtection<true, false>();
+			} else {
+				UpdateProtection<false, true>();
+			}
 		}
-		if constexpr (source == DirtySource::Cpu && clear) {
-			UpdateCpuProtection<true>();
-			ForEachRange(mask, std::forward<Func>(func));
-			return;
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
-		if constexpr (source == DirtySource::Gpu && clear) {
-			UpdateGpuProtection<false>();
-		}
-		ForEachRange(mask, std::forward<Func>(func));
 	}
 
 	TrackingSpinLock lock;
 
 private:
-	template <bool track>
-	void UpdateCpuProtection() {
-		auto mask  = m_cpu_dirty ^ m_writable;
-		m_writable = m_cpu_dirty;
+	template <bool track, bool is_read>
+	void UpdateProtection() {
+		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
+		auto&      previous   = is_read ? m_readable : m_writable;
+		auto       mask       = protection ^ previous;
 		if (mask.None()) {
 			return;
 		}
-		m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask);
-	}
-
-	template <bool track>
-	void UpdateGpuProtection() {
-		auto readable = ~m_gpu_dirty;
-		auto mask     = readable ^ m_readable;
-		m_readable    = readable;
-		if (mask.None()) {
-			return;
-		}
-		if constexpr (track) {
-			m_page_manager.UpdatePageWatchersForRegion<true, true>(m_cpu_addr, mask);
-		} else {
-			m_page_manager.UpdatePageWatchersForRegion<false, true>(m_cpu_addr, mask);
-		}
+		previous = protection;
+		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
 	template <DirtySource source>
@@ -189,13 +176,6 @@ private:
 		const auto offset = vaddr - m_cpu_addr;
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
-	}
-
-	template <typename Func>
-	void ForEachRange(const RegionBits& bits, Func&& func) const {
-		for (const auto [start, end]: bits) {
-			func(m_cpu_addr + start * TRACKER_PAGE_SIZE, (end - start) * TRACKER_PAGE_SIZE);
-		}
 	}
 
 	PageManager& m_page_manager;

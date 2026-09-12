@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/tile.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -15,10 +16,6 @@
 
 namespace Libs::Graphics {
 
-static uint32_t AlignUp(uint32_t value, uint32_t alignment) {
-	return (value + alignment - 1u) & ~(alignment - 1u);
-}
-
 static uint32_t ShiftCeil(uint32_t value, uint32_t shift) {
 	return static_cast<uint32_t>((static_cast<uint64_t>(value) + (1ull << shift) - 1ull) >> shift);
 }
@@ -33,7 +30,7 @@ static uint32_t CalcLinearAlignedLevelPitch(uint32_t base_width, uint32_t base_h
 	const uint32_t level_width  = ShiftCeil(base_width, level);
 	const uint32_t level_height = ShiftCeil(base_height, level);
 	const uint32_t padded_width =
-	    AlignUp(std::max(level_width, 1u), CalcLinearBlockWidth(bytes_per_element));
+	    Common::AlignUp(std::max(level_width, 1u), CalcLinearBlockWidth(bytes_per_element));
 	const uint64_t size =
 	    static_cast<uint64_t>(padded_width) * std::max(level_height, 1u) * bytes_per_element;
 	EXIT_NOT_IMPLEMENTED(size > 0xffffffffull);
@@ -61,7 +58,7 @@ static uint32_t SetLinearMipChainLayout(uint32_t levels, const uint32_t* mip_pit
 		offset += mip_size[level];
 	}
 
-	return AlignUp(offset, 256u);
+	return Common::AlignUp(offset, 256u);
 }
 
 struct Log2BlockDimensions {
@@ -366,8 +363,8 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
 		mip.height = std::max(
 		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
-		mip.padded_width  = AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		mip.padded_height = AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		mip.padded_width  = Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		mip.padded_height = Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
 		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
 		           block.bytes_per_element;
 		result.block_slice_size += mip.size;
@@ -1121,8 +1118,8 @@ static bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& hti
 	}
 	// Prospero HTile stores one DWORD per depth tile. Its 32 KiB allocation blocks cover
 	// 1024x512 pixels, independently of the attachment's fragment count.
-	const uint64_t size = static_cast<uint64_t>(AlignUp(width, 1024u) / 1024u) *
-	                      (AlignUp(height, 512u) / 512u) * 32768u;
+	const uint64_t size = static_cast<uint64_t>(Common::AlignUp(width, 1024u) / 1024u) *
+	                      (Common::AlignUp(height, 512u) / 512u) * 32768u;
 	if (size == 0 || size > UINT32_MAX) {
 		return false;
 	}
@@ -1154,13 +1151,13 @@ bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch,
 		                                           &stencil_block_height));
 		const uint32_t fragments = 1u << num_fragments_log2;
 		const uint64_t depth_bytes_total =
-		    valid_blocks ? static_cast<uint64_t>(AlignUp(width, depth_block_width)) *
-		                       AlignUp(height, depth_block_height) * depth_bytes * fragments
+		    valid_blocks ? static_cast<uint64_t>(Common::AlignUp(width, depth_block_width)) *
+		                       Common::AlignUp(height, depth_block_height) * depth_bytes * fragments
 		                 : 0;
 		const uint64_t stencil_bytes_total =
 		    stencil_format == Prospero::StencilFormat::k8UInt && valid_blocks
-		        ? static_cast<uint64_t>(AlignUp(width, stencil_block_width)) *
-		              AlignUp(height, stencil_block_height) * fragments
+		        ? static_cast<uint64_t>(Common::AlignUp(width, stencil_block_width)) *
+		              Common::AlignUp(height, stencil_block_height) * fragments
 		        : 0;
 		TileSizeAlign calculated_htile {};
 		const bool    htile_valid = !htile || TileGetHtileSize(width, height, calculated_htile);
@@ -1187,8 +1184,7 @@ uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
 	                                                         &block_width, &block_height)) {
 		return 0;
 	}
-	const uint64_t pitch = (static_cast<uint64_t>(width) + block_width - 1u) &
-	                       ~static_cast<uint64_t>(block_width - 1u);
+	const uint64_t pitch = Common::AlignUp(static_cast<uint64_t>(width), block_width);
 	return pitch <= UINT32_MAX ? static_cast<uint32_t>(pitch) : 0;
 }
 
@@ -1209,8 +1205,7 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 	    pitch != TileGetRenderTargetPitch(width, bytes_per_element, num_fragments_log2)) {
 		return false;
 	}
-	const uint64_t padded_height = (static_cast<uint64_t>(height) + block_height - 1u) &
-	                               ~static_cast<uint64_t>(block_height - 1u);
+	const uint64_t padded_height = Common::AlignUp(static_cast<uint64_t>(height), block_height);
 	const uint64_t size = static_cast<uint64_t>(pitch) * padded_height * bytes_per_element *
 	                      (1u << num_fragments_log2);
 	if (size == 0 || size > UINT32_MAX) {
@@ -1372,7 +1367,7 @@ uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
 			TileTextureElementLayout element {};
 			if (TileGetTextureElementLayout(format, element) && element.texel_width == 1 &&
 			    element.texel_height == 1) {
-				pitch = AlignUp(pitch, CalcLinearBlockWidth(element.bytes));
+				pitch = Common::AlignUp(pitch, CalcLinearBlockWidth(element.bytes));
 			}
 			break;
 		}
@@ -1383,7 +1378,7 @@ uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
 		case Prospero::TileMode::kRenderTarget: {
 			TileTextureBlockLayout layout {};
 			if (TileGetTextureBlockLayout(format, tile, false, layout)) {
-				pitch = AlignUp(pitch, layout.block.block_width * layout.texel_width);
+				pitch = Common::AlignUp(pitch, layout.block.block_width * layout.texel_width);
 			}
 			break;
 		}

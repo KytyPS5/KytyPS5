@@ -148,7 +148,6 @@ private:
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
-	GpuResourceManager& GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;

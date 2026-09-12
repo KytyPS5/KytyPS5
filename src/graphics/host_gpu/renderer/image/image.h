@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -133,7 +134,7 @@ public:
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
-		return backing.image == nullptr ? 0 : (info.data.size + 1023) & ~uint64_t {1023};
+		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 

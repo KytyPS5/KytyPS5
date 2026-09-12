@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -260,12 +261,10 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 			region.bufferRowLength   = layout.mips[mip_level].row_length;
 			region.bufferImageHeight = layout.mips[mip_level].image_height;
 		} else {
-			const auto texel_width    = layout.surface.texture.texel_width;
-			const auto align_to_texel = [texel_width](uint32_t dimension) {
-				return ((dimension + texel_width - 1u) / texel_width) * texel_width;
-			};
-			const auto aligned_pitch = align_to_texel(mip_pitch);
-			region.bufferRowLength = aligned_pitch > align_to_texel(mip_width) ? aligned_pitch : 0;
+			const auto texel_width   = layout.surface.texture.texel_width;
+			const auto aligned_pitch = Common::AlignUp(mip_pitch, texel_width);
+			region.bufferRowLength =
+			    aligned_pitch > Common::AlignUp(mip_width, texel_width) ? aligned_pitch : 0;
 		}
 		for (uint32_t slice_index = 0; slice_index < mip_depth; ++slice_index) {
 			region.bufferOffset = layout.mips[mip_level].offset + slice_index * layout.slice_stride;

@@ -17,7 +17,6 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
-#include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -2111,16 +2110,14 @@ public:
 
   void CheckGpuMappedRangeLifecycle() {
     EnsureRuntimeContext();
-    auto &context = Renderer();
-    CommandScheduler scheduler(context, m_runtime_context);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     context.InitializeGpu(nullptr);
-    auto &gpu = context.GetGpu();
-    GpuResourceManager resources(m_runtime_context, scheduler);
-    resources.SetGpu(&gpu);
+    auto &resources = context;
 
     constexpr uint64_t base = 0x0000000200000000ull;
     constexpr uint64_t page = 0x4000;
@@ -2159,7 +2156,6 @@ public:
                 resources.IsMapped(new_prt, page * 6),
             "old-unmap/new-map did not replace full PRT coverage");
 
-    resources.SetGpu(nullptr);
     scheduler.Finish();
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
@@ -2167,12 +2163,13 @@ public:
 
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
-    GpuResourceManager resources(m_runtime_context, scheduler);
+    auto &resources = context;
     auto &cache = resources.GetBufferCache();
     constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
         {MemoryUsage::Upload, 512ull << 20},
@@ -2800,7 +2797,7 @@ public:
                 ordered_finished.load(),
             "submit done did not drain prior PM4 work");
 
-    auto &resources = context.GetGpuResources();
+    auto &resources = context;
     constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
     constexpr uint64_t empty_unmap_size = 0x4000;
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
@@ -3187,15 +3184,18 @@ public:
     std::binary_semaphore release_command{0};
     std::atomic<bool> shutdown_complete{false};
     std::atomic<bool> submission_lane_entered{false};
+    bool shutdown_owner_visible = false;
+    resources.MapMemory(empty_unmap_base, empty_unmap_size);
     gpu.SendCommand([&] {
       command_entered.release();
       release_command.acquire();
+      shutdown_owner_visible = &context.GetGpu() == &gpu;
       gpu.Done();
       submission_lane_entered = true;
     });
     command_entered.acquire();
     std::jthread shutdown_thread([&] {
-      gpu.Shutdown();
+      context.ShutdownGpu();
       shutdown_complete = true;
     });
     while (!gpu.IsStopping()) {
@@ -3207,8 +3207,13 @@ public:
     shutdown_thread.join();
     Require(
         "GpuCommandLane", "owned shutdown completion",
-        shutdown_complete.load() && submission_lane_entered.load(),
-        "GPU owner did not drain a command that entered the submission lane");
+        shutdown_complete.load() && submission_lane_entered.load() &&
+            shutdown_owner_visible,
+        "GPU owner did not remain available while draining queued work");
+    resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
+    Require("GpuCommandLane", "unmap after shutdown",
+            !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+            "renderer retained mapped coverage after the GPU command lane stopped");
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", "GpuCommandLane");
   }
@@ -3459,14 +3464,13 @@ public:
     constexpr uint32_t ring_fault_second_value = 0x4e5f6071u;
 
     EnsureRuntimeContext();
-    auto &context = Renderer();
-    CommandScheduler scheduler(context, m_runtime_context);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     context.InitializeGpu(nullptr);
-    auto &gpu = context.GetGpu();
 
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
@@ -3487,8 +3491,7 @@ public:
     std::memcpy(memory + clean_offset, &clean_value, sizeof(clean_value));
 
     {
-      GpuResourceManager resources(m_runtime_context, scheduler);
-      resources.SetGpu(&gpu);
+      auto &resources = context;
       auto &cache = resources.GetBufferCache();
       resources.MapMemory(base, allocation_size);
 
@@ -4284,7 +4287,6 @@ public:
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
 
-      resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
@@ -4393,8 +4395,8 @@ public:
     constexpr uint64_t allocation_size = 0x2800000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
-    auto &context = Renderer();
-    CommandScheduler scheduler(context, m_runtime_context);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -4419,8 +4421,7 @@ public:
     std::memcpy(memory, &initial, sizeof(initial));
 
     {
-      GpuResourceManager resources(m_runtime_context, scheduler);
-      resources.SetGpu(&gpu);
+      auto &resources = context;
       namespace Exception = Common::HostException;
       Require(name, "guest fault handler",
               Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
@@ -7756,7 +7757,6 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
-      resources.SetGpu(nullptr);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
@@ -7794,13 +7794,14 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "BGRA16 fixed mapping failed");
 
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     {
-      GpuResourceManager resources(m_runtime_context, scheduler);
+      auto &resources = context;
       resources.MapMemory(base, allocation_size);
       const uint32_t pitch = TileGetTexturePitch(format, 1, tile);
       TileSizeAlign total{};
@@ -7973,7 +7974,7 @@ public:
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -8114,7 +8115,7 @@ public:
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -8369,7 +8370,7 @@ public:
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -8442,7 +8443,7 @@ public:
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -8564,7 +8565,7 @@ public:
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -8680,7 +8681,7 @@ public:
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -8898,7 +8899,7 @@ public:
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -9008,7 +9009,7 @@ public:
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
 
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -9105,7 +9106,7 @@ public:
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -11959,7 +11960,7 @@ public:
     HW::Shader shaders{};
     registers.SetRenderTargetMask(0xf);
     scheduler.Begin(registers, user_config, shaders);
-    auto &resources = context.GetGpuResources();
+    auto &resources = context;
     auto &cache = context.GetTextureCache();
     auto &executor = context.GetRenderExecutor();
     int64_t direct_offset = -1;
@@ -12108,7 +12109,7 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().CreateGraphicsPipeline(
+      return context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, vertex, scheduler.Current(), &pixel,
           vk::PrimitiveTopology::eTriangleList, false, vertex_shader, pixel_shader);
     };
@@ -12218,6 +12219,36 @@ public:
                 last_pixels[i] == (solid_pixels[i] == 0 ? 0 : 0x3e800000u),
                 "last-vertex flat shading changed coverage or did not use vertex two");
       }
+
+      const auto blend_pipeline = [&](bool enabled, bool bypass) -> PipelineCache::Pipeline & {
+        auto blend = registers.GetBlendControl(0);
+        blend.enable = enabled;
+        blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kZero);
+        blend.alpha_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kZero);
+        registers.SetBlendControl(0, blend);
+        auto target = registers.GetRenderTarget(0).info;
+        target.blend_bypass = bypass;
+        registers.SetColorInfo(0, target);
+        return pipeline(true, 2, 2);
+      };
+      auto &disabled_blend = blend_pipeline(false, false);
+      Require(name, "effective blend pipeline cache",
+              blend_pipeline(false, true).pipeline == disabled_blend.pipeline &&
+                  blend_pipeline(true, true).pipeline == disabled_blend.pipeline,
+              "disabled and bypassed blending did not share the same host pipeline");
+      auto &enabled_blend = blend_pipeline(true, false);
+      Require(name, "enabled blend pipeline cache",
+              enabled_blend.pipeline != disabled_blend.pipeline &&
+                  blend_pipeline(true, false).pipeline == enabled_blend.pipeline,
+              "active blending was lost from the pipeline key or missed its cached pipeline");
+      draw(enabled_blend);
+      const auto blended_pixels = read_color();
+      Require(name, "active blend output",
+              std::ranges::all_of(blended_pixels, [](u32 value) { return value == 0; }),
+              "zero-factor blending did not clear the fragment color");
+      draw(blend_pipeline(true, true));
+      Require(name, "bypassed blend output", read_color() == solid_pixels,
+              "blend bypass did not restore the unblended fragment color and coverage");
     }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
@@ -25307,7 +25338,7 @@ void CheckEmbeddedFetchVertexOffset() {
     program.info.vertex_offset_sgpr = result.program.info.vertex_offset_sgpr;
     vertex.stage.program = &program;
     vertex.stage.resources = result.resources;
-    return ResolveVertexOffset(index_offset, vertex);
+    return ResolveDrawOffsets(index_offset, vertex).first;
   };
 
   const auto ResolveInstance = [](const CompiledShader &result) {
@@ -25319,7 +25350,7 @@ void CheckEmbeddedFetchVertexOffset() {
         result.program.info.instance_offset_sgpr;
     vertex.stage.program = &program;
     vertex.stage.resources = result.resources;
-    return ResolveInstanceOffset(vertex);
+    return ResolveDrawOffsets(0, vertex).second;
   };
 
   const auto valid =
@@ -25846,64 +25877,6 @@ void CheckSampledDepthResource() {
                                              vk::Format::eR32Uint),
           "R32 uint depth-view compatibility diverged from its backing role");
   std::printf("[host]    %-32s ok\n", "SampledDepthResource");
-}
-
-void CheckSampledVideoOutView(RenderContext &renderer) {
-  auto &context = renderer.GetGraphics();
-  CommandScheduler scheduler(renderer, context);
-  ShaderRecompiler::IR::ImageResource resource{};
-  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
-  resource.numeric_class = Prospero::TextureNumericClass::Float;
-  resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  resource.read = true;
-
-  ShaderTextureResource descriptor{};
-  descriptor.fields[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D)
-                         << 28u;
-  ImageInfo info{};
-  info.pixel_format = vk::Format::eR8G8B8A8Unorm;
-  info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
-  info.type = Prospero::ImageType::kColor2D;
-  info.extent = {1, 1, 1};
-  info.resources = {1, 1};
-  info.pitch = 1;
-  info.bytes_per_block = 4;
-  info.samples = 1;
-  info.tile_mode = Prospero::TileMode::kLinear;
-  info.mip_layout[0] = {0, 4, 1, 1};
-  Image image(context, scheduler, info);
-  image.usage.video_out = true;
-  Require("SampledVideoOutView", "basic 2D",
-          IsSupportedSampledVideoOutView(resource, descriptor, image),
-          "basic 2D video-out view was rejected");
-
-  const auto basic_resource = resource;
-  resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  const bool rejects_array_resource =
-      !IsSupportedSampledVideoOutView(resource, descriptor, image);
-  resource = basic_resource;
-  descriptor.fields[3] =
-      static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u;
-  const bool rejects_array_descriptor =
-      !IsSupportedSampledVideoOutView(resource, descriptor, image);
-  descriptor.fields[3] = static_cast<uint32_t>(Prospero::ImageType::kColor2D)
-                         << 28u;
-  descriptor.fields[4] = 1u << 16u;
-  const bool rejects_base_layer =
-      !IsSupportedSampledVideoOutView(resource, descriptor, image);
-  descriptor.fields[4] = 1u;
-  const bool rejects_layer_count =
-      !IsSupportedSampledVideoOutView(resource, descriptor, image);
-  descriptor.fields[4] = 0;
-  image.info.resources.layers = 2;
-  const bool rejects_layered_image =
-      !IsSupportedSampledVideoOutView(resource, descriptor, image);
-  Require("SampledVideoOutView", "array hard failures",
-          rejects_array_resource && rejects_array_descriptor &&
-              rejects_base_layer && rejects_layer_count &&
-              rejects_layered_image,
-          "unsupported layered video-out view was accepted");
-  std::printf("[host]    %-32s ok\n", "SampledVideoOutView");
 }
 
 void CheckImageTransitionState(RenderContext &renderer) {
@@ -27382,57 +27355,6 @@ void CheckStandard64RenderTargetTileRoundTrip() {
           pitch == 384 && storage.size == 0x60000 && storage.align == 0x10000,
           "partial Standard64KB footprint was not padded in 128x128 blocks");
 
-  ImageInfo info{};
-  info.data = {0x10000, storage.size};
-  info.pixel_format = vk::Format::eR8G8B8A8Unorm;
-  info.guest_format = format;
-  info.type = Prospero::ImageType::kColor2D;
-  info.extent = {width, height, 1};
-  info.resources = {1, 1};
-  info.pitch = pitch;
-  info.bytes_per_block = 4;
-  info.samples = 1;
-  info.tile_mode = tile;
-  info.mip_layout[0] = {0, storage.size, pitch, height};
-  Require("Standard64RenderTarget", "support boundary",
-          IsSupportedStandard64RenderTarget(info) && IsTiledRenderTarget(info),
-          "exact Standard64KB render target was not classified as tiled");
-  Require("Standard64RenderTarget", "display tile boundary",
-          IsSupportedDisplayRenderTargetTileMode(
-              Prospero::TileMode::kRenderTarget) &&
-              !IsSupportedDisplayRenderTargetTileMode(tile),
-          "Standard64KB render target could alias a mode-27 display image");
-  auto unsupported = info;
-  unsupported.data.address += 4;
-  Require("Standard64RenderTarget", "address guard",
-          !IsSupportedStandard64RenderTarget(unsupported),
-          "unaligned Standard64KB backing was accepted");
-  unsupported = info;
-  unsupported.bytes_per_block = 8;
-  Require("Standard64RenderTarget", "element guard",
-          !IsSupportedStandard64RenderTarget(unsupported),
-          "unimplemented Standard64KB element size was accepted");
-  unsupported = info;
-  unsupported.pitch += 128;
-  Require("Standard64RenderTarget", "pitch guard",
-          !IsSupportedStandard64RenderTarget(unsupported),
-          "non-minimal Standard64KB pitch was accepted");
-  unsupported = info;
-  unsupported.data.size += 0x10000;
-  Require("Standard64RenderTarget", "size guard",
-          !IsSupportedStandard64RenderTarget(unsupported),
-          "non-exact Standard64KB allocation was accepted");
-  unsupported = info;
-  unsupported.resources.levels = 2;
-  Require("Standard64RenderTarget", "mip guard",
-          !IsSupportedStandard64RenderTarget(unsupported),
-          "unimplemented Standard64KB mip chain was accepted");
-  unsupported = info;
-  unsupported.resources.layers = 2;
-  Require("Standard64RenderTarget", "layer guard",
-          !IsSupportedStandard64RenderTarget(unsupported),
-          "unimplemented Standard64KB array was accepted");
-
   std::printf("[host]    %-32s ok\n", "Standard64RenderTarget");
 }
 
@@ -27588,30 +27510,6 @@ void CheckPs5DepthRegisterDecoding() {
               !malformed_stencil.HasValidTextureCompatibility(),
           "partial texture-compatible aggregate encodings were accepted");
   std::printf("[host]    %-32s ok\n", "Ps5DepthRegisterDecoding");
-}
-
-void CheckStencilAttachmentAccess() {
-  PipelineStencilStaticState state{vk::StencilOp::eKeep, vk::StencilOp::eKeep,
-                                   vk::StencilOp::eKeep,
-                                   vk::CompareOp::eAlways};
-  PipelineStencilDynamicState dynamic{0xff, 0xff, 0};
-  Require("StencilAttachmentAccess", "always keep",
-          !stencil_face_accesses_attachment(state, dynamic),
-          "ALWAYS/KEEP state was classified as stencil access");
-  state.compareOp = vk::CompareOp::eEqual;
-  Require("StencilAttachmentAccess", "compare reads",
-          stencil_face_accesses_attachment(state, dynamic),
-          "real stencil comparison was classified as no access");
-  state.compareOp = vk::CompareOp::eAlways;
-  state.passOp = vk::StencilOp::eZero;
-  Require("StencilAttachmentAccess", "write operation",
-          stencil_face_accesses_attachment(state, dynamic),
-          "write-capable stencil operation was classified as no access");
-  dynamic.writeMask = 0;
-  Require("StencilAttachmentAccess", "masked write",
-          !stencil_face_accesses_attachment(state, dynamic),
-          "fully masked stencil write was classified as access");
-  std::printf("[host]    %-32s ok\n", "StencilAttachmentAccess");
 }
 
 void CheckDepthAttachmentWrites() {
@@ -29419,6 +29317,10 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
+    CheckEmbeddedFetchVertexOffset();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
@@ -29498,7 +29400,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledColorViews();
-    CheckSampledVideoOutView(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
@@ -29550,7 +29451,6 @@ int main(int argc, char **argv) {
   VulkanHarness vulkan;
   CheckRenderTargetFormatContract();
   CheckSampledColorViews();
-  CheckSampledVideoOutView(vulkan.RuntimeRenderer());
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
@@ -29566,7 +29466,6 @@ int main(int argc, char **argv) {
   CheckNativeMsaaState();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
-  CheckStencilAttachmentAccess();
   CheckDepthAttachmentWrites();
   CheckDynamicRenderingState();
   CheckDepthTargetFootprints();

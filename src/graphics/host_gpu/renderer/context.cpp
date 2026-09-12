@@ -61,11 +61,11 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
-	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
-	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};

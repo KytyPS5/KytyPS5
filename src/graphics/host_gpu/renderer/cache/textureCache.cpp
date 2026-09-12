@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -266,9 +267,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
-	}
+	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -284,12 +285,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
 	}
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
-	}
+	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -312,11 +313,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			}
 		});
 		for (const auto association: associations) {
-			auto& associated = m_slot_images[association];
-			if (associated.IsGpuModified()) {
-				associated.ClearGpuModified();
-			}
-			DeleteImage(association);
+			FreeImage(association);
 		}
 	}
 	if (image->IsGpuModified()) {
@@ -443,7 +440,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
-	const auto address = (begin + TRACKER_PAGE_SIZE) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
 	image.track_addr   = address;
 	if (image.track_addr == image.track_addr_end) {
@@ -460,7 +457,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
-	const auto address   = end & ~(TRACKER_PAGE_SIZE - 1);
+	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
 	image.track_addr_end = address;
 	if (image.track_addr == image.track_addr_end) {
@@ -494,10 +491,10 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	}
 
 	ImageIds result;
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+	ForEachPage(address, size, [&](uint64_t page) {
 		const auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr) {
-			continue;
+			return;
 		}
 		owners->ForEach([&](ImageId id) {
 			auto* image = m_slot_images.try_get(id);
@@ -512,7 +509,7 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 				result.push_back(id);
 			}
 		});
-	}
+	});
 	return result;
 }
 
@@ -1386,9 +1383,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			if (!image.info.data.Empty()) {
-				if (!image.registered || image.depth_id) {
-					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
-				}
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
@@ -1851,8 +1845,8 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
-	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
-	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
@@ -1970,10 +1964,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		if (owner->IsGpuModified()) {
-			owner->ClearGpuModified();
-		}
-		DeleteImage(id);
+		FreeImage(id);
 	}
 }
 
@@ -2019,9 +2010,8 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !TryDownloadImage(id)) {
 					continue;
 				}
-				owner->ClearGpuModified();
 			}
-			DeleteImage(id);
+			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

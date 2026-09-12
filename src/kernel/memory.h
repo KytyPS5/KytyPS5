@@ -6,7 +6,7 @@
 #include "common/virtualMemory.h"
 
 namespace Libs::Graphics {
-class GpuResourceManager;
+class RenderContext;
 enum class PageFaultAccess;
 } // namespace Libs::Graphics
 
@@ -114,7 +114,7 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,

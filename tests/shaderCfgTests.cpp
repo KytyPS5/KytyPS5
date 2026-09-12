@@ -1093,6 +1093,22 @@ constexpr uint32_t EncodeSopp(uint32_t opcode, uint32_t simm = 0) {
          (simm & 0xffffu);
 }
 
+void TestShaderBufferResourceSize() {
+  ShaderBufferResource descriptor;
+  descriptor.fields[2] = UINT32_MAX;
+  Check(descriptor.GetSize() == UINT32_MAX,
+        "zero-stride buffer records must count bytes");
+  descriptor.fields[1] = 0x3FFFu << 16u;
+  Check(descriptor.GetSize() == uint64_t{0x3FFF} * UINT32_MAX,
+        "strided buffer byte size must preserve the full 64-bit product");
+  descriptor.UpdateAddress48(0x123456789ABCull);
+  Check(descriptor.GetSize() == uint64_t{0x3FFF} * UINT32_MAX,
+        "buffer address must not affect the descriptor byte size");
+  descriptor.fields[2] = 0;
+  Check(descriptor.GetSize() == 0,
+        "zero-record buffer must be empty even with a nonzero stride");
+}
+
 void TestNativeShaderResourceDependencies() {
   const auto stages = ShaderPipelineStages(vk::ShaderStageFlagBits::eVertex |
                                            vk::ShaderStageFlagBits::eFragment |
@@ -12738,6 +12754,7 @@ int main() {
 
   EnsureConfigInitialized();
   TestResourceDescriptorClassification();
+  TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestSpirvRequirementsAnalysis();

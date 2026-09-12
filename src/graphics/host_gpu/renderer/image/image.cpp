@@ -693,11 +693,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 }
 
 uint64_t Image::HashGuestEdges() const {
-	constexpr uint64_t                         page_mask = TRACKER_PAGE_SIZE - 1;
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
 	const auto                                 range = info.data;
-	const uint64_t head_end     = std::min(range.End(), (range.address + page_mask) & ~page_mask);
-	const uint64_t tail_begin   = std::max(range.address, range.End() & ~page_mask);
+	const uint64_t head_end =
+	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
+	const uint64_t tail_begin =
+	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));
 	const uint64_t head_size    = head_end - range.address;
 	const uint64_t tail_address = tail_begin < head_end ? head_end : tail_begin;
 	const uint64_t tail_size    = range.End() - tail_address;

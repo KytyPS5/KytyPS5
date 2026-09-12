@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -103,8 +104,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
-	auto* buffer = m_slot_buffers.try_get(id);
-	if (buffer == nullptr || buffer->is_deleted) {
+	if (IsBufferInvalid(id)) {
 		return;
 	}
 	Unregister(id);
@@ -120,12 +120,11 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 	    copy.size > copy.buffer->Size() - copy.source_offset) {
 		EXIT("BufferCache: invalid download copy\n");
 	}
-	const auto begin = copy.source_offset & ~uint64_t {3};
-	if (copy.source_offset > UINT64_MAX - copy.size ||
-	    copy.source_offset + copy.size > UINT64_MAX - 3) {
+	const auto begin = Common::AlignDown(copy.source_offset, 4);
+	if (copy.source_offset + copy.size > UINT64_MAX - 3) {
 		EXIT("BufferCache: download copy alignment overflow\n");
 	}
-	const auto end = (copy.source_offset + copy.size + 3) & ~uint64_t {3};
+	const auto end = Common::AlignUp(copy.source_offset + copy.size, 4);
 	if (end > copy.buffer->Size()) {
 		EXIT("BufferCache: aligned download copy exceeds its owner\n");
 	}
@@ -147,7 +146,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
 			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 			                  vk::AccessFlagBits::eHostRead);
-			cursor += AlignDownload(envelope_size);
+			cursor += Common::AlignUp(envelope_size, DOWNLOAD_ALIGNMENT);
 		}
 		download.Commit();
 		const auto completion_tick = m_scheduler.CurrentTick();
@@ -159,7 +158,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			const auto offset = cursor + copy.source_offset - source_begin;
 			download.Invalidate(base_offset + offset, copy.size);
 			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
-			cursor += AlignDownload(envelope_size);
+			cursor += Common::AlignUp(envelope_size, DOWNLOAD_ALIGNMENT);
 		}
 		batch.clear();
 		packed_size = 0;
@@ -172,7 +171,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 			DownloadCopy part {copy.buffer, copy.source_offset, copy.address, bytes};
 			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
 			(void)source_begin;
-			packed_size += AlignDownload(envelope_size);
+			packed_size += Common::AlignUp(envelope_size, DOWNLOAD_ALIGNMENT);
 			batch.push_back(part);
 			copy.source_offset += bytes;
 			copy.address += bytes;
@@ -252,44 +251,40 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync(
-	    [this, vaddr, size, is_write] { ReadMemoryOnGpu(vaddr, size, is_write); });
-}
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		if (is_write && !IsRegionRegistered(vaddr, size)) {
+			return;
+		}
+		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
-	if (is_write && !IsRegionRegistered(vaddr, size)) {
-		return;
-	}
-	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		// Widen nearby CPU reads so they share one GPU drain.
+		constexpr uint64_t WindowSize   = 512 * 1024;
+		const auto         buffer_begin = buffer.CpuAddress();
+		const auto         buffer_end   = buffer_begin + buffer.Size();
+		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
-	// Widen nearby CPU reads so they share one GPU drain.
-	constexpr uint64_t WindowSize   = 512 * 1024;
-	const auto         buffer_begin = buffer.CpuAddress();
-	const auto         buffer_end   = buffer_begin + buffer.Size();
-	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
-	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
-
-	std::vector<DownloadCopy> copies;
-	m_memory_tracker.ForEachDownloadRange<false>(
-	    window_begin, window_end - window_begin,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-		                                           "memory invalidation");
-	    },
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_gpu_modified_ranges.ForEachIntersection(address, bytes, [&](RangeSet::Range range) {
-			    copies.push_back(
-			        {&buffer, buffer.Offset(range.address), range.address, range.size});
+		std::vector<DownloadCopy> copies;
+		m_memory_tracker.ForEachDownloadRange<false>(
+		    window_begin, window_end - window_begin,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+			                                           "memory invalidation");
+		    },
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+				    copies.push_back({&buffer, buffer.Offset(start), start, end - start});
+			    });
 		    });
-	    });
-	if (!copies.empty()) {
-		DownloadBufferMemory(copies);
-		// The enumeration covered whole dirty pages and every exact interval on them.
-		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-	}
-	if (is_write) {
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-	}
+		if (!copies.empty()) {
+			DownloadBufferMemory(copies);
+			// The enumeration covered whole dirty pages and every exact interval on them.
+			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		}
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+	});
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -340,7 +335,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		end                       = std::max(end, buffer_end);
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
-			// Fix the shadPS4 bug that reserves space opposite to the incoming stream's growth.
+			// Reserve space in the incoming stream's direction of growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice versa.
 			if (expands_left) {
 				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
@@ -371,8 +366,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
-	const auto end = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	vaddr &= ~(CACHING_PAGESIZE - 1);
+	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
@@ -485,17 +480,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	auto* buffer = m_slot_buffers.try_get(id);
-	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
-		id     = FindBuffer(vaddr, size);
-		buffer = &m_slot_buffers[id];
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
 	}
-	TouchBuffer(*buffer);
-	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
-	return {buffer, buffer->Offset(vaddr)};
+	return {&buffer, buffer.Offset(vaddr)};
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -547,9 +541,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
-	const auto id          = FindBuffer(vaddr, size);
-	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true, id);
-	EXIT_IF(dst == nullptr);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -583,10 +575,6 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
-	EXIT_IF(src == nullptr || dst == nullptr);
-	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
-		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
-	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
@@ -649,10 +637,10 @@ void BufferCache::RunGarbageCollector() {
 				                                           dirty_size, "garbage collection");
 			    },
 			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
-				    m_gpu_modified_ranges.ForEachIntersection(
-				        dirty_address, dirty_size, [&](RangeSet::Range range) {
-					    copies.push_back({&buffer, range.address - buffer.CpuAddress(),
-					                      range.address, range.size});
+				    m_gpu_modified_ranges.ForEachInRange(
+				        dirty_address, dirty_size, [&](uint64_t start, uint64_t end) {
+					    copies.push_back({&buffer, start - buffer.CpuAddress(), start,
+					                      end - start});
 				        });
 				});
 			dirty_buffers.push_back(id);

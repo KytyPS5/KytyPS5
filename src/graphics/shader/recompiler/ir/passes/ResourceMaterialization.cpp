@@ -173,12 +173,6 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 	}
 }
 
-uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
-	return descriptor.Stride() == 0u
-	           ? descriptor.NumRecords()
-	           : static_cast<uint64_t>(descriptor.Stride()) * descriptor.NumRecords();
-}
-
 bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
 	return runtime.read_specialization_memory != nullptr &&
 	       runtime.read_specialization_memory(runtime.userdata, address, &word);
@@ -188,7 +182,7 @@ bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynam
                           uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
 	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
 	const auto aligned     = byte_offset & ~uint64_t {3};
-	const auto size        = ScalarBufferSize(descriptor);
+	const auto size        = descriptor.GetSize();
 	if (aligned > size || size - aligned < sizeof(uint32_t)) {
 		word = 0;
 		return true;
@@ -223,7 +217,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	const auto period      = uint64_t {1} << 32u;
 	const auto step        = std::gcd<uint64_t>(indirect.selector_stride, period);
 	const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
-	const auto size        = ScalarBufferSize(material);
+	const auto size        = material.GetSize();
 	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
 	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 	if (probe_count > MaxIndirectImageProbes) {

@@ -116,10 +116,6 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		}
 		format = vk::Format::eR16G16Sfloat;
 		size   = 2;
-		if (NarrowInputFormat(format, size, used_components)) {
-			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
-			     vk::to_string(format).c_str(), used_components);
-		}
 		return;
 	}
 
@@ -259,35 +255,23 @@ void CreatePipelineInternal(
 	EXIT_NOT_IMPLEMENTED(
 	    rect_list && (tess_control_shader_module == nullptr || tess_eval_shader_module == nullptr));
 
-	vk::PipelineShaderStageCreateInfo vert_shader_stage_info {};
-	vert_shader_stage_info.stage  = vertex_stage;
-	vert_shader_stage_info.module = vertex_program.module;
-	vert_shader_stage_info.pName  = "main";
-
-	vk::PipelineShaderStageCreateInfo frag_shader_stage_info {};
-	frag_shader_stage_info.stage  = vk::ShaderStageFlagBits::eFragment;
-	frag_shader_stage_info.module = pixel_program.module;
-	frag_shader_stage_info.pName  = "main";
-
-	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
-	tess_control_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationControl;
-	tess_control_shader_stage_info.module = tess_control_shader_module;
-	tess_control_shader_stage_info.pName  = "main";
-
-	vk::PipelineShaderStageCreateInfo tess_eval_shader_stage_info {};
-	tess_eval_shader_stage_info.stage  = vk::ShaderStageFlagBits::eTessellationEvaluation;
-	tess_eval_shader_stage_info.module = tess_eval_shader_module;
-	tess_eval_shader_stage_info.pName  = "main";
-
-	vk::PipelineShaderStageCreateInfo shader_stages[4]   = {};
-	uint32_t                          shader_stage_count = 0;
-	shader_stages[shader_stage_count++]                  = vert_shader_stage_info;
+	vk::PipelineShaderStageCreateInfo shader_stages[4] = {
+	    {.stage = vertex_stage, .module = vertex_program.module, .pName = "main"}};
+	uint32_t shader_stage_count = 1;
 	if (rect_list) {
-		shader_stages[shader_stage_count++] = tess_control_shader_stage_info;
-		shader_stages[shader_stage_count++] = tess_eval_shader_stage_info;
+		shader_stages[shader_stage_count++] = {.stage =
+		                                           vk::ShaderStageFlagBits::eTessellationControl,
+		                                       .module = tess_control_shader_module,
+		                                       .pName  = "main"};
+		shader_stages[shader_stage_count++] = {.stage =
+		                                           vk::ShaderStageFlagBits::eTessellationEvaluation,
+		                                       .module = tess_eval_shader_module,
+		                                       .pName  = "main"};
 	}
 	if (ps_active) {
-		shader_stages[shader_stage_count++] = frag_shader_stage_info;
+		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
+		                                       .module = pixel_program.module,
+		                                       .pName  = "main"};
 	}
 
 	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX] {};
@@ -410,8 +394,7 @@ void CreatePipelineInternal(
 		EXIT_NOT_IMPLEMENTED((static_params.color_mask[i] & ~0x0fu) != 0);
 		color_blend_attachment[i].colorWriteMask =
 		    vk::ColorComponentFlags {static_params.color_mask[i]};
-		color_blend_attachment[i].blendEnable =
-		    (static_params.blend_enable[i] && !static_params.blend_bypass[i]) ? VK_TRUE : VK_FALSE;
+		color_blend_attachment[i].blendEnable = static_params.blend_enable[i] ? VK_TRUE : VK_FALSE;
 		color_blend_attachment[i].srcColorBlendFactor =
 		    GetBlendFactor(static_params.color_srcblend[i]);
 		color_blend_attachment[i].dstColorBlendFactor =

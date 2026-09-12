@@ -130,12 +130,14 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 }
 
 static vk::DescriptorBufferInfo
-NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
+NativeStorageBuffer(RenderContext& context, PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
                     uint32_t slot, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto address = source.address;
+	const auto size    = source.size;
+	const auto id      = source.id;
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
@@ -152,7 +154,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
+	buffer_offset       = static_cast<uint32_t>(adjustment);
+	source.stream       = context.GetBufferCache().IsStreamAllocation(buffer);
+	source.resolved     = true;
+	source.adjustment   = buffer_offset;
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
@@ -776,6 +781,8 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	// Rebinding rebuilds the descriptors, so any earlier publication is stale from here.
+	prepared.published = false;
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = prepared.runtime->resources;
 	const auto& layout    = program.bindings;
@@ -798,19 +805,115 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	// The flattened_srt and shader_data uploads used to happen here. shader_data carries the
+	// packed memory offsets, so it has to be uploaded from the settled state - see PublishBuffers.
+}
+
+// Re-resolves every cache-backed binding from its guest range and republishes the descriptor, the
+// packed offset and the uploads from one settled snapshot.
+//
+// Runs after all range-changing work for the draw or dispatch. RebindImages reaches CreateBuffer
+// through ResolveTexture -> FindImage -> InitializeImage -> ObtainBufferForImage, so a buffer a
+// stage already captured can be retired after that stage was rebound.
+//
+// Performs no obtain-side work: no allocation, no join, no synchronize, no upload into a buffer,
+// no dirty-state change, no LRU touch. Those happened once, in order, during RebindBuffers.
+void RenderExecutor::PublishBuffers(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = prepared.runtime->resources;
+	const auto& layout   = program.bindings;
+	prepared.published   = true;
+
+	if (prepared.buffer_sources.size() == prepared.buffers.size()) {
+		auto& cache = m_context.GetBufferCache();
+		std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
+		          prepared.shader_data.end(), 0);
+		for (uint32_t i = 0; i < prepared.buffer_sources.size(); i++) {
+			const auto& source = prepared.buffer_sources[i];
+			if (!source.resolved) {
+				continue;
+			}
+			const auto pack = [&](uint32_t adjustment) {
+				const auto dword = layout.memory_offset_dword + i / 4u;
+				const auto shift = (i % 4u) * 8u;
+				prepared.shader_data[dword] |= adjustment << shift;
+			};
+			if (source.stream) {
+				// As issued: the ring allocation holds this binding's private copy of the guest
+				// bytes, and no guest range owns it.
+				pack(source.adjustment);
+				continue;
+			}
+			const auto owner = cache.FindPublishedOwner(source.address, source.size);
+			if (owner.first == nullptr) {
+				// Allocating here would be a range-changing operation after everything was
+				// supposed to have settled, and publishing an unconfirmed view would hide it.
+				EXIT("binding publication found no owner for guest range 0x%016" PRIx64
+				     " size 0x%" PRIx64 "\n",
+				     source.address, source.size);
+			}
+			const auto  alignment      = m_context.GetGraphics().StorageMinAlignment();
+			const auto  aligned_offset = owner.second - owner.second % alignment;
+			const auto  adjustment     = static_cast<uint32_t>(owner.second - aligned_offset);
+			auto&       view           = prepared.buffers[i];
+			view.buffer                = owner.first->Handle();
+			view.offset                = aligned_offset;
+			view.range                 = source.size + adjustment;
+			pack(adjustment);
+		}
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
-	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
+	        layout, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+	}
+}
+
+// Rebind and publish every stage of a draw or dispatch.
+//
+// THREE PASSES OVER THE WHOLE SPAN, never stage at a time: finalizing one stage completely before
+// starting the next is the bug this exists to prevent, because the second stage's rebinding can
+// retire a buffer the first stage already published.
+//
+//   1. rebind buffers, every stage
+//   2. rebind images,  every stage   (these can reach CreateBuffer)
+//   3. publish,        every stage   (nothing after this changes ranges)
+//
+// One call, so a caller cannot rebind without publishing.
+void RenderExecutor::FinalizeBindings(std::span<PreparedBindings* const> stages) {
+	KYTY_PROFILER_FUNCTION();
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			stage->published = false;
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			RebindBuffers(*stage);
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			RebindImages(*stage);
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			PublishBuffers(*stage);
+		}
 	}
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	// Image resolution can retire a buffer an earlier publish resolved.
+	prepared.published = false;
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = prepared.runtime->resources;
 	auto&       images   = prepared.images;
@@ -874,17 +977,13 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
 		m_context.PrepareBda();
 	}
-	RebindBuffers(bindings.vertex);
-	if (bindings.pixel) {
-		RebindBuffers(*bindings.pixel);
-	}
-	RebindImages(bindings.vertex);
-	if (bindings.pixel) {
-		RebindImages(*bindings.pixel);
-	}
+	PreparedBindings* stages[2] = {&bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr};
+	FinalizeBindings(std::span<PreparedBindings* const> {stages, bindings.pixel ? 2u : 1u});
 	return bindings;
 }
 
+// Publication owns the shader_data and flattened_srt uploads, so a stage reaching commit
+// unpublished has unbound descriptors. Fail here, naming the cause.
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -902,7 +1001,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
 	for (const auto* prepared: prepared_bindings) {
-		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime ||
+		        !prepared->published);
 		const auto& program = *prepared->runtime->program;
 		write_count += program.bindings.descriptors.size();
 		for (const auto& binding: program.bindings.descriptors) {

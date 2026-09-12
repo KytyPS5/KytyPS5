@@ -31,6 +31,15 @@ struct PreparedBindings {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		BufferId id;
+		// Set when ObtainBuffer served this binding from the stream ring. Such a binding is
+		// republished as issued; re-resolving it by address would hand back a cached buffer and
+		// discard the ring allocation holding its data.
+		bool stream = false;
+		// False for a null binding, which has nothing to republish.
+		bool resolved = false;
+		// Byte adjustment folded into the packed memory offsets in shader_data. Kept beside the
+		// range so publication rewrites both together and they cannot disagree.
+		uint32_t adjustment = 0;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
@@ -39,6 +48,11 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// Set by PublishBuffers, asserted by CommitBindings. The shader_data and flattened_srt
+	// uploads happen during publication, so a stage that reaches commit unpublished has unbound
+	// descriptors. Cleared by anything that can retire a buffer, so a reused PreparedBindings
+	// cannot carry a stale true past the assertion.
+	bool                                  published = false;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};

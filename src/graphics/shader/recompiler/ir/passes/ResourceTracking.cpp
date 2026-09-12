@@ -174,6 +174,28 @@ private:
 		std::abort();
 	}
 
+	// A phi whose every arm already resolves to a descriptor the host can evaluate. Returns
+	// the first arm, or an empty value when any arm is something else -- an unresolved
+	// descriptor must still abort loudly.
+	Value SoleSamplerPhiArm(Value value) const {
+		const auto* phi = value.Resolve().TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->NumArgs() == 0) {
+			return {};
+		}
+		Value first;
+		for (size_t index = 0; index < phi->NumArgs(); index++) {
+			const auto arm = ResolveInvariantPhi(m_program, phi->Arg(index));
+			if (arm.IsEmpty() || arm.Resolve().GetType() != Type::U32 ||
+			    !ValidateRuntimeValue(m_program, arm, RuntimeValueType::Any, nullptr)) {
+				return {};
+			}
+			if (first.IsEmpty()) {
+				first = arm;
+			}
+		}
+		return first;
+	}
+
 	bool CollapseNullPhi(Value value, Value& loaded, std::vector<Block*>& null_blocks) const {
 		const auto* phi = value.Resolve().TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) {
@@ -1245,6 +1267,22 @@ private:
 				descriptor.dwords[bad_dword] = Value(0u);
 				handle->SetArg(bad_dword, Value(0u));
 				continue;
+			}
+			// A sampler S# the shader picks between at run time: every arm of the phi is itself a
+			// valid descriptor, but a binding resolves to exactly one, so the choice cannot be
+			// represented. Take the first arm. An S# carries only filter and addressing state -- no
+			// address -- so the cost is wrong filtering on the pixels that wanted the other one,
+			// against losing the whole title to an abort. Say so once per shader rather than
+			// silently. The real fix is to bind the alternatives as a sampler array and index it.
+			if (expected == ValueOpcode::GetSamplerResource && bad_dword < descriptor.dword_count) {
+				if (const auto arm = SoleSamplerPhiArm(descriptor.dwords[bad_dword]); !arm.IsEmpty()) {
+					LOGF("shader resource tracking: hash=0x%016llx pc=0x%08x picks between sampler "
+					     "descriptors at run time; using the first (dword %u)\n",
+					     static_cast<unsigned long long>(m_program.shader_hash), pc, bad_dword);
+					descriptor.dwords[bad_dword] = arm;
+					handle->SetArg(bad_dword, arm);
+					continue;
+				}
 			}
 			const auto indirect = m_indirect_reasons.find(handle);
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value: {}{}",

@@ -1812,6 +1812,7 @@ void TestNewShaderRecompilerScalarVectorAlu() {
       EncodeSop2(0x30, 11, 10, 1),     // s_lshl3_add_u32 s11, s10, s1
       EncodeSop2(0x31, 12, 11, 1),     // s_lshl4_add_u32 s12, s11, s1
       EncodeSop2(0x35, 13, 12, 1),     // s_mul_hi_u32 s13, s12, s1
+      EncodeSop2(0x36, 15, 12, 1),     // s_mul_hi_i32 s15, s12, s1
       EncodeSopc(0x08, 8, 1),          // s_cmp_gt_u32 s8, s1
       EncodeSop2(0x04, 14, 13, 129),   // s_addc_u32 s14, s13, 1
       EncodeVop2(0x03, 1, 242, 0),     // v_add_f32 v1, 1.0, v0
@@ -1848,6 +1849,8 @@ void TestNewShaderRecompilerScalarVectorAlu() {
       "new decoder did not decode old-backed S_LSHL4_ADD_U32");
   Check(Common::ContainsStr(result.decoded_dump, "s_mul_hi_u32 s13, s12, s1"),
         "new decoder did not decode old-backed S_MUL_HI_U32");
+  Check(Common::ContainsStr(result.decoded_dump, "s_mul_hi_i32 s15, s12, s1"),
+        "new decoder did not decode old-backed S_MUL_HI_I32");
   Check(Common::ContainsStr(result.decoded_dump, "v_add_f32 v1"),
         "new decoder did not decode VOP2 float add");
   Check(Common::ContainsStr(result.decoded_dump, "v_cndmask_b32 v5"),
@@ -1884,6 +1887,8 @@ void TestNewShaderRecompilerScalarVectorAlu() {
       "S_LSHL4_ADD_U32 did not lower through carry-writing shift-left-add IR");
   Check(Common::ContainsStr(result.ir_dump, "UMulHighU32 s13, s12, s1"),
         "S_MUL_HI_U32 did not lower to unsigned high-multiply IR");
+  Check(Common::ContainsStr(result.ir_dump, "SMulHighI32 s15, s12, s1"),
+        "S_MUL_HI_I32 did not lower to signed high-multiply IR");
   Check(Common::ContainsStr(result.ir_dump, "CompareGtU32"),
         "SOPC compare did not lower to IR");
   Check(Common::ContainsStr(result.ir_dump, "FAddF32 v1"),

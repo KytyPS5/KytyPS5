@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -12,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <type_traits>
@@ -63,6 +65,8 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Called once per presented frame; image staleness is judged against it, not submissions.
+	void AdvanceFrame() noexcept { m_frame_index.fetch_add(1, std::memory_order_relaxed); }
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -78,9 +82,11 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void RunGarbageCollector();
+	void RunGarbageCollector(bool per_frame = false);
 
 private:
+	void FreePublishedEvictions();
+
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
@@ -129,6 +135,11 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	// `with_download_plan` asks whether a write-back could be built; only the collector needs it.
+	[[nodiscard]] Headroom::CollectorImageFacts CollectorFacts(const Image& image,
+	                                                           bool         with_download_plan);
+	// Frees what can be freed with no GPU work. Caller holds m_lock; returns accounted bytes.
+	[[nodiscard]] uint64_t ReclaimForAllocation(uint64_t needed);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -170,6 +181,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	std::atomic<uint64_t>                             m_frame_index {0};
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
@@ -185,6 +197,13 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// Evicted images stay registered until their download lands; m_evict_published has a leaf lock.
+	std::unordered_map<ImageId, uint64_t>  m_evict_pending;
+	std::unordered_map<ImageId, uint64_t>  m_evict_backoff;
+	std::unordered_map<uint64_t, uint64_t> m_evicted_addresses;
+	std::mutex                             m_evict_published_lock;
+	std::vector<ImageId>                   m_evict_published;
+	uint64_t                               m_gc_frame           = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;

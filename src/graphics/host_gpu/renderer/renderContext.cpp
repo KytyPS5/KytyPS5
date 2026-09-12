@@ -150,7 +150,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(true);
 	m_buffer_cache.RunGarbageCollector();
 }
 

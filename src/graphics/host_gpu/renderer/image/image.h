@@ -47,7 +47,9 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	// With `report`, a failed device allocation sets BackingFailed() instead of exiting.
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      GraphicContext::ImageAllocationReport* report = nullptr);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -103,8 +105,13 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified = true;
+		++m_gpu_write_serial;
+	}
+	void ClearGpuModified() noexcept { m_gpu_modified = false; }
+	// Counts GPU writes, never reset - unlike m_gpu_modified, which only the free path clears.
+	[[nodiscard]] uint64_t GpuWriteSerial() const noexcept { return m_gpu_write_serial; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
@@ -121,6 +128,7 @@ public:
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
+	[[nodiscard]] bool     BackingFailed() const noexcept { return m_backing_failed; }
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
@@ -155,7 +163,10 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	// Counted in presented frames, not queue submissions.
+	uint64_t              frame_accessed_last = 0;
+	uint64_t              frame_touched_last  = 0;
+	size_t                lru_id              = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

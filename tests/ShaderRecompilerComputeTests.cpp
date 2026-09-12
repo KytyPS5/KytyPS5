@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -253,6 +254,7 @@ struct TextureCacheTestAccess {
     return std::unique_lock(cache.m_lock);
   }
 
+
   static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
                          const vk::ImageSubresourceRange &range,
                          const vk::ClearValue &clear) {
@@ -267,11 +269,16 @@ struct TextureCacheTestAccess {
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
+    cache.m_evicted_addresses.clear();
+    const uint64_t frame = std::max<uint64_t>(cache.m_frame_index.load(),
+                                              Headroom::EvictMinIdleFrames);
+    cache.m_frame_index.store(frame);
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
         image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.frame_touched_last = frame;
         live.push_back(id);
       }
     });
@@ -279,6 +286,7 @@ struct TextureCacheTestAccess {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
         owner->tick_accessed_last = 0;
+        owner->frame_touched_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
       }
     }
@@ -286,6 +294,21 @@ struct TextureCacheTestAccess {
       if (std::ranges::find(oldest, id) == oldest.end()) {
         cache.m_slot_images[id].lru_id = cache.m_lru_cache.Insert(id, tick);
       }
+    }
+  }
+
+  static void QueueForCollection(TextureCache &cache, std::span<const ImageId> order,
+                                 std::span<const uint64_t> frames, uint64_t frame) {
+    cache.m_trigger_gc_memory = 0;
+    cache.m_pressure_gc_memory = 0;
+    cache.m_critical_gc_memory = UINT64_MAX;
+    cache.m_gc_tick = 1000;
+    cache.m_frame_index.store(frame);
+    cache.m_lru_cache = {};
+    for (size_t i = 0; i < order.size(); i++) {
+      auto &image = cache.m_slot_images[order[i]];
+      image.frame_touched_last = frames[i];
+      image.lru_id = cache.m_lru_cache.Insert(order[i], i);
     }
   }
 
@@ -9435,15 +9458,19 @@ public:
                                                 sizeof(uint32_t));
       }
       Require(name, "batched image pressure retirement",
-              std::ranges::none_of(gc_images,
-                                   [&](ImageId image) {
-                                     return TextureCacheTestAccess::Contains(
-                                         texture_cache, image);
-                                   }) &&
+              std::ranges::all_of(gc_images,
+                                  [&](ImageId image) {
+                                    return TextureCacheTestAccess::Contains(
+                                        texture_cache, image);
+                                  }) &&
+                  texture_cache.FindImageFromRange(
+                      gc_image_desc_a.info.data.address,
+                      gc_image_desc_a.info.data.size) == gc_images[0] &&
                   scheduler.CurrentTick() == gc_batch_tick &&
                   gc_before_completion == gc_stale_values,
-              "GC submitted per image or published a readback before GPU "
-              "completion");
+              "GC submitted per image, published a readback before GPU "
+              "completion, or released an evicted image while guest memory "
+              "still held stale bytes");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
@@ -9462,6 +9489,15 @@ public:
               scheduler.CurrentTick() == gc_batch_tick + 1 &&
                   gc_after_completion == gc_image_values,
               "one submission did not publish both deferred image readbacks");
+      texture_cache.RunGarbageCollector();
+      Require(name, "published eviction release",
+              std::ranges::none_of(gc_images,
+                                   [&](ImageId image) {
+                                     return TextureCacheTestAccess::Contains(
+                                         texture_cache, image);
+                                   }),
+              "GC kept an evicted image after its readback reached guest "
+              "memory");
       Require(name, "refreshed post-image buffer alias",
               refreshed_buffer_alias.first != nullptr,
               "failed to reacquire the cached Buffer alias after image "
@@ -9974,20 +10010,24 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_before_completion,
           sizeof(depth_before_completion));
-      const bool depth_image_retired = !TextureCacheTestAccess::Contains(
+      // BuildDepthCopies downloads depth alone, so evicting this image would destroy its stencil.
+      const bool depth_image_retained = TextureCacheTestAccess::Contains(
           texture_cache, combined_destination_image);
-      const bool depth_proxy_retired = !texture_cache.FindImageFromRange(
-          base + added_stencil_offset, added_stencil_size, false);
+      const bool depth_proxy_retained = static_cast<bool>(
+          texture_cache.FindImageFromRange(base + added_stencil_offset,
+                                           added_stencil_size, false));
       Require(
-          name, "depth/stencil deferred pressure retirement",
-          depth_image_retired && depth_proxy_retired &&
+          name, "depth/stencil pressure retention",
+          depth_image_retained && depth_proxy_retained &&
               scheduler.CurrentTick() == depth_gc_tick &&
               depth_before_completion == stale_added_stencil_depth,
           fmt::format(
-              "GC failed to retire/defer depth: image={} proxy={} tick={}/{} "
+              "GC collected a depth/stencil image under pressure, or "
+              "submitted per image: image={} proxy={} tick={}/{} "
               "depth={}/{}",
-              depth_image_retired, depth_proxy_retired, scheduler.CurrentTick(),
-              depth_gc_tick, depth_before_completion, stale_added_stencil_depth)
+              depth_image_retained, depth_proxy_retained,
+              scheduler.CurrentTick(), depth_gc_tick, depth_before_completion,
+              stale_added_stencil_depth)
               .c_str());
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -9995,10 +10035,18 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_after_completion,
           sizeof(depth_after_completion));
-      Require(name, "depth/stencil depth-plane preservation",
-              depth_after_completion == added_stencil_depth_value,
-              "GC discarded the current depth plane of a depth/stencil "
-              "image");
+      Require(name, "depth/stencil plane retention",
+              depth_after_completion == stale_added_stencil_depth,
+              "GC downloaded and released a depth/stencil image whose stencil "
+              "plane nothing could restore");
+      texture_cache.RunGarbageCollector();
+      Require(name, "depth/stencil retention across collections",
+              TextureCacheTestAccess::Contains(texture_cache,
+                                               combined_destination_image) &&
+                  static_cast<bool>(texture_cache.FindImageFromRange(
+                      base + added_stencil_offset, added_stencil_size, false)),
+              "GC released a depth/stencil image, and with it the only copy "
+              "of its stencil plane, on a later collection boundary");
 
       constexpr size_t gc_depth_pair_count = 6;
       constexpr uint64_t gc_depth_pair_offset = 0x350000;
@@ -10083,11 +10131,16 @@ public:
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
+        const bool large_retained =
+            TextureCacheTestAccess::Contains(texture_cache, image);
         Require(
             name, "near-capacity deferred retirement",
-            !TextureCacheTestAccess::Contains(texture_cache, image) &&
-                scheduler.CurrentTick() == tick,
-            "near-capacity readback was rejected or synchronously submitted");
+            large_retained && scheduler.CurrentTick() == tick,
+            fmt::format("near-capacity readback was rejected, synchronously "
+                        "submitted, or released before its pixels reached "
+                        "guest memory: retained={} tick={}/{}",
+                        large_retained, scheduler.CurrentTick(), tick)
+                .c_str());
         scheduler.Finish();
         scheduler.DrainPriorityOperations();
         bool content = true;
@@ -10100,6 +10153,11 @@ public:
         Require(
             name, "near-capacity readback content", content,
             "near-capacity image readback did not publish its GPU contents");
+        texture_cache.RunGarbageCollector();
+        Require(name, "near-capacity published eviction release",
+                !TextureCacheTestAccess::Contains(texture_cache, image),
+                "GC kept a near-capacity eviction after its readback reached "
+                "guest memory");
         return handle;
       };
       const auto large_download = RunLargeReadback(0xa5a5a5a5u);

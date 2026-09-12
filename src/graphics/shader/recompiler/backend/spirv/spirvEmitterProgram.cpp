@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
@@ -57,11 +56,11 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
-	uint32_t                                      header_label       = 0;
-	uint32_t                                      select_label       = 0;
-	uint32_t                                      after_switch_label = 0;
-	uint32_t                                      continue_label     = 0;
-	uint32_t                                      merge_label        = 0;
+	uint32_t                                                     header_label       = 0;
+	uint32_t                                                     select_label       = 0;
+	uint32_t                                                     after_switch_label = 0;
+	uint32_t                                                     continue_label     = 0;
+	uint32_t                                                     merge_label        = 0;
 };
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -110,20 +109,21 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0});
 	ctx.state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1});
-	const auto kind     = info.terminator.condition;
-	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
-	                      kind == CFG::BranchCondition::VccZero ||
-	                      kind == CFG::BranchCondition::SccZero;
+	const auto kind = info.terminator.condition;
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero ||
+	                  kind == CFG::BranchCondition::SccZero;
 	const auto combined =
 	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-	ctx.state.builder.AddFunction({zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                               result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u)});
+	ctx.state.builder.AddFunction({static_cast<uint32_t>(zero ? spv::OpIEqual : spv::OpINotEqual),
+	                               TypeBool(ctx.state), result, combined,
+	                               ConstantU32(ctx.state, zero ? ~0u : 0u)});
 	return result;
 }
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
-	const auto& program = ctx.state.program;
+	const auto& program    = ctx.state.program;
 	const auto& term       = info.terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -360,7 +360,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
-	const auto& program = ctx.state.program;
+	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction({spv::OpBranch, ctx.Label(program.blocks.front())});
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -478,7 +478,8 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 				return loaded->second.second;
 			}
 			const auto id = state.builder.AllocateId();
-			state.builder.AddFunction({spv::OpLoad, TypeId(state, inst->GetType()), id, found->second});
+			state.builder.AddFunction(
+			    {spv::OpLoad, TypeId(state, inst->GetType()), id, found->second});
 			dispatcher_block_loads.insert_or_assign(inst, std::pair {state.current_label, id});
 			return id;
 		}
@@ -554,9 +555,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	const auto physical_lane =
 	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high          = state.builder.AllocateId();
-	const auto in_high       = state.builder.AllocateId();
-	const auto value         = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	const auto in_high = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {spv::OpGroupNonUniformShuffle, type, low, scope, HalfArg(inst, index, 0), physical_lane});
 	state.builder.AddFunction(

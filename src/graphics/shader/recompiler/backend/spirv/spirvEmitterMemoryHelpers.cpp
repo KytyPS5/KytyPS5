@@ -76,10 +76,9 @@ static void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
-MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
-                                                         const IR::MemoryInfo& mem,
-                                                         uint32_t variable,
-                                                         uint32_t pointer_type) {
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
+                                                        const IR::MemoryInfo& mem,
+                                                        uint32_t variable, uint32_t pointer_type) {
 	if (variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
@@ -125,12 +124,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			return access;
 		case IR::ResourceKind::ScalarAddress:
 		case IR::ResourceKind::Flat:
-		case IR::ResourceKind::Global:
-			EXIT("physical address memory must use the BDA emitter\n");
+		case IR::ResourceKind::Global: EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
-			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			access = PrepareStorageBufferResourceAccess(state, mem, state.storage_buffer_variable,
+			                                            TypeStorageBufferPointer(state));
 			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
 			                                    ConstantU32(state, 2u));
 			access.add_index_offset = true;
@@ -173,9 +171,8 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 	                                       TypeStorageBufferElementPointer(state));
 }
 
-uint32_t EmitStorageBufferElementPointer(EmitterState& state,
-                                         const MemoryResourceAccess& access, uint32_t index,
-                                         uint32_t pointer_type) {
+uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
+                                         uint32_t index, uint32_t pointer_type) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                           ConstantU32(state, 0), index});
@@ -210,7 +207,7 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	                                            ConstantU32(state, 23u - mantissa_bits));
 	const auto normal_bits =
 	    EmitBinaryU32(state, spv::OpBitwiseOr, exponent_bits, mantissa_bits_32);
-	const auto normal      = EmitBitcastU32ToF32(state, normal_bits);
+	const auto normal = EmitBitcastU32ToF32(state, normal_bits);
 
 	const auto special_bits =
 	    EmitBinaryU32(state, spv::OpBitwiseOr, ConstantU32(state, 0x7f800000u), mantissa_bits_32);
@@ -296,25 +293,25 @@ uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t 
 		uint32_t key;
 	};
 	const auto classify = [&](uint32_t bits) {
-		const auto cls = EmitClassifyF32Bits(state, bits);
+		const auto cls      = EmitClassifyF32Bits(state, bits);
 		const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual,
 		                                             EmitAndConstant(state, bits, 0x80000000u), 0u);
 		const auto negative_key = state.builder.AllocateId();
 		state.builder.AddFunction({spv::OpNot, TypeU32(state), negative_key, bits});
 		const auto positive_key =
 		    EmitBinaryU32(state, spv::OpBitwiseXor, bits, ConstantU32(state, 0x80000000u));
-		return OrderedBits {
-		    cls.nan, cls.zero,
-		    EmitSelectValueU32(state, negative, negative_key, positive_key)};
+		return OrderedBits {cls.nan, cls.zero,
+		                    EmitSelectValueU32(state, negative, negative_key, positive_key)};
 	};
 	const auto source_class = classify(source);
 	const auto old_class    = classify(old);
-	const auto unordered = EmitLogicalOrBool(
-	    state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
-	    EmitLogicalAndBool(state, source_class.zero, old_class.zero));
+	const auto unordered =
+	    EmitLogicalOrBool(state, EmitLogicalOrBool(state, source_class.nan, old_class.nan),
+	                      EmitLogicalAndBool(state, source_class.zero, old_class.zero));
 	const auto compare = state.builder.AllocateId();
-	state.builder.AddFunction({max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
-	                           compare, source_class.key, old_class.key});
+	state.builder.AddFunction(
+	    {static_cast<uint32_t>(max_value ? spv::OpUGreaterThan : spv::OpULessThan), TypeBool(state),
+	     compare, source_class.key, old_class.key});
 	return EmitSelectValueU32(
 	    state, EmitLogicalAndBool(state, EmitLogicalNotBool(state, unordered), compare), source,
 	    old);

@@ -64,7 +64,7 @@ uint32_t TypeF32Vector(EmitterState& state, uint32_t components) {
 }
 
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee) {
-	return state.builder.Type(spv::OpTypePointer, {storage_class, pointee});
+	return state.builder.Type(spv::OpTypePointer, {static_cast<uint32_t>(storage_class), pointee});
 }
 
 uint32_t TypeFunction(EmitterState& state) {
@@ -74,13 +74,14 @@ uint32_t TypeFunction(EmitterState& state) {
 uint32_t StorageRuntimeArrayType(EmitterState& state) {
 	return state.builder.DecoratedType(
 	    spv::OpTypeRuntimeArray, {TypeU32(state)},
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}});
+	    {{spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationArrayStride), sizeof(uint32_t)}}});
 }
 
 uint32_t StorageBufferType(EmitterState& state) {
-	return state.builder.DecoratedType(spv::OpTypeStruct, {StorageRuntimeArrayType(state)},
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}});
+	return state.builder.DecoratedType(
+	    spv::OpTypeStruct, {StorageRuntimeArrayType(state)},
+	    {{spv::OpMemberDecorate, {0, static_cast<uint32_t>(spv::DecorationOffset), 0}},
+	     {spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationBlock)}}});
 }
 
 uint32_t TypeStorageBufferPointer(EmitterState& state) {
@@ -94,13 +95,14 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state) {
 uint32_t StorageU64RuntimeArrayType(EmitterState& state) {
 	return state.builder.DecoratedType(
 	    spv::OpTypeRuntimeArray, {TypeScalarU64(state)},
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint64_t)}}});
+	    {{spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationArrayStride), sizeof(uint64_t)}}});
 }
 
 uint32_t StorageBufferU64Type(EmitterState& state) {
-	return state.builder.DecoratedType(spv::OpTypeStruct, {StorageU64RuntimeArrayType(state)},
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}});
+	return state.builder.DecoratedType(
+	    spv::OpTypeStruct, {StorageU64RuntimeArrayType(state)},
+	    {{spv::OpMemberDecorate, {0, static_cast<uint32_t>(spv::DecorationOffset), 0}},
+	     {spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationBlock)}}});
 }
 
 uint32_t TypeStorageBufferU64Pointer(EmitterState& state) {
@@ -136,20 +138,23 @@ uint32_t PushConstantArrayType(EmitterState& state) {
 	const auto count = ConstantU32(state, IR::PushData::DwordCount);
 	return state.builder.DecoratedType(
 	    spv::OpTypeArray, {TypeU32(state), count},
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}});
+	    {{spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationArrayStride), sizeof(uint32_t)}}});
 }
 
 uint32_t PushConstantBlockType(EmitterState& state) {
-	return state.builder.DecoratedType(spv::OpTypeStruct, {PushConstantArrayType(state)},
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}});
+	return state.builder.DecoratedType(
+	    spv::OpTypeStruct, {PushConstantArrayType(state)},
+	    {{spv::OpMemberDecorate, {0, static_cast<uint32_t>(spv::DecorationOffset), 0}},
+	     {spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationBlock)}}});
 }
 
 uint32_t PerVertexType(EmitterState& state) {
 	return state.builder.DecoratedType(
 	    spv::OpTypeStruct, {TypeF32Vector(state, 4)},
-	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
-	     {spv::OpDecorate, {spv::DecorationBlock}}});
+	    {{spv::OpMemberDecorate,
+	      {0, static_cast<uint32_t>(spv::DecorationBuiltIn),
+	       static_cast<uint32_t>(spv::BuiltInPosition)}},
+	     {spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationBlock)}}});
 }
 
 uint32_t SampleMaskArrayType(EmitterState& state) {
@@ -470,8 +475,8 @@ void DefineOutputs(EmitterState& state) {
 	                         spv::BuiltIn builtin) {
 		if (variable == 0) {
 			variable = DefineInterfaceVariable(state, type, spv::StorageClassOutput, name);
-			state.builder.AddAnnotation(
-			    {spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin});
+			state.builder.AddAnnotation({spv::OpDecorate, variable, spv::DecorationBuiltIn,
+			                             static_cast<uint32_t>(builtin)});
 		}
 		return variable;
 	};
@@ -621,21 +626,22 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel({state.program.info.uses_dma
-	                                  ? spv::AddressingModelPhysicalStorageBuffer64
-	                                  : spv::AddressingModelLogical,
-	                              spv::MemoryModelGLSL450});
+	state.builder.AddMemoryModel(
+	    {static_cast<uint32_t>(state.program.info.uses_dma
+	                               ? spv::AddressingModelPhysicalStorageBuffer64
+	                               : spv::AddressingModelLogical),
+	     static_cast<uint32_t>(spv::MemoryModelGLSL450)});
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(
 	    {state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve, 32u});
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
-		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_z = 1u;
-		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_z = 1u;
+		local_x          = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y          = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z          = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;

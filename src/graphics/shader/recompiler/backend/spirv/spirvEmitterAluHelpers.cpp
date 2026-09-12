@@ -87,7 +87,8 @@ uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state), cond, lhs, rhs});
+	    {static_cast<uint32_t>(max_value ? spv::OpUGreaterThan : spv::OpULessThan), TypeBool(state),
+	     cond, lhs, rhs});
 	state.builder.AddFunction({spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs});
 	return ret;
 }
@@ -96,7 +97,8 @@ uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto cond = state.builder.AllocateId();
 	const auto ret  = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {max_value ? spv::OpSGreaterThan : spv::OpSLessThan, TypeBool(state), cond, lhs, rhs});
+	    {static_cast<uint32_t>(max_value ? spv::OpSGreaterThan : spv::OpSLessThan), TypeBool(state),
+	     cond, lhs, rhs});
 	state.builder.AddFunction({spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs});
 	return ret;
 }
@@ -110,7 +112,7 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	const auto exponent_max =
 	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
 	const auto mantissa_nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa_bits, 0);
-	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
+	cls.nan                     = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
 	cls.zero                    = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
 	return cls;
 }
@@ -184,8 +186,9 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
 	const auto numeric_cond = state.builder.AllocateId();
-	state.builder.AddFunction({max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
-	                           TypeBool(state), numeric_cond, lhs, rhs});
+	state.builder.AddFunction(
+	    {static_cast<uint32_t>(max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan),
+	     TypeBool(state), numeric_cond, lhs, rhs});
 	const auto ordered_bits =
 	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
 

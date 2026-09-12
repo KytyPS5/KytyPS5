@@ -51,8 +51,9 @@ uint32_t EmitMulHigh(EmitterState& state, uint32_t lhs, uint32_t rhs, bool signe
 		rhs_operand = Unary(state, spv::OpBitcast, TypeI32(state), rhs);
 	}
 	const auto extended = state.builder.AllocateId();
-	state.builder.AddFunction({signed_value ? spv::OpSMulExtended : spv::OpUMulExtended, pair_type,
-	                           extended, lhs_operand, rhs_operand});
+	state.builder.AddFunction(
+	    {static_cast<uint32_t>(signed_value ? spv::OpSMulExtended : spv::OpUMulExtended), pair_type,
+	     extended, lhs_operand, rhs_operand});
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction({spv::OpCompositeExtract, operand_type, high, extended, 1});
 	return signed_value ? Unary(state, spv::OpBitcast, TypeU32(state), high) : high;

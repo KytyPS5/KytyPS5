@@ -54,13 +54,16 @@ void DefineMeshOutputs(EmitterState& state) {
 			    {spv::OpDecorate, output.variable_id, spv::DecorationLocation, output.location});
 		} else {
 			state.builder.AddAnnotation(
-			    {spv::OpDecorate, output.variable_id, spv::DecorationBuiltIn,
-			     output.kind == IR::StageOutputKind::Layer ? spv::BuiltInLayer
-			                                               : spv::BuiltInPosition});
+			    {static_cast<uint32_t>(spv::OpDecorate), output.variable_id,
+			     static_cast<uint32_t>(spv::DecorationBuiltIn),
+			     static_cast<uint32_t>(output.kind == IR::StageOutputKind::Layer
+			                               ? spv::BuiltInLayer
+			                               : spv::BuiltInPosition)});
 		}
 		if (output.kind == IR::StageOutputKind::Layer) {
-			state.builder.AddAnnotation({spv::OpDecorate, output.variable_id,
-			                             spv::DecorationPerPrimitiveEXT}); // PerPrimitiveEXT
+			state.builder.AddAnnotation(
+			    {static_cast<uint32_t>(spv::OpDecorate), output.variable_id,
+			     static_cast<uint32_t>(spv::DecorationPerPrimitiveEXT)}); // PerPrimitiveEXT
 		}
 	}
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
@@ -147,7 +150,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind == IR::StageOutputKind::Layer) {
 					continue;
 				}
-				const auto type  = MeshOutputType(state, output.kind);
+				const auto type = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));

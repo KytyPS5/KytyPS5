@@ -55,7 +55,8 @@ class RectListEmitter {
 public:
 	RectListEmitter(const std::vector<Parameter>& parameters_, spv::ExecutionModel model)
 	    : parameters(parameters_) {
-		builder.AddMemoryModel({spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+		builder.AddMemoryModel({static_cast<uint32_t>(spv::AddressingModelLogical),
+		                        static_cast<uint32_t>(spv::MemoryModelGLSL450)});
 
 		void_type       = Type(spv::OpTypeVoid);
 		uint_type       = Type(spv::OpTypeInt, 32u, 0u);
@@ -66,8 +67,10 @@ public:
 
 		per_vertex_type = builder.DecoratedType(
 		    spv::OpTypeStruct, {vec4_float_type},
-		    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
-		     {spv::OpDecorate, {spv::DecorationBlock}}});
+		    {{spv::OpMemberDecorate,
+		      {0u, static_cast<uint32_t>(spv::DecorationBuiltIn),
+		       static_cast<uint32_t>(spv::BuiltInPosition)}},
+		     {spv::OpDecorate, {static_cast<uint32_t>(spv::DecorationBlock)}}});
 
 		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
 		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
@@ -165,8 +168,8 @@ public:
 	std::vector<uint32_t> EmitEvaluation() {
 		DefineEntry(spv::ExecutionModelTessellationEvaluation);
 
-		const auto x     = Load(float_type, Access(ptr_input_float, tess_coord, Int(0)));
-		const auto y     = Load(float_type, Access(ptr_input_float, tess_coord, Int(1)));
+		const auto x = Load(float_type, Access(ptr_input_float, tess_coord, Int(0)));
+		const auto y = Load(float_type, Access(ptr_input_float, tess_coord, Int(1)));
 		const auto index =
 		    Result(spv::OpIAdd, int_type,
 		           Result(spv::OpIMul, int_type, Result(spv::OpConvertFToS, int_type, y), Int(2)),
@@ -188,7 +191,7 @@ public:
 private:
 	template <typename... Args>
 	uint32_t Type(spv::Op opcode, Args... operands) {
-		return builder.Type(opcode, {operands...});
+		return builder.Type(opcode, {static_cast<uint32_t>(operands)...});
 	}
 
 	uint32_t Constant(uint32_t type, uint32_t value) {
@@ -196,7 +199,7 @@ private:
 	}
 
 	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
-		return Type(spv::OpTypePointer, storage, type);
+		return Type(spv::OpTypePointer, static_cast<uint32_t>(storage), type);
 	}
 
 	uint32_t Array(uint32_t type, uint32_t size) {
@@ -206,25 +209,27 @@ private:
 	template <typename... Args>
 	uint32_t Result(spv::Op opcode, uint32_t type, Args... operands) {
 		const auto id = builder.AllocateId();
-		builder.AddFunction({opcode, type, id, operands...});
+		builder.AddFunction(
+		    {static_cast<uint32_t>(opcode), type, id, static_cast<uint32_t>(operands)...});
 		return id;
 	}
 
 	template <typename... Args>
 	uint32_t ResultWithoutType(spv::Op opcode, Args... operands) {
 		const auto id = builder.AllocateId();
-		builder.AddFunction({opcode, id, operands...});
+		builder.AddFunction(
+		    {static_cast<uint32_t>(opcode), id, static_cast<uint32_t>(operands)...});
 		return id;
 	}
 
 	template <typename... Args>
 	void Emit(spv::Op opcode, Args... operands) {
-		builder.AddFunction({opcode, operands...});
+		builder.AddFunction({static_cast<uint32_t>(opcode), static_cast<uint32_t>(operands)...});
 	}
 
 	template <typename... Args>
 	uint32_t Access(uint32_t pointer_type, uint32_t base, Args... indices) {
-		return Result(spv::OpAccessChain, pointer_type, base, indices...);
+		return Result(spv::OpAccessChain, pointer_type, base, static_cast<uint32_t>(indices)...);
 	}
 
 	uint32_t Load(uint32_t type, uint32_t pointer) { return Result(spv::OpLoad, type, pointer); }
@@ -242,19 +247,23 @@ private:
 	}
 
 	void Decorate(uint32_t target, spv::Decoration decoration, uint32_t value) {
-		builder.AddAnnotation({spv::OpDecorate, target, decoration, value});
+		builder.AddAnnotation({static_cast<uint32_t>(spv::OpDecorate), target,
+		                       static_cast<uint32_t>(decoration), value});
 	}
 
 	void DefineEntry(spv::ExecutionModel model) {
 		builder.RequireCapability(spv::CapabilityShader);
 		builder.RequireCapability(spv::CapabilityTessellation);
-		main = Result(spv::OpFunction, void_type, spv::FunctionControlMaskNone, function_type);
+		main = Result(spv::OpFunction, void_type,
+		              static_cast<uint32_t>(spv::FunctionControlMaskNone), function_type);
 		if (model == spv::ExecutionModelTessellationControl) {
-			builder.AddExecutionMode({main, spv::ExecutionModeOutputVertices, 4u});
+			builder.AddExecutionMode(
+			    {main, static_cast<uint32_t>(spv::ExecutionModeOutputVertices), 4u});
 		} else {
-			builder.AddExecutionMode({main, spv::ExecutionModeQuads});
-			builder.AddExecutionMode({main, spv::ExecutionModeSpacingEqual});
-			builder.AddExecutionMode({main, spv::ExecutionModeVertexOrderCw});
+			builder.AddExecutionMode({main, static_cast<uint32_t>(spv::ExecutionModeQuads)});
+			builder.AddExecutionMode({main, static_cast<uint32_t>(spv::ExecutionModeSpacingEqual)});
+			builder.AddExecutionMode(
+			    {main, static_cast<uint32_t>(spv::ExecutionModeVertexOrderCw)});
 		}
 		DefineInputs(model);
 		DefineOutputs(model);
@@ -296,10 +305,12 @@ private:
 			gl_out     = AddInterface(spv::StorageClassOutput, Array(per_vertex_type, 4u));
 			tess_inner = AddInterface(spv::StorageClassOutput, Array(float_type, 2u));
 			Decorate(tess_inner, spv::DecorationBuiltIn, spv::BuiltInTessLevelInner);
-			builder.AddAnnotation({spv::OpDecorate, tess_inner, spv::DecorationPatch});
+			builder.AddAnnotation({static_cast<uint32_t>(spv::OpDecorate), tess_inner,
+			                       static_cast<uint32_t>(spv::DecorationPatch)});
 			tess_outer = AddInterface(spv::StorageClassOutput, Array(float_type, 4u));
 			Decorate(tess_outer, spv::DecorationBuiltIn, spv::BuiltInTessLevelOuter);
-			builder.AddAnnotation({spv::OpDecorate, tess_outer, spv::DecorationPatch});
+			builder.AddAnnotation({static_cast<uint32_t>(spv::OpDecorate), tess_outer,
+			                       static_cast<uint32_t>(spv::DecorationPatch)});
 		} else {
 			gl_out = AddInterface(spv::StorageClassOutput, per_vertex_type);
 		}

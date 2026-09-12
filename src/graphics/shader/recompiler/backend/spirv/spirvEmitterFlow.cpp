@@ -6,9 +6,9 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& dword_index) {
-	const auto register_index = IR::RegIndex(reg);
-	const auto& registers = state.program.bindings.user_data_registers;
-	const auto  found     = std::lower_bound(registers.begin(), registers.end(), register_index);
+	const auto  register_index = IR::RegIndex(reg);
+	const auto& registers      = state.program.bindings.user_data_registers;
+	const auto  found = std::lower_bound(registers.begin(), registers.end(), register_index);
 	if (found == registers.end() || *found != register_index) {
 		return false;
 	}
@@ -251,7 +251,7 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 			state.builder.AddFunction(
 			    {spv::OpCompositeExtract, TypeU32(state), packed, data, pair});
 			state.builder.AddFunction({spv::OpExtInst, TypeF32Vector(state, 2), unpacked,
-			                           GlslStd450(state), unpack, packed});
+			                           GlslStd450(state), static_cast<uint32_t>(unpack), packed});
 			for (uint32_t lane = 0; lane < 2u; lane++) {
 				const auto component = pair * 2u + lane;
 				if (((exp.en >> component) & 1u) != 0u) {
@@ -368,8 +368,8 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 	}
 }
 
-uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float scale,
-                               float offset, float half_extent) {
+uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float scale, float offset,
+                               float half_extent) {
 	const auto window  = state.builder.AllocateId();
 	const auto biased  = state.builder.AllocateId();
 	const auto divided = state.builder.AllocateId();
@@ -393,10 +393,10 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 		state.builder.AddFunction(
 		    {spv::OpCompositeExtract, TypeF32(state), components[i], position, i});
 	}
-	components[0] = ConvertClipCoordinate(state, components[0], transform.scale[0],
-	                                      transform.offset[0], transform.half_extent[0]);
-	components[1] = ConvertClipCoordinate(state, components[1], transform.scale[1],
-	                                      transform.offset[1], transform.half_extent[1]);
+	components[0]        = ConvertClipCoordinate(state, components[0], transform.scale[0],
+	                                             transform.offset[0], transform.half_extent[0]);
+	components[1]        = ConvertClipCoordinate(state, components[1], transform.scale[1],
+	                                             transform.offset[1], transform.half_extent[1]);
 	const auto converted = state.builder.AllocateId();
 	state.builder.AddFunction({spv::OpCompositeConstruct, TypeF32Vector(state, 4), converted,
 	                           components[0], components[1], components[2], components[3]});

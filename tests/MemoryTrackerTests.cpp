@@ -493,12 +493,15 @@ void TestGpuDownloadProtectionMirrors() {
         "non-clearing download changed protection or lost sparse ranges");
 
   visited.clear();
+  bool protected_during_download = false;
   tracker.ForEachDownloadRange<true>(
       address + 16, 32,
       [&](uint64_t range_address, uint64_t range_size) noexcept {
+        protected_during_download = Protection(memory) == PAGE_NOACCESS;
         visited.push_back({range_address, range_size});
       });
-  Check(visited.size() == 1 && visited[0].first == address &&
+  Check(protected_during_download && visited.size() == 1 &&
+            visited[0].first == address &&
             visited[0].second == page_size && g_protection_log.size() == 1 &&
             g_protection_log[0].address == address &&
             g_protection_log[0].size == page_size &&
@@ -641,11 +644,14 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   std::binary_semaphore finish_download{0};
   std::binary_semaphore mutation_finished{0};
   std::jthread downloader([&] {
-    tracker.ForEachDownloadRange<false>(allocation_base, page_size,
-                                        [&](uint64_t, uint64_t) noexcept {
-                                          download_entered.release();
-                                          finish_download.acquire();
-                                        });
+    tracker.ForEachDownloadRange<false>(
+        allocation_base, second_region + page_size - allocation_base,
+        [&](uint64_t address, uint64_t) noexcept {
+          if (address == allocation_base) {
+            download_entered.release();
+            finish_download.acquire();
+          }
+        });
   });
   download_entered.acquire();
   std::jthread mutation([&] {

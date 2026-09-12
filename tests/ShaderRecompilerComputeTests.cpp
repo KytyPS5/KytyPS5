@@ -4054,7 +4054,7 @@ public:
               "partial invalidation lost disjoint native bytes");
 
       constexpr uint64_t large_offset = 0x10000;
-      constexpr uint64_t large_size = 33ull * 1024 * 1024;
+      constexpr uint64_t large_size = 32ull << 20;
       constexpr uint32_t large_value = 0x5aa55aa5u;
       constexpr uint32_t large_stale = 0x12345678u;
       std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
@@ -4066,12 +4066,17 @@ public:
               large_allocation.first != nullptr,
               "failed to allocate the near-capacity dirty native buffer");
       cache.FillBuffer(base + large_offset, large_size, large_value, false);
+      const auto large_submission_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
+      // Earlier dirty owners in this GC pass may require one ring-wrap drain
+      // before the full-capacity download can reserve the stream.
       Require(name, "near-capacity synchronized retirement",
-              !cache.IsRegionRegistered(base + large_offset, large_size),
-              "near-capacity dirty Buffer survived pressured collection");
+              !cache.IsRegionRegistered(base + large_offset, large_size) &&
+                  scheduler.CurrentTick() > large_submission_tick &&
+                  scheduler.CurrentTick() <= large_submission_tick + 2,
+              "capacity-sized dirty Buffer exceeded one ring-wrap drain");
       uint32_t large_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + large_offset,
                                               &large_before_completion,
@@ -4088,15 +4093,13 @@ public:
                   fixed_download->Handle() == fixed_download_handle &&
                   fixed_download->Size() == (32ull << 20),
               "image acquisition replaced the shared Buffer download stream");
-      uint32_t large_first = 0;
-      uint32_t large_last = 0;
-      Libs::LibKernel::Memory::TryReadBacking(base + large_offset, &large_first,
-                                              sizeof(large_first));
-      Libs::LibKernel::Memory::TryReadBacking(base + large_offset + large_size -
-                                                  sizeof(large_last),
-                                              &large_last, sizeof(large_last));
+      std::vector<uint32_t> large_published(large_size / sizeof(uint32_t));
       Require(name, "near-capacity Buffer publication contents",
-              large_first == large_value && large_last == large_value,
+              Libs::LibKernel::Memory::TryReadBacking(
+                  base + large_offset, large_published.data(), large_size) &&
+                  std::ranges::all_of(large_published, [](uint32_t value) {
+                    return value == large_value;
+                  }),
               "near-capacity Buffer GC did not publish its complete transfer");
 
       constexpr uint64_t grouped_first_offset = 0x10000;
@@ -4148,6 +4151,94 @@ public:
               grouped_first_backing == grouped_first_value &&
                   grouped_second_backing == grouped_second_value,
               "per-owner GC transfers lost data while wrapping the fixed ring");
+
+      constexpr uint64_t sparse_offset = 0x2180000;
+      constexpr uint64_t sparse_owner_stride = 2 * BufferCache::CACHING_PAGESIZE;
+      constexpr std::array<uint64_t, 3> sparse_starts{1, 7, 13};
+      constexpr std::array<uint64_t, 3> sparse_sizes{3, 2, 1};
+      constexpr std::array<uint32_t, 2> sparse_values{0x41372b19u, 0x957f6953u};
+      std::array<uint8_t, 16> sparse_clean{};
+      sparse_clean.fill(0xcdu);
+      const auto FillSparseOwner = [&](uint32_t owner_index) {
+        const auto address = base + sparse_offset +
+                             owner_index * sparse_owner_stride;
+        Libs::LibKernel::Memory::WriteBacking(address, sparse_clean.data(),
+                                              sparse_clean.size());
+        Libs::Graphics::Buffer *owner = nullptr;
+        for (size_t index = 0; index < sparse_starts.size(); ++index) {
+          const auto allocation = cache.ObtainBuffer(
+              address + sparse_starts[index], sparse_sizes[index], true, false);
+          Require(name, "sparse byte-range owner",
+                  allocation.first != nullptr &&
+                      (owner == nullptr || owner == allocation.first),
+                  "disjoint byte ranges did not resolve to one cached owner");
+          owner = allocation.first;
+        }
+        // Deliberately change native clean neighbors too: only the exact dirty
+        // bytes may be published to guest memory.
+        owner->Fill(owner->Offset(address), sparse_clean.size(),
+                    sparse_values[owner_index]);
+      };
+      const auto CheckSparseOwner = [&](uint32_t owner_index) {
+        const auto address = base + sparse_offset +
+                             owner_index * sparse_owner_stride;
+        auto expected = sparse_clean;
+        std::array<uint8_t, sizeof(uint32_t)> value_bytes{};
+        std::memcpy(value_bytes.data(), &sparse_values[owner_index],
+                    value_bytes.size());
+        for (size_t index = 0; index < sparse_starts.size(); ++index) {
+          for (uint64_t byte = sparse_starts[index];
+               byte < sparse_starts[index] + sparse_sizes[index]; ++byte) {
+            expected[byte] = value_bytes[byte % value_bytes.size()];
+          }
+        }
+        std::array<uint8_t, 16> published{};
+        Require(name, "sparse byte-range publication",
+                Libs::LibKernel::Memory::TryReadBacking(
+                    address, published.data(), published.size()) &&
+                    published == expected &&
+                    !cache.HasGpuDirtyBytes(address, published.size()) &&
+                    !cache.IsRegionGpuModified(address, published.size()),
+                "odd-byte readback lost dirty bytes or overwrote clean neighbors");
+      };
+      FillSparseOwner(0);
+      bool sparse_callback_ran = false;
+      bool sparse_callback_clean = false;
+      scheduler.DeferOperation([&] {
+        sparse_callback_clean =
+            !cache.HasGpuDirtyBytes(base + sparse_offset, sparse_clean.size()) &&
+            !cache.IsRegionGpuModified(base + sparse_offset, sparse_clean.size());
+        sparse_callback_ran = true;
+      });
+      const auto sparse_read_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + sparse_offset + sparse_starts[0], sparse_sizes[0]);
+      Require(name, "sparse byte-range submission",
+              scheduler.CurrentTick() == sparse_read_tick + 1,
+              "sparse source ranges were downloaded in separate submissions");
+      scheduler.PopPendingOperations();
+      Require(name, "readback callback ownership consistency",
+              sparse_callback_ran && sparse_callback_clean,
+              "readback drained a deferred callback before clearing page ownership");
+      CheckSparseOwner(0);
+
+      FillSparseOwner(0);
+      FillSparseOwner(1);
+      Require(name, "sparse disjoint GC owners",
+              BufferCacheTestAccess::PageOwner(cache, base + sparse_offset) !=
+                  BufferCacheTestAccess::PageOwner(
+                      cache, base + sparse_offset + sparse_owner_stride),
+              "sparse GC fixtures merged into one source owner");
+      const auto sparse_gc_tick = scheduler.CurrentTick();
+      for (uint32_t tick = 0; tick <= 160; ++tick) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "sparse multi-owner GC submission",
+              scheduler.CurrentTick() == sparse_gc_tick + 1 &&
+                  !cache.IsRegionRegistered(base + sparse_offset,
+                                             sparse_owner_stride + 16),
+              "sparse GC owners did not share one completion drain");
+      CheckSparseOwner(0);
+      CheckSparseOwner(1);
 
       constexpr uint64_t disjoint_owner_offset = 0x2140000;
       constexpr uint64_t disjoint_owner_size = 0x8000;

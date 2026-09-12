@@ -88,11 +88,8 @@ private:
 		bool                has_stream_leap;
 	};
 
-	struct DownloadCopy;
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
-	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
-	[[nodiscard]] static std::pair<uint64_t, uint64_t> DownloadEnvelope(const DownloadCopy& copy);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
@@ -108,7 +105,8 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

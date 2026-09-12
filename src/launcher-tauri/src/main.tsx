@@ -19,7 +19,10 @@ import "@fontsource-variable/inter/wght.css";
 // intended 220ms, both because theme.css was the one winning the tie.
 import "./theme.css";
 import App from "./App";
+import { ErrorBoundary } from "./shell/ErrorBoundary";
 import { runPerfProbe } from "./lib/perf";
+import { installIdleThrottle } from "./lib/idle";
+import { installContextMenuSuppression } from "./lib/contextMenu";
 import { initLocale } from "./i18n";
 
 initLocale();
@@ -27,7 +30,9 @@ initLocale();
 try {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <App />
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
     </React.StrictMode>,
   );
 } catch (e) {
@@ -40,3 +45,5 @@ try {
 }
 
 runPerfProbe();
+installIdleThrottle();
+installContextMenuSuppression();

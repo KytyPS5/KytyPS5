@@ -16,6 +16,9 @@ unaffected either way.
 
 ## Run it
 
+`start.sh` is bash-only. For Windows and macOS, and for a step-by-step first run, see
+[RUNNING.md](RUNNING.md).
+
 ```bash
 cd src/launcher-tauri
 npm install       # first time only

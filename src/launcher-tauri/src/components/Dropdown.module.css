@@ -89,7 +89,8 @@
   transform: translateY(0) scale(1);
 }
 
-:global(:root[data-perf="low"]) .panel {
+:global(:root[data-perf="low"]) .panel,
+:global(:root[data-idle="1"]) .panel {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   background: rgba(20, 24, 36, 0.96);

@@ -44,7 +44,7 @@ export function RestMode({ open, onClose }: { open: boolean; onClose: () => void
 
   return (
     <div className={`${styles.root} ${isOpen ? styles.isOpen : ""}`}>
-      <div className={styles.atmosphere} style={{ backgroundImage: "url(/art/ambient_idle.png)" }} />
+      <div className={styles.atmosphere} style={{ backgroundImage: "url(/art/ambient_idle.webp)" }} />
       <div className={styles.status}>{t("restMode.status")}</div>
     </div>
   );

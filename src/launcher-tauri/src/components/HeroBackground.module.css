@@ -91,3 +91,11 @@
   composes: accentRadial;
   opacity: 1;
 }
+
+/* Idle throttle (lib/idle.ts, theme.css). The Ken Burns pan is the single
+   most expensive thing this app composites -- a full-screen transform that
+   never ends -- so it is the first thing to park when nobody is watching. */
+:global(:root[data-idle="1"]) .base,
+:global(:root[data-idle="1"]) .layer {
+  animation-play-state: paused;
+}

@@ -287,8 +287,26 @@ impl Configuration {
         }
         doc.set(section, &k("host_input_mapping"), encode_string_list(&self.host_input_mapping));
         doc.set(section, &k("elf"), encode_string(&self.elf));
-        doc.set(section, &k("audio_output_device"), encode_string(&self.audio_output_device));
-        doc.set(section, &k("audio_input_device"), encode_string(&self.audio_input_device));
+        // Same rule as bvh_stub_enabled above: both of these are
+        // launcher-tauri additions the Qt launcher knows nothing about, so
+        // writing them unconditionally put `audio_output_device=` and
+        // `audio_input_device=` into every Kyty.ini this launcher saved --
+        // including the files a user carries back and forth to the Qt
+        // launcher. Empty means "whatever SDL2 picks by default", which is
+        // exactly what an absent key already decodes to (read_from leaves
+        // the String::new() default), so the empty case is left out
+        // entirely and an existing key is cleared on the way back to
+        // default.
+        if self.audio_output_device.is_empty() {
+            doc.remove(section, &k("audio_output_device"));
+        } else {
+            doc.set(section, &k("audio_output_device"), encode_string(&self.audio_output_device));
+        }
+        if self.audio_input_device.is_empty() {
+            doc.remove(section, &k("audio_input_device"));
+        } else {
+            doc.set(section, &k("audio_input_device"), encode_string(&self.audio_input_device));
+        }
     }
 
     fn read_from(doc: &IniDocument, section: &str, prefix: &str) -> Self {
@@ -557,6 +575,35 @@ mod tests {
 
         save(&path, &cfg).unwrap();
         let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after.trim_end(), REAL_KYTY_INI.trim_end());
+    }
+
+    #[test]
+    fn selected_audio_devices_round_trip_and_clear_back_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(&dir, "Kyty.ini", REAL_KYTY_INI);
+
+        // A picked device is persisted...
+        let mut cfg = load(&path);
+        cfg.global.audio_output_device = "Speakers (Realtek)".to_string();
+        cfg.global.audio_input_device = "Microphone (USB)".to_string();
+        save(&path, &cfg).unwrap();
+
+        let reloaded = load(&path);
+        assert_eq!(reloaded.global.audio_output_device, "Speakers (Realtek)");
+        assert_eq!(reloaded.global.audio_input_device, "Microphone (USB)");
+
+        // ...and clearing it back to "system default" takes the key out
+        // again rather than leaving an empty one behind, so the file goes
+        // back to something the Qt launcher would have written.
+        let mut cleared = reloaded;
+        cleared.global.audio_output_device = String::new();
+        cleared.global.audio_input_device = String::new();
+        save(&path, &cleared).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("audio_output_device"), "{after}");
+        assert!(!after.contains("audio_input_device"), "{after}");
         assert_eq!(after.trim_end(), REAL_KYTY_INI.trim_end());
     }
 

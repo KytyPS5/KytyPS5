@@ -154,3 +154,9 @@
 .captionHidden {
   opacity: 0;
 }
+
+/* Idle throttle (lib/idle.ts, theme.css) -- same reasoning as GameTile. */
+:global(:root[data-idle="1"]) .artFlux::before,
+:global(:root[data-idle="1"]) .artShimmer::before {
+  animation-play-state: paused;
+}

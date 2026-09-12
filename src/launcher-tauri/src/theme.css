@@ -374,7 +374,13 @@ body::after {
 .pill-button.primary:focus-visible,
 .pill-button.primary.ps-focused {
   outline-color: var(--focus-ring-dark);
-  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.5), 0 0 0 2px var(--focus-ring-dark) inset;
+  /* One ring, not two. This used to add `0 0 0 2px inset` on top of the
+     outline above, which drew a second concentric ring a couple of pixels
+     inside the first -- most obvious on Home's Play button, the largest
+     primary in the app. The outline follows border-radius on its own, so
+     the inset copy bought nothing but the doubling. The drop shadow stays:
+     that is the button's lift off the page, not a focus indicator. */
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.5);
 }
 
 /* Shared range-slider primitive -- the app's only input[type=range] styling,
@@ -482,8 +488,10 @@ input[type="range"]:disabled {
 }
 .icon-button:focus-visible,
 .icon-button.ps-focused {
+  /* Outline only -- the `0 0 0 2px` ring this used to also carry sat just
+     outside the outline and read as two stacked boxes, which is what the
+     modal close button looked like. */
   outline-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 .icon-button:disabled {
   opacity: 0.35;
@@ -770,4 +778,38 @@ select {
     transition-duration: 1ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ---- idle throttle -------------------------------------------------------
+   Set by lib/idle.ts whenever nobody is watching this window: hidden,
+   unfocused, or a game is running (the case that matters -- with
+   autoCloseOnLaunch off the launcher stays resident for the whole session,
+   and the emulator wants that GPU).
+
+   Parking the animations rather than shortening them, unlike the
+   reduced-motion block above: this state is temporary and reverses, so
+   `paused` lets anything caught mid-flight resume from where it stopped
+   instead of snapping to its end. Measured cost of not doing this: ~17% of
+   one core at rest on Windows, ~13% of it inside WebView2's GPU process,
+   composited against the backdrop-filter rules the second selector flattens.
+
+   Targeted at the *infinite* animations only -- the hero Ken Burns, the
+   tile/card flux ring and shimmer, and the pulse dot below -- never blanket
+   `*`. A blanket rule also froze the one-shot entrance animations, and
+   those reveal their elements: Home.module.css builds its tiles at
+   `opacity: 0` and animates up to 1 with `forwards`/`both`, so pausing
+   those left the game icons invisible until the idle state cleared rather
+   than saving anything. One-shot entrances are ~300ms and cost nothing;
+   they are deliberately left to run. Each component module pauses its own
+   looping animations under this same attribute. */
+:root[data-idle="1"] .status-dot {
+  /* ps-pulse is applied as an inline style (TopBar.tsx, Logs.tsx), so this
+     needs `!important` to win against it. */
+  animation-play-state: paused !important;
+}
+
+:root[data-idle="1"] .glass-panel {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.92);
 }

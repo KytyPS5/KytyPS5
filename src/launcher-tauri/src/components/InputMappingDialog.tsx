@@ -10,7 +10,7 @@
 //   actually reads) already assumes. Produces `--gamepad-map
 //   Control=SdlName` strings consumed by window.cpp's GamepadRemap.
 //
-// The diagram (public/art/controller_diagram.png) depicts a DualSense-
+// The diagram (public/art/controller_diagram.webp) depicts a DualSense-
 // shaped silhouette at the owner's explicit request (2026-09-08, cropped
 // from a reference photo, cropped to its front-view panel) -- flagged once
 // as a closer trade-dress consideration than the previous generic
@@ -357,7 +357,7 @@ function CaptureOverlayFrame({ message, onCancel }: { message: string; onCancel:
 function ControllerDiagram() {
   return (
     <img
-      src="/art/controller_diagram.png"
+      src="/art/controller_diagram.webp"
       alt=""
       style={{ display: "block", width: "100%", height: "auto" }}
     />

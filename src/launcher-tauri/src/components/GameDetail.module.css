@@ -172,3 +172,73 @@
   display: flex;
   flex-direction: column;
 }
+
+/* ---- compatibility badge + its hover detail -----------------------------
+   The badge itself is the whole story at a glance ("In game"); which
+   platform that figure came from, how many reports stand behind it and
+   which build they were filed against is the fine print you go looking for,
+   not something to read every time you open a game. So the badge stands
+   alone and the rest appears on hover.
+
+   `.ps-focused` alongside `:hover` is not optional here: this app is driven
+   by a gamepad, which has no pointer, so a hover-only reveal would hide the
+   detail from exactly the input it is designed around. The badge carries
+   data-focusable so the pad can land on it -- the same thing Trophies' and
+   the saved-data rows do for informational elements. */
+.compatBadge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-secondary);
+  outline: 1.5px solid transparent;
+  outline-offset: 2px;
+  transition: outline-color var(--t-focus) var(--ease-enter);
+}
+.compatBadge.ps-focused {
+  outline-color: var(--accent);
+}
+
+.compatTip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: max-content;
+  max-width: 280px;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: var(--glass-heavy-bg);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 28px -10px var(--shadow-color);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition: opacity var(--t-fast) var(--ease-ui), transform var(--t-fast) var(--ease-ui);
+}
+.compatBadge:hover .compatTip,
+.compatBadge.ps-focused .compatTip {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Same flatten as every other blurred surface under the perf probe and the
+   idle throttle (theme.css). */
+:global(:root[data-perf="low"]) .compatTip,
+:global(:root[data-idle="1"]) .compatTip {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.95);
+}

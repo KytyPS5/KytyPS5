@@ -125,6 +125,15 @@ export interface Catalog {
     removeSaveDataFailed: string;
     saveDataTab: string;
     noSaveData: string;
+    compatReport: string;
+    compatReports: string;
+    compatTestedOn: string;
+    compatAllPlatforms: string;
+    compatThisPlatform: string;
+    reportStatus: string;
+    compatibilityNote: string;
+    reportStatusPrompt: string;
+    reportStatusConfirm: string;
     status: {
       Unknown: string;
       InGame: string;
@@ -438,6 +447,15 @@ const en: Catalog = {
     removeSaveDataFailed: "Could not remove:\n{list}",
     saveDataTab: "Saved data",
     noSaveData: "No saved data found for this game.",
+    compatReport: "1 report",
+    compatReports: "{count} reports",
+    compatTestedOn: "tested on {value}",
+    compatAllPlatforms: "all platforms",
+    compatThisPlatform: "this platform",
+    reportStatus: "Report status",
+    compatibilityNote: "Note (optional)",
+    reportStatusPrompt: "Opens the KytyPS5 issue form on GitHub, pre-filled with this game's name, serial and your emulator build. Nothing is sent until you submit it there.",
+    reportStatusConfirm: "Open in browser",
     status: {
       Unknown: "Unknown",
       InGame: "In game",

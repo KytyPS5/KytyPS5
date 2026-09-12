@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { openPath } from "@tauri-apps/plugin-opener";
-import { FolderOpen, Play, Save as SaveIcon, Square, SlidersHorizontal, Trophy, Wrench } from "lucide-react";
-import type { Configuration, CompatibilityMap, GameEntry, GameStatus, KytyConfig, PatchStatus } from "../types";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { Flag, FolderOpen, Play, Save as SaveIcon, Square, SlidersHorizontal, Trophy, Wrench } from "lucide-react";
+import type { Configuration, CompatibilityMap, EmulatorInfo, GameEntry, GameStatus, KytyConfig, PatchStatus } from "../types";
+import { buildStatusReportUrl } from "../lib/statusReport";
 import { useStore } from "../store/observable";
 import { isRunningStore, runningGameStore, runGame, stopGame } from "../store/run";
 import { STATUS_CLASS, useGameArt } from "./GameCard";
 import { ConfigForm, Field } from "./ConfigForm";
 import { configStore, saveConfigAndRescan } from "../store/library";
 import { Dropdown } from "./Dropdown";
+import { Modal } from "./Modal";
 import { Toggle } from "./Toggle";
 import { TrophiesView } from "../views/Trophies";
 import { useT } from "../i18n";
@@ -52,9 +54,42 @@ export function GameDetail({
   const [isPatchable, setIsPatchable] = useState(false);
   const [saveDirs, setSaveDirs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** Gates the jump out to the browser behind a confirm step -- leaving the
+   * app for an external site is not something a button press should do
+   * without saying so first. Modal rather than a native confirm(): the
+   * OS dialog's buttons live outside FocusNav's DOM, so a controller-only
+   * session could not answer it (the same reasoning the saved-data confirm
+   * below is written out for). */
+  const [reportPrompt, setReportPrompt] = useState(false);
 
   const entry = compatibility[game.config.titleId.toUpperCase()];
   const status: GameStatus = entry?.status ?? "Unknown";
+
+  /** What the badge is actually claiming, in small print under it.
+   *
+   * A bare status is not enough to act on: the community feed reports a
+   * cross-platform aggregate alongside a per-OS breakdown, and the two
+   * disagree often enough to matter -- a title that is InGame on Linux can
+   * be DoesntBoot on Windows. compatibility.rs resolves this platform's own
+   * figure when the feed has one, and this says which of the two is on
+   * screen, how many reports stand behind it, and which emulator build they
+   * were filed against. One report on a build from months ago is a very
+   * different claim from twelve on the current one.
+   *
+   * Nothing here for a locally-edited database: that is the user's own
+   * opinion, with no report count or platform split to describe. */
+  const compatDetail = (() => {
+    if (compatibilityIsLocal || !entry || status === "Unknown") return null;
+    const lines: string[] = [
+      entry.platformSpecific ? t("gameDetail.compatThisPlatform") : t("gameDetail.compatAllPlatforms"),
+    ];
+    if (entry.reports === 1) lines.push(t("gameDetail.compatReport"));
+    else if (entry.reports > 1) lines.push(t("gameDetail.compatReports", { count: String(entry.reports) }));
+    if (entry.version) lines.push(t("gameDetail.compatTestedOn", { value: entry.version }));
+    // One line each rather than a single "a · b · c" run: the build string
+    // alone is long enough to push that past any sensible tooltip width.
+    return lines;
+  })();
 
   useEffect(() => {
     setError(null);
@@ -73,8 +108,42 @@ export function GameDetail({
     }
   };
 
+  /** Opens the upstream status-report form with what the launcher already
+   * knows filled in. The emulator's version is probed here rather than held
+   * in state because it is wanted exactly once, at the moment the user asks
+   * to report -- and a failure to probe it is not a reason to refuse the
+   * report, only to leave that one field blank for them to type. */
+  const reportStatus = async () => {
+    setReportPrompt(false);
+    let emulatorVersion = "";
+    try {
+      emulatorVersion = (await invoke<EmulatorInfo>("find_emulator")).version;
+    } catch {
+      // Leave it blank; the form is still worth opening.
+    }
+    await openUrl(
+      buildStatusReportUrl({
+        name: game.config.name,
+        titleId: game.config.titleId,
+        emulatorVersion,
+        status,
+      }),
+    );
+  };
+
   const setStatus = async (next: GameStatus) => {
     await invoke("compatibility_set_status", { titleId: game.config.titleId, status: next });
+    onRescanCompatibility();
+  };
+
+  /** Only reachable while the database is local. `compatibility_set_comment`
+   * has existed since the port but nothing ever called it, so a user editing
+   * their own compatibility notes could set a status and never say why.
+   * Committed on blur rather than per keystroke: every save rewrites the
+   * whole JSON file and triggers a rescan. */
+  const commitComment = async (next: string) => {
+    if (next === (entry?.comment ?? "")) return;
+    await invoke("compatibility_set_comment", { titleId: game.config.titleId, comment: next });
     onRescanCompatibility();
   };
 
@@ -107,18 +176,47 @@ export function GameDetail({
           </div>
           <div className={styles.headerActions}>
             {compatibilityIsLocal ? (
-              <div style={{ width: 170 }}>
+              <div style={{ width: 170, display: "flex", flexDirection: "column", gap: 6 }}>
                 <Dropdown
                   ariaLabel={t("gameDetail.compatibilityStatus")}
                   value={status}
                   onChange={(v) => void setStatus(v as GameStatus)}
                   options={Object.entries(STATUS_KEYS).map(([value, key]) => ({ value, label: t(key) }))}
                 />
+                <input
+                  aria-label={t("gameDetail.compatibilityNote")}
+                  placeholder={t("gameDetail.compatibilityNote")}
+                  defaultValue={entry?.comment ?? ""}
+                  key={game.config.titleId}
+                  onBlur={(e) => void commitComment(e.target.value)}
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    color: "inherit",
+                    background: "rgba(255, 255, 255, 0.06)",
+                    border: "1px solid rgba(255, 255, 255, 0.14)",
+                    borderRadius: 8,
+                  }}
+                />
               </div>
             ) : (
-              <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+              <span
+                className={styles.compatBadge}
+                // Only a nav stop when there is something behind it to
+                // reveal; an unknown status has no detail worth stopping on.
+                {...(compatDetail ? { "data-focusable": true, "data-focus-key": `compat-${game.config.titleId}` } : {})}
+              >
                 <span className={`status-dot ${STATUS_CLASS[status] ?? "unknown"}`} />
                 {t(STATUS_KEYS[status])}
+                {compatDetail && (
+                  <span className={styles.compatTip} role="tooltip">
+                    {compatDetail.map((line) => (
+                      <span key={line}>{line}</span>
+                    ))}
+                  </span>
+                )}
               </span>
             )}
             {isThisRunning ? (
@@ -132,6 +230,9 @@ export function GameDetail({
             )}
             <button className="pill-button" disabled={!game.config.basedir} onClick={() => void openPath(game.config.basedir)}>
               <FolderOpen size={15} /> {t("gameDetail.openFolder")}
+            </button>
+            <button className="pill-button" disabled={!game.config.titleId} onClick={() => setReportPrompt(true)}>
+              <Flag size={15} /> {t("gameDetail.reportStatus")}
             </button>
           </div>
         </div>
@@ -173,6 +274,27 @@ export function GameDetail({
           </div>
         </div>
       </div>
+
+      {reportPrompt && (
+        <Modal
+          title={t("gameDetail.reportStatus")}
+          width={520}
+          dividers={false}
+          onClose={() => setReportPrompt(false)}
+          footer={
+            <>
+              <button className="pill-button" onClick={() => setReportPrompt(false)}>
+                {t("common.cancel")}
+              </button>
+              <button className="pill-button primary" onClick={() => void reportStatus()}>
+                {t("gameDetail.reportStatusConfirm")}
+              </button>
+            </>
+          }
+        >
+          <p style={{ margin: 0, fontSize: 14, lineHeight: 1.55 }}>{t("gameDetail.reportStatusPrompt")}</p>
+        </Modal>
+      )}
     </div>
   );
 }

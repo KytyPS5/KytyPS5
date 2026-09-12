@@ -36,7 +36,13 @@ function stripInterfaceBlock(src, name) {
 }
 
 function loadCatalog(file) {
-  const src = readFileSync(path.join(localesDir, file), "utf8");
+  // Normalised to LF first. Every strip below is a regex anchored on a bare
+  // newline, and git checks these files out with CRLF on Windows
+  // (core.autocrlf), so on a Windows clone the DeepPartial strip matched
+  // nothing: the `export type` survived into the data: URL and the whole
+  // script died with "SyntaxError: Unexpected token 'export'". It reports
+  // coverage fine on Linux, which is why this went unnoticed.
+  const src = readFileSync(path.join(localesDir, file), "utf8").replace(/\r\n/g, "\n");
   const stripped = stripInterfaceBlock(src, "Catalog")
     .replace(/export type DeepPartial<T>[\s\S]*?:\s*T;\n/, "")
     .replace(/^import[^\n]*\n/gm, "")

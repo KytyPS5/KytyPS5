@@ -14,7 +14,7 @@ function hashToPlaceholder(key: string): string {
     h = (h * 31 + key.charCodeAt(i)) | 0;
   }
   const index = (Math.abs(h) % COVER_PLACEHOLDER_COUNT) + 1;
-  return `/art/cover_placeholder_${String(index).padStart(2, "0")}.png`;
+  return `/art/cover_placeholder_${String(index).padStart(2, "0")}.webp`;
 }
 
 export type HeroArtKind = "backdrop" | "icon" | "placeholder";

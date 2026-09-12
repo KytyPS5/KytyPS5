@@ -105,8 +105,8 @@ export function BootController({
       {children}
       {phase !== "ready" && (
         <div className={styles.root} data-phase={phase}>
-          <div className={styles.atmosphere} style={{ backgroundImage: "url(/art/ambient_boot.png)" }} />
-          <img className={styles.logo} src="/art/kyty_mark.png" alt="" />
+          <div className={styles.atmosphere} style={{ backgroundImage: "url(/art/ambient_boot.webp)" }} />
+          <img className={styles.logo} src="/art/kyty_mark.webp" alt="" />
           <div className={styles.status}>{t("boot.status")}</div>
         </div>
       )}

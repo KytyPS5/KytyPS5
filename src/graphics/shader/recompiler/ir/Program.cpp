@@ -219,6 +219,15 @@ Value ResolveActiveU32(Value value, Value active) {
 }
 
 Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+	const auto fail = [&](CyclicPhiReject reason, Value entry = {}, Value other = {}) {
+		if (reject != nullptr) {
+			*reject = {reason, entry, other};
+		}
+		return Value {};
+	};
+	if (reject != nullptr) {
+		*reject = {};
+	}
 	value            = value.Resolve();
 	const auto* root = value.TryInstruction();
 	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
@@ -292,8 +301,12 @@ Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
 				entry = operand;
 			} else if (!EquivalentValue(program, entry, operand)) {
 				// A merge, not a loop: no single host binding stands for it.
+				return fail(CyclicPhiReject::Merge, entry, operand);
 			}
 		}
+	}
+	if (entry.IsEmpty()) {
+		return fail(CyclicPhiReject::NoEntry);
 	}
 	if (web_out != nullptr) {
 		*web_out = web_order;

@@ -164,6 +164,7 @@ private:
 	ResourcePlan::EvaluationContext& m_context;
 	SrtRefusal                       m_refusal = SrtRefusal::None;
 	// Loop-carried phi values a fixpoint trial takes on trust, and phis no walk here may assume.
+	// Set only inside a ballot's per-lane sweep; a flat-slot read or a readfirstlane suspends it.
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

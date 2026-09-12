@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -20,6 +21,9 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+std::string& MaterializeFailure() {
+	static thread_local std::string reason;
+	return reason;
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
@@ -1380,10 +1384,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (const auto found = cloned.find(source); found != cloned.end()) {
 			return Value(found->second);
 		}
-		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			plan.requires_specialization_memory = true;
-			plan.capture_specialization_reads   = true;
-		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
 		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
@@ -1585,8 +1585,6 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
@@ -1640,19 +1638,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    kind, resource, source, candidates));
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
 		if (base_index >= program.info.buffers.size()) return false;
-		const auto& base = program.info.buffers[base_index];
-		if (i < program.info.buffers.size()) {
-			const auto* source = Source(program, base.source);
-			if (source == nullptr) return false;
-			if (source->indirect_descriptor.has_value()) {
-				snapshot.buffers[i] = {.dword_count = 4u};
-				if (active.empty() || active[base.source]) {
-					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers,
 					        [&](DescriptorValue& value) {
@@ -1661,8 +1650,6 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
-			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
-				return false;
 			}
 		}
 		auto&                descriptor_value = snapshot.buffers[i];
@@ -1690,6 +1677,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+			auto& evaluator = capture_reads && written ? clean : walker;
+			return evaluator.EvaluateDescriptor(source, value) ||
+			       SpecializationFail(fmt::format("descriptor evaluation source={}: {}", source,
+			                                      SrtRefusalName(evaluator.Refusal())));
+		return MaterializeFailure().empty() ? SpecializationFail(fmt::format(
+		                                          "indirect {} resource={} source={} candidates={}",
+		                                          kind, resource, source, candidates))
+				}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {

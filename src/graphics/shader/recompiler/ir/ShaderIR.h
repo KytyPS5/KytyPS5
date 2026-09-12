@@ -689,6 +689,7 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
+	// On the plan because the host walk re-executes a readfirstlane once per lane.
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
@@ -727,7 +728,6 @@ struct Program: ResourcePlan {
 
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
-	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	// A hardware ray-tracing intersect was lowered to a constant miss.
@@ -756,7 +756,18 @@ bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,
                                const DescriptorSource::IndirectDescriptor& right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+
+// Why a loop-carried phi web has no single entry value: no operand enters it, or two disagree.
+enum class CyclicPhiReject { None, NoEntry, Merge };
+
+struct CyclicPhiFailure {
+	CyclicPhiReject reason = CyclicPhiReject::None;
+	Value           entry;
+	Value           other;
+};
+
 Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out = nullptr,
 Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

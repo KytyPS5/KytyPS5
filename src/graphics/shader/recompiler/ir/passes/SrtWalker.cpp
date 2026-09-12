@@ -215,6 +215,14 @@ private:
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		if (require_uniform) {
+			const auto cached = m_validated_uniform.find(inst);
+			if (cached != m_validated_uniform.end() &&
+			    std::ranges::find(cached->second, Scope {m_active_mask, m_lane_bound}) !=
+			        cached->second.end()) {
+				return true;
+			}
+		}
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
@@ -292,6 +300,11 @@ private:
 				return finish(false);
 			}
 			return finish(Validate(invariant));
+		}
+		if (op == ValueOpcode::LaneId) {
+			// Only a ballot re-executes its predicate per lane; elsewhere the value varies per
+			// lane.
+			return finish(inst->NumArgs() == 0 && m_lane_bound);
 		}
 		if (op == ValueOpcode::ReadFirstLane) {
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
@@ -677,6 +690,7 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	SrtWalker trial(*this, m_active_mask, false, m_clean_evaluator, true);
 	trial.m_assumed        = m_assumed;
 	trial.m_barred         = m_barred;
+	trial.m_lane           = m_lane;
 	trial.m_suspended_lane = m_suspended_lane;
 	for (const auto* member: web) {
 		}
@@ -741,13 +755,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
@@ -756,26 +768,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		if (immediate < 0) {
 			return false;
 		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
 				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
 			}
 		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
 			result = 0u;
 			return true;
-		}
-		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
@@ -790,7 +787,6 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 	} else {
-		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
@@ -825,11 +821,29 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 		case ValueOpcode::ReadFirstLane: {
+			// A uniform operand, so a ballot lane bound above does not reach it.
+			auto* lane       = m_lane;
+			auto* suspended  = m_suspended_lane;
+			m_suspended_lane = DependenceScope();
+			m_lane           = nullptr;
+			bool evaluated   = false;
 			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
-				return EvaluateWide(inst.Arg(0), result);
+				evaluated = EvaluateWide(inst.Arg(0), result);
+			} else {
+				SrtWalker active(*this, inst.Arg(1), false, &clean_active);
+				evaluated = active.EvaluateWide(inst.Arg(0), result);
 			}
-			return active.EvaluateWide(inst.Arg(0), result);
+			m_lane           = lane;
+			m_suspended_lane = suspended;
+			return evaluated;
+		}
+		case ValueOpcode::Ballot: return EvaluateBallot(inst, result);
+		case ValueOpcode::LaneId:
+			// Only a per-lane sweep binds the lane; elsewhere the value varies per lane.
+			if (m_lane == nullptr) return Refuse(SrtRefusal::VaryingLane);
+			m_lane->dependent = true;
 			result            = m_lane->lane;
+			return true;
 		}
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
@@ -850,7 +864,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				    (inst.Flags<SrtReadFlags>().clean != 0u ||
 				     (inst.GetOpcode() == ValueOpcode::LoadBufferU32 &&
 				      m_clean_evaluator->m_active_mask == m_active_mask))) {
-					return m_clean_evaluator->EvaluateWide(Value(const_cast<Inst*>(&inst)), result);
 				}
 				return EvaluateRawRead(inst, result);
 			}

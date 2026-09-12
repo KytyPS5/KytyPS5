@@ -164,6 +164,17 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                   values.size_bytes())) {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -344,12 +355,23 @@ struct PipelineCache::ProgramCache {
 	}
 
 	void Skip(const ProgramKey& key, ShaderType stage, uint64_t hash, uint32_t pc,
+	          std::string_view reason) {
+		programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}, nullptr)
+		    .first->second.skip_dispatch = true;
+		if (!reported_shaders.insert(hash).second) {
 			return;
 		}
 		PipelineCacheLog("!!! SHADER SKIP !!! shader=0x{:016x} stage={} pc=0x{:08x} reason={}; its "
 		                 "draws and dispatches are dropped, rendering is incomplete",
 		                 hash, StageShortName(stage), pc,
 		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
+	}
+
+	void ReportUnmaterialized(ShaderType stage, uint64_t hash) {
+		if (!reported_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("shader resources unavailable, skipping this dispatch: "
 	}
 
 	void ReportStubbed(ShaderType stage, uint64_t hash) {
@@ -593,6 +615,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<uint64_t>                                reported_shaders;
 	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;

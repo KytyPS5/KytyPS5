@@ -136,6 +136,13 @@ struct Fixture {
 
   // A guest shape tracking refuses reports a status; tests that expect a refusal see it as fatal.
   void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input) {
+    const auto status = TryPlanAndTrack(input);
+    if (!status.ok) throw std::runtime_error(status.reason);
+  }
+
+  ResourceTrackingStatus TryPlanAndTrack() { return TryPlanAndTrack({.compute = &compute_info}); }
+
+  ResourceTrackingStatus TryPlanAndTrack(Libs::Graphics::ShaderStageInputInfo input) {
     for (size_t index = 0; index < program.blocks.size(); ++index) {
       const auto condition = program.blocks[index]->condition;
       if (!condition.IsEmpty())
@@ -157,7 +164,7 @@ struct Fixture {
         Emit(ValueOpcode::ReferenceU32, {value}, 0, target);
       }
     }
-    TrackResources(program, {}, {}, input);
+    return TrackResources(program, {}, {}, input);
   }
 };
 
@@ -8894,6 +8901,26 @@ void TestMalformedMemoryKindsRejected() {
         "image operation has invalid resource kind",
         "resource tracking accepted an image opcode with address metadata");
   }
+}
+
+
+// ---- Descriptor port (U2): the branch's tracking fixtures, re-expressed on upstream's tracker ----
+
+int FlatSlotKind(const Program &program, Value value) {
+  for (uint32_t slot = 0; slot < program.srt_reads.size(); ++slot) {
+    if (program.srt_reads[slot].value.Resolve() == value.Resolve()) {
+      return slot < program.data_flat_slots.size()
+                 ? static_cast<int>(program.data_flat_slots[slot])
+                 : -2;
+    }
+  }
+  return -1;
+}
+
+bool StoresDecodedInShader(const Program &program) {
+  return std::ranges::any_of(program.memory_info, [](const auto &memory) {
+    return memory.kind == ResourceKind::IndirectBuffer;
+  });
 }
 
 } // namespace

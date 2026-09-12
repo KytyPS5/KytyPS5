@@ -5423,6 +5423,8 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
 
 void TestNewShaderRecompilerImageGatherVariants() {
   const uint32_t shader[] = {
+      EncodeMimg0(0x44, 0x1),
+      EncodeMimg1(84, 0, 1, 28), // image_gather4_l
       EncodeMimg0(0x47, 0x1),
       EncodeMimg1(60, 0, 1, 4), // image_gather4_lz
       EncodeMimg0(0x48, 0x2),
@@ -5446,6 +5448,8 @@ void TestNewShaderRecompilerImageGatherVariants() {
   auto result = RecompileForTest(shader, options);
   Check(Common::ContainsStr(result.decoded_dump, "image_gather4_lz"),
         "new decoder did not decode IMAGE_GATHER4_LZ");
+  Check(Common::ContainsStr(result.decoded_dump, "GATHER4_L "),
+        "new decoder did not decode IMAGE_GATHER4_L");
   Check(Common::ContainsStr(result.decoded_dump, "image_gather4_lz_o"),
         "new decoder did not decode IMAGE_GATHER4_LZ_O");
   Check(Common::ContainsStr(result.decoded_dump, "image_gather4_c"),

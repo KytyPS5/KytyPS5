@@ -38,7 +38,7 @@ void Builder::RequireVersion(uint32_t version) {
 
 void Builder::RequireCapability(spv::Capability capability) {
 	if (m_required_capabilities.insert(capability).second) {
-		AppendInstruction(m_capabilities, spv::OpCapability, {capability});
+		AppendInstruction(m_capabilities, spv::OpCapability, {static_cast<uint32_t>(capability)});
 	}
 }
 
@@ -77,7 +77,7 @@ uint32_t Builder::Type(spv::Op opcode, const std::vector<uint32_t>& operands) {
 	}
 	const auto id = AllocateId();
 	m_declaration_ids.emplace(std::move(key), id);
-	std::vector<uint32_t> words {opcode, id};
+	std::vector<uint32_t> words {static_cast<uint32_t>(opcode), id};
 	words.insert(words.end(), operands.begin(), operands.end());
 	AppendInstructionWords(m_declarations, words.data(), words.size());
 	return id;
@@ -88,7 +88,8 @@ uint32_t Builder::DecoratedType(spv::Op opcode, std::initializer_list<uint32_t> 
 	if (annotations.size() == 0) {
 		return Type(opcode, operands);
 	}
-	std::vector<uint32_t> key {opcode, static_cast<uint32_t>(operands.size())};
+	std::vector<uint32_t> key {static_cast<uint32_t>(opcode),
+	                           static_cast<uint32_t>(operands.size())};
 	key.insert(key.end(), operands.begin(), operands.end());
 	key.push_back(static_cast<uint32_t>(annotations.size()));
 	for (const auto& annotation: annotations) {
@@ -101,11 +102,11 @@ uint32_t Builder::DecoratedType(spv::Op opcode, std::initializer_list<uint32_t> 
 	}
 	const auto id = AllocateId();
 	m_declaration_ids.emplace(std::move(key), id);
-	std::vector<uint32_t> words {opcode, id};
+	std::vector<uint32_t> words {static_cast<uint32_t>(opcode), id};
 	words.insert(words.end(), operands.begin(), operands.end());
 	AppendInstructionWords(m_declarations, words.data(), words.size());
 	for (const auto& annotation: annotations) {
-		words = {annotation.opcode, id};
+		words = {static_cast<uint32_t>(annotation.opcode), id};
 		words.insert(words.end(), annotation.operands.begin(), annotation.operands.end());
 		AppendInstructionWords(m_annotations, words.data(), words.size());
 	}
@@ -128,7 +129,7 @@ uint32_t Builder::Constant(spv::Op opcode, uint32_t type, const std::vector<uint
 	}
 	const auto id = AllocateId();
 	m_declaration_ids.emplace(std::move(key), id);
-	std::vector<uint32_t> words {opcode, type, id};
+	std::vector<uint32_t> words {static_cast<uint32_t>(opcode), type, id};
 	words.insert(words.end(), operands.begin(), operands.end());
 	AppendInstructionWords(m_declarations, words.data(), words.size());
 	return id;
@@ -142,7 +143,8 @@ uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass 
 
 void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
                                    spv::StorageClass storage_class) {
-	AppendInstruction(m_declarations, spv::OpVariable, {pointer_type, id, storage_class});
+	AppendInstruction(m_declarations, spv::OpVariable,
+	                  {pointer_type, id, static_cast<uint32_t>(storage_class)});
 }
 
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
@@ -181,7 +183,7 @@ void Builder::AddMemoryModel(std::initializer_list<uint32_t> operands) {
 
 void Builder::AddEntryPoint(spv::ExecutionModel execution_model, uint32_t entry_point,
                             const char* name, const std::vector<uint32_t>& interfaces) {
-	std::vector<uint32_t> operands = {execution_model, entry_point};
+	std::vector<uint32_t> operands = {static_cast<uint32_t>(execution_model), entry_point};
 	AppendString(operands, name);
 	operands.insert(operands.end(), interfaces.begin(), interfaces.end());
 	if (m_version >= 0x00010400u) {

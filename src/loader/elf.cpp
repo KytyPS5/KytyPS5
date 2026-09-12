@@ -1,4 +1,5 @@
 #include "loader/elf.h"
+#include "loader/elfValidator.h"
 
 #include "common/assert.h"
 #include "common/file.h"
@@ -437,23 +438,10 @@ bool Elf64::IsSelf() const {
 		return false;
 	}
 
-	const bool known_magic = (m_self->ident[0] == 0x4f && m_self->ident[1] == 0x15 &&
-	                          m_self->ident[2] == 0x3d && m_self->ident[3] == 0x1d) ||
-	                         (m_self->ident[0] == 0x54 && m_self->ident[1] == 0x14 &&
-	                          m_self->ident[2] == 0xf5 && m_self->ident[3] == 0xee);
-	if (!known_magic) {
+	if (!HasSupportedSelfMagic(*m_self)) {
 		return false;
 	}
-
-	const bool known_ident_tail =
-	    (m_self->ident[4] == 0x00 && m_self->ident[5] == 0x01 && m_self->ident[6] == 0x01 &&
-	     m_self->ident[7] == 0x12 && m_self->ident[8] == 0x01 && m_self->ident[9] == 0x01 &&
-	     m_self->ident[10] == 0x00 && m_self->ident[11] == 0x00 && m_self->unknown == 0x22) ||
-	    (m_self->ident[4] == 0x10 && m_self->ident[5] == 0x01 && m_self->ident[6] == 0x01 &&
-	     m_self->ident[7] == 0x12 && m_self->ident[8] == 0x01 && m_self->ident[9] == 0x01 &&
-	     m_self->ident[10] == 0x00 && m_self->ident[11] == 0x10 && m_self->unknown == 0x32);
-
-	if (!known_ident_tail) {
+	if (!IsSupportedSelfHeader(*m_self)) {
 		LOGF("Unknown SELF file\n");
 		return false;
 	}
@@ -531,6 +519,12 @@ bool Elf64::IsValid() const {
 
 void Elf64::Open(const std::filesystem::path& file_name) {
 	Clear();
+
+	std::string validation_error;
+	if (!ValidateElfFile(file_name, nullptr, &validation_error)) {
+		EXIT("Invalid ELF/SELF %s: %s\n", Common::PathToString(file_name).c_str(),
+		     validation_error.c_str());
+	}
 
 	m_f = std::make_unique<Common::File>();
 	m_f->Open(file_name, Common::File::Mode::Read);

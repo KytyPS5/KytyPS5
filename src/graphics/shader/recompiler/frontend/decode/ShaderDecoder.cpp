@@ -247,6 +247,11 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		DecodeVectorGpr(code - 256u, operand);
 		return;
 	}
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Sgpr;
+		operand.reg  = code;
+		return;
+	}
 
 	switch (code) {
 		case 106u: operand.kind = OperandKind::VccLo; return;
@@ -272,6 +277,11 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
+		operand.kind = OperandKind::Sgpr;
+		operand.reg  = code;
+		return;
+	}
+	if (code >= 108u && code <= 123u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
 		return;
@@ -421,7 +431,11 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::FloatInlineConstant:
 			text = fmt::format("{:f}", std::bit_cast<float>(operand.value));
 			break;
-		case OperandKind::Sgpr: text = fmt::format("s{}", operand.reg); break;
+		case OperandKind::Sgpr:
+			text = operand.reg >= 108u && operand.reg <= 123u
+			           ? fmt::format("ttmp{}", operand.reg - 108u)
+			           : fmt::format("s{}", operand.reg);
+			break;
 		case OperandKind::Vgpr: text = fmt::format("v{}", operand.reg); break;
 		case OperandKind::VccLo: text = "vcc_lo"; break;
 		case OperandKind::VccHi: text = "vcc_hi"; break;

@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -892,6 +893,16 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+	        m_draw_indirect_args_base_addr + data_offset,
+	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DrawIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     m_draw_indirect_args_base_addr + data_offset);
+		}
+	}
 
 	if (!indexed) {
 		DrawIndirectArgs args {};
@@ -970,6 +981,15 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(count_addr),
+		                                                  sizeof(uint32_t))) {
+			static std::atomic<uint32_t> sync_fallback_logs {0};
+			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DrawIndirectMulti: failed to synchronise the draw count at 0x%016" PRIx64
+				     " (image-owned range, reading guest memory)\n",
+				     reinterpret_cast<uint64_t>(count_addr));
+			}
+		}
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -982,6 +1002,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+	        m_draw_indirect_args_base_addr + data_offset,
+	        static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes + args_size)) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DrawIndirectMulti: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     m_draw_indirect_args_base_addr + data_offset);
+		}
+	}
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
@@ -1057,7 +1087,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode,
+                                      uint64_t indirect_args) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1102,7 +1133,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		                                              thread_group_y, thread_group_z, mode,
+		                                              indirect_args);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1138,9 +1170,18 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     args_addr);
+		}
+	}
+	DispatchIndirectArgs args {};
+	std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
 
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode, args_addr);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {

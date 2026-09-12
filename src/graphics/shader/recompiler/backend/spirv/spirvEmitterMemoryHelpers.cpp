@@ -281,6 +281,146 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
+static uint32_t EmitSelectU32(EmitterState& state, uint32_t condition, uint32_t true_value,
+                              uint32_t false_value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpSelect, TypeU32(state), ret, condition, true_value, false_value});
+	return ret;
+}
+
+static uint32_t EmitFormatClampF32(EmitterState& state, uint32_t raw, float low, float high) {
+	const auto value  = EmitBitcastU32ToF32(state, raw);
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpIsNan, TypeBool(state), is_nan, value});
+	const auto finite  = EmitTBufferSelectF32(state, is_nan, ConstantF32Value(state, 0.0f), value);
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FClamp,
+	                           finite, ConstantF32Value(state, low), ConstantF32Value(state, high)});
+	return clamped;
+}
+
+static uint32_t EmitScaledRoundEven(EmitterState& state, uint32_t value, float scale) {
+	const auto scaled = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {spv::OpFMul, TypeF32(state), scaled, value, ConstantF32Value(state, scale)});
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state), GLSLstd450RoundEven, scaled});
+	return rounded;
+}
+
+static uint32_t EmitF32ToU32(EmitterState& state, uint32_t value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpConvertFToU, TypeU32(state), ret, value});
+	return ret;
+}
+
+static uint32_t EmitF32ToI32Bits(EmitterState& state, uint32_t value, uint32_t mask) {
+	const auto converted = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpConvertFToS, TypeI32(state), converted, value});
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpBitcast, TypeU32(state), bits, converted});
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, bits, ConstantU32(state, mask));
+}
+
+static uint32_t EmitF32ToHalfBits(EmitterState& state, uint32_t raw) {
+	const auto value = EmitBitcastU32ToF32(state, raw);
+	const auto pair  = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
+	                           ConstantF32Value(state, 0.0f)});
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {spv::OpExtInst, TypeU32(state), packed, GlslStd450(state), GLSLstd450PackHalf2x16, pair});
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0xffffu));
+}
+
+static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t raw, uint32_t bits) {
+	const auto mantissa_bits = bits == 11u ? 6u : 5u;
+	const auto shift         = 23u - mantissa_bits;
+	const auto infinity      = 31u << mantissa_bits;
+	const auto exponent      = EmitBinaryU32(
+        state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, raw, ConstantU32(state, 23)),
+        ConstantU32(state, 0xffu));
+	const auto half_ulp = EmitBinaryU32(
+	    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, raw, ConstantU32(state, shift)),
+	    ConstantU32(state, 1u));
+	const auto biased = EmitAddU32(
+	    state, EmitAddU32(state, raw, ConstantU32(state, (1u << (shift - 1u)) - 1u)), half_ulp);
+	const auto normal = EmitBinaryU32(
+	    state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftRightLogical, biased, ConstantU32(state, shift)),
+	    ConstantU32(state, 112u << mantissa_bits));
+	const auto normal_clamped = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state),
+	                           GLSLstd450UMin, normal, ConstantU32(state, infinity)});
+	const auto value    = EmitBitcastU32ToF32(state, raw);
+	const auto denormal = EmitF32ToU32(
+	    state, EmitScaledRoundEven(state, value,
+	                               std::ldexp(1.0f, static_cast<int>(14u + mantissa_bits))));
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpIsNan, TypeBool(state), is_nan, value});
+	const auto sign     = EmitBinaryU32(state, spv::OpBitwiseAnd, raw, ConstantU32(state, 0x80000000u));
+	const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual, sign, 0);
+	const auto special  = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 255);
+	const auto small    = EmitCompareU32Constant(state, spv::OpULessThan, exponent, 113);
+	const auto finite   = EmitSelectU32(state, small, denormal, normal_clamped);
+	const auto positive = EmitSelectU32(state, special, ConstantU32(state, infinity), finite);
+	const auto numeric  = EmitSelectU32(state, negative, ConstantU32(state, 0), positive);
+	return EmitSelectU32(state, is_nan,
+	                     ConstantU32(state, infinity | (1u << (mantissa_bits - 1u))), numeric);
+}
+
+uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                             uint32_t component, uint32_t raw) {
+	const auto bits = info.component_bits[component];
+	if (bits == 32u) {
+		return raw;
+	}
+	const auto max_unsigned = (1u << bits) - 1u;
+	const auto max_signed   = static_cast<int32_t>((1u << (bits - 1u)) - 1u);
+	switch (info.type) {
+		case Format::ComponentType::Uint: {
+			const auto ret = state.builder.AllocateId();
+			state.builder.AddFunction({spv::OpExtInst, TypeU32(state), ret, GlslStd450(state), GLSLstd450UMin,
+			                           raw, ConstantU32(state, max_unsigned)});
+			return ret;
+		}
+		case Format::ComponentType::Sint: {
+			const auto clamped = state.builder.AllocateId();
+			state.builder.AddFunction({spv::OpExtInst, TypeI32(state), clamped, GlslStd450(state),
+			                           GLSLstd450SClamp, EmitTBufferBitcastU32ToI32(state, raw),
+			                           ConstantI32(state, -max_signed - 1),
+			                           ConstantI32(state, max_signed)});
+			const auto clamped_bits = state.builder.AllocateId();
+			state.builder.AddFunction({spv::OpBitcast, TypeU32(state), clamped_bits, clamped});
+			return EmitBinaryU32(state, spv::OpBitwiseAnd, clamped_bits,
+			                     ConstantU32(state, max_unsigned));
+		}
+		case Format::ComponentType::Unorm:
+			return EmitF32ToU32(
+			    state, EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, 0.0f, 1.0f),
+			                               static_cast<float>(max_unsigned)));
+		case Format::ComponentType::Snorm:
+			return EmitF32ToI32Bits(
+			    state,
+			    EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, -1.0f, 1.0f),
+			                        static_cast<float>(max_signed)),
+			    max_unsigned);
+		case Format::ComponentType::Uscaled:
+			return EmitF32ToU32(
+			    state, EmitFormatClampF32(state, raw, 0.0f, static_cast<float>(max_unsigned)));
+		case Format::ComponentType::Sscaled:
+			return EmitF32ToI32Bits(state,
+			                        EmitFormatClampF32(state, raw,
+			                                           static_cast<float>(-max_signed - 1),
+			                                           static_cast<float>(max_signed)),
+			                        max_unsigned);
+		case Format::ComponentType::Float:
+			return bits == 16u ? EmitF32ToHalfBits(state, raw)
+			                   : EmitF32ToUFloatBits(state, raw, bits);
+		default: return raw;
+	}
+}
+
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
 	const auto semantics =
 	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask;

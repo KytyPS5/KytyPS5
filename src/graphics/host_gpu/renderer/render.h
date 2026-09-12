@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -155,7 +156,8 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    uint64_t indirect_args = 0);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void                           FindBuffers(PreparedBindings& bindings);
@@ -201,7 +203,9 @@ private:
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	                                                     const CommandBuffer& buffer, uint32_t group_x,
+	                                                     uint32_t group_y, uint32_t group_z,
+	                                                     uint32_t mode);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -212,6 +216,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	std::unordered_set<uint64_t> m_unrepresentable_textures;
+	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

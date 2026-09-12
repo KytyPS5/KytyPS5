@@ -445,6 +445,13 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t key_arg         = 0;
+		uint32_t table_offset = 0;
+		uint32_t key_bound    = 0;
+		static constexpr uint32_t NoBoundSource = UINT32_MAX;
+		uint32_t                  bound_source  = NoBoundSource;
+		bool                      bound_signed  = false;
+		uint32_t item_bound = 0;
+		uint32_t selector_immediate = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

@@ -134,6 +134,11 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 }
 
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
+	uint32_t default_bits = 0;
+	if (state.program.stage == ShaderType::Pixel &&
+	    ShaderPixelParameterDefault(*state.input_info.pixel, attr, chan & 3u, default_bits)) {
+		return ConstantU32(state, default_bits);
+	}
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -152,6 +157,12 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 		return value;
 	};
 	if (input->per_vertex) {
+		if (PixelParameterIsFlat(state, attr)) {
+			const auto provoking = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {spv::OpBitcast, TypeU32(state), provoking, load_per_vertex(0)});
+			return provoking;
+		}
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
@@ -193,7 +204,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
                                     uint32_t mode) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
-	if (!input->per_vertex) {
+	if (input == nullptr || !input->per_vertex) {
 		return EmitAttribute(ctx.state, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {
@@ -589,6 +600,20 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 	return ctx.Ballot(predicate);
+}
+
+uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
+	auto&      state  = ctx.state;
+	const auto ballot = ctx.Ballot(predicate);
+	const auto low    = state.builder.AllocateId();
+	const auto high   = state.builder.AllocateId();
+	const auto any    = state.builder.AllocateId();
+	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), low, ballot, 0});
+	state.builder.AddFunction({spv::OpCompositeExtract, TypeU32(state), high, ballot, 1});
+	state.builder.AddFunction({spv::OpINotEqual, TypeBool(state), any,
+	                           EmitBinaryU32(state, spv::OpBitwiseOr, low, high),
+	                           ConstantU32(state, 0)});
+	return any;
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {

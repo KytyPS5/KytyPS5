@@ -1,0 +1,78 @@
+[package]
+name = "kyty-launcher"
+version = "0.1.0"
+description = "Alternative launcher for the Kyty PS5 emulator"
+edition = "2021"
+
+[lib]
+name = "kyty_launcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Release tuning per Tauri's own size guide. This launcher is a front-end
+# that sits resident next to an emulator competing for the same machine, so
+# its code pages are RAM the emulator does not get: smaller is the point,
+# and there is no hot compute path here that would want opt-level = 3.
+#
+# `panic = "abort"` drops the unwinding tables. Nothing here uses
+# catch_unwind (checked), and cargo ignores this setting when building test
+# targets, so `cargo test --release` still works.
+[profile.release]
+codegen-units = 1  # one unit lets LLVM optimize across the whole crate
+lto = true         # link-time optimization across crates too
+opt-level = "s"    # size over raw speed -- see above
+panic = "abort"    # no unwinding tables
+strip = true       # no debug symbols in the shipped binary
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = ["protocol-asset", "image-png"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2.5"
+regex = "1.12"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+dirs = "5"
+gilrs = { version = "0.11.2", features = ["serde"] }
+tokio = { version = "1", features = ["time", "rt"] }
+futures-util = "0.3"
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0", features = ["v2_38"] }
+# Bluetooth has no cross-platform backend: every portable Rust crate is
+# BLE-only, and the devices this panel targets (DualSense pads, headsets)
+# pair over Bluetooth Classic instead. So each OS gets its native stack --
+# BlueZ here, WinRT below, IOBluetooth on macOS. See bluetooth.rs.
+bluer = { version = "0.17.4", features = ["bluetoothd"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# WebView2 memory tuning for webview2_tuning.rs -- see that file's doc comment.
+# Pinned to the tree wry/tauri already link (webview2-com 0.38 -> windows-core
+# 0.61), which is a different `windows` major than the 0.62 the Bluetooth code
+# below uses. Both resolve side by side; the COM types must not be mixed across
+# them, and are not.
+webview2-com = "0.38"
+windows-core = "0.61"
+windows = { version = "0.62", features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString"] }
+objc2-io-bluetooth = { version = "0.3", features = [
+    "IOBluetoothDevice",
+    "IOBluetoothDevicePair",
+    "IOBluetoothHostController",
+    "Bluetooth",
+    "IOBluetoothDeviceInquiry",
+] }
+# CoreAudio device enumeration for audio.rs -- see that file's doc comment.
+coreaudio-rs = "0.14"

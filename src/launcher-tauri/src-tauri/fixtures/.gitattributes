@@ -1,0 +1,6 @@
+# These are byte-exact fixtures: qsettings.rs and config.rs round-trip them
+# through the writer and assert the result is identical to the file on disk.
+# Git's autocrlf would rewrite them to CRLF on checkout under Windows and
+# break that assertion for reasons that have nothing to do with the writer,
+# so pin them to LF regardless of platform or the user's core.autocrlf.
+*.ini -text eol=lf

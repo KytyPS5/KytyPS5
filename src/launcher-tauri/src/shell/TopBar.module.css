@@ -1,0 +1,125 @@
+.bar {
+  flex: none;
+  height: 44px;
+  display: flex;
+  align-items: stretch;
+  /* A plain gradient, not backdrop-filter -- cheap to render even while the
+     content behind it (Home's hero) is mid-crossfade. See the plan's
+     WebKitGTK measurement: backdrop-filter over animating content is the
+     one thing to avoid; a gradient never samples anything beneath it.
+     Deliberately faint and short (fully clear well before the bar's own
+     bottom edge) -- the real PS5 top bar has no visible band at all, icons
+     just float on the art with their own drop-shadow (below) for
+     legibility; this is only a hint of contrast right behind them, not a
+     panel. */
+  background: linear-gradient(to bottom, rgba(5, 8, 18, 0.4) 0%, transparent 65%);
+}
+
+/* Replaces BrandMark in the same top-left slot on every view except Home --
+   same 40px footprint (BrandMark's default size=28 + 12px padding) so the
+   swap doesn't shift anything else in the bar. */
+.backButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex: none;
+  align-self: center;
+  margin-left: 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background var(--t-hover) var(--ease-ui), color var(--t-hover) var(--ease-ui);
+  filter: drop-shadow(0 1px 5px rgba(0, 0, 0, 0.7));
+}
+.backButton:hover {
+  background: var(--glass-bg-strong);
+  color: var(--text-primary);
+}
+
+/* The draggable spacer. Deliberately contains no buttons -- Tauri's
+   data-tauri-drag-region fires on mousedown, so anything interactive placed
+   inside it would start a window drag instead of receiving the click. */
+.dragRegion {
+  flex: 1;
+  min-width: 0;
+}
+
+.controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px 0 16px;
+  /* Legibility over bright art with no opaque bar behind it -- matches the
+     text-shadow treatment Home's own title/chips already use over the hero. */
+  filter: drop-shadow(0 1px 5px rgba(0, 0, 0, 0.7));
+}
+
+.profileChip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 50%;
+  transition: box-shadow var(--t-hover) var(--ease-ui);
+}
+.profileChip:hover {
+  box-shadow: 0 0 0 2px var(--glass-border-strong);
+}
+
+.profileAvatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--glass-bg-strong);
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.clock {
+  font-family: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  letter-spacing: 0.3px;
+  color: var(--text-secondary);
+}
+
+.runningPill {
+  composes: pill-button from global;
+  height: 30px;
+  padding: 0 14px;
+}
+
+.windowButtons {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 6px;
+  padding-left: 10px;
+  border-left: 1px solid var(--glass-border);
+}
+
+.winBtn {
+  composes: icon-button from global;
+  width: 32px;
+  height: 32px;
+}
+
+.winBtnClose:hover {
+  background: var(--error);
+  color: #fff;
+}

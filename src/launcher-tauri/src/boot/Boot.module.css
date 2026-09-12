@@ -1,0 +1,67 @@
+.root {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-boot);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--void);
+  transition: opacity var(--t-scene) var(--ease-exit);
+  pointer-events: none;
+}
+.root[data-phase="homeEnter"] {
+  opacity: 0;
+}
+
+.logo {
+  position: relative;
+  z-index: 1;
+  width: 96px;
+  height: 96px;
+  object-fit: contain;
+  opacity: 0;
+  transform: scale(0.96);
+  transition: opacity var(--t-scene) var(--ease-enter), transform var(--t-scene) var(--ease-enter);
+}
+.root[data-phase="logo"] .logo,
+.root[data-phase="atmosphere"] .logo {
+  opacity: 1;
+  transform: scale(1);
+}
+.root[data-phase="logoExit"] .logo,
+.root[data-phase="homeEnter"] .logo {
+  opacity: 0;
+  transform: scale(1.04);
+}
+
+/* The dark, space-like scene the reference passes through before the home
+   background becomes visible (01-motion-system.md phase D). */
+.atmosphere {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  opacity: 0;
+  transition: opacity var(--t-scene) var(--ease-ui);
+}
+.root[data-phase="atmosphere"] .atmosphere,
+.root[data-phase="homeEnter"] .atmosphere {
+  opacity: 1;
+}
+
+.status {
+  position: absolute;
+  bottom: 64px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity var(--t-panel) var(--ease-ui);
+}
+.root[data-phase="atmosphere"] .status {
+  opacity: 1;
+}

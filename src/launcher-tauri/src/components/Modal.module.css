@@ -1,0 +1,27 @@
+/* Real glassmorphism -- previously `className="glass-panel"` (blur(18px))
+   was applied and then immediately defeated by an opaque inline
+   `background: var(--bg-elevated)`, so the blur ran for nothing. This is
+   the "heavy" weight (real backdrop-filter): modals sit over static content
+   behind the backdrop scrim, not the animating Home hero, so the perf
+   constraint that rules out blur elsewhere (see GlassPanel.module.css)
+   doesn't apply here. */
+.surface {
+  background: var(--glass-heavy-bg);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: var(--radius-modal);
+  backdrop-filter: var(--glass-heavy-blur);
+  -webkit-backdrop-filter: var(--glass-heavy-blur);
+  box-shadow: 0 24px 60px -16px var(--shadow-color);
+}
+
+:global(:root[data-perf="low"]) .surface,
+:global(:root[data-idle="1"]) .surface {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.92);
+}
+
+.header,
+.footer {
+  border-color: var(--glass-border);
+}

@@ -1,0 +1,244 @@
+/* Per-game detail page. Now a full screen (Library.tsx swaps the grid out
+   for this instead of docking it in a side panel), so it uses the exact
+   same page chrome as Library and Settings, not its own bespoke hero-card
+   look: .page + .scrim ground, a .header row, and a rail + detail split
+   for the Settings/Trophies/Patches/Saved data sections (mirrors
+   Settings.module.css's own .rail/.railItem/.detail one-for-one). */
+
+.page {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 900px 700px at 8% 0%, rgba(255, 205, 155, 0.07) 0%, transparent 60%), linear-gradient(180deg, rgba(5, 8, 18, 0.9) 0%, rgba(5, 8, 18, 0.86) 100%);
+}
+
+.body {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: var(--gutter-block) var(--gutter);
+  gap: clamp(20px, calc(2 * var(--vwx)), 32px);
+}
+
+/* Shared with Library's and Settings' own page headers -- owner rule,
+   2026-09-09: "unify title styles". See styles/pageHeader.module.css. */
+.header {
+  composes: header from "../styles/pageHeader.module.css";
+}
+
+.headerIcon {
+  composes: headerIcon from "../styles/pageHeader.module.css";
+  width: 64px;
+  height: 64px;
+  color: var(--text-muted);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 22px;
+}
+
+.headerIconImage {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.headerInfo {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.title {
+  composes: title from "../styles/pageHeader.module.css";
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metaRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.headerActions {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.error {
+  flex: none;
+  margin: 0;
+  font-size: 12px;
+  color: var(--error);
+  white-space: pre-wrap;
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: clamp(24px, calc(3 * var(--vwx)), 56px);
+}
+
+/* Copied from Settings.module.css's own .rail/.railItem/.railItemActive
+   rather than shared via `composes` -- Settings' rail is load-bearing and
+   already working, and duplicating a handful of rules here is a much lower
+   risk way to guarantee the identical look than refactoring the file both
+   pages would depend on. Keep these two blocks in sync by hand if either
+   page's rail styling changes. */
+.rail {
+  flex: none;
+  width: var(--settings-rail);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.railItem {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 20px 18px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 15.5px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui), border-color var(--t-hover) var(--ease-ui), color var(--t-hover) var(--ease-ui), transform var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .railItem:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.045);
+}
+.railItem.ps-focused,
+.railItemActive.ps-focused {
+  border-color: transparent;
+  box-shadow: none;
+  outline-color: transparent;
+  background: rgba(255, 255, 255, 0.075);
+  transform: translateX(2px);
+}
+.railItemActive {
+  composes: railItem;
+  color: var(--text-primary);
+  font-weight: 600;
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.detailProse {
+  max-width: 720px;
+}
+
+/* Trophies is the one tab that owns its own internal scroller (Trophies.tsx
+   keeps its tab pills pinned and scrolls only the list beneath them) rather
+   than relying on .detail's scroll like the content-flow tabs do. That only
+   works if this wrapper actually has a resolvable height: Trophies.tsx asks
+   for height:100% on its root, which resolves against *this* element as its
+   containing block -- previously this branch rendered with no class at all
+   (height:auto), so height:100% computed to auto too (CSS 2.1 10.5) and the
+   inner list's own overflow-y:auto never had anything to overflow, so it
+   never scrolled. */
+.detailFill {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- compatibility badge + its hover detail -----------------------------
+   The badge itself is the whole story at a glance ("In game"); which
+   platform that figure came from, how many reports stand behind it and
+   which build they were filed against is the fine print you go looking for,
+   not something to read every time you open a game. So the badge stands
+   alone and the rest appears on hover.
+
+   `.ps-focused` alongside `:hover` is not optional here: this app is driven
+   by a gamepad, which has no pointer, so a hover-only reveal would hide the
+   detail from exactly the input it is designed around. The badge carries
+   data-focusable so the pad can land on it -- the same thing Trophies' and
+   the saved-data rows do for informational elements. */
+.compatBadge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-secondary);
+  outline: 1.5px solid transparent;
+  outline-offset: 2px;
+  transition: outline-color var(--t-focus) var(--ease-enter);
+}
+.compatBadge.ps-focused {
+  outline-color: var(--accent);
+}
+
+.compatTip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: max-content;
+  max-width: 280px;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  background: var(--glass-heavy-bg);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 28px -10px var(--shadow-color);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition: opacity var(--t-fast) var(--ease-ui), transform var(--t-fast) var(--ease-ui);
+}
+.compatBadge:hover .compatTip,
+.compatBadge.ps-focused .compatTip {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Same flatten as every other blurred surface under the perf probe and the
+   idle throttle (theme.css). */
+:global(:root[data-perf="low"]) .compatTip,
+:global(:root[data-idle="1"]) .compatTip {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.95);
+}

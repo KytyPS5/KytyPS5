@@ -1,0 +1,53 @@
+/* Shared list/row surface for FolderBrowserModal and ImageBrowserModal.
+   Extracted from what used to be inline styles on each row -- an inline
+   style cannot express :hover or the gamepad .ps-focused class at all,
+   which is why these rows previously had no visual state whatsoever, mouse
+   or pad. See workflow/launcher_ui_audit.md for the audit that found this. */
+
+.list {
+  min-height: 260px;
+  max-height: 48vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.row {
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  outline: 1.5px solid transparent;
+  outline-offset: -2px;
+  transition: background var(--t-hover) var(--ease-ui), outline-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter);
+}
+
+:root:not([data-gamepad-active="true"]) .row:hover {
+  background: var(--glass-bg-strong);
+}
+
+.row.ps-focused {
+  outline-color: var(--accent);
+  box-shadow: 0 0 14px var(--accent-glow);
+}
+
+.rowSelected {
+  background: var(--glass-bg-strong);
+}
+
+.rowName {
+  font-size: 13px;
+}
+
+.tag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-glow);
+  color: var(--accent);
+  flex: none;
+}

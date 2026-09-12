@@ -1,0 +1,41 @@
+/* Full-page confirm, reachable only via the fullscreen-only Exit Launcher
+   icon in TopBar (shell/TopBar.tsx) -- a flat scrim over the shared
+   HeroBackground (shell/AppShell.tsx) rather than Profile/Logs' directional
+   gradient, since the content here is one centered card, not text hugging
+   an edge. */
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: rgba(5, 8, 18, 0.72);
+}
+
+.center {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.panel {
+  width: 100%;
+  max-width: 360px;
+  padding: 36px 32px 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.title {
+  composes: title from "../styles/pageHeader.module.css";
+  font-size: 22px;
+  margin-bottom: 26px;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+}

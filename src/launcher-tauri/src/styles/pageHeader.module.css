@@ -1,0 +1,38 @@
+/* Shared page-header primitives: an icon chip + a title, the same shape on
+   every full page (Game Library, the per-game detail page, and each
+   Emulator Settings category). Library.module.css, GameDetail.module.css and
+   Settings.module.css all `composes` these rather than each defining their
+   own copy, so "unify the title style" is enforced by having one true
+   definition instead of three to keep in sync by hand. Consumers may add
+   their own extra declarations (size, background image) on top via their
+   own `composes` rule, same as `.rowStack { composes: row; ... }` already
+   does elsewhere in this codebase. */
+
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.headerIcon {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.title {
+  font-family: var(--font-display);
+  font-weight: 300;
+  font-size: 32px;
+  letter-spacing: 0.2px;
+  color: var(--text-primary);
+  margin: 0;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.6);
+}

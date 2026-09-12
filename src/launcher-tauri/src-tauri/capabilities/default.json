@@ -1,0 +1,27 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the main Kyty Launcher window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-current-monitor",
+    "core:window:allow-primary-monitor",
+    { "identifier": "opener:allow-open-path", "allow": [{ "path": "**" }] },
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://github.com/KytyPS5/KytyPS5/issues/*" }]
+    },
+
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-minimize",
+    "core:window:allow-close"
+  ]
+}

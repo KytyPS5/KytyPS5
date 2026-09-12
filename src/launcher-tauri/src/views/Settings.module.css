@@ -1,0 +1,396 @@
+/* Bare-over-background layout, matching the real PS5 System pane: no boxed
+   glass panels, just text directly on the (blurred, vignetted) selected
+   dashboard background, a hairline-separated rail on the left, and
+   hairline-separated rows on the right. No backdrop-filter anywhere here --
+   there is nothing to blur behind text that already sits on a static image. */
+
+.page {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Near-black ground + a soft warm spotlight from the top-left, matching
+   ps5_settings.jpg's own treatment, in place of the previous heavy 115deg
+   directional scrim. Still no backdrop-filter -- a static gradient, nothing
+   to profile. */
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 900px 700px at 8% 0%, rgba(255, 205, 155, 0.07) 0%, transparent 60%), linear-gradient(180deg, rgba(5, 8, 18, 0.9) 0%, rgba(5, 8, 18, 0.86) 100%);
+}
+
+.body {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  padding: var(--gutter-block) var(--gutter);
+  gap: clamp(24px, calc(3 * var(--vwx)), 56px);
+}
+
+.heading {
+  composes: heading from "../styles/settingsForm.module.css";
+  flex: none;
+  margin-bottom: 28px;
+}
+
+/* Wraps the fixed title + the scrolling .detail below it, so the title
+   stays put while only the category content scrolls -- mirrors Library's
+   own header staying above its scrolling grid. */
+.detailColumn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.rail {
+  flex: none;
+  width: var(--settings-rail);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+/* No hairline separators at all (ps5_settings.jpg has none, only vertical
+   rhythm from padding + the .rail gap) -- only the selected row gets a thin
+   outline. */
+.railItem {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 20px 18px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 15.5px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-hover) var(--ease-ui), border-color var(--t-hover) var(--ease-ui), color var(--t-hover) var(--ease-ui), transform var(--t-hover) var(--ease-ui);
+}
+/* Same fill the focused state uses (see .ps-focused below), just at a lower
+   opacity -- hover reads as a weaker version of focus, not a different
+   language. Guarded against gamepad input: theme.css hides the OS cursor
+   under [data-gamepad-active="true"], but WebKit keeps applying :hover to
+   whatever the parked cursor sits over, which would otherwise leave a stray
+   highlight next to the real focus ring. */
+:root:not([data-gamepad-active="true"]) .railItem:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.045);
+}
+/* Focused-but-not-selected (gamepad/keyboard): a quiet fill + a barely
+   perceptible nudge, no glow, no box -- overrides theme.css's generic
+   [data-focusable] ring outright (02-focus-hover-navigation.md's
+   settings-row recipe says "the movement should be almost imperceptible").
+   Selection (.railItemActive) is a separate, static language and never
+   carries this. */
+.railItem.ps-focused,
+.railItemActive.ps-focused {
+  border-color: transparent;
+  box-shadow: none;
+  outline-color: transparent;
+  background: var(--focus-fill);
+  transform: translateX(2px);
+}
+.railItemActive {
+  composes: railItem;
+  color: var(--text-primary);
+  font-weight: 600;
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+/* The scroll VIEWPORT -- spans the full remaining width of .body, no
+   max-width of its own (owner rule, 2026-09-09: a vertical scrollbar must
+   sit at the true right edge of its panel, never hugging a narrower
+   content column with dead space beyond it -- this is a whole-app
+   guideline, not a Settings-only fix). Read-width text/rows get their cap
+   from .detailProse below instead, applied inside this box, not on it;
+   GamepadCategory's button-mapping grid + controller diagram render
+   straight inside this full-width box (no .detailProse wrapper), which
+   also fixes the grid visually overflowing past the old 720px cap it
+   never actually respected. */
+.detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+/* Readable-width wrapper for prose/row categories (Profile, Appearance,
+   Audio, Bluetooth, Game folders, Emulator settings, System) -- keeps
+   long lines and label/control rows from stretching edge to edge on a
+   wide window, without narrowing the scroll box itself (see .detail). */
+.detailProse {
+  max-width: 720px;
+}
+
+/* No hairline separators (owner rule, 2026-09-09): rows read through
+   vertical rhythm from padding alone, same as .railItem above. A
+   border-bottom used to live here, but it only ever fired correctly on a
+   row's own :last-child -- any row followed by unrelated non-.row content
+   (a slider wrapper, ConfigForm's grid) kept the line, which read as a
+   stray rule rather than a separator. Removed outright rather than
+   patched per call site. */
+.row {
+  composes: row from "../styles/settingsForm.module.css";
+}
+
+.rowStack {
+  composes: row;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+}
+
+/* 10px less top padding than the shared .row (closing the gap under the
+   launch-mode row above it) and 15px less bottom padding, so the hint right
+   below ("Frees the launcher's...") reads as attached to this row instead
+   of floating between it and the next block. */
+.autoCloseRow {
+  composes: row;
+  padding-top: 0;
+  padding-bottom: 5px;
+}
+
+/* One consistent gap above a follow-up action that sits below a category's
+   rows or list (add a folder, scan for devices, save changes) -- replaces
+   each category inventing its own margin-top (8px/16px/20px) for what is
+   the same visual role everywhere. */
+.actionRow {
+  composes: actionRow from "../styles/settingsForm.module.css";
+}
+
+/* A distinct control group within one category (e.g. Appearance's layout
+   picker under the background thumbnails) -- more separation than the
+   20px row rhythm above, since it's a new subsection, not another row in
+   the same list. */
+.subsection {
+  margin-top: 32px;
+}
+
+/* GamepadCategory is the one category outside .detailProse's 720px cap (the
+   button-mapping grid + diagram need more room, see .detail above), but "no
+   cap" left it stretching to the full scroll-viewport width with nothing to
+   compose it as one panel. 800px = two 132px chip columns + 16px gaps either
+   side of the 504px diagram column (see InputMappingDialog's RemapPanel). */
+.gamepadPane {
+  max-width: 800px;
+}
+
+.rowLabel {
+  composes: rowLabel from "../styles/settingsForm.module.css";
+}
+
+.rowHint {
+  composes: rowHint from "../styles/settingsForm.module.css";
+}
+
+.rowValue {
+  flex: none;
+  color: var(--text-secondary);
+  font-size: 14px;
+  text-align: right;
+}
+
+.blockHint {
+  composes: blockHint from "../styles/settingsForm.module.css";
+}
+
+/* The auto-close hint closes out the launch-mode group, so it needs more
+   air under it than a hint that introduces the block below. */
+.autoCloseHint {
+  composes: blockHint from "../styles/settingsForm.module.css";
+  margin-bottom: 20px;
+}
+
+.subheading {
+  composes: subheading from "../styles/settingsForm.module.css";
+}
+
+/* ---- Background theme thumbnails ---------------------------------------
+   BackgroundCategory used inline `style` objects here, which is why hover
+   was never possible: an inline style can't express `:hover`. Moved to a
+   module so the thumbnails get a real hover state, distinct from the
+   selection ring below. */
+.themeCard {
+  width: 128px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.themeThumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-sm);
+  background-size: cover;
+  background-position: center;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  box-shadow: none;
+  transition: border-color var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui), filter var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .themeThumb:hover:not(.themeThumbActive) {
+  border-color: var(--glass-border-strong);
+  filter: brightness(1.2);
+}
+.themeThumbActive {
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.themeLabel {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-align: center;
+}
+.themeLabelActive {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.customThumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-size: cover;
+  background-position: center;
+  border: 2px dashed var(--glass-border-strong);
+  box-shadow: none;
+  transition: border-color var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui), background-color var(--t-hover) var(--ease-ui), filter var(--t-hover) var(--ease-ui);
+}
+:root:not([data-gamepad-active="true"]) .customThumb:hover:not(.customThumbActive) {
+  background-color: var(--glass-bg-strong);
+  filter: brightness(1.2);
+}
+.customThumbActive {
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* Previously the only cursor:pointer rule in this file with no :hover, no
+   :focus-visible, no :active, not even a transition -- clicking it worked,
+   but nothing about it ever changed state, mouse or pad. */
+.customClear {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(5, 8, 18, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  outline: 1.5px solid transparent;
+  outline-offset: -2px;
+  transition: background var(--t-hover) var(--ease-ui), border-color var(--t-hover) var(--ease-ui), transform var(--t-fast) var(--ease-ui), outline-color var(--t-focus) var(--ease-enter);
+}
+:root:not([data-gamepad-active="true"]) .customClear:hover {
+  background: rgba(5, 8, 18, 0.92);
+  border-color: var(--hover-border);
+}
+.customClear:active {
+  transform: scale(0.92);
+}
+.customClear:focus-visible,
+.customClear.ps-focused {
+  outline-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+/* Profile-switch row (ProfileCategory) -- previously an inline-styled div
+   with an onClick and no role/tabIndex, matching none of FOCUSABLE_SELECTOR
+   (nav/FocusNav.tsx), so a pad could never reach it at all. Same treatment
+   FolderBrowserModal.tsx's rows already received: real :hover + .ps-focused
+   states instead of an inline style that structurally cannot carry either.
+   Skipped entirely on the active profile's own row (App.tsx renders it
+   cursor:default there, it is not clickable). */
+.profileRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 0;
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  margin: -4px -8px;
+  cursor: pointer;
+  outline: 1.5px solid transparent;
+  outline-offset: -2px;
+  transition: background var(--t-hover) var(--ease-ui), outline-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter);
+}
+.profileRowActive {
+  composes: profileRow;
+  cursor: default;
+}
+:root:not([data-gamepad-active="true"]) .profileRow:hover:not(.profileRowActive) {
+  background: var(--hover-fill);
+}
+.profileRow.ps-focused {
+  outline-color: var(--accent);
+  box-shadow: 0 0 14px var(--accent-glow);
+}
+
+/* Profile avatar. Was a 14-line inline style object repeated per row, which
+   could not carry a hover/focus state and drifted from ProfileView's own
+   copy of the same circle; one class, sized by the caller. */
+.profileAvatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--glass-bg-strong);
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 14px;
+}
+
+/* The "add a profile" row. Separated from the list above it by a rule, so a
+   text field and a button do not read as one more profile entry. */
+.profileCreateRow {
+  composes: row;
+  gap: 10px;
+  border-top: 1px solid var(--glass-border);
+  margin-top: 6px;
+  padding-top: 16px;
+}
+
+.profileNameField {
+  flex: 1;
+  max-width: 260px;
+}
+
+/* Inline delete confirmation, same shape as GameDetail's remove-save-data
+   step: destructive actions in this app ask once, in place, rather than
+   opening a modal or firing on the first click. */
+.profileConfirmRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.profileConfirmText {
+  font-size: 12px;
+  color: var(--text-secondary);
+}

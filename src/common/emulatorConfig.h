@@ -68,6 +68,8 @@ struct ConfigOptions {
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
+	std::string            audio_output_device         = "";
+	std::string            audio_input_device          = "";
 };
 
 void Load(const ConfigOptions& cfg);
@@ -109,7 +111,9 @@ bool PlayGoHackEnabled();
 bool RedZoneProtectionEnabled();
 #endif
 
-const Keymap& GetKeymap();
+const Keymap&    GetKeymap();
+const std::string& GetAudioOutputDevice();
+const std::string& GetAudioInputDevice();
 
 } // namespace Config
 

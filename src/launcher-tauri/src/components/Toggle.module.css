@@ -1,0 +1,66 @@
+.label {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.track {
+  width: 38px;
+  height: 22px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border-strong);
+  position: relative;
+  flex: none;
+  transition: background var(--t-hover) var(--ease-ui), border-color var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui);
+}
+.trackOn {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  /* transform, not left -- a layout property here would relayout this
+     element's own box on every toggle, the same class of bug
+     GameTile.module.css's old width/height growth had. */
+  transition: transform var(--t-hover) var(--ease-ui), background var(--t-hover) var(--ease-ui), box-shadow var(--t-hover) var(--ease-ui);
+}
+/* --accent is #ffffff in this theme, so a white knob on the ON track (which
+   fills with --accent) was white-on-white -- see .trackOn above. Flip the
+   knob to --void on ON, the same white-fill/near-black-content pairing
+   .pill-button.primary already uses (theme.css). */
+.trackOn .knob {
+  transform: translateX(16px);
+  background: var(--void);
+  box-shadow: none;
+}
+
+/* Hover: the track itself brightens. There used to be a 1px underline under
+   the whole row as well, but a row-based Toggle carries no inline caption
+   (Settings.tsx passes only ariaLabel), so the label box is just the 38px
+   track and that line read as a stray dash floating under the switch. The
+   track is the control; lighting it is enough. Guarded against gamepad
+   input the same way every other hover rule in this pass is (see
+   Settings.module.css's .railItem:hover comment for why). */
+:root:not([data-gamepad-active="true"]) .label:hover .track {
+  border-color: var(--text-primary);
+}
+
+/* Focused (gamepad/keyboard): same quiet-fill language as everywhere else
+   in this pass, not a second ring on top of the track's own hover glow. */
+.label.ps-focused {
+  background: var(--focus-fill);
+}

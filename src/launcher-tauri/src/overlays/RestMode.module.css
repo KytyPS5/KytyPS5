@@ -1,0 +1,50 @@
+/* Deliberately slower than any other transition in the app (--t-rest,
+   900ms) -- 01-motion-system.md's rest-mode section calls this out
+   explicitly: it should read as a state change, not a menu closing. Waking
+   (isOpen -> false) is a little quicker (~600ms), matching "any input
+   reverses it over ~600ms". */
+.root {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-boot);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--void);
+  opacity: 0;
+  transition: opacity 600ms var(--ease-ui);
+  pointer-events: none;
+}
+.root.isOpen {
+  opacity: 1;
+  transition-duration: var(--t-rest);
+}
+
+.atmosphere {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  opacity: 0;
+  transition: opacity 600ms var(--ease-ui);
+}
+.root.isOpen .atmosphere {
+  opacity: 1;
+  transition-duration: var(--t-rest);
+}
+
+.status {
+  position: relative;
+  z-index: 1;
+  font-family: var(--font-display);
+  font-weight: 300;
+  font-size: 28px;
+  letter-spacing: 0.4px;
+  color: var(--text-primary);
+  opacity: 0;
+  transition: opacity var(--t-panel) var(--ease-ui);
+  transition-delay: 200ms;
+}
+.root.isOpen .status {
+  opacity: 0.85;
+}

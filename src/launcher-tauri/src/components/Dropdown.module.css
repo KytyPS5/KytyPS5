@@ -1,0 +1,130 @@
+/* Trigger mirrors the pill text-input exactly (theme.css input[type=...]),
+   so a Dropdown sits next to a search box or another input without looking
+   like a different control. */
+.trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  padding: 0 12px 0 14px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--glass-border-strong);
+  background: var(--glass-bg);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--t-hover) var(--ease-ui), background var(--t-hover) var(--ease-ui);
+}
+/* Had cursor: pointer and this declared transition since it was first
+   written, but no :hover rule ever set anything for the transition to
+   animate toward -- a dead declaration. Guarded against gamepad input
+   the same way every other hover rule in this pass is (see
+   Settings.module.css's .railItem:hover comment for why). */
+:root:not([data-gamepad-active="true"]) .trigger:hover:not(:disabled) {
+  border-color: var(--hover-border);
+  background: var(--glass-bg-strong);
+}
+.trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.triggerOpen,
+.trigger:focus-visible {
+  border-color: var(--accent);
+  background: var(--bg-elevated);
+}
+/* Previously just outline: none with the border-colour change above doing
+   double duty as the only focus feedback -- restore a real ring via the
+   shared token instead of relying on a colour change alone. */
+.trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.triggerLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chevron {
+  flex: none;
+  color: var(--text-secondary);
+  transition: transform var(--t-hover) var(--ease-ui);
+}
+.triggerOpen .chevron {
+  transform: rotate(180deg);
+}
+
+/* The open option list -- portaled to <body> at a fixed rect, so it escapes
+   any ancestor's overflow:hidden (Modal's body, Settings' scroll panes).
+   Real backdrop-filter: like Modal.module.css's .surface, this floats over
+   static content behind a scrim/panel, not the animating Home hero. */
+.panel {
+  position: fixed;
+  z-index: var(--z-ctx);
+  background: var(--glass-heavy-bg);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: var(--radius-md);
+  backdrop-filter: var(--glass-heavy-blur);
+  -webkit-backdrop-filter: var(--glass-heavy-blur);
+  box-shadow: 0 24px 60px -16px var(--shadow-color);
+  padding: 6px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Entrance only (Overlay.module.css's values) -- see Dropdown.tsx's own
+     comment on why there is no separate exit animation here. */
+  opacity: 0;
+  transform: translateY(8px) scale(0.985);
+  transition: opacity 200ms var(--ease-enter), transform 220ms var(--ease-enter);
+}
+.panelOpen {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+:global(:root[data-perf="low"]) .panel,
+:global(:root[data-idle="1"]) .panel {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.96);
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+:root:not([data-gamepad-active="true"]) .option:hover:not(.optionDisabled) {
+  background: var(--glass-bg-strong);
+}
+.optionSelected {
+  background: var(--glass-bg-strong);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.optionDisabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.check {
+  flex: none;
+  color: var(--accent);
+}

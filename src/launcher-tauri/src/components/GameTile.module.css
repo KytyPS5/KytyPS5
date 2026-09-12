@@ -1,0 +1,423 @@
+/* Wraps each tile (game or shortcut) so the PS5-style hover caption
+   (.caption) can sit below the tile in absolute position without being
+   clipped by .tile's own overflow: hidden. */
+.tileWrap {
+  position: relative;
+  flex: none;
+}
+
+/* Uniform square slots (PS5 clone pass): the rail used to grow the selected
+   tile by animating width/height (115x65 -> 180x105), a layout property that
+   relaid out the whole flex row every frame for 300ms -- doubly so once the
+   row was itself a scroll container (Home.module.css's old .tileRow). Growth
+   is transform-only now (scale), which only re-layers the compositor, never
+   triggers layout, matching 01-motion-system.md's "Card scale: 1 element,
+   220ms" rule and the app's own Step 0b measurement discipline.
+
+   Neighbor dimming (01-motion-system.md) falls out of this for free: Home
+   always has exactly one active tile (activeIdx always points somewhere
+   once the library is non-empty), so the plain idle-vs-active opacity
+   difference below already reads as "the unselected ones recede" without a
+   separate :has()-driven class -- and without depending on WebKitGTK's
+   :has() support at all. */
+.tile {
+  flex-shrink: 0;
+  width: var(--rail-tile);
+  height: var(--rail-tile);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  cursor: pointer;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+  transform: scale(1);
+  /* Grows downward from a shared top edge (owner decision, 2026-09-09),
+     not upward -- the reference keeps every rail slot's top aligned, and
+     .railViewport/.railTrack (Home.module.css) reserve their extra room
+     below the row for exactly this reason. */
+  transform-origin: top center;
+  opacity: 0.78;
+  transition: transform var(--t-focus) var(--ease-enter), opacity var(--t-hover) var(--ease-ui), filter var(--t-hover) var(--ease-ui), border-color var(--t-focus) var(--ease-enter), box-shadow var(--t-focus) var(--ease-enter);
+  position: relative;
+  background: linear-gradient(135deg, var(--glass-bg-strong), var(--bg-elevated));
+}
+.tile:hover:not(.active) {
+  transform: scale(1.015);
+  opacity: 0.92;
+  border-color: var(--accent);
+  box-shadow: 0 8px 24px var(--accent-glow);
+}
+/* Short compression on gamepad confirm -- combined with each state's own
+   scale below rather than the old string-concatenated inline transform
+   (see theme.css's shared .ps-pressed doc comment for why that mattered). */
+.tile.ps-pressed {
+  transition-duration: 70ms;
+  transform: scale(calc(1.015 * 0.965));
+}
+.active.ps-pressed {
+  transform: scale(calc(var(--rail-grow) * 0.965));
+}
+
+/* The fixed Library/Settings/Console shortcuts -- same dark-glass surface as
+   the Home shortcut row's own chrome fill (see theme.css's --osd-bg
+   comment), not a colored gradient. Flat fill, no backdrop-filter: these
+   sit over the animating Home hero. Always full presence (chrome, not game
+   content), unlike .tile's idle dimming. */
+.shortcutTile {
+  composes: tile;
+  opacity: 1;
+  background: var(--osd-bg);
+  border-color: var(--osd-border);
+  /* Flex column (icon over label), both centered -- replaces the old
+     absolutely-positioned icon (top: 10px) + label (bottom: 6px) pair,
+     which fixed the label's box height regardless of what the label
+     actually needed and clipped it in longer locales (owner rule,
+     2026-09-09: "increase div size when text does not fit"). height: auto
+     + min-height (not .tile's fixed height) and overflow: visible are
+     what actually deliver that: a fixed height with overflow: hidden
+     still clips a wrapped label no matter how the flex column inside is
+     arranged, that gap was still open until this pass. */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 6px;
+  height: auto;
+  min-height: var(--rail-tile);
+  overflow: visible;
+}
+/* Hover (mouse), real mouse press (:active), or focus (gamepad/keyboard --
+   FocusNav's .ps-focused marker, theme.css) -- one unified state, styled
+   to match a selected GameTile's .active below exactly (owner rule,
+   2026-09-09: "must have the same style as a game button"): same
+   brightness lift, same border-color, same two-layer box-shadow. A
+   shortcut has no separate "active but not selected" rail state the way
+   GameTile does (only one tile is ever .active at a time), so
+   hover/press/focus directly is the selected state here. Written with a
+   leading .tileWrap ancestor selector (every ShortcutTile div is wrapped
+   in one, GameTile.tsx) so this rule is (0,4,0) and genuinely outranks
+   .tile:hover:not(.active) above, which is (0,3,0) -- without the extra
+   qualifier both were (0,3,0) and the win depended on source order, which
+   is exactly the fragile-to-a-later-edit tie this rule means to avoid. */
+.tileWrap [data-focusable].shortcutTile:hover,
+.tileWrap [data-focusable].shortcutTile:active,
+.tileWrap [data-focusable].shortcutTile.ps-focused {
+  transform: scale(var(--rail-grow));
+  /* Completely dark, not a lightening white film (owner rule, 2026-09-09):
+     stays the resting --osd-bg fill instead of switching to
+     --glass-bg-strong's white tint -- no separate zoomed background at
+     all, same solid dark panel as at rest. */
+  background: var(--osd-bg);
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.15);
+  filter: brightness(1.06);
+  z-index: 2;
+}
+/* Same press-compression pattern as .active.ps-pressed below -- compresses
+   from THIS tile's own zoomed rest state (--rail-grow, reached above by
+   hover or focus), not .tile.ps-pressed's smaller 1.015 baseline. Same
+   [data-focusable] specificity bump as the rule above, for the same
+   reason: .tile.ps-pressed is a tie otherwise, not an outright loss, and a
+   tie is not a fix. Without this a gamepad confirm on a zoomed shortcut
+   tile shows no compression at all, no tactile feedback, unlike every
+   other focusable tile in this file. */
+[data-focusable].shortcutTile.ps-pressed {
+  transition-duration: 70ms;
+  transform: scale(calc(var(--rail-grow) * 0.965));
+}
+
+/* Standing selection for a shortcut tile in Minimal layout (owner rule,
+   2026-09-09: "the zoom effect must be on active also, not only on
+   hover") -- Home.tsx tracks which rail item is selected (games and
+   shortcuts alike) and applies this class the same way it applies
+   GameTile's own .active below, so a selected shortcut stays zoomed after
+   the pointer/focus leaves instead of snapping back to rest. Identical
+   declaration set to .active, plus keeping the flat --osd-bg fill (a
+   shortcut's resting background) in place of .active's inherited opaque
+   gradient -- a shortcut's resting fill is flat --osd-bg, not .tile's
+   gradient, so it needs its own zoomed-fill rule rather than reusing
+   .active's; the point is that fill does not change on zoom at all.
+   Gaming library layout never applies this class (Home.tsx gates isActive
+   on layout === "standard"), so no [data-home-layout="library"] override
+   is needed here the way there is for the hover rule above. */
+.shortcutActive {
+  composes: shortcutTile;
+  transform: scale(var(--rail-grow));
+  background: var(--osd-bg);
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.15);
+  filter: brightness(1.06);
+  z-index: 2;
+}
+
+/* Gaming library layout (Home.tsx sets data-home-layout on .root; the
+   layout picker's own English label for this value is "Gaming library
+   layout", homeLayout.ts's "library") drops the zoom off these same three
+   buttons (owner rule, 2026-09-09) -- everything else above (brightness,
+   border-color, box-shadow, the flux sweep below) still applies, only the
+   scale is cancelled back to 1. Selectors repeat the ones above with the
+   [data-home-layout="library"] ancestor prefixed, which makes each one
+   strictly more specific than what it overrides, so this wins outright
+   rather than depending on appearing later in the file. Minimal layout
+   (homeLayout.ts's "standard", the layout the amplifying-effect rule above
+   was originally written for) is untouched. */
+[data-home-layout="library"] .tileWrap [data-focusable].shortcutTile:hover,
+[data-home-layout="library"] .tileWrap [data-focusable].shortcutTile:active,
+[data-home-layout="library"] .tileWrap [data-focusable].shortcutTile.ps-focused {
+  transform: none;
+}
+/* Press-compression still applies (tactile feedback on confirm is a
+   separate concern from the grow-on-select effect this layout opts out
+   of), just from this layout's own unscaled resting state instead of
+   --rail-grow. */
+[data-home-layout="library"] [data-focusable].shortcutTile.ps-pressed {
+  transform: scale(0.965);
+}
+
+/* Moving "flux" highlight riding a tile's own white border, plus a soft
+   shimmer across its face, whenever a tile is zoomed -- .active or
+   .shortcutActive alone, standing selection included, not only while
+   hover/press/focus is also live (owner rule, 2026-09-09: "when zoom the
+   white border must move, follow a flow"). This supersedes this file's
+   own earlier call the same day to keep a standing selection's ring
+   inert -- once ShortcutTile started holding its own persistent zoom too
+   (.shortcutActive, above), the owner revisited that and asked for the
+   ring to run continuously on whichever tile is currently zoomed, game or
+   shortcut alike, not only while the pointer/gamepad is actively on it.
+   The actual sweep (mask, gradients, keyframes) is defined once, globally,
+   in theme.css's .flux-ring / .flux-shimmer -- see that comment for why.
+   Everything below is what is genuinely per-tile: sizing to THIS tile's
+   own box (2px, matching
+   .tile's border), which state shows it, and starting the shared
+   keyframes -- kept out of the shared class so a rail full of tiles isn't
+   all quietly animating a hidden ring, only the one actually shown pays
+   for it (a real perf concern once this covers every GameTile, not just
+   3 fixed ShortcutTiles).
+
+   Sibling divs, not a ::before on .tile/.shortcutTile/.active themselves:
+   .tile already paints a background under an opaque conic-gradient sweep,
+   a ::before on the same element would fight that element's own stacking
+   context for no benefit; and the growing tile's z-index: 2 means a plain
+   child would still paint under the *next* rail slot once this one grows
+   into it, these siblings get z-index: 3 specifically to win that.
+
+   The :hover / :active / .ps-focused selectors below stay alongside the
+   bare .active / .shortcutActive ones rather than being replaced by them:
+   the CSS pseudo-class applies the instant the pointer/gamepad lands,
+   while .active / .shortcutActive only land a render later once React
+   commits the selection -- keeping both means the ring is already
+   spinning by the time that commit lands, no one-frame gap. */
+.tileFlux,
+.tileShimmer {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 3;
+  /* Scales in lockstep with the tile's own zoom (same origin, same
+     transition token) -- without this the effect stays sized to the
+     tile's RESTING (unscaled) box while the tile itself balloons via
+     transform, ending up swallowed underneath it instead of framing it. */
+  transform: scale(1);
+  transform-origin: top center;
+  transition: opacity var(--t-hover) var(--ease-ui), transform var(--t-focus) var(--ease-enter);
+}
+.tileFlux {
+  --flux-band: 2px;
+}
+.active ~ .tileFlux,
+.shortcutActive ~ .tileFlux,
+.shortcutTile:hover ~ .tileFlux,
+.shortcutTile:active ~ .tileFlux,
+.shortcutTile.ps-focused ~ .tileFlux {
+  opacity: 1;
+  transform: scale(var(--rail-grow));
+}
+.active ~ .tileFlux::before,
+.shortcutActive ~ .tileFlux::before,
+.shortcutTile:hover ~ .tileFlux::before,
+.shortcutTile:active ~ .tileFlux::before,
+.shortcutTile.ps-focused ~ .tileFlux::before {
+  animation: flux-spin 2.4s linear infinite;
+}
+.active ~ .tileShimmer,
+.shortcutActive ~ .tileShimmer,
+.shortcutTile:hover ~ .tileShimmer,
+.shortcutTile:active ~ .tileShimmer,
+.shortcutTile.ps-focused ~ .tileShimmer {
+  opacity: 1;
+  transform: scale(var(--rail-grow));
+}
+.active ~ .tileShimmer::before,
+.shortcutActive ~ .tileShimmer::before,
+.shortcutTile:hover ~ .tileShimmer::before,
+.shortcutTile:active ~ .tileShimmer::before,
+.shortcutTile.ps-focused ~ .tileShimmer::before {
+  animation: flux-shimmer-sweep 5s ease-in-out infinite;
+}
+
+/* A plain hover on an unselected GAME tile (not yet .active -- React commits
+   that a render later, see the comment above) gets the same flux, just at
+   .tile:hover's own smaller scale(1.015) instead of --rail-grow, so the ring
+   matches the border it's actually riding at that moment (owner rule,
+   2026-09-09: "when we hover into a game box ... at Dashboard ... the
+   flux-spin must be used"). :not(.active) keeps this from double-triggering
+   underneath the .active rule above once React does commit the selection.
+   :not(.shortcutTile) is load-bearing, not defensive: .shortcutTile
+   composes: tile (above), so a bare ShortcutTile div also carries .tile's
+   own compiled class, and this selector's :not(.active) plus 3 class-level
+   terms outscores .shortcutTile:hover's 2 -- without excluding it here, a
+   hovered-but-not-yet-.shortcutActive shortcut tile would have its ring
+   incorrectly shrunk to this rule's scale(1.015) instead of
+   scale(var(--rail-grow)), a real regression caught before it shipped. */
+.tile:hover:not(.active):not(.shortcutTile) ~ .tileFlux,
+.tile:hover:not(.active):not(.shortcutTile) ~ .tileShimmer {
+  opacity: 1;
+  transform: scale(1.015);
+}
+.tile:hover:not(.active):not(.shortcutTile) ~ .tileFlux::before {
+  animation: flux-spin 2.4s linear infinite;
+}
+.tile:hover:not(.active):not(.shortcutTile) ~ .tileShimmer::before {
+  animation: flux-shimmer-sweep 5s ease-in-out infinite;
+}
+
+/* Gaming library layout drops the shortcut tiles' own zoom (above), but the
+   flux ring/shimmer itself still belongs on Library/Settings/Console in
+   this layout too (owner rule, 2026-09-09: "we hover at Library, Settings,
+   Console buttons ... the flux-spin must also be used on the white
+   border") -- this used to turn the whole effect off here (opacity: 0,
+   animation: none), which was itself the bug: the actual defect was only
+   that the ring stayed sized to --rail-grow while the tile it was framing
+   no longer zoomed, floating outside the tile's real (unscaled) border.
+   Cancelling just the scale, not opacity/animation, fixes that without
+   losing the ring in this layout. Only ShortcutTile is affected (GameTile's
+   .active always zooms, in both layouts), same [data-home-layout="library"]
+   prefix pattern as the tile-zoom override above so it outranks the base
+   (0,2,0) show-rules outright. */
+[data-home-layout="library"] .shortcutTile:hover ~ .tileFlux,
+[data-home-layout="library"] .shortcutTile:active ~ .tileFlux,
+[data-home-layout="library"] .shortcutTile.ps-focused ~ .tileFlux,
+[data-home-layout="library"] .shortcutTile:hover ~ .tileShimmer,
+[data-home-layout="library"] .shortcutTile:active ~ .tileShimmer,
+[data-home-layout="library"] .shortcutTile.ps-focused ~ .tileShimmer {
+  transform: scale(1);
+}
+
+.active {
+  composes: tile;
+  transform: scale(var(--rail-grow));
+  opacity: 1;
+  filter: brightness(1.06);
+  z-index: 2;
+  border-color: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.15);
+}
+
+.image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* ShortcutTile's icon -- in-flow inside its flex column now, not
+   absolutely positioned (top: 10px, left: 50% + translateX) against a
+   tile whose height is no longer fixed. */
+.shortcutIcon {
+  flex: none;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 22px;
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+/* Used by ShortcutTile only (its label stays inside the small tile). GameTile
+   uses .caption below instead -- the PS5 dashboard renders the game name
+   large, below the row, not as a small in-tile overlay. */
+.labelScrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.7) 0%, transparent 60%);
+  opacity: 0;
+  transition: opacity var(--t-panel) var(--ease-ui);
+}
+.active .labelScrim {
+  opacity: 1;
+}
+
+/* In-flow now, not absolutely pinned to a fixed 6px-from-bottom slot --
+   that fixed slot is what clipped "Settings" (and every longer-locale
+   translation of it) regardless of window size (owner rule, 2026-09-09).
+   Wraps instead of eliding; .shortcutTile's flex column grows to fit
+   however many lines that takes. */
+.label {
+  flex: none;
+  /* Owner rule, 2026-09-09: 10px on top of .shortcutTile's own 6px
+     icon-to-label gap (16px total). */
+  margin-top: 10px;
+  max-width: 100%;
+  font-family: var(--font-ui);
+  font-size: clamp(8px, calc(0.65 * var(--vwx)), 10px);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #fff;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+  text-align: center;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.15;
+}
+
+/* PS5-style hover/active caption for game tiles: a modest label directly
+   below the row, left-aligned to the active tile -- not clamped inside its
+   small art box. Lives outside .tile (see .tileWrap) since .tile clips
+   overflow. Deliberately NOT the same scale as the big title next to the
+   Play button (Home.module.css .title, 52px/800) -- those are two distinct
+   elements on the real PS5 dashboard (a small per-tile label here, a large
+   marketing-style title down in the info panel); conflating their sizes
+   was a real regression, caught by screenshot comparison. */
+.caption {
+  position: absolute;
+  /* Clears the grown active tile, which now expands downward
+     (transform-origin: top center, see .tile) instead of upward, so the
+     caption has to start past that growth, not just past the tile's
+     resting height. */
+  top: calc(100% + var(--rail-grow-px));
+  left: 0;
+  margin-top: 8px;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.7);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--t-hover) var(--ease-ui);
+}
+.captionActive {
+  composes: caption;
+  opacity: 1;
+}
+
+/* Idle throttle (lib/idle.ts, theme.css). The flux ring and shimmer keep
+   spinning on whichever tile holds gamepad focus (.ps-focused persists with
+   no pointer involved), so they outlive the window being looked at. */
+:global(:root[data-idle="1"]) .tileFlux::before,
+:global(:root[data-idle="1"]) .tileShimmer::before {
+  animation-play-state: paused;
+}

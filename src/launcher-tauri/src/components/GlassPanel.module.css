@@ -1,0 +1,29 @@
+/* Two variants, per the Step 0b measurement:
+   - light: a flat semi-opaque fill, NO backdrop-filter. For panels floating
+     over the Home hero, which is already pre-blurred art on an animating
+     crossfade -- a live backdrop-filter there is what produced 13.3fps.
+   - heavy: real backdrop-filter blur. Only for panels over static,
+     non-animating content (Settings, Logs, modals). */
+
+.light {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-light-border);
+  border-radius: var(--radius-lg);
+}
+
+.heavy {
+  background: var(--glass-heavy-bg);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: var(--radius-lg);
+  backdrop-filter: var(--glass-heavy-blur);
+  -webkit-backdrop-filter: var(--glass-heavy-blur);
+}
+
+/* data-perf="low" already flattens .glass-panel (theme.css); this covers
+   the same case for GlassPanel's own heavy variant. */
+:global(:root[data-perf="low"]) .heavy,
+:global(:root[data-idle="1"]) .heavy {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(20, 24, 36, 0.92);
+}

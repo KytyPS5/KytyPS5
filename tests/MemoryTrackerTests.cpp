@@ -22,6 +22,16 @@
 #include <windows.h>
 #undef min
 #undef max
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <csignal>
+#include <limits.h>
+#include <map>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #else
 #include <csignal>
 #include <map>
@@ -66,6 +76,26 @@ int ToHostProt(uint32_t protection) {
 }
 
 uint32_t Protection(const void *address) {
+#if defined(__APPLE__)
+  mach_vm_address_t region_address =
+      reinterpret_cast<mach_vm_address_t>(address);
+  mach_vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info{};
+  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name = MACH_PORT_NULL;
+  Check(mach_vm_region(mach_task_self(), &region_address, &region_size,
+                       VM_REGION_BASIC_INFO_64,
+                       reinterpret_cast<vm_region_info_t>(&info), &info_count,
+                       &object_name) == KERN_SUCCESS,
+        "mach_vm_region failed");
+  if (object_name != MACH_PORT_NULL) {
+    mach_port_deallocate(mach_task_self(), object_name);
+  }
+  return (info.protection & VM_PROT_WRITE) != 0
+             ? PAGE_READWRITE
+             : (info.protection & VM_PROT_READ) != 0 ? PAGE_READONLY
+                                                     : PAGE_NOACCESS;
+#else
   const auto addr = reinterpret_cast<uintptr_t>(address);
   std::FILE *maps = std::fopen("/proc/self/maps", "r");
   Check(maps != nullptr, "open /proc/self/maps failed");
@@ -87,6 +117,7 @@ uint32_t Protection(const void *address) {
   }
   std::fclose(maps);
   return result;
+#endif
 }
 
 std::map<void *, size_t> &AllocationSizes() {
@@ -95,6 +126,23 @@ std::map<void *, size_t> &AllocationSizes() {
 }
 
 void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
+#if defined(__APPLE__)
+  mach_vm_address_t raw_address = reinterpret_cast<mach_vm_address_t>(address);
+  const auto flags = address != nullptr ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE;
+  if (mach_vm_allocate(mach_task_self(), &raw_address, size, flags) !=
+      KERN_SUCCESS) {
+    return nullptr;
+  }
+  if (mach_vm_protect(mach_task_self(), raw_address, size, false,
+                      static_cast<vm_prot_t>(ToHostProt(protection))) !=
+      KERN_SUCCESS) {
+    mach_vm_deallocate(mach_task_self(), raw_address, size);
+    return nullptr;
+  }
+  void *raw = reinterpret_cast<void *>(raw_address);
+  AllocationSizes()[raw] = size;
+  return raw;
+#else
   const int extra = address != nullptr ? MAP_FIXED_NOREPLACE : 0;
   void *raw = ::mmap(address, size, ToHostProt(protection),
                      MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
@@ -103,6 +151,7 @@ void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
   }
   AllocationSizes()[raw] = size;
   return raw;
+#endif
 }
 
 int VirtualFree(void *address, size_t, DWORD) {
@@ -111,7 +160,15 @@ int VirtualFree(void *address, size_t, DWORD) {
   if (it == sizes.end()) {
     return 0;
   }
+#if defined(__APPLE__)
+  const int ok = mach_vm_deallocate(mach_task_self(),
+                                    reinterpret_cast<mach_vm_address_t>(address),
+                                    it->second) == KERN_SUCCESS
+                     ? 1
+                     : 0;
+#else
   const int ok = ::munmap(address, it->second) == 0 ? 1 : 0;
+#endif
   sizes.erase(it);
   return ok;
 }
@@ -121,7 +178,16 @@ int VirtualProtect(void *address, size_t size, uint32_t protection,
   if (old_protection != nullptr) {
     *old_protection = Protection(address);
   }
+#if defined(__APPLE__)
+  return mach_vm_protect(mach_task_self(),
+                         reinterpret_cast<mach_vm_address_t>(address), size,
+                         false, static_cast<vm_prot_t>(ToHostProt(protection))) ==
+                 KERN_SUCCESS
+             ? 1
+             : 0;
+#else
   return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
+#endif
 }
 #else
 uint32_t Protection(const void *address) {
@@ -829,7 +895,15 @@ void CheckDeathCase(const char *name) {
   const pid_t pid = ::fork();
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
+#if defined(__APPLE__)
+    char path[PATH_MAX]{};
+    uint32_t path_size = sizeof(path);
+    Check(_NSGetExecutablePath(path, &path_size) == 0,
+          "_NSGetExecutablePath failed");
+    ::execl(path, "MemoryTrackerTests", "--death", name, nullptr);
+#else
     ::execl("/proc/self/exe", "MemoryTrackerTests", "--death", name, nullptr);
+#endif
     std::_Exit(0x7e);
   }
   int status = 0;

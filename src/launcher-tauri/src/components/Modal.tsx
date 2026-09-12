@@ -9,12 +9,20 @@ export function Modal({
   width = 560,
   children,
   footer,
+  dividers = true,
 }: {
   title: string;
   onClose: () => void;
   width?: number;
   children: ReactNode;
   footer?: ReactNode;
+  /** Hairlines under the header and above the footer. On by default: the
+   * folder and image browsers scroll a long list under their header, and
+   * without the rule the rows slide under the title with nothing to
+   * separate them. A short confirm has nothing to scroll and no ambiguity
+   * about where its body ends, so the two rules there are pure chrome --
+   * pass false and let the panel read as one surface. */
+  dividers?: boolean;
 }) {
   const t = useT();
   const surfaceRef = useRef<HTMLDivElement>(null);
@@ -83,7 +91,7 @@ export function Modal({
             alignItems: "center",
             justifyContent: "space-between",
             padding: "16px 20px",
-            borderBottom: "1px solid",
+            borderBottom: dividers ? "1px solid" : "none",
           }}
         >
           <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>{title}</h2>
@@ -99,7 +107,7 @@ export function Modal({
             className={styles.footer}
             style={{
               padding: "14px 20px",
-              borderTop: "1px solid",
+              borderTop: dividers ? "1px solid" : "none",
               display: "flex",
               justifyContent: "flex-end",
               gap: 10,

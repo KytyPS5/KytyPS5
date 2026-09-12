@@ -116,6 +116,19 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	return true;
 }
 
+[[nodiscard]] std::vector<vk::BufferImageCopy>
+BuildDepthCopies(const ImageInfo& info, uint64_t slice_stride, vk::ImageAspectFlags aspect) {
+	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		auto& copy             = copies[layer];
+		copy.bufferOffset      = slice_stride * layer;
+		copy.bufferRowLength   = info.pitch;
+		copy.bufferImageHeight = info.extent.height;
+		copy.imageSubresource  = {aspect, 0, layer, 1};
+		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+	}
+	return copies;
+}
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1871,21 +1884,68 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 		return;
 	}
 
-	const auto& info      = image.info;
-	const auto  transform = info.GetColorTransform();
 	if (info.IsTiled()) {
-		const auto copies = info.BufferCopies(0, levels);
 		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
-		                  levels);
-	} else if (transform != ColorTransform::None) {
-		auto       linear = m_tiler.GetScratchBuffer(destination_size);
-		const auto copies = info.BufferCopies(0, levels);
-		image.Download(copies, linear.buffer, 0, linear.size);
+		return;
+	}
+}
+
+void TextureCache::DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
+                                        ColorTransform transform, Buffer& destination,
+                                        uint64_t destination_offset, uint64_t destination_size) {
+	if (transform != ColorTransform::None) {
+		auto linear = m_tiler.GetScratchBuffer(destination_size);
+		image.Download(regions, linear.buffer, 0, linear.size);
 		m_tiler.TransformColor(linear, {destination.Handle(), destination_offset, destination_size},
 		                       transform, false);
-	} else {
-		const auto copies = info.BufferCopies(destination_offset, levels);
-		image.Download(copies, destination.Handle(), destination_offset, destination_size);
+		return;
+	}
+	for (auto& copy: regions) {
+		copy.bufferOffset += destination_offset;
+	}
+	image.Download(regions, destination.Handle(), destination_offset, destination_size);
+}
+
+void TextureCache::DownloadDepthRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
+                                        Buffer& destination, uint64_t destination_offset,
+                                        uint64_t destination_size) {
+	const auto& info           = image.info;
+	const auto  transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
+	if (transfer_bytes == info.bytes_per_block) {
+		for (auto& copy: regions) {
+			copy.bufferOffset += destination_offset;
+		}
+		image.Download(regions, destination.Handle(), destination_offset, destination_size);
+		return;
+	}
+	EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
+	                     transfer_bytes != sizeof(uint32_t));
+	const uint64_t source_row = static_cast<uint64_t>(info.pitch) * sizeof(uint32_t);
+	const uint64_t target_row = static_cast<uint64_t>(info.pitch) * sizeof(uint16_t);
+	auto           host       = regions;
+	uint64_t       host_size  = 0;
+	for (auto& copy: host) {
+		copy.bufferOffset = host_size;
+		host_size += source_row * copy.imageExtent.height;
+	}
+	auto host_linear = m_tiler.GetScratchBuffer(host_size);
+	image.Download(host, host_linear.buffer, 0, host_linear.size);
+	const bool d32 = DepthAspectTransferFormat(info.pixel_format) == vk::Format::eD32Sfloat;
+	for (size_t index = 0; index < regions.size(); index++) {
+		const uint32_t rows          = regions[index].imageExtent.height;
+		const uint64_t source_offset = host[index].bufferOffset;
+		const uint64_t target_offset = destination_offset + regions[index].bufferOffset;
+		m_tiler.ConvertD16(
+		    {host_linear.buffer, source_offset, host_linear.size - source_offset},
+		    {destination.Handle(), target_offset, destination.Size() - target_offset},
+		    TileManager::D16Direction::Demote, d32,
+		    {.width               = info.extent.width,
+		     .height              = rows,
+		     .layers              = 1,
+		     .source_row_stride   = source_row,
+		     .target_row_stride   = target_row,
+		     .source_slice_stride = source_row * rows,
+		     .target_slice_stride = target_row * rows});
 	}
 }
 
@@ -1944,10 +2004,47 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!image.SafeToDownload() || !CanDownload(image)) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	const auto& info      = image.info;
+	const auto  alignment = std::max<uint64_t>(info.bytes_per_block, 4);
+	const auto  capacity =
+	    Common::AlignDown(m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size(), 64);
+	if (info.data.size <= capacity) {
+	}
+
+	// Mirror the buffer path: split into batches that each fit the download stream.
+	std::vector<vk::BufferImageCopy> regions;
+	TextureDownloadBlock             block {};
+	uint64_t                         chunk_alignment = 1;
+		regions     = BuildDepthCopies(info, info.data.size / info.resources.layers,
+		                               vk::ImageAspectFlagBits::eDepth);
+		block.bytes = info.bytes_per_block;
+		const auto extent = vk::blockExtent(image.backing.format);
+		block             = {extent[0], extent[1], vk::blockSize(image.backing.format)};
+	}
+	if (regions.empty()) {
+		return false;
+	}
+	std::vector<TextureDownloadChunk> chunks;
+	if (!TexturePlanDownloadChunks(regions, info.data.size, block, capacity, chunk_alignment,
+	                               chunks)) {
+		EXIT("TextureCache: cannot split an image download past the download buffer: "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " format=%u extent=%ux%u\n",
+		     info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
+		     info.extent.width, info.extent.height);
+	}
+	for (const auto& chunk: chunks) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::DownloadImageBatch(Image& image, const TextureDownloadChunk& chunk,
+                                      uint64_t alignment) {
+	const GuestRange range {image.info.data.address + chunk.offset, chunk.size};
+	auto&            download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// Mapping past the stream's end waits for the previous batch to be written back.
+	auto [mapped, offset] = download.Map(range.size, alignment);
 	if (mapped == nullptr) {
 		EXIT("TextureCache: failed to map reusable download buffer\n");
 	}
@@ -1957,7 +2054,13 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	if (chunk.regions.empty()) {
+		auto regions = chunk.regions;
+		DownloadDepthRegions(image, regions, download, offset, range.size);
+	} else {
+		auto regions = chunk.regions;
+		                     range.size);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |

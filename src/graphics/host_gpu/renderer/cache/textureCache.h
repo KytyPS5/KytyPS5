@@ -30,6 +30,7 @@ class CommandScheduler;
 class RenderExecutor;
 class TextureCache;
 struct TextureCacheTestAccess;
+struct TextureDownloadChunk;
 
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
@@ -170,6 +171,10 @@ private:
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	void               DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
+	void               DownloadDepthRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
+	                                        Buffer& destination, uint64_t destination_offset,
+	                                        uint64_t destination_size);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
@@ -190,6 +195,9 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// An empty chunk region list downloads the whole transfer in one batch.
+	[[nodiscard]] bool DownloadImageBatch(Image& image, const TextureDownloadChunk& chunk,
+	                                      uint64_t alignment);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

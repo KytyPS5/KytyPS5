@@ -374,7 +374,13 @@ body::after {
 .pill-button.primary:focus-visible,
 .pill-button.primary.ps-focused {
   outline-color: var(--focus-ring-dark);
-  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.5), 0 0 0 2px var(--focus-ring-dark) inset;
+  /* One ring, not two. This used to add `0 0 0 2px inset` on top of the
+     outline above, which drew a second concentric ring a couple of pixels
+     inside the first -- most obvious on Home's Play button, the largest
+     primary in the app. The outline follows border-radius on its own, so
+     the inset copy bought nothing but the doubling. The drop shadow stays:
+     that is the button's lift off the page, not a focus indicator. */
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.5);
 }
 
 /* Shared range-slider primitive -- the app's only input[type=range] styling,
@@ -482,8 +488,10 @@ input[type="range"]:disabled {
 }
 .icon-button:focus-visible,
 .icon-button.ps-focused {
+  /* Outline only -- the `0 0 0 2px` ring this used to also carry sat just
+     outside the outline and read as two stacked boxes, which is what the
+     modal close button looked like. */
   outline-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 .icon-button:disabled {
   opacity: 0.35;

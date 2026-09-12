@@ -16,6 +16,8 @@
 #include <cstring>
 #include <deque>
 #include <vector>
+#include <ctime>
+#include <fstream>
 
 namespace Libs {
 
@@ -319,7 +321,8 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (!g_mount_slots.Empty()) {
-		return SAVE_DATA_ERROR_BUSY;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_BUSY");
+	return SAVE_DATA_ERROR_BUSY;
 	}
 	g_save_data_events.clear();
 
@@ -340,6 +343,42 @@ int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	LOGF("\t resource = %" PRId32 "\n", resource);
 
 	return OK;
+}
+
+// Save metadata (title, subtitle, detail, mtime) has to survive a restart or the game cannot tell
+// a real save from an empty slot. It is stored beside the save data as a small binary file.
+static std::string param_file_path(const std::string& dir_name) {
+	return Common::FixDirectorySlash(std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
+	                                 dir_name) +
+	       "/sce_param.bin";
+}
+
+static bool read_save_param(const std::string& dir_name, SaveDataParam* out) {
+	if (out == nullptr) {
+		return false;
+	}
+	std::ifstream file(param_file_path(dir_name), std::ios::binary);
+	if (!file.is_open()) {
+		return false;
+	}
+	SaveDataParam stored {};
+	file.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+	if (file.gcount() != static_cast<std::streamsize>(sizeof(stored))) {
+		return false;
+	}
+	*out = stored;
+	return true;
+}
+
+static void write_save_param(const std::string& dir_name, const SaveDataParam& param) {
+	SaveDataParam stored = param;
+	if (stored.mtime == 0) {
+		stored.mtime = static_cast<int64_t>(::time(nullptr));
+	}
+	std::ofstream file(param_file_path(dir_name), std::ios::binary | std::ios::trunc);
+	if (file.is_open()) {
+		file.write(reinterpret_cast<const char*>(&stored), sizeof(stored));
+	}
 }
 
 int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
@@ -408,7 +447,10 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
 		              dir_list[i].c_str());
 		if (result->params != nullptr) {
+			// Report what was stored: a blank title or mtime reads as an empty slot and the game
+			// starts a new game instead of offering the save.
 			result->params[i] = {};
+			(void)read_save_param(dir_list[i], &result->params[i]);
 		}
 		if (result->infos != nullptr) {
 			result->infos[i]             = {};
@@ -436,6 +478,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	     mount->user_id, mount->dir_name->data, mount->blocks, mount->system_blocks,
 	     mount->mount_mode, mount->resource);
 
+	// Always visible: the normal log channel is silenced by default, so a failing save mount left
+	// no trace at all. Save mounts are rare, so an unconditional line here costs nothing.
+	::printf("SaveDataMount3: dir=%s mode=%u blocks=%" PRIu64 "\n", mount->dir_name->data,
+	         mount->mount_mode, mount->blocks);
 	*mount_result = {};
 
 	Common::LockGuard lock(g_mount_mutex);
@@ -451,7 +497,8 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		return SAVE_DATA_ERROR_BUSY;
 	}
 	if (slot == SaveDataMountSlots::FULL) {
-		return SAVE_DATA_ERROR_MOUNT_FULL;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_MOUNT_FULL");
+	return SAVE_DATA_ERROR_MOUNT_FULL;
 	}
 
 	if (!create && !create2 && !open) {
@@ -459,11 +506,13 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	}
 
 	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
-		return SAVE_DATA_ERROR_NOT_FOUND;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_NOT_FOUND");
+	return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
 	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
-		return SAVE_DATA_ERROR_EXISTS;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_EXISTS");
+	return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
@@ -474,7 +523,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	const int mount_rc = mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	::printf("SaveDataMount3: dir=%s created=%d result=0x%08x\n", dir_name.c_str(),
+	         static_cast<int>(created), static_cast<unsigned>(mount_rc));
+	return mount_rc;
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
@@ -715,6 +767,14 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		{
+			Common::LockGuard lock(g_mount_mutex);
+			const int slot = g_mount_slots.Find(mount_point->data);
+			if (slot >= 0) {
+				(void)read_save_param(g_mount_slots.Directory(static_cast<size_t>(slot)),
+				                      static_cast<SaveDataParam*>(param_buf));
+			}
+		}
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -837,6 +897,11 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+		Common::LockGuard lock(g_mount_mutex);
+		const int slot = g_mount_slots.Find(mount_point->data);
+		if (slot >= 0) {
+			write_save_param(g_mount_slots.Directory(static_cast<size_t>(slot)), *p);
+		}
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}

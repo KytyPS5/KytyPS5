@@ -4170,6 +4170,24 @@ void TestNewShaderDecoderArchitecture() {
             !sin_f16.src0.absolute,
         "decoder rejected the VOP1 SDWA V_SIN_F16 instruction");
 
+  std::vector<uint32_t> fract_f16_code(0x9b0u / 4u, EncodeSopp(0x00));
+  fract_f16_code.push_back(0x7e12bf07u);
+  fract_f16_code.push_back(EncodeSopp(0x01));
+  Instruction fract_f16;
+  ShaderRecompiler::Decoder::DecodeInstruction(fract_f16_code, 0x9b0u / 4u,
+                                               fract_f16);
+  Check(fract_f16.pc == 0x9b0u && fract_f16.family == Family::VOP1 &&
+            fract_f16.opcode == Opcode::V_FRACT_F16 &&
+            fract_f16.opcode_id == 0x5fu && fract_f16.word_count == 1u &&
+            fract_f16.dst.kind == OperandKind::Vgpr && fract_f16.dst.reg == 9u &&
+            fract_f16.src_count == 1u &&
+            fract_f16.src0.kind == OperandKind::Vgpr && fract_f16.src0.reg == 7u,
+        "decoder rejected captured V_FRACT_F16 at pc 0x9b0");
+  ShaderRecompiler::Decoder::Program fract_program;
+  ShaderRecompiler::Decoder::DecodeProgram(fract_f16_code, fract_program);
+  Check(!ShaderRecompiler::CFG::BuildGraph(fract_program).unsupported,
+        "captured V_FRACT_F16 still fails CFG construction");
+
   const uint32_t literal_code[] = {EncodeVop1(0x01, 2, 255u), 0x12345678u};
   Instruction literal;
   ShaderRecompiler::Decoder::DecodeInstruction(literal_code, 0u, literal);
@@ -4414,6 +4432,62 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
                             "V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo"),
         "captured SDWA V_CMPX_CLASS_F32 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d72d4f9u, 0x86060000u, // v_cmpx_lt_u16 v0, vcc_lo (SDWA)
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(shader, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_LT_U16 &&
+            decoded.opcode_id == 0xb9u && decoded.word_count == 2u &&
+            decoded.raw[0] == shader[0] && decoded.raw[1] == shader[1] &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src0.reg == 0u && decoded.src0.sdwa_sel == 6u &&
+            decoded.src1.kind == Decoder::OperandKind::VccLo &&
+            decoded.src1.sdwa_sel == 6u &&
+            !decoded.src0.sdwa_sext && !decoded.src1.sdwa_sext &&
+            !decoded.src0.negate && !decoded.src1.negate &&
+            !decoded.src0.absolute && !decoded.src1.absolute,
+        "decoder rejected captured SDWA V_CMPX_LT_U16 fields");
+
+  Decoder::Program program;
+  Decoder::DecodeProgram(shader, program);
+  Check(!CFG::BuildGraph(program).unsupported,
+        "captured SDWA V_CMPX_LT_U16 still fails CFG construction");
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_LT_U16 exec_lo, v0, vcc_lo"),
+        "captured SDWA V_CMPX_LT_U16 is missing from decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // Independently assembled gfx1030 compact and VOP3 encodings.
+  const uint32_t compact[] = {0x7d720300u};
+  const uint32_t vop3[] = {0xd4b9007eu, 0x00020300u};
+  for (auto words : {std::span<const uint32_t>(compact),
+                     std::span<const uint32_t>(vop3)}) {
+    Decoder::DecodeInstruction(words, 0u, decoded);
+    Check(decoded.opcode == Decoder::Opcode::V_CMPX_LT_U16 &&
+              decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+              decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+              decoded.src0.reg == 0u &&
+              decoded.src1.kind == Decoder::OperandKind::Vgpr &&
+              decoded.src1.reg == 1u,
+          "compact/VOP3 V_CMPX_LT_U16 does not decode to an EXEC compare");
+  }
+  const uint32_t dpp[] = {EncodeVopc(0xb9u, 250u, 1u), EncodeVop2Dpp(0u)};
+  Decoder::DecodeInstruction(dpp, 0u, decoded);
+  Check(decoded.opcode == Decoder::Opcode::UNSUPPORTED &&
+            Common::ContainsStr(decoded.unsupported_reason,
+                                "VOPC DPP modifier is not supported for opcode"),
+        "V_CMPX_LT_U16 accepted an unsupported DPP encoding");
 }
 
 void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
@@ -13156,6 +13230,7 @@ int main() {
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
+  TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestPsInputCountRegisterDecode();

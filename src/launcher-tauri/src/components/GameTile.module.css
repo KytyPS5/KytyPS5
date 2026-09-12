@@ -413,3 +413,11 @@
   composes: caption;
   opacity: 1;
 }
+
+/* Idle throttle (lib/idle.ts, theme.css). The flux ring and shimmer keep
+   spinning on whichever tile holds gamepad focus (.ps-focused persists with
+   no pointer involved), so they outlive the window being looked at. */
+:global(:root[data-idle="1"]) .tileFlux::before,
+:global(:root[data-idle="1"]) .tileShimmer::before {
+  animation-play-state: paused;
+}

@@ -20,6 +20,8 @@ import "@fontsource-variable/inter/wght.css";
 import "./theme.css";
 import App from "./App";
 import { runPerfProbe } from "./lib/perf";
+import { installIdleThrottle } from "./lib/idle";
+import { installContextMenuSuppression } from "./lib/contextMenu";
 import { initLocale } from "./i18n";
 
 initLocale();
@@ -40,3 +42,5 @@ try {
 }
 
 runPerfProbe();
+installIdleThrottle();
+installContextMenuSuppression();

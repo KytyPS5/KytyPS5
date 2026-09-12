@@ -21,7 +21,8 @@
 
 /* data-perf="low" already flattens .glass-panel (theme.css); this covers
    the same case for GlassPanel's own heavy variant. */
-:global(:root[data-perf="low"]) .heavy {
+:global(:root[data-perf="low"]) .heavy,
+:global(:root[data-idle="1"]) .heavy {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   background: rgba(20, 24, 36, 0.92);

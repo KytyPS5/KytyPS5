@@ -4,7 +4,11 @@
 
 use crate::config::Configuration;
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
+// Only write_bash_script() needs it, and that is Unix-only -- the Windows
+// path hands the whole command line to `cmd /K` instead of writing a script.
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;

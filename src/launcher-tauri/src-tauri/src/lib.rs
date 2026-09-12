@@ -20,6 +20,9 @@ mod trophy;
 #[cfg(target_os = "linux")]
 mod webkit_tuning;
 
+#[cfg(windows)]
+mod webview2_tuning;
+
 use compatibility::CompatibilityMap;
 use config::{Configuration, KytyConfig};
 use std::collections::HashMap;
@@ -280,6 +283,22 @@ fn record_play_stop(app: tauri::AppHandle, game_path: String) -> Result<(), Stri
         })
         .unwrap_or(0);
     playtime::record_stop(&dir, &game_path, elapsed_seconds).map_err(|e| e.to_string())
+}
+
+/// Hands WebView2 the hint that this launcher is not the thing the machine
+/// should be spending memory on right now. Called by the frontend
+/// (lib/idle.ts) on the game-running transition only -- see
+/// webview2_tuning.rs for why not on focus changes, and why not TrySuspend.
+/// A no-op off Windows: WebKitGTK is tuned once at window creation instead
+/// (webkit_tuning.rs), and WKWebView exposes no equivalent.
+#[tauri::command]
+fn set_webview_memory_low(app: tauri::AppHandle, low: bool) {
+    #[cfg(windows)]
+    if let Some(window) = app.get_webview_window("main") {
+        webview2_tuning::set_low_memory(&window, low);
+    }
+    #[cfg(not(windows))]
+    let _ = (app, low);
 }
 
 #[tauri::command]
@@ -707,6 +726,7 @@ pub fn run() {
             save_prefs,
             run_game,
             stop_game,
+            set_webview_memory_low,
             is_game_running,
             is_resumed_launch,
             get_logs_dir,

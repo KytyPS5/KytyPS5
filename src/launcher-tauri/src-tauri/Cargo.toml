@@ -8,6 +8,21 @@ edition = "2021"
 name = "kyty_launcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Release tuning per Tauri's own size guide. This launcher is a front-end
+# that sits resident next to an emulator competing for the same machine, so
+# its code pages are RAM the emulator does not get: smaller is the point,
+# and there is no hot compute path here that would want opt-level = 3.
+#
+# `panic = "abort"` drops the unwinding tables. Nothing here uses
+# catch_unwind (checked), and cargo ignores this setting when building test
+# targets, so `cargo test --release` still works.
+[profile.release]
+codegen-units = 1  # one unit lets LLVM optimize across the whole crate
+lto = true         # link-time optimization across crates too
+opt-level = "s"    # size over raw speed -- see above
+panic = "abort"    # no unwinding tables
+strip = true       # no debug symbols in the shipped binary
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -34,6 +49,13 @@ webkit2gtk = { version = "2.0", features = ["v2_38"] }
 bluer = { version = "0.17.4", features = ["bluetoothd"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# WebView2 memory tuning for webview2_tuning.rs -- see that file's doc comment.
+# Pinned to the tree wry/tauri already link (webview2-com 0.38 -> windows-core
+# 0.61), which is a different `windows` major than the 0.62 the Bluetooth code
+# below uses. Both resolve side by side; the COM types must not be mixed across
+# them, and are not.
+webview2-com = "0.38"
+windows-core = "0.61"
 windows = { version = "0.62", features = [
     "Devices_Bluetooth",
     "Devices_Enumeration",

@@ -79,13 +79,45 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+
+	const auto attempt = [&](bool drop_within_budget, VmaMemoryUsage memory_usage) {
+		auto info = allocation_info;
+		if (drop_within_budget) {
+			info.flags &= ~static_cast<VmaAllocationCreateFlags>(
+			    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		}
+		info.usage = memory_usage;
+		const auto result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &info,
+		    &native_buffer, &m_allocation, &allocation_result));
+		if (result != vk::Result::eSuccess) {
+			native_buffer = VK_NULL_HANDLE;
+			m_allocation  = nullptr;
+		}
+		return result;
+	};
+
+	auto result = attempt(false, AllocationUsage(usage));
 	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+		// WITHIN_BUDGET makes VMA refuse an allocation the driver would still have served, so the
+		// first retry simply asks the driver.
+		result = attempt(true, AllocationUsage(usage));
+		if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal) {
+			result = attempt(true, VMA_MEMORY_USAGE_AUTO);
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		const auto budget = graphics.GetMemoryBudget();
+		graphics.LogMemoryBudget();
+		EXIT("out of device memory for a buffer: size=%llu usage=%u flags=0x%llx result=%s; "
+		     "device usage=%llu budget=%llu heap=%llu (budget %s)\n",
+		     static_cast<unsigned long long>(size), static_cast<unsigned>(usage),
+		     static_cast<unsigned long long>(static_cast<vk::BufferUsageFlags::MaskType>(flags)),
+		     vk::to_string(result).c_str(), static_cast<unsigned long long>(budget.usage),
+		     static_cast<unsigned long long>(budget.budget),
+		     static_cast<unsigned long long>(budget.heap_size),
+		     budget.reported ? "reported" : "unknown");
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {

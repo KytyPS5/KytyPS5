@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <map>
@@ -33,7 +34,6 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
-	bool                               depth_color_copy_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -93,14 +93,29 @@ struct GraphicContext {
 		return alignment != 0 ? alignment : 1;
 	}
 
+	struct ImageAllocationReport {
+		vk::Result              result = vk::Result::eSuccess;
+		Headroom::AllocationTier tier  = Headroom::AllocationTier::DeviceLocal;
+		uint64_t                size                  = 0;
+		bool                    host_fallback_allowed = true;
+		Headroom::MemoryBudget  budget;
+
+		[[nodiscard]] bool Failed() const noexcept { return result != vk::Result::eSuccess; }
+	};
+
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
-	void                   DeleteImage(VulkanImage& image);
+	// Without VK_EXT_memory_budget `reported` is false and only the raw heap size is known.
+	[[nodiscard]] Headroom::MemoryBudget GetMemoryBudget() const;
+	// Bytes this image would need, measured by creating an unbacked VkImage; 0 if that fails.
+	[[nodiscard]] uint64_t               ImageMemorySize(const vk::ImageCreateInfo& info) const;
+	[[nodiscard]] bool CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                               ImageAllocationReport* report = nullptr);
+	void               DeleteImage(VulkanImage& image);
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;

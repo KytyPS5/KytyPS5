@@ -190,9 +190,16 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	               vk::ImageUsageFlagBits::eSampled;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
-	if (!graphics.CreateImage(create, dst)) {
-		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
-		     extent.width, extent.height, static_cast<int>(format));
+	GraphicContext::ImageAllocationReport allocation {};
+	if (!graphics.CreateImage(create, dst, &allocation)) {
+		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d result=%s "
+		     "requested=%llu bytes; device memory usage=%llu budget=%llu (%s)\n",
+		     extent.width, extent.height, static_cast<int>(format),
+		     vk::to_string(allocation.result).c_str(),
+		     static_cast<unsigned long long>(allocation.size),
+		     static_cast<unsigned long long>(allocation.budget.usage),
+		     static_cast<unsigned long long>(allocation.budget.budget),
+		     allocation.budget.reported ? "reported" : "unknown");
 	}
 }
 
@@ -915,7 +922,9 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+	// One presented frame has passed; image staleness is judged in frames.
+	m_impl->renderer.GetTextureCache().AdvanceFrame();
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;

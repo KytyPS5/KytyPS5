@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -12,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -64,6 +66,10 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	// Called once per presented frame. Image staleness is judged against this rather than against
+	// the queue submission counter, which this title advances dozens of times inside one frame.
+	void AdvanceFrame() noexcept { m_frame_index.fetch_add(1, std::memory_order_relaxed); }
+
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
@@ -77,9 +83,15 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void RunGarbageCollector();
+	void RunGarbageCollector(bool per_frame = false);
 
 private:
+	void FreePublishedEvictions();
+
+	enum class TransferDirection { Upload, Download };
+	struct TextureTransfer;
+	struct ImageDownload;
+
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
@@ -131,6 +143,11 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	// `with_download_plan` asks whether a write-back could be built; only the collector needs it.
+	[[nodiscard]] Headroom::CollectorImageFacts CollectorFacts(const Image& image,
+	                                                           bool with_download_plan);
+	// Frees what can be freed with no GPU work. Caller holds m_lock; returns accounted bytes.
+	[[nodiscard]] uint64_t ReclaimForAllocation(uint64_t needed);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -166,6 +183,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	std::atomic<uint64_t>                             m_frame_index {0};
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
@@ -176,6 +194,14 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// Evicted images held registered until their download reaches guest memory. The priority runner
+	// appends to m_evict_published under its own leaf mutex, never m_lock, which would deadlock a
+	// caller already waiting on a priority operation.
+	std::unordered_map<ImageId, uint64_t>             m_evict_pending;
+	std::unordered_map<ImageId, uint64_t>             m_evict_backoff;
+	std::unordered_map<uint64_t, uint64_t>            m_evicted_addresses;
+	std::mutex                                        m_evict_published_lock;
+	std::vector<ImageId>                              m_evict_published;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

@@ -7,6 +7,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -143,6 +145,10 @@ void RenderContext::PrepareBda(bool stores) {
 }
 
 void RenderContext::RunGarbageCollector() {
+	static const bool per_frame_texture_gc = [] {
+		const char* text = std::getenv("KYTY_NO_PER_FRAME_TEXTURE_GC");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
@@ -155,7 +161,7 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
+	m_texture_cache.RunGarbageCollector(per_frame_texture_gc);
 	m_buffer_cache.RunGarbageCollector();
 }
 

@@ -29,6 +29,14 @@ inline std::string PathToString(const std::filesystem::path& path) {
 #endif
 }
 
+inline std::filesystem::path PathFromString(std::string_view utf8) {
+#if defined(__cpp_char8_t)
+	return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+#else
+	return std::filesystem::u8path(utf8);
+#endif
+}
+
 inline std::string PathToGenericString(const std::filesystem::path& path) {
 #if defined(__cpp_char8_t)
 	auto u8 = path.generic_u8string();

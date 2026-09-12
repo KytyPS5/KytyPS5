@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -32,6 +33,19 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// A full metadata fill covers every slice the guest can address. CB_COLOR_VIEW and DB_DEPTH_VIEW
+// both encode slice indices in 13 bits, so derive the capacity from the register field rather than
+// from any host integer width.
+constexpr uint64_t MetaSliceCapacity = static_cast<uint64_t>(Pm4::CB_COLOR0_VIEW_SLICE_MAX_MASK) + 1;
+// Pending ranges are bounded by the capacity and are narrowed to the 32-bit baseArrayLayer and
+// layerCount fields of vk::ImageSubresourceRange when a run is materialized.
+static_assert(MetaSliceCapacity <= std::numeric_limits<uint32_t>::max());
+
+// HTile pending state is still consumed one slice at a time at the depth binding, which checks only
+// the view's base layer. Arming the same 32 slices it armed before keeps depth behaviour unchanged;
+// widening it belongs with the separate multi-layer depth fix, not with this colour-DCC change.
+constexpr uint64_t LegacyNonDccSliceCapacity = 32;
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
                                   uint32_t fill, vk::ClearColorValue& clear) {
@@ -1149,7 +1163,7 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	} else if (metadata.type != MetaDataInfo::Type::Dcc) {
 		EXIT("TextureCache: image reuses non-DCC metadata\n");
 	}
-	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
+	if (!metadata.AnyPending() || image.info.resources.levels != 1 ||
 	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
 		return;
 	}
@@ -1162,26 +1176,31 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	const auto  first          = volume_texture ? 0u : view.base_layer;
 	const auto  count = volume_texture ? std::max(image.info.extent.depth >> view.base_level, 1u)
 	                                   : view.layer_count;
-	if (first >= 32 || count > 32 - first) {
+	// Check count against the capacity before subtracting, so an out-of-range view cannot wrap the
+	// bound and reach ForEachIntersection with a range the pending state can never describe.
+	if (count == 0 || count > MetaSliceCapacity || first > MetaSliceCapacity - count) {
 		return;
 	}
+	// Collect the pending runs before touching anything: ClearImage and the state update below both
+	// mutate structures that the traversal would otherwise be walking.
+	std::vector<RangeSet::Range> pending;
+	metadata.pending_clear.ForEachIntersection(
+	    first, count, [&pending](RangeSet::Range range) { pending.push_back(range); });
 	// The metadata fill covers the complete allocation. Consume each layer only after its
 	// native image contents exist; already materialized layers may have been rendered since.
-	for (uint32_t layer = first; layer < first + count;) {
-		if ((metadata.clear_mask & (1u << layer)) == 0) {
-			layer++;
-			continue;
-		}
-		const auto start = layer;
-		uint32_t   mask  = 0;
-		do {
-			mask |= 1u << layer++;
-		} while (layer < first + count && (metadata.clear_mask & (1u << layer)) != 0);
+	const auto metadata_address = desc.info.metadata.range.address;
+	for (const auto& range: pending) {
 		ClearImage(m_scheduler.Current(), id,
-		           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count, start,
-		            layer - start},
+		           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+		            static_cast<uint32_t>(range.address), static_cast<uint32_t>(range.size)},
 		           clear);
-		metadata.clear_mask &= ~mask;
+		// ClearImage can retire images, and retiring an image that shares this metadata allocation
+		// erases the entry, so re-resolve it instead of holding a reference across the clear.
+		const auto current = m_surface_metas.find(metadata_address);
+		if (current == m_surface_metas.end() || current->second.type != MetaDataInfo::Type::Dcc) {
+			return;
+		}
+		current->second.pending_clear.Subtract(range.address, range.size);
 	}
 }
 
@@ -1430,15 +1449,17 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	RefreshImage(id);
 	if (desc.info.HasMetadata()) {
 		image.info.metadata = desc.info.metadata;
-		auto [metadata, inserted] =
-		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
-		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                              .clear_mask = image.info.htile_clear_mask});
-		if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
-			// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
-			// The depth binding defines the new type; incompatible fill state cannot carry over.
-			metadata->second = {.type       = MetaDataInfo::Type::HTile,
-			                    .clear_mask = image.info.htile_clear_mask};
+		// htile_clear_mask only ever carries "everything pending" or "nothing pending" at this
+		// handoff, so it maps onto the range set as a whole-state flag.
+		auto [metadata, inserted] = m_surface_metas.try_emplace(
+		    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::HTile});
+		// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
+		// The depth binding defines the new type; incompatible fill state cannot carry over.
+		if (inserted || metadata->second.type != MetaDataInfo::Type::HTile) {
+			metadata->second = MetaDataInfo {.type = MetaDataInfo::Type::HTile};
+			if (image.info.htile_clear_mask != 0) {
+				metadata->second.ArmSlices(LegacyNonDccSliceCapacity);
+			}
 		}
 	}
 	CommitGpuWrite(image);
@@ -1879,13 +1900,13 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    slice >= 32) {
+	    slice >= MetaSliceCapacity) {
 		return false;
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found->second.IsPending(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -1897,7 +1918,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		// validated fill value, so an arbitrary compute write must not clear it.
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.ArmSlices(LegacyNonDccSliceCapacity);
 	return true;
 }
 
@@ -1907,18 +1928,18 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 	}
 	// DCC fills use a repeated byte code. Require all four bytes of the detected dword to agree,
 	// and mark only recognized deferred-clear encodings as logically clear.
-	const auto dcc_clear_mask = [fill_value] {
+	const bool dcc_clears_all = [fill_value] {
 		const auto code = static_cast<uint8_t>(fill_value);
 		if (fill_value != static_cast<uint32_t>(code) * 0x01010101u) {
-			return 0u;
+			return false;
 		}
 		switch (code) {
 			case 0x00:
 			case 0x20:
 			case 0x40:
 			case 0x80:
-			case 0xc0: return UINT32_MAX;
-			default: return 0u;
+			case 0xc0: return true;
+			default: return false;
 		}
 	}();
 	std::scoped_lock lock {m_lock};
@@ -1927,7 +1948,12 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 	const auto found = m_surface_metas.try_emplace(address).first;
 	if (found->second.type == MetaDataInfo::Type::PendingDcc ||
 	    found->second.type == MetaDataInfo::Type::Dcc) {
-		found->second.clear_mask = dcc_clear_mask;
+		// A fill covers the whole allocation, so every addressable slice becomes pending again.
+		if (dcc_clears_all) {
+			found->second.ArmSlices(MetaSliceCapacity);
+		} else {
+			found->second.DisarmSlices();
+		}
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
 	}
@@ -1937,13 +1963,13 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    slice >= 32) {
+	    slice >= MetaSliceCapacity) {
 		return false;
 	}
 	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
+		found->second.pending_clear.Add(slice, 1);
 	} else {
-		found->second.clear_mask &= ~(1u << slice);
+		found->second.pending_clear.Subtract(slice, 1);
 	}
 	return true;
 }

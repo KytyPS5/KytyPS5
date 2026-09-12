@@ -1519,6 +1519,14 @@ int KYTY_SYSV_ABI KernelIsSignalReturn(uint64_t /*pc*/) {
 	return 0;
 }
 
+// Empirical cut-off below which an address that belongs to no loaded module is treated as host
+// code rather than as a missing guest module. It sits inside the guest system-reserved range
+// (system-managed is 0x40000..0x7ffffbfff, system-reserved 0x7ffffc000..0xfffffffff, user
+// 0x1000000000..0xfbffffffff), so guest allocations below it are also reported as a boundary.
+// That is deliberate for now - stopping the unwind is better than raising - but the value has
+// never been tied to a specific host allocation, so it is a heuristic, not a layout fact.
+static constexpr uint64_t UNWIND_HOST_BOUNDARY_MAX = 0x800000000ull;
+
 int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
                                                ModuleInfoForUnwind* info) {
 	if (flags >= 3) {
@@ -1539,7 +1547,7 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 	auto* rt      = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto* program = rt->FindProgramByAddr(addr);
 	if (program == nullptr || program->elf == nullptr) {
-		if (addr < 0x800000000ull) {
+		if (addr < UNWIND_HOST_BOUNDARY_MAX) {
 			// TODO(unwind): guest unwinding can reach a Kyty host return address below the guest VA
 			// range. Report a synthetic boundary with no unwind tables so libc stops cleanly
 			// instead of raising.

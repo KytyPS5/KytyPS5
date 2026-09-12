@@ -167,7 +167,7 @@ LIB_VERSION("Graphics5Driver", 1, "Graphics5Driver", 1, 1);
 namespace Gen5Driver = Graphics::Gen5Driver;
 
 LIB_DEFINE(InitAgcDriver_1) {
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE_ALL(true);
 
 	LIB_FUNC("UglJIZjGssM", Gen5Driver::AgcDriverSubmitDcb);
 	LIB_FUNC("AhGvpITrf4M", Gen5Driver::AgcDriverSubmitDcb);

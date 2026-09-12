@@ -1,11 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -29,6 +31,73 @@ const char* StageName(ShaderType stage) {
 std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::string& message) {
 	return fmt::format("shader SRT: hash=0x{:016x} stage={} pc=0x{:08x} {}", program.shader_hash,
 	                   StageName(program.stage), pc, message);
+}
+
+// KYTY_SRT_DIAG=1 dumps the opcode tree of a descriptor dword that failed bind-time evaluation
+// (the "a descriptor source did not evaluate" drop). Zero cost unless the env var is set.
+// True when an address expression is carried around a loop, so it has no value before the draw.
+bool AddressReachesPhi(Value value, std::vector<const Inst*>& visited, uint32_t depth) {
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr || depth > 64u) {
+		return false;
+	}
+	if (inst->GetOpcode() == ValueOpcode::Phi) {
+		return true;
+	}
+	if (std::ranges::find(visited, inst) != visited.end()) {
+		return false;
+	}
+	visited.push_back(inst);
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		if (AddressReachesPhi(inst->Arg(index), visited, depth + 1u)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SrtDiagEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SRT_DIAG");
+		return v != nullptr && v[0] != '0';
+	}();
+	return on;
+}
+
+std::string DescribeValueTree(const ResourcePlan& program, Value value, uint32_t depth = 0) {
+	value            = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return value.IsImmediate() && value.GetType() == Type::U32
+		           ? fmt::format("0x{:08x}", value.U32())
+		           : std::string("opaque");
+	}
+	const auto op   = inst->GetOpcode();
+	auto       text = std::string(ValueOpcodeName(op));
+	if (op == ValueOpcode::GetUserData && inst->NumArgs() == 1 &&
+	    inst->Arg(0).GetType() == Type::ScalarReg) {
+		return text + fmt::format(" s{}", RegIndex(inst->Arg(0).ScalarRegister()));
+	}
+	if (op == ValueOpcode::ReadConst && inst->NumArgs() == 2 &&
+	    inst->Arg(1).Resolve().IsImmediate()) {
+		return text + fmt::format(" slot={}", inst->Arg(1).Resolve().U32());
+	}
+	if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+		const auto flags = inst->Flags<MemoryFlags>();
+		text += fmt::format(" pc=0x{:08x}", flags.pc);
+		if (flags.index < program.memory_info.size()) {
+			text += fmt::format(" offset=0x{:x}", program.memory_info[flags.index].offset);
+		}
+	}
+	if (inst->NumArgs() == 0 || depth >= 5u) {
+		return text;
+	}
+	text += '(';
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		text += index == 0 ? "" : ", ";
+		text += DescribeValueTree(program, inst->Arg(index), depth + 1u);
+	}
+	return text + ')';
 }
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -90,9 +159,14 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeConstructU32x4:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::FindUMsb32:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
 		case ValueOpcode::IAddCarry32:
@@ -139,7 +213,82 @@ public:
 
 	bool Run(Value value) { return Validate(value); }
 
+	const std::string& Reason() const { return m_reason; }
+
 private:
+	bool Reject(std::string reason) {
+		if (m_reason.empty()) {
+			m_reason = std::move(reason);
+		}
+		return false;
+	}
+
+	std::string Describe(Value value, uint32_t depth = 0) const {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return value.IsImmediate() && value.GetType() == Type::U32
+			           ? fmt::format("0x{:08x}", value.U32())
+			           : std::string("opaque");
+		}
+		const auto op   = inst->GetOpcode();
+		auto       text = std::string(ValueOpcodeName(op));
+		if (op == ValueOpcode::GetUserData && inst->NumArgs() == 1 &&
+		    inst->Arg(0).GetType() == Type::ScalarReg) {
+			return text + fmt::format(" s{}", RegIndex(inst->Arg(0).ScalarRegister()));
+		}
+		if (op == ValueOpcode::ReadConst && inst->NumArgs() == 2 &&
+		    inst->Arg(1).Resolve().IsImmediate()) {
+			return text + fmt::format(" slot={}", inst->Arg(1).Resolve().U32());
+		}
+		if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
+			const auto flags = inst->Flags<MemoryFlags>();
+			text += fmt::format(" pc=0x{:08x}", flags.pc);
+			if (flags.index < m_program.memory_info.size()) {
+				text += fmt::format(" offset=0x{:x}", m_program.memory_info[flags.index].offset);
+			}
+			return text;
+		}
+		if (inst->NumArgs() == 0 || depth >= 3u) {
+			return text;
+		}
+		text += '(';
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			text += index == 0 ? "" : ", ";
+			text += Describe(inst->Arg(index), depth + 1u);
+		}
+		return text + ')';
+	}
+
+	std::string DescribePhi(Value value) const {
+		std::vector<Value>              leaves;
+		std::vector<Value>              pending {value};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty()) {
+			const auto current = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = current.TryInstruction();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+				if (seen.insert(inst).second) {
+					for (size_t index = 0; index < inst->NumArgs(); index++) {
+						pending.push_back(inst->Arg(index));
+					}
+				}
+				continue;
+			}
+			if (std::ranges::none_of(leaves, [&](Value known) {
+				    return EquivalentValue(m_program, known, current);
+			    })) {
+				leaves.push_back(current);
+			}
+		}
+		auto text = fmt::format("Phi merges {} unequal values:", leaves.size());
+		for (size_t index = 0; index < leaves.size() && index < 6u; index++) {
+			text += fmt::format(" [{}] {}", index, Describe(leaves[index]));
+		}
+		return text;
+	}
+
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			if (!Validate(inst.Arg(index), require_uniform)) return false;
@@ -164,17 +313,24 @@ private:
 				case Type::U32:
 				case Type::U64:
 				case Type::F32: return true;
-				default: return false;
+				default: return Reject("operand is not an integer");
 			}
 		}
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
 		if (!m_visiting.insert(inst).second) {
+			if (require_uniform) {
+				Reject(fmt::format("{} is cyclic", ValueOpcodeName(inst->GetOpcode())));
+			}
 			return !require_uniform;
 		}
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			if (!valid && require_uniform) {
+				Reject(fmt::format("{} cannot be evaluated before the draw",
+				                   ValueOpcodeName(inst->GetOpcode())));
+			}
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -232,6 +388,7 @@ private:
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
+				Reject(DescribePhi(value));
 				return finish(false);
 			}
 			return finish(Validate(invariant));
@@ -279,6 +436,16 @@ private:
 			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
 				return finish(false);
 			}
+		} else if (op == ValueOpcode::CompositeExtractU32x4) {
+			// A 4-dword descriptor (V#/S#) the shader assembles in registers and then indexes,
+			// e.g. Team Asobi compute shaders building a sampler from CompositeConstructU32x4.
+			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
+			    index.U32() >= 4u ||
+			    source->GetOpcode() != ValueOpcode::CompositeConstructU32x4) {
+				return finish(false);
+			}
 		}
 		if (IsDescriptorHandle(op)) {
 			size_t expected = 4u;
@@ -302,6 +469,7 @@ private:
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
+	std::string                     m_reason;
 };
 
 class PlanBuilder {
@@ -394,7 +562,14 @@ private:
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+		// A flat slot is read once before the draw, so it only works when the whole read can be
+		// evaluated then. An immediate offset is not enough: if the base address is carried
+		// around a loop -- a pointer walked by the shader, as ray-tracing kernels do over a BVH
+		// -- there is no address to read from yet, and giving it a slot only guarantees the
+		// evaluation fails later and the dispatch is dropped. Leave those as runtime reads.
+		std::vector<const Inst*> visited;
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+		    AddressReachesPhi(inst->Arg(0), visited, 0u)) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
 			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);
@@ -512,6 +687,9 @@ private:
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
+			if (m_diag_first_fail == nullptr) {
+				m_diag_first_fail = inst;
+			}
 			return false;
 		}
 		m_cache.emplace(inst, out);
@@ -534,7 +712,9 @@ private:
 			return false;
 		}
 		const auto component = index.U32();
-		if (component >= 2u) {
+		const auto max_component =
+		    inst.GetOpcode() == ValueOpcode::CompositeExtractU32x4 ? 4u : 2u;
+		if (component >= max_component) {
 			return false;
 		}
 		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
@@ -549,7 +729,8 @@ private:
 		if (source == nullptr) {
 			return false;
 		}
-		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2 ||
+		    source->GetOpcode() == ValueOpcode::CompositeConstructU32x4) {
 			return EvaluateWide(source->Arg(component), result);
 		}
 		if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
@@ -584,6 +765,14 @@ private:
 			return false;
 		}
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+		// A V#/T# whose base pointer resolved to null is an unbound (optional) descriptor
+		// slot; on real hardware a read through it returns all-zero rather than faulting.
+		// Resolve it to 0 instead of failing the whole materialisation (which would drop the
+		// dispatch). Correct emulation, not a soft-ladder.
+		if (base == 0) {
+			result = 0;
+			return true;
+		}
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 		uint64_t   address   = 0;
 		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
@@ -653,7 +842,8 @@ private:
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 			case ValueOpcode::CompositeExtractU64:
-			case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+			case ValueOpcode::CompositeExtractU32x2:
+			case ValueOpcode::CompositeExtractU32x4: return EvaluateExtract(inst, result);
 			case ValueOpcode::CompositeConstructU64:
 				if (!binary()) {
 					return false;
@@ -796,6 +986,28 @@ private:
 			case ValueOpcode::BitwiseNot32:
 				if (Arg(inst, 0, a)) {
 					result = ~static_cast<uint32_t>(a);
+					return true;
+				}
+				return false;
+			case ValueOpcode::BitCount32:
+				if (Arg(inst, 0, a)) {
+					result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(a)));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FindILsb32:
+				if (Arg(inst, 0, a)) {
+					const auto bits = static_cast<uint32_t>(a);
+					result          = bits == 0u ? UINT32_MAX
+					                             : static_cast<uint32_t>(std::countr_zero(bits));
+					return true;
+				}
+				return false;
+			case ValueOpcode::FindUMsb32:
+				if (Arg(inst, 0, a)) {
+					const auto bits = static_cast<uint32_t>(a);
+					result          = bits == 0u ? UINT32_MAX
+					                             : static_cast<uint32_t>(31 - std::countl_zero(bits));
 					return true;
 				}
 				return false;
@@ -964,6 +1176,11 @@ private:
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
+
+public:
+	// Deepest instruction whose EvaluateInst returned false during the last Evaluate() call.
+	// Only meaningful when KYTY_SRT_DIAG is set; harmless otherwise.
+	const Inst* m_diag_first_fail = nullptr;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -1034,6 +1251,39 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		if (!evaluate_flat || active[source_index]) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+					if (SrtDiagEnabled()) {
+						std::string fail_node = "(none)";
+						if (evaluator.m_diag_first_fail != nullptr) {
+							fail_node = DescribeValueTree(
+							    program,
+							    Value(const_cast<Inst*>(evaluator.m_diag_first_fail)));
+						}
+						std::string probe;
+						const Inst* fi = evaluator.m_diag_first_fail;
+						if (fi != nullptr && fi->GetOpcode() == ValueOpcode::Phi) {
+							for (size_t e = 0; e < fi->NumArgs(); e++) {
+								Evaluator  pe(program, runtime, clean_flat_slots, &clean_evaluator);
+								uint32_t   v  = 0;
+								const bool ok = pe.Evaluate(fi->Arg(e), v);
+								probe += fmt::format("\n  phi-edge[{}] const={} value=0x{:08x} {}", e,
+								                     ok ? "YES" : "no", v,
+								                     DescribeValueTree(program, fi->Arg(e), 1));
+							}
+						}
+						LOGF("SRT-DIAG: hash=0x%016" PRIx64 " stage=%s source=%u/%u dword=%u/%u "
+						     "srt_slots=%u buffers=%u images=%u samplers=%u indirect_img=%d "
+						     "did not evaluate:\n  tree: %s\n  first-fail: %s%s\n",
+						     program.shader_hash, StageName(program.stage), source_index,
+						     static_cast<uint32_t>(program.descriptor_sources.size()), index,
+						     source->dword_count,
+						     static_cast<uint32_t>(program.srt_reads.size()),
+						     static_cast<uint32_t>(program.info.buffers.size()),
+						     static_cast<uint32_t>(program.info.images.size()),
+						     static_cast<uint32_t>(program.info.samplers.size()),
+						     source->indirect_image.has_value() ? 1 : 0,
+						     DescribeValueTree(program, source->dwords[index]).c_str(),
+						     fail_node.c_str(), probe.c_str());
+					}
 					return false;
 				}
 			}
@@ -1063,8 +1313,16 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 
 } // namespace
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          std::string* reason) {
+	RuntimeValidator validator(program, type);
+	if (validator.Run(value)) {
+		return true;
+	}
+	if (reason != nullptr) {
+		*reason = validator.Reason();
+	}
+	return false;
 }
 
 void BuildSrtPlan(Program& program) {

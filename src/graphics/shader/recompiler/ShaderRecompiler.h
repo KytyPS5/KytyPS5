@@ -19,6 +19,11 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	// PPSA21564: lower wide v_movrels_b32 to IndexedVectorLoad (Function-array + dynamic
+	// OpAccessChain) instead of a select ladder, so the composite/tonemap pixel shaders fit
+	// the module size limit. Title-gated: the lowering regresses Demon's Souls (a large
+	// v_movrels in an early draw device-losses), root cause still open.
+	bool                        lower_wide_movrels         = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

@@ -3,10 +3,14 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -93,13 +97,204 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
+// Matches the guest_gpu PixelPipeStatDump fallback convention: bit 63 marks a counter slot as
+// written/ready, the low 63 bits are the sample count the guest masks out and diffs.
+static constexpr uint64_t kOcclusionReadyBit = 1ull << 63u;
+
+static bool OcclusionQueriesTrusted() {
+	// Default on. Opt out with KYTY_OCCLUSION_QUERIES=0 if a title shows blinking / wrongly culled
+	// geometry with real queries -- the fallback reports every primitive visible, which can never
+	// cull something that is on screen.
+	static const bool trusted = [] {
+		const char* v = std::getenv("KYTY_OCCLUSION_QUERIES");
+		return v == nullptr || v[0] != '0';
+	}();
+	return trusted;
+}
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	m_pending_occlusion.reserve(64);
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_occlusion_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_occlusion_pool, nullptr);
+		m_occlusion_pool = nullptr;
+	}
+}
+
+bool CommandScheduler::EnsureOcclusionPool() {
+	if (m_occlusion_pool != nullptr) {
+		return true;
+	}
+	if (m_occlusion_pool_bad) {
+		return false;
+	}
+	vk::QueryPoolCreateInfo info {};
+	info.sType      = vk::StructureType::eQueryPoolCreateInfo;
+	info.queryType  = vk::QueryType::eOcclusion;
+	info.queryCount = OcclusionQuerySlots;
+	if (m_graphics.device.createQueryPool(&info, nullptr, &m_occlusion_pool) !=
+	        vk::Result::eSuccess ||
+	    m_occlusion_pool == nullptr) {
+		m_occlusion_pool     = nullptr;
+		m_occlusion_pool_bad = true;
+		return false;
+	}
+	return true;
+}
+
+void CommandScheduler::ResetOcclusionPool() {
+	// Slot numbering restarts each recording; the pool must be reset outside a render pass, which
+	// BeginCommand always is. Anything still pending from the previous recording has already been
+	// drained (DrainOcclusionBeforeReuse), so reusing slot 0 here is safe.
+	if (m_command.IsInvalid()) {
+		return;
+	}
+	// Create the pool here rather than on first use. SampleOcclusion only runs inside a render
+	// pass, where vkCmdResetQueryPool is illegal, so a pool created there missed this recording's
+	// reset entirely and its very first vkCmdBeginQuery hit an unreset query -- undefined results
+	// and a validation error. Creating it on the reset path means every pool is always reset
+	// before it is used.
+	if (!EnsureOcclusionPool() || m_occlusion_pool == nullptr) {
+		return;
+	}
+	m_command.Handle().resetQueryPool(m_occlusion_pool, 0, OcclusionQuerySlots);
+	m_occlusion_next_slot = 0;
+	m_occlusion_open_slot = -1;
+}
+
+void CommandScheduler::CloseOpenOcclusionQuery() {
+	if (m_occlusion_open_slot < 0 || m_occlusion_pool == nullptr || m_command.IsInvalid()) {
+		m_occlusion_open_slot = -1;
+		return;
+	}
+	// A query may not outlive its render pass instance and must end in the buffer that began it.
+	// Reached only when the guest never issued the matching end dump; the pending entry then
+	// resolves as "visible".
+	m_command.Handle().endQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot));
+	m_pending_occlusion.push_back({m_occlusion_begin_addr, m_occlusion_open_slot});
+	m_occlusion_open_slot = -1;
+}
+
+void CommandScheduler::DrainOcclusionBeforeReuse() {
+	if (m_pending_occlusion.empty() && m_occlusion_open_slot < 0) {
+		return;
+	}
+	// Results must be read back before the pool is reset for the next recording. The producing
+	// work is already submitted, so wait on the last submitted tick and resolve.
+	if (CurrentTick() > 1) {
+		m_master.Wait(CurrentTick() - 1);
+	}
+	ResolveOcclusion();
+}
+
+bool CommandScheduler::SampleOcclusion(uint64_t dst_addr) {
+	if (dst_addr == 0) {
+		return false;
+	}
+	if (!OcclusionQueriesTrusted()) {
+		// KYTY_OCCLUSION_QUERIES=0: publish a "visible" result for every occlusion-tested
+		// primitive (begin counter 0, end counter large) instead of leaving the guest to read
+		// stale memory. Disables occlusion culling; never wrongly culls on-screen geometry.
+		// begin/end dumps land 8 bytes apart on the same block. Use the safe guest writer --
+		// a result block that is not mapped yet during loading must not fault.
+		const bool     is_end = m_occlusion_begin_addr != 0 && dst_addr == m_occlusion_begin_addr + 8;
+		const uint64_t value =
+		    is_end ? (kOcclusionReadyBit | (uint64_t {1} << 40u)) : kOcclusionReadyBit;
+		(void)Libs::LibKernel::Memory::TryWriteBacking(dst_addr, &value, sizeof(value));
+		m_occlusion_begin_addr = is_end ? 0 : dst_addr;
+		return true;
+	}
+	if (!Active() || m_command.IsInvalid()) {
+		return false;
+	}
+	// beginQuery / endQuery must sit inside a render pass instance. The guest opens one before the
+	// occlusion-tested draw and keeps it open across the pair, so in practice it is; anything else
+	// falls back rather than guessing.
+	if (!m_command.IsRendering() || !EnsureOcclusionPool() || m_occlusion_pool == nullptr) {
+		return false;
+	}
+
+	const bool is_end = m_occlusion_open_slot >= 0 && dst_addr == m_occlusion_begin_addr + 8;
+	if (is_end) {
+		m_command.Handle().endQuery(m_occlusion_pool,
+		                            static_cast<uint32_t>(m_occlusion_open_slot));
+		m_pending_occlusion.push_back({m_occlusion_begin_addr, m_occlusion_open_slot});
+		m_occlusion_open_slot = -1;
+		// "Visible" placeholder until the real result is resolved, so an unresolved query never
+		// reads back as occluded.
+		reinterpret_cast<volatile uint64_t*>(m_occlusion_begin_addr + 8)[0] = kOcclusionReadyBit | 1u;
+		return true;
+	}
+
+	// A still-open query with no matching end: close it defensively before starting a new one.
+	if (m_occlusion_open_slot >= 0) {
+		CloseOpenOcclusionQuery();
+	}
+	if (m_occlusion_next_slot >= OcclusionQuerySlots) {
+		return false; // pool exhausted this recording
+	}
+
+	const auto slot = m_occlusion_next_slot++;
+	m_command.Handle().beginQuery(m_occlusion_pool, slot,
+	                              m_graphics.occlusion_query_precise_enabled
+	                                  ? vk::QueryControlFlagBits::ePrecise
+	                                  : vk::QueryControlFlags {});
+	m_occlusion_open_slot  = static_cast<int32_t>(slot);
+	m_occlusion_begin_addr = dst_addr;
+
+	// Begin dump resolves to zero for every DB; the guest takes end-minus-begin.
+	auto* begin_slots = reinterpret_cast<volatile uint64_t*>(dst_addr);
+	for (uint32_t db = 0; db < 16u; db++) {
+		begin_slots[db * 2u] = kOcclusionReadyBit;
+	}
+	return true;
+}
+
+void CommandScheduler::ResolveOcclusion() {
+	if (m_pending_occlusion.empty()) {
+		m_occlusion_open_slot = -1;
+		return;
+	}
+
+	uint32_t max_slot = 0;
+	for (const auto& p: m_pending_occlusion) {
+		if (p.slot >= 0 && static_cast<uint32_t>(p.slot) + 1 > max_slot) {
+			max_slot = static_cast<uint32_t>(p.slot) + 1;
+		}
+	}
+
+	std::vector<uint64_t> results(max_slot, 1); // default "visible" on any readback failure
+	if (m_occlusion_pool != nullptr && max_slot != 0) {
+		const auto status = m_graphics.device.getQueryPoolResults(
+		    m_occlusion_pool, 0, max_slot, results.size() * sizeof(uint64_t), results.data(),
+		    sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		if (status != vk::Result::eSuccess) {
+			std::fill(results.begin(), results.end(), uint64_t {1});
+		}
+	}
+
+	for (const auto& p: m_pending_occlusion) {
+		uint64_t count = 0;
+		if (p.slot >= 0 && static_cast<uint32_t>(p.slot) < results.size()) {
+			count = results[static_cast<uint32_t>(p.slot)];
+		}
+		// Publish into the OcclusionQueryResults block: begin counters zero, DB0 end counter the
+		// visible-sample count, other DBs zero. The guest sums end-minus-begin across DBs, so the
+		// total it computes is `count`.
+		auto* block = reinterpret_cast<volatile uint64_t*>(p.base_addr);
+		for (uint32_t db = 0; db < 16u; db++) {
+			block[db * 2u + 0u] = kOcclusionReadyBit;
+			block[db * 2u + 1u] = kOcclusionReadyBit | ((db == 0u) ? count : uint64_t {0});
+		}
+	}
+	m_pending_occlusion.clear();
+	m_occlusion_open_slot = -1;
 }
 
 void CommandScheduler::Shutdown() {
@@ -178,6 +373,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
+	ResolveOcclusion();
 	BeginNext();
 }
 
@@ -187,6 +383,7 @@ void CommandScheduler::Finish() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	ResolveOcclusion();
 	BeginNext();
 	PopPendingOperations();
 }
@@ -340,6 +537,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	ResetOcclusionPool(); // outside any render pass here; slot numbering restarts per recording
 	return m_command;
 }
 
@@ -393,6 +591,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 void CommandScheduler::BeginNext() {
 	CheckActive();
+	// Read back any occlusion results still owed from the previous recording before BeginCommand
+	// resets the pool and reuses slot 0 (FlushAndWait / Finish already resolved; this covers the
+	// plain async Flush path).
+	DrainOcclusionBeforeReuse();
 	BeginCommand();
 }
 

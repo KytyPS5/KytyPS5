@@ -4,6 +4,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -17,7 +18,7 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_scheduler(scheduler), m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
@@ -112,6 +113,9 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	// A Vulkan occlusion query must not outlive its render pass instance -- close any open one
+	// before ending the pass, whichever path triggered the end (state change, flush, submit).
+	m_scheduler.CloseOpenOcclusionQuery();
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};

@@ -137,6 +137,7 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
+	uint32_t                                       wave_size                    = 64;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
@@ -175,6 +176,8 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+bool     ShaderPixelParameterDefault(const ShaderPixelInputInfo& info, uint32_t input,
+                                     uint32_t component, uint32_t& bits);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;

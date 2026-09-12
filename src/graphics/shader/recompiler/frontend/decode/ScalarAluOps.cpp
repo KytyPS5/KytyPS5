@@ -63,6 +63,9 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
     {0x3bu, Opcode::S_BITREPLICATE_B64_B32},
     {0x3cu, Opcode::S_AND_SAVEEXEC_B32},
+    {0x3du, Opcode::S_OR_SAVEEXEC_B32},
+    {0x3eu, Opcode::S_XOR_SAVEEXEC_B32},
+    {0x3fu, Opcode::S_ANDN2_SAVEEXEC_B32},
     {0x40u, Opcode::S_ORN2_SAVEEXEC_B32},
     {0x44u, Opcode::S_ANDN1_SAVEEXEC_B32},
 };
@@ -104,6 +107,13 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x10u, Opcode::S_SENDMSG},
     {0x12u, Opcode::S_TRAP},
     {0x16u, Opcode::S_TTRACEDATA},
+    // Hardware-debug conditional branches (S_CBRANCH_CDBGSYS / _CDBGUSER /
+    // _OR_USER / _AND_USER). The CDBG mode bits are always zero on a non-debug
+    // target, so the branch is never taken -- decode as a plain NOP.
+    {0x17u, Opcode::S_NOP},
+    {0x18u, Opcode::S_NOP},
+    {0x19u, Opcode::S_NOP},
+    {0x1au, Opcode::S_NOP},
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
 };

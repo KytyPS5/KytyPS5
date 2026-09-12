@@ -28,6 +28,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -333,7 +334,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
-
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -456,6 +456,23 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
 }
 
+// Debug aid for a lost device. With VK_NV_device_diagnostic_checkpoints the driver keeps the
+// markers the GPU last passed, so tagging every draw with its pixel shader hash tells us which
+// draw was executing when the device died -- something neither GPU-assisted validation nor
+// VK_EXT_device_fault reports on NVIDIA. No-op unless KYTY_NV_DIAGNOSTICS enabled the extension.
+static void SetGpuCheckpoint(CommandBuffer& buffer, uint64_t marker) {
+	const auto& graphics = buffer.GetGraphics();
+	if (!graphics.nv_diagnostics_enabled || buffer.IsInvalid()) {
+		return;
+	}
+	static auto* set_checkpoint = reinterpret_cast<PFN_vkCmdSetCheckpointNV>(
+	    graphics.device.getProcAddr("vkCmdSetCheckpointNV"));
+	if (set_checkpoint == nullptr) {
+		return;
+	}
+	set_checkpoint(buffer.Handle(), reinterpret_cast<const void*>(static_cast<uintptr_t>(marker)));
+}
+
 struct DrawRenderState {
 	RenderDepthInfo       depth_info;
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
@@ -533,6 +550,28 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
 	}
+	// A stale depth target from an earlier, smaller pass must not shrink the render area for a
+	// larger colour pass. Astro Bot's title screen keeps a 1920x1080 depth attachment bound on
+	// a 3840x2160 composite pass; the render area would clamp to the 1080p corner and leave the
+	// rest of the frame holding whatever was there before ("only a square is cleared"). The
+	// guest cannot actually pair mismatched attachment sizes, so treat the depth as unbound.
+	// The same applies when the depth target is the larger one: hardware clips each attachment
+	// to its own bounds, but a Vulkan pass has a single render area, so pairing a 1024x1024
+	// colour target with a 1920x1080 depth attachment writes depth only in the 1024x1024 corner
+	// and leaves the rest of it stale. Astro Bot does exactly that -- two colour slots covering
+	// one 1024x1024 surface with complementary channel masks, over a full-size depth buffer.
+	if (depth.image_id && color_count > 0 &&
+	    (depth.desc.info.extent.width != state.width ||
+	     depth.desc.info.extent.height != state.height)) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderState: depth target %ux%u does not match colour %ux%u -- unbinding it "
+			     "for the draw\n",
+			     depth.desc.info.extent.width, depth.desc.info.extent.height, state.width,
+			     state.height);
+		}
+		depth.image_id = {};
+	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
@@ -544,11 +583,26 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
 		}
-		const bool meta_clear =
+		uint32_t   htile_fill       = 0;
+		bool       htile_fill_known = false;
+		const bool meta_cleared =
 		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
-		if (meta_clear &&
+		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer,
+		                        &htile_fill, &htile_fill_known);
+		const bool stencil_compressed = depth.desc.info.metadata.stencil_compressed;
+		const bool depth_uniform =
+		    meta_cleared && htile_fill_known && !htile_fill_clears_depth(htile_fill) &&
+		    htile_fill_depth_uniform(htile_fill, stencil_compressed);
+		depth.depth_meta_clear_enable =
+		    meta_cleared &&
+		    (!htile_fill_known || htile_fill_clears_depth(htile_fill) || depth_uniform);
+		depth.stencil_meta_clear_enable = meta_cleared && htile_fill_known && stencil_compressed &&
+		                                  htile_fill_clears_stencil(htile_fill);
+		if (depth_uniform) {
+			depth.depth_clear_value = htile_fill_depth_value(htile_fill, stencil_compressed);
+		}
+		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
+		if (meta_cleared &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
@@ -588,8 +642,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (feedback && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		const auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		                             : depth_attachment_layout(depth);
+		auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		                       : depth_attachment_layout(depth);
+		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
+		if (depth.depth_write_enable) {
+			writable |= vk::ImageAspectFlagBits::eDepth;
+		}
+		const auto pixel_writable = feedback ? writable & ~vk::ImageAspectFlagBits::eDepth : writable;
+		if (static_cast<bool>(image.binding.pixel_sampled_aspects & pixel_writable) ||
+		    static_cast<bool>(image.binding.other_sampled_aspects & writable)) {
+			layout = vk::ImageLayout::eGeneral;
+		}
 		// The attachment store writes even when guest depth/stencil tests do not.
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
@@ -612,7 +675,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
-		attachment.stencil_clear  = depth.stencil_clear_enable;
+		attachment.stencil_clear  = depth.stencil_clear_enable || depth.stencil_meta_clear_enable;
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -938,6 +1001,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	return true;
 }
 
+// Soft ladder (PPSA21564 only). A companion to the oversized-shader drop in the pipeline
+// cache: when Astro Bot's oversized GI pixel / mesh kernel is handed back as a null module,
+// its draw has no usable program. Skip that draw for this title so the frame still presents
+// (a missing GI contribution renders wrong; a device loss ends the title). Gated on TITLE_ID
+// so no other title's draws are ever skipped. Real fix: bind-time dynamic-SRT resolution.
+static bool DrawHasDroppedProgram(const DrawRenderState& state) {
+	static const bool enabled = [] {
+		std::string id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
+	}();
+	if (!enabled) {
+		return false;
+	}
+	return !state.programs.vertex || (state.ps_active && !state.programs.pixel);
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -1192,6 +1271,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	SetGpuCheckpoint(buffer, state.ps_input_info.stage.program != nullptr
+	                             ? state.ps_input_info.stage.program->shader_hash
+	                             : 0u);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
@@ -1314,6 +1396,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	RefreshShaders(buffer, draw, true, state);
+	if (DrawHasDroppedProgram(state)) {
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
 	                     args.index_addr);
@@ -1396,6 +1482,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	RefreshShaders(buffer, draw, false, state);
+	if (DrawHasDroppedProgram(state)) {
+		ResetBindings();
+		return;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&

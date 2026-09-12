@@ -140,6 +140,16 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 			return &input;
 		}
 	}
+	if (state.stage != ShaderType::Pixel) {
+		return nullptr;
+	}
+	const auto mapped = ShaderPixelParameterMappedLocation(*state.input_info.pixel, location);
+	for (const auto& input: state.inputs) {
+		if (input.kind == IR::StageInputKind::Parameter &&
+		    ShaderPixelParameterMappedLocation(*state.input_info.pixel, input.location) == mapped) {
+			return &input;
+		}
+	}
 	return nullptr;
 }
 

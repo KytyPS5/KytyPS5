@@ -19,6 +19,10 @@ VALUE_OPCODE(GetScalarRegister, U32, ScalarReg)
 VALUE_OPCODE(SetScalarRegister, Void, ScalarReg, U32)
 VALUE_OPCODE(GetVectorRegister, U32, VectorReg)
 VALUE_OPCODE(SetVectorRegister, Void, VectorReg, U32)
+// Variadic: arg[0] = element index, arg[1..N] = the candidate U32 values (a v_movrels_b32
+// indexed register read). The backend lowers it to a Function-local array + dynamic
+// OpAccessChain instead of an N-deep select ladder.
+VALUE_OPCODE(IndexedVectorLoad, U32)
 VALUE_OPCODE(GetGotoVariable, U1, U32)
 VALUE_OPCODE(SetGotoVariable, Void, U32, U1)
 VALUE_OPCODE(GetScc, U1)
@@ -82,6 +86,7 @@ VALUE_OPCODE(BitFieldUExtract, U32, U32, U32, U32)
 VALUE_OPCODE(BitFieldSExtract, U32, U32, U32, U32)
 VALUE_OPCODE(DppMoveU32, U32, U32, U1)
 VALUE_OPCODE(DppUpdateU32, U32, U32, U32, U1)
+VALUE_OPCODE(WqmU32, U32, U32)
 VALUE_OPCODE(WqmU64, U64, U64)
 
 // Core value operations used to expand architectural side effects.
@@ -185,6 +190,7 @@ VALUE_OPCODE(FPFract32, F32, F32)
 
 VALUE_OPCODE(LaneId, U32)
 VALUE_OPCODE(Ballot, U32x4, U1)
+VALUE_OPCODE(AnyLane, U1, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)
 VALUE_OPCODE(ReadLane, U32, U32, U32)
 VALUE_OPCODE(WriteLane, U32, U32, U32, U32)

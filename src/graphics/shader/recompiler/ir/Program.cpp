@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
+#include <limits>
 #include <map>
 #include <new>
 #include <unordered_map>
@@ -364,7 +365,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				                        ValueOpcodeName(inst.GetOpcode())));
 			}
 			const bool fixed_signature =
-			    inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity;
+			    inst.GetOpcode() != ValueOpcode::Phi && inst.GetOpcode() != ValueOpcode::Identity &&
+			    NumArgsOf(inst.GetOpcode()) != std::numeric_limits<size_t>::max();
 			if (fixed_signature && inst.NumArgs() != NumArgsOf(inst.GetOpcode())) {
 				return Fail(fmt::format("{} has {} arguments, expected {}",
 				                        ValueOpcodeName(inst.GetOpcode()), inst.NumArgs(),

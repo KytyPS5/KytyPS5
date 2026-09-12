@@ -69,6 +69,19 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
+bool UsesFlattenedSrt(const Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ReadConst) {
+				return true;
+			}
+		}
+	}
+	return std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		return image.indirect_search_iterations != 0u;
+	});
+}
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
@@ -130,12 +143,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
-	    });
-	if (uses_flattened_runtime) {
+	if (UsesFlattenedSrt(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

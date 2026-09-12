@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -712,6 +713,14 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Backs the guest's CxDbCountControl.PerfectZPassCounts -> VK_QUERY_CONTROL_PRECISE_BIT for
+	// occlusion queries (see CommandScheduler occlusion emulation). Without a precise query a
+	// driver may legally under-report partial/edge coverage as zero samples, which shows up as
+	// genuinely visible geometry being predicated away. Present on effectively every desktop GPU;
+	// degrade to approximate queries where it is not rather than refusing the device.
+	device_features.occlusionQueryPrecise    = supported_features2.features.occlusionQueryPrecise;
+	graphics.occlusion_query_precise_enabled =
+	    supported_features2.features.occlusionQueryPrecise == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
@@ -765,6 +774,22 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV nv_diagnostics {};
+	if (graphics.nv_diagnostics_enabled) {
+		nv_diagnostics.sType = vk::StructureType::eDeviceDiagnosticsConfigCreateInfoNV;
+		nv_diagnostics.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+		                       vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+		                       vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableAutomaticCheckpoints;
+		nv_diagnostics.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext    = &nv_diagnostics;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (graphics.device_fault_enabled) {
+		device_fault.sType        = vk::StructureType::ePhysicalDeviceFaultFeaturesEXT;
+		device_fault.deviceFault  = VK_TRUE;
+		device_fault.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &device_fault;
 	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
@@ -920,8 +945,20 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		// A validation error normally aborts, which is right for a clean run but useless while
+		// hunting a specific GPU fault: the first unrelated finding (e.g. the wave-lockstep LDS
+		// race the recompiler emits for guest shaders) kills the session before the interesting
+		// one is reached. KYTY_VALIDATION_FATAL=0 downgrades every validation error to a log
+		// line so a run can be driven past known findings.
+		static const bool validation_fatal = [] {
+			const char* v = std::getenv("KYTY_VALIDATION_FATAL");
+			return v == nullptr || v[0] != '0';
+		}();
+		if (validation_fatal) {
+			EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
+			           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		}
+		skip = false;
 	}
 
 	if (!skip) {
@@ -1156,6 +1193,29 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// Optional, debug-only and opt-in: KYTY_NV_DIAGNOSTICS=1 turns on NVIDIA's device
+		// diagnostics. The driver already writes a crash dump on device loss, but without this
+		// the dump is an empty shell; with it, it carries shader debug info, resource tracking
+		// and automatic checkpoints, which Nsight Graphics can open to name the faulting shader.
+		// Not enabled by default -- it costs performance on every submit.
+		{
+			const char* want = std::getenv("KYTY_NV_DIAGNOSTICS");
+			if (want != nullptr && want[0] != '0' &&
+			    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME) &&
+			    HasExtension(available_extensions,
+			                 VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+				graphic_ctx.nv_diagnostics_enabled = true;
+				LOGF("NVIDIA device diagnostics enabled (crash dumps will carry shader info)\n");
+			}
+		}
+		// Optional, debug-only: lets a lost device report which GPU addresses faulted
+		// (MasterSemaphore::Wait dumps it). Costs nothing when the driver does not expose it.
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			graphic_ctx.device_fault_enabled = true;
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

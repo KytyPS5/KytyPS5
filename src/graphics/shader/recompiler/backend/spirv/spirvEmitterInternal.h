@@ -98,6 +98,7 @@ enum : uint32_t {
 	BuiltInSampleId                  = 18,
 	BuiltInSampleMask                = 20,
 	BuiltInFragDepth                 = 22,
+	BuiltInHelperInvocation          = 23,
 	BuiltInWorkgroupId               = 26,
 	BuiltInLocalInvocationId         = 27,
 	BuiltInGlobalInvocationId        = 28,
@@ -134,6 +135,7 @@ enum : uint32_t {
 	MemorySemanticsNone            = 0,
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
+	MemorySemanticsSubgroupMemory  = 0x00000080u,
 	MemorySemanticsWorkgroupMemory = 0x00000100u,
 	MemorySemanticsImageMemory     = 0x00000800u,
 };
@@ -210,6 +212,7 @@ enum : uint32_t {
 	OpSMulExtended                 = 152,
 	OpAny                          = 154,
 	OpAll                          = 155,
+	OpIsNan                        = 156,
 	OpLogicalNotEqual              = 165,
 	OpLogicalOr                    = 166,
 	OpLogicalAnd                   = 167,
@@ -296,8 +299,10 @@ enum : uint32_t {
 	GlslSqrt            = 31,
 	GlslInverseSqrt     = 32,
 	GlslFMin            = 37,
+	GlslUMin            = 38,
 	GlslFMax            = 40,
 	GlslFClamp          = 43,
+	GlslSClamp          = 45,
 	GlslLdexp           = 53,
 	GlslFma             = 50,
 	GlslPackSnorm2x16   = 56,
@@ -387,7 +392,12 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// Debug only (KYTY_LOOP_FUEL): a per-invocation iteration budget that forces every loop
+	// to exit, so a shader that never terminates can be told apart from one that faults.
+	uint32_t                   loop_fuel_variable                    = 0;
+	uint32_t                   loop_ordinal                          = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -463,7 +473,7 @@ struct ValueEmitContext {
 	uint32_t              Def(IR::Value value);
 	uint32_t              Arg(const IR::Inst& inst, size_t index);
 	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
-	uint32_t              Ballot(IR::Value predicate);
+	uint32_t              Ballot(IR::Value predicate, bool exclude_helpers = true);
 	uint32_t              FirstLane(uint32_t ballot);
 	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
 	uint32_t              Result(const IR::Inst& inst);
@@ -483,6 +493,8 @@ struct ValueEmitContext {
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
+	// IndexedVectorLoad (v_movrels_b32): inst -> {Function-array OpVariable id, element count}.
+	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> indexed_vector_arrays;
 	uint32_t                                                           scratch_u32_variable = 0;
 	ValueEmitContext*                                                  other_half = nullptr;
 	uint32_t                                                           half       = 0;
@@ -683,7 +695,12 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type);
 
+uint32_t EmitTBufferBitcastU32ToF32(EmitterState& state, uint32_t value);
+
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
+
+uint32_t EmitTBufferCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value,
+                                       uint32_t constant);
 
 uint32_t EmitTBufferSelectF32(EmitterState& state, uint32_t condition, uint32_t true_value,
                               uint32_t false_value);
@@ -694,6 +711,9 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
+
+uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                             uint32_t component, uint32_t raw);
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 

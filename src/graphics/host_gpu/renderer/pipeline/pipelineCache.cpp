@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -100,6 +101,61 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+}
+
+// Raw current guest memory, no GPU-clean gate. Shader resource tables (SRTs) are CPU-written
+// and GPU-read-only, so a plain backing read is both correct and always available -- unlike the
+// clean-gated reader above, which refuses while the GPU has pending writes to the range. Without
+// this the SRT evaluator cannot resolve a descriptor the shader builds from SRT dwords
+// (Astro Bot PPSA21564: a buffer V# base = CompositeExtractU64(... ReadConst(GetSrtResource))).
+//
+// Gated to PPSA21564: wiring this reader for every title changes descriptor resolution for
+// shaders whose SRT raw-reads previously failed and were handled by a fallback -- it made
+// Demon's Souls hang in the intro. PR #500 shipped this field NULL for that reason. Real fix:
+// bind-time dynamic-SRT resolution, after which the reader is safe for all titles.
+bool ReadShaderMappedMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr &&
+	       Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
+}
+
+ShaderRecompiler::IR::SrtMemoryReader ShaderMappedMemoryReaderForTitle() {
+	static const bool enabled = [] {
+		std::string id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
+	}();
+	return enabled ? &ReadShaderMappedMemory : nullptr;
+}
+
+bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size);
+}
+
+// Returns false when the shader's resources could not be fully materialised. For a compute
+// dispatch the caller then drops that dispatch -- a descriptor the shader assembles from a
+// runtime-dynamic / loop-carried SRT pointer cannot be reconstructed ahead of the dispatch,
+// and KytyPS5 has no bindless (srt_flatbuf / BDA) descriptor path yet.
+// Soft ladder (PPSA21564): the real fix is a shadPS4-style flat-SRT bindless model; until then
+// dropping the un-materialisable GI/lighting compute kernels keeps the title running. A
+// graphics stage still aborts loudly.
+bool ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
+                           const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
+	if (!ok) {
+		if (stage == ShaderType::Compute) {
+			LOGF("shader resource materialization incomplete: stage=%u hash=0x%016" PRIx64
+			     " reason=%s -- dropping this dispatch\n",
+			     static_cast<uint32_t>(stage), hash, report.reason.c_str());
+			return false;
+		}
+		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
+		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
+	}
+	if (!report.dropped_summary.empty()) {
+		LOGF("%s indirect image tables: hash=0x%016" PRIx64 " dropped=%" PRIu32 " shapes=%" PRIu32
+		     "%s\n",
+		     label, hash, report.dropped_candidates, report.dropped_shapes,
+		     report.dropped_summary.c_str());
+	}
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -257,6 +313,8 @@ struct PipelineCache::ProgramCache {
 		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
 		                     "create recompiled shader module");
 		EXIT_IF(module == nullptr);
+		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
+		                     options.shader_hash);
 		if (options.dump_ir) {
 			if (!options.early_dump) {
 				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());
@@ -284,6 +342,14 @@ struct PipelineCache::ProgramCache {
 			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 			stage = ShaderType::Compute;
 		}
+		const char* label = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
+			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
+			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
+			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
 
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -296,11 +362,18 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ShaderMappedMemoryReaderForTitle(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .sync_memory                = SyncShaderGuestMemory,
 		};
+		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			if (!ReportMaterialization(label, stage, params.hash, report,
+			                           ShaderRecompiler::IR::MaterializeResources(
+			                               entry->second.resource_plan, runtime, resources,
+			                               specialization, &report))) {
+				return {};
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -325,14 +398,6 @@ struct PipelineCache::ProgramCache {
 		} else {
 			stage_input.compute = &input_info;
 		}
-		const char* label = nullptr;
-		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
@@ -340,6 +405,11 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		static const bool kLowerWideMovrels = [] {
+			std::string id;
+			return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
+		}();
+		options.lower_wide_movrels = kLowerWideMovrels;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.scratch_dwords = input_info.scratch_size_dwords;
@@ -352,13 +422,20 @@ struct PipelineCache::ProgramCache {
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
-			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			auto       resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			const bool mat_ok        = ReportMaterialization(
+                label, stage, params.hash, report,
+                ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+                                                          specialization, &report));
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			if (!mat_ok) {
+				return {};
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));

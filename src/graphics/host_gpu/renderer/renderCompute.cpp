@@ -59,7 +59,26 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
-	auto& cache = buffer.GetContext().GetTextureCache();
+	// Consuming the dispatch drops every store, so it must clear one metadata range only.
+	if (program.info.has_bitwise_xor || !program.info.images.empty() ||
+	    !program.info.samplers.empty() || program.has_address_writes) {
+		return false;
+	}
+	uint32_t stores = 0;
+	for (const auto& resource: program.info.buffers) {
+		if (resource.written || resource.atomic) {
+			if (resource.read || resource.atomic) {
+				return false;
+			}
+			stores++;
+		}
+	}
+	if (stores != 1) {
+		return false;
+	}
+	auto&    cache           = buffer.GetContext().GetTextureCache();
+	uint32_t metadata_writes = 0;
+	uint32_t metadata_index  = 0;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
@@ -68,21 +87,16 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
 			return false;
 		}
+		metadata_writes++;
+		metadata_index = i;
 	}
-
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
-		}
+	if (metadata_writes != 1) {
+		return false;
 	}
-	return false;
+	const auto metadata =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[metadata_index]);
+	const bool cleared = cache.ClearMetaSlices(metadata.Base48(), metadata.GetSize());
+	return cleared && cache.IsWithinMeta(metadata.Base48(), metadata.GetSize());
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,

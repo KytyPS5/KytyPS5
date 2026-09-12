@@ -140,6 +140,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
+	if (resource.written || resource.atomic) {
+		// Nanite exports HTile itself after a fast clear.
+		context.GetTextureCache().DiscardMetaClears(address, size);
+	}
 	return result;
 }
 

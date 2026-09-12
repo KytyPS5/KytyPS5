@@ -75,9 +75,15 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
+	// Inside a registered metadata surface, not only at its base: layers are cleared one by one.
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	[[nodiscard]] bool IsWithinMeta(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// Marks only the whole, slice-aligned slices a CP-DMA fill or compute clear covers.
+	[[nodiscard]] bool ClearMetaSlices(uint64_t address, uint64_t size);
+	// A shader store inside a metadata surface supersedes the pending clears it can reach.
+	void               DiscardMetaClears(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -88,9 +94,15 @@ private:
 	void FreePublishedEvictions();
 
 	struct MetaDataInfo {
+		// Footprint of the registered surface; the registry is keyed by base address alone.
+		uint64_t range_size = 0;
+		uint32_t slices     = 0;
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
 	};
+
+	// The registered surface whose footprint holds the address. Caller holds m_lock.
+	std::map<uint64_t, MetaDataInfo>::iterator FindMetaContaining(uint64_t address);
 
 	struct OverlapResult {
 		ImageId image;

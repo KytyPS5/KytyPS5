@@ -187,7 +187,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #endif
 	QVulkanInstance instance;
 	instance.setApiVersion(QVersionNumber(1, 3, 0));
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
 	instance.setFlags(QVulkanInstance::NoPortabilityDrivers);
 #endif
 	if (instance.create()) {

@@ -102,6 +102,7 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
+	void ConfigureGarbageCollectionBudget(uint64_t available_budget);
 
 	// Callers have validated the nonempty 40-bit range with TryGetPageRange.
 	template <typename Func>

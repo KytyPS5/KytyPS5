@@ -67,7 +67,7 @@ private:
 
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
-	void              ProcessCommands();
+	void              ProcessCommands(CommandProcessor* processor = nullptr);
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);

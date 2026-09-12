@@ -126,7 +126,7 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
-void GuestGpu::ProcessCommands() {
+void GuestGpu::ProcessCommands(CommandProcessor* processor) {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
@@ -136,6 +136,9 @@ void GuestGpu::ProcessCommands() {
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+		}
+		if (processor != nullptr) {
+			processor->FlushPendingReleaseMem();
 		}
 		command();
 	}
@@ -265,7 +268,14 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	m_release_mem_batch.Reset();
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::FlushPendingReleaseMem() {
+	if (m_release_mem_batch.Pending()) {
+		BufferFlush();
+	}
 }
 
 void CommandProcessor::BufferFlushAndWait() {
@@ -673,6 +683,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution, 0);
+	FlushPendingReleaseMem();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -696,7 +707,7 @@ void CommandProcessor::SuspendPm4() {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
-			g_gpu_state->ProcessCommands();
+			g_gpu_state->ProcessCommands(this);
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
@@ -718,6 +729,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		if (m_release_mem_batch.Pending() &&
+		    !ReleaseMemBatch::Eligible({packet, remaining_dw})) {
+			FlushPendingReleaseMem();
+		}
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u) {

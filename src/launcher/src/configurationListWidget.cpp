@@ -61,9 +61,10 @@ constexpr int GAME_NAME_COLUMN             = 0;
 constexpr int GAME_SERIAL_COLUMN           = 1;
 constexpr int GAME_VERSION_COLUMN          = 2;
 constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
-constexpr int GAME_PATH_COLUMN             = 4;
-constexpr int GAME_STATUS_COLUMN           = 5;
-constexpr int GAME_COMMENT_COLUMN          = 6;
+constexpr int GAME_SIZE_COLUMN             = 4;
+constexpr int GAME_PATH_COLUMN             = 5;
+constexpr int GAME_STATUS_COLUMN           = 6;
+constexpr int GAME_COMMENT_COLUMN          = 7;
 
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
@@ -217,6 +218,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_SERIAL_COLUMN, 110);
 	m_ui->cfgs_list->setColumnWidth(GAME_VERSION_COLUMN, 120);
 	m_ui->cfgs_list->setColumnWidth(GAME_FIRMWARE_VERSION_COLUMN, 150);
+	m_ui->cfgs_list->setColumnWidth(GAME_SIZE_COLUMN, 100);
 	m_ui->cfgs_list->setColumnWidth(GAME_PATH_COLUMN, 320);
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);

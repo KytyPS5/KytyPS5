@@ -5,12 +5,15 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QFont>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QSize>
 #include <QStringList>
 #include <QStyle>
@@ -18,6 +21,7 @@
 #include <QVersionNumber>
 #include <QWheelEvent>
 #include <QWidget>
+#include <QtConcurrentRun>
 
 namespace {
 
@@ -26,6 +30,7 @@ enum Column {
 	SerialColumn,
 	GameVersionColumn,
 	FirmwareVersionColumn,
+	SizeColumn,
 	PathColumn,
 	StatusColumn,
 	CommentsColumn,
@@ -155,6 +160,34 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 
 	Update();
 	SetRunning(false);
+
+	setData(SizeColumn, Qt::UserRole, qint64(-1));
+	setText(SizeColumn, QStringLiteral("\u2014"));
+	auto* watcher = new QFutureWatcher<qint64>(this);
+	connect(watcher, &QFutureWatcher<qint64>::finished, this, [this, watcher]() {
+		const auto bytes = watcher->result();
+		setData(SizeColumn, Qt::UserRole, bytes);
+		if (bytes >= 0) {
+			setText(SizeColumn,
+			        QLocale().formattedDataSize(bytes, 2, QLocale::DataSizeTraditionalFormat));
+		}
+		watcher->deleteLater();
+	});
+	watcher->setFuture(QtConcurrent::run([path = m_info->basedir]() -> qint64 {
+		if (path.isEmpty() || !QDir(path).exists()) {
+			return -1;
+		}
+		qint64       bytes = 0;
+		QDirIterator files(path, QDir::Files | QDir::Hidden | QDir::System | QDir::NoSymLinks,
+		                   QDirIterator::Subdirectories);
+		while (files.hasNext()) {
+			files.next();
+			if (files.fileInfo().isFile()) {
+				bytes += files.fileInfo().size();
+			}
+		}
+		return bytes;
+	}));
 }
 
 ConfigurationItem::~ConfigurationItem() = default;
@@ -193,6 +226,9 @@ bool ConfigurationItem::operator<(const QTreeWidgetItem& other) const {
 	const int column = treeWidget() != nullptr ? treeWidget()->sortColumn() : NameColumn;
 	switch (column) {
 		case NameColumn: return GetSortText(*m_info) < GetSortText(*other_item->m_info);
+		case SizeColumn:
+			return data(SizeColumn, Qt::UserRole).toLongLong() <
+			       other.data(SizeColumn, Qt::UserRole).toLongLong();
 		case StatusColumn:
 			return GetStatusText(m_info->game_status) <
 			       GetStatusText(other_item->m_info->game_status);

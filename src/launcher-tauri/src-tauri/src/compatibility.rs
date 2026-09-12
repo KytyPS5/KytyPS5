@@ -54,6 +54,41 @@ pub struct CompatibilityEntry {
     pub status: GameStatus,
     #[serde(default)]
     pub comment: String,
+    /// How many community reports back `status`. 0 for a locally-edited
+    /// entry, which is the user's own opinion rather than a report count.
+    #[serde(default)]
+    pub reports: u32,
+    /// The emulator build the reports were filed against, e.g.
+    /// "KytyPS5-2026-08-16-bc2f077". Empty when the feed does not say.
+    #[serde(default)]
+    pub version: String,
+    /// True when `status` came from this platform's own reports rather than
+    /// the feed's cross-platform aggregate -- see `platform_key`.
+    #[serde(default)]
+    pub platform_specific: bool,
+}
+
+/// Which `platforms` sub-object of the community feed applies to this build.
+///
+/// The feed carries a per-OS breakdown next to its aggregate, and the two
+/// disagree often enough to matter: a title reported InGame on Linux can be
+/// DoesntBoot on Windows, and the aggregate hides that. #177 raised exactly
+/// this ("be aware of the game compatibility across platforms ... probably
+/// not, especially on macOS"), so prefer this platform's own reports and
+/// keep the aggregate only as a fallback.
+const fn platform_key() -> &'static str {
+    #[cfg(windows)]
+    {
+        "windows"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        "linux"
+    }
 }
 
 pub type CompatibilityMap = HashMap<String, CompatibilityEntry>;
@@ -72,13 +107,25 @@ fn parse(data: &str) -> Result<CompatibilityMap, String> {
         if title_id.is_empty() {
             continue;
         }
-        let status = value
+        // This platform's own reports win over the cross-platform aggregate.
+        // A locally-edited file has no "platforms" at all, so it falls
+        // straight through to the top level, which is what it should do.
+        let per_platform = value.get("platforms").and_then(|p| p.get(platform_key()));
+        let platform_specific = per_platform.is_some();
+        let source = per_platform.unwrap_or(&value);
+
+        let status = source
             .get("status")
             .and_then(|v| v.as_str())
             .map(GameStatus::from_text)
             .unwrap_or_default();
-        let comment = value.get("comment").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        entries.insert(title_id, CompatibilityEntry { status, comment });
+        let comment = source.get("comment").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let reports = source.get("reports").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let version = source.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        entries.insert(
+            title_id,
+            CompatibilityEntry { status, comment, reports, version, platform_specific },
+        );
     }
     Ok(entries)
 }
@@ -182,6 +229,66 @@ mod tests {
         let mut entries = CompatibilityMap::new();
         set_status(&mut entries, "ppsa01234", GameStatus::MainMenu);
         assert_eq!(entries.get("PPSA01234").unwrap().status, GameStatus::MainMenu);
+    }
+
+    /// Shaped exactly like a real entry from the community feed.
+    const FEED_ENTRY: &str = r#"{
+      "PPSA01234": {
+        "status": "InGame",
+        "reports": 4,
+        "comment": "4 reports",
+        "platforms": {
+          "windows": { "status": "DoesntBoot", "reports": 1, "comment": "1 report",
+                       "version": "KytyPS5-2026-08-16-bc2f077" },
+          "linux":   { "status": "InGame", "reports": 3, "comment": "3 reports",
+                       "version": "KytyPS5-2026-08-16-bc2f077" },
+          "macos":   { "status": "Logo", "reports": 1, "comment": "1 report",
+                       "version": "KytyPS5-2026-08-16-bc2f077" }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn this_platforms_reports_win_over_the_aggregate() {
+        let entry = parse(FEED_ENTRY).unwrap().remove("PPSA01234").unwrap();
+
+        // The aggregate says InGame. Whatever this platform's own reports
+        // say is what the user is shown instead -- the point of the split.
+        let expected = if cfg!(windows) {
+            GameStatus::DoesntBoot
+        } else if cfg!(target_os = "macos") {
+            GameStatus::Logo
+        } else {
+            GameStatus::InGame
+        };
+        assert_eq!(entry.status, expected);
+        assert!(entry.platform_specific);
+        assert_eq!(entry.version, "KytyPS5-2026-08-16-bc2f077");
+    }
+
+    #[test]
+    fn entry_without_platforms_falls_back_to_the_aggregate() {
+        let json = r#"{ "PPSA01234": { "status": "MainMenu", "reports": 2 } }"#;
+        let entry = parse(json).unwrap().remove("PPSA01234").unwrap();
+
+        assert_eq!(entry.status, GameStatus::MainMenu);
+        assert_eq!(entry.reports, 2);
+        // Nothing claimed this is a per-platform figure, so the UI must not
+        // present it as one.
+        assert!(!entry.platform_specific);
+    }
+
+    #[test]
+    fn locally_edited_entries_are_never_platform_specific() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = CompatibilityMap::new();
+        set_status(&mut entries, "PPSA01234", GameStatus::InGame);
+        save_local(dir.path(), &entries).unwrap();
+
+        let entry = load_local(dir.path()).remove("PPSA01234").unwrap();
+        assert_eq!(entry.status, GameStatus::InGame);
+        assert!(!entry.platform_specific);
+        assert_eq!(entry.reports, 0, "a local edit is an opinion, not a report");
     }
 
     #[test]

@@ -129,6 +129,14 @@ export type GameStatus = "Unknown" | "InGame" | "Logo" | "DoesntBoot" | "MainMen
 export interface CompatibilityEntry {
   status: GameStatus;
   comment: string;
+  /** How many community reports back `status`. 0 for a local edit. */
+  reports: number;
+  /** Emulator build the reports were filed against, "" when unstated. */
+  version: string;
+  /** True when `status` is this platform's own figure rather than the
+   * feed's cross-platform aggregate -- the two disagree often enough that
+   * the UI has to say which one it is showing. */
+  platformSpecific: boolean;
 }
 
 export type CompatibilityMap = Record<string, CompatibilityEntry>;

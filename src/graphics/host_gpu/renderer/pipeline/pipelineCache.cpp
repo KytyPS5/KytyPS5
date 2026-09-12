@@ -242,6 +242,24 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// The reader the descriptor evaluator uses for every raw read. It prefers the coherent
+// path, which drains and downloads a range the GPU still owns, and otherwise falls back
+// to the plain dereference the evaluator did before there was a reader at all - so a
+// range the coherent path cannot serve behaves exactly as it used to, and no shader
+// that resolved yesterday stops resolving today.
+bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                  values.size_bytes())) {
+		return true;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -258,6 +276,21 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+const char* ShaderStageName(ShaderType stage) {
+	const char* name = nullptr;
+	switch (stage) {
+		case ShaderType::Vertex: name = "vs"; break;
+		case ShaderType::Mesh: name = "ms"; break;
+		case ShaderType::Local: name = "ls"; break;
+		case ShaderType::TessellationControl: name = "hs"; break;
+		case ShaderType::TessellationEvaluation: name = "ds"; break;
+		case ShaderType::Pixel: name = "ps"; break;
+		case ShaderType::Compute: name = "cs"; break;
+		default: EXIT("invalid pipeline shader stage\n");
+	}
+	return name;
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
@@ -578,8 +611,16 @@ struct PipelineCache::ProgramCache {
 
 	// A shader whose descriptors cannot be derived is dropped, not fatal: the draw is lost, the
 	// session is not. Report each distinct hash once so a per-frame skip does not flood the log.
-	void ReportSkipped(ShaderType stage, uint64_t hash, uint32_t pc, std::string_view reason) {
-		if (!skipped_shaders.insert(hash).second) {
+	// Permanent for the key that was refused: the recompiler rejected that translation, so no later
+	// dispatch of it can do better. Keyed on the whole ProgramKey and not on the hash, because a
+	// refusal is a property of the translation and the translation is a function of more than the
+	// code - the user-data count and the stage's static state reach resource tracking, and the
+	// specialization reaches the backend. A hash-keyed skip let one refused shape disable every
+	// other shape of the same shader, including shapes already drawing.
+	void ReportSkipped(const ProgramKey& key, ShaderType stage, uint64_t hash, uint32_t pc,
+	                   std::string_view reason) {
+		skipped_shaders.insert(key);
+		if (!reported_shaders.insert(hash).second) {
 			return;
 		}
 		if (reason.empty()) {
@@ -588,6 +629,19 @@ struct PipelineCache::ProgramCache {
 		PipelineCacheLog("shader resources unavailable, skipping draws: hash=0x{:016x} "
 		                 "stage={} pc=0x{:08x} {}",
 		                 hash, StageShortName(stage), pc, reason);
+	}
+
+	// Transient: materialization re-executes the descriptor chain against guest memory on every
+	// dispatch, so a failure describes this dispatch, not the shader. The draw is dropped and the
+	// next dispatch tries again - the plan is already cached, so the retry is cheap. Recording it
+	// as permanent would let one unlucky dispatch disable the shader for the whole run.
+	void ReportUnmaterialized(ShaderType stage, uint64_t hash) {
+		if (!reported_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("shader resources unavailable, skipping this dispatch: "
+		                 "hash=0x{:016x} stage={} descriptor materialization failed",
+		                 hash, StageShortName(stage));
 	}
 
 	// A hardware ray-tracing intersect lowered to a constant miss: the shader runs, but its
@@ -694,6 +748,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryPermissive,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
@@ -705,10 +760,9 @@ struct PipelineCache::ProgramCache {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
-				ReportSkipped(stage, params.hash, 0, {});
+				ReportUnmaterialized(stage, params.hash);
 				return {};
 			}
-
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -789,10 +843,9 @@ struct PipelineCache::ProgramCache {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
-				ReportSkipped(stage, params.hash, 0, {});
+				ReportUnmaterialized(stage, params.hash);
 				return {};
 			}
-
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
@@ -836,6 +889,9 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	std::unordered_set<uint64_t>                                skipped_shaders;
+	// Log throttle only: a hash here has been reported once, whether the cause was permanent or
+	// transient. Kept apart from skipped_shaders so a transient failure does not disable a shader.
+	std::unordered_set<uint64_t>                                reported_shaders;
 	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;

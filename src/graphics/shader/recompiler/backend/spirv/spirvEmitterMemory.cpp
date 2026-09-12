@@ -1571,7 +1571,9 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
-	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
+	if ((op == IR::ValueOpcode::LoadAddressU32 || op == IR::ValueOpcode::LoadBufferU32) &&
+	    mem.planning_only)
+		return;
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);

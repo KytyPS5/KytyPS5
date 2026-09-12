@@ -81,6 +81,9 @@ private:
 	// Loop-carried phi values taken on trust, inherited by any trial this walk starts.
 	std::unordered_map<const Inst*, uint64_t> m_assumed;
 	std::unordered_set<const Inst*>           m_barred;
+	// Non-null only inside the per-lane sweep a readfirstlane runs, which is the one place a
+	// lane index has a value. Owned by the sweep, shared with any walk it starts.
+	LaneScope*                                m_lane = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

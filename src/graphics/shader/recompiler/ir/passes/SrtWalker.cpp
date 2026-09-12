@@ -76,31 +76,64 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	return true;
 }
 
+// A vector-path buffer load whose address carries no lane identity: no index, no
+// per-lane offset, one plain dword. Hardware reaches it as base + soffset + imm, which
+// is the same shape the scalar reads below already re-execute, so the host can
+// reproduce it. The gate used to refuse every MUBUF load on its resource kind alone,
+// which dropped whole shaders whose only sin was fetching one uniform word through the
+// vector path - see the two decoupled-lookback scan passes in SILENT HILL 2.
+bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
+	if (inst.GetOpcode() != ValueOpcode::LoadBufferU32 || inst.NumArgs() != 5) {
+		return false;
+	}
+	const auto flags = inst.Flags<MemoryFlags>();
+	if (flags.index >= values.memory_info.size()) {
+		return false;
+	}
+	const auto& mem = values.memory_info[flags.index];
+	if (mem.kind != ResourceKind::Buffer || mem.idxen || mem.offen || mem.typed ||
+	    mem.formatted || mem.data_bits != 32u || mem.data_dwords != 1u) {
+		return false;
+	}
+	// The translator plants literal zeroes for the index and offset operands when the
+	// instruction does not use them; require that rather than trusting the flags alone.
+	for (size_t arg = 1; arg <= 2; arg++) {
+		const auto value = inst.Arg(arg).Resolve();
+		if (!value.IsImmediate() || value.GetType() != Type::U32 || value.U32() != 0u) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Which argument carries the read's dynamic byte offset. The scalar reads put it
+// second; a MUBUF load puts the index and the per-lane offset there and the scalar
+// offset fourth.
+size_t RawReadOffsetArg(ValueOpcode op) {
+	return op == ValueOpcode::LoadBufferU32 ? 3u : 1u;
+}
+
+// A MUBUF load carries the exec mask as its last operand. That is lane state, not part
+// of the address, and walking it would reject the read for depending on lane identity.
+size_t RawReadAddressArgs(const Inst& inst) {
+	return inst.GetOpcode() == ValueOpcode::LoadBufferU32 ? 4u : inst.NumArgs();
+}
+
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
-	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer &&
-	    op != ValueOpcode::LoadBufferU32) {
+	if (op == ValueOpcode::LoadBufferU32) {
+		return IsUniformBufferRead(values, inst);
+	}
+	if (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) {
 		return false;
 	}
 	const auto index = inst.Flags<MemoryFlags>().index;
 	if (index >= values.memory_info.size()) {
 		return false;
 	}
-	const auto& memory = values.memory_info[index];
-	if (op != ValueOpcode::LoadBufferU32) {
-		return (op == ValueOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarAddress) ||
-		       (op == ValueOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarBuffer);
-	}
-	if (inst.NumArgs() != 5u || memory.kind != ResourceKind::Buffer || memory.typed ||
-	    memory.formatted || memory.coherent || memory.data_bits != 32u ||
-	    memory.data_dwords != 1u || memory.idxen || memory.offen || memory.offset != 0u ||
-	    inst.Arg(4).GetType() != Type::U1) {
-		return false;
-	}
-	for (uint32_t arg = 1; arg <= 3; ++arg) {
-		if (inst.Arg(arg).Resolve() != Value(0u)) return false;
-	}
-	return true;
+	const auto kind = values.memory_info[index].kind;
+	return (op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
+	       (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
 }
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
@@ -184,7 +217,8 @@ public:
 
 private:
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
-		for (size_t index = 0; index < inst.NumArgs(); index++) {
+		const auto count = RawReadAddressArgs(inst);
+		for (size_t index = 0; index < count; index++) {
 			if (!Validate(inst.Arg(index), require_uniform)) return false;
 		}
 		return true;
@@ -210,15 +244,25 @@ private:
 				default: return false;
 			}
 		}
-		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		const auto active_mask_at_entry = m_active_mask;
+		// Uniform acceptance holds only under the EXEC mask it was proven with.
+		if (require_uniform) {
+			const auto cached = m_validated_uniform.find(inst);
+			if (cached != m_validated_uniform.end() &&
+			    std::find(cached->second.begin(), cached->second.end(), active_mask_at_entry) !=
+			        cached->second.end()) {
+				return true;
+			}
+		}
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			if (valid && require_uniform) m_validated_uniform[inst].push_back(active_mask_at_entry);
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -287,6 +331,21 @@ private:
 			}
 			return finish(Validate(entry));
 		}
+		if (op == ValueOpcode::LaneId) {
+			// A descriptor lives in scalar registers, so the only route a lane index has into one
+			// is the readfirstlane that lifts a vector value back into them - in practice the
+			// emulator's own model of "bit N of a scalar mask, for this lane", which hardware
+			// never spells per-lane at all. There the lane term has to cancel, and the evaluator
+			// proves it does by re-executing the operand for every lane. Outside that scope
+			// nothing bounds the lane, so the value stays refused.
+			if (inst->NumArgs() != 0) {
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
+			}
+			if (m_active_mask.IsEmpty()) {
+				return finish(Reject(RuntimeValueReject::UnsupportedOpcode, op));
+			}
+			return finish(true);
+		}
 		if (op == ValueOpcode::ReadFirstLane) {
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
 			    inst->Arg(1).GetType() != Type::U1) {
@@ -316,11 +375,6 @@ private:
 			if (!IsRawRead(m_program, *inst) || handle == nullptr ||
 			    handle->GetOpcode() != expected) {
 				return finish(false);
-			}
-			if (op == ValueOpcode::LoadBufferU32) {
-				const auto guard = inst->Arg(4).Resolve();
-				return finish(Validate(inst->Arg(0)) &&
-				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 			}
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
@@ -532,10 +586,6 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 			default: return false;
 		}
 	}
-	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
-		result = 1u;
-		return true;
-	}
 	auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
 		return false;
@@ -601,8 +651,11 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	// through and re-entering them would read as a cycle.
 	SrtWalker trial(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator, m_active_mask);
 	// Assumptions made further up the stack stay in force for any phi reached from here.
+	// Assumptions made further up the stack stay in force for any phi reached from here, and
+	// so does the lane the sweep is currently on.
 	trial.m_assumed = m_assumed;
 	trial.m_barred  = m_barred;
+	trial.m_lane    = m_lane;
 	for (const auto* member: web) {
 		// The whole web holds the candidate on one iteration, so assume all of it at once.
 		const auto assumed = trial.m_assumed.emplace(member, candidate);
@@ -684,13 +737,15 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) ||
+	    !Arg(inst, RawReadOffsetArg(inst.GetOpcode()), offset)) {
 		return false;
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
+	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
+	    inst.GetOpcode() == ValueOpcode::LoadBufferU32) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
@@ -699,25 +754,36 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		if (immediate < 0) {
 			return false;
 		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
-				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
-			}
-		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		const bool vector_load = inst.GetOpcode() != ValueOpcode::ReadConstBuffer;
+		const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		// A vector load adds the thread ID to its index when V# asks, so no one value holds.
+		if (vector_load && ((static_cast<uint32_t>(word3) >> 23u) & 1u) != 0u) {
 			return false;
 		}
-		address = (base & ~uint64_t {3}) + byte_offset;
+		if (vector_load && stride != 0u && (static_cast<uint32_t>(high) >> 31u) != 0u) {
+			const auto element = static_cast<uint64_t>(immediate);
+			if (static_cast<uint32_t>(records) == 0u || element + sizeof(uint32_t) > stride) {
+				return false;
+			}
+			const auto index_stride = uint64_t {8}
+			                          << ((static_cast<uint32_t>(word3) >> 21u) & 3u);
+			const auto byte_offset = (element & ~uint64_t {3}) * index_stride + (element & 3u) +
+			                         static_cast<uint32_t>(offset);
+			address = ((base & AddressMask & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+		} else {
+			const auto byte_offset = (static_cast<uint64_t>(immediate) & ~uint64_t {3}) +
+			                         (static_cast<uint32_t>(offset) & ~3u);
+			const auto size =
+			    stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+			                 : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+			// A descriptor chain that reads past its own descriptor is not trustworthy, so the
+			// walk refuses rather than substituting hardware's zero. shader_cfg_tests asserts
+			// this: "real S_BUFFER_LOAD walk ignored descriptor bounds".
+			if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+				return false;
+			}
+			address = (base & ~uint64_t {3}) + byte_offset;
+		}
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
@@ -726,13 +792,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
-	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
-	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+	if (m_runtime.read_memory != nullptr) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
 	} else {
-		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
@@ -760,19 +824,43 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 		case ValueOpcode::ReadFirstLane: {
-			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
-				return EvaluateWide(inst.Arg(0), result);
-			}
+			// A readfirstlane is how a vector value reaches the scalar registers a descriptor
+			// is assembled from, so its operand is wave-uniform on the hardware that wrote it
+			// and any lane index inside it has to cancel. Re-execute the operand for every
+			// lane and take the answer they all give: lanes that disagree mean no single
+			// descriptor stands for the wave, and a wrong descriptor is worse than a dropped
+			// dispatch, so that refusal stands.
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
-			                  inst.Arg(1));
-			// A lane-0 walk resolves selects on its own mask; outer assumptions need not hold.
-			active.m_barred = m_barred;
-			for (const auto& assumed: m_assumed) {
-				active.m_barred.insert(assumed.first);
+			LaneScope  scope;
+			uint64_t   common = 0;
+			for (scope.lane = 0; scope.lane < m_program.wave_size; scope.lane++) {
+				scope.dependent = false;
+				SrtWalker clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
+				SrtWalker active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
+				                 inst.Arg(1));
+				active.m_lane = &scope;
+				// A lane walk resolves selects on its own mask; outer assumptions need not hold.
+				active.m_barred = m_barred;
+				for (const auto& assumed: m_assumed) {
+					active.m_barred.insert(assumed.first);
+				}
+				uint64_t lane_value = 0;
+				if (!active.EvaluateWide(inst.Arg(0), lane_value)) {
+					return false;
+				}
+				if (scope.lane == 0) {
+					common = lane_value;
+				} else if (lane_value != common) {
+					return false;
+				}
+				// An operand that never asked for the lane gives the same answer for all of
+				// them, so one walk settles it.
+				if (!scope.dependent) {
+					break;
+				}
 			}
-			return active.EvaluateWide(inst.Arg(0), result);
+			result = common;
+			return true;
 		}
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
@@ -785,16 +873,39 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			result = static_cast<uint32_t>(a) |
 			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 			return true;
+		case ValueOpcode::ReadConst: {
+			const auto slot = inst.Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) {
+				return false;
+			}
+			// A flat slot is also walked on its own, outside any readfirstlane, so it must hold
+			// without a lane bound. RuntimeValidator drops the active mask here for the same
+			// reason; leaving the scope in place would accept a slot the separate walk cannot.
+			auto* lane = m_lane;
+			m_lane     = nullptr;
+			const bool read =
+			    slot.U32() < m_clean_flat_slots.size() &&
+			            m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr
+			        ? m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
+			                                          result)
+			        : EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
+			m_lane = lane;
+			return read;
+		}
+		case ValueOpcode::LaneId:
+			// Only the sweep above binds a lane. Anywhere else the value is per-lane with
+			// nothing to pin it down, and RuntimeValidator refused it for the same reason.
+			if (m_lane == nullptr) {
+				return false;
+			}
+			m_lane->dependent = true;
+			result            = m_lane->lane;
+			return true;
+		case ValueOpcode::LoadBufferU32:
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32:
 			if (IsRawRead(m_program, inst)) {
-				if (m_clean_evaluator != nullptr &&
-				    (inst.Flags<SrtReadFlags>().clean != 0u ||
-				     (inst.GetOpcode() == ValueOpcode::LoadBufferU32 &&
-				      m_clean_evaluator->m_active_mask == m_active_mask))) {
-					return m_clean_evaluator->EvaluateWide(Value(const_cast<Inst*>(&inst)), result);
-				}
 				return EvaluateRawRead(inst, result);
 			}
 			break;

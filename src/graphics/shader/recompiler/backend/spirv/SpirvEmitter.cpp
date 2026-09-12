@@ -33,7 +33,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
 			       const auto op = use.user->GetOpcode();
 			       if (op != IR::ValueOpcode::LoadAddressU32 &&
-			           op != IR::ValueOpcode::ReadConstBuffer) {
+			           op != IR::ValueOpcode::ReadConstBuffer &&
+			           op != IR::ValueOpcode::LoadBufferU32) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;

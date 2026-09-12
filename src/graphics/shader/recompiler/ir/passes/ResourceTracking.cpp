@@ -111,6 +111,15 @@ const char* StageName(ShaderType stage) {
 // opcode stopped the walk instead of only which dword. ValueOpcodeName is a string_view, so this
 // must stay inside fmt::format and out of any printf-style call.
 std::string DescribeRuntimeFailure(const RuntimeValueFailure& failure) {
+	if (failure.has_entry_opcodes) {
+		const auto operand = [](ValueOpcode opcode) {
+			return opcode == ValueOpcode::Void ? std::string_view("immediate")
+			                                   : ValueOpcodeName(opcode);
+		};
+		return fmt::format("{} {}, entries {} and {}", RuntimeValueRejectName(failure.reason),
+		                   ValueOpcodeName(failure.opcode), operand(failure.entry_opcode),
+		                   operand(failure.other_opcode));
+	}
 	if (failure.has_opcode) {
 		return fmt::format("{} {}", RuntimeValueRejectName(failure.reason),
 		                   ValueOpcodeName(failure.opcode));
@@ -369,6 +378,7 @@ public:
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectDescriptors();
+		PlanIndirectBuffers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (!Collect(inst)) {
@@ -513,6 +523,13 @@ private:
 		bool retain_reads = false;
 		bool table_indexed = false;
 		const Inst* table_read = nullptr;
+	};
+
+	// GetBufferResource is emitted once per access, so one recognized table usually owns several
+	// handles. Each handle carries the interned source; the reads themselves stay in the IR.
+	struct IndirectBufferPlan {
+		Inst*    handle = nullptr;
+		uint32_t source = 0;
 	};
 
 	// An emulator invariant: the IR reached tracking in a shape this pass must never see.
@@ -985,7 +1002,12 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value()) {
+			    current.indirect_descriptor.has_value() !=
+			        descriptor.indirect_descriptor.has_value() ||
+			    current.indirect_buffer != descriptor.indirect_buffer) {
+				// A table source carries the heap V# in its dwords, so without the indirect
+				// description it is indistinguishable from the heap binding itself and the two
+				// collapse into one resource that describes neither.
 				continue;
 			}
 			if (current.indirect_descriptor.has_value()) {
@@ -1101,6 +1123,92 @@ private:
 		MakeSource(*handle, width, false, false, base, descriptor, flags.pc);
 		uint32_t bad_dword = 0;
 		return ValidateSource(descriptor, bad_dword);
+	}
+
+	// Interns the V# of a table the shader indexes at runtime. The table descriptor itself is
+	// host-resolvable even though the record it selects is not, which is what lets the host
+	// enumerate the records at all.
+	bool MakeRuntimeBufferSource(const Inst& handle, uint32_t pc, uint32_t& source,
+	                             DescriptorSource& descriptor) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
+			return false;
+		}
+		MakeSource(handle, 4u, false, false, UINT32_MAX, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (!ValidateSource(descriptor, bad_dword)) {
+			return false;
+		}
+		source = InternSource(descriptor);
+		return true;
+	}
+
+	bool MatchMaterialOffset(Value value, uint32_t& stride, uint32_t& offset) const {
+		stride = 1u;
+		offset = 0u;
+		value = value.Resolve();
+		while (const auto* inst = value.TryInstruction()) {
+			if (inst->NumArgs() != 2u) break;
+			uint32_t constant = 0;
+			Value remaining;
+			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), constant) && constant < 32u) {
+				stride *= 1u << constant;
+				remaining = inst->Arg(0);
+			} else if (inst->GetOpcode() == ValueOpcode::IAdd32 ||
+			           inst->GetOpcode() == ValueOpcode::IMul32) {
+				if (ImmediateU32(inst->Arg(0), constant)) remaining = inst->Arg(1);
+				else if (ImmediateU32(inst->Arg(1), constant)) remaining = inst->Arg(0);
+				else break;
+				if (inst->GetOpcode() == ValueOpcode::IAdd32) offset += stride * constant;
+				else stride *= constant;
+			} else {
+				break;
+			}
+			value = remaining.Resolve();
+		}
+		// Treat the remaining GPU-derived scalar as any U32 value.
+		return stride != 0u && value.GetType() == Type::U32 && !value.IsImmediate();
+	}
+
+	bool MatchMaterialOffset(Value value, Value& selector, uint32_t& stride,
+	                         uint32_t& offset) const {
+		value           = value.Resolve();
+		offset          = 0;
+		auto* candidate = value.TryInstruction();
+		if (candidate != nullptr && candidate->GetOpcode() == ValueOpcode::IAdd32 &&
+		    candidate->NumArgs() == 2u) {
+			uint32_t immediate = 0;
+			if (ImmediateU32(candidate->Arg(0), immediate)) {
+				value = candidate->Arg(1).Resolve();
+			} else if (ImmediateU32(candidate->Arg(1), immediate)) {
+				value = candidate->Arg(0).Resolve();
+			} else {
+				return false;
+			}
+			offset = immediate;
+		}
+		const auto* multiply = value.TryInstruction();
+		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
+		    multiply->NumArgs() != 2u) {
+			return false;
+		}
+		if (ImmediateU32(multiply->Arg(0), stride)) {
+			selector = multiply->Arg(1).Resolve();
+		} else if (ImmediateU32(multiply->Arg(1), stride)) {
+			selector = multiply->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+		const auto* selector_inst = selector.TryInstruction();
+		return stride != 0u && selector_inst != nullptr &&
+		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+	}
+
+	const Inst* MaterialKeyShift(Value key, uint32_t& amount) const {
+		const auto* shift = key.Resolve().TryInstruction();
+		return shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+		               ImmediateU32(shift->Arg(1), amount) && amount != 0u && amount < 32u
+		           ? shift : nullptr;
 	}
 
 	enum class LaneQuantifier { Any, All };
@@ -2216,6 +2324,113 @@ private:
 		}
 	}
 
+	// Recognizes a buffer V# assembled from four consecutive scalar reads of one descriptor table
+	// at a wave-uniform record index. Only the index resists host evaluation; the table's own V#
+	// is CPU-derivable, so the host can enumerate the records it may select.
+	bool TryMakeIndirectBuffer(Inst& handle, uint32_t pc, uint32_t base_reg,
+	                           IndirectBufferPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		Inst*    heap_handle   = nullptr;
+		Value    heap_offset;
+		uint32_t record_offset = 0;
+		for (uint32_t dword = 0; dword < 4u; dword++) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr) {
+				return false;
+			}
+			if (dword == 0u) {
+				record_offset = memory->offset;
+				heap_offset   = read->Arg(1).Resolve();
+				if (record_offset > UINT32_MAX - 3u * sizeof(uint32_t)) {
+					return false;
+				}
+			} else if (memory->offset != record_offset + dword * sizeof(uint32_t) ||
+			           !EquivalentValue(m_program, heap_offset, read->Arg(1))) {
+				return false;
+			}
+			auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || (heap_handle != nullptr && current != heap_handle)) {
+				return false;
+			}
+			heap_handle = current;
+		}
+
+		Value    selector;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+		if (!MatchMaterialOffset(heap_offset, selector, selector_stride, selector_offset)) {
+			return false;
+		}
+
+		// A selector the host can re-execute names one record directly, so leave that descriptor
+		// on the ordinary path: recognizing the table must not change a shader that already
+		// materializes.
+		DescriptorSource direct;
+		MakeSource(handle, 4u, false, false, base_reg, direct, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(direct, bad_dword)) {
+			return false;
+		}
+
+		DescriptorSource heap_source;
+		uint32_t         heap_source_index = 0;
+		if (!MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
+			return false;
+		}
+
+		// The source stands for the table, not for any one record: its dwords are the table V#,
+		// which the host can re-execute, and the record index lives in the indirect description.
+		DescriptorSource buffer_source;
+		buffer_source.dword_count = 4u;
+		std::copy_n(heap_source.dwords.begin(), 4u, buffer_source.dwords.begin());
+		buffer_source.indirect_buffer = DescriptorSource::IndirectBuffer {
+		    heap_source_index, selector_stride, selector_offset, record_offset, 0u};
+
+		plan.handle = &handle;
+		plan.source = InternSource(buffer_source);
+		return true;
+	}
+
+	const IndirectBufferPlan* FindIndirectBuffer(const Inst& handle) const {
+		if (m_indirect_buffers.empty()) {
+			return nullptr;
+		}
+		const auto found = std::find_if(m_indirect_buffers.begin(), m_indirect_buffers.end(),
+		                                [&](const IndirectBufferPlan& plan) {
+			return plan.handle == &handle;
+		});
+		return found == m_indirect_buffers.end() ? nullptr : &*found;
+	}
+
+	void PlanIndirectBuffers() {
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None ||
+				    inst.NumArgs() == 0u) {
+					continue;
+				}
+				auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || FindIndirectBuffer(*handle) != nullptr) {
+					continue;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				IndirectBufferPlan plan;
+				if (flags.index < m_program.memory_info.size() &&
+				    TryMakeIndirectBuffer(*handle, flags.pc,
+				                          m_program.memory_info[flags.index].resource * 4u, plan)) {
+					m_indirect_buffers.push_back(plan);
+				}
+			}
+		}
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
 	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
 	               bool sample_adjust = false) {
@@ -2456,22 +2671,48 @@ private:
 
 		if (buffer != BufferAccess::None) {
 			handle = inst.Arg(0).Resolve().TryInstruction();
+			// 4. A scalar, DWORD x1 or formatted X load the others refused decodes its V# itself.
+			const auto take_indirect_load = [&]() {
+				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+				                                                        : ResourceKind::Buffer) ||
+				    !memory.SupportsIndirectBufferLoad(op)) {
+					return false;
+				}
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_info.uses_dma                         = true;
+				return true;
+			};
 			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
 			if (indirect != nullptr) {
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
-				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
-					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
+				// Two mechanisms, layered narrow-first. Decoding the V# in the shader over a raw
+				// device pointer needs no host-visible descriptor but only serves an unformatted,
+				// untyped DWORD x2/x3/x4 load, so it goes first. Resolving the table on the host into
+				// real, deduped bindings covers what that cannot express, so it picks up the rest
+				// rather than competing for the same accesses.
+				const bool raw_multi_dword = op == ValueOpcode::LoadBufferU32x2 ||
+				                             op == ValueOpcode::LoadBufferU32x3 ||
+				                             op == ValueOpcode::LoadBufferU32x4;
+				if (memory.kind == ResourceKind::Buffer && !memory.formatted && raw_multi_dword &&
+				    memory.SupportsIndirectBufferLoad(op)) {
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					m_info.uses_dma                         = true;
+					return true;
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
-				return true;
-
+				auto*       root     = inst.Arg(0).Resolve().TryInstruction();
+				const auto* indirect = root != nullptr ? FindIndirectBuffer(*root) : nullptr;
+				if (indirect == nullptr) {
+					if (indirect == nullptr && take_indirect_load()) {
+						return true;
+					}
+					return Reject(flags.pc,
+					              "buffer descriptor is not a valid runtime value; GPU-selected access "
+					              "requires a raw DWORD x2/x3/x4 load or a recognisable table");
+				}
+				handle = root;
+				source = indirect->source;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
@@ -2511,6 +2752,9 @@ private:
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+				// The store goes through the page table, so the emitter needs its own store-pointer
+				// helper and the context has to publish a writable BDA set for the draw.
+				m_info.writes_dma            = true;
 			}
 			m_info.uses_dma = true;
 			return true;
@@ -2571,7 +2815,8 @@ private:
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
+			    buffer_source->indirect_buffer.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
@@ -2608,6 +2853,7 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
+	std::vector<IndirectBufferPlan> m_indirect_buffers;
 	mutable ResourceTrackingStatus m_status;
 };
 

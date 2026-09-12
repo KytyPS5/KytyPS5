@@ -12,14 +12,27 @@
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
+#include <string>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
-constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+constexpr uint64_t AddressMask             = 0x0000ffffffffffffull;
+constexpr uint64_t MaxIndirectImageProbes  = 65536u;
+constexpr uint64_t MaxIndirectBufferProbes = 65536u;
+
+// The host-resolved half of a GPU-selected buffer table: every record the selector can name,
+// deduped into real descriptors. Main's ResourceKind::IndirectBuffer path handles what this
+// cannot match, by decoding the V# in the shader instead.
+struct IndirectBuffer {
+	uint32_t                     resource = 0;
+	std::vector<uint32_t>        keys;
+	std::vector<uint32_t>        candidates;
+	std::vector<DescriptorValue> descriptors;
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -195,6 +208,21 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
 }
 
+// One word out of a scalar buffer, by the same rule ReadScalarTable applies to a span: a read
+// past the descriptor extent yields zero rather than a refusal, because that is what the
+// hardware returns for it.
+bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynamic_offset,
+                          uint32_t immediate_offset, const SrtRuntime& runtime,
+                          uint32_t& word) {
+	const auto offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
+	if (offset > UINT32_MAX) {
+		return false;
+	}
+	word = 0;
+	return ReadScalarTable(descriptor.Base48(), descriptor.GetSize(),
+	                       static_cast<uint32_t>(offset), runtime, {&word, 1});
+}
+
 bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
@@ -329,8 +357,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return false;
 				if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
 			}
-			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
-			    (key_count != 0u && uint64_t {indirect.table_offset} + indirect.table_immediate +
+			if (indirect.table_stride == 0u || key_count > MaxIndirectImageProbes ||
+			    (key_count != 0u && uint64_t {indirect.table_offset} +
 			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
 			             UINT32_MAX + 1ull)) {
 				return false;
@@ -342,7 +370,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			uint32_t             first = 0, count = 0;
 			if (!DecodeBufferDescriptor(material_value, material) ||
 			    !clean.Evaluate(indirect.selector_first, first) ||
-			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectDescriptorProbes)
+			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectImageProbes ||
+			    uint64_t {first} + count > material.NumRecords())
 				return false;
 			// SMEM uses its instruction's byte stride; V# stride only supplies its bounds.
 			const auto step = selector->stride != 0u ? selector->stride : material.Stride();
@@ -379,8 +408,29 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				keys.push_back(key);
 				mask &= mask - 1u;
 			}
-		} else return false;
-		if (selector != nullptr) {
+		} else {
+			ShaderBufferResource material;
+			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u) {
+				return false;
+			}
+			// The first aligned offset includes the immediate added after shader U32 arithmetic.
+			const auto step = std::max<uint64_t>(4u,
+			    std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u));
+			const uint64_t first = indirect.selector_offset;
+			const auto size = material.GetSize();
+			const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
+			const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
+			if (probe_count > MaxIndirectImageProbes) {
+				return false;
+			}
+			if (!read_keys(material, first, step, probe_count)) return false;
+			if (indirect.selector_shift == 0u) keys.push_back(0u);
+		}
+		if (indirect.material_source != UINT32_MAX) {
+			for (auto& key: keys) key = (key >> indirect.selector_shift) & indirect.selector_bits;
+			if (indirect.selector_shift != 0u || indirect.selector_bits != UINT32_MAX) {
+				keys.push_back(0u); // An out-of-range material load returns zero.
+			}
 			std::ranges::sort(keys);
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}
@@ -423,6 +473,121 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
 		root.indirect_search_iterations = std::bit_width(key_count);
 	}
+	return true;
+}
+
+// These numbers decide whether a runtime descriptor selection is needed at all, so they are
+// reported once per shader whether the table is accepted or refused.
+void ReportIndirectBuffer(uint64_t shader_hash, const std::string& message) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> reported;
+	{
+		const std::lock_guard<std::mutex> lock(mutex);
+		if (!reported.insert(shader_hash).second) {
+			return;
+		}
+	}
+	std::printf("shader 0x%016llx indirect buffer table: %s\n",
+	            static_cast<unsigned long long>(shader_hash), message.c_str());
+	std::fflush(stdout);
+}
+
+bool ValidBufferDescriptor(const DescriptorValue& value) {
+	ShaderBufferResource descriptor;
+	if (!DecodeBufferDescriptor(value, descriptor)) {
+		return false;
+	}
+	// Type 0 is the only buffer V#; a table slot with no base or no records selects nothing.
+	return descriptor.Type() == 0u && descriptor.Base48() != 0u && descriptor.NumRecords() != 0u;
+}
+
+// Enumerates every record of a descriptor table the shader indexes with a wave-uniform selector
+// the host cannot re-execute. Records are probed only at their own stride: a window that straddles
+// two records decodes as a plausible descriptor often enough to exhaust the candidate budget.
+bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
+                               const DescriptorValue& heap_value, const SrtRuntime& runtime,
+                               uint64_t shader_hash, IndirectBuffer& result) {
+	ShaderBufferResource heap;
+	if (!DecodeBufferDescriptor(heap_value, heap) || indirect.selector_stride == 0u) {
+		return false;
+	}
+	const auto declared = static_cast<uint32_t>(heap.Stride());
+	const auto records  = heap.NumRecords();
+	if (declared != indirect.selector_stride && declared != 0u) {
+		ReportIndirectBuffer(
+		    shader_hash,
+		    fmt::format("refused: table stride {} does not match the selector stride {} "
+		                "(records {}, record offset {})",
+		                declared, indirect.selector_stride, records, indirect.record_offset));
+		return false;
+	}
+	const auto size        = heap.GetSize();
+	const auto probe_count = size / indirect.selector_stride;
+	if (probe_count > MaxIndirectBufferProbes) {
+		ReportIndirectBuffer(
+		    shader_hash,
+		    fmt::format("refused: {} probes exceed the {} probe budget (table stride {}, "
+		                "selector stride {}, records {}, record offset {})",
+		                probe_count, MaxIndirectBufferProbes, declared, indirect.selector_stride,
+		                records, indirect.record_offset));
+		return false;
+	}
+
+	IndirectBuffer next;
+	next.keys.reserve(static_cast<size_t>(probe_count));
+	next.candidates.reserve(static_cast<size_t>(probe_count));
+	for (uint64_t record = 0; record < probe_count; record++) {
+		const auto dynamic =
+		    record * indirect.selector_stride + static_cast<uint64_t>(indirect.selector_offset);
+		if (dynamic > UINT32_MAX) {
+			break;
+		}
+		DescriptorValue candidate;
+		candidate.dword_count = 4u;
+		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+			if (!ReadScalarBufferWord(heap, static_cast<uint32_t>(dynamic),
+			                          indirect.record_offset + dword * sizeof(uint32_t), runtime,
+			                          candidate.dwords[dword])) {
+				return false;
+			}
+		}
+		if (!ValidBufferDescriptor(candidate)) {
+			candidate.dwords.fill(0);
+		}
+		next.keys.push_back(static_cast<uint32_t>(record));
+		const auto found = std::ranges::find(next.descriptors, candidate);
+		if (found == next.descriptors.end()) {
+			if (next.descriptors.size() >= ShaderInfo::MaxBuffers) {
+				ReportIndirectBuffer(
+				    shader_hash,
+				    fmt::format("refused: distinct descriptors exceed the {} buffer limit over "
+				                "{} probes (table stride {}, selector stride {}, records {}, "
+				                "record offset {})",
+				                ShaderInfo::MaxBuffers, probe_count, declared,
+				                indirect.selector_stride, records, indirect.record_offset));
+				return false;
+			}
+			next.descriptors.push_back(candidate);
+			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
+		} else {
+			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
+		}
+	}
+	if (next.descriptors.empty()) {
+		// An empty table still has to name one descriptor for the binding the shader declares.
+		DescriptorValue null_descriptor;
+		null_descriptor.dword_count = 4u;
+		next.keys.push_back(0u);
+		next.descriptors.push_back(null_descriptor);
+		next.candidates.push_back(0u);
+	}
+	ReportIndirectBuffer(
+	    shader_hash,
+	    fmt::format("probes {}, distinct descriptors {}, table stride {}, selector stride {}, "
+	                "records {}, record offset {}",
+	                probe_count, next.descriptors.size(), declared, indirect.selector_stride,
+	                records, indirect.record_offset));
+	result = std::move(next);
 	return true;
 }
 
@@ -905,6 +1070,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
 	plan.user_data_count            = program.user_data_count;
+	plan.wave_size                  = program.wave_size;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
 	plan.source_reads               = program.source_reads;
@@ -938,10 +1104,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (const auto found = cloned.find(source); found != cloned.end()) {
 			return Value(found->second);
 		}
-		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			plan.requires_specialization_memory = true;
-			plan.capture_specialization_reads   = true;
-		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
 		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
@@ -968,6 +1130,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
+		// Plain indices and offsets, so it needs no cloning - but it does need carrying, or the
+		// plan binds the heap V# in place of the record the table selects.
+		target.indirect_buffer = source.indirect_buffer;
 		if (target.indirect_descriptor.has_value()) {
 			plan.requires_specialization_memory = true;
 			capture_indirect_reads = true;
@@ -1032,45 +1197,57 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
-	plan.capture_specialization_reads |=
-	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
-	if (plan.capture_specialization_reads) {
-		// Every former flat alias now targets its retained raw read. Mark those reads
-		// on the normalized graph, so discarded Phi/EXEC dependencies stay discarded.
-		std::unordered_set<const Inst*> planned_reads;
-		for (const auto& read: plan.srt_reads) {
-			auto* inst = read.value.ResolveInstruction();
-			EXIT_IF(inst == nullptr || (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
-			                           inst->GetOpcode() != ValueOpcode::ReadConstBuffer));
-			planned_reads.insert(inst);
+	plan.clean_flat_slots.resize(plan.srt_reads.size());
+	bool capture_image_reads = false;
+	for (const auto& buffer: plan.info.buffers) {
+		const auto* source = Source(plan, buffer.source);
+		if (source == nullptr || !source->indirect_buffer.has_value()) {
+			continue;
 		}
-		for (const auto& source: plan.descriptor_sources) {
-			if (!source.indirect_descriptor.has_value()) continue;
-			const auto& indirect = *source.indirect_descriptor;
-			if (indirect.selector)
-				MarkCleanReads(planned_reads, Source(plan, indirect.selector->source));
-			MarkCleanReads(planned_reads, nullptr, indirect.selector_mask);
-			MarkCleanReads(planned_reads, nullptr, indirect.selector_first);
-			MarkCleanReads(planned_reads, nullptr, indirect.key_count);
-			if (indirect.sources.empty()) {
-				MarkCleanReads(planned_reads, Source(plan, indirect.table_source));
-			} else {
-				for (const auto candidate: indirect.sources) {
-					MarkCleanReads(planned_reads, Source(plan, candidate));
-				}
+		MarkCleanFlatSlots(plan, Source(plan, source->indirect_buffer->heap_source),
+		                   plan.clean_flat_slots);
+	}
+	for (const auto& image: plan.info.images) {
+		const auto* source = Source(plan, image.source);
+		if (source == nullptr || !source->indirect_descriptor.has_value()) {
+			continue;
+		}
+		plan.requires_specialization_memory = true;
+		capture_image_reads |= !source->indirect_descriptor->selector_mask.IsEmpty() ||
+		                       !source->indirect_descriptor->sources.empty();
+		MarkCleanFlatSlots(plan, Source(plan, source->indirect_descriptor->material_source),
+		                   plan.clean_flat_slots, source->indirect_descriptor->selector_mask);
+		if (source->indirect_descriptor->sources.empty()) {
+			MarkCleanFlatSlots(plan, Source(plan, source->indirect_descriptor->table_source),
+			                   plan.clean_flat_slots);
+		} else {
+			for (const auto candidate: source->indirect_descriptor->sources) {
+				MarkCleanFlatSlots(plan, Source(plan, candidate), plan.clean_flat_slots);
 			}
 		}
+	}
+	plan.capture_specialization_reads = capture_image_reads || !plan.control_flow.empty();
+	if (plan.capture_specialization_reads) {
 		// Clean writable addresses prove that shader writes cannot overlap captured reads.
 		for (const auto& buffer: plan.info.buffers) {
-			if (buffer.written) MarkCleanReads(planned_reads, Source(plan, buffer.source));
+			if (buffer.written)
+				MarkCleanFlatSlots(plan, Source(plan, buffer.source), plan.clean_flat_slots);
 		}
 		for (const auto& image: plan.info.images) {
-			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
+			if (image.written)
+				MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
 		}
 	}
-	if (capture_indirect_reads || !plan.source_reads.empty())
-		plan.resource_tracking_complete &= !program.has_address_writes;
-	CompileSrtWalker(plan);
+	if (capture_image_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	for (const auto& buffer: plan.info.buffers) {
+		const auto* source = Source(plan, buffer.source);
+		if (source == nullptr || !source->indirect_buffer.has_value()) {
+			continue;
+		}
+		plan.requires_specialization_memory = true;
+		MarkCleanFlatSlots(plan, Source(plan, source->indirect_buffer->heap_source),
+		                   plan.clean_flat_slots);
+	}
 	return plan;
 }
 
@@ -1087,8 +1264,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtReadCapture capture {runtime, reads};
 	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
-	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
@@ -1110,34 +1286,38 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
+			return (written ? clean : walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.assign(program.info.buffers.size(), {});
-	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
-		const auto base_index =
-		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
-		if (base_index >= program.info.buffers.size()) return false;
-		const auto& base = program.info.buffers[base_index];
-		if (i < program.info.buffers.size()) {
-			const auto* source = Source(program, base.source);
-			if (source == nullptr) return false;
-			if (source->indirect_descriptor.has_value()) {
-				snapshot.buffers[i] = {.dword_count = 4u};
-				if (active.empty() || active[base.source]) {
-					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
-					        NormalizeIndirectStoreBuffer))
-						return false;
+	specialization.buffers.clear();
+	specialization.buffers.reserve(program.info.buffers.size());
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& buffer = program.info.buffers[i];
+		const auto* source = Source(program, buffer.source);
+		if (source != nullptr && source->indirect_buffer.has_value()) {
+			snapshot.buffers[i] = {.dword_count = 4u};
+			if (active.empty() || active[buffer.source]) {
+				DescriptorValue table;
+				IndirectBuffer  resolved;
+				if (!clean.EvaluateDescriptor(source->indirect_buffer->heap_source, table) ||
+				    !MaterializeIndirectBuffer(*source->indirect_buffer, table, runtime,
+				                               program.shader_hash, resolved)) {
+					return false;
 				}
-			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
-				return false;
+				// Stage one binds the one descriptor the table can select. A table with more than
+				// one needs a runtime selection this snapshot cannot express, so the draw is
+				// refused and the shader falls back to the in-shader V# decode.
+				if (resolved.descriptors.size() > 1u) {
+					return false;
+				}
+				snapshot.buffers[i] = resolved.descriptors[resolved.candidates[0]];
 			}
+		} else if (!evaluate(buffer.source, snapshot.buffers[i], buffer.written)) {
+			return false;
 		}
 		auto&                descriptor_value = snapshot.buffers[i];
 		ShaderBufferResource descriptor;
@@ -1156,12 +1336,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
-		auto& buffer         = specialization.buffers[i];
-		buffer.packed_stride = packed_stride;
-		buffer.descriptor_format =
-		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
-		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
-		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		specialization.buffers.push_back({
+		    .packed_stride     = packed_stride,
+		    .descriptor_format = program.info.buffers[i].formatted
+		                             ? descriptor.Format()
+		                             : Prospero::BufferFormat::kInvalid,
+		    .descriptor_swizzle =
+		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
+		    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
+		});
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());

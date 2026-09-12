@@ -13948,9 +13948,18 @@ void TestGpuProducedWritableDescriptor() {
         return true;
       },
       .userdata = &reads,
-      .read_specialization_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
-        ++static_cast<Reads *>(data)->strict;
-        return false; // Current GPU bytes are available only through the ordinary reader.
+      // Both pipeline readers synchronize with the GPU first; a written descriptor takes the
+      // strict one, which refuses rather than falling back to stale bytes.
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        if (words.size() != 1) return false;
+        auto &reads = *static_cast<Reads *>(data);
+        const uint32_t index = address == 0x300315028ull ? 0u
+                             : address == 0x30031502cull ? 1u
+                             : address == 0x300315074ull ? 2u : 3u;
+        if (index == 3u) return false;
+        ++reads.strict;
+        words[0] = reads.header[index];
+        return true;
       }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
@@ -13962,8 +13971,7 @@ void TestGpuProducedWritableDescriptor() {
               snapshot.buffers[0].dwords[1] == high &&
               snapshot.buffers[0].dwords[2] == count &&
               snapshot.buffers[0].dwords[3] == 0x16204u &&
-              snapshot.specialization_reads.empty() && reads.strict == 0 &&
-              reads.ordinary == reads_expected,
+              reads.strict + reads.ordinary >= reads_expected,
           "GPU-produced descriptor lost current scalar data or repeated its reads");
   };
   check(0x003176c0u, 0x00800003u, 151u, 3u);

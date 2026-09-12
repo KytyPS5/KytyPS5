@@ -456,6 +456,13 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(guest_printf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestPrintfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/guestPrintf.cpp"
+)
+target_link_libraries(guest_printf_tests common)
+target_include_directories(guest_printf_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -534,6 +541,7 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME guest_printf COMMAND $<TARGET_FILE:guest_printf_tests>)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -596,6 +604,7 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		guest_printf_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

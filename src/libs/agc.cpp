@@ -263,11 +263,16 @@ struct CommandBuffer {
 	}
 
 	[[nodiscard]] KYTY_SYSV_ABI uint32_t GetAvailableSizeDW() const {
-		if (cursor_up == nullptr || cursor_down == nullptr || cursor_down <= cursor_up) {
+		// Some guests pass "single-ended" buffers: {bottom, top, cursor, 0, cb, ...}
+		// with cursor_down left null - SpongeBob PPSA26893 does this for one-packet
+		// temporary slices. There the real bound is `top`, and the registered
+		// callback is only the overflow reporter, not a grow function.
+		auto* end = cursor_down != nullptr ? cursor_down : top;
+		if (cursor_up == nullptr || end == nullptr || end <= cursor_up) {
 			return 0;
 		}
 
-		auto available = static_cast<uint64_t>(cursor_down - cursor_up);
+		auto available = static_cast<uint64_t>(end - cursor_up);
 		if (available <= reserved_dw) {
 			return 0;
 		}

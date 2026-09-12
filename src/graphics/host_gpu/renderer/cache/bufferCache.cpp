@@ -127,27 +127,50 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
+	std::vector<vk::BufferCopy> ranges;
 	const auto                  buffer_address = buffer.CpuAddress();
+	const auto                  capacity = Common::AlignDown(m_download_buffer.Size(), 64);
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Keep packed ranges on separate cache lines, as in shadPS4.
-			    total_size += Common::AlignUp(end - start, 64);
+			    for (auto begin = start; begin < end;) {
+				    const auto part = std::min(end - begin, capacity);
+				    ranges.emplace_back(begin - buffer_address, 0, part);
+				    begin += part;
+			    }
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
-	if (copies.empty()) {
+	if (ranges.empty()) {
 		return false;
 	}
 
+	// Each batch fits the staging buffer; mapping the next one waits for the previous readback.
+	for (size_t first = 0; first < ranges.size();) {
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size = 0;
+		for (; first < ranges.size(); first++) {
+			// Keep packed ranges on separate cache lines, as in shadPS4.
+			const auto packed = Common::AlignUp(ranges[first].size, 64);
+			if (packed > capacity - total_size) {
+				break;
+			}
+			copies.emplace_back(ranges[first].srcOffset, total_size, ranges[first].size);
+			total_size += packed;
+		}
+		DownloadBatch(buffer, std::move(copies), total_size);
+	}
+	return true;
+}
+
+void BufferCache::DownloadBatch(Buffer& buffer, std::vector<vk::BufferCopy>&& copies,
+                                uint64_t total_size) {
+	const auto buffer_address   = buffer.CpuAddress();
 	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 32 MiB staging buffer capacity\n");
+		EXIT("BufferCache: download batch exceeds the staging buffer capacity\n");
 	}
 	m_download_buffer.Commit();
 	for (auto& copy: copies) {
@@ -189,7 +212,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	});
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,

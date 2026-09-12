@@ -4201,6 +4201,32 @@ public:
                   }),
               "near-capacity Buffer GC did not publish its complete transfer");
 
+      // A dirty range larger than the staging stream is split across batches.
+      constexpr uint64_t over_offset = 0x10000;
+      constexpr uint64_t over_size = (33ull << 20) + 12;
+      constexpr uint32_t over_value = 0x6bb66bb6u;
+      std::memcpy(memory + over_offset, &large_stale, sizeof(large_stale));
+      std::memcpy(memory + over_offset + over_size - sizeof(large_stale),
+                  &large_stale, sizeof(large_stale));
+      auto over_allocation =
+          cache.ObtainBuffer(base + over_offset, over_size, true, false);
+      Require(name, "over-capacity dirty allocation",
+              over_allocation.first != nullptr,
+              "failed to allocate the over-capacity dirty native buffer");
+      cache.FillBuffer(base + over_offset, over_size, over_value, false);
+      for (uint32_t tick = 0; tick <= 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      std::vector<uint32_t> over_published(over_size / sizeof(uint32_t));
+      Require(name, "over-capacity Buffer publication contents",
+              !cache.IsRegionRegistered(base + over_offset, over_size) &&
+                  Libs::LibKernel::Memory::TryReadBacking(
+                      base + over_offset, over_published.data(), over_size) &&
+                  std::ranges::all_of(over_published, [](uint32_t value) {
+                    return value == over_value;
+                  }),
+              "over-capacity Buffer GC did not publish its complete transfer");
+
       constexpr uint64_t grouped_first_offset = 0x10000;
       constexpr uint64_t grouped_second_offset = 0x1200000;
       constexpr uint64_t grouped_owner_size = 17ull * 1024 * 1024;
@@ -8163,6 +8189,243 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "BGRA16 direct-memory release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckLargeImageReadback() {
+    constexpr const char *name = "LargeImageReadback";
+    constexpr uintptr_t base = 0x0000000220000000ull;
+    constexpr uint64_t allocation_size = 0x10000000;
+    constexpr uint64_t alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, alignment, 0, &direct_offset) == 0,
+            "large readback direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "large readback fixed mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    {
+      auto &resources = context;
+      resources.MapMemory(base, allocation_size);
+      auto &cache = resources.GetTextureCache();
+      const uint64_t stream_size = resources.GetBufferCache()
+                                       .GetUtilityBuffer(MemoryUsage::Download)
+                                       .Size();
+      const auto CheckBacking = [&](const char *stage, uint64_t address,
+                                    const std::vector<uint8_t> &expected) {
+        std::vector<uint8_t> actual(expected.size());
+        Require(name, stage,
+                Libs::LibKernel::Memory::TryReadBacking(address, actual.data(),
+                                                        actual.size()),
+                "large readback guest backing is unreadable");
+        const auto mismatch = std::ranges::mismatch(actual, expected);
+        Require(name, stage, mismatch.in1 == actual.end(),
+                fmt::format("first mismatch at 0x{:x}: 0x{:02x} != 0x{:02x}",
+                            mismatch.in1 - actual.begin(),
+                            mismatch.in1 == actual.end() ? 0 : *mismatch.in1,
+                            mismatch.in2 == expected.end() ? 0
+                                                           : *mismatch.in2));
+      };
+
+      // Two layers of two levels whose level 0 alone exceeds the stream.
+      constexpr auto color_format = Prospero::BufferFormat::k32UInt;
+      constexpr auto linear = Prospero::TileMode::kLinear;
+      constexpr uint32_t color_width = 3072;
+      constexpr uint32_t color_height = 3072;
+      constexpr uint32_t color_levels = 2;
+      constexpr uint32_t color_layers = 2;
+      const uint32_t color_pitch =
+          TileGetTexturePitch(color_format, color_width, linear);
+      TileSizeAlign color_total{};
+      std::array<TileSizeOffset, 16> color_mips{};
+      std::array<TilePaddedSize, 16> color_padded{};
+      TileGetTextureSize(color_format, color_width, color_height, color_levels,
+                         linear, &color_total, color_mips.data(),
+                         color_padded.data());
+      const uint64_t color_slice = color_total.size;
+      const uint64_t color_size = color_slice * color_layers;
+      Require(name, "color fixture",
+              color_mips[0].size > stream_size && color_size % 4 == 0 &&
+                  color_size <= 0x6000000,
+              "color fixture does not exceed the download stream per level");
+      std::vector<uint32_t> color_words(color_size / 4);
+      std::iota(color_words.begin(), color_words.end(), 0x10000000u);
+      std::memcpy(memory, color_words.data(), color_size);
+
+      ImageDesc color_desc{};
+      color_desc.type = BindingType::Texture;
+      color_desc.info.data = {base, color_size};
+      color_desc.info.pixel_format = vk::Format::eR32Uint;
+      color_desc.info.guest_format = color_format;
+      color_desc.info.type = Prospero::ImageType::kColor2D;
+      color_desc.info.extent = {color_width, color_height, 1};
+      color_desc.info.resources = {color_levels, color_layers};
+      color_desc.info.pitch = color_pitch;
+      color_desc.info.bytes_per_block = 4;
+      color_desc.info.samples = 1;
+      color_desc.info.tile_mode = linear;
+      for (uint32_t level = 0; level < color_levels; level++) {
+        color_desc.info.mip_layout[level] = {
+            color_mips[level].offset, color_mips[level].size,
+            color_padded[level].width, color_padded[level].height};
+      }
+      color_desc.view_info.format = vk::Format::eR32Uint;
+      color_desc.view_info.type = vk::ImageViewType::e2DArray;
+      color_desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      color_desc.view_info.level_count = color_levels;
+      color_desc.view_info.layer_count = color_layers;
+      color_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto color_id = cache.FindImage(color_desc);
+      (void)cache.FindTexture(color_id, color_desc);
+      cache.MarkGpuWritten(color_id);
+      scheduler.Finish();
+
+      std::vector<uint32_t> color_stale(color_words.size(), 0xdeadbeefu);
+      std::vector<uint8_t> color_expected(color_size);
+      std::memcpy(color_expected.data(), color_stale.data(), color_size);
+      for (uint32_t layer = 0; layer < color_layers; layer++) {
+        for (uint32_t level = 0; level < color_levels; level++) {
+          const uint64_t level_base =
+              layer * color_slice + color_mips[level].offset;
+          const uint64_t row_bytes = color_padded[level].width * 4ull;
+          const uint64_t row_active = std::max(color_width >> level, 1u) * 4ull;
+          for (uint32_t y = 0; y < std::max(color_height >> level, 1u); y++) {
+            const uint64_t row = level_base + y * row_bytes;
+            std::memcpy(color_expected.data() + row,
+                        memory + row, row_active);
+          }
+        }
+      }
+      Libs::LibKernel::Memory::WriteBacking(base, color_stale.data(),
+                                            color_size);
+      TextureCacheTestAccess::SetLinearReadback(cache, true);
+      TextureCacheTestAccess::TrackDownload(cache, color_id);
+      cache.ProcessDownloadImages();
+      TextureCacheTestAccess::SetLinearReadback(cache, false);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      CheckBacking("color readback contents", base, color_expected);
+      Require(name, "color readback ownership",
+              TextureCacheTestAccess::Contains(cache, color_id) &&
+                  !TextureCacheTestAccess::PendingDownload(cache, color_id) &&
+                  cache.GetImage(color_id).IsGpuModified(),
+              "a split color readback changed the image's GPU ownership");
+
+      struct DepthCase {
+        const char *stage;
+        uint64_t offset;
+        vk::Format format;
+        Prospero::BufferFormat guest_format;
+        uint32_t bytes;
+        uint32_t width;
+        uint32_t height;
+        uint32_t pitch;
+        uint32_t layers;
+        uint64_t stencil_offset;
+      };
+      // Padded two-layer D32, then D16 read back through its D32 host plane.
+      constexpr std::array<DepthCase, 2> depth_cases{{
+          {"d32 readback contents", 0x6000000, vk::Format::eD32Sfloat,
+           Prospero::BufferFormat::k32Float, 4, 3000, 2800, 3008, 2, 0},
+          {"d16 readback contents", 0xa100000, vk::Format::eD32SfloatS8Uint,
+           Prospero::BufferFormat::k16UNorm, 2, 4200, 4200, 4200, 1,
+           0xc400000},
+      }};
+      for (const auto &depth : depth_cases) {
+        const uint64_t texels =
+            static_cast<uint64_t>(depth.pitch) * depth.height * depth.layers;
+        const uint64_t size = texels * depth.bytes;
+        const uint64_t address = base + depth.offset;
+        Require(name, depth.stage,
+                size > stream_size && depth.offset + size <= allocation_size,
+                "depth fixture does not exceed the download stream");
+        std::vector<uint8_t> guest(size);
+        for (uint64_t index = 0; index < texels; index++) {
+          if (depth.bytes == 4) {
+            const float value =
+                static_cast<float>(index % 4096u) / 4096.0f;
+            std::memcpy(guest.data() + index * 4, &value, 4);
+          } else {
+            const auto value =
+                static_cast<uint16_t>((index * 2654435761ull) >> 16u);
+            std::memcpy(guest.data() + index * 2, &value, 2);
+          }
+        }
+        std::memcpy(memory + depth.offset, guest.data(), size);
+
+        ImageDesc desc{};
+        desc.type = BindingType::DepthTarget;
+        desc.info.data = {address, size};
+        desc.info.pixel_format = depth.format;
+        desc.info.guest_format = depth.guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = {depth.width, depth.height, 1};
+        desc.info.resources = {1, depth.layers};
+        desc.info.pitch = depth.pitch;
+        desc.info.bytes_per_block = depth.bytes;
+        desc.info.samples = 1;
+        desc.info.tile_mode = linear;
+        desc.info.mip_layout[0] = {0, size, depth.pitch, depth.height};
+        desc.view_info.format = depth.format;
+        desc.view_info.type = depth.layers > 1 ? vk::ImageViewType::e2DArray
+                                               : vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.layer_count = depth.layers;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        if (depth.stencil_offset != 0) {
+          desc.info.stencil = {base + depth.stencil_offset, texels};
+          desc.view_info.aspect |= vk::ImageAspectFlagBits::eStencil;
+        }
+        const auto id = cache.FindImage(desc);
+        (void)cache.FindDepthTarget(id, desc);
+        scheduler.Finish();
+
+        const std::vector<uint8_t> stale(size, 0xa5);
+        auto expected = stale;
+        const uint64_t row_bytes =
+            static_cast<uint64_t>(depth.pitch) * depth.bytes;
+        for (uint64_t row = 0; row < static_cast<uint64_t>(depth.height) *
+                                         depth.layers;
+             row++) {
+          std::memcpy(expected.data() + row * row_bytes,
+                      guest.data() + row * row_bytes,
+                      static_cast<uint64_t>(depth.width) * depth.bytes);
+        }
+        Libs::LibKernel::Memory::WriteBacking(address, stale.data(), size);
+        Require(name, depth.stage,
+                TextureCacheTestAccess::TryDownload(cache, id),
+                "a depth readback past the download stream was rejected");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        CheckBacking(depth.stage, address, expected);
+      }
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "large readback fixed mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "large readback direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -29461,6 +29724,168 @@ void CheckDynamicRenderingState() {
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 
+void CheckImageDownloadPlan() {
+  constexpr const char *name = "ImageDownloadPlan";
+  const auto MakeCopy = [](uint32_t level, uint32_t layer, uint64_t offset,
+                           uint32_t width, uint32_t height,
+                           uint32_t row_length, uint32_t image_height) {
+    vk::BufferImageCopy copy{};
+    copy.bufferOffset = offset;
+    copy.bufferRowLength = row_length;
+    copy.bufferImageHeight = image_height;
+    copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+    copy.imageExtent = {width, height, 1};
+    return copy;
+  };
+  const auto RowBytes = [](const vk::BufferImageCopy &copy,
+                           const TextureDownloadBlock &block) {
+    const uint32_t texels = copy.bufferRowLength != 0
+                                ? copy.bufferRowLength
+                                : copy.imageExtent.width;
+    return static_cast<uint64_t>((texels + block.width - 1) / block.width) *
+           block.bytes;
+  };
+  const auto Verify = [&](const char *stage,
+                          const std::vector<vk::BufferImageCopy> &regions,
+                          uint64_t image_size,
+                          const TextureDownloadBlock &block, uint64_t capacity,
+                          uint64_t alignment, size_t min_chunks) {
+    std::vector<TextureDownloadChunk> chunks;
+    Require(name, stage,
+            TexturePlanDownloadChunks(regions, image_size, block, capacity,
+                                      alignment, chunks),
+            "a splittable download was rejected");
+    const uint64_t limit = capacity / alignment * alignment;
+    struct Span {
+      uint64_t top = 0;
+      uint64_t rows = 0;
+      uint64_t offset = 0;
+    };
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<Span>> spans;
+    uint64_t previous_end = 0;
+    for (const auto &chunk : chunks) {
+      Require(name, stage,
+              !chunk.regions.empty() && chunk.size != 0 &&
+                  chunk.size <= limit && chunk.offset >= previous_end &&
+                  chunk.offset % alignment == 0 &&
+                  chunk.size % alignment == 0 &&
+                  chunk.offset + chunk.size <= image_size,
+              fmt::format("chunk at 0x{:x} size 0x{:x} breaks the stream "
+                          "capacity, alignment or ordering",
+                          chunk.offset, chunk.size));
+      previous_end = chunk.offset + chunk.size;
+      for (const auto &copy : chunk.regions) {
+        const uint64_t rows =
+            (copy.imageExtent.height + block.height - 1) / block.height;
+        Require(name, stage,
+                copy.bufferOffset + rows * RowBytes(copy, block) <=
+                        chunk.size &&
+                    copy.imageOffset.y % block.height == 0 &&
+                    (copy.bufferImageHeight == 0 ||
+                     copy.bufferImageHeight >= copy.imageExtent.height),
+                "a split region escaped its chunk or block row");
+        spans[{copy.imageSubresource.mipLevel,
+               copy.imageSubresource.baseArrayLayer}]
+            .push_back({static_cast<uint64_t>(copy.imageOffset.y),
+                        copy.imageExtent.height,
+                        chunk.offset + copy.bufferOffset});
+      }
+    }
+    Require(name, stage, chunks.size() >= min_chunks,
+            fmt::format("expected at least {} chunks, planned {}", min_chunks,
+                        chunks.size()));
+    for (const auto &region : regions) {
+      auto &pieces = spans[{region.imageSubresource.mipLevel,
+                            region.imageSubresource.baseArrayLayer}];
+      std::ranges::sort(pieces, {}, &Span::top);
+      uint64_t top = 0;
+      for (const auto &piece : pieces) {
+        const bool last = &piece == &pieces.back();
+        Require(name, stage,
+                piece.top == top &&
+                    piece.offset == region.bufferOffset +
+                                        top / block.height *
+                                            RowBytes(region, block) &&
+                    (last || piece.rows % block.height == 0),
+                fmt::format("level {} layer {} rows are not covered exactly "
+                            "once at y={}",
+                            region.imageSubresource.mipLevel,
+                            region.imageSubresource.baseArrayLayer, top));
+        top += piece.rows;
+      }
+      Require(name, stage, top == region.imageExtent.height,
+              "a region's rows were not fully covered");
+    }
+  };
+
+  // Linear layers of three levels whose level 0 rows span several chunks.
+  {
+    const TextureDownloadBlock block{1, 1, 4};
+    const std::array<uint64_t, 3> level_offsets{0, 1000 * 700 * 4,
+                                                1000 * 700 * 4 + 500 * 350 * 4};
+    const uint64_t slice = level_offsets[2] + 250 * 175 * 4;
+    std::vector<vk::BufferImageCopy> regions;
+    for (uint32_t level = 0; level < 3; level++) {
+      for (uint32_t layer = 0; layer < 2; layer++) {
+        regions.push_back(MakeCopy(level, layer,
+                                   level_offsets[level] + layer * slice,
+                                   1000 >> level, 700 >> level, 1000 >> level,
+                                   700 >> level));
+      }
+    }
+    Verify("layered mip chain", regions, slice * 2, block, 1u << 20, 1, 6);
+  }
+  // BC-style 4x4 blocks with a height that is not a block multiple.
+  {
+    const TextureDownloadBlock block{4, 4, 16};
+    const std::vector<vk::BufferImageCopy> regions{
+        MakeCopy(0, 0, 0, 1024, 1022, 1024, 0),
+        MakeCopy(1, 0, 256 * 256 * 16, 512, 511, 512, 0)};
+    Verify("block rows", regions, 256 * 256 * 16 + 128 * 128 * 16, block,
+           0x10000, 1, 16);
+  }
+  // Swapped BGRA16 chunks stay on eight-byte boundaries with padded rows.
+  {
+    const TextureDownloadBlock block{1, 1, 8};
+    const std::vector<vk::BufferImageCopy> regions{
+        MakeCopy(0, 0, 16, 1000, 400, 1003, 400)};
+    Verify("bgra16 alignment", regions, 16 + 1003 * 400 * 8, block, 100003,
+           8, 30);
+  }
+  // A 12-byte row splits only on even rows to keep eight-byte boundaries.
+  {
+    const TextureDownloadBlock block{1, 1, 3};
+    const std::vector<vk::BufferImageCopy> regions{
+        MakeCopy(0, 0, 0, 4, 100, 4, 100)};
+    Verify("odd row alignment", regions, 1200, block, 60, 8, 20);
+  }
+
+  std::vector<TextureDownloadChunk> rejected;
+  const TextureDownloadBlock rgba{1, 1, 4};
+  Require(name, "row wider than capacity",
+          !TexturePlanDownloadChunks(
+              std::vector{MakeCopy(0, 0, 0, 1024, 4, 1024, 4)}, 1024 * 16,
+              rgba, 1024, 1, rejected),
+          "a row larger than the stream was planned");
+  Require(name, "overlapping regions",
+          !TexturePlanDownloadChunks(
+              std::vector{MakeCopy(0, 0, 0, 16, 16, 16, 16),
+                          MakeCopy(0, 1, 32, 16, 16, 16, 16)},
+              1024, rgba, 256, 1, rejected),
+          "overlapping regions were planned");
+  Require(name, "region past image",
+          !TexturePlanDownloadChunks(
+              std::vector{MakeCopy(0, 0, 8, 16, 16, 16, 16)}, 1024, rgba, 256,
+              1, rejected),
+          "a region past the image end was planned");
+  Require(name, "misaligned region",
+          !TexturePlanDownloadChunks(
+              std::vector{MakeCopy(0, 0, 4, 16, 16, 16, 16)}, 2048, rgba, 256,
+              8, rejected),
+          "a region off the chunk alignment was planned");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -31446,6 +31871,15 @@ int main(int argc, char **argv) {
     CheckDepthTargetFootprints();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-download-plan-only") == 0) {
+    CheckImageDownloadPlan();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--large-image-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLargeImageReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
@@ -31554,6 +31988,7 @@ int main(int argc, char **argv) {
   CheckDepthAttachmentWrites();
   CheckDynamicRenderingState();
   CheckDepthTargetFootprints();
+  CheckImageDownloadPlan();
   CheckSlotVectorLifetime();
 #else
   if (argc != 1) {
@@ -31614,6 +32049,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
+  vulkan.CheckLargeImageReadback();
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();

@@ -16,6 +16,7 @@ struct CompileOptions {
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
+	bool                        barycentric_supported = true;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;

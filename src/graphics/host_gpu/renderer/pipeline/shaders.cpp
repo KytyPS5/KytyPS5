@@ -467,12 +467,12 @@ void CreatePipelineInternal(
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
+	// Depth-bounds testing is an optional PM4-driven optimization (DB_DEPTH_CONTROL); when the
+	// device doesn't expose VkPhysicalDeviceFeatures::depthBounds (MoltenVK, some Mesa/Intel
+	// ICDs, etc.) we simply skip the test rather than refusing to run.
 	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
+	    (graphics.depth_bounds_supported && static_params.depth_bounds_test_enable) ? VK_TRUE
+	                                                                                 : VK_FALSE;
 	depth_stencil_info.stencilTestEnable = (static_params.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	depth_stencil_info.front.failOp      = static_params.stencil_front.failOp;
 	depth_stencil_info.front.passOp      = static_params.stencil_front.passOp;

@@ -71,6 +71,13 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
+// Upper bound on how long the main loop (WindowContext::Run()) can sit blocked in
+// HostInputWaitEvent() with no SDL event pending. Must be short enough that main-thread work
+// queued via RunOnMainThread() (window/graphics-thread cross-thread dispatch) is drained at a
+// steady cadence even when there's no real input activity; ~4ms keeps it well under a 240Hz
+// frame interval without meaningfully increasing idle CPU usage (SDL_WaitEventTimeout still
+// sleeps, it doesn't spin).
+constexpr int              MAIN_LOOP_IDLE_TIMEOUT_MS = 4;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -409,10 +416,25 @@ int PollMouse(uint64_t now_ms) {
 bool HostInputWaitEvent(SDL_Event* event) {
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
-		if (SDL_WaitEvent(event) == 0) {
+		// Previously an unbounded SDL_WaitEvent(): the main thread (WindowContext::Run()) would
+		// block indefinitely here whenever no SDL event was pending, and DrainMainThreadTasks()
+		// -- which processes work queued cross-thread via RunOnMainThread(), e.g. from the
+		// graphics/emulation thread -- only runs once per loop iteration, i.e. only after this
+		// call returns. With no real input activity (mouse stationary, no keys held), that main-
+		// thread work would sit queued until an incidental SDL event (window focus/expose, timer,
+		// etc.) happened to arrive, producing periodic stalls/stutter that vanished the moment
+		// continuous input (e.g. mouse motion) kept the loop waking every iteration.
+		//
+		// Bound the wait so the loop always comes back around at a steady interval regardless of
+		// input activity, matching the timeout already used in the mouse-to-joystick branch below.
+		SDL_ClearError();
+		if (SDL_WaitEventTimeout(event, MAIN_LOOP_IDLE_TIMEOUT_MS) != 0) {
+			return true;
+		}
+		if (SDL_GetError()[0] != '\0') {
 			EXIT("%s\n", SDL_GetError());
 		}
-		return true;
+		return false;
 	}
 
 	const int timeout_ms = PollMouse(SDL_GetTicks64());

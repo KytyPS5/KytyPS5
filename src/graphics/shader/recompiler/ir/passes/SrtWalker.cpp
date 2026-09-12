@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -450,13 +451,36 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+#ifdef KYTY_SRT_TEST_HOOKS
+thread_local std::pmr::memory_resource* t_memo_resource_override = nullptr;
+#endif
+
+// Each Evaluator owns a private memo map. The maps take their nodes and bucket arrays from one
+// pool per thread, so evaluating on a warm thread stops calling the system allocator for memo
+// entries. The pool keeps its high-water mark until the thread exits; its upstream is the static
+// new/delete resource, so thread-exit teardown only returns memory to ::operator delete.
+std::pmr::memory_resource* MemoResource() {
+#ifdef KYTY_SRT_TEST_HOOKS
+	if (t_memo_resource_override != nullptr) {
+		return t_memo_resource_override;
+	}
+#endif
+	thread_local std::pmr::unsynchronized_pool_resource pool {std::pmr::new_delete_resource()};
+	return &pool;
+}
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_cache(MemoMap::allocator_type(MemoResource())) {}
+
+	// The memo map is bound to this thread's pool; a copy would rebind it to the default resource.
+	Evaluator(const Evaluator&)            = delete;
+	Evaluator& operator=(const Evaluator&) = delete;
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -956,14 +980,16 @@ private:
 		return false;
 	}
 
-	const ResourcePlan&                       m_program;
-	const SrtRuntime&                         m_runtime;
-	std::span<const uint8_t>                  m_clean_flat_slots;
-	Evaluator*                                m_clean_evaluator = nullptr;
-	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
+	using MemoMap = std::pmr::unordered_map<const Inst*, uint64_t>;
+
+	const ResourcePlan&      m_program;
+	const SrtRuntime&        m_runtime;
+	std::span<const uint8_t> m_clean_flat_slots;
+	Evaluator*               m_clean_evaluator = nullptr;
+	Value                    m_active_mask;
+	MemoMap                  m_cache;
+	std::vector<const Inst*> m_visiting;
+	bool                     m_reserved = false;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -1093,6 +1119,14 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	}
 	return true;
 }
+
+#ifdef KYTY_SRT_TEST_HOOKS
+namespace SrtTestHooks {
+void SetMemoResource(std::pmr::memory_resource* resource) {
+	t_memo_resource_override = resource;
+}
+} // namespace SrtTestHooks
+#endif
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result) {

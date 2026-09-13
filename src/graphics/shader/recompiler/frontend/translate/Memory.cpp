@@ -421,6 +421,23 @@ bool Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
 	return true;
 }
 
+bool Translator::S_MEMREALTIME(const Decoder::Instruction& inst) {
+	// The counter is host state: the renderer samples it for every draw and dispatch and
+	// places the low and high dwords in the shader-data block.
+	//
+	// A Vulkan shader cannot observe time passing while it runs, so a frozen counter would
+	// hang any guest loop that waits for a deadline to expire. The first read of an
+	// invocation therefore returns the sampled time and every later read returns the end of
+	// time, which retires such a loop after one pass instead of never.
+	for (uint32_t component = 0; component < IR::BindingLayout::RealTimeCounterDwords;
+	     component++) {
+		WriteOperand(ScalarDestinationOperand(inst.dst, component),
+		             ir.Emit(IR::ValueOpcode::GetRealTimeCounter, {IR::Value(component)}));
+	}
+	ir.Emit(IR::ValueOpcode::MarkRealTimeCounterRead);
+	return true;
+}
+
 bool Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;
@@ -889,6 +906,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
+		case Decoder::Opcode::S_MEMREALTIME: return S_MEMREALTIME(inst);
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:

@@ -65,6 +65,7 @@ struct SpirvRequirements {
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
 	bool function_scratch             = false;
+	bool function_realtime_counter    = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
 };
@@ -108,6 +109,7 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                   realtime_counter_read_variable        = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;

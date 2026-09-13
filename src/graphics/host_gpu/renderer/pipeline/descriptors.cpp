@@ -27,6 +27,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 
 #include <algorithm>
 #include <atomic>
@@ -773,6 +774,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+// S_MEMREALTIME counts ticks of a constant 25 MHz clock. The process time counter is the
+// host clock the title already observes; rescale it exactly, without 128-bit arithmetic.
+static uint64_t RealTimeCounter25Mhz() {
+	constexpr uint64_t realtime_frequency = 25000000u;
+	const auto         ticks              = Libs::LibKernel::KernelGetProcessTimeCounter();
+	const auto frequency = Libs::LibKernel::KernelGetProcessTimeCounterFrequency();
+	return ticks / frequency * realtime_frequency +
+	       ticks % frequency * realtime_frequency / frequency;
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -797,6 +808,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+	}
+	if (layout.uses_realtime_counter) {
+		const auto counter = RealTimeCounter25Mhz();
+		const auto dword   = layout.RealTimeCounterDword();
+		prepared.shader_data[dword]      = static_cast<uint32_t>(counter);
+		prepared.shader_data[dword + 1u] = static_cast<uint32_t>(counter >> 32u);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

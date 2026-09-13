@@ -91,6 +91,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::MeshAllocate:
+		case ValueOpcode::MarkRealTimeCounterRead:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
 	}

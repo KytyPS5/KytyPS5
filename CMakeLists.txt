@@ -524,41 +524,46 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
-	add_test(NAME emulator_user_name_cli
-	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
-	add_test(NAME emulator_user_name_too_long
-	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 12345678901234567)
+	add_custom_target(kyty_cpu_tests)
+	# Keep the CPU build target and CTest selection in sync. Linking Vulkan code
+	# does not require a GPU; only register entry points that never initialize it.
+	function(add_kyty_cpu_test name target)
+		add_test(NAME ${name} COMMAND $<TARGET_FILE:${target}> ${ARGN})
+		set_tests_properties(${name} PROPERTIES LABELS cpu TIMEOUT 180)
+		add_dependencies(kyty_cpu_tests ${target})
+	endfunction()
+
+	add_kyty_cpu_test(emulator_user_name_cli kyty_emulator --help --user-name 1234567890123456)
+	add_kyty_cpu_test(emulator_user_name_too_long kyty_emulator --help --user-name 12345678901234567)
 	set_tests_properties(emulator_user_name_too_long PROPERTIES WILL_FAIL TRUE)
-	add_test(NAME emulator_present_mode_cli
-	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Immediate)
-	add_test(NAME emulator_present_mode_invalid
-	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
+	add_kyty_cpu_test(emulator_present_mode_cli kyty_emulator --help --present-mode Immediate)
+	add_kyty_cpu_test(emulator_present_mode_invalid kyty_emulator --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
-	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
-	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
-	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
-	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
-	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
-	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
-	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
-	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
-	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
-	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
-	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
+	add_kyty_cpu_test(ime_dialog ime_dialog_tests)
+	add_kyty_cpu_test(shader_cfg shader_cfg_tests)
+	add_kyty_cpu_test(scalar_provenance scalar_provenance_tests)
+	add_kyty_cpu_test(image_page_table image_page_table_tests)
+	if(WIN32 OR LINUX)
+		# The POSIX harness uses Linux /proc and MAP_FIXED_NOREPLACE, not macOS APIs.
+		add_kyty_cpu_test(memory_tracker memory_tracker_tests)
+		add_kyty_cpu_test(page_manager page_manager_tests)
+	endif()
+	add_kyty_cpu_test(bit_array bit_array_tests)
+	add_kyty_cpu_test(shader_vertex_metadata shader_vertex_metadata_tests)
+	add_kyty_cpu_test(resource_materialization resource_materialization_tests)
+	add_kyty_cpu_test(resource_tracking resource_tracking_tests)
+	add_kyty_cpu_test(event_queue_lifetime event_queue_lifetime_tests)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
-	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
-	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_kyty_cpu_test(sync_on_address sync_on_address_tests)
+	add_kyty_cpu_test(audio_out2_port audio_out2_port_tests)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
-	add_test(NAME graphics_draw_offsets
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
-	add_test(NAME virtual_memory_allocation
-		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
-	add_test(NAME guest_red_zone_patcher
-		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	add_kyty_cpu_test(graphics_draw_offsets shader_recompiler_compute_tests --draw-offset-only)
+	add_kyty_cpu_test(virtual_memory_allocation virtual_memory_allocation_tests)
+	add_kyty_cpu_test(guest_red_zone_patcher virtual_memory_allocation_tests --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring
@@ -578,8 +583,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
-	add_test(NAME texture_cache_depth_readback
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_kyty_cpu_test(texture_cache_depth_readback shader_recompiler_compute_tests --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
@@ -596,22 +600,9 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
-		ime_dialog_tests
-		shader_cfg_tests
-		scalar_provenance_tests
-		image_page_table_tests
-		memory_tracker_tests
-		page_manager_tests
-		bit_array_tests
-		shader_vertex_metadata_tests
-		resource_materialization_tests
-		resource_tracking_tests
-		event_queue_lifetime_tests
+		kyty_cpu_tests
 		kernel_file_system_tests
-		sync_on_address_tests
 		shader_recompiler_compute_tests
-		virtual_memory_allocation_tests
-		audio_out2_port_tests
 	)
 endif()
 

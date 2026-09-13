@@ -91,7 +91,7 @@ static int KYTY_SYSV_ABI Hmd2GetDeviceInformation(uint64_t info, uint64_t a1, ui
 	}
 
 	if (info < 0x10000 ||
-	    !Graphics::HostMemoryRangeIsReadable(info, HMD2_DEVICE_INFORMATION_SIZE)) {
+	    !Graphics::HostMemoryRangeIsWritable(info, HMD2_DEVICE_INFORMATION_SIZE)) {
 		return HMD2_OK;
 	}
 
@@ -211,7 +211,7 @@ static int KYTY_SYSV_ABI VrTracker2QueryMemory(uint64_t param, uint64_t out) {
 		     param, out, VR_TRACKER2_WORK_MEMORY_SIZE, VR_TRACKER2_WORK_MEMORY_ALIGN);
 	}
 
-	if (out < 0x10000 || !Graphics::HostMemoryRangeIsReadable(out, VR_TRACKER2_MEMORY_INFO_SIZE)) {
+	if (out < 0x10000 || !Graphics::HostMemoryRangeIsWritable(out, VR_TRACKER2_MEMORY_INFO_SIZE)) {
 		return VR_TRACKER2_OK;
 	}
 

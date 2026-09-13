@@ -6450,6 +6450,30 @@ public:
               !texture_cache.IsMeta(base + 0x28000),
               "retiring the HTile image left its metadata registered");
 
+      // SILENT HILL 2 renders its R11G11B10 scene colour at an address a BGRA8 target
+      // used before. Sharing that UNORM8 image clamped every HDR texel to all ones.
+      auto unorm_target = MakeLinearDesc(
+          base + 0x12600, sizeof(uint32_t), vk::Format::eB8G8R8A8Unorm,
+          Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      unorm_target.type = BindingType::RenderTarget;
+      unorm_target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      auto float_target = MakeLinearDesc(
+          base + 0x12600, sizeof(uint32_t), vk::Format::eB10G11R11UfloatPack32,
+          Prospero::BufferFormat::k11_11_10Float, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      float_target.type = BindingType::RenderTarget;
+      float_target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      const auto unorm_target_id = texture_cache.FindImage(unorm_target);
+      const auto float_target_id = texture_cache.FindImage(float_target);
+      Require(name, "packed float target keeps its own backing",
+              unorm_target_id != float_target_id &&
+                  texture_cache.GetImage(float_target_id).backing.format ==
+                      vk::Format::eB10G11R11UfloatPack32,
+              "an R11G11B10 target reused a UNORM8 image at the same address");
+      texture_cache.UnmapMemory(unorm_target.info.data.address,
+                                unorm_target.info.data.size);
+
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =
           MakeLinearDesc(base + partial_unmap_image_offset, 0x2000,
@@ -28682,9 +28706,14 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA06228 R11G11B10 storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicBgraStorageTextureResource(), r11g11b10,
                          0x870000);
-  ValidateStorageColorView(vk::Format::eB8G8R8A8Unorm,
+  // The float surface gets its own image; UNORM8 texels cannot back a float view.
+  ValidateStorageColorView(vk::Format::eB10G11R11UfloatPack32,
                            vk::Format::eB10G11R11UfloatPack32,
                            r11g11b10.DstSelXYZW());
+  Require("BasicStorageTexture", "PPSA06228 R11G11B10 backing",
+          !ImageViewOps::FormatsCompatible(vk::Format::eB8G8R8A8Unorm,
+                                           vk::Format::eB10G11R11UfloatPack32),
+          "a BGRA8 image was accepted as backing for an R11G11B10 view");
 
   const auto max_mip = Ppsa01530MaxMipStorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA01530 max-mip descriptor",

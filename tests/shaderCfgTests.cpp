@@ -1286,7 +1286,13 @@ void TestNormalizedImageContracts() {
             !ImageViewOps::FormatsCompatible(vk::Format::eD32Sfloat,
                                              vk::Format::eR32Sfloat) &&
             ImageViewOps::FormatsCompatible(vk::Format::eBc3UnormBlock,
-                                            vk::Format::eR32G32B32A32Uint),
+                                            vk::Format::eR32G32B32A32Uint) &&
+            !ImageViewOps::FormatsCompatible(vk::Format::eB8G8R8A8Unorm,
+                                             vk::Format::eB10G11R11UfloatPack32) &&
+            !ImageViewOps::FormatsCompatible(vk::Format::eB10G11R11UfloatPack32,
+                                             vk::Format::eB8G8R8A8Unorm) &&
+            !ImageViewOps::FormatsCompatible(vk::Format::eR32Uint,
+                                             vk::Format::eE5B9G9R9UfloatPack32),
         "Vulkan image-view compatibility classes diverged from production");
 }
 

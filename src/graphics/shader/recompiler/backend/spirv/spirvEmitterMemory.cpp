@@ -654,18 +654,54 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 	});
 }
 
+// Packed components share one dword, so a store replaces only its own bitfield.
+void StorePackedComponentInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                  const MemoryResourceAccess& resource, uint32_t index,
+                                  const Format::BufferFormatInfo& info, uint32_t component,
+                                  uint32_t encoded) {
+	const auto bits      = info.component_bits[component];
+	const auto offset    = info.component_bit_offset[component];
+	const auto low_mask  = bits >= 32u ? 0xffffffffu : (1u << bits) - 1u;
+	const auto keep_mask = ~(low_mask << offset);
+	const auto pointer   = EmitMemoryElementPointer(ctx.state, resource, index);
+	const auto value     = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
+	                              Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), encoded,
+	                                     ConstantU32(ctx.state, low_mask)),
+	                              ConstantU32(ctx.state, offset));
+	const auto merge     = [&](uint32_t old) {
+		return Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state),
+		              Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), old,
+		                     ConstantU32(ctx.state, keep_mask)),
+		              value);
+	};
+	if (mem.kind == IR::ResourceKind::Scratch) {
+		const auto old = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), old, pointer);
+		ctx.state.builder.AddFunction(spv::OpStore, pointer, merge(old));
+	} else {
+		AtomicUpdate(ctx.state, pointer, mem.kind, merge);
+	}
+}
+
 void FormattedStorePrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                             uint32_t component, const MemoryResourceAccess& resource,
-                            uint32_t data) {
+                            uint32_t raw_data) {
 	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
 	if (info.type == Format::ComponentType::Unknown) {
-		StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, data);
+		StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource, raw_data);
 		return;
 	}
 	if (component >= info.component_count) return;
 	const auto bits          = info.component_bits[component];
 	const auto component_mem = RebaseFormattedComponent(mem, info, component);
-	if (bits == 8u || bits == 16u) {
+	const auto data          = EncodeFormatComponent(ctx.state, info, component, raw_data);
+	if (info.packed_bitfield) {
+		const auto index =
+		    EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, component_mem));
+		EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+			StorePackedComponentInBounds(ctx, component_mem, resource, index, info, component, data);
+		});
+	} else if (bits == 8u || bits == 16u) {
 		StoreSubwordPrepared(ctx, inst, component_mem, resource, bits, data);
 	} else {
 		StoreWordPrepared(ctx, inst, component_mem, resource, data);
@@ -875,10 +911,14 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 
 void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                             const PreparedFormattedMemory& plan, uint32_t component,
-                            uint32_t data) {
+                            uint32_t raw_data) {
 	if (component >= plan.info.component_count) return;
 	const auto bits = plan.info.component_bits[component];
-	if (bits == 8u || bits == 16u) {
+	const auto data = EncodeFormatComponent(ctx.state, plan.info, component, raw_data);
+	if (plan.info.packed_bitfield) {
+		StorePackedComponentInBounds(ctx, mem, plan.resource, plan.indices[component], plan.info,
+		                             component, data);
+	} else if (bits == 8u || bits == 16u) {
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {

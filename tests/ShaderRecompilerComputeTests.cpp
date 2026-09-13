@@ -22665,6 +22665,158 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   return test;
 }
 
+TestCase BufferStoreFormatFloats(const char *name, u32 store_opcode,
+                                 Prospero::BufferFormat format,
+                                 std::vector<u32> values,
+                                 std::vector<u32> initial,
+                                 std::vector<u32> expected) {
+  using O = ShaderOpcode;
+  static const O store_opcodes[] = {
+      O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
+      O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW};
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  for (u32 i = 0; i < values.size(); i++) {
+    AppendVMovLiteral(&code, i, values[i]);
+  }
+  code.push_back(EncodeMubuf0(store_opcode));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = std::move(code);
+  test.initial = std::move(initial);
+  test.expected = std::move(expected);
+  test.opcodes = {O::V_MOV_B32, store_opcodes[store_opcode - 0x04u],
+                  O::S_ENDPGM};
+  test.user_data =
+      MakeStructuredStorageBufferData(0, 8, false, BufferFormat(format));
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwResource8888SnormQuantizesFloats() {
+  // 1.0 -> 0x7f, -1.0 -> 0x81, 0.25 -> round(31.75) = 0x20, 0.0 -> 0x00.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource8_8_8_8SnormQuantizesFloats", 0x07u,
+      Prospero::BufferFormat::k8_8_8_8SNorm,
+      {0x3f800000u, 0xbf800000u, 0x3e800000u, 0x00000000u},
+      {0xdeadbeefu, 0x11223344u}, {0x0020817fu, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyzwResource16161616SnormQuantizesFloats() {
+  // 2.0 clamps to 0x7fff, -1.0 -> 0x8001, 0.5 -> 0x4000, -0.25 -> 0xe000.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource16_16_16_16SnormQuantizesFloats", 0x07u,
+      Prospero::BufferFormat::k16_16_16_16SNorm,
+      {0x40000000u, 0xbf800000u, 0x3f000000u, 0xbe800000u},
+      {0xdeadbeefu, 0xdeadbeefu, 0x11223344u},
+      {0x80017fffu, 0xe0004000u, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyzwResource8888UnormQuantizesFloats() {
+  // 1.0 -> 0xff, NaN -> 0x00, -0.5 clamps to 0x00, 0.2 -> 0x33.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource8_8_8_8UnormQuantizesFloats", 0x07u,
+      Prospero::BufferFormat::k8_8_8_8UNorm,
+      {0x3f800000u, 0x7fc00000u, 0xbf000000u, 0x3e4ccccdu},
+      {0xdeadbeefu, 0x11223344u}, {0x330000ffu, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyResource1616FloatPacksHalf() {
+  // 1.0 -> 0x3c00, -2.5 -> 0xc100.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyResource16_16FloatPacksHalf", 0x05u,
+      Prospero::BufferFormat::k16_16Float, {0x3f800000u, 0xc0200000u},
+      {0xdeadbeefu, 0x11223344u}, {0xc1003c00u, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXResource16FloatPreservesUpperHalfword() {
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXResource16FloatPreservesUpperHalfword", 0x04u,
+      Prospero::BufferFormat::k16Float, {0x3f000000u}, {0x11223344u},
+      {0x11223800u});
+}
+
+TestCase BufferStoreFormatXyzwResource1010102UnormPacksBitfields() {
+  // 1.0 -> 0x3ff, 0.0 -> 0, 0.5 -> round(511.5) = 0x200, 1.0 -> 3.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource10_10_10_2UnormPacksBitfields", 0x07u,
+      Prospero::BufferFormat::k10_10_10_2UNorm,
+      {0x3f800000u, 0x00000000u, 0x3f000000u, 0x3f800000u},
+      {0x12345678u, 0x11223344u}, {0xe00003ffu, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXResource1010102SnormPreservesOtherFields() {
+  // -1.0 -> 0x201 in the low ten bits; the other fields keep their bits.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXResource10_10_10_2SnormPreservesOtherFields", 0x04u,
+      Prospero::BufferFormat::k10_10_10_2SNorm, {0xbf800000u}, {0xffffffffu},
+      {0xfffffe01u});
+}
+
+TestCase BufferStoreFormatXyzResource111110FloatPacksSmallFloats() {
+  // 1.0 -> 0x3c0, 0.5 -> 0x380 (11-bit), 2.0 -> 0x200 (10-bit).
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzResource11_11_10FloatPacksSmallFloats", 0x06u,
+      Prospero::BufferFormat::k11_11_10Float,
+      {0x3f800000u, 0x3f000000u, 0x40000000u}, {0x00000000u, 0x11223344u},
+      {0x801c03c0u, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyzResource111110FloatSaturatesSpecials() {
+  // -1.0 -> 0, +Inf -> 0x7c0, 1e30 -> largest finite 10-bit value 0x3df.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzResource11_11_10FloatSaturatesSpecials", 0x06u,
+      Prospero::BufferFormat::k11_11_10Float,
+      {0xbf800000u, 0x7f800000u, 0x7149f2cau}, {0x12345678u},
+      {0xf7fe0000u});
+}
+
+TestCase BufferStoreFormatXyzResource111110FloatRoundsSubnormalAndNan() {
+  // 2^-16 -> subnormal 0x010, 1.9921875 rounds up to 2.0 (0x400), NaN -> 0x3ff.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzResource11_11_10FloatRoundsSubnormalAndNan", 0x06u,
+      Prospero::BufferFormat::k11_11_10Float,
+      {0x37800000u, 0x3fff0000u, 0x7fc00000u}, {0x12345678u},
+      {0xffe00010u});
+}
+
+TestCase BufferStoreFormatXyzwResource8888SnormRoundTripsThroughLoad() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0xbf800000u);
+  AppendVMovLiteral(&code, 2, 0x3f000000u);
+  AppendVMovLiteral(&code, 3, 0xbe800000u);
+  code.push_back(EncodeMubuf0(0x07u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendBufferLoadOpcode(&code, 0x03, 4, 20);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 4 + i, 1 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwResource8_8_8_8SnormRoundTripsThroughLoad";
+  test.code = std::move(code);
+  test.initial = {0xdeadbeefu, 0, 0, 0, 0};
+  // 0.5 stores 64 and loads as 64/127; -0.25 stores -32 and loads as -32/127.
+  test.expected = {0xe040817fu, 0x3f800000u, 0xbf800000u, 0x3f010204u,
+                   0xbe810204u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW,
+                  O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 32, false, BufferFormat(Prospero::BufferFormat::k8_8_8_8SNorm));
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferLoadFormatXyResource88UintExtractsBytes() {
   using O = ShaderOpcode;
 
@@ -27314,6 +27466,17 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwResource8888SnormQuantizesFloats);
+  AddCase(BufferStoreFormatXyzwResource16161616SnormQuantizesFloats);
+  AddCase(BufferStoreFormatXyzwResource8888UnormQuantizesFloats);
+  AddCase(BufferStoreFormatXyResource1616FloatPacksHalf);
+  AddCase(BufferStoreFormatXResource16FloatPreservesUpperHalfword);
+  AddCase(BufferStoreFormatXyzwResource1010102UnormPacksBitfields);
+  AddCase(BufferStoreFormatXResource1010102SnormPreservesOtherFields);
+  AddCase(BufferStoreFormatXyzResource111110FloatPacksSmallFloats);
+  AddCase(BufferStoreFormatXyzResource111110FloatSaturatesSpecials);
+  AddCase(BufferStoreFormatXyzResource111110FloatRoundsSubnormalAndNan);
+  AddCase(BufferStoreFormatXyzwResource8888SnormRoundTripsThroughLoad);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);

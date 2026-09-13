@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -835,6 +836,47 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: {
 			m_predicate_skip = false;
 		} break;
+		case 0x01: { // zpass (occlusion-query) predication
+			if (address == nullptr) {
+				m_predicate_skip = false;
+				break;
+			}
+			// PredicationZPassWaitOp: kWaitForQueryResults == 0 asks the CP to stall until the
+			// occlusion result is ready (the inverse of the usual "0 means don't wait"). Without
+			// waiting, `address` still holds the pre-draw begin count and every predication would
+			// misread as "not visible".
+			if (wait_op == 0) {
+				BufferFlushAndWait();
+			}
+			// OcclusionQueryResults: DB0's {m_zPassCountBegin, m_zPassCountEnd} at [0] and [1].
+			// Bit 63 is the "written" marker (see TriggerEvent 0x39); mask it off before diffing.
+			const auto*        block   = reinterpret_cast<const volatile uint64_t*>(address);
+			constexpr uint64_t mask    = (1ull << 63u) - 1u;
+			const uint64_t     begin   = block[0] & mask;
+			const uint64_t     end     = block[1] & mask;
+			const bool         visible = end > begin;
+			switch (condition) {
+				case 0x00: m_predicate_skip = visible; break;   // kSkipIfVisible
+				case 0x01: m_predicate_skip = !visible; break;  // kSkipIfNotVisible
+				default: EXIT("unknown z-pass predication condition: 0x%08" PRIx32 "\n", condition);
+			}
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 64) {
+				LOGF("\t z-pass predication: addr=0x%016" PRIx64 ", begin=%" PRIu64 ", end=%" PRIu64
+				     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
+				     reinterpret_cast<uint64_t>(address), begin, end, condition,
+				     m_predicate_skip ? 1u : 0u, wait_op);
+			}
+		} break;
+		case 0x02: { // primitive-count predication
+			// No emulated primitive counter -- treat as unpredicated (draw everything) rather
+			// than risk wrongly culling.
+			m_predicate_skip = false;
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 32) {
+				LOGF("\t predication op 0x%08" PRIx32 " (primcount) treated as unpredicated\n", op);
+			}
+		} break;
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 
@@ -892,6 +934,16 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+	        m_draw_indirect_args_base_addr + data_offset,
+	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DrawIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     m_draw_indirect_args_base_addr + data_offset);
+		}
+	}
 
 	if (!indexed) {
 		DrawIndirectArgs args {};
@@ -970,6 +1022,15 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(count_addr),
+		                                                  sizeof(uint32_t))) {
+			static std::atomic<uint32_t> sync_fallback_logs {0};
+			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DrawIndirectMulti: failed to synchronise the draw count at 0x%016" PRIx64
+				     " (image-owned range, reading guest memory)\n",
+				     reinterpret_cast<uint64_t>(count_addr));
+			}
+		}
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -982,6 +1043,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+	        m_draw_indirect_args_base_addr + data_offset,
+	        static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes + args_size)) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DrawIndirectMulti: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     m_draw_indirect_args_base_addr + data_offset);
+		}
+	}
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
@@ -1057,7 +1128,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode,
+                                      uint64_t indirect_args) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1102,7 +1174,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		                                              thread_group_y, thread_group_z, mode,
+		                                              indirect_args);
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1138,9 +1211,18 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     args_addr);
+		}
+	}
+	DispatchIndirectArgs args {};
+	std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
 
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode, args_addr);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
@@ -1493,15 +1575,21 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			// Real Vulkan occlusion query where the sample can be serviced (render pass open,
+			// pool available): the begin/end dump pair maps onto beginQuery/endQuery around the
+			// one occlusion-tested draw the guest brackets. SampleOcclusion writes the block.
+			if (GetScheduler().Active() && GetScheduler().SampleOcclusion(event_address)) {
+				break;
+			}
+
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+				std::printf("Warning: occlusion query could not be serviced by a host query; "
+				            "falling back to always-visible (culling lost for this sample).\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
+			// Fallback: publish an always-visible result. The PS5 layout contains one interleaved
+			// begin/end pair per DB, and bit 63 marks a result ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);

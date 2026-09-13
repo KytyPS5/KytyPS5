@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
@@ -62,7 +63,12 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 				           write_mask, op_value);
 			}
 			return vk::StencilOp::eInvert;
-		default: DepthFatal("unsupported stencil operation: 0x%02" PRIx8, value);
+		// "Set to ones": Vulkan has no direct op. From a zeroed marker bit under the write mask
+		// eInvert (0 -> 1) matches; this is what the graphics tutorial stencil sample expects.
+		case Prospero::StencilOp::kOnes: return vk::StencilOp::eInvert;
+		// kAnd/kOr/kNand/kNor/kXnor (0x0a-0x0f) have no Vulkan equivalent; approximate with a
+		// replace rather than aborting the title.
+		default: return vk::StencilOp::eReplace;
 	}
 }
 
@@ -265,6 +271,24 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
+	// Depth/stencil test is enabled but no depth, stencil or HTILE memory is bound at all --
+	// every DB address register is zero -- and this draw does not clear or copy the buffer.
+	// (Astro Bot's title screen leaves DB_DEPTH_CONTROL.z_enable set on a 4K composite pass
+	// with all DB addresses cleared.) There is nothing to test against; a stale DB_Z_INFO /
+	// DB_DEPTH_SIZE from an earlier, smaller pass must not manufacture a phantom depth
+	// attachment, which would then shrink the render area to that size and leave the rest of
+	// the frame uncleared. Drop the depth state for this draw.
+	if (!rc.depth_clear_enable && !rc.stencil_clear_enable && !rc.copy_depth_to_color &&
+	    !rc.copy_stencil_to_color && z.z_read_base_addr == 0 && z.z_write_base_addr == 0 &&
+	    z.stencil_read_base_addr == 0 && z.stencil_write_base_addr == 0 &&
+	    z.htile_data_base_addr == 0) {
+		static std::atomic_bool logged_null = false;
+		if (!logged_null.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: depth/stencil test enabled with no bound DB memory -- dropping "
+			     "depth state for the draw\n");
+		}
+		return;
+	}
 	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
 	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
@@ -274,6 +298,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
+	r.depth_meta_clear_enable = false;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -287,7 +312,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
-	r.stencil_clear_value = hw.GetStencilClearValue();
+	r.stencil_clear_value       = hw.GetStencilClearValue();
+	r.stencil_meta_clear_enable = false;
 	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
 		const bool stencil_ops_disabled =
@@ -438,7 +464,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
+	if (stencil_clear_enable || stencil_meta_clear_enable ||
 	    (stencil_test_enable && (face_writes(stencil_static_front, stencil_dynamic_front) ||
 	                             face_writes(stencil_static_back, stencil_dynamic_back)))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;

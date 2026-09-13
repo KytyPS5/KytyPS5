@@ -134,6 +134,11 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 }
 
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
+	uint32_t default_bits = 0;
+	if (state.program.stage == ShaderType::Pixel &&
+	    ShaderPixelParameterDefault(*state.input_info.pixel, attr, chan & 3u, default_bits)) {
+		return ConstantU32(state, default_bits);
+	}
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -151,6 +156,11 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 		return value;
 	};
 	if (input->per_vertex) {
+		if (PixelParameterIsFlat(state, attr)) {
+			const auto provoking = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), provoking, load_per_vertex(0));
+			return provoking;
+		}
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
@@ -192,7 +202,7 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
                                     uint32_t mode) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
-	if (!input->per_vertex) {
+	if (input == nullptr || !input->per_vertex) {
 		return EmitAttribute(ctx.state, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {
@@ -401,6 +411,28 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+uint32_t EmitWqmU32(EmitterState& state, uint32_t value) {
+	// For every aligned group of 4 bits: if any bit is set, set all 4; else clear all 4.
+	const auto shifted_one = state.builder.AllocateId();
+	const auto merged_one  = state.builder.AllocateId();
+	const auto shifted_two = state.builder.AllocateId();
+	const auto merged_two  = state.builder.AllocateId();
+	const auto quad_bits   = state.builder.AllocateId();
+	const auto result      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), shifted_one, value,
+	                          ConstantU32(state, 1u));
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), merged_one, value, shifted_one);
+	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), shifted_two, merged_one,
+	                          ConstantU32(state, 2u));
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), merged_two, merged_one,
+	                          shifted_two);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), quad_bits, merged_two,
+	                          ConstantU32(state, 0x11111111u));
+	state.builder.AddFunction(spv::OpIMul, TypeU32(state), result, quad_bits,
+	                          ConstantU32(state, 0x0fu));
+	return result;
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -517,11 +549,20 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitBarrier(EmitterState& state) {
-	const auto semantics =
-	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
-	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
-	                          ConstantU32(state, spv::ScopeWorkgroup),
-	                          ConstantU32(state, semantics));
+	// Vulkan only allows a Workgroup execution/memory scope in stages that actually have
+	// a workgroup: compute, mesh and tessellation control. A guest s_barrier can appear
+	// in a vertex shader too (GCN uses it for the LS->HS handoff), and emitting a
+	// workgroup barrier there produces invalid SPIR-V -- spirv-val rejects it with
+	// VUID-StandaloneSpirv-spv::OpControlBarrier-04682. Fall back to a subgroup barrier,
+	// which is legal everywhere and still orders the wave.
+	const bool workgroup =
+	    state.program.stage == ShaderType::Compute || state.program.stage == ShaderType::Mesh;
+	const auto scope     = workgroup ? spv::ScopeWorkgroup : spv::ScopeSubgroup;
+	const auto semantics = spv::MemorySemanticsAcquireReleaseMask |
+	                       (workgroup ? spv::MemorySemanticsWorkgroupMemoryMask
+	                                  : spv::MemorySemanticsSubgroupMemoryMask);
+	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, scope),
+	                          ConstantU32(state, scope), ConstantU32(state, semantics));
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -549,6 +590,58 @@ uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 	}
 }
 
+uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
+	auto&      state  = ctx.state;
+	const auto ballot = ctx.Ballot(predicate);
+	const auto low     = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), result,
+	                          EmitBinaryU32(state, spv::OpBitwiseOr, low, high),
+	                          ConstantU32(state, 0));
+	return result;
+}
+
+// v_movrels_b32: pick element inst.Arg(0) from inst.Arg(1..N). Build the candidate list as
+// one array value, store it into a Function-local variable, then index it dynamically -- an
+// N-deep select ladder is what blows the composite/tonemap pixel shaders past the module
+// size limit.
+uint32_t EmitIndexedVectorLoad(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto found = ctx.indexed_vector_arrays.find(&inst);
+	if (found == ctx.indexed_vector_arrays.end() || inst.NumArgs() < 2) {
+		ctx.Fail(inst, "IndexedVectorLoad has no array variable");
+	}
+	const auto var   = found->second.first;
+	const auto count = found->second.second;
+	const auto array_type =
+	    state.builder.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, count));
+	std::vector<uint32_t> compose {spv::OpCompositeConstruct, array_type,
+	                               state.builder.AllocateId()};
+	for (uint32_t i = 0; i < count; i++) {
+		compose.push_back(ctx.Arg(inst, i + 1u));
+	}
+	state.builder.AddFunction(compose);
+	state.builder.AddFunction(spv::OpStore, var, compose[2]);
+	// Match the old select-ladder: an index past the enumerated range falls back to element 0
+	// (never an out-of-bounds Function-array access, which is UB / a GPU fault).
+	const auto raw_index = ctx.Arg(inst, 0);
+	const auto in_range  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_range, raw_index,
+	                          ConstantU32(state, count));
+	const auto index = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), index, in_range, raw_index,
+	                          ConstantU32(state, 0));
+	const auto elem_ptr = TypePointer(state, spv::StorageClassFunction, TypeU32(state));
+	const auto ptr      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, elem_ptr, ptr, var, index);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, ptr);
+	return result;
+}
+
 uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) {
 	return EmitBuiltinU32(ctx.state, static_cast<IR::StageInputKind>(kind.U32()), index.U32());
 }
@@ -567,7 +660,7 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (flags.fetch_inactive) {
 		return shuffled;
 	}
-	const auto ballot        = ctx.Ballot(inst.Arg(1));
+	const auto ballot        = ctx.Ballot(inst.Arg(1), false);
 	const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
 	const auto can_fetch     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), can_fetch, target.valid,

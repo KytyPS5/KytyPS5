@@ -158,6 +158,10 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	auto* program = rt->LoadProgram(
 	    Libs::LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(elf)));
 
+	// Unlike a dynamically loaded peripheral/plugin module, the primary game
+	// executable failing to load is unrecoverable.
+	EXIT_IF(program == nullptr);
+
 	if (dbg_print_reloc) {
 		program->dbg_print_reloc = true;
 	}

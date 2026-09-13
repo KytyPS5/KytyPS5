@@ -121,12 +121,61 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	return result;
 }
 
+// Debug only. A shader that hangs and one that faults both surface as a lost device, and the
+// driver reports nothing either way. KYTY_LOOP_FUEL gives every invocation a total iteration
+// budget: once it is spent each loop is forced to take its exit edge, so if the device stops
+// being lost the cause was a loop that never terminated.
+// Which loops the budget applies to, as a bitmask over the loop headers in emission order
+// (default: all of them). Clearing bits narrows a hang down to a single loop.
+uint32_t LoopFuelMask() {
+	static const uint32_t mask = [] {
+		const char* v = std::getenv("KYTY_LOOP_FUEL_MASK");
+		return v == nullptr ? ~0u : static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+	}();
+	return mask;
+}
+
+uint32_t LoopFuelBudget() {
+	static const uint32_t budget = [] {
+		const char* v = std::getenv("KYTY_LOOP_FUEL");
+		return v == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+	}();
+	return budget;
+}
+
+// True once the invocation has spent its budget.
+uint32_t LoopFuelExhausted(EmitterState& state) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, state.loop_fuel_variable);
+	const auto spent = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), spent, value,
+	                           ConstantU32(state, LoopFuelBudget()));
+	return spent;
+}
+
+void SpendLoopFuel(EmitterState& state) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, state.loop_fuel_variable);
+	const auto next = EmitBinaryU32(state, spv::OpIAdd, value, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, state.loop_fuel_variable, next);
+}
+
+bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
+	return std::ranges::any_of(program.block_info, [=](const IR::BlockInfo& info) {
+		return info.terminator.loop_header && info.terminator.merge_block == target;
+	});
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
+			if (ctx.state.loop_fuel_variable != 0 &&
+			    (LoopFuelMask() & (1u << (ctx.state.loop_ordinal++ & 31u))) != 0) {
+				SpendLoopFuel(ctx.state);
+			}
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
@@ -160,7 +209,24 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			auto condition = BranchCondition(ctx, info);
+			if (ctx.state.loop_fuel_variable != 0) {
+				// Bias the branch towards whichever edge leaves the loop.
+				const bool true_exits  = IsLoopMergeBlock(program, term.true_block);
+				const bool false_exits = IsLoopMergeBlock(program, term.false_block);
+				if (true_exits != false_exits) {
+					const auto spent  = LoopFuelExhausted(ctx.state);
+					const auto forced = ctx.state.builder.AllocateId();
+					if (true_exits) {
+						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced, condition, spent);
+					} else {
+						const auto alive = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), alive, spent);
+						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced, condition, alive);
+					}
+					condition = forced;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -492,13 +558,29 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
 }
 
-uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+uint32_t ValueEmitContext::Ballot(IR::Value predicate, bool exclude_helpers) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
-	const auto low         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
+	// A helper invocation is not a live guest lane: it never clears its EXEC bit, so leaving it
+	// in a wave-level ballot makes an s_cbranch_execnz loop test true forever and hangs the GPU
+	// (Astro Bot's looping composite pixel shaders). Mask helpers out of every ballot.
+	const auto live = [&](uint32_t value) {
+		if (!exclude_helpers || state.helper_invocation_variable == 0) {
+			return value;
+		}
+		const auto helper = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), helper,
+		                          state.helper_invocation_variable);
+		const auto not_helper = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), not_helper, helper);
+		const auto masked = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), masked, value, not_helper);
+		return masked;
+	};
+	const auto low = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpGroupNonUniformBallot, ballot_type, low, scope,
+	    live(other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate)));
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -506,8 +588,9 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto low_word  = state.builder.AllocateId();
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	state.builder.AddFunction(
+	    spv::OpGroupNonUniformBallot, ballot_type, high, scope,
+	    live(half == 1 ? Def(predicate) : other_half->Def(predicate)));
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
@@ -638,6 +721,10 @@ void EmitProgram(EmitterState& state) {
 		high.half       = 1;
 	}
 	std::optional<DispatcherFunctionState> dispatcher;
+	if (LoopFuelBudget() != 0) {
+		state.loop_fuel_variable = state.builder.AllocateId();
+		state.builder.AddName(state.loop_fuel_variable, "loop_fuel");
+	}
 	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
@@ -715,6 +802,20 @@ void EmitProgram(EmitterState& state) {
 			break;
 		}
 	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::IndexedVectorLoad || inst.NumArgs() < 2) {
+				continue;
+			}
+			const auto count = static_cast<uint32_t>(inst.NumArgs() - 1u);
+			ctx.indexed_vector_arrays.emplace(&inst,
+			                                  std::pair {state.builder.AllocateId(), count});
+			if (state.lane_count == 2) {
+				high.indexed_vector_arrays.emplace(
+				    &inst, std::pair {state.builder.AllocateId(), count});
+			}
+		}
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -738,6 +839,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.loop_fuel_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                           TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                           state.loop_fuel_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -757,6 +863,11 @@ void EmitProgram(EmitterState& state) {
 			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
+		for (const auto& [inst, entry]: lane.indexed_vector_arrays) {
+			(void)inst;
+			state.builder.AddFunction(spv::OpVariable, TypeU32ArrayPointer(state, spv::StorageClassFunction, entry.second),
+			     entry.first, spv::StorageClassFunction);
+		}
 	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
@@ -766,6 +877,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_fuel_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_fuel_variable, ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

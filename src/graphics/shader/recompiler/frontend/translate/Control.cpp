@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
@@ -61,6 +63,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		switch (operation) {
 			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
+			case IR::ValueOpcode::LogicalXor: result = ir.BitwiseXor(lhs, rhs); break;
 			default: EXIT("unsupported SAVEEXEC operation");
 		}
 		WriteRawU32(inst.dst, old);
@@ -333,10 +336,31 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
-	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
-	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
+	const auto base = inst.src0.reg;
+	const auto m0   = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
+	                                IR::U32(IR::Value(0xffu)));
+	const auto count =
+	    current_vector_limit > base + 1u ? current_vector_limit - base : 1u;
+	// Wide indexed reads (Astro Bot's composite/tonemap pixel shaders use v_movrels over ~40
+	// registers, dozens of times) blow the module past the SPIR-V size limit as a select
+	// ladder. Lower those to one IndexedVectorLoad -> Function-array + dynamic OpAccessChain.
+	// Narrow ones keep the ladder: it is small, and the ladder form has proven behaviour where
+	// a lane's source register was never written.
+	if (count >= 16u && program.lower_wide_movrels) {
+		std::vector<IR::Value> values;
+		values.reserve(count);
+		for (uint32_t i = 0; i < count; i++) {
+			values.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(base + i)));
+		}
+		const auto handle = ir.Emit(IR::ValueOpcode::IndexedVectorLoad, {m0});
+		auto*      node   = handle.TryInstruction();
+		for (uint32_t i = 0; i < count; i++) {
+			node->SetArg(1u + i, values[i]);
+		}
+		WriteOperand(DestinationOperand(inst), IR::U32(handle));
+		return;
+	}
+	auto selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);

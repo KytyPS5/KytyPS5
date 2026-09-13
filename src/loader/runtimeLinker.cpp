@@ -1375,13 +1375,21 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	program->elf = std::make_unique<Elf64>();
 	program->elf->Open(elf_name);
 
-	if (program->elf->IsValid()) {
-		LoadProgramToMemory(program);
-		ParseProgramDynamicInfo(program);
-		CreateSymbolDatabase(program);
-	} else {
-		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+	if (!program->elf->IsValid()) {
+		// Titles legitimately probe for several optional peripheral modules (e.g. a
+		// steering-wheel driver PRX per supported brand) that don't exist / aren't valid
+		// SELF/ELF images for this session and are never meant to load -- on real
+		// hardware that's just a load failure the game handles, not a fatal error. Let
+		// the caller decide: KernelLoadStartModule() returns a KERNEL_ERROR_* to the
+		// guest, PreloadAdjacentPrograms() skips it, and only the primary game
+		// executable load in emulator.cpp::LoadElf() treats a null return as fatal.
+		LOGF("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+		return nullptr;
 	}
+
+	LoadProgramToMemory(program);
+	ParseProgramDynamicInfo(program);
+	CreateSymbolDatabase(program);
 
 	m_programs.push_back(program_owner.release());
 
@@ -1880,7 +1888,10 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 	add_dir(root / "sce_modules");
 
 	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
+		auto* program = LoadProgram(path);
+		if (program == nullptr) {
+			continue;
+		}
 		program->fail_if_global_not_resolved = false;
 	}
 }

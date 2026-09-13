@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
 #include <array>
+#include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -57,6 +58,9 @@ Type TypeOf(ValueOpcode opcode) {
 }
 
 size_t NumArgsOf(ValueOpcode opcode) {
+	if (opcode == ValueOpcode::IndexedVectorLoad) {
+		return std::numeric_limits<size_t>::max(); // variadic: [index, value0, value1, ...]
+	}
 	return MetaTable[static_cast<size_t>(opcode)].num_args;
 }
 

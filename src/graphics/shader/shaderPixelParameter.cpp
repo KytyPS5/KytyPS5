@@ -6,8 +6,10 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
-constexpr uint32_t PsInputFlatShade  = 0x00000400u;
+constexpr uint32_t PsInputOffsetMask   = 0x0000001fu;
+constexpr uint32_t PsInputUseDefault   = 0x00000020u;
+constexpr uint32_t PsInputDefaultShift = 8u;
+constexpr uint32_t PsInputFlatShade    = 0x00000400u;
 
 } // namespace
 
@@ -43,6 +45,20 @@ bool ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input
 
 bool ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input) {
 	return input < 32u && (info.custom_interpolation_mask & (1u << input)) != 0;
+}
+
+bool ShaderPixelParameterDefault(const ShaderPixelInputInfo& info, uint32_t input,
+                                 uint32_t component, uint32_t& bits) {
+	if (input >= info.input_num || (info.interpolator_settings[input] & PsInputUseDefault) == 0 ||
+	    (info.interpolator_settings[input] & PsInputFlatShade) != 0 ||
+	    ShaderPixelParameterIsCustom(info, input)) {
+		return false;
+	}
+	const auto value = (info.interpolator_settings[input] >> PsInputDefaultShift) & 0x3u;
+	const bool one   = value == 3u || (value == 1u && component == 3u) ||
+	                 (value == 2u && component < 3u);
+	bits = one ? 0x3f800000u : 0u;
+	return true;
 }
 
 } // namespace Libs::Graphics

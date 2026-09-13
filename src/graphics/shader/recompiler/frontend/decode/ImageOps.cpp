@@ -172,6 +172,51 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     {0xbeu, "image_sample_c_b_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
          ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    // PlayStation gradient-adjust ("_a") derivative / coarse-derivative variants. Team Asobi
+    // shaders (Astro Bot PPSA21564) emit these; they route through the same explicit-LOD sample
+    // path as the plain _d / _cd ops, with Adjust only steering sampler dword3 canonicalization.
+    {0xa2u, "image_sample_d_a", ImageSampleFlagDerivative | ImageSampleFlagAdjust},
+    {0xa3u, "image_sample_d_cl_a",
+     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xaau, "image_sample_c_d_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagAdjust},
+    {0xabu, "image_sample_c_d_cl_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
+         ImageSampleFlagAdjust},
+    {0xb2u, "image_sample_d_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xb3u, "image_sample_d_cl_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xbau, "image_sample_c_d_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xbbu, "image_sample_c_d_cl_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xe8u, "image_sample_cd_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagAdjust},
+    {0xe9u, "image_sample_cd_cl_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp |
+         ImageSampleFlagAdjust},
+    {0xeau, "image_sample_c_cd_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagAdjust},
+    {0xebu, "image_sample_c_cd_cl_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagLodClamp | ImageSampleFlagAdjust},
+    {0xecu, "image_sample_cd_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
+    {0xedu, "image_sample_cd_cl_o_a",
+     ImageSampleFlagDerivative | ImageSampleFlagCd | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xeeu, "image_sample_c_cd_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagOffset | ImageSampleFlagAdjust},
+    {0xefu, "image_sample_c_cd_cl_o_a",
+     ImageSampleFlagCompare | ImageSampleFlagDerivative | ImageSampleFlagCd |
+         ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust},
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
@@ -233,6 +278,10 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		// Ray tracing (ISA 8.2.10): opcode 230 takes a 32-bit BVH node pointer, 231 a 64-bit
+		// one. Neither uses a sampler, and both are encoded with R128=1 / DIM=0 / DMASK=0xf.
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -249,7 +298,16 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const Detail::OpcodeMap* atomic) {
+                                     const Detail::OpcodeMap* atomic, bool a16) {
+	// Ray tracing (ISA Table 48). The address registers carry the node pointer, ray extent,
+	// origin, direction and inverse direction; A16 packs direction and inverse direction into
+	// halves, which drops three registers. The 64-bit variant spends one more on the pointer.
+	if (opcode == 0xe6u) {
+		return a16 ? 8u : 11u;
+	}
+	if (opcode == 0xe7u) {
+		return a16 ? 9u : 12u;
+	}
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -357,11 +415,19 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic, a16);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	}
+	if ((inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	     inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY) &&
+	    a16) {
+		// A16 packs ray_dir and ray_inv_dir into halves; the traversal reads them as full
+		// floats, so reject that encoding rather than misreading the ray.
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG BVH ray intersection with A16 packing is not implemented");
 	}
 	if (gather != nullptr && !IsSingleDmaskBit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

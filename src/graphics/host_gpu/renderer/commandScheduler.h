@@ -42,6 +42,18 @@ public:
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
+	// Occlusion-query emulation for PixelPipeStatDump (guest_gpu TriggerEvent 0x39). The guest
+	// brackets one occlusion-tested draw with a begin dump and an end dump 8 bytes apart in an
+	// OcclusionQueryResults block (one begin/end pair per DB). Returns true when the sample was
+	// serviced by a real Vulkan occlusion query; false tells the caller to fall back to the
+	// always-visible monotonic counter.
+	[[nodiscard]] bool SampleOcclusion(uint64_t dst_addr);
+	// Publish any resolved occlusion results to guest memory. Safe to call with nothing pending.
+	void               ResolveOcclusion();
+	// Ends a still-open occlusion query. Called by CommandBuffer::EndRendering so a query never
+	// outlives the render pass instance that began it. Must run while that pass is still active.
+	void               CloseOpenOcclusionQuery();
+
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
@@ -81,6 +93,24 @@ private:
 	};
 
 	void BeginNext();
+
+	// --- occlusion query emulation ---
+	static constexpr uint32_t OcclusionQuerySlots = 2048;
+	struct PendingOcclusion {
+		uint64_t base_addr = 0; // address of m_zPassCountBegin of DB0
+		int32_t  slot      = -1;
+	};
+	bool EnsureOcclusionPool();
+	void ResetOcclusionPool();       // records vkCmdResetQueryPool; must be outside a render pass
+	void DrainOcclusionBeforeReuse();
+
+	vk::QueryPool                 m_occlusion_pool       = nullptr;
+	bool                          m_occlusion_pool_bad   = false;
+	uint32_t                      m_occlusion_next_slot  = 0;
+	int32_t                       m_occlusion_open_slot  = -1;
+	uint64_t                      m_occlusion_begin_addr = 0;
+	std::vector<PendingOcclusion> m_pending_occlusion;
+
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 

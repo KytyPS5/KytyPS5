@@ -579,6 +579,9 @@ static void ShaderGetStaticInputInfoPS(
 	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
 	// flags in the hardware state and extract only the input count here.
 	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	// SPI_PS_IN_CONTROL.PS_W32_EN. RDNA2 runs most pixel shaders in wave32, and the whole
+	// EXEC/VCC lane-mask model depends on knowing which it is, so read it rather than assuming.
+	ps_info.wave_size            = (sh.ps_in_control & 0x8000u) != 0 ? 32u : 64u;
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
@@ -697,6 +700,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
 	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.wave_size);
 	key.push_back(info.input_num);
 	key.push_back(info.ps_system_input_base);
 	key.push_back(info.custom_interpolation_mask);

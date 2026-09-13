@@ -697,6 +697,32 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
+	const auto current = info.resources.layers;
+	if (info.resources.levels != 1 || current == 0 || layers <= current ||
+	    info.mip_layout[0].offset != 0 || info.mip_layout[0].size != info.data.size) {
+		return false;
+	}
+	const auto stretch = [&](GuestRange& range) {
+		if (range.Empty()) {
+			return true;
+		}
+		if (range.size % current != 0) {
+			return false;
+		}
+		range.size = range.size / current * layers;
+		return true;
+	};
+	auto grown = info;
+	if (!stretch(grown.data) || !stretch(grown.stencil) || !stretch(grown.metadata.range)) {
+		return false;
+	}
+	grown.mip_layout[0].size = grown.data.size;
+	grown.resources.layers   = layers;
+	info                     = grown;
+	return true;
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -760,7 +786,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.resources  = cached.info.resources;
 		info.mip_layout = cached.info.mip_layout;
 	} else {
-		info.resources = std::max(requested.resources, cached.info.resources);
+		auto merged = std::max(requested.resources, cached.info.resources);
+		if (merged.layers > requested.resources.layers &&
+		    !GrowImageToLayers(info, merged.layers)) {
+			merged.layers = requested.resources.layers;
+		}
+		info.resources = merged;
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
@@ -1105,6 +1136,58 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_offset) {
+	const auto&     info = image.info;
+	TileBlockLayout block {};
+	if (!info.HasStencil() || info.samples != 1 || image.backing.samples != 1 ||
+	    info.resources.layers == 0 || info.stencil.size % info.resources.layers != 0 ||
+	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, block) ||
+	    (info.pixel_format != vk::Format::eD32SfloatS8Uint &&
+	     info.pixel_format != vk::Format::eD24UnormS8Uint &&
+	     info.pixel_format != vk::Format::eD16UnormS8Uint)) {
+		EXIT("TextureCache: invalid stencil upload: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " layers=%u samples=%u format=%u\n",
+		     info.stencil.address, info.stencil.size, info.resources.layers, info.samples,
+		     static_cast<uint32_t>(info.pixel_format));
+	}
+	const auto     layers     = info.resources.layers;
+	const uint64_t slice_size = info.stencil.size / layers;
+	const auto     align      = [](uint64_t value, uint64_t alignment) {
+        return (value + alignment - 1) / alignment * alignment;
+	};
+	const uint64_t pitch = align(info.extent.width, block.block_width);
+	const uint64_t rows  = align(info.extent.height, block.block_height);
+	if (info.tile_mode == Prospero::TileMode::kLinear || pitch * rows != slice_size ||
+	    pitch > UINT32_MAX) {
+		LOGF("TextureCache: stencil upload skipped addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " extent=%ux%u pitch=%" PRIu64 " rows=%" PRIu64 " layers=%u tile=%u\n",
+		     info.stencil.address, info.stencil.size, info.extent.width, info.extent.height, pitch,
+		     rows, layers, static_cast<uint32_t>(info.tile_mode));
+		return;
+	}
+	std::vector<GpuTileInfo>         tiles;
+	std::vector<vk::BufferImageCopy> copies(layers);
+	tiles.reserve(layers);
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		const uint64_t offset  = slice_size * layer;
+		auto&          copy    = copies[layer];
+		copy.bufferOffset      = offset;
+		copy.bufferRowLength   = static_cast<uint32_t>(pitch);
+		copy.bufferImageHeight = info.extent.height;
+		copy.imageSubresource  = {vk::ImageAspectFlagBits::eStencil, 0, layer, 1};
+		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+		tiles.push_back({block.family, 1, offset, slice_size, offset, slice_size, 0,
+		                 info.extent.width, info.extent.height, 1, static_cast<uint32_t>(pitch)});
+		tiles.back().surface_z = layer;
+	}
+	const auto linear =
+	    m_tiler.Detile(source.Handle(), source_offset, info.stencil.size, info.stencil.size, tiles);
+	for (auto& copy: copies) {
+		copy.bufferOffset += linear.offset;
+	}
+	image.Upload(copies, linear.buffer, linear.offset, linear.size);
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -1188,6 +1271,15 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 void TextureCache::RefreshImage(ImageId id) {
 	TrackImage(id);
 	auto& image = m_slot_images[id];
+	if (image.IsStencilModified()) {
+		const auto [source, source_offset] =
+		    m_buffer_cache.ObtainBufferForImage(image.info.stencil.address, image.info.stencil.size);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain stencil upload source\n");
+		}
+		UploadStencil(image, *source, source_offset);
+		image.ClearStencilModified();
+	}
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
@@ -1294,6 +1386,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (desc.info.tile_mode == Prospero::TileMode::kDepth &&
+		    (desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+		    (image.info.data.size != desc.info.data.size ||
+		     !(image.info.resources == desc.info.resources))) {
+			LOGF("TextureCache: depth-tiled view matched a differently shaped image: requested"
+			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " levels=%u layers=%u extent=%ux%u,"
+			     " image addr=0x%016" PRIx64 " size=0x%016" PRIx64 " levels=%u layers=%u"
+			     " extent=%ux%u fmt=%u depth=%d usage=%s%s%s%s gpu_modified=%d cpu_dirty=%d"
+			     " view_mip=%d view_layer=%d\n",
+			     desc.info.data.address, desc.info.data.size, desc.info.resources.levels,
+			     desc.info.resources.layers, desc.info.extent.width, desc.info.extent.height,
+			     image.info.data.address, image.info.data.size, image.info.resources.levels,
+			     image.info.resources.layers, image.info.extent.width, image.info.extent.height,
+			     static_cast<uint32_t>(image.info.guest_format), image.info.IsDepth() ? 1 : 0,
+			     image.usage.texture ? "texture " : "", image.usage.storage ? "storage " : "",
+			     image.usage.render_target ? "render_target " : "",
+			     image.usage.depth_target ? "depth_target " : "", image.IsGpuModified() ? 1 : 0,
+			     image.IsCpuDirty() ? 1 : 0, view_mip, view_layer);
+		}
 		if (desc.type == BindingType::VideoOut &&
 		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
@@ -1820,7 +1931,14 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.depth_id || !image.Overlaps(address, size)) {
+		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (image.depth_id) {
+			auto* depth = m_slot_images.try_get(image.depth_id);
+			if (depth != nullptr && depth->info.HasStencil() && depth->backing.image != nullptr) {
+				depth->MarkStencilModified();
+			}
 			continue;
 		}
 		if (image.IsGpuModified()) {
@@ -1875,7 +1993,8 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end() && found->second.type != MetaDataInfo::Type::PendingDcc;
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value) {
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
+                                 bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
@@ -1884,6 +2003,9 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
+	}
+	if (fill_known != nullptr) {
+		*fill_known = found->second.fill_known;
 	}
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
@@ -1898,6 +2020,20 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_known = false;
+	return true;
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
+	    found->second.type == MetaDataInfo::Type::Dcc) {
+		return false;
+	}
+	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_value = fill_value;
+	found->second.fill_known = true;
 	return true;
 }
 
@@ -1930,6 +2066,7 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 		found->second.clear_mask = dcc_clear_mask;
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
+		found->second.fill_known = true;
 	}
 }
 

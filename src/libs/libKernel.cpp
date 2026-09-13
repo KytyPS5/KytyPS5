@@ -1239,6 +1239,18 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	program = rt->LoadProgram(module_path);
 
+	if (program == nullptr) {
+		// The file exists but isn't a valid SELF/ELF for this session (e.g. an
+		// optional peripheral driver PRX the title probes for that doesn't apply
+		// here). Real hardware would fail this load too; report it to the guest
+		// instead of taking the whole emulator down.
+		LOGF("\tmodule is not a valid ELF = %s\n", Common::PathToString(module_path).c_str());
+		if (res != nullptr) {
+			*res = KERNEL_ERROR_ENOEXEC;
+		}
+		return KERNEL_ERROR_ENOEXEC;
+	}
+
 	auto handle = program->unique_id;
 
 	program->dbg_print_reloc = true;

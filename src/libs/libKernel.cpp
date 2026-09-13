@@ -2120,19 +2120,43 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 	EXIT_NOT_IMPLEMENTED(uaddr != nullptr);
 
 	switch (operation) {
-		case UMTX_OP_WAIT:
-			if (timeout != nullptr) {
-				LibKernel::KernelTimespec duration {};
-				std::memcpy(&duration, timeout, sizeof(duration));
-				if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
-					*GetErrorAddr() = POSIX_EINVAL;
-					return -1;
-				}
-				EXIT("Valid _umtx_op timed waits are not implemented\n");
+		case UMTX_OP_WAIT: {
+			if (timeout == nullptr) {
+				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
+				    static_cast<volatile uint64_t*>(address), value, nullptr,
+				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
 			}
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-			    static_cast<volatile uint64_t*>(address), value, nullptr,
-			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
+
+			LibKernel::KernelTimespec duration {};
+			std::memcpy(&duration, timeout, sizeof(duration));
+			if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
+				*GetErrorAddr() = POSIX_EINVAL;
+				return -1;
+			}
+
+			// SyncOnAddress takes a 32-bit microsecond timeout, which tops out at ~71 minutes,
+			// so longer relative timeouts are waited out in slices.
+			constexpr int64_t MAX_SLICE_MICROS = UINT32_MAX;
+			constexpr int64_t MAX_SECONDS      = (INT64_MAX / 1000000) - 1;
+			int64_t           remaining_micros =
+			    (duration.tv_sec > MAX_SECONDS)
+			        ? INT64_MAX
+			        : duration.tv_sec * 1000000 + (duration.tv_nsec + 999) / 1000;
+
+			int wait_result = OK;
+			for (;;) {
+				auto slice_micros =
+				    static_cast<uint32_t>(std::min<int64_t>(remaining_micros, MAX_SLICE_MICROS));
+				wait_result = LibKernel::SyncOnAddress::Wait64(
+				    static_cast<volatile uint64_t*>(address), value, &slice_micros,
+				    LibKernel::KernelDispatchPendingSignalForCurrentThread);
+				remaining_micros -= slice_micros;
+				if (wait_result != LibKernel::KERNEL_ERROR_ETIMEDOUT || remaining_micros <= 0) {
+					break;
+				}
+			}
+			return POSIX_CALL(wait_result);
+		}
 		case UMTX_OP_WAKE:
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
 		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);

@@ -4669,6 +4669,37 @@ void TestNewShaderRecompilerMemoryFamilyTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerMemRealTime() {
+  // S_MEMREALTIME returns the 64-bit real-time counter in SDST and SDST+1. The
+  // counter is host state, so it must reach the shader through two reserved
+  // shader-data dwords rather than a compile-time constant.
+  const uint32_t shader[] = {
+      EncodeSmem0(0x25, 12, 0),
+      0u, // s_memrealtime s[12:13]
+      EncodeVop1(0x01, 0, 12),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "S_MEMREALTIME"),
+        "new decoder did not decode SMEM real-time counter read");
+  Check(Common::ContainsStr(result.ir_dump, "GetRealTimeCounter"),
+        "S_MEMREALTIME did not lower to the real-time counter IR");
+  Check(Common::ContainsStr(result.ir_dump, "MarkRealTimeCounterRead"),
+        "S_MEMREALTIME kept no marker, so later reads would not retire a deadline loop");
+  const auto &bindings = result.program.bindings;
+  Check(bindings.uses_realtime_counter &&
+            bindings.ShaderDataDwords() ==
+                bindings.RealTimeCounterDword() +
+                    ShaderRecompiler::IR::BindingLayout::RealTimeCounterDwords,
+        "S_MEMREALTIME did not reserve the real-time counter shader-data dwords");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   const auto count_live_memory_ops =
       [](const ShaderRecompiler::IR::Program &program,
@@ -13223,6 +13254,7 @@ int main() {
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
+  TestNewShaderRecompilerMemRealTime();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.

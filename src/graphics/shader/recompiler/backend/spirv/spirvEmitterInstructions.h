@@ -155,6 +155,8 @@ inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitGetRealTimeCounter(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitMarkRealTimeCounterRead(EmitterState& state);
 uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
 uint32_t              EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
 uint32_t              EmitUndefU1(EmitterState& state, const IR::Inst& inst);

@@ -106,6 +106,7 @@ private:
 	bool DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	bool DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	bool DS_ADDTID(const Decoder::Instruction& inst, bool write);
+	bool S_MEMREALTIME(const Decoder::Instruction& inst);
 	bool DS_SWIZZLE_B32(const Decoder::Instruction& inst);
 	bool DS_BPERMUTE_B32(const Decoder::Instruction& inst);
 

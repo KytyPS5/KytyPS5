@@ -14622,6 +14622,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_WRITE_B128:
   case Opcode::DS_WRITE_ADDTID_B32:
   case Opcode::DS_READ_ADDTID_B32:
+  case Opcode::S_MEMREALTIME:
     return CoverageClass::NeedsMemoryCase;
 
   case Opcode::IMAGE_GET_RESINFO:

@@ -575,6 +575,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Opcode::S_BUFFER_LOAD_DWORDX16:
+		case Opcode::S_MEMREALTIME:
 		case Opcode::BUFFER_LOAD_FORMAT_X:
 		case Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:

@@ -547,6 +547,9 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
+	if (state.requirements.function_realtime_counter) {
+		state.realtime_counter_read_variable = state.builder.AllocateId();
+	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.scratch_variable[half] = state.builder.AllocateId();
@@ -665,6 +668,9 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddName(state.main_func, "main");
 	if (state.requirements.function_lds) {
 		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
+	if (state.requirements.function_realtime_counter) {
+		state.builder.AddName(state.realtime_counter_read_variable, "realtime_counter_read");
 	}
 	if (state.requirements.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {

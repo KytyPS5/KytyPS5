@@ -390,11 +390,18 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	bool                           uses_realtime_counter = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	static constexpr uint32_t RealTimeCounterDwords = 2;
+
+	// The real-time counter follows the packed memory offsets in the shader-data block.
+	[[nodiscard]] uint32_t RealTimeCounterDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return RealTimeCounterDword() + (uses_realtime_counter ? RealTimeCounterDwords : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

@@ -539,6 +539,37 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+uint32_t EmitGetRealTimeCounter(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&       state    = ctx.state;
+	const auto& bindings = state.program.bindings;
+	const auto  index    = inst.Arg(0).U32();
+	if (!bindings.uses_realtime_counter || index >= IR::BindingLayout::RealTimeCounterDwords ||
+	    state.realtime_counter_read_variable == 0) {
+		ctx.Fail(inst, "invalid real-time counter dword");
+	}
+	const auto sampled = EmitShaderDataDwordLoad(state, bindings.RealTimeCounterDword() + index);
+	const auto flag    = state.builder.AllocateId();
+	const auto first   = state.builder.AllocateId();
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), flag,
+	                          state.realtime_counter_read_variable);
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first, flag,
+	                          ConstantU32(state, 0));
+	// Every read after the first one in this invocation reports the end of time, so a guest
+	// loop waiting for a deadline retires instead of spinning on a counter that cannot move.
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, first, sampled,
+	                          ConstantU32(state, 0xffffffffu));
+	return result;
+}
+
+void EmitMarkRealTimeCounterRead(EmitterState& state) {
+	if (state.realtime_counter_read_variable == 0) {
+		EXIT("real-time counter marker without its per-invocation state");
+	}
+	state.builder.AddFunction(spv::OpStore, state.realtime_counter_read_variable,
+	                          ConstantU32(state, 1));
+}
+
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 
 	uint32_t dword = 0;

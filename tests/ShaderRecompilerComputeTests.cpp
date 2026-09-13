@@ -374,7 +374,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
-    metadata.clear_mask = 0;
+    metadata.clear_mask = {};
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }

@@ -30,6 +30,59 @@ class RenderExecutor;
 struct TextureCacheTestAccess;
 struct TextureDownloadChunk;
 
+// Per-slice clear state; a fill marks every slice, bindings consume them one at a time.
+class MetaSliceMask {
+public:
+	[[nodiscard]] static MetaSliceMask All() {
+		MetaSliceMask mask;
+		mask.m_rest = true;
+		return mask;
+	}
+	// UINT32_MAX marks every slice; any other value marks only the slices it names.
+	[[nodiscard]] static MetaSliceMask FromBits32(uint32_t bits) {
+		if (bits == UINT32_MAX) {
+			return All();
+		}
+		MetaSliceMask mask;
+		if (bits != 0) {
+			mask.m_words.push_back(bits);
+		}
+		return mask;
+	}
+
+	[[nodiscard]] bool Any() const noexcept {
+		if (m_rest) {
+			return true;
+		}
+		for (const auto word: m_words) {
+			if (word != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+	[[nodiscard]] bool Test(uint32_t slice) const noexcept {
+		const auto word = slice / 64u;
+		return word < m_words.size() ? ((m_words[word] >> (slice % 64u)) & 1u) != 0 : m_rest;
+	}
+	void Assign(uint32_t slice, bool cleared) {
+		const auto word = slice / 64u;
+		if (word >= m_words.size()) {
+			if (cleared == m_rest) {
+				return;
+			}
+			m_words.resize(word + 1u, m_rest ? UINT64_MAX : 0u);
+		}
+		const auto bit = uint64_t {1} << (slice % 64u);
+		m_words[word]  = cleared ? (m_words[word] | bit) : (m_words[word] & ~bit);
+	}
+
+private:
+	std::vector<uint64_t> m_words;
+	// State of every slice past the explicit words.
+	bool m_rest = false;
+};
+
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
@@ -86,8 +139,8 @@ private:
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		Type          type;
+		MetaSliceMask clear_mask = MetaSliceMask::All();
 	};
 
 	struct OverlapResult {

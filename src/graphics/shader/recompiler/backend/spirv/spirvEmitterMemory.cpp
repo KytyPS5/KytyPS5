@@ -735,6 +735,7 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 	});
 }
 
+
 // The trailing barrier is the acquire edge only; the last-child idiom needs the release too.
 uint32_t AtomicSemantics(const IR::MemoryInfo& mem) {
 	return spv::MemorySemanticsAcquireReleaseMask |
@@ -882,53 +883,6 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
-uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
-                                       const Format::BufferFormatInfo& info,
-                                       uint32_t component, uint32_t data, uint32_t data_bits) {
-	auto& state = ctx.state;
-	const auto bits = info.component_bits[component];
-	if (data_bits == 16u) {
-		if (info.type == Format::ComponentType::Uint) {
-			data = EmitBitFieldUExtract(state, data, ConstantU32(state, 0), ConstantU32(state, 16));
-		} else if (info.type == Format::ComponentType::Sint) {
-			data = EmitBitFieldSExtract(state, data, ConstantU32(state, 0), ConstantU32(state, 16));
-		} else {
-			data = EmitBitCastU32F32(state, EmitF16BitsToF32(state, data));
-		}
-	}
-	const bool normalized = info.type == Format::ComponentType::Unorm ||
-	                        info.type == Format::ComponentType::Snorm;
-	const bool scaled = info.type == Format::ComponentType::Uscaled ||
-	                    info.type == Format::ComponentType::Sscaled;
-	if (normalized || scaled) {
-		// Two-bit packed channels are unsigned even in signed formats.
-		const bool is_signed = bits != 2u && (info.type == Format::ComponentType::Snorm ||
-		                                      info.type == Format::ComponentType::Sscaled);
-		const auto max_value = static_cast<float>((1u << (bits - (is_signed ? 1u : 0u))) - 1u);
-		const auto lower = normalized ? (is_signed ? -1.0f : 0.0f)
-		                              : (is_signed ? -max_value - 1.0f : 0.0f);
-		const auto upper = normalized ? 1.0f : max_value;
-		auto value = Select(state, TypeF32(state), EmitClassifyF32Bits(state, data).nan,
-		                    ConstantF32Value(state, 0.0f), EmitBitCastF32U32(state, data));
-		value = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
-		    state, value, ConstantF32Value(state, lower), ConstantF32Value(state, upper));
-		if (normalized) {
-			value = EmitFPRoundEven32(
-			    state, EmitFPMul32(state, value, ConstantF32Value(state, max_value)));
-		}
-		// Float-to-integer conversion truncates scaled values toward zero.
-		value = Unary(state, is_signed ? spv::OpConvertFToS : spv::OpConvertFToU,
-		              is_signed ? TypeI32(state) : TypeU32(state), value);
-		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
-	}
-	if (bits == 16u && info.type == Format::ComponentType::Float) {
-		const auto pair = EmitCompositeConstructF32x2(
-		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
-		return EmitPackHalf2x16(state, pair);
-	}
-	return data;
-}
-
 void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
                              const IR::MemoryInfo& mem, const MemoryResourceAccess& resource,
                              const Format::BufferFormatInfo& info, uint32_t data,
@@ -947,7 +901,7 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 					                              value, data, component);
 				}
 			}
-			value = EncodeFormattedStoreComponent(ctx, info, component, value, mem.data_bits);
+			value = EncodeFormatComponent(ctx.state, info, component, value);
 			const auto bits = info.component_bits[component];
 			if (info.packed_bitfield) {
 				packed = EmitBitFieldInsert(

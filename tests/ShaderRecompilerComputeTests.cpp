@@ -31588,106 +31588,156 @@ TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
   return test;
 }
 
-std::vector<TestCase> BufferLoadFormatD16XCases() {
-  using F = Prospero::BufferFormat;
+TestCase BufferStoreFormatFloats(const char *name, u32 store_opcode,
+                                 Prospero::BufferFormat format,
+                                 std::vector<u32> values,
+                                 std::vector<u32> initial,
+                                 std::vector<u32> expected) {
   using O = ShaderOpcode;
-  struct LoadCase {
-    const char *name;
-    F format;
-    u32 input;
-    u32 expected;
-    u32 selector = 4;
-    u32 index = 0;
-    bool active = true;
-    bool overlap = false;
-  };
-  constexpr LoadCase inputs[] = {
-      {"BufferLoadFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xabcdc000u},
-      {"BufferLoadFormatD16XFloat32", F::k32Float, 0x3f000000u, 0xabcd3800u},
-      {"BufferLoadFormatD16XUint32", F::k32UInt, 0x1234fffeu, 0xabcdffffu},
-      {"BufferLoadFormatD16XUintAtMax", F::k32UInt, 0x0000ffffu, 0xabcdffffu},
-      {"BufferLoadFormatD16XUintMax32", F::k32UInt, 0xffffffffu, 0xabcdffffu},
-      {"BufferLoadFormatD16XSint32", F::k32SInt, 0xffff8001u, 0xabcd8001u},
-      {"BufferLoadFormatD16XSintAboveMax", F::k32SInt, 0x00008000u, 0xabcd7fffu},
-      {"BufferLoadFormatD16XSintBelowMin", F::k32SInt, 0xffff7fffu, 0xabcd8000u},
-      {"BufferLoadFormatD16XSintAtMax", F::k32SInt, 0x00007fffu, 0xabcd7fffu},
-      {"BufferLoadFormatD16XSintAtMin", F::k32SInt, 0xffff8000u, 0xabcd8000u},
-      {"BufferLoadFormatD16XSintMax32", F::k32SInt, 0x7fffffffu, 0xabcd7fffu},
-      {"BufferLoadFormatD16XSintMin32", F::k32SInt, 0x80000000u, 0xabcd8000u},
-      {"BufferLoadFormatD16XUnorm8", F::k8UNorm, 0xffu, 0xabcd3c00u},
-      {"BufferLoadFormatD16XSnorm16", F::k16SNorm, 0x8001u, 0xabcdbc00u},
-      {"BufferLoadFormatD16XFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1},
-      {"BufferLoadFormatD16XOobFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1, 4},
-      {"BufferLoadFormatD16XOobUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 4},
-      {"BufferLoadFormatD16XOobZero", F::k32Float, 0u, 0xabcd0000u, 4, 4},
-      {"BufferLoadFormatD16XInactive", F::k32Float, 0u, 0xabcd1234u, 4, 0, false},
-      {"BufferLoadFormatD16XOverlappingAddress", F::k16UInt, 7u, 7u, 4, 0, true, true},
-  };
-  std::vector<TestCase> cases;
-  for (const auto &input : inputs) {
-    TestCase test;
-    test.name = input.name;
-    AppendVMovLiteral(&test.code, 0, input.overlap ? input.index : 0xabcd1234u);
-    AppendVMovU32(&test.code, 1, input.index);
-    if (!input.active) {
-      test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
-    }
-    test.code.push_back(EncodeMubuf0(0x80u, 0, true, false));
-    test.code.push_back(EncodeMubuf1(0, 0, input.overlap ? 0 : 1));
-    if (!input.active) {
-      test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
-      test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
-    }
-    AppendStoreVgpr(&test.code, 0, 2);
-    AppendEnd(&test.code);
-    test.initial = {input.input, 0xdeadbeefu, 0u, 0xcafef00du};
-    test.expected = {input.input, 0xdeadbeefu, input.expected, 0xcafef00du};
-    test.user_data = MakeStructuredStorageBufferData(4, 4, false, BufferFormat(input.format));
-    test.user_data[3] = (test.user_data[3] & ~7u) | input.selector;
-    test.has_user_data = true;
-    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_X,
-                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-    cases.push_back(std::move(test));
+  static const O store_opcodes[] = {
+      O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
+      O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW};
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  for (u32 i = 0; i < values.size(); i++) {
+    AppendVMovLiteral(&code, i, values[i]);
   }
-  return cases;
+  code.push_back(EncodeMubuf0(store_opcode));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = std::move(code);
+  test.initial = std::move(initial);
+  test.expected = std::move(expected);
+  test.opcodes = {O::V_MOV_B32, store_opcodes[store_opcode - 0x04u],
+                  O::S_ENDPGM};
+  test.user_data =
+      MakeStructuredStorageBufferData(0, 8, false, BufferFormat(format));
+  test.has_user_data = true;
+  return test;
 }
 
-std::vector<TestCase> BufferStoreFormatD16XCases() {
-  using F = Prospero::BufferFormat;
+TestCase BufferStoreFormatXyzwResource8888SnormQuantizesFloats() {
+  // 1.0 -> 0x7f, -1.0 -> 0x81, 0.25 -> round(31.75) = 0x20, 0.0 -> 0x00.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource8_8_8_8SnormQuantizesFloats", 0x07u,
+      Prospero::BufferFormat::k8_8_8_8SNorm,
+      {0x3f800000u, 0xbf800000u, 0x3e800000u, 0x00000000u},
+      {0xdeadbeefu, 0x11223344u}, {0x0020817fu, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyzwResource16161616SnormQuantizesFloats() {
+  // 2.0 clamps to 0x7fff, -1.0 -> 0x8001, 0.5 -> 0x4000, -0.25 -> 0xe000.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource16_16_16_16SnormQuantizesFloats", 0x07u,
+      Prospero::BufferFormat::k16_16_16_16SNorm,
+      {0x40000000u, 0xbf800000u, 0x3f000000u, 0xbe800000u},
+      {0xdeadbeefu, 0xdeadbeefu, 0x11223344u},
+      {0x80017fffu, 0xe0004000u, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyzwResource8888UnormQuantizesFloats() {
+  // 1.0 -> 0xff, NaN -> 0x00, -0.5 clamps to 0x00, 0.2 -> 0x33.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource8_8_8_8UnormQuantizesFloats", 0x07u,
+      Prospero::BufferFormat::k8_8_8_8UNorm,
+      {0x3f800000u, 0x7fc00000u, 0xbf000000u, 0x3e4ccccdu},
+      {0xdeadbeefu, 0x11223344u}, {0x330000ffu, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyResource1616FloatPacksHalf() {
+  // 1.0 -> 0x3c00, -2.5 -> 0xc100.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyResource16_16FloatPacksHalf", 0x05u,
+      Prospero::BufferFormat::k16_16Float, {0x3f800000u, 0xc0200000u},
+      {0xdeadbeefu, 0x11223344u}, {0xc1003c00u, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXResource16FloatPreservesUpperHalfword() {
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXResource16FloatPreservesUpperHalfword", 0x04u,
+      Prospero::BufferFormat::k16Float, {0x3f000000u}, {0x11223344u},
+      {0x11223800u});
+}
+
+TestCase BufferStoreFormatXyzwResource1010102UnormPacksBitfields() {
+  // 1.0 -> 0x3ff, 0.0 -> 0, 0.5 -> round(511.5) = 0x200, 1.0 -> 3.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzwResource10_10_10_2UnormPacksBitfields", 0x07u,
+      Prospero::BufferFormat::k10_10_10_2UNorm,
+      {0x3f800000u, 0x00000000u, 0x3f000000u, 0x3f800000u},
+      {0x12345678u, 0x11223344u}, {0xe00003ffu, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXResource1010102SnormPreservesOtherFields() {
+  // -1.0 -> 0x201 in the low ten bits; the other fields keep their bits.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXResource10_10_10_2SnormPreservesOtherFields", 0x04u,
+      Prospero::BufferFormat::k10_10_10_2SNorm, {0xbf800000u}, {0xffffffffu},
+      {0xfffffe01u});
+}
+
+TestCase BufferStoreFormatXyzResource111110FloatPacksSmallFloats() {
+  // 1.0 -> 0x3c0, 0.5 -> 0x380 (11-bit), 2.0 -> 0x200 (10-bit).
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzResource11_11_10FloatPacksSmallFloats", 0x06u,
+      Prospero::BufferFormat::k11_11_10Float,
+      {0x3f800000u, 0x3f000000u, 0x40000000u}, {0x00000000u, 0x11223344u},
+      {0x801c03c0u, 0x11223344u});
+}
+
+TestCase BufferStoreFormatXyzResource111110FloatSaturatesSpecials() {
+  // -1.0 -> 0, +Inf -> 0x7c0, 1e30 -> largest finite 10-bit value 0x3df.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzResource11_11_10FloatSaturatesSpecials", 0x06u,
+      Prospero::BufferFormat::k11_11_10Float,
+      {0xbf800000u, 0x7f800000u, 0x7149f2cau}, {0x12345678u},
+      {0xf7fe0000u});
+}
+
+TestCase BufferStoreFormatXyzResource111110FloatRoundsSubnormalAndNan() {
+  // 2^-16 -> subnormal 0x010, 1.9921875 rounds up to 2.0 (0x400), NaN -> 0x3ff.
+  return BufferStoreFormatFloats(
+      "BufferStoreFormatXyzResource11_11_10FloatRoundsSubnormalAndNan", 0x06u,
+      Prospero::BufferFormat::k11_11_10Float,
+      {0x37800000u, 0x3fff0000u, 0x7fc00000u}, {0x12345678u},
+      {0xffe00010u});
+}
+
+TestCase BufferStoreFormatXyzwResource8888SnormRoundTripsThroughLoad() {
   using O = ShaderOpcode;
-  struct StoreCase {
-    const char *name;
-    F format;
-    u32 input;
-    u32 expected;
-  };
-  constexpr StoreCase inputs[] = {
-      {"BufferStoreFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xffffc000u},
-      {"BufferStoreFormatD16XFloat32", F::k32Float, 0x7e633800u, 0x3f000000u},
-      {"BufferStoreFormatD16XUint32", F::k32UInt, 0x7e63fffeu, 0x0000fffeu},
-      {"BufferStoreFormatD16XSint32", F::k32SInt, 0x7e63fffeu, 0xfffffffeu},
-      {"BufferStoreFormatD16XUnorm8", F::k8UNorm, 0x7e633800u, 0xffffff80u},
-      {"BufferStoreFormatD16XSnorm16", F::k16SNorm, 0x7e63b800u, 0xffffc000u},
-      {"BufferStoreFormatD16XZeroFill", F::k16_16Float, 0x7e633800u, 0x00003800u},
-  };
-  std::vector<TestCase> cases;
-  for (const auto &input : inputs) {
-    TestCase test;
-    test.name = input.name;
-    AppendVMovLiteral(&test.code, 66, input.input);
-    AppendVMovU32(&test.code, 65, 1);
-    // Match the captured CS824586f35db5c80d instruction at pc 0x484.
-    test.code.push_back(EncodeMubuf0(0x84u, 0, true, false));
-    test.code.push_back(EncodeMubuf1(66, 0, 65));
-    AppendEnd(&test.code);
-    test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
-    test.expected = {0xdeadbeefu, input.expected, 0xcafef00du};
-    test.user_data = MakeStructuredStorageBufferData(4, 3, false, BufferFormat(input.format));
-    test.has_user_data = true;
-    test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
-    cases.push_back(std::move(test));
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0xbf800000u);
+  AppendVMovLiteral(&code, 2, 0x3f000000u);
+  AppendVMovLiteral(&code, 3, 0xbe800000u);
+  code.push_back(EncodeMubuf0(0x07u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendBufferLoadOpcode(&code, 0x03, 4, 20);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgpr(&code, 4 + i, 1 + i);
   }
-  return cases;
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwResource8_8_8_8SnormRoundTripsThroughLoad";
+  test.code = std::move(code);
+  test.initial = {0xdeadbeefu, 0, 0, 0, 0};
+  // 0.5 stores 64 and loads as 64/127; -0.25 stores -32 and loads as -32/127.
+  test.expected = {0xe040817fu, 0x3f800000u, 0xbf800000u, 0x3f010204u,
+                   0xbe810204u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW,
+                  O::BUFFER_LOAD_FORMAT_XYZW, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 32, false, BufferFormat(Prospero::BufferFormat::k8_8_8_8SNorm));
+  test.has_user_data = true;
+  return test;
 }
 
 std::vector<TestCase> FormattedStoreConversionCases() {

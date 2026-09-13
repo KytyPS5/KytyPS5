@@ -273,6 +273,16 @@ through the full suite and are not run on the standard GitHub-hosted runners.
 Register new CPU-only tests with `add_kyty_cpu_test` in `CMakeLists.txt` so their executable
 is built by `kyty_cpu_tests` and their test receives the `cpu` label used by CI.
 
+CI uses [sccache](https://github.com/mozilla/sccache) with GitHub Actions cache storage
+for C and C++ compilation on all three platforms. Unchanged compilation results can be
+reused across runs; compiler, option, source, or relevant header changes cause recompilation.
+Builds on the default branch populate a cache that pull requests can read, while caches
+created by a pull request are available only to subsequent runs of that PR. The first run
+may therefore be cold, and cache eviction or toolchain updates can reduce reuse.
+Linking, installation/package checks, and CPU tests still run. Cache statistics appear in
+the sccache action's post-job report. Updating a PR also cancels its superseded workflow run;
+push and release runs are not cancelled in progress by this setting.
+
 ### Visual Studio Code
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake

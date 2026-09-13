@@ -1331,6 +1331,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 
 	if (cmd_id == 0xc0021600) {
 		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
+
 		return 3;
 	}
 

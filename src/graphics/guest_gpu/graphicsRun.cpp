@@ -968,7 +968,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
-                                      uint32_t thread_group_z, uint32_t mode) {
+                                      uint32_t thread_group_z, uint32_t mode,
+                                      uint64_t indirect_args_addr) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -994,7 +995,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
+		                                              thread_group_y, thread_group_z, mode,
+		                                              indirect_args_addr);
 	}
 }
 
@@ -1002,12 +1004,13 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		// The address travels with the counts so the limit check can name where they came from.
+		DispatchDirect(args->x, args->y, args->z, mode, args_addr);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
-	                                                IsAsyncComputeQueue());
+	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {

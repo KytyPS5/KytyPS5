@@ -59,6 +59,9 @@ constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_DEFAULT                        = 0x0000
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_119_88HZ                       = 0x000000000000000FULL;
 // Set on top of an ordinary mode when the port drives the headset.
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_VR                             = 0x0000000000020000ULL;
+// The base mode a headset port is asked for. The emulator has no table of headset refresh modes;
+// this is the one Red Matter (PPSA16509) configures, alongside the modes a TV can be in.
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_HEADSET                        = 0x000000000000000CULL;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
@@ -1707,15 +1710,20 @@ static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 		}
 	}
 
-	// The headset picks its own refresh rate out of a set the emulator has no list for, so a VR
-	// mode is taken as given rather than matched against the modes a TV can be in. The port itself
-	// always opens - a title refused the handle flips with the error code anyway - so --vr is
-	// gated here instead: refusing the mode is where a title gives up on VR and carries on flat.
-	if ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0) {
-		return (Config::VrEnabled() ? OK : VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE);
+	// The VR bit is an addition to an ordinary mode, never a mode of its own, so the base mode is
+	// validated the same way either way. The port itself always opens - a title refused the handle
+	// flips with the error code anyway - so --vr is gated here instead: refusing the mode is where
+	// a title gives up on VR and carries on flat.
+	const bool     vr        = ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0);
+	const uint64_t base_mode = (mode & ~VIDEO_OUT_OUTPUT_MODE_VR);
+
+	if (vr && !Config::VrEnabled()) {
+		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
 
-	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
+	if (base_mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT &&
+	    base_mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ &&
+	    !(vr && base_mode == VIDEO_OUT_OUTPUT_MODE_HEADSET)) {
 		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
 
@@ -1746,6 +1754,7 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 		return result;
 	}
 
+	// The headset runs its own panel at its own rate, which is not the one the window runs at.
 	if ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0) {
 		return VIDEO_OUT_TRUE;
 	}

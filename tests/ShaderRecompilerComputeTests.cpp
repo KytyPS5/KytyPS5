@@ -18886,6 +18886,29 @@ TestCase VectorLaneAndPackedOps() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// The shader compiler spells -1 on a packed 16-bit integer lane as 0x7fff.neg, the
+// neighbourhood clamp UE5's temporal upscale builds its -1 taps from.
+TestCase VectorPackedI16NegateFlipsSignBit() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 6, 0x7fff7fffu);
+  AppendVMovLiteral(&code, 7, 0xfffdfffdu);
+  AppendVMovLiteral(&code, 8, 0x00050005u);
+  AppendVop3p(&code, 0x07, 9, Vgpr(6), Vgpr(7), 0, 0x3, 0, 0x1, 0x1);
+  AppendVop3p(&code, 0x0a, 10, Vgpr(6), Vgpr(8), 0, 0x3, 0, 0x1, 0x1);
+  AppendStoreVgpr(&code, 9, 0);
+  AppendStoreVgpr(&code, 10, 1);
+  AppendEnd(&code);
+
+  return {"VectorPackedI16NegateFlipsSignBit",
+          code,
+          {},
+          {0xffffffffu, 0x00040004u},
+          {O::V_MOV_B32, O::V_PK_MAX_I16, O::V_PK_ADD_U16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase Vop2PkFmacF16AccumulatesPackedHalvesIndependently() {
   using O = ShaderOpcode;
 
@@ -26673,6 +26696,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
   AddCase(VectorLaneAndPackedOps);
+  AddCase(VectorPackedI16NegateFlipsSignBit);
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);

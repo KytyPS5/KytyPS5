@@ -543,8 +543,9 @@ IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_la
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
 	auto value = ReadU16LaneRaw(operand, high_lane);
+	// NEG flips the lane's sign bit, as for 32-bit and F16 operands: -1 is encoded 0x7fff.neg.
 	if (high_lane ? operand.negate_hi : operand.negate) {
-		value = ir.BitwiseAnd(ir.ISub(IR::U32(IR::Value(0u)), value), IR::U32(IR::Value(0xffffu)));
+		value = ir.BitwiseXor(value, IR::U32(IR::Value(0x8000u)));
 	}
 	if (sign_extend || operand.sdwa_sext) {
 		value = IR::U32(

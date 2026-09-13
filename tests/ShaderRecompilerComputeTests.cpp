@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -1150,6 +1151,93 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+void CheckDispatchWorkGroupGuard() {
+  constexpr const char *name = "DispatchWorkGroupGuard";
+  constexpr std::array<uint32_t, 3> limits{65535, 65535, 65535};
+  constexpr std::array<uint32_t, 3> local{64, 1, 1};
+
+  // SILENT HILL 2 run3: CS 0x4495052b63c5b153 reached vkCmdDispatch with 2,709,921 groups.
+  const auto garbage =
+      PlanComputeDispatch({2709921, 1, 1}, local, false, limits);
+  Require(name, "oversized packet dispatch",
+          garbage.action == DispatchPlanAction::SkipOverLimit &&
+              garbage.failed_axis == 0 && garbage.groups[0] == 2709921,
+          "a group count past maxComputeWorkGroupCount must never be recorded");
+
+  const auto threads =
+      PlanComputeDispatch({0x0A566840u, 1, 1}, local, true, limits);
+  Require(name, "oversized thread dimensions",
+          threads.action == DispatchPlanAction::SkipOverLimit &&
+              threads.groups[0] == 2709921,
+          "thread dimensions must be checked after conversion to groups");
+
+  const auto wrapped =
+      PlanComputeDispatch({0xFFFFFFFFu, 1, 1}, local, true, limits);
+  Require(name, "thread conversion overflow",
+          wrapped.action == DispatchPlanAction::SkipOverLimit &&
+              wrapped.groups[0] == 0x4000000u,
+          "rounding a huge thread count up wrapped to a small group count");
+
+  const auto normal = PlanComputeDispatch({74, 1, 1}, local, false, limits);
+  Require(name, "normal dispatch",
+          normal.action == DispatchPlanAction::Record &&
+              normal.groups == std::array<uint32_t, 3>{74, 1, 1},
+          "an ordinary dispatch was rejected");
+
+  const auto edge = PlanComputeDispatch({65535, 65535, 1}, local, false, limits);
+  Require(name, "limit is inclusive", edge.action == DispatchPlanAction::Record,
+          "a dispatch exactly at the device limit was rejected");
+
+  for (uint32_t axis = 0; axis < 3; ++axis) {
+    std::array<uint32_t, 3> counts{1, 1, 1};
+    counts[axis] = 65536;
+    const auto over = PlanComputeDispatch(counts, local, false, limits);
+    Require(name, "per-axis limit",
+            over.action == DispatchPlanAction::SkipOverLimit &&
+                over.failed_axis == axis,
+            "an axis past its own limit was accepted");
+  }
+
+  const auto empty = PlanComputeDispatch({0, 1, 1}, local, true, limits);
+  Require(name, "zero-sized dispatch",
+          empty.action == DispatchPlanAction::SkipEmpty,
+          "a zero thread count must still be skipped as empty");
+  const auto rounded = PlanComputeDispatch({65, 3, 1}, {64, 2, 1}, true, limits);
+  Require(name, "thread rounding",
+          rounded.action == DispatchPlanAction::Record &&
+              rounded.groups == std::array<uint32_t, 3>{2, 2, 1},
+          "thread dimensions did not round up to whole groups");
+  const auto over_empty =
+      PlanComputeDispatch({0, 0x80000000u, 1}, {1, 1, 1}, false, limits);
+  Require(name, "over-limit wins over empty",
+          over_empty.action == DispatchPlanAction::SkipOverLimit,
+          "a garbage axis hid behind a zero axis");
+
+  constexpr std::array<uint32_t, 3> mesh_limits{4194304, 65535, 65535};
+  Require(name, "mesh within limits",
+          MeshWorkGroupsWithinLimits(1024, 16, mesh_limits, 4194304),
+          "an ordinary mesh draw was rejected");
+  Require(name, "mesh total limit",
+          !MeshWorkGroupsWithinLimits(65535, 65535, mesh_limits, 4194304),
+          "a mesh draw past maxMeshWorkGroupTotalCount was accepted");
+  Require(name, "mesh axis limit",
+          !MeshWorkGroupsWithinLimits(1, 65536, mesh_limits, 0xFFFFFFFFu),
+          "a mesh draw past maxMeshWorkGroupCount[1] was accepted");
+
+  Require(name, "draw counts", DrawCountsRepresentable(3, 1000000, 0, 0),
+          "an ordinary instanced draw was rejected");
+  Require(name, "draw at id limit",
+          DrawCountsRepresentable(1, 1, 0xFFFFFFFFu, 0),
+          "a draw ending exactly at the id limit was rejected");
+  Require(name, "draw id overflow",
+          !DrawCountsRepresentable(2, 1, 0xFFFFFFFFu, 0),
+          "a draw whose vertex ids overflow 32 bits was accepted");
+  Require(name, "draw invocation overflow",
+          !DrawCountsRepresentable(0x0A566840u, 0x100u, 0, 0),
+          "a draw whose total invocations overflow 32 bits was accepted");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 struct BdaMapping {
@@ -32001,6 +32089,10 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckDispatchWorkGroupGuard();
+  if (argc == 2 && std::strcmp(argv[1], "--dispatch-guard-only") == 0) {
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tessellation-only") == 0) {
     CheckTessellationPrograms();
     CheckEmbeddedFetchVertexOffset();

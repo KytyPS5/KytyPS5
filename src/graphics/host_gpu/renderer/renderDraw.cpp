@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -1094,12 +1095,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		if (!MeshWorkGroupsWithinLimits(
+		        mesh_groups, draw.instance_count,
+		        {limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupCount[1],
+		         limits.maxMeshWorkGroupCount[2]},
+		        limits.maxMeshWorkGroupTotalCount)) {
+			static std::atomic<uint64_t> rejected {0};
+			const auto total = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (total <= 32) {
+				LOGF("%s: skipping mesh draw over the workgroup limit vs=0x%016" PRIx64
+				     " count=%u primitives=%u groups=%ux%u max=%ux%u total_max=%u "
+				     "rejected_total=%" PRIu64 "\n",
+				     draw.Name(), state.vertex_info[0].stage.program->shader_hash, draw.index_count,
+				     primitives, mesh_groups, draw.instance_count, limits.maxMeshWorkGroupCount[0],
+				     limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount, total);
+			}
+			return;
 		}
 	}
 
@@ -1217,6 +1228,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
+static bool DrawCountsAccepted(const char* name, uint32_t count, uint32_t instances,
+                               uint32_t first_element, uint32_t first_instance,
+                               DrawOffsetSource source, uint64_t submit_id) {
+	if (DrawCountsRepresentable(count, instances, first_element, first_instance)) {
+		return true;
+	}
+	static std::atomic<uint64_t> rejected {0};
+	const auto total = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (total <= 32) {
+		LOGF("%s: skipping draw with unrepresentable counts source=%s count=0x%08" PRIx32
+		     " instances=0x%08" PRIx32 " first=0x%08" PRIx32 " first_instance=0x%08" PRIx32
+		     " submit=%" PRIu64 " rejected_total=%" PRIu64 "\n",
+		     name, source == DrawOffsetSource::IndirectArgs ? "indirect" : "packet", count,
+		     instances, first_element, first_instance, submit_id, total);
+	}
+	return false;
+}
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
@@ -1233,6 +1262,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
+		return;
+	}
+	if (!DrawCountsAccepted("DrawIndex", args.index_count, args.instance_count, 0,
+	                        args.first_instance, args.offset_source, submit_id)) {
 		return;
 	}
 
@@ -1344,6 +1377,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		return;
+	}
+	if (!DrawCountsAccepted("DrawIndexAuto", args.vertex_count, args.instance_count,
+	                        args.first_vertex, args.first_instance, args.offset_source,
+	                        submit_id)) {
 		return;
 	}
 

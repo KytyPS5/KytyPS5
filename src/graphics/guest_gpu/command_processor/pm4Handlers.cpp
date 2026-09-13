@@ -1342,7 +1342,8 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		uint32_t mode = buffer[2];
 
 		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode,
+		                  reinterpret_cast<uint64_t>(args));
 
 		return 3;
 	}

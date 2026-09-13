@@ -95,6 +95,8 @@ class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
+	static void OverrideStencilPlaneRedirect(std::optional<bool> enabled);
+
 	struct ImageDesc {
 		ImageInfo     info;
 		ImageViewInfo view_info;
@@ -118,7 +120,9 @@ public:
 		TouchImage(image);
 		return image;
 	}
-	void MarkGpuWritten(ImageId id);
+	// A write that left the stencil plane alone must not claim it: the plane may be shared with
+	// another depth surface that still holds its contents.
+	void MarkGpuWritten(ImageId id, bool stencil_written = true);
 
 	// Called once per presented frame. Image staleness is judged against this rather than against
 	// the queue submission counter, which this title advances dozens of times inside one frame.
@@ -223,6 +227,7 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	[[nodiscard]] ImageId       StencilPlaneOwner(const ImageDesc& desc) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -283,6 +288,7 @@ private:
 	std::mutex                                        m_evict_published_lock;
 	std::vector<ImageId>                              m_evict_published;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::unordered_map<uint64_t, ImageId>             m_stencil_planes;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

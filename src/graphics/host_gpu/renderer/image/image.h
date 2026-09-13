@@ -16,6 +16,8 @@
 
 namespace Libs::Graphics {
 
+[[nodiscard]] uint64_t NextImageWriteEpoch() noexcept;
+
 class Buffer;
 class CommandScheduler;
 class TileManager;
@@ -124,13 +126,19 @@ public:
 	void               MarkGpuModified() noexcept {
 		m_gpu_modified = true;
 		++m_gpu_write_serial;
+		m_gpu_write_epoch = NextImageWriteEpoch();
 	}
 	void ClearGpuModified() noexcept { m_gpu_modified = false; }
 	// Counts GPU writes, never reset - unlike m_gpu_modified, which only the free path clears.
 	[[nodiscard]] uint64_t GpuWriteSerial() const noexcept { return m_gpu_write_serial; }
+	[[nodiscard]] uint64_t GpuWriteEpoch() const noexcept { return m_gpu_write_epoch; }
+	[[nodiscard]] uint64_t BufferWriteEpoch() const noexcept { return m_buffer_write_epoch; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void               MarkBufferModified() noexcept {
+		m_buffer_modified    = true;
+		m_buffer_write_epoch = NextImageWriteEpoch();
+	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -149,6 +157,12 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+
+	[[nodiscard]] static bool FormatHasStencil(vk::Format format) noexcept;
+	// vkCmdCopyImage requires the source and destination aspect masks to agree once either image
+	// is depth/stencil, so stencil can only ride along when the two backing formats are identical.
+	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
+	                                             vk::Format destination) noexcept;
 
 	ImageInfo        info;
 	VulkanImage      backing;
@@ -185,6 +199,8 @@ private:
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;
 	uint64_t          m_gpu_write_serial = 0;
+	uint64_t          m_gpu_write_epoch    = 0;
+	uint64_t          m_buffer_write_epoch = 0;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
 	bool              m_backing_failed   = false;

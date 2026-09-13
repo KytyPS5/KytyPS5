@@ -23,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -110,6 +111,42 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	}
 	clear.float32 = channels;
 	return true;
+}
+
+[[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
+                                                              uint64_t slice_stride,
+                                                              vk::ImageAspectFlags aspect) {
+	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		auto& copy             = copies[layer];
+		copy.bufferOffset      = slice_stride * layer;
+		copy.bufferRowLength   = info.pitch;
+		copy.bufferImageHeight = info.extent.height;
+		copy.imageSubresource  = {aspect, 0, layer, 1};
+		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+	}
+	return copies;
+}
+
+[[nodiscard]] std::vector<GpuTileInfo> BuildDepthTiles(const ImageInfo& info) {
+	TileBlockLayout block {};
+	EXIT_NOT_IMPLEMENTED(
+	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
+	const auto               full_slice_size = info.data.size / info.resources.layers;
+	std::vector<GpuTileInfo> tiles;
+	tiles.reserve(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		const auto offset = full_slice_size * layer;
+		tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
+		                 full_slice_size, 0, info.extent.width, info.extent.height, 1, info.pitch});
+		tiles.back().surface_z = layer;
+	}
+	return tiles;
+}
+
+// Only an 8-bit colour sample or storage image can alias a stencil plane; a target stays its own.
+[[nodiscard]] bool IsStencilPlaneView(const Image& image) {
+	return !image.info.IsDepth() && image.info.bytes_per_block == 1 && !image.usage.render_target;
 }
 
 } // namespace
@@ -321,6 +358,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 
 void TextureCache::DeleteImage(ImageId id) {
 	m_evict_pending.erase(id);
+	std::erase_if(m_stencil_planes, [id](const auto& entry) { return entry.second == id; });
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -675,9 +713,18 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
 	PrepareImageCopy(destination);
+	const bool stencil_involved = Image::FormatHasStencil(source.backing.format) ||
+	                              Image::FormatHasStencil(destination.backing.format);
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
+		}
+		if (stencil_involved) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: stencil_copy_dropped path=buffer_modified addr=0x%016" PRIx64
+			           " %s -> %s\n",
+			           source.info.data.address, vk::to_string(source.backing.format).c_str(),
+			           vk::to_string(destination.backing.format).c_str());
 		}
 		return;
 	}
@@ -691,6 +738,17 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	if (stencil_involved) {
+		const bool carried =
+		    direct_copy && Image::CopyCarriesStencil(source.backing.format,
+		                                             destination.backing.format);
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "TextureCache: %s path=%s addr=0x%016" PRIx64 " %s -> %s\n",
+		           carried ? "stencil_copy_carried" : "stencil_copy_dropped",
+		           direct_copy ? "direct" : "cross_format", source.info.data.address,
+		           vk::to_string(source.backing.format).c_str(),
+		           vk::to_string(destination.backing.format).c_str());
+	}
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -1280,12 +1338,15 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!depth.info.IsDepth() || !depth.info.HasStencil()) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
+	depth.info.stencil = stencil;
 
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
 		if (owner != nullptr && owner->info.data == stencil &&
-		    owner->info.extent == depth.info.extent) {
+		    owner->info.extent == depth.info.extent &&
+		    (owner->depth_id || IsStencilPlaneView(*owner))) {
+
 			association = id;
 		}
 	}
@@ -1317,6 +1378,48 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 
 	return association;
+}
+
+namespace {
+
+std::atomic<int> g_stencil_plane_redirect_override {-1};
+
+[[nodiscard]] bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+[[nodiscard]] bool StencilPlaneRedirectEnabled() {
+	const int forced = g_stencil_plane_redirect_override.load(std::memory_order_relaxed);
+	if (forced >= 0) {
+		return forced != 0;
+	}
+	static const bool enabled = !EnvFlag("KYTY_NO_STENCIL_PLANE_REDIRECT");
+	return enabled;
+}
+
+} // namespace
+
+void TextureCache::OverrideStencilPlaneRedirect(std::optional<bool> enabled) {
+	g_stencil_plane_redirect_override.store(enabled ? (*enabled ? 1 : 0) : -1,
+	                                        std::memory_order_relaxed);
+}
+
+ImageId TextureCache::StencilPlaneOwner(const ImageDesc& desc) const {
+	const auto found = m_stencil_planes.find(desc.info.data.address);
+	if (found == m_stencil_planes.end()) {
+		return {};
+	}
+	const auto* depth = m_slot_images.try_get(found->second);
+	if (depth == nullptr || !depth->registered || depth->dormant || depth->depth_id ||
+	    !depth->info.IsDepth() || !depth->info.HasStencil() ||
+	    depth->info.stencil.address != desc.info.data.address ||
+	    depth->info.extent.width != desc.info.extent.width ||
+	    depth->info.extent.height != desc.info.extent.height || !depth->IsGpuModified() ||
+	    depth->backing.image == nullptr) {
+		return {};
+	}
+	return found->second;
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -1390,7 +1493,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources < desc.info.resources ||
+			           (resolved.depth_id && desc.type != BindingType::Texture &&
+			            desc.type != BindingType::Storage)) {
+				// A target binding reclaims the address from a stale stencil proxy.
 				FreeImage(result);
 				result = {};
 			}
@@ -1561,6 +1667,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             desc.info.resources.layers};
 	}
 	image.info.stencil = desc.info.stencil;
+	if (desc.info.HasStencil()) {
+		m_stencil_planes[desc.info.stencil.address] = id;
+	}
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [entry, inserted] = m_surface_metas.emplace(
@@ -1594,7 +1703,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
-void TextureCache::MarkGpuWritten(ImageId id) {
+void TextureCache::MarkGpuWritten(ImageId id, bool stencil_written) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {
@@ -1602,7 +1711,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
-	if (image.info.HasStencil()) {
+	if (image.info.HasStencil() && stencil_written) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
@@ -1646,6 +1755,21 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			candidate_subresources = owner->stencil_subresources;
 			owner        = m_slot_images.try_get(candidate_id);
 			if (owner == nullptr || owner->backing.image == nullptr || !owner->info.HasStencil()) {
+				continue;
+			}
+			// A stale proxy fill erases the current plane; a partial view's own slice is current.
+			const auto& plane         = owner->info.stencil;
+			const auto& bound         = owner->stencil_subresources;
+			bool        current_plane = plane == GuestRange {address, size};
+			if (!current_plane && bound.layer_count != 0 && plane.size % bound.layer_count == 0) {
+				const auto slice = plane.size / bound.layer_count;
+				const auto shift = uint64_t {bound.base_layer} * slice;
+				current_plane    = slice != 0 && plane.address >= shift &&
+				                address == plane.address - shift +
+				                               uint64_t {candidate_subresources.base_layer} * slice &&
+				                size == uint64_t {candidate_subresources.layer_count} * slice;
+			}
+			if (!current_plane) {
 				continue;
 			}
 		} else if (!owner->depth_id && owner->info.data.address == address &&

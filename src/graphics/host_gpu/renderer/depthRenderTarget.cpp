@@ -379,7 +379,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	BindRenderTarget(write_id);
 	cache.UpdateImage(read_id);
 	cache.UpdateImage(write_id);
-	cache.MarkGpuWritten(write_id);
+	cache.MarkGpuWritten(write_id, stencil_copy);
 	auto& source      = cache.GetImage(read_id);
 	auto& destination = cache.GetImage(write_id);
 	EXIT_IF(read_id == write_id || source.backing.format != destination.backing.format);

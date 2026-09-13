@@ -20,6 +20,11 @@
 
 namespace Libs::Graphics {
 
+uint64_t NextImageWriteEpoch() noexcept {
+	static std::atomic<uint64_t> epoch {0};
+	return epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 namespace {
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
@@ -120,6 +125,14 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 		default: return vk::ImageAspectFlagBits::eColor;
 	}
+}
+
+bool Image::FormatHasStencil(vk::Format format) noexcept {
+	return static_cast<bool>(FullAspectMask(format) & vk::ImageAspectFlagBits::eStencil);
+}
+
+bool Image::CopyCarriesStencil(vk::Format source, vk::Format destination) noexcept {
+	return source == destination && FormatHasStencil(source);
 }
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
@@ -357,10 +370,13 @@ void Image::CopyImage(Image& source) {
 	                            : backing.image_type == vk::ImageType::e3D
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
+	const bool     carry_stencil = CopyCarriesStencil(source.backing.format, backing.format);
 	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    carry_stencil ? FullAspectMask(source.backing.format)
+	                  : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    carry_stencil ? FullAspectMask(backing.format)
+	                  : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {

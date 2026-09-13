@@ -65,7 +65,9 @@ public:
 		TouchImage(image);
 		return image;
 	}
-	void MarkGpuWritten(ImageId id);
+	// A write that left the stencil plane alone must not claim it; another surface may share it.
+	void MarkGpuWritten(ImageId id, bool stencil_written = true);
+
 	// Called once per presented frame; image staleness is judged against it, not submissions.
 	void AdvanceFrame() noexcept { m_frame_index.fetch_add(1, std::memory_order_relaxed); }
 
@@ -157,6 +159,7 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	[[nodiscard]] ImageId       StencilPlaneOwner(const ImageDesc& desc) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -223,6 +226,7 @@ private:
 	std::unordered_map<uint64_t, uint64_t> m_evicted_addresses;
 	std::mutex                             m_evict_published_lock;
 	std::vector<ImageId>                   m_evict_published;
+	std::unordered_map<uint64_t, ImageId>  m_stencil_planes;
 	uint64_t                               m_gc_frame           = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;

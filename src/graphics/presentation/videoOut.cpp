@@ -46,6 +46,8 @@ constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
+// The headset hangs off its own bus, which does not continue the 0..2 numbering.
+constexpr int      VIDEO_OUT_BUS_TYPE_VR                                = 32;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_BUFFER_INDEX_BLACK                         = -2;
@@ -55,6 +57,8 @@ constexpr size_t   VIDEO_OUT_FLIP_QUEUE_CAPACITY                        = 16;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX                   = 4;
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_DEFAULT                        = 0x0000000000000001ULL;
 constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_119_88HZ                       = 0x000000000000000FULL;
+// Set on top of an ordinary mode when the port drives the headset.
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_VR                             = 0x0000000000020000ULL;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
@@ -237,7 +241,8 @@ private:
 
 struct VideoOutDriver::Impl {
 public:
-	static constexpr int VIDEO_OUT_NUM_MAX = 4;
+	static constexpr int VIDEO_OUT_NUM_MAX   = 5;
+	static constexpr int VIDEO_OUT_VR_HANDLE = 4;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
 	    : m_renderer(presenter.Renderer()), m_presenter(presenter), m_flip_queue(presenter) {
@@ -509,6 +514,13 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
+	// Frames flipped to the headset have nowhere to go: their buffers are described by GPU image
+	// descriptors the presenter cannot read, and there is no panel to put them on. The flip still
+	// has to complete, or the title stalls waiting for it, so it is turned into a blank one.
+	if (handle == VideoOutDriver::Impl::VIDEO_OUT_VR_HANDLE) {
+		index = VIDEO_OUT_BUFFER_INDEX_BLANK;
+	}
+
 	Common::LockGuard lock(video_out->mutex);
 	if (video_out->closing ||
 	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
@@ -613,8 +625,8 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 int VideoOutDriver::Impl::Open(int bus_type) {
 	Common::LockGuard lock(m_mutex);
 
-	const int handle = bus_type + 1;
-	if (m_video_out_ctx[handle].opened) {
+	const int handle = (bus_type == VIDEO_OUT_BUS_TYPE_VR ? VIDEO_OUT_VR_HANDLE : bus_type + 1);
+	if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || m_video_out_ctx[handle].opened) {
 		return -1;
 	}
 	auto&             config = m_video_out_ctx[handle];
@@ -1168,9 +1180,11 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
 	PRINT_NAME();
 
+	LOGF("VideoOutOpen: user_id = %d, bus_type = %d, index = %d\n", user_id, bus_type, index);
+
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
 	if (bus_type != VIDEO_OUT_BUS_TYPE_MAIN && bus_type != VIDEO_OUT_BUS_TYPE_OVERLAY &&
-	    bus_type != VIDEO_OUT_BUS_TYPE_SUB) {
+	    bus_type != VIDEO_OUT_BUS_TYPE_SUB && bus_type != VIDEO_OUT_BUS_TYPE_VR) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
 	EXIT_NOT_IMPLEMENTED(index != 0);
@@ -1693,6 +1707,14 @@ static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 		}
 	}
 
+	// The headset picks its own refresh rate out of a set the emulator has no list for, so a VR
+	// mode is taken as given rather than matched against the modes a TV can be in. The port itself
+	// always opens - a title refused the handle flips with the error code anyway - so --vr is
+	// gated here instead: refusing the mode is where a title gives up on VR and carries on flat.
+	if ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0) {
+		return (Config::VrEnabled() ? OK : VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE);
+	}
+
 	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
 		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
@@ -1722,6 +1744,10 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	int result = ValidateOutputConfig(handle, mode, options, reserved_ptr, reserved);
 	if (result != OK) {
 		return result;
+	}
+
+	if ((mode & VIDEO_OUT_OUTPUT_MODE_VR) != 0) {
+		return VIDEO_OUT_TRUE;
 	}
 
 	if (mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) {

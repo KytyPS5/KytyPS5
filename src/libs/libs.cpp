@@ -74,6 +74,14 @@ namespace LibGen5 {
 LIB_DEFINE(InitVideoOut_1);
 } // namespace LibGen5
 
+namespace LibHmd2 {
+LIB_DEFINE(InitHmd2_1);
+} // namespace LibHmd2
+
+namespace LibVrTracker2 {
+LIB_DEFINE(InitVrTracker2_1);
+} // namespace LibVrTracker2
+
 LIB_DEFINE(InitAppContent_1);
 LIB_DEFINE(InitAudio_1);
 LIB_DEFINE(InitConvertKeycode_1);
@@ -115,6 +123,8 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFont_1(s);
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
+	LibHmd2::InitHmd2_1(s);
+	LibVrTracker2::InitVrTracker2_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);
 	LibKeyboard::InitKeyboard_1(s);

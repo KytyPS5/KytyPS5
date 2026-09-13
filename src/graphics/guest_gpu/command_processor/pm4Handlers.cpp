@@ -3819,6 +3819,18 @@ void GraphicsInitJmpTablesUcIndirect() {
 		func = nullptr;
 	}
 
+	// Written every draw by the PSVR2 render path of Red Matter (PPSA16509), in three groups of
+	// consecutive registers. What they select is not known - the title renders correctly without
+	// them - so they are accepted and dropped rather than aborting the command processor.
+	for (const uint32_t offset: {0x2bcu, 0x2bdu, 0x2c4u, 0x2c5u, 0x2c6u, 0x2c7u, 0x2ccu, 0x2cdu,
+	                             0x2ceu, 0x2cfu, 0x2e4u, 0x2e5u, 0x2e8u, 0x2e9u}) {
+		g_hw_uc_indirect_func[offset] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			(void)cp;
+			(void)cmd_offset;
+			(void)value;
+		};
+	}
+
 	g_hw_uc_indirect_func[Pm4::GE_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeControl r;
 		r.primitive_group_size = KYTY_PM4_GET(value, GE_CNTL, PRIM_GRP_SIZE);

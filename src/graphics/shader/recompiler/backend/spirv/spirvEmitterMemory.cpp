@@ -462,6 +462,40 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	});
 }
 
+uint32_t EncodeFormattedComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                   uint32_t component, uint32_t data) {
+	if (info.type == Format::ComponentType::Float && info.component_bits[component] == 16u) {
+		const auto value = EmitBitcastU32ToF32(state, data);
+		const auto pair  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
+		                           ConstantF32Value(state, 0.0f));
+		const auto packed = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state), GLSLstd450PackHalf2x16, pair);
+		return packed;
+	}
+	const bool signed_value = info.type == Format::ComponentType::Snorm;
+	if (!signed_value && info.type != Format::ComponentType::Unorm) return data;
+	// Formatted stores consume floating-point register values. Truncating their
+	// raw bits to the storage width loses both the value and tangent handedness.
+	const auto value   = EmitBitcastU32ToF32(state, data);
+	const auto nan     = Binary(state, spv::OpFUnordNotEqual, TypeBool(state), value, value);
+	const auto finite  = Select(state, TypeF32(state), nan, ConstantF32Value(state, 0.0f), value);
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FClamp,
+	                           finite, ConstantF32Value(state, signed_value ? -1.0f : 0.0f),
+	                           ConstantF32Value(state, 1.0f));
+	const auto bits = info.component_bits[component];
+	const auto maximum =
+	    static_cast<float>((uint32_t {1} << (bits - (signed_value ? 1u : 0u))) - 1u);
+	const auto scaled =
+	    Binary(state, spv::OpFMul, TypeF32(state), clamped, ConstantF32Value(state, maximum));
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state), GLSLstd450RoundEven, scaled);
+	const auto type    = signed_value ? TypeI32(state) : TypeU32(state);
+	const auto encoded = Unary(state, signed_value ? spv::OpConvertFToS : spv::OpConvertFToU, type, rounded);
+	return signed_value ? Unary(state, spv::OpBitcast, TypeU32(state), encoded) : encoded;
+}
+
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
@@ -722,12 +756,9 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                             uint32_t data) {
 	if (component >= plan.info.component_count) return;
 	const auto bits = plan.info.component_bits[component];
-	if (plan.info.type == Format::ComponentType::Snorm && bits == 16u) {
-		const auto value = EmitBitCastF32U32(ctx.state, data);
-		data = EmitPackSnorm2x16(
-		    ctx.state, EmitCompositeConstructF32x2(ctx.state, value, ConstantF32Value(ctx.state, 0.0f)));
-	}
+
 	if (bits == 8u || bits == 16u) {
+		data = EncodeFormattedComponent(ctx.state, plan.info, component, data);
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {

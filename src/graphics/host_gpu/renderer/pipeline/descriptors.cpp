@@ -825,6 +825,13 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
+	// FindBuffer creates BDA page-table entries. PrepareBda subsequently uploads
+	// dirty guest data before the draw/dispatch can consume these physical reads.
+	for (const auto& range: snapshot.physical_read_ranges) {
+		if (m_context.IsMapped(range.address, range.size)) {
+			(void)cache.FindBuffer(range.address, range.size);
+		}
+	}
 	prepared.buffer_sources.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);

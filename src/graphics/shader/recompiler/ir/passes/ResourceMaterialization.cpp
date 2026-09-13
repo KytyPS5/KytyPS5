@@ -843,6 +843,16 @@ private:
 				}
 			return true;
 		}
+		if (op == ValueOpcode::GetBuiltin &&
+		    inst.Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId))) {
+			const auto axis = inst.Arg(1).Resolve();
+			if (!axis.IsImmediate() || axis.U32() >= m_runtime.workgroup_size.size()) return false;
+			const auto size = m_runtime.workgroup_size[axis.U32()];
+			if (size == 0 || size > MaxValues) return false;
+			out.resize(size);
+			std::iota(out.begin(), out.end(), 0u);
+			return true;
+		}
 		if (op == ValueOpcode::GetBuiltin && m_workgroup &&
 		    inst.Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId))) {
 			const auto axis = inst.Arg(1).Resolve();
@@ -1947,6 +1957,33 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
 	plan.control_flow = ResourceControlFlow(program);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::LoadAddressU32) continue;
+			const auto flags = inst.Flags<MemoryFlags>();
+			const auto& memory = program.memory_info[flags.index];
+			if ((memory.kind != ResourceKind::ScalarAddress && memory.kind != ResourceKind::Global) ||
+			    memory.planning_only || memory.address_is_full) continue;
+			const auto* base = inst.Arg(0).Resolve().TryInstruction();
+			if (base == nullptr || base->GetOpcode() != ValueOpcode::GetAddressResource) continue;
+			PhysicalAddressRead read {
+			    {CloneAt(base->Arg(0), flags.pc), CloneAt(base->Arg(1), flags.pc)},
+			    CloneAt(inst.Arg(1), flags.pc), memory.offset,
+			    memory.kind == ResourceKind::ScalarAddress};
+			const auto ranges = std::ranges::find_if(program.address_read_index_ranges,
+			    [&](const auto& entry) { return entry.first == flags.index; });
+			if (ranges != program.address_read_index_ranges.end()) {
+				read.index_ranges = ranges->second;
+				for (auto& range: read.index_ranges) {
+					range.value = CloneAt(range.value, flags.pc);
+					range.begin = CloneAt(range.begin, flags.pc);
+					range.end   = CloneAt(range.end, flags.pc);
+					for (auto& [bound, limit]: range.bound_limits) bound = CloneAt(bound, flags.pc);
+				}
+			}
+			plan.physical_address_reads.push_back(std::move(read));
+		}
+	}
 	for (auto& block: plan.control_flow) {
 		block.condition = Clone(block.condition);
 	}
@@ -1987,6 +2024,42 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
+	snapshot.physical_read_ranges.clear();
+	// A fault discovered after dispatch cannot repair values already consumed by
+	// that dispatch. Prepare finite physical reads before their first GPU access.
+	UniformValueCache address_cache;
+	for (const auto& read: program.physical_address_reads) {
+		std::array<uint32_t, 2> base_words {};
+		std::vector<uint32_t> offsets;
+		if (!EvaluateUniformValues(program, read.base, runtime, base_words, &address_cache) ||
+		    !BufferOffsets(program, runtime, read.index_ranges)
+		         .EvaluateDispatch(read.byte_offset, offsets)) {
+			continue;
+		}
+		const auto base = (uint64_t {base_words[1]} << 32u) | base_words[0];
+		if (base > AddressMask) continue;
+		const auto alignment_mask = read.scalar ? ~3u : UINT32_MAX;
+		const auto immediate = int64_t {static_cast<int32_t>(read.immediate & alignment_mask)};
+		for (const auto offset: offsets) {
+			const auto address = static_cast<int64_t>(base) + immediate + (offset & alignment_mask);
+			if (address > 0 && static_cast<uint64_t>(address) <= AddressMask - 3u) {
+				snapshot.physical_read_ranges.push_back({static_cast<uint64_t>(address), 4});
+			}
+		}
+	}
+	std::ranges::sort(snapshot.physical_read_ranges, {}, &ResourceSnapshot::AddressRange::address);
+	size_t range_count = 0;
+	for (const auto range: snapshot.physical_read_ranges) {
+		if (range_count != 0) {
+			auto& previous = snapshot.physical_read_ranges[range_count - 1];
+			if (range.address <= previous.address + previous.size) {
+				previous.size = std::max(previous.size, range.address + range.size - previous.address);
+				continue;
+			}
+		}
+		snapshot.physical_read_ranges[range_count++] = range;
+	}
+	snapshot.physical_read_ranges.resize(range_count);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;

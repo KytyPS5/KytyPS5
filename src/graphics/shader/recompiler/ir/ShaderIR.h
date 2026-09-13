@@ -509,6 +509,14 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct PhysicalAddressRead {
+	std::array<Value, 2>                       base;
+	Value                                     byte_offset;
+	uint32_t                                  immediate = 0;
+	bool                                      scalar = true;
+	std::vector<DescriptorSource::IndexRange> index_ranges;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -565,6 +573,7 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<PhysicalAddressRead>      physical_address_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;
@@ -604,6 +613,9 @@ struct Program: ResourcePlan {
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
 	std::vector<Value>            dynamic_reads;
+	// Loop domains for physical reads, keyed by the live instruction's memory metadata.
+	std::vector<std::pair<uint32_t, std::vector<DescriptorSource::IndexRange>>>
+	    address_read_index_ranges;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

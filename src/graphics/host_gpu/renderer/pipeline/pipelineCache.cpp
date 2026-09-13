@@ -372,7 +372,11 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		read_cache.Reset();
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		std::array<uint32_t, 3> workgroup_size {};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			std::copy_n(input_info.threads_num, 3, workgroup_size.begin());
+		}
+		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemory,
@@ -381,6 +385,7 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_range  = ReadShaderGuestRange,
 		    .is_memory_mapped           = IsShaderMemoryMapped,
 		    .workgroup_count            = workgroup_count,
+		    .workgroup_size             = workgroup_size,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(

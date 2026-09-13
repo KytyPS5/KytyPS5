@@ -23,6 +23,7 @@ struct SrtRuntime {
 	SrtMemoryRangeValidator   is_memory_mapped           = nullptr;
 	// Runtime dispatch extent; zero means the stage has no compute workgroups.
 	std::array<uint32_t, 3> workgroup_count {};
+	std::array<uint32_t, 3> workgroup_size {};
 };
 
 enum class RuntimeValueType { Any, Integer };

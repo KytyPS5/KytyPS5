@@ -1605,6 +1605,11 @@ private:
 				return;
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
+			if (op == ValueOpcode::LoadAddressU32 && !memory.address_is_full &&
+			    (memory.kind == ResourceKind::ScalarAddress || memory.kind == ResourceKind::Global)) {
+				m_program.address_read_index_ranges.emplace_back(
+				    flags.index, FindIndexRanges(inst.Arg(1), flags.pc));
+			}
 			m_info.uses_dma = true;
 			return;
 		}

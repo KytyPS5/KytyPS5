@@ -4440,6 +4440,7 @@ public:
       scheduler.Finish();
     }
 
+    context.ShutdownGpu();
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "slice growth direct mapping release failed");
@@ -11872,7 +11873,7 @@ public:
     color.image_id = cache.FindImage(color.desc);
     std::array<float, 18> vertices{
         -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 1, 1, 1, 1,
-        0.0f, 0.75f, 1, 1, 1, 1};
+        0.0f, 0.75f, 0.25f, 1, 1, 1};
     if (depth_feedback) {
       vertices = {-1, -1, 0, 0, 0, 1, 3, -1, 2, 0, 0, 1, -1, 3, 0, 2, 0, 1};
     }

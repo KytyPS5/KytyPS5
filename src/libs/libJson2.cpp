@@ -4,6 +4,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -990,8 +991,13 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 		for (size_t i = 0; i < cleaned.size(); i++) {
 			const char c = cleaned[i];
 			if (in_string) {
-				escaped   = (c == '\\' && !escaped);
-				in_string = !(c == '"' && !escaped);
+				if (escaped) {
+					escaped = false;
+				} else if (c == '\\') {
+					escaped = true;
+				} else if (c == '"') {
+					in_string = false;
+				}
 				continue;
 			}
 			if (c == '"') {
@@ -1033,7 +1039,8 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 		}
 	}
 	if (json.is_discarded() || !JsonValueFromNlohmann(&parsed, json)) {
-		LOGF("JsonParserParse: document discarded (size=%zu, head: %.80s)\n", size, src);
+		LOGF("JsonParserParse: document discarded (size=%zu, head: %.*s)\n", size,
+		     static_cast<int>(std::min<size_t>(size, 80)), src);
 		JsonValueClear(&parsed);
 		return JSON_ERROR_PARSE_INVALID_CHAR;
 	}

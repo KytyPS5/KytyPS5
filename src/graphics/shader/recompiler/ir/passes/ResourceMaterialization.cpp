@@ -1195,6 +1195,11 @@ static bool IsResourcePlanningReference(const Program& program, const Inst& inst
 
 static uint32_t NativeImageKeyArg(const Program& program, const Inst& inst) {
 	const auto index = inst.Flags<uint32_t>();
+	if (index == UINT32_MAX) {
+		// The FMASK remap sentinel: ApplyResourceSpecialization already redirected this
+		// GetImageResource to nothing, and it survives dead until EliminateDeadCode runs.
+		return UINT32_MAX;
+	}
 	EXIT_IF(index >= program.info.images.size());
 	const auto source = program.info.images[index].source;
 	EXIT_IF(source >= program.descriptor_sources.size());

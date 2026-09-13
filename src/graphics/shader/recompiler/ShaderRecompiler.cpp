@@ -584,7 +584,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		// this guard should never fire.
 		static const bool strict_structured = [] {
 			const char* v = std::getenv("KYTY_STRICT_STRUCTURED");
-			return v != nullptr && v[0] != '0';
+			return v != nullptr && v[0] != '\0' && v[0] != '0';
 		}();
 		if (!CFG::Structurize(cfg) || (strict_structured && unmerged_selection(cfg))) {
 			dispatcher_fallback      = true;

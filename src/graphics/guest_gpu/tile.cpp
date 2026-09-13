@@ -1341,9 +1341,10 @@ bool TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint
 		const TileSurfaceDescription description {
 		    format, tile, TileSurfaceDimension::Dim3D, width, height, depth, levels, 1};
 		if (!TileGetTiledTextureLayout(description, layout)) {
-			EXIT("unsupported 3D texture layout: format=%u tile=%u extent=%ux%ux%u levels=%u\n",
+			LOGF("unsupported 3D texture layout: format=%u tile=%u extent=%ux%ux%u levels=%u\n",
 			     static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width, height, depth,
 			     levels);
+			return false;
 		}
 		if (layout.total_size > UINT32_MAX) {
 			return false;

@@ -467,6 +467,54 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
+// Round to nearest, saturate to max finite, negatives and -Inf to zero, NaN to all ones.
+static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t bits, uint32_t width) {
+	const auto mantissa_bits = width == 11u ? 6u : 5u;
+	const auto mantissa_mask = (1u << mantissa_bits) - 1u;
+	const auto infinity      = 31u << mantissa_bits;
+	const auto max_finite    = (30u << mantissa_bits) | mantissa_mask;
+	const auto drop          = 23u - mantissa_bits;
+
+	const auto exponent =
+	    EmitBitFieldUExtract(state, bits, ConstantU32(state, 23u), ConstantU32(state, 8u));
+	const auto mantissa = EmitAndConstant(state, bits, 0x007fffffu);
+	const auto negative =
+	    EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, bits, 0x80000000u);
+	const auto special = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 255u);
+	const auto nan     = EmitLogicalAndBool(
+	    state, special, EmitCompareU32Constant(state, spv::OpINotEqual, mantissa, 0));
+
+	// A carry out of the rounded mantissa lands in the exponent field, which is the correct result.
+	const auto normal_exponent =
+	    EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                  EmitBinaryU32(state, spv::OpISub, exponent, ConstantU32(state, 127u - 15u)),
+	                  ConstantU32(state, mantissa_bits));
+	const auto rounded_mantissa =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical,
+	                  EmitAddU32(state, mantissa, ConstantU32(state, 1u << (drop - 1u))),
+	                  ConstantU32(state, drop));
+	const auto normal   = EmitAddU32(state, normal_exponent, rounded_mantissa);
+	const auto overflow = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, normal, infinity);
+	const auto normal_sat =
+	    EmitSelectValueU32(state, overflow, ConstantU32(state, max_finite), normal);
+
+	const auto scaled = EmitFPMul32(
+	    state, EmitBitcastU32ToF32(state, bits),
+	    ConstantF32Value(state, std::ldexp(1.0f, 15 - 1 + static_cast<int>(mantissa_bits))));
+	const auto subnormal =
+	    Unary(state, spv::OpConvertFToU, TypeU32(state), EmitFPRoundEven32(state, scaled));
+
+	const auto is_subnormal =
+	    EmitCompareU32Constant(state, spv::OpULessThanEqual, exponent, 127u - 15u);
+	const auto finite = EmitSelectValueU32(state, is_subnormal, subnormal, normal_sat);
+	const auto non_negative =
+	    EmitSelectValueU32(state, special, ConstantU32(state, infinity), finite);
+	const auto sign_applied =
+	    EmitSelectValueU32(state, negative, ConstantU32(state, 0), non_negative);
+	return EmitSelectValueU32(state, nan, ConstantU32(state, infinity | mantissa_mask),
+	                          sign_applied);
+}
+
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                        uint32_t component, uint32_t data, uint32_t data_bits,
                                        UnormRounding rounding) {
@@ -521,6 +569,9 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		const auto pair = EmitCompositeConstructF32x2(
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
 		return EmitPackHalf2x16(state, pair);
+	}
+	if ((bits == 10u || bits == 11u) && info.type == Format::ComponentType::Float) {
+		return EmitF32ToUFloatBits(state, data, bits);
 	}
 	return data;
 }

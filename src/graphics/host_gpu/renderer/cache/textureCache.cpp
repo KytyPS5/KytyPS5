@@ -167,6 +167,11 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	return tiles;
 }
 
+// Only an 8-bit colour sample or storage image can alias a stencil plane; a target stays its own.
+[[nodiscard]] bool IsStencilPlaneView(const Image& image) {
+	return !image.info.IsDepth() && image.info.bytes_per_block == 1 && !image.usage.render_target;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1248,7 +1253,8 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data.address == stencil.address) {
+		if (owner != nullptr && owner->info.data.address == stencil.address &&
+		    (owner->depth_id || IsStencilPlaneView(*owner))) {
 			association = id;
 		}
 	}
@@ -1308,7 +1314,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources < desc.info.resources ||
+			           (resolved.depth_id && desc.type != BindingType::Texture &&
+			            desc.type != BindingType::Storage)) {
+				// A target binding reclaims the address from a stale stencil proxy.
 				FreeImage(result);
 				result = {};
 			}

@@ -12382,10 +12382,9 @@ public:
               ordered_color.image_id != stale_ordered_color &&
                   ordered_rendering.color_attachments[0].image_view != nullptr &&
                   ordered_rendering.depth_stencil_attachment.image_view != nullptr &&
-                  texture_cache.GetImage(ordered_color.image_id).depth_id ==
-                      ordered_depth.image_id,
+                  !texture_cache.GetImage(ordered_color.image_id).depth_id,
               "depth acquisition ran before the stale color target was "
-              "recreated and associated");
+              "recreated, or its stencil association hijacked the color target");
       RenderExecutorTestAccess::ResetBindings(executor);
       TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
 
@@ -12574,6 +12573,205 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "descriptor discovery direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Final acquisition EXITs on a stencil proxy, so discovery must never return one for a target.
+  void CheckRenderExecutorStencilAliasRediscovery() {
+    constexpr const char *name = "RenderExecutorStencilAliasRediscovery";
+    constexpr uintptr_t base = 0x0000000211000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t aliased_depth_address = base;
+    constexpr uint64_t owner_depth_address = base + 0x20000;
+    constexpr uint64_t stencil_view_address = base + 0x40000;
+    constexpr uint64_t second_depth_address = base + 0x60000;
+    constexpr uint64_t stencil_size = 0x20000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "stencil alias direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "stencil alias fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+
+      const auto make_desc = [](BindingType type, uint64_t address,
+                                vk::Format format,
+                                Prospero::BufferFormat guest_format,
+                                uint32_t bytes_per_block) {
+        ImageDesc desc{};
+        desc.type = type;
+        desc.info.data = {address, 0x10000};
+        desc.info.pixel_format = format;
+        desc.info.guest_format = guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = {1, 1, 1};
+        desc.info.resources = {1, 1};
+        desc.info.pitch = 1;
+        desc.info.bytes_per_block = bytes_per_block;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, desc.info.data.size, 1, 1};
+        desc.view_info.format = format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        switch (type) {
+        case BindingType::DepthTarget:
+          desc.view_info.aspect = ImageViewOps::DepthAspectMask(format);
+          desc.view_info.usage =
+              vk::ImageUsageFlagBits::eDepthStencilAttachment;
+          break;
+        case BindingType::RenderTarget:
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+          break;
+        default:
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          break;
+        }
+        return desc;
+      };
+      const auto make_depth = [&](uint64_t address, GuestRange stencil) {
+        auto desc = make_desc(BindingType::DepthTarget, address,
+                              stencil.Empty() ? vk::Format::eD32Sfloat
+                                              : vk::Format::eD32SfloatS8Uint,
+                              Prospero::BufferFormat::k32Float, 4);
+        desc.info.stencil = stencil;
+        return desc;
+      };
+      const auto draw = [&](RenderColorInfo *color, RenderDepthInfo *depth) {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        if (color != nullptr) {
+          color->image_id = texture_cache.FindImage(color->desc);
+          RenderExecutorTestAccess::BindRenderTarget(executor, color->image_id);
+        }
+        if (depth != nullptr) {
+          depth->image_id = texture_cache.FindImage(depth->desc);
+          RenderExecutorTestAccess::BindRenderTarget(executor, depth->image_id);
+        }
+        const auto *color_owner =
+            color != nullptr
+                ? TextureCacheTestAccess::Owner(texture_cache, color->image_id)
+                : nullptr;
+        const auto *depth_owner =
+            depth != nullptr
+                ? TextureCacheTestAccess::Owner(texture_cache, depth->image_id)
+                : nullptr;
+        const bool acquirable = (color == nullptr || (color_owner != nullptr &&
+                                                      !color_owner->depth_id)) &&
+                                (depth == nullptr || (depth_owner != nullptr &&
+                                                      !depth_owner->depth_id));
+        if (!acquirable) {
+          return false;
+        }
+        RenderDepthInfo no_depth{};
+        RenderColorInfo no_color{};
+        const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), color != nullptr ? color : &no_color,
+            color != nullptr ? 1 : 0, depth != nullptr ? *depth : no_depth);
+        return (color == nullptr ||
+                rendering.color_attachments[0].image_view != nullptr) &&
+               (depth == nullptr ||
+                rendering.depth_stencil_attachment.image_view != nullptr);
+      };
+
+      RenderDepthInfo aliased{};
+      aliased.desc = make_depth(aliased_depth_address, {});
+      Require(name, "aliased depth first draw", draw(nullptr, &aliased),
+              "the depth target at the later stencil address did not bind");
+      const auto aliased_id = aliased.image_id;
+
+      RenderDepthInfo owner{};
+      owner.desc =
+          make_depth(owner_depth_address, {aliased_depth_address, stencil_size});
+      Require(name, "stencil owner draw", draw(nullptr, &owner),
+              "the depth/stencil target did not bind");
+      const auto proxy_id = texture_cache.FindImageFromRange(
+          aliased_depth_address, stencil_size, false);
+      Require(name, "lightweight stencil proxy",
+              proxy_id && proxy_id != aliased_id &&
+                  texture_cache.GetImage(proxy_id).depth_id == owner.image_id &&
+                  !texture_cache.GetImage(aliased_id).depth_id,
+              "stencil association turned the cached depth target at its "
+              "address into a stencil proxy");
+
+      Require(name, "aliased depth rediscovery", draw(nullptr, &aliased),
+              "depth discovery handed final acquisition a stencil proxy");
+      Require(name, "aliased depth survives",
+              aliased.image_id == aliased_id &&
+                  texture_cache.GetImage(aliased_id).usage.depth_target,
+              "rediscovery replaced the depth target instead of reusing it");
+      Require(name, "stencil owner rebind", draw(nullptr, &owner),
+              "the depth/stencil target did not rebind");
+      Require(name, "no proxy ping-pong",
+              !texture_cache.GetImage(aliased_id).depth_id &&
+                  texture_cache.FindImageFromRange(aliased_depth_address,
+                                                   stencil_size, false) ==
+                      proxy_id,
+              "re-associating the stencil hijacked the aliased depth target");
+
+      auto stencil_view = make_desc(BindingType::Texture, stencil_view_address,
+                                    vk::Format::eR8Uint,
+                                    Prospero::BufferFormat::k8UInt, 1);
+      const auto stencil_view_id = texture_cache.FindImage(stencil_view);
+      (void)texture_cache.FindTexture(stencil_view_id, stencil_view);
+      RenderDepthInfo second_owner{};
+      second_owner.desc =
+          make_depth(second_depth_address, {stencil_view_address, 0x10000});
+      Require(name, "stencil view owner draw", draw(nullptr, &second_owner),
+              "the second depth/stencil target did not bind");
+      Require(name, "stencil view adoption",
+              texture_cache.GetImage(stencil_view_id).depth_id ==
+                  second_owner.image_id,
+              "an 8-bit stencil view was not kept as the stencil proxy");
+
+      RenderColorInfo aliased_color{};
+      aliased_color.desc =
+          make_desc(BindingType::RenderTarget, stencil_view_address,
+                    vk::Format::eR8Uint, Prospero::BufferFormat::k8UInt, 1);
+      Require(name, "aliased color rediscovery", draw(&aliased_color, nullptr),
+              "color discovery handed final acquisition a stencil proxy");
+      Require(name, "retired stencil view",
+              aliased_color.image_id != stencil_view_id &&
+                  (TextureCacheTestAccess::Owner(texture_cache, stencil_view_id) ==
+                       nullptr ||
+                   !TextureCacheTestAccess::Owner(texture_cache, stencil_view_id)
+                        ->registered),
+              "binding the stencil address as a color target kept the proxy");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "stencil alias direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "stencil alias direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -32656,6 +32854,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-alias-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorStencilAliasRediscovery();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-only") == 0) {
     RunCase(nullptr, ImageStoreMipSelectsPpsa01340Descriptor());
     return 0;
@@ -32760,6 +32963,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
+  vulkan.CheckRenderExecutorStencilAliasRediscovery();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckLargeImageReadback();

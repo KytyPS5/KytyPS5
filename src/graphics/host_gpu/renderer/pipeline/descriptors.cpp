@@ -138,8 +138,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	// Raw copies can read memory last written through a render target or storage image too.
+	const bool read_image_backing = resource.formatted || resource.read;
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	                                                              read_image_backing, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;

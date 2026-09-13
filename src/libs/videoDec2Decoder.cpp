@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -78,6 +79,7 @@ public:
 
 	~Instance() {
 		ClearPictureMetadata();
+		av_frame_free(&m_pending_flush_frame);
 		if (m_sws != nullptr) {
 			sws_freeContext(m_sws);
 		}
@@ -190,17 +192,32 @@ public:
 		return decode_result;
 	}
 
-	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output) {
+	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output, bool drain) {
 		std::scoped_lock lock(m_mutex);
 		*output = {};
 
-		AVFrame* frame = av_frame_alloc();
+		const bool have_pending_frame = m_pending_flush_frame != nullptr;
+		AVFrame*   frame =
+		    have_pending_frame ? std::exchange(m_pending_flush_frame, nullptr) : av_frame_alloc();
 		if (frame == nullptr) {
 			return Result::ApiFail;
 		}
 
-		// Guest Flush collects available pictures between AUs while retaining reference frames.
-		const int receive_result = avcodec_receive_frame(m_codec, frame);
+		// Regular Flush retains reference frames between access units. Only an
+		// explicit end-of-stream drain sends the terminal packet to FFmpeg.
+		if (drain && !m_draining) {
+			const int send_result = avcodec_send_packet(m_codec, nullptr);
+			if (send_result == 0 || send_result == AVERROR_EOF) {
+				m_draining = true;
+			} else if (send_result != AVERROR(EAGAIN)) {
+				LOGF("Videodec2: flushing decoder failed: %s (%d)\n", AvErrorString(send_result),
+				     send_result);
+				av_frame_free(&frame);
+				return Result::ApiFail;
+			}
+		}
+
+		const int receive_result = have_pending_frame ? 0 : avcodec_receive_frame(m_codec, frame);
 		if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
 			av_frame_free(&frame);
 			return Result::Ok;
@@ -214,12 +231,29 @@ public:
 
 		const auto result = CopyFrame(frame, frame_buffer, output);
 		av_frame_free(&frame);
+		if (result == Result::Ok && m_draining) {
+			// Keep one decoded frame of lookahead so the final picture carries
+			// the stream-completion flag without requiring another guest buffer.
+			auto* next = av_frame_alloc();
+			if (next == nullptr) return Result::ApiFail;
+			const int next_result = avcodec_receive_frame(m_codec, next);
+			if (next_result == 0) {
+				m_pending_flush_frame = next;
+			} else {
+				av_frame_free(&next);
+				output->end_of_stream = next_result == AVERROR_EOF;
+				if (next_result != AVERROR_EOF && next_result != AVERROR(EAGAIN))
+					return Result::ApiFail;
+			}
+		}
 		return result;
 	}
 
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
+		av_frame_free(&m_pending_flush_frame);
+		m_draining = false;
 		ClearPictureMetadata();
 	}
 
@@ -343,7 +377,9 @@ private:
 
 	Config                    m_config;
 	AVCodecContext*           m_codec    = nullptr;
+	AVFrame*                  m_pending_flush_frame = nullptr;
 	SwsContext*               m_sws      = nullptr;
+	bool                      m_draining = false;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };
@@ -378,7 +414,11 @@ Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_b
 }
 
 Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
-	return instance->FlushOutput(frame_buffer, output);
+	return instance->FlushOutput(frame_buffer, output, false);
+}
+
+Result Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
+	return instance->FlushOutput(frame_buffer, output, true);
 }
 
 void Reset(Instance* instance) {

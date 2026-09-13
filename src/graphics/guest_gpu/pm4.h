@@ -15,7 +15,8 @@ class File;
 	 (((op) & 0xffu) << 8u) | (((r) & (Pm4::R_NUM - 1u)) << 2u))
 
 #define KYTY_PM4_R(cmd_id)   (((cmd_id) >> 2u) & (Pm4::R_NUM - 1u))
-#define KYTY_PM4_LEN(cmd_id) ((((cmd_id) >> 16u) & 0x3fffu) + 2u)
+// AGC's count=-1 NOP contains only its header.
+#define KYTY_PM4_LEN(cmd_id) ((cmd_id) == 0xffff1000u ? 1u : ((((cmd_id) >> 16u) & 0x3fffu) + 2u))
 
 namespace Libs::Graphics::Pm4 {
 

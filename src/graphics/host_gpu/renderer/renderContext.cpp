@@ -55,6 +55,9 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
+		return false;
+	}
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;

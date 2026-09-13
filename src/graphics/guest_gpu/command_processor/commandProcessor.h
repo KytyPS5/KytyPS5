@@ -99,6 +99,7 @@ public:
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
+	void DispatchIndirectAddress(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
@@ -129,7 +130,7 @@ public:
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
-	void             ProcessIndirectBuffer(std::span<const uint32_t> commands);
+	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain = false);
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
 

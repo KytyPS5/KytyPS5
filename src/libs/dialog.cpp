@@ -306,7 +306,10 @@ LIB_NAME("SaveDataDialog", "SaveDataDialog");
 
 constexpr int SAVE_STATUS_NONE        = 0;
 constexpr int SAVE_STATUS_INITIALIZED = 1;
+constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
+constexpr int SAVE_MODE_LIST          = 1;
+constexpr int SAVE_MODE_PROGRESS_BAR  = 5;
 constexpr int SAVE_RESULT_OK          = 0;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
 
@@ -386,9 +389,11 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 		auto* r      = static_cast<SaveDataDialogResult*>(result);
 		r->mode      = g_save_mode;
 		r->result    = SAVE_RESULT_OK;
-		r->button_id = SAVE_BUTTON_ID_OK;
+		r->button_id = g_save_mode == SAVE_MODE_LIST ? 0 : SAVE_BUTTON_ID_OK;
 		r->user_data = g_save_user_data;
-		if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
+		// An empty directory selects a new save. Clear the caller's output too,
+		// otherwise it can retain a directory from a previous dialog result.
+		if (r->dir_name != nullptr) {
 			std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
 			              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
 		}
@@ -431,7 +436,10 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		}
 	}
 
-	g_save_status = SAVE_STATUS_FINISHED;
+	// Progress dialogs stay open while the application performs the operation.
+	// Reporting FINISHED here makes clients reopen them instead of starting work.
+	g_save_status =
+	    g_save_mode == SAVE_MODE_PROGRESS_BAR ? SAVE_STATUS_RUNNING : SAVE_STATUS_FINISHED;
 
 	return OK;
 }

@@ -558,6 +558,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool min_lod_extension =
+	    HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod_features {};
+	if (min_lod_extension) {
+		min_lod_features.pNext    = supported_features2.pNext;
+		supported_features2.pNext = &min_lod_features;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
@@ -590,6 +597,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	graphics.image_view_min_lod_enabled = min_lod_extension && min_lod_features.minLod;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -672,6 +680,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	if (graphics.image_view_min_lod_enabled) {
+		min_lod_features.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext      = &min_lod_features;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1048,6 +1060,7 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		                             VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

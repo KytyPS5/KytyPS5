@@ -274,7 +274,7 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 
 class Swapchain final {
 public:
-	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, Unavailable };
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
@@ -316,7 +316,8 @@ struct Presenter::Impl {
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
-		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		frames.Initialize(swapchain.ImageCount() != 0 ? swapchain.ImageCount() : 3u,
+		                  swapchain.Format());
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -401,6 +402,9 @@ void Swapchain::Create() {
 		format = *it;
 	}
 	m_format                      = format.format;
+	// Minimized surfaces can have no drawable area. Keep the guest frame pool
+	// usable and defer swapchain creation until a later presentation attempt.
+	if (m_extent.width == 0 || m_extent.height == 0) return;
 	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
@@ -545,7 +549,12 @@ void Swapchain::Recreate(bool surface_lost) {
 }
 
 Swapchain::Status Swapchain::AcquireNextImage() {
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	if (m_handle == nullptr) {
+		m_window.RefreshSurfaceCapabilities();
+		Create();
+		if (m_handle == nullptr) return Status::Unavailable;
+	}
+	EXIT_IF(m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -771,6 +780,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	auto&      swapchain  = m_impl->swapchain;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
+		if (status == Swapchain::Status::Unavailable) {
+			m_impl->frames.Release(&frame, true);
+			return;
+		}
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
 			continue;

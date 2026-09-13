@@ -27,6 +27,46 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
 	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
+
+struct BackingPageProtection {
+	uint64_t begin;
+	uint64_t end;
+	DWORD    protection;
+};
+
+static bool CaptureBackingProtection(uint64_t vaddr, uint64_t size,
+                                     std::vector<BackingPageProtection>& ranges) {
+	const auto end = vaddr + size;
+	while (vaddr < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT) {
+			return false;
+		}
+		const auto next =
+		    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+		if (next <= vaddr) {
+			return false;
+		}
+		ranges.push_back({vaddr, next, info.Protect});
+		vaddr = next;
+	}
+	return true;
+}
+
+static bool RestoreBackingProtection(uint64_t vaddr, uint64_t size,
+                                     const std::vector<BackingPageProtection>& ranges) {
+	for (const auto& range: ranges) {
+		const auto begin    = std::max(vaddr, range.begin);
+		const auto end      = std::min(vaddr + size, range.end);
+		DWORD      previous = 0;
+		if (begin < end && VirtualProtect(reinterpret_cast<void*>(begin), end - begin,
+		                                  range.protection, &previous) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
 #endif
 
 class GuestBackingStore {
@@ -292,12 +332,21 @@ public:
 
 		std::vector<MapEntry> removed;
 		removed.reserve(targets.size());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::vector<BackingPageProtection> removed_protection;
+		if (!CaptureBackingProtection(vaddr, size, removed_protection)) {
+			return false;
+		}
+#endif
 		for (const auto& entry: targets) {
 			bool part_placeholder_preserved = false;
 			if (!UnmapOne(entry.vaddr, entry.size, &part_placeholder_preserved)) {
 				for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 					EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
 					                                     it->mode));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					EXIT_IF(!RestoreBackingProtection(it->vaddr, it->size, removed_protection));
+#endif
 				}
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = false;
@@ -316,6 +365,7 @@ public:
 			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
 				                                     it->mode));
+				EXIT_IF(!RestoreBackingProtection(it->vaddr, it->size, removed_protection));
 			}
 			return false;
 		}
@@ -376,6 +426,14 @@ public:
 		const uint64_t right_size = old_end - right_addr;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Splitting a file view recreates its surviving fragments. Their current page
+		// permissions include GPU cache watches and can differ from the original map mode.
+		std::vector<BackingPageProtection> protection;
+		if (!CaptureBackingProtection(old.vaddr, old.size, protection)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
+		}
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -396,6 +454,8 @@ public:
 				     ok;
 			}
 			if (ok) {
+				EXIT_IF(!RestoreBackingProtection(old.vaddr, left_size, protection));
+				EXIT_IF(!RestoreBackingProtection(right_addr, right_size, protection));
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -412,6 +472,7 @@ public:
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(
 			    !MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			EXIT_IF(!RestoreBackingProtection(old.vaddr, old.size, protection));
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
@@ -733,18 +794,56 @@ public:
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		// Splitting a backing view temporarily removes its surviving neighbours too.
+		// Serialize transfers with the entire address-space mapping transaction.
+		std::lock_guard lock(m_mutex);
 		return m_backing->TryWriteBacking(vaddr, data, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+		std::lock_guard lock(m_mutex);
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+		std::lock_guard lock(m_mutex);
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
-	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+	bool BackingContains(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_mutex);
+		return m_backing->Contains(vaddr, size);
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool IsHostAccessRestored(uint64_t vaddr, Graphics::PageFaultAccess access) {
+		// Splitting a Windows file view temporarily unmaps its surviving neighbours too.
+		// Wait for that transaction before deciding whether a guest fault needs GPU readback.
+		std::lock_guard lock(m_mutex);
+		if (!m_backing->Contains(vaddr, 1)) {
+			return false;
+		}
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) != 0) {
+			return false;
+		}
+		const auto protection = info.Protect & 0xffu;
+		switch (access) {
+			case Graphics::PageFaultAccess::Read:
+				return protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+				       protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+				       protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+			case Graphics::PageFaultAccess::Write:
+				return protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+				       protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+			case Graphics::PageFaultAccess::Execute:
+				return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+				       protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+			default: return false;
+		}
+	}
+#endif
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {

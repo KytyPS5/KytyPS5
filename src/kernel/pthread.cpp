@@ -17,14 +17,18 @@
 #include "loader/timer.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -373,8 +377,6 @@ struct PthreadAttrPrivate {
 	pthread_attr_t p;
 };
 
-struct PthreadCondPrivate;
-
 struct PthreadGuestData {
 	int32_t thread_id;
 	uint8_t reserved[4092];
@@ -398,7 +400,7 @@ struct PthreadPrivate {
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
 	uint64_t              cond_sequence = 0;
-	PthreadCondPrivate*   waiting_cond  = nullptr;
+	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
@@ -453,8 +455,6 @@ struct PthreadCondPrivate {
 	uint8_t                 reserved[256];
 	std::string             name;
 	std::mutex              m;
-	std::condition_variable cv;
-	uint64_t                sequence = 0;
 	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
 	std::vector<Pthread>    waiters;
 };
@@ -463,77 +463,40 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
-	thread->waiting_cond = cond;
 	cond->waiters.push_back(thread);
 }
 
-static bool CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
+static void CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
-	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
-	if (it == cond->waiters.end()) {
-		return false;
-	}
-
-	cond->waiters.erase(it);
-	if (thread->waiting_cond == cond) {
-		thread->waiting_cond = nullptr;
-	}
-	return true;
+	std::erase(cond->waiters, thread);
 }
 
-static bool CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
+static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 
 	if (thread == nullptr) {
 		if (cond->waiters.empty()) {
-			return false;
+			return;
 		}
 		thread = cond->waiters.front();
 	}
 
 	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
 	if (it == cond->waiters.end()) {
-		return false;
+		return;
 	}
 
 	cond->waiters.erase(it);
-	if (thread->waiting_cond == cond) {
-		thread->waiting_cond = nullptr;
-	}
 	thread->cond_sequence++;
-	return true;
-}
-
-static void CondClearWaiters(PthreadCondPrivate* cond) {
-	EXIT_IF(cond == nullptr);
-
-	for (auto* thread: cond->waiters) {
-		if (thread != nullptr && thread->waiting_cond == cond) {
-			thread->waiting_cond = nullptr;
-		}
-	}
-	cond->waiters.clear();
+	// Notify while holding cond->m so the selected waiter cannot exit and be freed first.
+	thread->cond_cv.notify_one();
 }
 
 void PthreadWakeForSignal(Pthread thread) {
-	if (thread == nullptr) {
-		return;
-	}
-
-	auto* cond = thread->waiting_cond;
-	if (cond == nullptr) {
-		return;
-	}
-
-	bool notify = false;
-	{
-		std::lock_guard lock(cond->m);
-		notify = (thread->waiting_cond == cond);
-	}
-	if (notify) {
-		cond->cv.notify_all();
+	if (thread != nullptr) {
+		thread->cond_cv.notify_one();
 	}
 }
 
@@ -612,34 +575,20 @@ private:
 	Common::Mutex                     m_mutex;
 };
 
-class PthreadKeys {
-public:
-	PthreadKeys() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PthreadKeys() { KYTY_NOT_IMPLEMENTED; }
-
-	KYTY_CLASS_NO_COPY(PthreadKeys);
-
-	bool Create(int* key, pthread_key_destructor_func_t destructor);
-	bool Delete(int key);
-	void Destruct(int thread_id);
-	bool Set(int key, int thread_id, void* data);
-	bool Get(int key, int thread_id, void** data);
-
-private:
-	struct Map {
-		int   thread_id = -1;
-		void* data      = nullptr;
-	};
-
-	struct Key {
-		bool                          used       = false;
-		pthread_key_destructor_func_t destructor = nullptr;
-		std::vector<Map>              specific_values;
-	};
-
-	Common::Mutex m_mutex;
-	Key           m_keys[KEYS_MAX];
+struct PthreadSpecificValue {
+	uint64_t generation = 0;
+	void*    data       = nullptr;
 };
+
+struct PthreadKeyState {
+	// Odd generations are allocated; deletion advances to the next even generation.
+	std::atomic<uint64_t>         generation {0};
+	pthread_key_destructor_func_t destructor = nullptr;
+};
+
+static std::array<PthreadKeyState, KEYS_MAX>                g_pthread_keys;
+static std::mutex                                           g_pthread_keys_mutex;
+static thread_local std::unique_ptr<PthreadSpecificValue[]> g_pthread_specific;
 
 class PthreadPool {
 public:
@@ -676,8 +625,6 @@ public:
 	void               SetPthreadPool(PthreadPool* pool) { m_pthread_pool = pool; }
 	PthreadStaticObjects* GetPthreadStaticObjects() { return m_pthread_static_objects; }
 	void SetPthreadStaticObjects(PthreadStaticObjects* objs) { m_pthread_static_objects = objs; }
-	PthreadKeys* GetPthreadKeys() { return m_pthread_keys; }
-	void         SetPthreadKeys(PthreadKeys* keys) { m_pthread_keys = keys; }
 
 	[[nodiscard]] thread_dtors_func_t GetThreadDtors() const { return m_thread_dtors; }
 	void SetThreadDtors(thread_dtors_func_t dtors) { m_thread_dtors = dtors; }
@@ -690,7 +637,6 @@ private:
 	PthreadAttr           m_default_attr           = nullptr;
 	PthreadPool*          m_pthread_pool           = nullptr;
 	PthreadStaticObjects* m_pthread_static_objects = nullptr;
-	PthreadKeys*          m_pthread_keys           = nullptr;
 
 	std::atomic<thread_dtors_func_t> m_thread_dtors = nullptr;
 };
@@ -1140,7 +1086,6 @@ void Initialize() {
 
 	g_pthread_context->SetPthreadStaticObjects(new PthreadStaticObjects);
 	g_pthread_context->SetPthreadPool(new PthreadPool);
-	g_pthread_context->SetPthreadKeys(new PthreadKeys);
 	Common::CondVar::SetWaitPollCallback(KernelDispatchPendingSignalForCurrentThread);
 
 	PthreadMutexattr  default_mutexattr  = nullptr;
@@ -1600,119 +1545,37 @@ void PthreadPool::FreeDetachedThreads() {
 	}
 }
 
-bool PthreadKeys::Create(int* key, pthread_key_destructor_func_t destructor) {
-	EXIT_IF(key == nullptr);
-
-	Common::LockGuard lock(m_mutex);
-
-	for (int index = 0; index < KEYS_MAX; index++) {
-		if (!m_keys[index].used) {
-			*key                     = index;
-			m_keys[index].used       = true;
-			m_keys[index].destructor = destructor;
-			m_keys[index].specific_values.clear();
-			return true;
-		}
+static void DestructPthreadSpecific() {
+	if (g_pthread_specific == nullptr) {
+		return;
 	}
 
-	return false;
-}
-
-bool PthreadKeys::Delete(int key) {
-	Common::LockGuard lock(m_mutex);
-
-	if (key < 0 || key >= KEYS_MAX || !m_keys[key].used) {
-		return false;
-	}
-
-	m_keys[key].used       = false;
-	m_keys[key].destructor = nullptr;
-	m_keys[key].specific_values.clear();
-
-	return true;
-}
-
-void PthreadKeys::Destruct(int thread_id) {
-	struct CallInfo {
-		pthread_key_destructor_func_t destructor;
-		void*                         data;
-	};
-
+	std::unique_lock lock(g_pthread_keys_mutex);
 	for (int iter = 0; iter < DESTRUCTOR_ITERATIONS; iter++) {
-		std::vector<CallInfo> delete_list;
-
-		{
-			Common::LockGuard lock(m_mutex);
-
-			for (auto& key: m_keys) {
-				if (key.used && key.destructor != nullptr) {
-					for (auto& v: key.specific_values) {
-						if (v.thread_id == thread_id && v.data != nullptr) {
-							delete_list.push_back(CallInfo {key.destructor, v.data});
-							v.data = nullptr;
-						}
-					}
-				}
+		bool called = false;
+		for (int index = 0; index < KEYS_MAX; index++) {
+			const auto value = std::exchange(g_pthread_specific[index], {});
+			if (value.data == nullptr) {
+				continue;
 			}
+
+			const auto& entry      = g_pthread_keys[index];
+			const auto  generation = entry.generation.load(std::memory_order_relaxed);
+			if ((generation & 1u) == 0 || generation != value.generation ||
+			    entry.destructor == nullptr) {
+				continue;
+			}
+			const auto destructor = entry.destructor;
+			lock.unlock();
+			destructor(value.data);
+			lock.lock();
+			called = true;
 		}
-
-		if (delete_list.empty()) {
-			return;
-		}
-
-		for (auto& d: delete_list) {
-			d.destructor(d.data);
-		}
-	}
-
-	Common::LockGuard lock(m_mutex);
-
-	for (auto& key: m_keys) {
-		auto& values = key.specific_values;
-		values.erase(std::remove_if(values.begin(), values.end(),
-		                            [thread_id](const Map& v) { return v.thread_id == thread_id; }),
-		             values.end());
-	}
-}
-
-bool PthreadKeys::Set(int key, int thread_id, void* data) {
-	Common::LockGuard lock(m_mutex);
-
-	if (key < 0 || key >= KEYS_MAX || !m_keys[key].used) {
-		return false;
-	}
-
-	for (auto& v: m_keys[key].specific_values) {
-		if (v.thread_id == thread_id) {
-			v.data = data;
-			return true;
+		if (!called) {
+			break;
 		}
 	}
-
-	m_keys[key].specific_values.push_back(Map({thread_id, data}));
-
-	return true;
-}
-
-bool PthreadKeys::Get(int key, int thread_id, void** data) {
-	EXIT_IF(data == nullptr);
-
-	Common::LockGuard lock(m_mutex);
-
-	if (key < 0 || key >= KEYS_MAX || !m_keys[key].used) {
-		return false;
-	}
-
-	for (auto& v: m_keys[key].specific_values) {
-		if (v.thread_id == thread_id) {
-			*data = v.data;
-			return true;
-		}
-	}
-
-	*data = nullptr;
-
-	return true;
+	g_pthread_specific.reset();
 }
 
 int KYTY_SYSV_ABI PthreadMutexattrInit(PthreadMutexattr* attr) {
@@ -2873,27 +2736,13 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		if (!(*cond)->waiters.empty()) {
-			(*cond)->sequence++;
-			CondClearWaiters(*cond);
-			notify = true;
-		}
+	std::lock_guard lock((*cond)->m);
+	for (auto* thread: (*cond)->waiters) {
+		thread->cond_sequence++;
+		thread->cond_cv.notify_one();
 	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond broadcast: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	(*cond)->waiters.clear();
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
@@ -2977,23 +2826,9 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		notify = CondWakeWaiter(*cond, nullptr);
-	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond signal: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	std::lock_guard lock((*cond)->m);
+	CondWakeWaiter(*cond, nullptr);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
@@ -3010,23 +2845,9 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		notify = CondWakeWaiter(*cond, thread);
-	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond signalto: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	std::lock_guard lock((*cond)->m);
+	CondWakeWaiter(*cond, thread);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
@@ -3055,7 +2876,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3068,9 +2888,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
-	auto       ready    = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -3086,7 +2904,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 			                            ? remaining
 			                            : std::chrono::steady_clock::duration(
 			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			cond_value->cv.wait_for(cond_lock, poll);
+			thread->cond_cv.wait_for(cond_lock, poll);
 
 			if (!ready()) {
 				cond_lock.unlock();
@@ -3147,7 +2965,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3159,9 +2976,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
 		const auto now = std::chrono::steady_clock::now();
@@ -3174,7 +2989,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		                            ? remaining
 		                            : std::chrono::steady_clock::duration(
 		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		cond_value->cv.wait_for(cond_lock, poll);
+		thread->cond_cv.wait_for(cond_lock, poll);
 
 		if (!ready()) {
 			cond_lock.unlock();
@@ -3226,7 +3041,6 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3238,12 +3052,10 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
-		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 		if (!ready()) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
@@ -3380,7 +3192,7 @@ static void CleanupThread(void* arg) {
 		thread_dtors();
 	}
 
-	g_pthread_context->GetPthreadKeys()->Destruct(thread->unique_id);
+	DestructPthreadSpecific();
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
@@ -4096,62 +3908,71 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 }
 
 int KYTY_SYSV_ABI PthreadKeyCreate(PthreadKey* key, pthread_key_destructor_func_t destructor) {
-	PRINT_NAME();
-
 	if (key == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	if (!g_pthread_context->GetPthreadKeys()->Create(key, destructor)) {
-		return KERNEL_ERROR_EAGAIN;
+	std::lock_guard lock(g_pthread_keys_mutex);
+	for (int index = 0; index < KEYS_MAX; index++) {
+		auto&      entry      = g_pthread_keys[index];
+		const auto generation = entry.generation.load(std::memory_order_relaxed);
+		if ((generation & 1u) == 0) {
+			entry.destructor = destructor;
+			entry.generation.store(generation + 1, std::memory_order_release);
+			*key = index;
+			return OK;
+		}
 	}
-
-	LOGF("\t destructor = %016" PRIx64 "\n"
-	     "\t key        = %d\n",
-	     reinterpret_cast<uint64_t>(destructor), *key);
-
-	return OK;
+	return KERNEL_ERROR_EAGAIN;
 }
 
 int KYTY_SYSV_ABI PthreadKeyDelete(PthreadKey key) {
-	PRINT_NAME();
-
-	LOGF("\t key = %d\n", key);
-
-	if (!g_pthread_context->GetPthreadKeys()->Delete(key)) {
+	if (key < 0 || key >= KEYS_MAX) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	std::lock_guard lock(g_pthread_keys_mutex);
+	auto&           entry      = g_pthread_keys[key];
+	const auto      generation = entry.generation.load(std::memory_order_relaxed);
+	if ((generation & 1u) == 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	entry.generation.store(generation + 1, std::memory_order_release);
+	entry.destructor = nullptr;
 	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadSetspecific(PthreadKey key, void* value) {
-	// PRINT_NAME();
-
-	int thread_id = Common::Thread::GetThreadIdUnique();
-
-	LOGF("\t key       = %d\n"
-	     "\t thread_id = %d\n"
-	     "\t value     = %016" PRIx64 "\n",
-	     key, thread_id, reinterpret_cast<uint64_t>(value));
-
-	if (!g_pthread_context->GetPthreadKeys()->Set(key, thread_id, value)) {
+	if (key < 0 || key >= KEYS_MAX) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
+	const auto generation = g_pthread_keys[key].generation.load(std::memory_order_acquire);
+	if ((generation & 1u) == 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (g_pthread_specific == nullptr) {
+		if (value == nullptr) {
+			return OK;
+		}
+		g_pthread_specific.reset(new (std::nothrow) PthreadSpecificValue[KEYS_MAX] {});
+		if (g_pthread_specific == nullptr) {
+			return KERNEL_ERROR_ENOMEM;
+		}
+	}
+	g_pthread_specific[key] = {generation, value};
 	return OK;
 }
 
 void* KYTY_SYSV_ABI PthreadGetspecific(PthreadKey key) {
-	int thread_id = Common::Thread::GetThreadIdUnique();
-
-	void* value = nullptr;
-
-	if (!g_pthread_context->GetPthreadKeys()->Get(key, thread_id, &value)) {
+	if (key < 0 || key >= KEYS_MAX || g_pthread_specific == nullptr) {
 		return nullptr;
 	}
-
-	return value;
+	const auto  generation = g_pthread_keys[key].generation.load(std::memory_order_acquire);
+	const auto& value      = g_pthread_specific[key];
+	if ((generation & 1u) != 0 && generation == value.generation) {
+		return value.data;
+	}
+	return nullptr;
 }
 
 } // namespace LibKernel
@@ -4581,15 +4402,11 @@ int KYTY_SYSV_ABI pthread_key_delete(LibKernel::PthreadKey key) {
 }
 
 int KYTY_SYSV_ABI pthread_setspecific(LibKernel::PthreadKey key, void* value) {
-	PRINT_NAME();
-
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadSetspecific(key, value));
 }
 
 void* KYTY_SYSV_ABI pthread_getspecific(LibKernel::PthreadKey key) {
-	PRINT_NAME();
-
-	return (LibKernel::PthreadGetspecific(key));
+	return LibKernel::PthreadGetspecific(key);
 }
 
 int KYTY_SYSV_ABI pthread_mutex_destroy(LibKernel::PthreadMutex* mutex) {

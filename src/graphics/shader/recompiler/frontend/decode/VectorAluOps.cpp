@@ -139,6 +139,7 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x5cu, Opcode::V_CEIL_F16},
     {0x5du, Opcode::V_TRUNC_F16},
     {0x5eu, Opcode::V_RNDNE_F16},
+    {0x5fu, Opcode::V_FRACT_F16},
     {0x60u, Opcode::V_SIN_F16},
     {0x61u, Opcode::V_COS_F16},
 };
@@ -192,6 +193,7 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x5cu, Opcode::V_CEIL_F16},
     {0x5du, Opcode::V_TRUNC_F16},
     {0x5eu, Opcode::V_RNDNE_F16},
+    {0x5fu, Opcode::V_FRACT_F16},
     {0x60u, Opcode::V_SIN_F16},
     {0x61u, Opcode::V_COS_F16},
 };
@@ -233,6 +235,7 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xa9u, Opcode::V_CMP_LT_U16},         {0xaau, Opcode::V_CMP_EQ_U16},
     {0xabu, Opcode::V_CMP_LE_U16},         {0xacu, Opcode::V_CMP_GT_U16},
     {0xadu, Opcode::V_CMP_NE_U16},         {0xaeu, Opcode::V_CMP_GE_U16},
+    {0xb9u, Opcode::V_CMPX_LT_U16, false},
     {0xbcu, Opcode::V_CMPX_GT_U16},        {0xc0u, Opcode::V_CMP_F_U32},
     {0xc1u, Opcode::V_CMP_LT_U32},         {0xc2u, Opcode::V_CMP_EQ_U32},
     {0xc3u, Opcode::V_CMP_LE_U32},         {0xc4u, Opcode::V_CMP_GT_U32},
@@ -479,6 +482,7 @@ bool IsVop1FloatSourceOpcode(Opcode opcode) {
 		case Opcode::V_CEIL_F16:
 		case Opcode::V_TRUNC_F16:
 		case Opcode::V_RNDNE_F16:
+		case Opcode::V_FRACT_F16:
 		case Opcode::V_SIN_F16:
 		case Opcode::V_COS_F16:
 		case Opcode::V_SIN_F32:
@@ -547,6 +551,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_TRUNC_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
     {Opcode::V_RNDNE_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
+     SdwaSelWords() | SdwaSelFull(), true},
+    {Opcode::V_FRACT_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
     {Opcode::V_SIN_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
@@ -773,6 +779,7 @@ bool IsVop1FloatResultOpcode(Opcode opcode) {
 		case Opcode::V_CEIL_F16:
 		case Opcode::V_TRUNC_F16:
 		case Opcode::V_RNDNE_F16:
+		case Opcode::V_FRACT_F16:
 		case Opcode::V_SIN_F16:
 		case Opcode::V_COS_F16:
 		case Opcode::V_SIN_F32:
@@ -1434,6 +1441,7 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_GE_U32:
 		case Opcode::V_CMPX_NE_I64:
 		case Opcode::V_CMPX_NE_U64:
+		case Opcode::V_CMPX_LT_U16:
 		case Opcode::V_CMPX_GT_U16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:

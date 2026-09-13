@@ -33,6 +33,7 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
     {0x33u, Opcode::S_PACK_LH_B32_B16}, {0x34u, Opcode::S_PACK_HH_B32_B16},
     {0x35u, Opcode::S_MUL_HI_U32},
+    {0x36u, Opcode::S_MUL_HI_I32},
 };
 
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {

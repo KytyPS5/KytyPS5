@@ -1,29 +1,17 @@
+#include "gpu_tiler_standard.inc"
 uint standard64_offset(uvec2 p) {
 	uint x = p.x, y = p.y;
+	uint offset = standard_offset(p);
 	switch (ELEMENT_BYTES) {
-	case 1: return (x & 0x0fu) ^ ((x << 5) & 0x200u) ^ ((x << 6) & 0x800u) ^
-	               ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^
-	               ((y << 4) & 0x1f0u) ^ ((y << 5) & 0x400u) ^
-	               ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u);
-	case 2: return ((x << 1) & 0x00eu) ^ ((x << 4) & 0x080u) ^
-	               ((x << 5) & 0x200u) ^ ((x << 6) & 0x800u) ^
-	               ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^
-	               ((y << 4) & 0x070u) ^ ((y << 5) & 0x100u) ^
-	               ((y << 6) & 0x400u) ^ ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u);
-	case 4: return ((x << 2) & 0x00cu) ^ ((x << 5) & 0x080u) ^
-	               ((x << 6) & 0x200u) ^ ((x << 7) & 0x800u) ^
-	               ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^
-	               ((y << 4) & 0x070u) ^ ((y << 5) & 0x100u) ^
-	               ((y << 6) & 0x400u) ^ ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u);
-	case 8: return ((x << 3) & 0x008u) ^ ((x << 5) & 0x0c0u) ^
-	               ((x << 6) & 0x200u) ^ ((x << 7) & 0x800u) ^
-	               ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^
-	               ((y << 4) & 0x030u) ^ ((y << 6) & 0x100u) ^
-	               ((y << 7) & 0x400u) ^ ((y << 8) & 0x1000u) ^ ((y << 9) & 0x4000u);
-	default: return ((x << 6) & 0x0c0u) ^ ((x << 7) & 0x200u) ^
-	                ((x << 8) & 0x800u) ^ ((x << 9) & 0x2000u) ^
-	                ((x << 10) & 0x8000u) ^ ((y << 4) & 0x030u) ^
-	                ((y << 6) & 0x100u) ^ ((y << 7) & 0x400u) ^
-	                ((y << 8) & 0x1000u) ^ ((y << 9) & 0x4000u);
+	case 1: return offset ^ ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^
+	                       ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u);
+	case 2: return offset ^ ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u) ^
+	                       ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u);
+	case 4: return offset ^ ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^
+	                       ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u);
+	case 8: return offset ^ ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^
+	                       ((y << 8) & 0x1000u) ^ ((y << 9) & 0x4000u);
+	default: return offset ^ ((x << 9) & 0x2000u) ^ ((x << 10) & 0x8000u) ^
+	                        ((y << 8) & 0x1000u) ^ ((y << 9) & 0x4000u);
 	}
 }

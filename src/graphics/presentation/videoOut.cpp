@@ -1152,7 +1152,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 
 	if (Config::GraphicsDebugDumpEnabled() &&
-	    Config::GetPrintfDirection() != Config::OutputDirection::Silent) {
+	    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 		LOGF("Flip done: %d\n", r.index);
 	}
 

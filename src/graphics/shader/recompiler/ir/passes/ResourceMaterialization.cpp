@@ -235,12 +235,6 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 	}
 }
 
-uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
-	return descriptor.Stride() == 0u
-	           ? descriptor.NumRecords()
-	           : static_cast<uint64_t>(descriptor.Stride()) * descriptor.NumRecords();
-}
-
 bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
 	return runtime.read_specialization_memory != nullptr &&
 	       runtime.read_specialization_memory(runtime.userdata, address, &word);
@@ -256,7 +250,7 @@ bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynam
                           uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
 	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
 	const auto aligned     = byte_offset & ~uint64_t {3};
-	const auto size        = ScalarBufferSize(descriptor);
+	const auto size        = descriptor.GetSize();
 	if (aligned > size || size - aligned < sizeof(uint32_t)) {
 		word = 0;
 		return true;
@@ -498,15 +492,15 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	const auto period      = uint64_t {1} << 32u;
 	const auto step        = std::gcd<uint64_t>(indirect.selector_stride, period);
 	const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
-	const auto size        = ScalarBufferSize(material);
+	const auto size        = material.GetSize();
 	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
 	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
 	if (probe_count > MaxIndirectImageProbes) {
 		return note("material table is too large to enumerate");
 	}
 
-	MakeRangeReadable(runtime, material.Base48() & ~uint64_t {3}, ScalarBufferSize(material));
-	MakeRangeReadable(runtime, heap.Base48() & ~uint64_t {3}, ScalarBufferSize(heap));
+	MakeRangeReadable(runtime, material.Base48() & ~uint64_t {3}, material.GetSize());
+	MakeRangeReadable(runtime, heap.Base48() & ~uint64_t {3}, heap.GetSize());
 	std::vector<uint32_t>        keys {0u};
 	std::unordered_set<uint32_t> seen {0u};
 	keys.reserve(static_cast<size_t>(probe_count) + 1u);

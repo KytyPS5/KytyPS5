@@ -316,10 +316,6 @@ struct PipelineCache::ProgramCache {
 		SetVulkanObjectNameF(device, module, "Kyty.Shader.{}[0x{:016x}]", stage_name,
 		                     options.shader_hash);
 		if (options.dump_ir) {
-			if (!options.early_dump) {
-				LOGF("%s decoded RDNA2:\n%s", options.dump_label, result.decoded_dump.c_str());
-				LOGF("%s IR:\n%s", options.dump_label, result.ir_dump.c_str());
-			}
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
@@ -403,7 +399,7 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
 		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
 		static const bool kLowerWideMovrels = [] {
 			std::string id;
@@ -412,13 +408,12 @@ struct PipelineCache::ProgramCache {
 		options.lower_wide_movrels = kLowerWideMovrels;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
-		options.scratch_dwords = input_info.scratch_size_dwords;
+
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
 			if (stage == ShaderType::Mesh) {
 				options.user_data_base = 0;
 				options.wave_size      = input_info.mesh.wave_size;
-				options.scratch_dwords = input_info.mesh.scratch_size_dwords;
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
@@ -710,7 +705,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -750,6 +745,16 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
+		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		static_params.color_srcblend[i]       = bc.color_srcblend;
+		static_params.color_comb_fcn[i]       = bc.color_comb_fcn;
+		static_params.color_destblend[i]      = bc.color_destblend;
+		static_params.alpha_srcblend[i]       = bc.alpha_srcblend;
+		static_params.alpha_comb_fcn[i]       = bc.alpha_comb_fcn;
+		static_params.alpha_destblend[i]      = bc.alpha_destblend;
+		static_params.separate_alpha_blend[i] = bc.separate_alpha_blend;
+		static_params.blend_enable[i]         = bc.enable && !rt.info.blend_bypass;
 	}
 	const bool with_depth =
 	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
@@ -809,19 +814,6 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 
-	for (uint32_t i = 0; i < color_count; i++) {
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		static_params.color_srcblend[i]       = bc.color_srcblend;
-		static_params.color_comb_fcn[i]       = bc.color_comb_fcn;
-		static_params.color_destblend[i]      = bc.color_destblend;
-		static_params.alpha_srcblend[i]       = bc.alpha_srcblend;
-		static_params.alpha_comb_fcn[i]       = bc.alpha_comb_fcn;
-		static_params.alpha_destblend[i]      = bc.alpha_destblend;
-		static_params.separate_alpha_blend[i] = bc.separate_alpha_blend;
-		static_params.blend_enable[i]         = bc.enable;
-		static_params.blend_bypass[i]         = rt.info.blend_bypass;
-	}
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
@@ -880,8 +872,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 }
 
 PipelineCache::Pipeline&
-PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
-                                     const ShaderProgram&          compute_program) {
+PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                  const ShaderProgram&          compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

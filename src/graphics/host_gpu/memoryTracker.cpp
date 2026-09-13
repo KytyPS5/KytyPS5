@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/memoryTracker.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 
 namespace Libs::Graphics {
@@ -8,9 +9,6 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
-	for (size_t i = 0; i < REGION_COUNT; i++) {
-		m_regions[i].store(nullptr, std::memory_order_relaxed);
-	}
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -34,8 +32,8 @@ void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr,
 void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                               const char* operation) {
 	ValidateRange(vaddr, size);
-	const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-	const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
 		const bool has_dirty_bytes = dirty.Intersects(page, TRACKER_PAGE_SIZE);
 		if (IsRegionGpuModified(page, TRACKER_PAGE_SIZE) != has_dirty_bytes) {

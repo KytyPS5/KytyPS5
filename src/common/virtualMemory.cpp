@@ -50,8 +50,8 @@ bool FreeRange(uint64_t address, uint64_t size) {
 	return SysVirtualFreeRange(address, size);
 }
 
-bool Protect(uint64_t address, uint64_t size, Mode mode, Mode* old_mode) {
-	return SysVirtualProtect(address, size, mode, old_mode);
+bool Protect(uint64_t address, uint64_t size, Mode mode) {
+	return SysVirtualProtect(address, size, mode);
 }
 
 bool FlushInstructionCache(uint64_t address, uint64_t size) {

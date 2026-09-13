@@ -12,6 +12,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -196,16 +197,22 @@ void TestRangeSet() {
             !ranges.Intersects(0x1100, 0x100) &&
             !ranges.Intersects(0x1240, 1),
         "range set intersection did not preserve half-open boundaries");
-  auto intersections = ranges.Intersections(0x1070, 0x1b0);
-  Check(intersections.size() == 2 && intersections[0].address == 0x1070 &&
-            intersections[0].size == 0x90 &&
-            intersections[1].address == 0x1200 && intersections[1].size == 0x20,
+  std::vector<std::pair<uint64_t, uint64_t>> intersections;
+  ranges.ForEachInRange(0x1070, 0x1b0, [&](uint64_t start, uint64_t end) {
+    intersections.emplace_back(start, end);
+  });
+  Check(intersections.size() == 2 && intersections[0].first == 0x1070 &&
+            intersections[0].second == 0x1100 &&
+            intersections[1].first == 0x1200 && intersections[1].second == 0x1220,
         "range set did not merge and intersect exact byte ranges");
   ranges.Subtract(0x1040, 0x1e0);
-  intersections = ranges.Intersections(0x1000, 0x300);
-  Check(intersections.size() == 2 && intersections[0].address == 0x1000 &&
-            intersections[0].size == 0x40 &&
-            intersections[1].address == 0x1220 && intersections[1].size == 0x20,
+  intersections.clear();
+  ranges.ForEachInRange(0x1000, 0x300, [&](uint64_t start, uint64_t end) {
+    intersections.emplace_back(start, end);
+  });
+  Check(intersections.size() == 2 && intersections[0].first == 0x1000 &&
+            intersections[0].second == 0x1040 &&
+            intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
 }
 
@@ -436,7 +443,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
         "disjoint byte dirtiness duplicated the page watcher");
 
   exact_dirty.Subtract(address + 64, 16);
-  if (exact_dirty.Intersections(address, page_size).empty()) {
+  if (!exact_dirty.Intersects(address, page_size)) {
     tracker.UnmarkRegionAsGpuModified(address, page_size);
   }
   Check(g_protection_calls == 1 &&
@@ -445,7 +452,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
         "draining one exact interval prematurely released its shared page");
 
   exact_dirty.Subtract(address + 192, 32);
-  if (exact_dirty.Intersections(address, page_size).empty()) {
+  if (!exact_dirty.Intersects(address, page_size)) {
     tracker.UnmarkRegionAsGpuModified(address, page_size);
   }
   Check(g_protection_calls == 2 &&
@@ -471,28 +478,31 @@ void TestGpuDownloadProtectionMirrors() {
   tracker.MarkRegionAsGpuModified(address + 16, 32);
   tracker.MarkRegionAsGpuModified(address + page_size * 2 + 16, 32);
 
-  std::vector<RangeSet::Range> visited;
+  std::vector<std::pair<uint64_t, uint64_t>> visited;
   ResetProtectionLog();
   tracker.ForEachDownloadRange<false>(
       address, page_size * 3,
       [&](uint64_t range_address, uint64_t range_size) noexcept {
         visited.push_back({range_address, range_size});
       });
-  Check(visited.size() == 2 && visited[0].address == address &&
-            visited[0].size == page_size &&
-            visited[1].address == address + page_size * 2 &&
-            visited[1].size == page_size && g_protection_calls == 0 &&
+  Check(visited.size() == 2 && visited[0].first == address &&
+            visited[0].second == page_size &&
+            visited[1].first == address + page_size * 2 &&
+            visited[1].second == page_size && g_protection_calls == 0 &&
             tracker.IsRegionGpuModified(address, page_size * 3),
         "non-clearing download changed protection or lost sparse ranges");
 
   visited.clear();
+  bool protected_during_download = false;
   tracker.ForEachDownloadRange<true>(
       address + 16, 32,
       [&](uint64_t range_address, uint64_t range_size) noexcept {
+        protected_during_download = Protection(memory) == PAGE_NOACCESS;
         visited.push_back({range_address, range_size});
       });
-  Check(visited.size() == 1 && visited[0].address == address &&
-            visited[0].size == page_size && g_protection_log.size() == 1 &&
+  Check(protected_during_download && visited.size() == 1 &&
+            visited[0].first == address &&
+            visited[0].second == page_size && g_protection_log.size() == 1 &&
             g_protection_log[0].address == address &&
             g_protection_log[0].size == page_size &&
             g_protection_log[0].mode == Common::VirtualMemory::Mode::Read &&
@@ -634,11 +644,14 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   std::binary_semaphore finish_download{0};
   std::binary_semaphore mutation_finished{0};
   std::jthread downloader([&] {
-    tracker.ForEachDownloadRange<false>(allocation_base, page_size,
-                                        [&](uint64_t, uint64_t) noexcept {
-                                          download_entered.release();
-                                          finish_download.acquire();
-                                        });
+    tracker.ForEachDownloadRange<false>(
+        allocation_base, second_region + page_size - allocation_base,
+        [&](uint64_t address, uint64_t) noexcept {
+          if (address == allocation_base) {
+            download_entered.release();
+            finish_download.acquire();
+          }
+        });
   });
   download_entered.acquire();
   std::jthread mutation([&] {

@@ -138,6 +138,9 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_LT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThan32, false, false);
 			return true;
+		case O::V_CMPX_LT_U16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThan32, false, true);
+			return true;
 		case O::V_CMP_LE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThanEqual32, false, false);
 			return true;
@@ -370,6 +373,7 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CEIL_F16: return Float16Unary(inst, IR::ValueOpcode::FPCeil32, false);
 		case O::V_TRUNC_F16: return Float16Unary(inst, IR::ValueOpcode::FPTrunc32, false);
 		case O::V_RNDNE_F16: return Float16Unary(inst, IR::ValueOpcode::FPRoundEven32, false);
+		case O::V_FRACT_F16: return Float16Unary(inst, IR::ValueOpcode::FPFract32, false);
 		case O::V_SIN_F16: return Float16Trig(inst, IR::ValueOpcode::FPSin);
 		case O::V_COS_F16: return Float16Trig(inst, IR::ValueOpcode::FPCos);
 		case O::V_MIN3_F16: return Float16Ternary(inst, IR::ValueOpcode::FPMinTri32, false, false);

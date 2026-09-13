@@ -56,8 +56,7 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase,
-                           const std::string& reason) {
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
@@ -71,7 +70,7 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     CFG::FailureKindToString(cfg.failure_kind).c_str(), cfg.failure_block, start, end,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
-	     static_cast<uint64_t>(cfg.back_edges.size()), reason.c_str());
+	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
 }
 
 enum class EmbeddedFetchValueType {
@@ -558,11 +557,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (cfg.irreducible) {
 		dispatcher_fallback = true;
 		dispatcher_reason   = cfg.unsupported_reason;
-		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
+		LogDispatcherFallback(options, cfg, "build");
 	} else {
-		const auto unstructured_cfg = cfg;
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+		const auto unstructured_cfg = cfg;
 		// Structurize can report success while still leaving a conditional branch without a
 		// merge block. The emitter then writes OpBranchConditional with no OpSelectionMerge in
 		// front of it, which is invalid SPIR-V ("Selection must be structured") -- and nothing
@@ -592,7 +591,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			dispatcher_reason        = cfg.unsupported_reason;
 			const auto failure_kind  = cfg.failure_kind;
 			const auto failure_block = cfg.failure_block;
-			LogDispatcherFallback(options, cfg, "structurize", dispatcher_reason);
+			LogDispatcherFallback(options, cfg, "structurize");
 			cfg                    = unstructured_cfg;
 			cfg.unsupported        = true;
 			cfg.failure_kind       = failure_kind;
@@ -609,25 +608,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
 	}
 
-	const ShaderVertexInputInfo*  vertex  = nullptr;
-	const ShaderPixelInputInfo*   pixel   = nullptr;
-	const ShaderComputeInputInfo* compute = nullptr;
-	switch (options.stage) {
-		case ShaderType::Vertex:
-		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
-		case ShaderType::Pixel:
-			pixel = options.input_info.pixel;
-			break;
-		case ShaderType::Compute:
-			compute = options.input_info.compute;
-			break;
-		default: break;
-	}
 	EmbeddedFetchData embedded_fetch;
-	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
-		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, options.user_data_base,
-		                                           static_cast<uint32_t>(options.user_data.size()),
-		                                           options.wave_size);
+	if (options.stage == ShaderType::Vertex && options.input_info.vertex != nullptr &&
+	    options.input_info.vertex->fetch_embedded) {
+		embedded_fetch = DetectEmbeddedVertexFetch(
+		    decoded, options.input_info.vertex, options.user_data_base,
+		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
 			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(embedded_fetch.loads.size()));
@@ -639,15 +625,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .shader_hash         = options.shader_hash,
 	    .user_data_base      = options.user_data_base,
 	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
-	    .scratch_dwords      = options.scratch_dwords,
 	    .dispatcher_fallback = dispatcher_fallback,
 	    .lower_wide_movrels  = options.lower_wide_movrels,
 	    .cfg_failure_kind    = cfg.failure_kind,
 	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
 	                                                    : dispatcher_reason,
-	    .vertex              = vertex,
-	    .pixel               = pixel,
-	    .compute             = compute,
+	    .input_info          = options.input_info,
 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
@@ -714,24 +697,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 
-	const ShaderVertexInputInfo*  vertex  = nullptr;
-	const ShaderPixelInputInfo*   pixel   = nullptr;
-	const ShaderComputeInputInfo* compute = nullptr;
-	switch (options.stage) {
-		case ShaderType::Vertex:
-		case ShaderType::Mesh: vertex = options.input_info.vertex; break;
-		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
-		case ShaderType::Compute: compute = options.input_info.compute; break;
-		default: EXIT("invalid shader stage\n");
-	}
-
-	IR::ShaderInfoOptions info_options;
-	info_options.vertex  = vertex;
-	info_options.pixel   = pixel;
-	info_options.compute = compute;
-	IR::CollectShaderInfo(ir, info_options);
+	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword);
-	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
@@ -741,11 +708,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	}
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
 	     static_cast<uint64_t>(spirv.size()),
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)

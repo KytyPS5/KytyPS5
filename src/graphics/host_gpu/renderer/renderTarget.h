@@ -84,14 +84,6 @@ struct PipelineStencilDynamicState {
 
 #pragma pack(pop)
 
-inline constexpr bool stencil_face_accesses_attachment(const PipelineStencilStaticState&  state,
-                                                       const PipelineStencilDynamicState& dynamic) {
-	return state.compareOp != vk::CompareOp::eAlways ||
-	       (dynamic.writeMask != 0 &&
-	        (state.failOp != vk::StencilOp::eKeep || state.passOp != vk::StencilOp::eKeep ||
-	         state.depthFailOp != vk::StencilOp::eKeep));
-}
-
 static_assert(std::is_trivially_copyable_v<PipelineStencilStaticState>);
 static_assert(std::is_standard_layout_v<PipelineStencilStaticState>);
 static_assert(alignof(PipelineStencilStaticState) == 1);

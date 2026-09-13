@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -266,9 +267,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
-	}
+	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -284,12 +285,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
 	}
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
-	}
+	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -312,11 +313,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			}
 		});
 		for (const auto association: associations) {
-			auto& associated = m_slot_images[association];
-			if (associated.IsGpuModified()) {
-				associated.ClearGpuModified();
-			}
-			DeleteImage(association);
+			FreeImage(association);
 		}
 	}
 	if (image->IsGpuModified()) {
@@ -443,7 +440,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
-	const auto address = (begin + TRACKER_PAGE_SIZE) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
 	image.track_addr   = address;
 	if (image.track_addr == image.track_addr_end) {
@@ -460,7 +457,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
-	const auto address   = end & ~(TRACKER_PAGE_SIZE - 1);
+	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
 	image.track_addr_end = address;
 	if (image.track_addr == image.track_addr_end) {
@@ -494,10 +491,10 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	}
 
 	ImageIds result;
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+	ForEachPage(address, size, [&](uint64_t page) {
 		const auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr) {
-			continue;
+			return;
 		}
 		owners->ForEach([&](ImageId id) {
 			auto* image = m_slot_images.try_get(id);
@@ -512,7 +509,7 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 				result.push_back(id);
 			}
 		});
-	}
+	});
 	return result;
 }
 
@@ -958,7 +955,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	return expanded_id;
 }
 
-struct TextureCache::TextureTransferPlan {
+struct TextureCache::TextureTransfer {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
 	std::vector<GpuTileInfo>         tiles;
@@ -974,13 +971,13 @@ struct TextureCache::TextureTransferPlan {
 	}
 };
 
-struct TextureCache::DownloadPlan {
-	TextureTransferPlan texture;
+struct TextureCache::ImageDownload {
+	TextureTransfer texture;
 	bool                depth_target = false;
 	bool                valid        = false;
 };
 
-TextureCache::TextureTransferPlan
+TextureCache::TextureTransfer
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
                                     TransferDirection direction) const {
 	const auto& info             = image.info;
@@ -993,8 +990,8 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	bool        allow_depth_tile = upload;
 	const char* owner            = "TextureCache readback";
 
-	TextureTransferPlan plan;
-	plan.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
+	TextureTransfer transfer;
+	transfer.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
 	if (render_target) {
 		format = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
 	}
@@ -1024,44 +1021,44 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 		}
 	}
 
-	plan.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
+	transfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
-	plan.regions = TextureBuildImageCopies(plan.layout);
+	transfer.regions = TextureBuildImageCopies(transfer.layout);
 	if (info.IsDepth()) {
-		for (auto& region: plan.regions) {
+		for (auto& region: transfer.regions) {
 			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
 		}
 	}
-	if (plan.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
-		if (!TextureBuildGpuTileInfos(info.data.size, plan.regions, plan.layout,
-		                              info.resources.levels, plan.tiles)) {
-			return plan;
+	if (transfer.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
+		if (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
+		                              info.resources.levels, transfer.tiles)) {
+			return transfer;
 		}
 	}
-	plan.valid = true;
-	return plan;
+	transfer.valid = true;
+	return transfer;
 }
 
-TextureCache::DownloadPlan TextureCache::BuildDownload(const Image& image) const {
+TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) const {
 	const auto&  info    = image.info;
 	const auto   binding = UploadBinding(image);
-	DownloadPlan plan {.depth_target = binding == BindingType::DepthTarget};
+	ImageDownload transfer {.depth_target = binding == BindingType::DepthTarget};
 	if (info.samples != 1 || image.backing.samples != 1) {
-		return plan;
+		return transfer;
 	}
-	if (plan.depth_target) {
-		plan.valid = IsSupportedDepthPlaneReadback(info) && info.resources.layers != 0 &&
+	if (transfer.depth_target) {
+		transfer.valid = IsSupportedDepthPlaneReadback(info) && info.resources.layers != 0 &&
 		             info.data.size % info.resources.layers == 0 &&
 		             Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
-		return plan;
+		return transfer;
 	}
 	if (info.metadata.compression != VideoOutCompression::Uncompressed) {
-		return plan;
+		return transfer;
 	}
-	plan.texture = BuildTextureTransfer(image, binding, TransferDirection::Download);
-	plan.valid   = plan.texture.valid;
-	return plan;
+	transfer.texture = BuildTextureTransfer(image, binding, TransferDirection::Download);
+	transfer.valid   = transfer.texture.valid;
+	return transfer;
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
@@ -1075,26 +1072,26 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	};
 
 	if (binding != BindingType::DepthTarget) {
-		auto plan = BuildTextureTransfer(image, binding, TransferDirection::Upload);
-		if (!plan.valid) {
+		auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+		if (!transfer.valid) {
 			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
 			     "pitch=%u levels=%u layers=%u samples=%u\n",
 			     static_cast<uint32_t>(binding), info.data.address, info.data.size,
 			     static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
-			     static_cast<uint32_t>(plan.layout.surface.texture.block.family), info.extent.width,
+			     static_cast<uint32_t>(transfer.layout.surface.texture.block.family), info.extent.width,
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
-		if (!plan.tiles.empty()) {
+		if (!transfer.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        plan.LinearSize(), plan.tiles);
+			                        transfer.LinearSize(), transfer.tiles);
 		}
-		if (plan.swap_bgra16) {
+		if (transfer.swap_bgra16) {
 			linear = m_tiler.SwapBgra16(linear);
 		}
-		upload(plan.regions, linear);
+		upload(transfer.regions, linear);
 		return;
 	}
 
@@ -1497,9 +1494,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
 			if (!image.info.data.Empty()) {
-				if (!image.registered || image.depth_id) {
-					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
-				}
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
@@ -1786,12 +1780,12 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	             destination_offset, info.data.size, tiles);
 }
 
-void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
-                                     uint64_t destination_size, DownloadPlan plan) {
-	if (!plan.valid) {
-		EXIT("TextureCache: invalid image download plan\n");
+void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+                                     uint64_t destination_size, ImageDownload transfer) {
+	if (!transfer.valid) {
+		EXIT("TextureCache: invalid image download transfer\n");
 	}
-	if (plan.depth_target) {
+	if (transfer.depth_target) {
 		if (destination_size != image.info.data.size) {
 			EXIT("TextureCache: partial depth image download is unsupported\n");
 		}
@@ -1799,7 +1793,7 @@ void TextureCache::DownloadImageData(Image& image, Buffer& destination, uint64_t
 		return;
 	}
 
-	auto&      texture   = plan.texture;
+	auto&      texture   = transfer.texture;
 	const auto transform = texture.swap_bgra16 ? TileManager::ColorTransform::SwapBgra16
 	                                           : TileManager::ColorTransform::None;
 	if (texture.tiles.empty()) {
@@ -1860,15 +1854,15 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (copy_size == 0) {
 		return false;
 	}
-	auto plan = m_texture_cache.BuildDownload(image);
-	if (!plan.valid) {
+	auto transfer = m_texture_cache.BuildDownload(image);
+	if (!transfer.valid) {
 		return false;
 	}
-	if (plan.depth_target && copy_size != image.info.data.size) {
+	if (transfer.depth_target && copy_size != image.info.data.size) {
 		return false;
 	}
-	if (!plan.depth_target && levels < image.info.resources.levels) {
-		auto& texture = plan.texture;
+	if (!transfer.depth_target && levels < image.info.resources.levels) {
+		auto& texture = transfer.texture;
 		std::erase_if(texture.regions, [levels](const vk::BufferImageCopy& region) {
 			return region.imageSubresource.mipLevel >= levels;
 		});
@@ -1883,17 +1877,17 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			}
 		}
 	}
-	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));
+	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
 	return true;
 }
 
-bool TextureCache::TryDownloadImage(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
 	}
-	auto plan = BuildDownload(image);
-	if (!plan.valid || !SafeToDownload(image)) {
+	auto transfer = BuildDownload(image);
+	if (!transfer.valid || !SafeToDownload(image)) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -1909,7 +1903,7 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImageData(image, download, offset, range.size, std::move(plan));
+	DownloadImage(image, download, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -1969,8 +1963,8 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
-	const auto page_begin = address & ~(TRACKER_PAGE_SIZE - 1);
-	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
@@ -2107,10 +2101,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		if (owner->IsGpuModified()) {
-			owner->ClearGpuModified();
-		}
-		DeleteImage(id);
+		FreeImage(id);
 	}
 }
 
@@ -2153,12 +2144,11 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !pressured) {
 					continue;
 				}
-				if (safe && !TryDownloadImage(id)) {
+				if (safe && !DownloadImageMemory(id)) {
 					continue;
 				}
-				owner->ClearGpuModified();
 			}
-			DeleteImage(id);
+			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
@@ -2180,7 +2170,7 @@ void TextureCache::ProcessDownloadImages() {
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);
 		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
-			(void)TryDownloadImage(id);
+			(void)DownloadImageMemory(id);
 		}
 	}
 	m_download_images.clear();

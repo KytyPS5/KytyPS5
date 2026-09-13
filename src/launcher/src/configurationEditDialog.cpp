@@ -110,9 +110,9 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
-		        auto log = TextToEnum<Configuration::ShaderLogDirection>(text);
+		        auto log = TextToEnum<Configuration::LogDirection>(text);
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
-		            log == Configuration::ShaderLogDirection::File);
+		            log == Configuration::LogDirection::File);
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
@@ -222,7 +222,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
-	                                             Configuration::ShaderLogDirection::File);
+	                                             Configuration::LogDirection::File);
 	m_ui->checkBox_cmd_dump->setChecked(info.command_buffer_dump_enabled);
 	m_ui->lineEdit_cmd_dump_folder->setText(info.command_buffer_dump_folder);
 	m_ui->lineEdit_cmd_dump_folder->setEnabled(info.command_buffer_dump_enabled);
@@ -230,7 +230,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setText(info.printf_output_file);
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
-	ListInit(m_ui->comboBox_profiler_direction, info.profiler_direction);
+	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -357,7 +357,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 #endif
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
-	info.shader_log_direction = TextToEnum<Configuration::ShaderLogDirection>(
+	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
 	info.command_buffer_dump_enabled = ui.checkBox_cmd_dump->isChecked();
@@ -365,8 +365,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.printf_direction =
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
 	info.printf_output_file = ui.lineEdit_printf_file->text();
-	info.profiler_direction =
-	    TextToEnum<Configuration::ProfilerDirection>(ui.comboBox_profiler_direction->currentText());
+	info.profiler_enabled = ui.checkBox_profiler->isChecked();
 }
 
 void ConfigurationEditDialog::update_info() {

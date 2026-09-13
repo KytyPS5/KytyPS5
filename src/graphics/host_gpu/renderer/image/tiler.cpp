@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
@@ -221,7 +222,7 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 
 	const uint64_t uniform_alignment =
 	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, 1);
-	const uint64_t stride = (sizeof(Push) + uniform_alignment - 1) & ~(uniform_alignment - 1);
+	const uint64_t stride = Common::AlignUp<uint64_t>(sizeof(Push), uniform_alignment);
 	EXIT_NOT_IMPLEMENTED(dispatches.size() > UINT64_MAX / stride);
 	const uint64_t bytes  = dispatches.size() * stride;
 	auto [mapped, offset] = m_stream_buffer.Map(bytes, uniform_alignment);
@@ -287,12 +288,12 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_descriptor_offset = source_offset & ~(descriptor_alignment - 1);
-	const uint64_t target_descriptor_offset = target_offset & ~(descriptor_alignment - 1);
+	const uint64_t source_descriptor_offset = Common::AlignDown(source_offset, descriptor_alignment);
+	const uint64_t target_descriptor_offset = Common::AlignDown(target_offset, descriptor_alignment);
 	const uint64_t source_base              = source_offset - source_descriptor_offset;
 	const uint64_t target_base              = target_offset - target_descriptor_offset;
-	const uint64_t source_range             = (source_base + source_capacity + 3u) & ~uint64_t {3};
-	const uint64_t target_range             = (target_base + target_capacity + 3u) & ~uint64_t {3};
+	const uint64_t source_range             = Common::AlignUp(source_base + source_capacity, 4);
+	const uint64_t target_range             = Common::AlignUp(target_base + target_capacity, 4);
 	EXIT_NOT_IMPLEMENTED(source_range > limits.maxStorageBufferRange ||
 	                     target_range > limits.maxStorageBufferRange || target_offset % 4 != 0 ||
 	                     target_capacity % 4 != 0);
@@ -372,7 +373,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
-	auto scratch = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
+	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(scratch);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
 	       true);
@@ -406,7 +407,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	// Reserve all stream parameters before creating a scheduler-lived scratch dependency:
 	// StreamBuffer::Map is allowed to submit the current tick when it wraps.
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches);
-	auto linear = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
+	auto linear = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(linear);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Result source {linear.buffer, 0, linear.size};
@@ -418,7 +419,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
-	auto scratch = AllocateScratch((size + 3u) & ~uint64_t {3});
+	auto scratch = AllocateScratch(Common::AlignUp(size, 4));
 	DeferDestroy(scratch);
 	return {scratch.buffer, 0, scratch.size};
 }
@@ -426,11 +427,11 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
 TileManager::StorageBinding TileManager::BindStorage(Result buffer, uint64_t size) const {
 	const auto& limits            = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto  alignment         = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const auto  descriptor_offset = buffer.offset - buffer.offset % alignment;
+	const auto  descriptor_offset = Common::AlignDown(buffer.offset, alignment);
 	const auto  base              = buffer.offset - descriptor_offset;
 	EXIT_IF(buffer.buffer == nullptr || size == 0 || buffer.size < size || base > UINT32_MAX ||
 	        size > UINT64_MAX - base || base + size > UINT64_MAX - 3);
-	const auto range = (base + size + 3) & ~uint64_t {3};
+	const auto range = Common::AlignUp(base + size, 4);
 	EXIT_IF(range > limits.maxStorageBufferRange || range > UINT32_MAX);
 	return {{buffer.buffer, descriptor_offset, range}, static_cast<uint32_t>(base)};
 }
@@ -512,8 +513,8 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	const auto target_required = required(layout.height, layout.layers, layout.target_row_stride,
 	                                      layout.target_slice_stride, target_active);
 	EXIT_IF(source_required > UINT64_MAX - 3 || target_required > UINT64_MAX - 3);
-	const auto source_barrier_size = (source_required + 3) & ~uint64_t {3};
-	const auto target_barrier_size = (target_required + 3) & ~uint64_t {3};
+	const auto source_barrier_size = Common::AlignUp(source_required, 4);
+	const auto target_barrier_size = Common::AlignUp(target_required, 4);
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();

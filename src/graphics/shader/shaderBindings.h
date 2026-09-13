@@ -44,6 +44,10 @@ struct ShaderBufferResource {
 	[[nodiscard]] uint16_t Stride() const { return (fields[1] >> 16u) & 0x3FFFu; }
 	[[nodiscard]] bool     SwizzleEnabled() const { return ((fields[1] >> 31u) & 0x1u) == 1; }
 	[[nodiscard]] uint32_t NumRecords() const { return fields[2]; }
+	[[nodiscard]] uint64_t GetSize() const {
+		// The 14-bit stride and 32-bit record count require a 64-bit product.
+		return Stride() == 0 ? NumRecords() : static_cast<uint64_t>(Stride()) * NumRecords();
+	}
 	[[nodiscard]] uint8_t  DstSelX() const { return (fields[3] >> 0u) & 0x7u; }
 	[[nodiscard]] uint8_t  DstSelY() const { return (fields[3] >> 3u) & 0x7u; }
 	[[nodiscard]] uint8_t  DstSelZ() const { return (fields[3] >> 6u) & 0x7u; }

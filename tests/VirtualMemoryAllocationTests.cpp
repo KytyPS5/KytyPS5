@@ -102,7 +102,7 @@ void InitSubsystems() {
 	subsystems.Initialize<Config::Lifecycle>();
 
 	Config::ConfigOptions options;
-	options.printf_direction = Config::OutputDirection::Silent;
+	options.printf_direction = Config::LogDirection::Silent;
 	Config::Load(options);
 
 	subsystems.Initialize<Log::Lifecycle>();
@@ -1147,23 +1147,13 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(middle)");
 
-	Common::VirtualMemory::Mode old_left {};
-	Common::VirtualMemory::Mode old_right {};
-	Check(test,
-	      Common::VirtualMemory::Protect(base, SceKernelPageSize,
-	                                     Common::VirtualMemory::Mode::ReadWrite, &old_left),
-	      "could not inspect left-page protection");
-	Check(test,
-	      Common::VirtualMemory::Protect(base + SceKernelPageSize * 2, SceKernelPageSize,
-	                                     Common::VirtualMemory::Mode::ReadWrite, &old_right),
-	      "could not inspect right-page protection");
-	Check(test, old_left == Common::VirtualMemory::Mode::ReadWrite,
-	      "partial unmap changed the left neighbor protection");
-	Check(test, old_right == Common::VirtualMemory::Mode::ReadWrite,
-	      "partial unmap changed the right neighbor protection");
-	*reinterpret_cast<uint64_t*>(base) = 0x4c45465450524f54ull; // "LEFTPROT"
-	*reinterpret_cast<uint64_t*>(base + SceKernelPageSize * 2) =
-	    0x5247485450524f54ull; // "RGHTPROT"
+	// Access the neighbors without changing their host permissions first.
+	auto* left  = reinterpret_cast<volatile uint64_t*>(base);
+	auto* right = reinterpret_cast<volatile uint64_t*>(base + SceKernelPageSize * 2);
+	*left       = 0x4c45465450524f54ull; // "LEFTPROT"
+	*right      = 0x5247485450524f54ull; // "RGHTPROT"
+	Check(test, *left == 0x4c45465450524f54ull, "partial unmap changed the left neighbor access");
+	Check(test, *right == 0x5247485450524f54ull, "partial unmap changed the right neighbor access");
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
 	        "KernelReleaseDirectMemory");

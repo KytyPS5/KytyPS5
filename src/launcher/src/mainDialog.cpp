@@ -247,7 +247,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
-	args << "--profiler-direction" << EnumToText(info.profiler_direction);
+	if (info.profiler_enabled) {
+		args << "--profile";
+	}
 	args << "--spirv-debug-printf" << "false";
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {

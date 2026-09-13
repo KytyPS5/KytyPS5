@@ -31,8 +31,7 @@
 namespace Common {
 
 static pthread_mutex_t              g_virtual_mutex {};
-static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
-static std::map<uintptr_t, int>*    g_protects = nullptr;
+static std::map<uintptr_t, size_t>* g_allocs = nullptr;
 
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
@@ -46,8 +45,7 @@ void SysVirtualInit() {
 	pthread_mutex_init(&g_virtual_mutex, &attr);
 	pthread_mutexattr_destroy(&attr);
 
-	g_allocs   = new std::map<uintptr_t, size_t>;
-	g_protects = new std::map<uintptr_t, int>;
+	g_allocs = new std::map<uintptr_t, size_t>;
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -66,21 +64,6 @@ static int get_protection_flag(VirtualMemory::Mode mode) {
 		default: protect = PROT_NONE; break;
 	}
 	return protect;
-}
-
-static VirtualMemory::Mode get_protection_flag(int mode) {
-	switch (mode) {
-		case PROT_NONE: return VirtualMemory::Mode::NoAccess;
-		case PROT_READ: return VirtualMemory::Mode::Read;
-		case PROT_WRITE: return VirtualMemory::Mode::Write;
-		case PROT_READ | PROT_WRITE: return VirtualMemory::Mode::ReadWrite; // NOLINT
-		case PROT_EXEC: return VirtualMemory::Mode::Execute;
-		case PROT_EXEC | PROT_WRITE: return VirtualMemory::Mode::ExecuteWrite; // NOLINT
-		case PROT_EXEC | PROT_READ: return VirtualMemory::Mode::ExecuteRead;   // NOLINT
-		case PROT_EXEC | PROT_WRITE | PROT_READ:
-			return VirtualMemory::Mode::ExecuteReadWrite; // NOLINT
-		default: return VirtualMemory::Mode::NoAccess;
-	}
 }
 
 // Keep automatic mappings inside the guest and GPU-addressable low window.
@@ -161,11 +144,6 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		uintptr_t page_start = ret_addr >> 12u;
-		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = protect;
-		}
 		pthread_mutex_unlock(&g_virtual_mutex);
 	}
 
@@ -251,11 +229,6 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	record_alloc(ret_addr, size);
-	uintptr_t page_start = ret_addr >> 12u;
-	uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-	for (uintptr_t page = page_start; page <= page_end; page++) {
-		(*g_protects)[page] = protect;
-	}
 	pthread_mutex_unlock(&g_virtual_mutex);
 
 	return ret_addr;
@@ -337,11 +310,6 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		uintptr_t page_start = ret_addr >> 12u;
-		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = protect;
-		}
 		pthread_mutex_unlock(&g_virtual_mutex);
 
 		return true;
@@ -516,18 +484,7 @@ bool SysVirtualFree(uint64_t address) {
 		return false;
 	}
 
-	if (munmap(reinterpret_cast<void*>(addr), size) == 0) {
-		uintptr_t page_start = addr >> 12u;
-		uintptr_t page_end   = (addr + size - 1) >> 12u;
-		pthread_mutex_lock(&g_virtual_mutex);
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			g_protects->erase(page);
-		}
-		pthread_mutex_unlock(&g_virtual_mutex);
-		return true;
-	}
-
-	return false;
+	return munmap(reinterpret_cast<void*>(addr), size) == 0;
 }
 
 bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
@@ -582,40 +539,16 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	if (end < alloc_end) {
 		(*g_allocs)[end] = alloc_end - end;
 	}
-	for (uintptr_t page = addr >> 12u; page <= (end - 1u) >> 12u; page++) {
-		g_protects->erase(page);
-	}
 	pthread_mutex_unlock(&g_virtual_mutex);
 	return true;
 }
 
-bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                       VirtualMemory::Mode* old_mode) {
-	auto addr = static_cast<uintptr_t>(address);
-
-	pthread_mutex_lock(&g_virtual_mutex);
-	if (old_mode != nullptr) {
-		if (auto s = g_protects->find(addr >> 12u); s != g_protects->end()) {
-			*old_mode = get_protection_flag(s->second);
-		} else {
-			*old_mode = VirtualMemory::Mode::NoAccess;
-		}
-	}
-	pthread_mutex_unlock(&g_virtual_mutex);
-
-	uintptr_t page_start = addr >> 12u;
-	uintptr_t page_end   = (addr + size - 1) >> 12u;
-	if (mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
-	             get_protection_flag(mode)) == 0) {
-		pthread_mutex_lock(&g_virtual_mutex);
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = get_protection_flag(mode);
-		}
-		pthread_mutex_unlock(&g_virtual_mutex);
-		return true;
-	}
-
-	return false;
+bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	const auto addr       = static_cast<uintptr_t>(address);
+	const auto page_start = addr >> 12u;
+	const auto page_end   = (addr + size - 1) >> 12u;
+	return mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
+	                get_protection_flag(mode)) == 0;
 }
 
 bool SysVirtualFlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {

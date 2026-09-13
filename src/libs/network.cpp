@@ -2025,21 +2025,26 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
-	int64_t result = 0;
+	sockaddr_storage host_addr {};
+	SocketLength     host_addrlen = sizeof(host_addr);
+	int64_t          result       = 0;
 	if (addr == nullptr) {
 		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
 	} else {
-		sockaddr_storage host_addr {};
-		SocketLength     host_addrlen = sizeof(host_addr);
 		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
 		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
-		if (result >= 0 &&
-		    ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
-			return -1;
-		}
 	}
+#if defined(_WIN32)
+	if (result < 0 && WSAGetLastError() == WSAEMSGSIZE) {
+		// Winsock copied the datagram prefix; POSIX reports its length as success.
+		result = host_len;
+	}
+#endif
 	if (result < 0) {
 		return SetHostSocketError();
+	}
+	if (addr != nullptr && ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
+		return -1;
 	}
 
 	return result;

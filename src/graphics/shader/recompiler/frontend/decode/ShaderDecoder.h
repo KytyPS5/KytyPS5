@@ -738,6 +738,9 @@ void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t wor
 void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const char* reason);
 std::string OperandToString(const Operand& operand);
 const char* ImageDimensionToString(ImageDimension dimension);
+
+// On an atomic, GLC returns the pre-operation value in VDATA and carries no cache meaning.
+bool GlcSelectsAtomicReturnValue(Opcode opcode);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
 

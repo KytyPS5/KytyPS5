@@ -1,6 +1,13 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstring>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+bool CoherentBufferAccess(const IR::MemoryInfo& mem) {
+	// Not mem.glc: the frontend already dropped the bit on atomics, where it has no cache meaning.
+	return mem.cache_bypass;
+}
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.program.bindings.UsesPushData()) {
@@ -129,11 +136,17 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
+			// glc=1 goes through the Coherent alias; glc=0 traffic stays on the plain variable.
+			const auto coherent =
+			    CoherentBufferAccess(mem) && state.storage_buffer_coherent_variable != 0;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			    state, mem,
+			    coherent ? state.storage_buffer_coherent_variable : state.storage_buffer_variable,
+			    TypeStorageBufferPointer(state));
 			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
 			                                    ConstantU32(state, 2u));
 			access.add_index_offset = true;
+			access.coherent         = CoherentBufferAccess(mem);
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));

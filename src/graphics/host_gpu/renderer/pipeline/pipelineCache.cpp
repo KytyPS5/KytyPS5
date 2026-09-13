@@ -26,6 +26,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -37,6 +38,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -189,8 +191,29 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+	// Coherent rather than merely clean: a GPU-driven pass sizes its own output from a
+	// count an earlier dispatch wrote, and refusing that word drops the whole shader.
+	if (value == nullptr) {
+		return false;
+	}
+	return Libs::LibKernel::Memory::TryReadGpuCoherentBacking(address, value, sizeof(*value));
+}
+
+// The reader the descriptor evaluator uses for every raw read. It prefers the coherent
+// path, which drains and downloads a range the GPU still owns, and otherwise falls back
+// to the plain dereference the evaluator did before there was a reader at all - so a
+// range the coherent path cannot serve behaves exactly as it used to, and no shader
+// that resolved yesterday stops resolving today.
+bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, uint32_t* value) {
+	if (value == nullptr) {
+		return false;
+	}
+	if (Libs::LibKernel::Memory::TryReadGpuCoherentBacking(address, value,
+	                                                       sizeof(*value))) {
+		return true;
+	}
+	std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -209,6 +232,21 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+}
+
+const char* ShaderStageName(ShaderType stage) {
+	const char* name = nullptr;
+	switch (stage) {
+		case ShaderType::Vertex: name = "vs"; break;
+		case ShaderType::Mesh: name = "ms"; break;
+		case ShaderType::Local: name = "ls"; break;
+		case ShaderType::TessellationControl: name = "hs"; break;
+		case ShaderType::TessellationEvaluation: name = "ds"; break;
+		case ShaderType::Pixel: name = "ps"; break;
+		case ShaderType::Compute: name = "cs"; break;
+		default: EXIT("invalid pipeline shader stage\n");
+	}
+	return name;
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
@@ -445,6 +483,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		// Set instead of `handle` when the backend refused the program.
+		std::string                                  reason;
 	};
 
 	struct SourceEntry {
@@ -456,6 +496,56 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
 	};
+
+	static const char* StageShortName(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return "vs";
+			case ShaderType::Mesh: return "ms";
+			case ShaderType::Pixel: return "ps";
+			case ShaderType::Compute: return "cs";
+			default: return "unknown";
+		}
+	}
+
+	// A shader whose descriptors cannot be derived is dropped, not fatal: the draw is lost, the
+	// session is not. Report each distinct hash once so a per-frame skip does not flood the log.
+	// Permanent: the recompiler rejected the program, so no later dispatch can do better.
+	void ReportSkipped(ShaderType stage, uint64_t hash, uint32_t pc, std::string_view reason) {
+		skipped_shaders.insert(hash);
+		if (!reported_shaders.insert(hash).second) {
+			return;
+		}
+		if (reason.empty()) {
+			reason = "descriptor materialization failed";
+		}
+		PipelineCacheLog("shader resources unavailable, skipping draws: hash=0x{:016x} "
+		                 "stage={} pc=0x{:08x} {}",
+		                 hash, StageShortName(stage), pc, reason);
+	}
+
+	// Transient: materialization re-executes the descriptor chain against guest memory on every
+	// dispatch, so a failure describes this dispatch, not the shader. The draw is dropped and the
+	// next dispatch tries again - the plan is already cached, so the retry is cheap. Recording it
+	// as permanent would let one unlucky dispatch disable the shader for the whole run.
+	void ReportUnmaterialized(ShaderType stage, uint64_t hash) {
+		if (!reported_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("shader resources unavailable, skipping this dispatch: "
+		                 "hash=0x{:016x} stage={} descriptor materialization failed",
+		                 hash, StageShortName(stage));
+	}
+
+	// A hardware ray-tracing intersect lowered to a constant miss: the shader runs, but its
+	// traced results are fabricated. Report each distinct hash once so the log says so.
+	void ReportStubbed(ShaderType stage, uint64_t hash) {
+		if (!stubbed_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("hardware ray tracing stubbed to a permanent miss: hash=0x{:016x} "
+		                 "stage={}",
+		                 hash, StageShortName(stage));
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -480,20 +570,20 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		const char* stage_name = nullptr;
-		switch (options.stage) {
-			case ShaderType::Vertex: stage_name = "vs"; break;
-			case ShaderType::Mesh: stage_name = "ms"; break;
-			case ShaderType::Local: stage_name = "ls"; break;
-			case ShaderType::TessellationControl: stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: stage_name = "ds"; break;
-			case ShaderType::Pixel: stage_name = "ps"; break;
-			case ShaderType::Compute: stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
-		}
+		const char* stage_name = ShaderStageName(options.stage);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		// Dump before the rejection returns: a shader the backend refused is exactly the one worth
+		// looking at, and its decoded ISA is already in hand here.
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		if (!result.status.ok) {
+			// The backend refused the program. Hand back a permutation with no module; the caller
+			// reports it once and drops the shader's draws.
+			Permutation rejected;
+			rejected.specialization = std::move(specialization);
+			rejected.reason         = std::move(result.status.reason);
+			return rejected;
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -530,6 +620,12 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		// A shader already rejected once is rejected for good: skip it before paying for another
+		// translation, which would otherwise repeat on every dispatch.
+		if (skipped_shaders.contains(params.hash)) {
+			return {};
+		}
+
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
@@ -541,11 +637,16 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryPermissive,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			// Call unconditionally: EXIT_IF drops its argument under KYTY_FINAL.
+			if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
+			                                               resources, specialization)) {
+				ReportUnmaterialized(stage, params.hash);
+				return {};
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -601,14 +702,42 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		// A rejected recompile leaves no usable program: a CFG-build rejection returns an empty
+		// one, and resource tracking rewrites the program in place so a rejected pass leaves it
+		// half-written - extracting a plan from that indexes past the end of a resource list.
+		// Checked before the cache branch because the other arm falls through to
+		// CompilePermutation, which would emit SPIR-V from the same unusable program.
+		if (!translated.status.ok) {
+			// A shader refused this early never reaches CompilePermutation, so dump its ISA here
+			// instead: a descriptor chain the host cannot re-execute is read off the ISA.
+			DumpShaderOriginal(ShaderStageName(stage), params.hash, params.code,
+			                   translated.decoded_dump);
+			ReportSkipped(stage, params.hash, translated.status.pc, translated.status.reason);
+			return {};
+		}
+		if (translated.program.uses_bvh_intersect_stub) {
+			ReportStubbed(stage, params.hash);
+		}
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
+			// A rejected plan is still cached: MaterializeResources fails on it again, so later
+			// draws take the cheap cached path instead of re-translating the shader every time.
+			const bool materialized = ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization);
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			if (!materialized) {
+				ReportUnmaterialized(stage, params.hash);
+				return {};
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		if (!entry->second.permutations.back().handle) {
+			auto rejected = std::move(entry->second.permutations.back());
+			entry->second.permutations.pop_back();
+			ReportSkipped(stage, params.hash, 0, rejected.reason);
+			return {};
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -642,6 +771,11 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<uint64_t>                                skipped_shaders;
+	// Log throttle only: a hash here has been reported once, whether the cause was permanent or
+	// transient. Kept apart from skipped_shaders so a transient failure does not disable a shader.
+	std::unordered_set<uint64_t>                                reported_shaders;
+	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -897,6 +1031,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		if (!result.pixel) {
+			return {};
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);

@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {

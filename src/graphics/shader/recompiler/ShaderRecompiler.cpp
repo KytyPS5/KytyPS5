@@ -542,6 +542,23 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+	// A shader the CFG builder cannot model - an undecodable instruction, a branch into nothing -
+	// is dropped, not fatal. Only a build failure sets unsupported here: the irreducible path
+	// clears it inside BuildGraph, and the structurizer has not run yet.
+	if (cfg.unsupported) {
+		LOGF("%s CFG build rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32 " %s\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, cfg.failure_pc,
+		     cfg.unsupported_reason.c_str());
+		TranslateResult result;
+		result.status.ok     = false;
+		result.status.pc     = cfg.failure_pc;
+		result.status.reason = cfg.unsupported_reason;
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.cfg_dump     = CFG::GraphToString(cfg);
+		}
+		return result;
+	}
 	if (cfg.irreducible) {
 		LogDispatcherFallback(options, cfg, "build");
 	} else {
@@ -604,9 +621,20 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
-	IR::EliminateDeadCode(ir.blocks);
+	auto tracking = IR::TrackResources(ir);
 	TranslateResult result;
+	if (!tracking.ok) {
+		LOGF("%s resource tracking rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32
+		     " %s\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, tracking.pc,
+		     tracking.reason.c_str());
+		result.status.ok     = false;
+		result.status.pc     = tracking.pc;
+		result.status.reason = std::move(tracking.reason);
+		result.program       = std::move(ir);
+		return result;
+	}
+	IR::EliminateDeadCode(ir.blocks);
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);

@@ -423,11 +423,27 @@ void TestSharedIntegerRuntimeDependencies() {
                               RuntimeValueType::Integer),
         "integer-only dependency acceptance was reused as uniform acceptance");
 
+  const auto lane_first =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {inactive, active});
+  Check(ValidateRuntimeValue(fixture.program, lane_first, RuntimeValueType::Integer),
+        "shared lane-dependent uniform chain was rejected");
+
+  const auto undefined = fixture.Emit(ValueOpcode::UndefU32);
+  const auto guarded_arm =
+      fixture.Emit(ValueOpcode::IAdd32, {inactive, undefined});
+  const auto guarded = fixture.Emit(
+      ValueOpcode::SelectU32, {active, Value(42u), guarded_arm});
+  const auto guarded_first =
+      fixture.Emit(ValueOpcode::ReadFirstLane, {guarded, active});
   const auto other_active =
       fixture.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
   const auto other_first =
-      fixture.Emit(ValueOpcode::ReadFirstLane, {selected, other_active});
-  const auto both = fixture.Emit(ValueOpcode::IAdd32, {first, other_first});
+      fixture.Emit(ValueOpcode::ReadFirstLane, {guarded, other_active});
+  Check(ValidateRuntimeValue(fixture.program, guarded_first,
+                             RuntimeValueType::Integer),
+        "undefined operand behind the inactive arm was rejected");
+  const auto both =
+      fixture.Emit(ValueOpcode::IAdd32, {guarded_first, other_first});
   Check(!ValidateRuntimeValue(fixture.program, both, RuntimeValueType::Integer),
         "uniform acceptance was reused across different execution masks");
 

@@ -63,6 +63,8 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	// glc read as a cache hint; false on an atomic, where the bit names the return value.
+	bool                    cache_bypass                                          = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    planning_only                                         = false;
@@ -447,6 +449,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool                             writes_dma         = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -471,9 +474,23 @@ struct DescriptorSource {
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
-	std::array<Value, 8>         dwords {};
-	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	// A buffer V# the shader loads out of a descriptor table it indexes with a wave-uniform
+	// selector. The table's own V# is CPU-derivable; only the record index is not, so the host
+	// enumerates the records instead of re-executing the selector.
+	struct IndirectBuffer {
+		uint32_t heap_source     = 0;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+		uint32_t record_offset   = 0;
+		uint32_t key_arg         = 0;
+
+		bool operator==(const IndirectBuffer& other) const = default;
+	};
+
+	std::array<Value, 8>          dwords {};
+	uint32_t                      dword_count = 0;
+	std::optional<IndirectImage>  indirect_image;
+	std::optional<IndirectBuffer> indirect_buffer;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -525,6 +542,9 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
+	// Kept with the plan, not only with the translated program: the host walk re-executes a
+	// readfirstlane once per lane, so it needs the wave the shader was compiled for.
+	uint32_t                      wave_size       = 64;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
@@ -551,7 +571,6 @@ struct Program: ResourcePlan {
 
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
-	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	// Set when a hardware ray-tracing intersect was lowered to a constant miss. Purely
@@ -577,6 +596,29 @@ void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+// Why a loop-carried phi has no single entry value. Reported so the log can tell a self-contained
+// cycle apart from a merge of two different entry values: the first needs a runtime descriptor,
+// the second only needs the two operands proved equivalent.
+enum class CyclicPhiReject {
+	None,
+	// Every operand of every phi in the web leads back into the web, so the loop is entered with
+	// no value the host could stand in for.
+	NoEntry,
+	// Two operands enter the web from outside and are not equivalent, so this is a merge rather
+	// than a loop and no single host binding stands for it.
+	Merge,
+};
+
+// On Merge, the two operands that disagree, so a caller can name them instead of only the phi.
+struct CyclicPhiFailure {
+	CyclicPhiReject reason = CyclicPhiReject::None;
+	Value           entry;
+	Value           other;
+};
+
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out = nullptr,
+                            CyclicPhiFailure*         reject  = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

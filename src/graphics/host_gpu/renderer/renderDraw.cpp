@@ -877,7 +877,8 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+// False when a stage's descriptors could not be derived. The draw is then dropped.
+static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -906,13 +907,22 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	for (uint32_t i = 0; i < state.programs.VertexStageCount(); i++) {
+		if (!state.programs.vertex[i] || !state.vertex_info[i].stage) {
+			return false;
+		}
+	}
+	return !state.ps_active || (static_cast<bool>(state.programs.pixel) &&
+	                            static_cast<bool>(state.ps_input_info.stage));
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
-	RefreshShaders(buffer, draw, state);
+	if (!RefreshShaders(buffer, draw, state)) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

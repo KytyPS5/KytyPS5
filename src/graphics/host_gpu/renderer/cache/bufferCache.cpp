@@ -93,6 +93,13 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
+		m_bda_tracked_ranges.ForEachInRange(
+		    buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
+			    for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+				    addresses[(page - buffer.CpuAddress()) >> CACHING_PAGEBITS] |=
+				        BDA_STORE_TRACKED_BIT;
+			    }
+		    });
 		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
@@ -674,6 +681,64 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
+	if ((vaddr & (CACHING_PAGESIZE - 1)) != 0 || size == 0 ||
+	    (size & (CACHING_PAGESIZE - 1)) != 0 || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: BDA fault range must be page aligned\n");
+	}
+	RangeSet stored;
+	RangeSet missing;
+	for (auto page = vaddr; page < vaddr + size; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		(owner != nullptr && *owner ? stored : missing).Add(page, CACHING_PAGESIZE);
+	}
+	stored.ForEach([this](uint64_t begin, uint64_t end) {
+		m_bda_tracked_ranges.Add(begin, end - begin);
+		m_bda_unmarked_ranges.Add(begin, end - begin);
+	});
+	missing.ForEach([this](uint64_t begin, uint64_t end) { (void)FindBuffer(begin, end - begin); });
+	stored.ForEach([this](uint64_t begin, uint64_t end) {
+		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				continue;
+			}
+			const auto&             buffer = m_slot_buffers[*owner];
+			const vk::DeviceAddress entry =
+			    (buffer.BufferDeviceAddress() + (page - buffer.CpuAddress())) |
+			    BDA_STORE_TRACKED_BIT;
+			WriteDataBuffer(m_bda_pagetable_buffer,
+			                (page >> CACHING_PAGEBITS) * sizeof(vk::DeviceAddress), &entry,
+			                sizeof(entry));
+		}
+	});
+}
+
+void BufferCache::MarkBdaStoresInRange(uint64_t vaddr, uint64_t size, bool all_tracked) {
+	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
+	ranges.ForEachInRange(
+	    vaddr, size, [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
+}
+
+void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start >= finish) {
+			continue;
+		}
+		TouchBuffer(buffer);
+		(void)SynchronizeBuffer(buffer, start, finish - start, true, false);
+		m_gpu_modified_ranges.Add(start, finish - start);
+	}
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

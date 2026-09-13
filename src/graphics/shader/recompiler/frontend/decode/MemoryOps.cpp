@@ -217,6 +217,34 @@ bool IsFlatStoreOpcode(Opcode opcode) {
 
 } // namespace
 
+bool GlcSelectsAtomicReturnValue(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::BUFFER_ATOMIC_SWAP:
+		case Opcode::BUFFER_ATOMIC_CMPSWAP:
+		case Opcode::BUFFER_ATOMIC_SWAP_X2:
+		case Opcode::BUFFER_ATOMIC_ADD:
+		case Opcode::BUFFER_ATOMIC_SUB:
+		case Opcode::BUFFER_ATOMIC_SMIN:
+		case Opcode::BUFFER_ATOMIC_UMIN:
+		case Opcode::BUFFER_ATOMIC_SMAX:
+		case Opcode::BUFFER_ATOMIC_UMAX:
+		case Opcode::BUFFER_ATOMIC_AND:
+		case Opcode::BUFFER_ATOMIC_OR:
+		case Opcode::BUFFER_ATOMIC_OR_X2:
+		case Opcode::BUFFER_ATOMIC_XOR:
+		case Opcode::BUFFER_ATOMIC_FMIN:
+		case Opcode::BUFFER_ATOMIC_FMAX:
+		case Opcode::IMAGE_ATOMIC_SWAP:
+		case Opcode::IMAGE_ATOMIC_ADD:
+		case Opcode::IMAGE_ATOMIC_UMIN:
+		case Opcode::IMAGE_ATOMIC_UMAX:
+		case Opcode::IMAGE_ATOMIC_AND:
+		case Opcode::IMAGE_ATOMIC_OR:
+		case Opcode::IMAGE_ATOMIC_XOR: return true;
+		default: return false;
+	}
+}
+
 void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
 	const uint32_t word0   = code[word_index];

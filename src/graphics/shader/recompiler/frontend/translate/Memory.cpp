@@ -120,6 +120,8 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
+	// On an atomic glc selects the pre-operation return value, not a cache policy.
+	memory.cache_bypass  = decoded.glc && !Decoder::GlcSelectsAtomicReturnValue(decoded.opcode);
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);

@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -329,15 +330,33 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetImageHeap().BeginDraw();
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
-	if (!compute_program) return;
+	if (!compute_program || !input_info.stage) return;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
-	const auto& program   = *input_info.stage.program;
-	const auto& resources = *input_info.stage.resources;
+	const auto& program       = *input_info.stage.program;
+	const auto& resources     = *input_info.stage.resources;
+	const auto& device_limits = m_context.GetGraphics().physical_device_properties.limits;
+	const std::array<uint32_t, 3> max_groups {device_limits.maxComputeWorkGroupCount[0],
+	                                          device_limits.maxComputeWorkGroupCount[1],
+	                                          device_limits.maxComputeWorkGroupCount[2]};
+	const std::array<uint32_t, 3> counts {thread_group_x, thread_group_y, thread_group_z};
+	const std::array<uint32_t, 3> local_size {
+	    cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y, cs_regs.cs_regs.num_thread_z};
+	const auto plan = PlanComputeDispatch(counts, local_size, use_thread_dimensions, max_groups);
+	if (plan.action == DispatchPlanAction::SkipOverLimit) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: skipping dispatch over the workgroup limit "
+			     "shader=0x%016" PRIx64 " groups=%ux%ux%u\n",
+			     program.shader_hash, plan.groups[0], plan.groups[1], plan.groups[2]);
+		}
+		ResetBindings();
+		return;
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
@@ -411,6 +430,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		const uint32_t old_x = thread_group_x;
 		const uint32_t old_y = thread_group_y;
 		const uint32_t old_z = thread_group_z;
+		thread_group_x       = plan.groups[0];
+		thread_group_y       = plan.groups[1];
+		thread_group_z       = plan.groups[2];
 
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -421,6 +443,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
 			     thread_group_z);
 		}
+	}
+
+	if (plan.action == DispatchPlanAction::SkipEmpty) {
+		return;
 	}
 
 	buffer.EndRendering();

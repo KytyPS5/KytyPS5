@@ -14,45 +14,54 @@
 #include <QStringList>
 #include <QTreeWidget>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 
 namespace {
 
-constexpr int  BINDING_COLUMN            = 1;
+constexpr int  PRIMARY_COLUMN            = 1;
+constexpr int  FALLBACK_COLUMN           = 2;
 constexpr auto DEFAULT_MOUSE_SENSITIVITY = 1.0;
 constexpr char MOUSE_SENSITIVITY[]       = "MouseSensitivity=";
 
 struct PadControl {
 	const char* id;
 	const char* label;
-	const char* default_binding;
+	const char* primary_binding;
+	const char* fallback_binding;
 };
 
 constexpr PadControl PAD_CONTROLS[] = {
-    {"Up", "D-pad Up", "Up"},
-    {"Down", "D-pad Down", "Down"},
-    {"Left", "D-pad Left", "Left"},
-    {"Right", "D-pad Right", "Right"},
-    {"LeftStickUp", "Left stick Up", "W"},
-    {"LeftStickDown", "Left stick Down", "S"},
-    {"LeftStickLeft", "Left stick Left", "A"},
-    {"LeftStickRight", "Left stick Right", "D"},
-    {"RightStickUp", "Right stick Up", "T"},
-    {"RightStickDown", "Right stick Down", "G"},
-    {"RightStickLeft", "Right stick Left", "F"},
-    {"RightStickRight", "Right stick Right", "H"},
-    {"Triangle", "Triangle", "I"},
-    {"Circle", "Circle", "L"},
-    {"Cross", "Cross", "J"},
-    {"Square", "Square", "K"},
-    {"L1", "L1", "Q"},
-    {"R1", "R1", "E"},
-    {"L2", "L2", ""},
-    {"R2", "R2", ""},
-    {"L3", "L3", "Left Shift"},
-    {"R3", "R3", "Left Ctrl"},
-    {"Options", "Options", "Return"},
-    {"TouchPad", "Touch pad left (SELECT)", "Backspace"},
-    {"TouchPadRight", "Touch pad right (START)", "Tab"},
+    {"Up", "D-pad Up", "Up", "1"},
+    {"Left", "D-pad Left", "Left", "2"},
+    {"Down", "D-pad Down", "Down", "3"},
+    {"Right", "D-pad Right", "Right", "4"},
+    {"LeftStickUp", "Left stick Up", "W", ""},
+    {"LeftStickDown", "Left stick Down", "S", ""},
+    {"LeftStickLeft", "Left stick Left", "A", ""},
+    {"LeftStickRight", "Left stick Right", "D", ""},
+    {"RightStickUp", "Right stick Up", "", "Keypad 8"},
+    {"RightStickDown", "Right stick Down", "", "Keypad 2"},
+    {"RightStickLeft", "Right stick Left", "", "Keypad 4"},
+    {"RightStickRight", "Right stick Right", "", "Keypad 6"},
+    {"Triangle", "Triangle", "I", "C"},
+    {"Circle", "Circle", "L", "X"},
+    {"Cross", "Cross", "K", "Left Shift"},
+    {"Square", "Square", "J", "Z"},
+    {"L1", "L1", "Q", ""},
+    {"R1", "R1", "E", ""},
+    {"L2", "L2", "Mouse:Right", "R"},
+    {"R2", "R2", "Mouse:Left", "F"},
+    {"L3", "L3", "T", ""},
+    {"R3", "R3", "V", ""},
+    {"Options", "Options", "Return", ""},
+    {"TouchPad", "Touch pad press", "Backspace", ""},
+    {"TouchPadRight", "Touch pad secondary", "", ""},
+    {"AnalogModifier", "Analog modifier", "Tab", ""},
+    {"AnalogStepDown", "Analog step 25%", "Minus", ""},
+    {"AnalogStepMiddle", "Analog step 50%", "Equals", ""},
+    {"AnalogStepUp", "Analog step 75%", "Plus", ""},
+    {"AnalogLock", "Analog adjustment lock", "CapsLock", ""},
+    {"Gyro", "Gyroscope", "7", "/"},
 };
 
 QString KeypadName(int key) {
@@ -94,6 +103,9 @@ QString KeyName(const QKeyEvent& event) {
 		case Qt::Key_Enter: return QStringLiteral("Return");
 		case Qt::Key_Backspace: return QStringLiteral("Backspace");
 		case Qt::Key_Tab: return QStringLiteral("Tab");
+		case Qt::Key_Minus: return QStringLiteral("Minus");
+		case Qt::Key_Equal:
+		case Qt::Key_Plus: return QStringLiteral("Equals");
 		case Qt::Key_Shift: return QStringLiteral("Left Shift");
 		case Qt::Key_Control: return QStringLiteral("Left Ctrl");
 		case Qt::Key_Alt: return QStringLiteral("Left Alt");
@@ -113,6 +125,7 @@ QString KeyName(const QKeyEvent& event) {
 		case Qt::Key_ScrollLock: return QStringLiteral("ScrollLock");
 		case Qt::Key_Pause: return QStringLiteral("Pause");
 		case Qt::Key_Print: return QStringLiteral("PrintScreen");
+		case Qt::Key_Slash: return QStringLiteral("/");
 		default: break;
 	}
 
@@ -131,9 +144,9 @@ public:
 		setMinimumWidth(360);
 
 		auto* layout = new QVBoxLayout(this);
-		m_label      = new QLabel(
-		    tr("Press a key or mouse button.\nSpace, F1, F7, and F11 are reserved; Esc cancels."),
-		    this);
+		m_label = new QLabel(tr("Press a key, mouse button, or wheel direction.\nSpace, F1, F7, "
+		                        "and F11 are reserved; Esc cancels."),
+		                     this);
 		m_label->setAlignment(Qt::AlignCenter);
 		layout->addWidget(m_label);
 	}
@@ -175,13 +188,23 @@ protected:
 		accept();
 	}
 
+	void wheelEvent(QWheelEvent* event) override {
+		const int delta = event->angleDelta().y();
+		if (delta == 0) {
+			m_label->setText(tr("That wheel event is not available."));
+			return;
+		}
+		m_binding = delta > 0 ? QStringLiteral("Mouse:WheelUp") : QStringLiteral("Mouse:WheelDown");
+		accept();
+	}
+
 private:
 	QLabel* m_label = nullptr;
 	QString m_binding;
 };
 
-QHash<QString, QString> ParseMapping(const QStringList& mapping) {
-	QHash<QString, QString> result;
+QHash<QString, QStringList> ParseMapping(const QStringList& mapping) {
+	QHash<QString, QStringList> result;
 	for (const auto& entry: mapping) {
 		if (entry.startsWith(QLatin1String(MOUSE_SENSITIVITY))) {
 			continue;
@@ -189,14 +212,7 @@ QHash<QString, QString> ParseMapping(const QStringList& mapping) {
 		const auto separator = entry.indexOf(QLatin1Char('='));
 		if (separator > 0 && separator + 1 < entry.size()) {
 			const auto binding = entry.mid(separator + 1);
-			for (auto item = result.begin(); item != result.end();) {
-				if (item.value().compare(binding, Qt::CaseInsensitive) == 0) {
-					item = result.erase(item);
-				} else {
-					++item;
-				}
-			}
-			result.insert(entry.left(separator), binding);
+			result[entry.left(separator)].append(binding);
 		}
 	}
 	return result;
@@ -227,6 +243,19 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	const auto parsed = ParseMapping(mapping);
 	m_custom_bindings = !parsed.isEmpty();
 
+	auto* explanation = new QLabel(
+	    tr("Analog adjustment: hold the input and press Tab with Minus for 25%, Equals for 50%, "
+	       "or Plus for 75%. Release Tab while holding the input for 100%. "
+	       "You can also use Tab plus mouse wheel down/up for continuous adjustment.\n\n"
+	       "Caps Lock is the analog adjustment lock. Press it once to keep the current trigger, "
+	       "microphone, or gyro value after releasing the adjustment keys; press it again to reset "
+	       "all locked analog values. Caps Lock is captured by its physical scancode and can be "
+	       "changed in the binding table."),
+	    this);
+	explanation->setWordWrap(true);
+	explanation->setTextFormat(Qt::PlainText);
+	layout->addWidget(explanation);
+
 	auto* sensitivity_layout = new QHBoxLayout;
 	sensitivity_layout->addWidget(new QLabel(tr("Mouse sensitivity"), this));
 	m_sensitivity = new QDoubleSpinBox(this);
@@ -240,20 +269,32 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	layout->addLayout(sensitivity_layout);
 
 	m_bindings = new QTreeWidget(this);
-	m_bindings->setColumnCount(2);
-	m_bindings->setHeaderLabels({tr("DualSense control"), tr("Host input")});
+	m_bindings->setColumnCount(3);
+	m_bindings->setHeaderLabels(
+	    {tr("DualSense Control"), tr("Host Input"), tr("Host Input (Fallback)")});
 	m_bindings->setRootIsDecorated(false);
 	m_bindings->setSelectionMode(QAbstractItemView::SingleSelection);
 	m_bindings->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-	m_bindings->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+	m_bindings->header()->setSectionResizeMode(PRIMARY_COLUMN, QHeaderView::Stretch);
+	m_bindings->header()->setSectionResizeMode(FALLBACK_COLUMN, QHeaderView::Stretch);
 	layout->addWidget(m_bindings);
 
 	for (const auto& control: PAD_CONTROLS) {
+		QStringList values = parsed.value(QString::fromLatin1(control.id));
+		if (values.isEmpty()) {
+			values << QString::fromLatin1(control.primary_binding)
+			       << QString::fromLatin1(control.fallback_binding);
+		} else if (values.size() == 1) {
+			values << QString::fromLatin1(control.fallback_binding);
+		}
 		auto* item = new QTreeWidgetItem(m_bindings);
 		item->setText(0, tr(control.label));
 		item->setData(0, Qt::UserRole, QString::fromLatin1(control.id));
-		SetBinding(item, m_custom_bindings ? parsed.value(QString::fromLatin1(control.id))
-		                                   : QString::fromLatin1(control.default_binding));
+		SetBinding(item, PRIMARY_COLUMN, values.value(0));
+		SetBinding(item, FALLBACK_COLUMN, values.value(1));
+		if (values.value(0).isEmpty() && QString::fromLatin1(control.id).startsWith("RightStick")) {
+			item->setText(PRIMARY_COLUMN, tr("Mouse movement (F7)"));
+		}
 	}
 	m_bindings->setCurrentItem(m_bindings->topLevelItem(0));
 
@@ -283,10 +324,10 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 
 QStringList InputMappingDialog::Mapping() const {
 	QStringList result;
-	if (m_custom_bindings) {
-		for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
-			const auto* item    = m_bindings->topLevelItem(index);
-			const auto  binding = item->data(BINDING_COLUMN, Qt::UserRole).toString();
+	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
+		const auto* item = m_bindings->topLevelItem(index);
+		for (const int column: {PRIMARY_COLUMN, FALLBACK_COLUMN}) {
+			const auto binding = item->data(column, Qt::UserRole).toString();
 			if (!binding.isEmpty()) {
 				result.append(item->data(0, Qt::UserRole).toString() + QLatin1Char('=') + binding);
 			}
@@ -312,36 +353,41 @@ void InputMappingDialog::ChangeBinding() {
 
 	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
 		auto* other = m_bindings->topLevelItem(index);
-		if (other != item && other->data(BINDING_COLUMN, Qt::UserRole)
-		                             .toString()
-		                             .compare(dialog.Binding(), Qt::CaseInsensitive) == 0) {
-			SetBinding(other, {});
+		for (const int column: {PRIMARY_COLUMN, FALLBACK_COLUMN}) {
+			if (other != item && other->data(column, Qt::UserRole)
+			                             .toString()
+			                             .compare(dialog.Binding(), Qt::CaseInsensitive) == 0) {
+				SetBinding(other, column, {});
+			}
 		}
 	}
-	SetBinding(item, dialog.Binding());
+	SetBinding(item, m_bindings->currentColumn(), dialog.Binding());
 	m_custom_bindings = true;
 }
 
 void InputMappingDialog::ClearBinding() {
-	SetBinding(m_bindings->currentItem(), {});
+	SetBinding(m_bindings->currentItem(), m_bindings->currentColumn(), {});
 	m_custom_bindings = true;
 }
 
 void InputMappingDialog::RestoreDefaults() {
 	for (int index = 0; index < m_bindings->topLevelItemCount(); index++) {
-		SetBinding(m_bindings->topLevelItem(index),
-		           QString::fromLatin1(PAD_CONTROLS[index].default_binding));
+		const auto& control = PAD_CONTROLS[index];
+		SetBinding(m_bindings->topLevelItem(index), PRIMARY_COLUMN,
+		           QString::fromLatin1(control.primary_binding));
+		SetBinding(m_bindings->topLevelItem(index), FALLBACK_COLUMN,
+		           QString::fromLatin1(control.fallback_binding));
 	}
 	m_sensitivity->setValue(DEFAULT_MOUSE_SENSITIVITY);
 	m_custom_bindings = false;
 }
 
-void InputMappingDialog::SetBinding(QTreeWidgetItem* item, const QString& binding) {
+void InputMappingDialog::SetBinding(QTreeWidgetItem* item, int column, const QString& binding) {
 	if (item == nullptr) {
 		return;
 	}
-	item->setData(BINDING_COLUMN, Qt::UserRole, binding);
-	item->setText(BINDING_COLUMN, binding.isEmpty() ? tr("None") : binding);
+	item->setData(column, Qt::UserRole, binding);
+	item->setText(column, binding.isEmpty() ? tr("None") : binding);
 	UpdateButtons();
 }
 
@@ -350,7 +396,8 @@ void InputMappingDialog::UpdateButtons() {
 		return;
 	}
 	const auto* item = m_bindings->currentItem();
-	m_change_button->setEnabled(item != nullptr);
-	m_clear_button->setEnabled(item != nullptr &&
-	                           !item->data(BINDING_COLUMN, Qt::UserRole).toString().isEmpty());
+	m_change_button->setEnabled(item != nullptr && m_bindings->currentColumn() > 0);
+	m_clear_button->setEnabled(
+	    item != nullptr && m_bindings->currentColumn() > 0 &&
+	    !item->data(m_bindings->currentColumn(), Qt::UserRole).toString().isEmpty());
 }

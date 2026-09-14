@@ -87,6 +87,8 @@ struct ControllerState {
 	uint32_t buttons                               = 0;
 	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
 	Touch    touch[2];
+	float    angular_velocity[3] = {};
+	uint8_t  microphone_level    = 0;
 };
 
 class GameController {
@@ -100,6 +102,9 @@ public:
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
+	void Motion(int id, float angular_x, float angular_y, float angular_z);
+	void Microphone(int id, uint8_t level);
+	void GetLightBarColor(uint8_t* red, uint8_t* green, uint8_t* blue);
 	void TouchPad(int id, int finger, bool down, float x, float y);
 	void ResetInputState();
 	void ReleaseHostPads();
@@ -127,6 +132,9 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	uint8_t          m_light_r       = 40;
+	uint8_t          m_light_g       = 130;
+	uint8_t          m_light_b       = 255;
 };
 
 static GameController* g_controller = nullptr;
@@ -137,14 +145,20 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
-	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
-	data->orientation_w     = 1.0f;
+	data->buttons                               = state.buttons;
+	data->left_stick_x                          = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y                          = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x                         = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y                         = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2                     = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2                     = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->orientation_w                         = 1.0f;
+	data->angular_velocity_x                    = state.angular_velocity[0];
+	data->angular_velocity_y                    = state.angular_velocity[1];
+	data->angular_velocity_z                    = state.angular_velocity[2];
+	data->extension_unit_data_extension_unit_id = 0x4b595459;
+	data->extension_unit_data_data_length       = 1;
+	data->extension_unit_data_data[0]           = state.microphone_level;
 	for (const auto& touch: state.touch) {
 		if (touch.down) {
 			auto& output = data->touch_data.touch[data->touch_data.touch_num++];
@@ -378,6 +392,26 @@ void GameController::RightStick(int id, int x, int y) {
 	}
 }
 
+void GameController::Motion(int id, float angular_x, float angular_y, float angular_z) {
+	Common::LockGuard lock(m_mutex);
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		m_state.time                = LibKernel::KernelGetProcessTime();
+		m_state.angular_velocity[0] = angular_x;
+		m_state.angular_velocity[1] = angular_y;
+		m_state.angular_velocity[2] = angular_z;
+		AddState();
+	}
+}
+
+void GameController::Microphone(int id, uint8_t level) {
+	Common::LockGuard lock(m_mutex);
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		m_state.time             = LibKernel::KernelGetProcessTime();
+		m_state.microphone_level = level;
+		AddState();
+	}
+}
+
 void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	if (finger < 0 || finger >= 2) {
 		return;
@@ -424,7 +458,7 @@ void GameController::ReleaseHostPads() {
 		    pad != nullptr) {
 			if (SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
 				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
+				effect.enable_bits      = 0x0c;
 				effect.right_trigger[0] = 0x05;
 				effect.left_trigger[0]  = 0x05;
 				(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
@@ -466,10 +500,20 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
+	m_light_r = r;
+	m_light_g = g;
+	m_light_b = b;
 	if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
 		(void)SDL_GameControllerSetLED(pad, r, g, b);
 	}
+}
+
+void GameController::GetLightBarColor(uint8_t* red, uint8_t* green, uint8_t* blue) {
+	Common::LockGuard lock(m_mutex);
+	if (red != nullptr) *red = m_light_r;
+	if (green != nullptr) *green = m_light_g;
+	if (blue != nullptr) *blue = m_light_b;
 }
 
 bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
@@ -574,6 +618,18 @@ void SetAxis(int id, Axis axis, int value) {
 
 void SetRightStick(int id, int x, int y) {
 	g_controller->RightStick(id, x, y);
+}
+
+void SetMotion(int id, float angular_x, float angular_y, float angular_z) {
+	g_controller->Motion(id, angular_x, angular_y, angular_z);
+}
+
+void SetMicrophoneLevel(int id, uint8_t level) {
+	g_controller->Microphone(id, level);
+}
+
+void GetLightBarColor(uint8_t* red, uint8_t* green, uint8_t* blue) {
+	g_controller->GetLightBarColor(red, green, blue);
 }
 
 void SetTouchPad(int id, int finger, bool down, float x, float y) {

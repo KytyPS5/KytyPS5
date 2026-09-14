@@ -111,8 +111,8 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
-		        m_ui->lineEdit_shader_log_folder->setEnabled(
-		            log == Configuration::LogDirection::File);
+		        m_ui->lineEdit_shader_log_folder->setEnabled(log ==
+		                                                     Configuration::LogDirection::File);
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
@@ -231,6 +231,14 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
+	m_ui->checkBox_input_feedback->setChecked(info.input_feedback_enabled);
+	m_ui->checkBox_input_feedback_frame->setChecked(info.input_feedback_frame);
+	m_ui->checkBox_input_feedback_gyro->setChecked(info.input_feedback_gyro);
+	m_ui->checkBox_input_feedback_microphone->setChecked(info.input_feedback_microphone);
+	m_ui->checkBox_input_feedback_lock->setChecked(info.input_feedback_lock);
+	m_ui->checkBox_input_feedback_labels->setChecked(info.input_feedback_labels);
+	m_ui->checkBox_input_feedback_vibration->setChecked(info.input_feedback_vibration);
+	m_ui->checkBox_input_debug_log->setChecked(info.input_debug_log);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -357,15 +365,23 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 #endif
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
-	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
-	    ui.comboBox_shader_log_direction->currentText());
+	info.shader_log_direction =
+	    TextToEnum<Configuration::LogDirection>(ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
 	info.command_buffer_dump_enabled = ui.checkBox_cmd_dump->isChecked();
 	info.command_buffer_dump_folder  = ui.lineEdit_cmd_dump_folder->text();
 	info.printf_direction =
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
-	info.printf_output_file = ui.lineEdit_printf_file->text();
-	info.profiler_enabled = ui.checkBox_profiler->isChecked();
+	info.printf_output_file        = ui.lineEdit_printf_file->text();
+	info.profiler_enabled          = ui.checkBox_profiler->isChecked();
+	info.input_feedback_enabled    = ui.checkBox_input_feedback->isChecked();
+	info.input_feedback_frame      = ui.checkBox_input_feedback_frame->isChecked();
+	info.input_feedback_gyro       = ui.checkBox_input_feedback_gyro->isChecked();
+	info.input_feedback_microphone = ui.checkBox_input_feedback_microphone->isChecked();
+	info.input_feedback_lock       = ui.checkBox_input_feedback_lock->isChecked();
+	info.input_feedback_labels     = ui.checkBox_input_feedback_labels->isChecked();
+	info.input_feedback_vibration  = ui.checkBox_input_feedback_vibration->isChecked();
+	info.input_debug_log           = ui.checkBox_input_debug_log->isChecked();
 }
 
 void ConfigurationEditDialog::update_info() {

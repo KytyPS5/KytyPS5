@@ -245,6 +245,21 @@
           <property name="clearButtonEnabled"><bool>true</bool></property>
          </widget>
         </item>
+        <item row="5" column="0" colspan="4">
+         <widget class="QGroupBox" name="input_feedback_group">
+          <property name="title"><string>Input feedback</string></property>
+          <layout class="QGridLayout" name="inputFeedbackLayout">
+           <item row="0" column="0"><widget class="QCheckBox" name="checkBox_input_feedback"><property name="text"><string>Enable feedback</string></property><property name="toolTip"><string>Show temporary input diagnostics around the game</string></property></widget></item>
+           <item row="0" column="1"><widget class="QCheckBox" name="checkBox_input_feedback_frame"><property name="text"><string>Frame</string></property></widget></item>
+           <item row="0" column="2"><widget class="QCheckBox" name="checkBox_input_feedback_gyro"><property name="text"><string>Gyroscope</string></property></widget></item>
+           <item row="0" column="3"><widget class="QCheckBox" name="checkBox_input_feedback_microphone"><property name="text"><string>Microphone</string></property></widget></item>
+           <item row="1" column="0"><widget class="QCheckBox" name="checkBox_input_feedback_lock"><property name="text"><string>Caps Lock indicator</string></property></widget></item>
+           <item row="1" column="1"><widget class="QCheckBox" name="checkBox_input_feedback_labels"><property name="text"><string>Labels</string></property><property name="toolTip"><string>Show L2/R2/MIC percentage labels on the overlay</string></property></widget></item>
+           <item row="1" column="2" colspan="2"><widget class="QCheckBox" name="checkBox_input_feedback_vibration"><property name="text"><string>Controller vibration feedback</string></property><property name="toolTip"><string>Use vibration for supported physical controllers</string></property></widget></item>
+           <item row="2" column="0" colspan="4"><widget class="QCheckBox" name="checkBox_input_debug_log"><property name="text"><string>Log keyboard/mouse input mappings to console</string></property><property name="toolTip"><string>Print each key/mouse event and how it maps to DualSense inputs (only when input is received)</string></property></widget></item>
+          </layout>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

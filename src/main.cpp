@@ -78,6 +78,8 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --input-profile <name>               Host input profile (default, keyboard-only, "
+	         "legacy).\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -308,12 +310,35 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--keymap") {
-			const auto split = value.find('=');
-			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
-				::printf("invalid keymap: %s\n", value.c_str());
+			std::string error;
+			if (!Config::ValidateKeymapEntry(value, &error)) {
+				::printf("invalid keymap '%s': %s\n", value.c_str(), error.c_str());
 				return false;
 			}
 			options.config.keymap.push_back(value);
+		} else if (arg == "--input-profile" || arg == "--keymap-profile") {
+			if (value != "default" && value != "keyboard-only" && value != "keyboard" &&
+			    value != "legacy") {
+				::printf("invalid input profile: %s\n", value.c_str());
+				return false;
+			}
+			options.config.input_profile = value;
+		} else if (arg == "--input-feedback") {
+			if (!ParseBool(value, options.config.input_feedback_enabled)) return false;
+		} else if (arg == "--input-feedback-frame") {
+			if (!ParseBool(value, options.config.input_feedback_frame)) return false;
+		} else if (arg == "--input-feedback-gyro") {
+			if (!ParseBool(value, options.config.input_feedback_gyro)) return false;
+		} else if (arg == "--input-feedback-microphone") {
+			if (!ParseBool(value, options.config.input_feedback_microphone)) return false;
+		} else if (arg == "--input-feedback-lock") {
+			if (!ParseBool(value, options.config.input_feedback_lock)) return false;
+		} else if (arg == "--input-feedback-labels") {
+			if (!ParseBool(value, options.config.input_feedback_labels)) return false;
+		} else if (arg == "--input-feedback-vibration") {
+			if (!ParseBool(value, options.config.input_feedback_vibration)) return false;
+		} else if (arg == "--input-debug-log") {
+			if (!ParseBool(value, options.config.input_debug_log)) return false;
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;

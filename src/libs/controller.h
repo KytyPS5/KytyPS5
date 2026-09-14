@@ -33,6 +33,8 @@ constexpr uint32_t PAD_BUTTON_TRIANGLE  = 0x00001000;
 constexpr uint32_t PAD_BUTTON_CIRCLE    = 0x00002000;
 constexpr uint32_t PAD_BUTTON_CROSS     = 0x00004000;
 constexpr uint32_t PAD_BUTTON_SQUARE    = 0x00008000;
+constexpr uint32_t PAD_BUTTON_PS        = 0x00010000;
+constexpr uint32_t PAD_BUTTON_CREATE    = 0x00020000;
 constexpr uint32_t PAD_BUTTON_TOUCH_PAD = 0x00100000;
 
 enum class Axis {
@@ -68,6 +70,9 @@ void Disconnect(int id);
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
+void SetMotion(int id, float angular_x, float angular_y, float angular_z);
+void SetMicrophoneLevel(int id, uint8_t level);
+void GetLightBarColor(uint8_t* red, uint8_t* green, uint8_t* blue);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void ResetInputState();
 

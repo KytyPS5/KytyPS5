@@ -3,11 +3,68 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <memory>
 
 namespace Config {
 
-static std::unique_ptr<ConfigOptions> g_config;
+namespace {
+std::unique_ptr<ConfigOptions> g_config;
+} // namespace
+
+bool ValidateKeymapEntry(const std::string& entry, std::string* error) {
+	if (entry.starts_with("MouseSensitivity=")) {
+		return true;
+	}
+	const auto split = entry.find('=');
+	if (split == std::string::npos || split == 0 || split + 1 == entry.size()) {
+		if (error != nullptr) {
+			*error = "expected Control=Input";
+		}
+		return false;
+	}
+	static constexpr std::array kControls = {
+	    "L3",
+	    "R3",
+	    "Options",
+	    "Up",
+	    "Right",
+	    "Down",
+	    "Left",
+	    "L2",
+	    "R2",
+	    "L1",
+	    "R1",
+	    "Triangle",
+	    "Circle",
+	    "Cross",
+	    "Square",
+	    "TouchPad",
+	    "TouchPadRight",
+	    "LeftStickLeft",
+	    "LeftStickRight",
+	    "LeftStickUp",
+	    "LeftStickDown",
+	    "RightStickLeft",
+	    "RightStickRight",
+	    "RightStickUp",
+	    "RightStickDown",
+	    "AnalogModifier",
+	    "AnalogStepDown",
+	    "AnalogStepMiddle",
+	    "AnalogStepUp",
+	    "AnalogLock",
+	    "Gyro",
+	};
+	const auto control = entry.substr(0, split);
+	if (std::find(kControls.begin(), kControls.end(), control) == kControls.end()) {
+		if (error != nullptr) {
+			*error = "unknown DualSense control: " + control;
+		}
+		return false;
+	}
+	return true;
+}
 
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
@@ -135,6 +192,35 @@ bool RedZoneProtectionEnabled() {
 
 const Keymap& GetKeymap() {
 	return g_config->keymap;
+}
+
+const std::string& GetInputProfile() {
+	return g_config->input_profile;
+}
+
+bool InputFeedbackEnabled() {
+	return g_config->input_feedback_enabled;
+}
+bool InputFeedbackFrameEnabled() {
+	return g_config->input_feedback_frame;
+}
+bool InputFeedbackGyroEnabled() {
+	return g_config->input_feedback_gyro;
+}
+bool InputFeedbackMicrophoneEnabled() {
+	return g_config->input_feedback_microphone;
+}
+bool InputFeedbackLockEnabled() {
+	return g_config->input_feedback_lock;
+}
+bool InputFeedbackLabelsEnabled() {
+	return g_config->input_feedback_labels;
+}
+bool InputFeedbackVibrationEnabled() {
+	return g_config->input_feedback_vibration;
+}
+bool InputDebugLogEnabled() {
+	return g_config->input_debug_log;
 }
 
 } // namespace Config

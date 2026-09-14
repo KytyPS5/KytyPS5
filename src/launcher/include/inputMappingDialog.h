@@ -20,7 +20,7 @@ private:
 	void ChangeBinding();
 	void ClearBinding();
 	void RestoreDefaults();
-	void SetBinding(QTreeWidgetItem* item, const QString& binding);
+	void SetBinding(QTreeWidgetItem* item, int column, const QString& binding);
 	void UpdateButtons();
 
 	QTreeWidget*    m_bindings        = nullptr;

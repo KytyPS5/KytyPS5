@@ -107,7 +107,17 @@ public:
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
+	QString     input_profile             = QStringLiteral("default");
+	bool        input_feedback_enabled    = false;
+	bool        input_feedback_frame      = true;
+	bool        input_feedback_gyro       = true;
+	bool        input_feedback_microphone = true;
+	bool        input_feedback_lock       = true;
+	bool        input_feedback_labels     = true;
+	bool        input_feedback_vibration  = false;
+	bool        input_debug_log           = false;
 	QStringList host_input_mapping;
+	int         host_input_mapping_version = static_cast<int>(Config::HOST_INPUT_MAPPING_VERSION);
 
 	QString elf = QStringLiteral("eboot.bin");
 
@@ -135,7 +145,17 @@ public:
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
-		host_input_mapping = other.host_input_mapping;
+		input_profile              = other.input_profile;
+		input_feedback_enabled     = other.input_feedback_enabled;
+		input_feedback_frame       = other.input_feedback_frame;
+		input_feedback_gyro        = other.input_feedback_gyro;
+		input_feedback_microphone  = other.input_feedback_microphone;
+		input_feedback_lock        = other.input_feedback_lock;
+		input_feedback_labels      = other.input_feedback_labels;
+		input_feedback_vibration   = other.input_feedback_vibration;
+		input_debug_log            = other.input_debug_log;
+		host_input_mapping         = other.host_input_mapping;
+		host_input_mapping_version = other.host_input_mapping_version;
 	}
 
 	void CopyFrom(const Configuration& other) {
@@ -180,6 +200,16 @@ public:
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
+		KYTY_CFG_SET(input_profile);
+		KYTY_CFG_SET(input_feedback_enabled);
+		KYTY_CFG_SET(input_feedback_frame);
+		KYTY_CFG_SET(input_feedback_gyro);
+		KYTY_CFG_SET(input_feedback_microphone);
+		KYTY_CFG_SET(input_feedback_lock);
+		KYTY_CFG_SET(input_feedback_labels);
+		KYTY_CFG_SET(input_feedback_vibration);
+		KYTY_CFG_SET(input_debug_log);
+		KYTY_CFG_SET(host_input_mapping_version);
 		s->setValue("host_input_mapping", host_input_mapping);
 		KYTY_CFG_SET(elf);
 	}
@@ -223,8 +253,34 @@ public:
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
 #endif
+		input_profile = s->value("input_profile", input_profile).toString();
+		input_feedback_enabled =
+		    s->value("input_feedback_enabled", input_feedback_enabled).toBool();
+		input_feedback_frame = s->value("input_feedback_frame", input_feedback_frame).toBool();
+		input_feedback_gyro  = s->value("input_feedback_gyro", input_feedback_gyro).toBool();
+		input_feedback_microphone =
+		    s->value("input_feedback_microphone", input_feedback_microphone).toBool();
+		input_feedback_lock   = s->value("input_feedback_lock", input_feedback_lock).toBool();
+		input_feedback_labels = s->value("input_feedback_labels", input_feedback_labels).toBool();
+		input_feedback_vibration =
+		    s->value("input_feedback_vibration", input_feedback_vibration).toBool();
+		input_debug_log = s->value("input_debug_log", input_debug_log).toBool();
+		if (input_profile.compare("default", Qt::CaseInsensitive) != 0 &&
+		    input_profile.compare("keyboard-only", Qt::CaseInsensitive) != 0 &&
+		    input_profile.compare("keyboard", Qt::CaseInsensitive) != 0 &&
+		    input_profile.compare("legacy", Qt::CaseInsensitive) != 0) {
+			input_profile = QStringLiteral("default");
+		}
 		host_input_mapping = s->value("host_input_mapping", host_input_mapping).toStringList();
-		elf                = s->value("elf", elf).toString();
+		host_input_mapping_version = s->value("host_input_mapping_version", 1).toInt();
+		if (host_input_mapping_version < 1 ||
+		    host_input_mapping_version > static_cast<int>(Config::HOST_INPUT_MAPPING_VERSION)) {
+			host_input_mapping_version = static_cast<int>(Config::HOST_INPUT_MAPPING_VERSION);
+		}
+		if (host_input_mapping_version < static_cast<int>(Config::HOST_INPUT_MAPPING_VERSION)) {
+			host_input_mapping_version = static_cast<int>(Config::HOST_INPUT_MAPPING_VERSION);
+		}
+		elf = s->value("elf", elf).toString();
 	}
 };
 

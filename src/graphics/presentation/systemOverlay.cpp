@@ -2,8 +2,10 @@
 
 #include "SDL.h"
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
@@ -28,8 +30,8 @@ namespace Libs::Graphics {
 
 namespace {
 
-namespace CoreIme   = Libs::Ime;
-namespace DialogIme = Libs::Dialog::ImeDialog;
+namespace CoreIme     = Libs::Ime;
+namespace DialogIme   = Libs::Dialog::ImeDialog;
 namespace ErrorDialog = Libs::Dialog::ErrorDialog;
 
 namespace Ime {
@@ -169,12 +171,12 @@ bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
-bool                         g_input_active               = false;
-bool                         g_input_controller           = false;
-bool                         g_input_keyboard             = false;
-bool                         g_input_multiline            = false;
-bool                         g_input_lifecycle_active     = false;
-bool                         g_controller_captured        = false;
+bool                         g_input_active           = false;
+bool                         g_input_controller       = false;
+bool                         g_input_keyboard         = false;
+bool                         g_input_multiline        = false;
+bool                         g_input_lifecycle_active = false;
+bool                         g_controller_captured    = false;
 OverlaySession               g_session;
 
 void ClearInputEvents() {
@@ -462,8 +464,13 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	const auto input  = HostInputGetDiagnostics();
+	const bool feedback =
+	    Config::InputFeedbackEnabled() &&
+	    (input.adjustment_active || input.analog_lock || input.left_trigger > 0.0f ||
+	     input.right_trigger > 0.0f || input.microphone > 0.0f || input.gyro > 0.0f);
+	return {core.active || dialog.active || error.active || feedback,
+	        core.revision + dialog.revision + error.revision + input.revision};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -942,12 +949,202 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	void DrawInputFeedback(vk::Extent2D frame_extent) {
+		if (!Config::InputFeedbackEnabled() || g_session.kind != OverlayKind::None) {
+			return;
+		}
+		const auto input = HostInputGetDiagnostics();
+		if (!input.adjustment_active && !input.analog_lock && input.gyro <= 0.0f) {
+			return;
+		}
+		const float width     = static_cast<float>(frame_extent.width);
+		const float height    = static_cast<float>(frame_extent.height);
+		const float thickness = 28.0f;
+		uint8_t     led_r     = 40;
+		uint8_t     led_g     = 130;
+		uint8_t     led_b     = 255;
+		Controller::GetLightBarColor(&led_r, &led_g, &led_b);
+		if (led_r == 0 && led_g == 0 && led_b == 0) {
+			led_r = 40;
+			led_g = 130;
+			led_b = 255;
+		}
+
+		struct GradientColor {
+			float               r, g, b, a;
+			[[nodiscard]] ImU32 ToImU32() const {
+				return IM_COL32(static_cast<int>(r), static_cast<int>(g), static_cast<int>(b),
+				                static_cast<int>(a));
+			}
+			[[nodiscard]] ImU32 WithZeroAlpha() const {
+				return IM_COL32(static_cast<int>(r), static_cast<int>(g), static_cast<int>(b), 0);
+			}
+		};
+
+		const auto make_led_gradient = [&](float intensity) -> GradientColor {
+			intensity = std::clamp(intensity, 0.0f, 1.0f);
+			if (intensity <= 0.001f) {
+				return {static_cast<float>(led_r), static_cast<float>(led_g),
+				        static_cast<float>(led_b), 0.0f};
+			}
+			const float boost = 0.75f + 0.55f * intensity;
+			const float r     = std::clamp(
+			    static_cast<float>(led_r) * boost + 60.0f * intensity * intensity, 0.0f, 255.0f);
+			const float g = std::clamp(
+			    static_cast<float>(led_g) * boost + 35.0f * intensity * intensity, 0.0f, 255.0f);
+			const float b = std::clamp(static_cast<float>(led_b) * boost, 0.0f, 255.0f);
+			const float a = std::clamp(40.0f + intensity * 190.0f, 0.0f, 230.0f);
+			return {r, g, b, a};
+		};
+
+		const auto lerp_color = [](const GradientColor& c1, const GradientColor& c2,
+		                           float t) -> GradientColor {
+			return {c1.r + (c2.r - c1.r) * t, c1.g + (c2.g - c1.g) * t, c1.b + (c2.b - c1.b) * t,
+			        c1.a + (c2.a - c1.a) * t};
+		};
+
+		if (Config::InputFeedbackFrameEnabled()) {
+			auto* draw = ImGui::GetBackgroundDrawList();
+
+			// Swap triggers: L2 appears on right, R2 appears on left
+			const GradientColor col_l2  = make_led_gradient(input.right_trigger);
+			const GradientColor col_r2  = make_led_gradient(input.left_trigger);
+			const GradientColor col_mic = make_led_gradient(input.microphone);
+
+			const GradientColor col_top_center   = lerp_color(col_r2, col_l2, 0.5f);
+			const GradientColor col_bottom_left  = lerp_color(col_r2, col_mic, 0.5f);
+			const GradientColor col_bottom_right = lerp_color(col_l2, col_mic, 0.5f);
+
+			const float half_w = width * 0.5f;
+
+			// Top-Left Bar: (0, 0) to (half_w, thickness) - now uses R2 color
+			draw->AddRectFilledMultiColor({0.0f, 0.0f}, {half_w, thickness}, col_r2.ToImU32(),
+			                              col_top_center.ToImU32(), col_top_center.WithZeroAlpha(),
+			                              col_r2.WithZeroAlpha());
+
+			// Top-Right Bar: (half_w, 0) to (width, thickness) - now uses L2 color
+			draw->AddRectFilledMultiColor({half_w, 0.0f}, {width, thickness},
+			                              col_top_center.ToImU32(), col_l2.ToImU32(),
+			                              col_l2.WithZeroAlpha(), col_top_center.WithZeroAlpha());
+
+			// Left Bar: (0, thickness) to (thickness, height - thickness) - now uses R2 color
+			draw->AddRectFilledMultiColor(
+			    {0.0f, thickness}, {thickness, height - thickness}, col_r2.ToImU32(),
+			    col_r2.WithZeroAlpha(), col_bottom_left.WithZeroAlpha(), col_bottom_left.ToImU32());
+
+			// Right Bar: (width - thickness, thickness) to (width, height - thickness) - now uses
+			// L2 color
+			draw->AddRectFilledMultiColor(
+			    {width - thickness, thickness}, {width, height - thickness}, col_l2.WithZeroAlpha(),
+			    col_l2.ToImU32(), col_bottom_right.ToImU32(), col_bottom_right.WithZeroAlpha());
+
+			// Bottom-Left Bar: (0, height - thickness) to (half_w, height) - now uses R2 color
+			draw->AddRectFilledMultiColor({0.0f, height - thickness}, {half_w, height},
+			                              col_bottom_left.WithZeroAlpha(), col_mic.WithZeroAlpha(),
+			                              col_mic.ToImU32(), col_bottom_left.ToImU32());
+
+			// Bottom-Right Bar: (half_w, height - thickness) to (width, height) - now uses L2 color
+			draw->AddRectFilledMultiColor(
+			    {half_w, height - thickness}, {width, height}, col_bottom_right.WithZeroAlpha(),
+			    col_bottom_right.ToImU32(), col_mic.ToImU32(), col_bottom_right.WithZeroAlpha());
+
+			// Corners
+			// Top-Left corner: (0, 0) to (thickness, thickness) - now uses R2 color
+			draw->AddRectFilledMultiColor({0.0f, 0.0f}, {thickness, thickness}, col_r2.ToImU32(),
+			                              col_r2.ToImU32(), col_r2.WithZeroAlpha(),
+			                              col_r2.ToImU32());
+
+			// Top-Right corner: (width - thickness, 0) to (width, thickness) - now uses L2 color
+			draw->AddRectFilledMultiColor({width - thickness, 0.0f}, {width, thickness},
+			                              col_l2.ToImU32(), col_l2.ToImU32(), col_l2.ToImU32(),
+			                              col_l2.WithZeroAlpha());
+
+			// Bottom-Left corner: (0, height - thickness) to (thickness, height)
+			draw->AddRectFilledMultiColor({0.0f, height - thickness}, {thickness, height},
+			                              col_bottom_left.ToImU32(),
+			                              col_bottom_left.WithZeroAlpha(),
+			                              col_bottom_left.ToImU32(), col_bottom_left.ToImU32());
+
+			// Bottom-Right corner: (width - thickness, height - thickness) to (width, height)
+			draw->AddRectFilledMultiColor({width - thickness, height - thickness}, {width, height},
+			                              col_bottom_right.WithZeroAlpha(),
+			                              col_bottom_right.ToImU32(), col_bottom_right.ToImU32(),
+			                              col_bottom_right.ToImU32());
+		}
+
+		if (Config::InputFeedbackGyroEnabled() && (input.gyro > 0.0f || input.gyro_active)) {
+			auto*        draw = ImGui::GetBackgroundDrawList();
+			const ImVec2 center(width * 0.5f, height - 75.0f);
+			draw->AddCircle(center, 24.0f, IM_COL32(led_r, led_g, led_b, 180), 48, 2.0f);
+			const ImVec2 moving(center.x + std::clamp(input.gyro, -1.0f, 1.0f) * 18.0f, center.y);
+			draw->AddCircleFilled(moving, 8.0f, IM_COL32(led_r, led_g, led_b, 240), 32);
+		}
+
+		if (Config::InputFeedbackLabelsEnabled()) {
+			auto* fg_draw = ImGui::GetForegroundDrawList();
+			// Swap triggers: L2 appears on right, R2 appears on left
+			if (input.right_trigger > 0.001f) {
+				const int pct = static_cast<int>(std::round(input.right_trigger * 100.0f));
+				char      buf[32];
+				std::snprintf(buf, sizeof(buf), "L2: %d%%", pct);
+				fg_draw->AddText({width - 100.0f, 20.0f}, IM_COL32(230, 240, 255, 230), buf);
+			}
+			if (input.left_trigger > 0.001f) {
+				const int pct = static_cast<int>(std::round(input.left_trigger * 100.0f));
+				char      buf[32];
+				std::snprintf(buf, sizeof(buf), "R2: %d%%", pct);
+				fg_draw->AddText({32.0f, 20.0f}, IM_COL32(230, 240, 255, 230), buf);
+			}
+			if (input.microphone > 0.001f) {
+				const int pct = static_cast<int>(std::round(input.microphone * 100.0f));
+				char      buf[32];
+				std::snprintf(buf, sizeof(buf), "MIC: %d%%", pct);
+				fg_draw->AddText({32.0f, height - 50.0f}, IM_COL32(230, 240, 255, 230), buf);
+			}
+			if (input.gyro > 0.001f || input.gyro_active) {
+				const int pct = static_cast<int>(std::round(std::abs(input.gyro) * 100.0f));
+				char      buf[32];
+				std::snprintf(buf, sizeof(buf), "GYRO: %d%%", pct);
+				fg_draw->AddText({width - 100.0f, height - 50.0f}, IM_COL32(230, 240, 255, 230),
+				                 buf);
+			}
+
+			const char* source = nullptr;
+			switch (input.source) {
+				case HostInputSource::Keyboard: source = "Input: Keyboard"; break;
+				case HostInputSource::Mouse: source = "Input: Mouse"; break;
+				case HostInputSource::Touch: source = "Input: Touch"; break;
+				case HostInputSource::Controller: source = "Input: Controller"; break;
+				case HostInputSource::Microphone: source = "Input: Microphone"; break;
+				default: break;
+			}
+			if (source != nullptr) {
+				fg_draw->AddText({24.0f, height - 30.0f}, IM_COL32(220, 235, 255, 210), source);
+			}
+		}
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		const bool      system_overlay = GetOverlaySnapshot(&snapshot);
+		const auto      input          = HostInputGetDiagnostics();
+		const bool      feedback_active =
+		    Config::InputFeedbackEnabled() &&
+		    (input.adjustment_active || input.analog_lock || input.gyro > 0.0f);
+
+		// Debug: log overlay preparation
+		if (Config::InputDebugLogEnabled()) {
+			LOGF("[OverlayDebug] PrepareFrame: input_feedback=%s, adjustment_active=%s, "
+			     "analog_lock=%s, gyro=%.3f, feedback_active=%s\n",
+			     Config::InputFeedbackEnabled() ? "true" : "false",
+			     input.adjustment_active ? "true" : "false", input.analog_lock ? "true" : "false",
+			     input.gyro, feedback_active ? "true" : "false");
+		}
+
+		if (!system_overlay && !feedback_active) {
 			return false;
 		}
-		const auto prepared_session = snapshot.session;
+		const auto prepared_session = system_overlay ? snapshot.session : OverlaySession {};
 		EnsureVulkan(format, image_count);
 		if (session != snapshot.session) {
 			session       = snapshot.session;
@@ -974,15 +1171,17 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
+		if (system_overlay &&
+		    (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
 			ImGui::EndFrame();
 			return false;
 		}
-		if (snapshot.session.kind == OverlayKind::Error) {
+		if (system_overlay && snapshot.session.kind == OverlayKind::Error) {
 			DrawError(snapshot.error, frame_extent);
-		} else {
+		} else if (system_overlay) {
 			DrawIme(snapshot.ime, frame_extent);
 		}
+		DrawInputFeedback(frame_extent);
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

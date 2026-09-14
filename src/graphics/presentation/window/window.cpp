@@ -218,11 +218,9 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen =
-	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
-	const auto mode =
-	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const bool fullscreen = (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode       = fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
@@ -271,7 +269,7 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 		fullscreen_key = SDLK_UNKNOWN;
 	}
 	if ((key.down || key.up) && !key.repeat && !fullscreen_key_event) {
-		HostInputKey(key.key_code, key.down);
+		HostInputScancode(key.scan_code, key.key_code, key.down);
 	}
 }
 
@@ -310,10 +308,13 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		}
 
 		HostInputMouseButton(mouse_button, mb.down);
+	} else if (mb.wheel) {
+		HostInputMouseWheel(mb.y > 0 ? 1 : -1);
 	}
 }
 
 static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
+	HostInputFinger(f.down, f.up, f.motion, f.x, f.y, f.dx, f.dy);
 #ifdef KYTY_DBG_INPUT
 	if (f.motion) {
 		LOGF("Finger motion: time = %.04f, %d, %d, (x,y) = [%f, %f], (dx,dy) = [%f, %f], pressure "
@@ -368,8 +369,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -990,10 +990,10 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t          fps_start      = Common::Timer::QueryPerformanceCounter();
+	static uint64_t          frame_num      = 0;
+	static uint64_t          fps_frames     = 0;
+	static double            current_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1015,7 +1015,7 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
+	auto        text        = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),

@@ -439,9 +439,17 @@ uint32_t EmitTwoDimensionalGatherLod(ValueEmitContext& ctx, const IR::MemoryInfo
 	auto&              state    = ctx.state;
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
 
-	const auto image   = LoadSampledImageDescriptor(state, mem.resource);
+	const auto image = LoadSampledImageDescriptor(state, mem.resource);
+	// One level serves the size query and every sample: a gather reads a single level, so a
+	// fractional LOD is floored rather than allowed to select or blend two.
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450Floor, lod);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), level, GlslStd450(state),
+	                          GLSLstd450FMax, floored, ZeroF32(state));
 	const auto lod_int = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), lod_int, lod);
+	state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), lod_int, level);
 	const auto size = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 2), size, image,
 	                          lod_int);
@@ -491,7 +499,7 @@ uint32_t EmitTwoDimensionalGatherLod(ValueEmitContext& ctx, const IR::MemoryInfo
 		                          axis_coord[0], axis_coord[1]);
 		const auto texel = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpImageSampleExplicitLod, vector_type, texel, sampled,
-		                          sample_coord, spv::ImageOperandsLodMask, lod);
+		                          sample_coord, spv::ImageOperandsLodMask, level);
 		values[texel_index] = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, values[texel_index], texel,
 		                          component);

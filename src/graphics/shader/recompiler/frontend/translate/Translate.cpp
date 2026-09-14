@@ -481,7 +481,8 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	}
 	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	IR::U32    high(IR::Value(0u));
-	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr) {
+	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr ||
+	    operand.kind == Decoder::OperandKind::Ttmp) {
 		high = ReadRawU32(OffsetOperand(operand, 1));
 	} else if (operand.kind == Decoder::OperandKind::IntegerInlineConstant &&
 	           operand.signed_val < 0) {

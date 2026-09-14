@@ -575,6 +575,11 @@ private:
 		image.first_use_pc = std::min(image.first_use_pc, pc);
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
+		if (atomic && image.atomic && IsWideAtomic(op) != image.atomic64) {
+			EXIT("image resource mixes %u-bit and %u-bit atomics at pc 0x%08x; the image can only "
+			     "be declared at one width\n",
+			     image.atomic64 ? 64u : 32u, IsWideAtomic(op) ? 64u : 32u, pc);
+		}
 		image.atomic       = image.atomic || atomic;
 		image.atomic64     = image.atomic64 || IsWideAtomic(op);
 	}

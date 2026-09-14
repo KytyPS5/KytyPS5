@@ -391,16 +391,20 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
+	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Srgb, vk::ColorSpaceKHR::eSrgbNonlinear};
+	if (surface.formats.size() == 1 && surface.formats.front().format == vk::Format::eUndefined) {
+		format.colorSpace = surface.formats.front().colorSpace;
+	} else {
 		// Present through an sRGB swapchain. A 10-bit or float scanout holds linear values, which
 		// the blit then encodes; an sRGB guest surface decodes on read and re-encodes on write,
 		// which is a net identity. Presenting linear values raw into a UNORM surface made the
 		// picture far too dark.
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Srgb ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Srgb;
+			                             return candidate.colorSpace ==
+			                                        vk::ColorSpaceKHR::eSrgbNonlinear &&
+			                                    (candidate.format == vk::Format::eB8G8R8A8Srgb ||
+			                                     candidate.format == vk::Format::eR8G8B8A8Srgb);
 		                             });
 		if (it == surface.formats.end()) {
 			EXIT("no supported sRGB swapchain format\n");

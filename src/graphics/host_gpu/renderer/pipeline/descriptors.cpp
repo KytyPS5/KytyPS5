@@ -382,18 +382,22 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			desc.info.guest_format = Prospero::BufferFormat::k32Float;
 			break;
 		case Prospero::TextureNumericClass::Uint:
-			desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+			desc.info.guest_format = resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
+			                                           : Prospero::BufferFormat::k32UInt;
 			break;
 		case Prospero::TextureNumericClass::Sint:
 			desc.info.guest_format = Prospero::BufferFormat::k32SInt;
 			break;
 		default: EXIT("null image has unsupported numeric class\n");
 	}
-	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+	// The 64-bit atomic path names the two-channel guest format but declares R64_UINT, so the null
+	// stand-in has to agree with the image the shader expects to be bound.
+	desc.info.pixel_format =
+	    resource.atomic64 ? vk::Format::eR64Uint : VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
-	desc.info.bytes_per_block = 4;
+	desc.info.bytes_per_block = resource.atomic64 ? 8u : 4u;
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
@@ -554,13 +558,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
 	// A view cannot name a level the image does not have; the guest's tail levels collapse onto
 	// the smallest one that exists. Multisampled descriptors carry a sample count here instead of
-	// a mip range, so they pass through untouched.
+	// a mip range, and a dynamic-storage view's level count has to keep matching the mip count the
+	// resource plan derived from the same unclamped range, so both pass through untouched.
+	const bool clamp_view_range = !multisampled && !dynamic_storage;
 	const auto shifted_base_level =
-	    multisampled ? static_cast<uint32_t>(base_level)
-	                 : std::min<uint32_t>(base_level, levels - 1u);
+	    clamp_view_range ? std::min<uint32_t>(base_level, levels - 1u)
+	                     : static_cast<uint32_t>(base_level);
 	const auto shifted_last_level =
-	    multisampled ? last_level
-	                 : static_cast<uint8_t>(std::min<uint32_t>(last_level, levels - 1u));
+	    clamp_view_range ? static_cast<uint8_t>(std::min<uint32_t>(last_level, levels - 1u))
+	                     : last_level;
 
 	const auto view_last_level    = !multisampled && !dynamic_storage
 	                                    ? std::min(shifted_last_level, max_mip)

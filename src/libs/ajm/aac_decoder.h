@@ -74,9 +74,11 @@ public:
 			return result;
 		}
 
-		m_config_number       = params->config_number;
-		m_sampling_freq_index = params->sampling_freq_index;
-		m_is_initialized      = true;
+		m_config_number         = params->config_number;
+		m_sampling_freq_index   = params->sampling_freq_index;
+		m_is_initialized        = true;
+		m_channel_config_index  = 0;
+		m_channel_config_locked = false;
 		Reset();
 		if (m_codec_context == nullptr) {
 			m_is_initialized = false;
@@ -129,13 +131,14 @@ public:
 		bool   decoded = DecodePacket(static_cast<const uint8_t*>(input),
 		                              static_cast<int>(input_size), output, output_size,
 		                              &output_offset, gapless, &result);
-		while (!decoded && !m_channel_config_locked && AdvanceChannelConfig()) {
+		while (!decoded && result.frames == 0 && !m_channel_config_locked &&
+		       AdvanceChannelConfig()) {
 			output_offset = 0;
 			result        = MakeResult();
 			decoded = DecodePacket(static_cast<const uint8_t*>(input), static_cast<int>(input_size),
 			                       output, output_size, &output_offset, gapless, &result);
 		}
-		if (decoded && result.frames > 0) {
+		if (result.frames > 0) {
 			// A layout that produced audio is the stream's own; stop reconsidering it so a later
 			// corrupt packet cannot walk the decoder onto a different one.
 			m_channel_config_locked = true;

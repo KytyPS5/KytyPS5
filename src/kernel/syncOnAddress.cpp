@@ -13,10 +13,22 @@
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#define KYTY_SYNC_ON_ADDRESS_LINUX 1
 #include <cerrno>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#define KYTY_SYNC_ON_ADDRESS_WINDOWS 1
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#define KYTY_SYNC_ON_ADDRESS_PORTABLE 1
 #endif
 
 namespace Libs::LibKernel::SyncOnAddress {
@@ -60,9 +72,10 @@ struct WaitDeadline {
 	return MakeDeadline(std::chrono::microseconds(*timeout_micros));
 }
 
-[[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
+[[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait,
+                                          bool has_signal_poll) {
 	if (!deadline.finite) {
-		return SIGNAL_POLL_MICROS;
+		return has_signal_poll ? SIGNAL_POLL_MICROS : UINT32_MAX - 1u;
 	}
 
 	const auto now = Clock::now();
@@ -72,6 +85,10 @@ struct WaitDeadline {
 
 	const auto remaining =
 	    std::chrono::ceil<std::chrono::microseconds>(deadline.end - now).count();
+	if (!has_signal_poll) {
+		return static_cast<uint32_t>(
+		    std::min<int64_t>(remaining, UINT32_MAX - 1u));
+	}
 	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_POLL_MICROS));
 }
 
@@ -81,7 +98,7 @@ void PollSignals(signal_poll_func_t signal_poll) {
 	}
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if defined(KYTY_SYNC_ON_ADDRESS_LINUX)
 
 template <typename T>
 int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
@@ -92,7 +109,8 @@ int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
 		if (ReadWord(address) != expected) {
 			return OK;
 		}
-		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
+		const auto slice_micros =
+		    GetWaitSliceMicros(deadline, first_wait, signal_poll != nullptr);
 		if (slice_micros == UINT32_MAX) {
 			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
 		}
@@ -135,6 +153,75 @@ int WakeLinux(volatile void* address, int32_t count) {
 }
 
 #endif
+
+#if defined(KYTY_SYNC_ON_ADDRESS_WINDOWS)
+
+template <typename T>
+int WaitWindows(volatile T* address, T expected, const WaitDeadline& deadline,
+                signal_poll_func_t signal_poll) {
+	bool first_wait = true;
+
+	for (;;) {
+		if (ReadWord(address) != expected) {
+			return OK;
+		}
+		const auto slice_micros =
+		    GetWaitSliceMicros(deadline, first_wait, signal_poll != nullptr);
+		if (slice_micros == UINT32_MAX) {
+			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
+		}
+
+		DWORD ms = 0;
+		if (!deadline.finite && signal_poll == nullptr) {
+			ms = INFINITE;
+		} else if (slice_micros == 0) {
+			ms = 0;
+		} else {
+			ms = static_cast<DWORD>((static_cast<uint64_t>(slice_micros) + 999u) / 1000u);
+		}
+
+		T compare_value = expected;
+		const BOOL ok = WaitOnAddress(address, &compare_value, sizeof(T), ms);
+		if (ok) {
+			return OK;
+		}
+
+		const DWORD err = GetLastError();
+		if (err != ERROR_TIMEOUT) {
+			return KERNEL_ERROR_EINVAL;
+		}
+
+		if (ReadWord(address) != expected) {
+			return OK;
+		}
+
+		PollSignals(signal_poll);
+		if (deadline.finite && Clock::now() >= deadline.end) {
+			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
+		}
+		first_wait = false;
+	}
+}
+
+int WakeWindows(volatile void* address, int32_t count) {
+	if (count == 0) {
+		return OK;
+	}
+	if (count == 1) {
+		WakeByAddressSingle(const_cast<void*>(address));
+	} else if (count == INT_MAX) {
+		WakeByAddressAll(const_cast<void*>(address));
+	} else {
+		for (int32_t i = 0; i < count; ++i) {
+			WakeByAddressSingle(const_cast<void*>(address));
+		}
+	}
+	return OK;
+}
+
+#endif
+
+#if defined(KYTY_SYNC_ON_ADDRESS_PORTABLE)
 
 struct PortableWaiter {
 	Common::CondVar condition;
@@ -198,7 +285,8 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
 	int            result     = OK;
 
 	while (ReadWord(address) == expected && !waiter.wake_requested) {
-		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
+		const auto slice_micros =
+		    GetWaitSliceMicros(deadline, first_wait, signal_poll != nullptr);
 		if (slice_micros == UINT32_MAX) {
 			result = KERNEL_ERROR_ETIMEDOUT;
 			break;
@@ -253,6 +341,8 @@ int WakePortable(volatile void* address, int32_t count) {
 	return OK;
 }
 
+#endif
+
 template <typename T>
 int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
@@ -261,9 +351,11 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 	}
 
 	int result = OK;
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if defined(KYTY_SYNC_ON_ADDRESS_LINUX)
 	result = WaitLinux(address, expected, deadline, signal_poll);
-#else
+#elif defined(KYTY_SYNC_ON_ADDRESS_WINDOWS)
+	result = WaitWindows(address, expected, deadline, signal_poll);
+#elif defined(KYTY_SYNC_ON_ADDRESS_PORTABLE)
 	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif
 	PollSignals(signal_poll);
@@ -292,10 +384,13 @@ int Wake(volatile void* address, int32_t count) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if defined(KYTY_SYNC_ON_ADDRESS_LINUX)
 	return WakeLinux(address, count);
-#endif
+#elif defined(KYTY_SYNC_ON_ADDRESS_WINDOWS)
+	return WakeWindows(address, count);
+#elif defined(KYTY_SYNC_ON_ADDRESS_PORTABLE)
 	return WakePortable(address, count);
+#endif
 }
 
 } // namespace Libs::LibKernel::SyncOnAddress

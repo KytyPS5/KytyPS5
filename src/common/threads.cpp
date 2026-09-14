@@ -368,8 +368,13 @@ void CondVar::Wait(Mutex* mutex) {
 	if (g_cond_wait_poll_callback == nullptr) {
 		func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, INFINITE);
 	} else {
-		if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, 10) == 0 &&
-		    GetLastError() == ERROR_TIMEOUT) {
+		while (true) {
+			if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, 10) != 0) {
+				break;
+			}
+			if (GetLastError() != ERROR_TIMEOUT) {
+				break;
+			}
 			poll_callback();
 		}
 	}
@@ -377,8 +382,11 @@ void CondVar::Wait(Mutex* mutex) {
 	if (g_cond_wait_poll_callback == nullptr) {
 		m_cond_var->m_cv.wait(cpp_lock);
 	} else {
-		if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(10000)) ==
-		    std::cv_status::timeout) {
+		while (true) {
+			if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(10000)) ==
+			    std::cv_status::no_timeout) {
+				break;
+			}
 			poll_callback();
 		}
 	}
@@ -395,15 +403,69 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
-#ifdef KYTY_WIN_CS
-	static auto func = ResolveSleepConditionVariableCS();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
-	           0 &&
-	       GetLastError() == ERROR_TIMEOUT);
+	auto poll_callback = [&] {
+		auto* callback = g_cond_wait_poll_callback;
+		if (callback == nullptr) {
+			return;
+		}
+#if defined(KYTY_WIN_CS)
+		LeaveCriticalSection(&mutex->m_mutex->m_cs);
+		callback();
+		EnterCriticalSection(&mutex->m_mutex->m_cs);
 #else
-	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
-	      std::cv_status::no_timeout);
+		cpp_lock.unlock();
+		callback();
+		cpp_lock.lock();
+#endif
+	};
+
+	if (g_cond_wait_poll_callback == nullptr) {
+#ifdef KYTY_WIN_CS
+		static auto func = ResolveSleepConditionVariableCS();
+		EXIT_NOT_IMPLEMENTED(func == nullptr);
+		ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs,
+		            (micros < 1000 ? 1 : micros / 1000)) == 0 &&
+		       GetLastError() == ERROR_TIMEOUT);
+#else
+		ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
+		      std::cv_status::no_timeout);
+#endif
+	} else {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+		while (true) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) {
+				ok = false;
+				break;
+			}
+			const auto remaining_us =
+			    std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+			const auto step_us = std::min<int64_t>(remaining_us, 10000);
+
+#ifdef KYTY_WIN_CS
+			static auto func = ResolveSleepConditionVariableCS();
+			EXIT_NOT_IMPLEMENTED(func == nullptr);
+			const DWORD step_ms = (step_us < 1000 ? 1 : static_cast<DWORD>(step_us / 1000));
+			if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, step_ms) != 0) {
+				ok = true;
+				break;
+			}
+			if (GetLastError() != ERROR_TIMEOUT) {
+				ok = false;
+				break;
+			}
+			poll_callback();
+#else
+			if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(step_us)) ==
+			    std::cv_status::no_timeout) {
+				ok = true;
+				break;
+			}
+			poll_callback();
+#endif
+		}
+	}
+#ifndef KYTY_WIN_CS
 	cpp_lock.release();
 #endif
 	return ok;

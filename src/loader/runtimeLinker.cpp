@@ -1517,31 +1517,36 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 		*bind_self = false;
 	}
 
-	if (ids.size() == 3) {
-		const LibraryId* l = FindLibrary(*program, ids.at(1));
-		const ModuleId*  m = FindModule(*program, ids.at(2));
+	auto find_in_databases = [&](auto&& lookup_fn) -> bool {
+		if (m_symbols != nullptr) {
+			if (const auto* rec = lookup_fn(m_symbols.get()); rec != nullptr) {
+				*out_info = *rec;
+				return true;
+			}
+		}
 
-		auto resolve_by_nid = [this, type](const std::string& nid, SymbolRecord* out) -> bool {
-			EXIT_IF(out == nullptr);
-
-			if (m_symbols != nullptr) {
-				if (const auto* rec = m_symbols->FindByNid(nid, type); rec != nullptr) {
-					*out = *rec;
+		for (auto* p: m_programs) {
+			if (p != nullptr && p->export_symbols != nullptr) {
+				if (const auto* rec = lookup_fn(p->export_symbols.get()); rec != nullptr) {
+					*out_info = *rec;
+					if (bind_self != nullptr) {
+						*bind_self = (p == program);
+					}
 					return true;
 				}
 			}
+		}
 
-			for (auto* p: m_programs) {
-				if (p != nullptr && p->export_symbols != nullptr) {
-					if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
-						*out = *rec;
-						return true;
-					}
-				}
-			}
+		return false;
+	};
 
-			return false;
-		};
+	auto resolve_by_nid = [&](const std::string& nid) -> bool {
+		return find_in_databases([&](const auto* db) { return db->FindByNid(nid, type); });
+	};
+
+	if (ids.size() == 3) {
+		const LibraryId* l = FindLibrary(*program, ids.at(1));
+		const ModuleId*  m = FindModule(*program, ids.at(2));
 
 		if (l != nullptr && m != nullptr) {
 			SymbolResolve sr {};
@@ -1569,7 +1574,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec == nullptr) {
-				if (resolve_by_nid(sr.name, out_info)) {
+				if (resolve_by_nid(sr.name)) {
 					LOGF("PS5 NID fallback: %s -> %s\n", sr.name.c_str(), out_info->name.c_str());
 					return;
 				}
@@ -1583,44 +1588,39 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 				out_info->name     = SymbolDatabase::GenerateName(sr);
 				out_info->dbg_name = "";
 			}
-		} else {
-			if (resolve_by_nid(ids.at(0), out_info)) {
-				LOGF("PS5 NID fallback: %s -> %s (missing lib/module metadata)\n",
-				     ids.at(0).c_str(), out_info->name.c_str());
+			return;
+		}
+
+		if (resolve_by_nid(ids.at(0))) {
+			LOGF("PS5 NID fallback: %s -> %s (missing lib/module metadata)\n", ids.at(0).c_str(),
+			     out_info->name.c_str());
+			return;
+		}
+
+		EXIT("l == nullptr || m == nullptr");
+	} else if (ids.size() == 2 && !ids.at(0).empty()) {
+		const auto* l = FindLibrary(*program, ids.at(1));
+		if (l != nullptr) {
+			if (find_in_databases([&](const auto* db) {
+				    return db->FindByLibrary(ids.at(0), l->name, l->version, type);
+			    })) {
 				return;
 			}
-
-			EXIT("l == nullptr || m == nullptr");
 		}
-	} else if ((ids.size() == 1 || ids.size() == 2) && !ids.at(0).empty()) {
-		if (m_symbols != nullptr) {
-			if (const auto* rec = m_symbols->FindByNid(ids.at(0), type); rec != nullptr) {
-				*out_info = *rec;
-				return;
-			}
+		if (resolve_by_nid(ids.at(0))) {
+			LOGF("PS5 NID fallback: %s -> %s (2-part symbol)\n", ids.at(0).c_str(),
+			     out_info->name.c_str());
+			return;
 		}
-
-		for (auto* p: m_programs) {
-			if (p != nullptr && p->export_symbols != nullptr) {
-				if (const auto* rec = p->export_symbols->FindByNid(ids.at(0), type);
-				    rec != nullptr) {
-					*out_info = *rec;
-					if (bind_self != nullptr) {
-						*bind_self = (p == program);
-					}
-					return;
-				}
-			}
+	} else if (ids.size() == 1 && !ids.at(0).empty()) {
+		if (resolve_by_nid(ids.at(0))) {
+			return;
 		}
-
-		out_info->vaddr    = 0;
-		out_info->name     = name;
-		out_info->dbg_name = "";
-	} else {
-		out_info->vaddr    = 0;
-		out_info->name     = name;
-		out_info->dbg_name = "";
 	}
+
+	out_info->vaddr    = 0;
+	out_info->name     = name;
+	out_info->dbg_name = "";
 }
 
 bool RuntimeLinker::ResolveLoadedSymbolByNid(const std::string& nid, SymbolType type,

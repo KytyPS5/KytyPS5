@@ -91,4 +91,20 @@ const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolTy
 	return nullptr;
 }
 
+const SymbolRecord* SymbolDatabase::FindByLibrary(const std::string& name,
+                                                  const std::string& library, int library_version,
+                                                  SymbolType type) const {
+	auto lib_name = UpdateName(library);
+	auto prefix   = fmt::format("{}[{}_v{}][", name.c_str(), lib_name.c_str(), library_version);
+	auto suffix   = fmt::format("[{}]", Common::EnumName(type).c_str());
+
+	for (const auto& symbol: m_symbols) {
+		if (Common::StartsWith(symbol.name, prefix) && Common::EndsWith(symbol.name, suffix)) {
+			return &symbol;
+		}
+	}
+
+	return nullptr;
+}
+
 } // namespace Loader

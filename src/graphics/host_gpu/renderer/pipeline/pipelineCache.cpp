@@ -243,6 +243,18 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		// A 64-bit image atomic emits CapabilityInt64ImageEXT unconditionally. Without the device
+		// feature behind it the shader module or pipeline is rejected with a result code that says
+		// nothing about the cause, so the missing capability is named here instead.
+		if (!image_atomic_int64) {
+			const auto& images = translated.program.info.images;
+			if (std::ranges::any_of(images, [](const auto& image) { return image.atomic64; })) {
+				EXIT("%s hash=0x%016" PRIx64
+				     ": shader needs 64-bit image atomics, which this device does not support "
+				     "(VK_EXT_shader_image_atomic_int64)\n",
+				     options.dump_label, options.shader_hash);
+			}
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
@@ -383,7 +395,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool image_atomic_int64)
+	    : device(device), image_atomic_int64(image_atomic_int64) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -398,11 +411,14 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	bool                                                        image_atomic_int64 = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device,
+                                                     graphics.image_atomic_int64_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

@@ -237,7 +237,9 @@ private:
 
 struct VideoOutDriver::Impl {
 public:
-	static constexpr int VIDEO_OUT_NUM_MAX = 4;
+	static constexpr std::array VIDEO_OUT_BUSES {
+	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
 	    : m_renderer(presenter.Renderer()), m_presenter(presenter), m_flip_queue(presenter) {
@@ -248,7 +250,7 @@ public:
 	~Impl();
 	KYTY_CLASS_NO_COPY(Impl);
 
-	int             Open(int bus_type);
+	int             Open(int bus_type, int index);
 	bool            Close(int handle);
 	VideoOutConfig* Get(int handle);
 	VideoOutConfig* Get(int handle, uint64_t& generation);
@@ -610,12 +612,17 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 	}
 }
 
-int VideoOutDriver::Impl::Open(int bus_type) {
+int VideoOutDriver::Impl::Open(int bus_type, int index) {
+	const auto bus = std::find(VIDEO_OUT_BUSES.begin(), VIDEO_OUT_BUSES.end(), bus_type);
+	if (bus == VIDEO_OUT_BUSES.end()) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	EXIT_NOT_IMPLEMENTED(index != 0);
 	Common::LockGuard lock(m_mutex);
 
-	const int handle = bus_type + 1;
+	const int handle = static_cast<int>(bus - VIDEO_OUT_BUSES.begin()) + 1;
 	if (m_video_out_ctx[handle].opened) {
-		return -1;
+		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
 	}
 	auto&             config = m_video_out_ctx[handle];
 	Common::LockGuard config_lock(config.mutex);
@@ -1169,21 +1176,9 @@ KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void*
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
-	if (bus_type != VIDEO_OUT_BUS_TYPE_MAIN && bus_type != VIDEO_OUT_BUS_TYPE_OVERLAY &&
-	    bus_type != VIDEO_OUT_BUS_TYPE_SUB) {
-		return VIDEO_OUT_ERROR_INVALID_VALUE;
-	}
-	EXIT_NOT_IMPLEMENTED(index != 0);
-
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	int handle = DriverState().Open(bus_type);
-
-	if (handle < 0) {
-		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
-	}
-
-	return handle;
+	return DriverState().Open(bus_type, index);
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {

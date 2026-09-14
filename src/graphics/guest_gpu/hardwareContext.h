@@ -936,6 +936,12 @@ private:
 	ShaderRegisters m_sh_regs;
 };
 
+struct FsrView {
+	uint32_t control_points[2][4] {};
+	uint32_t alphas[2][2] {};
+	uint32_t window[2] {};
+};
+
 class UserConfig {
 public:
 	UserConfig()  = default;
@@ -965,8 +971,17 @@ public:
 	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
 	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }
 	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
+	void SetFsrControlPoint(uint32_t axis, uint32_t index, uint32_t value) {
+		m_fsr_view.control_points[axis][index] = value;
+	}
+	void SetFsrAlpha(uint32_t axis, uint32_t index, uint32_t value) {
+		m_fsr_view.alphas[axis][index] = value;
+	}
+	void SetFsrWindow(uint32_t index, uint32_t value) { m_fsr_view.window[index] = value; }
+	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
+	FsrView m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;

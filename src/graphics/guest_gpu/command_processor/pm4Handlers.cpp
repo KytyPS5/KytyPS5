@@ -3819,6 +3819,25 @@ void GraphicsInitJmpTablesUcIndirect() {
 	for (auto& func: g_hw_uc_indirect_func) {
 		func = nullptr;
 	}
+	for (uint32_t i = 0; i < 4; ++i) {
+		g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			cp.GetUcfg().SetFsrControlPoint(0, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_X, value);
+		};
+		g_hw_uc_indirect_func[Pm4::FSR_CONTROL_POINTS_LEFT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			cp.GetUcfg().SetFsrControlPoint(1, cmd_offset - Pm4::FSR_CONTROL_POINTS_LEFT_Y, value);
+		};
+	}
+	for (uint32_t i = 0; i < 2; ++i) {
+		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_X + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			cp.GetUcfg().SetFsrAlpha(0, cmd_offset - Pm4::FSR_ALPHA_LEFT_X, value);
+		};
+		g_hw_uc_indirect_func[Pm4::FSR_ALPHA_LEFT_Y + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			cp.GetUcfg().SetFsrAlpha(1, cmd_offset - Pm4::FSR_ALPHA_LEFT_Y, value);
+		};
+		g_hw_uc_indirect_func[Pm4::FSR_WINDOW_LEFT + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			cp.GetUcfg().SetFsrWindow(cmd_offset - Pm4::FSR_WINDOW_LEFT, value);
+		};
+	}
 
 	g_hw_uc_indirect_func[Pm4::GE_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeControl r;

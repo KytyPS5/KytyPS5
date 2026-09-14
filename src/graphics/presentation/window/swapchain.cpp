@@ -14,6 +14,9 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -390,13 +393,17 @@ void Swapchain::Create() {
 
 	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
 	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
+		// Present through an sRGB swapchain. A 10-bit or float scanout holds linear values, which
+		// the blit then encodes; an sRGB guest surface decodes on read and re-encodes on write,
+		// which is a net identity. Presenting linear values raw into a UNORM surface made the
+		// picture far too dark.
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
+			                             return candidate.format == vk::Format::eB8G8R8A8Srgb ||
+			                                    candidate.format == vk::Format::eR8G8B8A8Srgb;
 		                             });
 		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
+			EXIT("no supported sRGB swapchain format\n");
 		}
 		format = *it;
 	}
@@ -713,15 +720,13 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
-	auto frame_format = info.pixel_format;
-	switch (frame_format) {
-		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
-		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
-		default: break;
-	}
+	// The prepared frame keeps the guest surface's own format, transfer function included, so the
+	// present blit converts exactly once.
+	const auto frame_format = info.pixel_format;
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+
 	return *frame;
 }
 

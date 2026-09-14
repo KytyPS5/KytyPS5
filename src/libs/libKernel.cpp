@@ -176,26 +176,26 @@ static std::string kernel_symbol_to_nid(const char* symbol) {
 	return std::string(nid);
 }
 
+static bool kernel_is_valid_nid(const char* s) {
+	if (s == nullptr || std::strlen(s) != 11) {
+		return false;
+	}
+	for (int i = 0; i < 11; i++) {
+		char c = s[i];
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+		      c == '+' || c == '-')) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static const Loader::SymbolRecord* kernel_find_export_symbol(const Loader::SymbolDatabase* symbols,
                                                              const char*                   symbol) {
 	EXIT_IF(symbols == nullptr);
 	EXIT_IF(symbol == nullptr);
 
-	static auto is_valid_nid = [](const char* s) {
-		if (std::strlen(s) != 11) {
-			return false;
-		}
-		for (int i = 0; i < 11; i++) {
-			char c = s[i];
-			if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-			      c == '+' || c == '-')) {
-				return false;
-			}
-		}
-		return true;
-	};
-
-	const bool maybe_nid = is_valid_nid(symbol);
+	const bool maybe_nid = kernel_is_valid_nid(symbol);
 	if (maybe_nid) {
 		const auto symbol_str = std::string(symbol);
 		if (const auto* record = symbols->FindByNid(symbol_str, Loader::SymbolType::Func);

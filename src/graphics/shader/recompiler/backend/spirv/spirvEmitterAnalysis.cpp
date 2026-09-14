@@ -124,15 +124,26 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		sampled = 2;
 		if (image.atomic) {
 			EXIT_IF(image.numeric_class != Prospero::TextureNumericClass::Uint);
-			format = spv::ImageFormatR32ui;
+			format = image.atomic64 ? spv::ImageFormatR64ui : spv::ImageFormatR32ui;
 		}
 	} else {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
-	return state.builder.Type(spv::OpTypeImage, ImageScalarType(state, image.numeric_class),
-	                          info.spirv_dimension, image.depth_compare ? 1u : 0u, info.arrayed,
-	                          info.multisampled, sampled, format);
+	// A 64-bit atomic image carries 64-bit texels, so its sampled type widens with the format.
+	// It has to be the genuine scalar: TypeU64 is the IR's pair-of-u32 representation, which is a
+	// vector and not a legal sampled type.
+	const auto scalar_type =
+	    image.atomic64 ? TypeScalarU64(state) : ImageScalarType(state, image.numeric_class);
+	if (image.atomic64) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+		state.builder.RequireCapability(spv::CapabilityInt64ImageEXT);
+		state.builder.RequireExtension("SPV_EXT_shader_image_int64");
+	}
+	return state.builder.Type(spv::OpTypeImage, scalar_type, info.spirv_dimension,
+	                          image.depth_compare ? 1u : 0u, info.arrayed, info.multisampled,
+	                          sampled, format);
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {

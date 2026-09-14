@@ -122,6 +122,9 @@ struct ImageResource {
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
+	// A 64-bit atomic needs an R64ui image declaration and an Int64 texel pointer, so the width
+	// has to reach the backend with the resource rather than the instruction.
+	bool                          atomic64          = false;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;

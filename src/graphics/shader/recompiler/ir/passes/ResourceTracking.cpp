@@ -555,6 +555,19 @@ private:
 		return static_cast<uint32_t>(m_info.images.size() - 1);
 	}
 
+	static bool IsWideAtomic(ValueOpcode op) {
+		switch (op) {
+			case ValueOpcode::ImageAtomicSwap64:
+			case ValueOpcode::ImageAtomicIAdd64:
+			case ValueOpcode::ImageAtomicUMin64:
+			case ValueOpcode::ImageAtomicUMax64:
+			case ValueOpcode::ImageAtomicAnd64:
+			case ValueOpcode::ImageAtomicOr64:
+			case ValueOpcode::ImageAtomicXor64: return true;
+			default: return false;
+		}
+	}
+
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
 		const auto access  = ImageOpcodeInfoOf(op).access;
 		const bool atomic  = access == ImageAccess::Atomic;
@@ -563,6 +576,7 @@ private:
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.atomic64     = image.atomic64 || IsWideAtomic(op);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

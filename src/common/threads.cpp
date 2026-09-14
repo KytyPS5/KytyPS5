@@ -368,13 +368,8 @@ void CondVar::Wait(Mutex* mutex) {
 	if (g_cond_wait_poll_callback == nullptr) {
 		func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, INFINITE);
 	} else {
-		while (true) {
-			if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, 10) != 0) {
-				break;
-			}
-			if (GetLastError() != ERROR_TIMEOUT) {
-				break;
-			}
+		if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, 10) == 0 &&
+		    GetLastError() == ERROR_TIMEOUT) {
 			poll_callback();
 		}
 	}
@@ -382,11 +377,8 @@ void CondVar::Wait(Mutex* mutex) {
 	if (g_cond_wait_poll_callback == nullptr) {
 		m_cond_var->m_cv.wait(cpp_lock);
 	} else {
-		while (true) {
-			if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(10000)) ==
-			    std::cv_status::no_timeout) {
-				break;
-			}
+		if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(10000)) ==
+		    std::cv_status::timeout) {
 			poll_callback();
 		}
 	}

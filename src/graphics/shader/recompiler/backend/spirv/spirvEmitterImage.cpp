@@ -445,9 +445,19 @@ uint32_t EmitTwoDimensionalGatherLod(ValueEmitContext& ctx, const IR::MemoryInfo
 	const auto floored = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
 	                          GLSLstd450Floor, lod);
+	const auto at_least_zero = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), at_least_zero, GlslStd450(state),
+	                          GLSLstd450FMax, floored, ZeroF32(state));
+	// Sampling clamps a LOD past the top level while OpImageQuerySizeLod is undefined there, so
+	// the level is bounded by the image before either sees it.
+	const auto level_count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), level_count, image);
+	const auto last_level = Unary(
+	    state, spv::OpConvertUToF, TypeF32(state),
+	    Binary(state, spv::OpISub, TypeU32(state), level_count, ConstantU32(state, 1)));
 	const auto level = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), level, GlslStd450(state),
-	                          GLSLstd450FMax, floored, ZeroF32(state));
+	                          GLSLstd450FMin, at_least_zero, last_level);
 	const auto lod_int = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), lod_int, level);
 	const auto size = state.builder.AllocateId();

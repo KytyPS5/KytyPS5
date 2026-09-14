@@ -49,8 +49,23 @@ namespace {
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
 	if (info.IsBlock()) {
-		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
-		       vk::ImageUsageFlagBits::eSampled;
+		auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+		             vk::ImageUsageFlagBits::eSampled;
+		// A guest compute pass reaches a block-compressed surface through an uncompressed view to
+		// read or write raw blocks. A BC format reports no storage feature of its own, but every
+		// non-depth image here is created with eExtendedUsage, which lets the image declare a
+		// usage its own format does not support so long as the view format does, and the view
+		// narrows it back down through VkImageViewUsageCreateInfo. Without the flag the descriptor
+		// write is invalid and the pass writes nowhere.
+		// An uncompressed view of a block image is limited to one layer unless maintenance6
+		// reports blockTexelViewCompatibleMultipleLayers, so a layered image only qualifies where
+		// the device says it may.
+		const bool layers_supported =
+		    info.resources.layers == 1 || graphics.block_texel_view_multiple_layers;
+		if (graphics.supports_block_texel_view && layers_supported && !info.IsVolume()) {
+			usage |= vk::ImageUsageFlagBits::eStorage;
+		}
+		return usage;
 	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
 	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;

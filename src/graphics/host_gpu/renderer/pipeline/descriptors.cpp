@@ -337,12 +337,16 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	// A 64-bit image atomic addresses a two-dword texel, so its descriptor names the 64-bit
+	// format; only the 32-bit width uses k32UInt.
+	const auto required_atomic_format = resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
+	                                                      : Prospero::BufferFormat::k32UInt;
 	const bool format_ok =
 	    raw_sint_storage ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
-	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	     (!resource.atomic || format == required_atomic_format));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -450,11 +454,12 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
+                                     uint32_t view_levels, uint32_t image_layers,
+                                     uint32_t base_level) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
-	view.base_level  = descriptor.BaseLevel();
+	view.base_level  = base_level;
 	view.level_count = view_levels;
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
@@ -529,17 +534,42 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto last_level   = descriptor.LastLevel();
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
-	const auto max_mip      = resource.r128 ? last_level : descriptor.MaxMip();
-	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
+	const auto raw_max_mip = resource.r128 ? last_level : descriptor.MaxMip();
+	// A descriptor that views a block-compressed surface through an uncompressed format sizes its
+	// extent in 4x4 blocks while MAX_MIP still counts the texel chain. The two disagree only at
+	// the tail: the last texel levels are smaller than a block and have no block-view level at
+	// all. Level N of the block chain still covers texel level N, so the range is clamped to the
+	// levels that exist rather than renumbered -- shifting it would select a mip too large.
+	const auto extent_levels = [&]() -> uint32_t {
+		auto largest = std::max(width, height);
+		if (type == Prospero::ImageType::kColor3D) {
+			largest = std::max(largest, static_cast<uint32_t>(descriptor.Depth()) + 1u);
+		}
+		return static_cast<uint32_t>(std::bit_width(std::max(largest, 1u)));
+	}();
+	const auto levels =
+	    multisampled ? 1u : std::min(static_cast<uint32_t>(raw_max_mip) + 1u, extent_levels);
+	const auto max_mip = multisampled ? raw_max_mip : static_cast<uint8_t>(levels - 1u);
 	const bool dynamic_storage =
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-	const auto view_last_level =
-	    !multisampled && !dynamic_storage ? std::min(last_level, max_mip) : last_level;
+	// A view cannot name a level the image does not have; the guest's tail levels collapse onto
+	// the smallest one that exists. Multisampled descriptors carry a sample count here instead of
+	// a mip range, so they pass through untouched.
+	const auto shifted_base_level =
+	    multisampled ? static_cast<uint32_t>(base_level)
+	                 : std::min<uint32_t>(base_level, levels - 1u);
+	const auto shifted_last_level =
+	    multisampled ? last_level
+	                 : static_cast<uint8_t>(std::min<uint32_t>(last_level, levels - 1u));
+
+	const auto view_last_level    = !multisampled && !dynamic_storage
+	                                    ? std::min(shifted_last_level, max_mip)
+	                                    : shifted_last_level;
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
-	if ((!multisampled && (base_level > view_last_level || view_last_level >= levels)) ||
+	if ((!multisampled && (shifted_base_level > view_last_level || view_last_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
@@ -558,7 +588,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
-	    multisampled ? 1u : static_cast<uint32_t>(view_last_level - base_level) + 1u;
+	    multisampled ? 1u : static_cast<uint32_t>(view_last_level - shifted_base_level) + 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
@@ -605,7 +635,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
+	// Vulkan defines 64-bit image atomics on R64_UINT, while the guest descriptor names the
+	// two-channel 32-bit format for the same 64-bit texel. Both sit in the same format class, so
+	// the image can carry the single-channel form without disturbing other views of the memory.
+	const bool atomic64_image = storage && resource.atomic64;
+	if (atomic64_image) {
+		pixel_format = vk::Format::eR64Uint;
+	}
+	const auto storage_view_format = atomic64_image ? vk::Format::eR64Uint
+	                                 : storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
@@ -640,15 +678,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		PopulateTextureMipLayout(desc.info);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
+	                                 view_levels, desc.info.resources.layers, shifted_base_level);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
+	// A stencil association redirects a view of a stencil plane onto the depth image that owns it,
+	// for reads and for stores alike. It is the view format that decides: any other format names a
+	// surface which merely shares the address -- guests reuse the memory behind a stencil plane for
+	// colour targets -- and following the redirect there hands out a colour view onto a depth
+	// backing, which no later check catches because they all test info.pixel_format.
+	const bool stencil_association =
+	    image->depth_id && ImageViewOps::IsStencilViewFormat(view_format);
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+	} else if (image->depth_id) {
+		texture_cache.DropStencilAssociation(id);
+	}
+	if (stencil_association) {
+		// Redirected to the owning depth image; its own binding rules were checked when it was
+		// bound as a depth target.
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");

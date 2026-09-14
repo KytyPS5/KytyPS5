@@ -177,17 +177,17 @@ static std::string kernel_symbol_to_nid(const char* symbol) {
 }
 
 static bool kernel_is_valid_nid(const char* s) {
-	if (s == nullptr || std::strlen(s) != 11) {
+	if (s == nullptr) {
 		return false;
 	}
-	for (int i = 0; i < 11; i++) {
-		char c = s[i];
-		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-		      c == '+' || c == '-')) {
+	for (int i = 0; i < 11; ++i) {
+		const char c = s[i];
+		if (c == '\0' || !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		                   (c >= '0' && c <= '9') || c == '+' || c == '-')) {
 			return false;
 		}
 	}
-	return true;
+	return s[11] == '\0';
 }
 
 static const Loader::SymbolRecord* kernel_find_export_symbol(const Loader::SymbolDatabase* symbols,

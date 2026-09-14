@@ -176,10 +176,41 @@ static std::string kernel_symbol_to_nid(const char* symbol) {
 	return std::string(nid);
 }
 
+static bool kernel_is_valid_nid(const char* s) {
+	if (s == nullptr) {
+		return false;
+	}
+	for (int i = 0; i < 11; ++i) {
+		const char c = s[i];
+		if (c == '\0' || !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		                   (c >= '0' && c <= '9') || c == '+' || c == '-')) {
+			return false;
+		}
+	}
+	return s[11] == '\0';
+}
+
 static const Loader::SymbolRecord* kernel_find_export_symbol(const Loader::SymbolDatabase* symbols,
                                                              const char*                   symbol) {
 	EXIT_IF(symbols == nullptr);
 	EXIT_IF(symbol == nullptr);
+
+	const bool maybe_nid = kernel_is_valid_nid(symbol);
+	if (maybe_nid) {
+		const auto symbol_str = std::string(symbol);
+		if (const auto* record = symbols->FindByNid(symbol_str, Loader::SymbolType::Func);
+		    record != nullptr) {
+			return record;
+		}
+		if (const auto* record = symbols->FindByNid(symbol_str, Loader::SymbolType::Object);
+		    record != nullptr) {
+			return record;
+		}
+		if (const auto* record = symbols->FindByNid(symbol_str, Loader::SymbolType::NoType);
+		    record != nullptr) {
+			return record;
+		}
+	}
 
 	const auto nid = kernel_symbol_to_nid(symbol);
 
@@ -195,16 +226,20 @@ static const Loader::SymbolRecord* kernel_find_export_symbol(const Loader::Symbo
 		return record;
 	}
 
-	const auto symbol_name = std::string(symbol);
-	if (const auto* record = symbols->FindByName(symbol_name, Loader::SymbolType::Func);
-	    record != nullptr) {
-		return record;
+	if (!maybe_nid) {
+		const auto symbol_name = std::string(symbol);
+		if (const auto* record = symbols->FindByName(symbol_name, Loader::SymbolType::Func);
+		    record != nullptr) {
+			return record;
+		}
+		if (const auto* record = symbols->FindByName(symbol_name, Loader::SymbolType::Object);
+		    record != nullptr) {
+			return record;
+		}
+		return symbols->FindByName(symbol_name, Loader::SymbolType::NoType);
 	}
-	if (const auto* record = symbols->FindByName(symbol_name, Loader::SymbolType::Object);
-	    record != nullptr) {
-		return record;
-	}
-	return symbols->FindByName(symbol_name, Loader::SymbolType::NoType);
+
+	return nullptr;
 }
 
 static void* KYTY_SYSV_ABI KernelApplicationHeapGetMem(uint64_t alignment, uint64_t size) {
@@ -1168,7 +1203,6 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
 		CloseHandle(target_thread);
 		return OK;
@@ -1193,7 +1227,6 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
 		WaitForSignalDispatch(thread, signum);
 		return OK;
@@ -2112,8 +2145,8 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
-                           void* uaddr, const void* timeout) {
+int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value, void* uaddr,
+                         const void* timeout) {
 	constexpr int UMTX_OP_WAIT = 2;
 	constexpr int UMTX_OP_WAKE = 3;
 
@@ -2128,12 +2161,13 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 					*GetErrorAddr() = POSIX_EINVAL;
 					return -1;
 				}
-				const auto max_ns = std::chrono::nanoseconds::max().count();
+				const auto max_ns     = std::chrono::nanoseconds::max().count();
 				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
 				                            ? max_ns
 				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
 				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
+				    static_cast<volatile uint64_t*>(address), value,
+				    std::chrono::nanoseconds(timeout_ns),
 				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
 			}
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(

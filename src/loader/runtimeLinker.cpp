@@ -1517,31 +1517,36 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 		*bind_self = false;
 	}
 
-	if (ids.size() == 3) {
-		const LibraryId* l = FindLibrary(*program, ids.at(1));
-		const ModuleId*  m = FindModule(*program, ids.at(2));
+	auto find_in_databases = [&](auto&& lookup_fn) -> bool {
+		if (m_symbols != nullptr) {
+			if (const auto* rec = lookup_fn(m_symbols.get()); rec != nullptr) {
+				*out_info = *rec;
+				return true;
+			}
+		}
 
-		auto resolve_by_nid = [this, type](const std::string& nid, SymbolRecord* out) -> bool {
-			EXIT_IF(out == nullptr);
-
-			if (m_symbols != nullptr) {
-				if (const auto* rec = m_symbols->FindByNid(nid, type); rec != nullptr) {
-					*out = *rec;
+		for (auto* p: m_programs) {
+			if (p != nullptr && p->export_symbols != nullptr) {
+				if (const auto* rec = lookup_fn(p->export_symbols.get()); rec != nullptr) {
+					*out_info = *rec;
+					if (bind_self != nullptr) {
+						*bind_self = (p == program);
+					}
 					return true;
 				}
 			}
+		}
 
-			for (auto* p: m_programs) {
-				if (p != nullptr && p->export_symbols != nullptr) {
-					if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
-						*out = *rec;
-						return true;
-					}
-				}
-			}
+		return false;
+	};
 
-			return false;
-		};
+	auto resolve_by_nid = [&](const std::string& nid) -> bool {
+		return find_in_databases([&](const auto* db) { return db->FindByNid(nid, type); });
+	};
+
+	if (ids.size() == 3) {
+		const LibraryId* l = FindLibrary(*program, ids.at(1));
+		const ModuleId*  m = FindModule(*program, ids.at(2));
 
 		if (l != nullptr && m != nullptr) {
 			SymbolResolve sr {};
@@ -1569,7 +1574,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec == nullptr) {
-				if (resolve_by_nid(sr.name, out_info)) {
+				if (resolve_by_nid(sr.name)) {
 					LOGF("PS5 NID fallback: %s -> %s\n", sr.name.c_str(), out_info->name.c_str());
 					return;
 				}
@@ -1583,20 +1588,39 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 				out_info->name     = SymbolDatabase::GenerateName(sr);
 				out_info->dbg_name = "";
 			}
-		} else {
-			if (resolve_by_nid(ids.at(0), out_info)) {
-				LOGF("PS5 NID fallback: %s -> %s (missing lib/module metadata)\n",
-				     ids.at(0).c_str(), out_info->name.c_str());
+			return;
+		}
+
+		if (resolve_by_nid(ids.at(0))) {
+			LOGF("PS5 NID fallback: %s -> %s (missing lib/module metadata)\n", ids.at(0).c_str(),
+			     out_info->name.c_str());
+			return;
+		}
+
+		EXIT("l == nullptr || m == nullptr");
+	} else if (ids.size() == 2 && !ids.at(0).empty()) {
+		const auto* l = FindLibrary(*program, ids.at(1));
+		if (l != nullptr) {
+			if (find_in_databases([&](const auto* db) {
+				    return db->FindByLibrary(ids.at(0), l->name, l->version, type);
+			    })) {
 				return;
 			}
-
-			EXIT("l == nullptr || m == nullptr");
 		}
-	} else {
-		out_info->vaddr    = 0;
-		out_info->name     = name;
-		out_info->dbg_name = "";
+		if (resolve_by_nid(ids.at(0))) {
+			LOGF("PS5 NID fallback: %s -> %s (2-part symbol)\n", ids.at(0).c_str(),
+			     out_info->name.c_str());
+			return;
+		}
+	} else if (ids.size() == 1 && !ids.at(0).empty()) {
+		if (resolve_by_nid(ids.at(0))) {
+			return;
+		}
 	}
+
+	out_info->vaddr    = 0;
+	out_info->name     = name;
+	out_info->dbg_name = "";
 }
 
 bool RuntimeLinker::ResolveLoadedSymbolByNid(const std::string& nid, SymbolType type,
@@ -2471,6 +2495,15 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 			return;
 		}
 
+		auto resolve_symbol_type = [](uint8_t t) {
+			switch (t) {
+				case STT_NOTYPE: return SymbolType::NoType;
+				case STT_FUNC: return SymbolType::Func;
+				case STT_OBJECT: return SymbolType::Object;
+				default: return SymbolType::Unknown;
+			}
+		};
+
 		for (auto* sym = program->dynamic_info->symbol_table;
 		     reinterpret_cast<uint8_t*>(sym) <
 		     reinterpret_cast<uint8_t*>(program->dynamic_info->symbol_table) +
@@ -2495,12 +2528,22 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 					sr.module               = m->name;
 					sr.module_version_major = m->version_major;
 					sr.module_version_minor = m->version_minor;
-					switch (type) {
-						case STT_NOTYPE: sr.type = SymbolType::NoType; break;
-						case STT_FUNC: sr.type = SymbolType::Func; break;
-						case STT_OBJECT: sr.type = SymbolType::Object; break;
-						default: sr.type = SymbolType::Unknown; break;
-					}
+					sr.type                 = resolve_symbol_type(type);
+					symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
+				}
+			} else if ((ids.size() == 1 || ids.size() == 2) && !ids.at(0).empty()) {
+				if ((bind == STB_GLOBAL || bind == STB_WEAK) &&
+				    (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE) &&
+				    is_export == (sym->st_value != 0)) {
+					const auto*   l = ids.size() == 2 ? FindLibrary(*program, ids.at(1)) : nullptr;
+					SymbolResolve sr {};
+					sr.name                 = ids.at(0);
+					sr.library              = l != nullptr ? l->name : "";
+					sr.library_version      = l != nullptr ? l->version : 1;
+					sr.module               = "";
+					sr.module_version_major = 1;
+					sr.module_version_minor = 1;
+					sr.type                 = resolve_symbol_type(type);
 					symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
 				}
 			}

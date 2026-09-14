@@ -8,7 +8,6 @@
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
 #include <mutex>
-#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
 #define KYTY_WIN_CS
@@ -197,9 +196,7 @@ struct CondVarPrivate {
 #endif
 };
 
-static std::recursive_mutex                         g_cond_waiters_mutex;
-static std::vector<std::pair<int, CondVarPrivate*>> g_cond_waiters;
-static wait_poll_func_t                             g_cond_wait_poll_callback = nullptr;
+static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
 
 static void WakeCondVar(CondVarPrivate* cond_var) {
 #ifdef KYTY_WIN_CS
@@ -209,24 +206,6 @@ static void WakeCondVar(CondVarPrivate* cond_var) {
 #else
 	cond_var->m_cv.notify_all();
 #endif
-}
-
-static void RegisterCondWaiter(CondVarPrivate* cond_var) {
-	std::lock_guard lock(g_cond_waiters_mutex);
-	g_cond_waiters.emplace_back(Thread::GetThreadIdUnique(), cond_var);
-}
-
-static void UnregisterCondWaiter(CondVarPrivate* cond_var) {
-	const auto      thread_id = Thread::GetThreadIdUnique();
-	std::lock_guard lock(g_cond_waiters_mutex);
-
-	const auto it = std::find_if(g_cond_waiters.begin(), g_cond_waiters.end(),
-	                             [thread_id, cond_var](const auto& waiter) {
-		                             return waiter.first == thread_id && waiter.second == cond_var;
-	                             });
-	if (it != g_cond_waiters.end()) {
-		g_cond_waiters.erase(it);
-	}
 }
 
 struct ThreadPrivate {
@@ -365,7 +344,6 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
-	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -406,7 +384,6 @@ void CondVar::Wait(Mutex* mutex) {
 	}
 	cpp_lock.release();
 #endif
-	UnregisterCondWaiter(m_cond_var.get());
 }
 
 void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
@@ -415,22 +392,74 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
-	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
-#ifdef KYTY_WIN_CS
-	static auto func = ResolveSleepConditionVariableCS();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
-	           0 &&
-	       GetLastError() == ERROR_TIMEOUT);
+	auto poll_callback = [&] {
+		auto* callback = g_cond_wait_poll_callback;
+		if (callback == nullptr) {
+			return;
+		}
+#if defined(KYTY_WIN_CS)
+		LeaveCriticalSection(&mutex->m_mutex->m_cs);
+		callback();
+		EnterCriticalSection(&mutex->m_mutex->m_cs);
 #else
-	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
-	      std::cv_status::no_timeout);
+		cpp_lock.unlock();
+		callback();
+		cpp_lock.lock();
+#endif
+	};
+
+	if (g_cond_wait_poll_callback == nullptr) {
+#ifdef KYTY_WIN_CS
+		static auto func = ResolveSleepConditionVariableCS();
+		EXIT_NOT_IMPLEMENTED(func == nullptr);
+		ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs,
+		            (micros < 1000 ? 1 : micros / 1000)) == 0 &&
+		       GetLastError() == ERROR_TIMEOUT);
+#else
+		ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
+		      std::cv_status::no_timeout);
+#endif
+	} else {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
+		while (true) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) {
+				ok = false;
+				break;
+			}
+			const auto remaining_us =
+			    std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+			const auto step_us = std::min<int64_t>(remaining_us, 10000);
+
+#ifdef KYTY_WIN_CS
+			static auto func = ResolveSleepConditionVariableCS();
+			EXIT_NOT_IMPLEMENTED(func == nullptr);
+			const DWORD step_ms = (step_us < 1000 ? 1 : static_cast<DWORD>(step_us / 1000));
+			if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, step_ms) != 0) {
+				ok = true;
+				break;
+			}
+			if (GetLastError() != ERROR_TIMEOUT) {
+				ok = false;
+				break;
+			}
+			poll_callback();
+#else
+			if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(step_us)) ==
+			    std::cv_status::no_timeout) {
+				ok = true;
+				break;
+			}
+			poll_callback();
+#endif
+		}
+	}
+#ifndef KYTY_WIN_CS
 	cpp_lock.release();
 #endif
-	UnregisterCondWaiter(m_cond_var.get());
 	return ok;
 }
 
@@ -448,13 +477,10 @@ void CondVar::SignalAll() {
 	WakeCondVar(m_cond_var.get());
 }
 
-void CondVar::SignalThread(int thread_id) {
-	std::lock_guard lock(g_cond_waiters_mutex);
-	for (const auto& waiter: g_cond_waiters) {
-		if (waiter.first == thread_id) {
-			WakeCondVar(waiter.second);
-		}
-	}
+void CondVar::SignalThread(int /*thread_id*/) {
+	// No-op: waking shared condition variables for thread-directed signals is unsafe
+	// and causes glibc broadcast/cancel deadlocks. Threads sleeping in CondVar::Wait
+	// already poll for signals every 10ms via g_cond_wait_poll_callback.
 }
 
 int Thread::GetThreadIdUnique() {

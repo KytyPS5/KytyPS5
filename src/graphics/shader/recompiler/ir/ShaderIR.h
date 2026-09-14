@@ -125,6 +125,9 @@ struct ImageResource {
 	// A 64-bit atomic needs an R64ui image declaration and an Int64 texel pointer, so the width
 	// has to reach the backend with the resource rather than the instruction.
 	bool                          atomic64          = false;
+	// Set by any storage access that works in 32-bit texels. The image is declared at one width,
+	// so such an access cannot share a resource with a 64-bit atomic.
+	bool                          narrow_texel_op   = false;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;

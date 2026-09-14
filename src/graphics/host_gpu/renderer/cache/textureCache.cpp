@@ -1405,8 +1405,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
+			auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
+				// The cached image keeps whatever resident_base_level it first admitted;
+				// streaming can only add finer mips over time, never take them away, so if
+				// this request now sees a lower (more complete) level, adopt it and mark
+				// the image for re-upload so InitializeImage() actually pulls the newly
+				// resident levels in instead of leaving them permanently skipped.
+				if (desc.info.resident_base_level < image.info.resident_base_level) {
+					image.info.resident_base_level = desc.info.resident_base_level;
+					image.MarkBufferModified();
+				}
 				result = id;
 			}
 		}

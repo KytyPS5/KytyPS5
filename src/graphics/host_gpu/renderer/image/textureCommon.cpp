@@ -353,9 +353,13 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 			}
 			if (!FitsBufferRange(tile_info.linear_offset, tile_info.linear_size, UINT64_MAX) ||
 			    !FitsBufferRange(tile_info.tiled_offset, tile_info.tiled_size, tiled_size)) {
-				// A streaming surface only backs part of its footprint; skip what is
-				// not there rather than rejecting the whole transfer.
-				continue;
+				// Every level from base_level up was already trimmed to what the guest has
+				// resident, so a tile that still does not fit here is a real bug rather than
+				// expected partial residency. Reject the transfer: dropping just this tile
+				// would leave tile_infos one entry short of regions, desyncing every tile
+				// after it (Detile() indexes tiles by their own offsets, but the caller's
+				// regions vector is untouched, so the mismatch would surface downstream).
+				return false;
 			}
 			const auto row_length =
 			    region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <unordered_map>
 #include <utility>
 
@@ -48,6 +49,12 @@ Decoder::Operand Translator::OffsetOperand(const Decoder::Operand& operand, uint
 	switch (result.kind) {
 		case Decoder::OperandKind::Sgpr:
 		case Decoder::OperandKind::Vgpr: result.reg += offset; break;
+		case Decoder::OperandKind::Ttmp:
+			if (result.reg + offset >= IR::NumTtmpRegs) {
+				EXIT("trap-temporary operand offset is out of range");
+			}
+			result.reg += offset;
+			break;
 		case Decoder::OperandKind::VccLo:
 			EXIT_IF(offset != 1u);
 			result.kind = Decoder::OperandKind::VccHi;
@@ -68,6 +75,7 @@ Decoder::Operand Translator::ScalarDestinationOperand(const Decoder::Operand& op
 	uint32_t code = 0;
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: code = operand.reg; break;
+		case Decoder::OperandKind::Ttmp: code = 108u + operand.reg; break;
 		case Decoder::OperandKind::VccLo: code = 106u; break;
 		case Decoder::OperandKind::VccHi: code = 107u; break;
 		default: EXIT("invalid scalar-memory destination");
@@ -77,6 +85,9 @@ Decoder::Operand Translator::ScalarDestinationOperand(const Decoder::Operand& op
 	if (code < 106u) {
 		result.kind = Decoder::OperandKind::Sgpr;
 		result.reg  = code;
+	} else if (code >= 108u && code <= 123u) {
+		result.kind = Decoder::OperandKind::Ttmp;
+		result.reg  = code - 108u;
 	} else {
 		switch (code) {
 			case 106u: result.kind = Decoder::OperandKind::VccLo; break;
@@ -124,6 +135,7 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
+		case Decoder::OperandKind::Ttmp: return ir.GetScalarReg(IR::TtmpReg(operand.reg));
 		case Decoder::OperandKind::Vgpr:
 			return ir.GetVectorReg(static_cast<IR::VectorReg>(operand.reg));
 		case Decoder::OperandKind::VccLo: return ir.GetVccLo();
@@ -151,6 +163,9 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 IR::U32 Translator::ReadScalarCode(uint32_t code) {
 	if (code < 106u) {
 		return ir.GetScalarReg(static_cast<IR::ScalarReg>(code));
+	}
+	if (code >= 108u && code <= 123u) {
+		return ir.GetScalarReg(IR::TtmpReg(code - 108u));
 	}
 	switch (code) {
 		case 106u: return ir.GetVccLo();
@@ -294,6 +309,15 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			if (IR::RegIndex(reg) > 0u) {
 				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(IR::RegIndex(reg) - 1u),
 				                    IR::U1(IR::Value(false)));
+			}
+			break;
+		}
+		case Decoder::OperandKind::Ttmp: {
+			const auto reg = IR::TtmpReg(operand.reg);
+			ir.SetScalarReg(reg, value);
+			ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
+			if (operand.reg > 0u) {
+				ir.SetScalarMaskTag(IR::TtmpReg(operand.reg - 1u), IR::U1(IR::Value(false)));
 			}
 			break;
 		}
@@ -1090,8 +1114,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(options.wave_size != 64u || mesh.primitives_per_group == 0u ||
-			                     mesh.vertices_per_group > 64u || total_threads > 15u * 64u);
+			if ((options.wave_size != 32u && options.wave_size != 64u) ||
+			    mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
+			    total_threads > 15u * options.wave_size) {
+				EXIT("unsupported mesh group: wave_size=%u primitives_per_group=%u "
+				     "vertices_per_group=%u total_threads=%u\n",
+				     options.wave_size, mesh.primitives_per_group, mesh.vertices_per_group,
+				     total_threads);
+			}
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
 				return IR::U32(
@@ -1116,12 +1146,20 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
 			                                       {subtract_saturate(vertices, size), step})),
 			                  u32(1)));
-			const auto wave            = entry_ir.ShiftRightLogical(local, u32(6));
-			const auto wave_base       = entry_ir.BitwiseAnd(local, u32(~63u));
-			const auto vertex_count    = minimum(subtract_saturate(vertices, wave_base), u32(64));
-			const auto primitive_count = minimum(subtract_saturate(primitives, wave_base), u32(64));
-			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
-			                                          u32(((total_threads + 63u) / 64u) << 28u));
+			// RDNA2 runs a mesh group in either width, so the wave a lane belongs to, the lane
+			// range that wave covers, and the per-wave vertex and primitive caps all follow the
+			// configured wave size rather than a fixed 64.
+			const auto wave_size  = options.wave_size;
+			const auto wave_shift = static_cast<uint32_t>(std::countr_zero(wave_size));
+			const auto wave       = entry_ir.ShiftRightLogical(local, u32(wave_shift));
+			const auto wave_base  = entry_ir.BitwiseAnd(local, u32(~(wave_size - 1u)));
+			const auto vertex_count =
+			    minimum(subtract_saturate(vertices, wave_base), u32(wave_size));
+			const auto primitive_count =
+			    minimum(subtract_saturate(primitives, wave_base), u32(wave_size));
+			const auto wave_info = entry_ir.BitwiseOr(
+			    entry_ir.ShiftLeftLogical(wave, u32(24)),
+			    u32(((total_threads + wave_size - 1u) / wave_size) << 28u));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(

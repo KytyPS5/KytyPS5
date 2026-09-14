@@ -14,6 +14,7 @@
 
 #include <map>
 #include <type_traits>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -167,6 +168,7 @@ private:
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	void               AssociateStencil(ImageId depth, GuestRange stencil);
+	void               DropStencilAssociation(ImageId id);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 

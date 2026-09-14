@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <cinttypes>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -17,15 +19,6 @@ namespace {
 		case vk::ComponentSwizzle::eG:
 		case vk::ComponentSwizzle::eB:
 		case vk::ComponentSwizzle::eA: return true;
-		default: return false;
-	}
-}
-
-[[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
-	switch (format) {
-		case vk::Format::eS8Uint:
-		case vk::Format::eR8Uint:
-		case vk::Format::eR8Unorm: return true;
 		default: return false;
 	}
 }
@@ -283,6 +276,15 @@ enum CompatibilityClass : uint32_t {
 
 } // namespace
 
+bool IsStencilViewFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eS8Uint:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Unorm: return true;
+		default: return false;
+	}
+}
+
 vk::ImageAspectFlags DepthAspectMask(vk::Format format) {
 	switch (format) {
 		case vk::Format::eD16Unorm:
@@ -317,7 +319,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eDepth;
 	}
 	if (image_aspect & vk::ImageAspectFlagBits::eStencil &&
-	    IsStencilViewFormat(normalized.format)) {
+	    ImageViewOps::IsStencilViewFormat(normalized.format)) {
 		normalized.format = image.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
@@ -347,14 +349,23 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
+		// The guest range and info format are reported alongside the backing format because the
+		// two disagreeing is itself a diagnosis: the binding checks upstream all test
+		// info.pixel_format, so a depth backing carrying a colour info format slips past them.
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u"
+		     " info_format=%d guest_format=%u addr=0x%016" PRIx64 " size=0x%" PRIx64
+		     " extent=%ux%ux%u tile=%u rt=%d storage=%d video_out=%d\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
 		     static_cast<int>(normalized.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		     image.layers, static_cast<int>(info.pixel_format),
+		     static_cast<uint32_t>(info.guest_format), info.data.address, info.data.size,
+		     info.extent.width, info.extent.height, info.extent.depth,
+		     static_cast<uint32_t>(info.tile_mode), static_cast<int>(usage.render_target),
+		     static_cast<int>(usage.storage), static_cast<int>(usage.video_out));
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};

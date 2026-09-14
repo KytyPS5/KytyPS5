@@ -1225,6 +1225,16 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	record.depth_id = depth_id;
 }
 
+// Binding this memory as something other than a stencil plane proves the guest has repurposed it,
+// so the association no longer describes the surface. Dropping it is safe because every depth
+// target bind re-associates its stencil range.
+void TextureCache::DropStencilAssociation(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+		image->depth_id = {};
+	}
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {

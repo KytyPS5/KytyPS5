@@ -493,12 +493,19 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
+                                     uint32_t view_levels, uint32_t image_layers,
+                                     uint32_t resident_base) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
-	view.base_level  = descriptor.BaseLevel();
-	view.level_count = view_levels;
+	// Levels below the resident one hold another texture or nothing at all, so the view must
+	// not expose them: the shader would otherwise sample whatever is there.
+	const auto first_level = std::max<uint32_t>(descriptor.BaseLevel(), resident_base);
+	view.base_level        = first_level;
+	view.level_count =
+	    view_levels > (first_level - descriptor.BaseLevel())
+	        ? view_levels - (first_level - descriptor.BaseLevel())
+	        : 1u;
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
@@ -638,7 +645,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
-	uint32_t      pitch        = 0;
+	uint32_t      pitch         = 0;
 	TileSizeAlign size {};
 	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
 	const char* rejection = nullptr;
@@ -737,6 +744,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.info.extent       = {width, height, volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
 	desc.info.pitch        = pitch;
+	// MIN_LOD (4.8 fixed point) is the finest level the title has actually streamed in. The
+	// coarser ones are unbacked and another texture sits right behind them, so they must not
+	// be read. MIN_LOD_WARN is not usable here: it is a feedback threshold, not a residency
+	// boundary, and clamping to it blacks out levels that are present.
+	desc.info.resident_base_level =
+	    multisampled ? 0u : std::min<uint32_t>(descriptor.MinLod() >> 8u, levels - 1u);
 	desc.info.bytes_per_block =
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
@@ -757,7 +770,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		PopulateTextureMipLayout(desc.info);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
+	                                 view_levels, desc.info.resources.layers,
+	                                 desc.info.resident_base_level);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);

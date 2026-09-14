@@ -289,12 +289,16 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
-                              std::vector<GpuTileInfo>& out_tile_infos) {
+                              std::vector<GpuTileInfo>& out_tile_infos, uint32_t base_level) {
 	const auto& description    = layout.surface.description;
 	const bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
 	const auto  depth          = volume_texture ? description.depth : description.layers;
-	if (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 ||
-	    regions.size() != GetTextureRegionCount(depth, levels, volume_texture) ||
+	// The caller may have dropped the levels the guest does not have resident, so the region
+	// list covers base_level..levels-1 rather than the whole chain.
+	const auto expected_regions = GetTextureRegionCount(depth, levels, volume_texture) -
+	                              GetTextureRegionCount(depth, base_level, volume_texture);
+	if (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 || base_level >= levels ||
+	    regions.size() != expected_regions ||
 	    Prospero::IsFmaskTextureFormat(description.format)) {
 		return false;
 	}
@@ -311,7 +315,9 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 	tile_infos.reserve(regions.size());
 	const auto slices_per_copy = volume_texture ? block.block_depth : 1u;
 	size_t     region_base     = 0;
-	for (uint32_t mip_level = 0; mip_level < levels; ++mip_level) {
+	// `regions` holds only the levels actually being transferred, so the walk begins at
+	// the first level the caller kept and indexes from there.
+	for (uint32_t mip_level = base_level; mip_level < levels; ++mip_level) {
 		const auto& mip       = surface.mips[mip_level];
 		const auto  mip_depth = GetTextureLevelDepth(depth, mip_level, volume_texture);
 		for (uint32_t slice_index = 0; slice_index < mip_depth; slice_index += slices_per_copy) {
@@ -347,7 +353,9 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 			}
 			if (!FitsBufferRange(tile_info.linear_offset, tile_info.linear_size, UINT64_MAX) ||
 			    !FitsBufferRange(tile_info.tiled_offset, tile_info.tiled_size, tiled_size)) {
-				return false;
+				// A streaming surface only backs part of its footprint; skip what is
+				// not there rather than rejecting the whole transfer.
+				continue;
 			}
 			const auto row_length =
 			    region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;

@@ -52,7 +52,8 @@ TextureUploadLayout    TextureCalcUploadLayout(Prospero::BufferFormat format, ui
 std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayout& layout);
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
-                              std::vector<GpuTileInfo>& out_tile_infos);
+                              std::vector<GpuTileInfo>& out_tile_infos,
+                              uint32_t base_level = 0);
 
 } // namespace Libs::Graphics
 

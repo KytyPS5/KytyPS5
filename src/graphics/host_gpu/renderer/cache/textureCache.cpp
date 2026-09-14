@@ -20,10 +20,12 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <vector>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -1025,6 +1027,13 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	transfer.regions = TextureBuildImageCopies(transfer.layout);
+	const auto tile_base =
+	    direction == TransferDirection::Upload ? info.resident_base_level : 0u;
+	if (tile_base != 0) {
+		std::erase_if(transfer.regions, [tile_base](const vk::BufferImageCopy& region) {
+			return region.imageSubresource.mipLevel < tile_base;
+		});
+	}
 	if (info.IsDepth()) {
 		for (auto& region: transfer.regions) {
 			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
@@ -1032,7 +1041,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	}
 	if (transfer.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
 		if (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
-		                              info.resources.levels, transfer.tiles)) {
+		                              info.resources.levels, transfer.tiles, tile_base)) {
 			return transfer;
 		}
 	}
@@ -1188,12 +1197,103 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
 	image.Upload(copies, linear.buffer, linear.offset, linear.size);
 }
 
+namespace {
+
+// PPSA21564 diagnostic: pair each uploaded BC7 atlas with how much of it is untouched
+// memory, so an offline join against the APR destination log can say whether the empty
+// pages are exactly the pages APR never wrote.
+void NoteAtlasUpload(const ImageInfo& info) {
+	if (!info.IsBlock() || info.resources.levels <= 1 || info.data.Empty() ||
+	    info.guest_format != Prospero::BufferFormat::kBc7UNorm) {
+		if (info.guest_format != Prospero::BufferFormat::kBc7Srgb) {
+			return;
+		}
+	}
+	static std::mutex            mutex;
+	static std::vector<uint64_t> seen;
+	std::scoped_lock             lock(mutex);
+	if (std::find(seen.begin(), seen.end(), info.data.address) != seen.end()) {
+		return;
+	}
+	seen.push_back(info.data.address);
+	std::vector<uint8_t> bytes(static_cast<size_t>(info.data.size));
+	if (!Libs::LibKernel::Memory::TryReadBacking(info.data.address, bytes.data(), info.data.size)) {
+		return;
+	}
+	uint32_t empty = 0;
+	uint32_t total = 0;
+	for (size_t o = 0; o + 16 <= bytes.size(); o += 16) {
+		total++;
+		if (bytes[o] == 0) {
+			empty++;
+		}
+	}
+	if (auto* out = std::fopen("J:/tmp/atlas_up.txt", "at"); out != nullptr) {
+		std::fprintf(out, "0x%016llx size=%llu %ux%u mips=%u empty=%u/%u\n",
+		             static_cast<unsigned long long>(info.data.address),
+		             static_cast<unsigned long long>(info.data.size), info.extent.width,
+		             info.extent.height, info.resources.levels, empty, total);
+		std::fclose(out);
+	}
+}
+
+} // namespace
+
+namespace {
+
+// A BC7 block encodes its mode as the position of the lowest set bit of its first byte, so a
+// zero first byte is not a legal block - it is memory nobody wrote. A streaming title only
+// backs the levels it has pulled in and packs other textures immediately behind them, and
+// MIN_LOD only tells us about some of those. Sampling each level for unwritten blocks finds
+// the boundary for the rest: a level that is really there reads back clean.
+[[nodiscard]] uint32_t FindResidentBaseLevel(const ImageInfo& info) {
+	constexpr uint32_t kBlockBytes    = 16;
+	constexpr uint32_t kMaxSamples    = 2048;
+	constexpr uint32_t kUnwrittenPart = 8;  // more than one block in eight means not resident
+	if (info.guest_format != Prospero::BufferFormat::kBc7UNorm &&
+	    info.guest_format != Prospero::BufferFormat::kBc7Srgb) {
+		return 0;
+	}
+	std::array<uint8_t, kBlockBytes> block {};
+	uint32_t                         base = 0;
+	for (uint32_t level = 0; level + 1 < info.resources.levels; level++) {
+		const auto& mip = info.mip_layout[level];
+		if (mip.size < kBlockBytes) {
+			break;
+		}
+		const auto blocks = static_cast<uint32_t>(mip.size / kBlockBytes);
+		const auto step   = std::max(1u, blocks / kMaxSamples);
+		uint32_t   seen   = 0;
+		uint32_t   empty  = 0;
+		for (uint32_t i = 0; i < blocks; i += step) {
+			const auto at = info.data.address + mip.offset + static_cast<uint64_t>(i) * kBlockBytes;
+			if (!Libs::LibKernel::Memory::TryReadBacking(at, block.data(), 1)) {
+				break;
+			}
+			seen++;
+			if (block[0] == 0) {
+				empty++;
+			}
+		}
+		// Do not stop at the first level that reads clean: the coarsest levels of an
+		// overrunning surface land on a neighbouring texture and look like perfectly good
+		// blocks. Keep going and take the level after the last one that is clearly unwritten.
+		if (seen != 0 && empty * kUnwrittenPart > seen) {
+			base = level + 1;
+		}
+	}
+	return base;
+}
+
+} // namespace
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
 	}
 	TrackImage(id);
+	NoteAtlasUpload(image.info);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
 			image.RefreshComplete();
@@ -1202,6 +1302,9 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	if (image.info.samples > 1) {
 		return;
+	}
+	if (image.info.resident_base_level == 0) {
+		image.info.resident_base_level = FindResidentBaseLevel(image.info);
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {

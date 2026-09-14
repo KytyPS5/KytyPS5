@@ -92,7 +92,7 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 }
 
 static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t size) {
-	EXIT_NOT_IMPLEMENTED(user_id != Config::GetUserId());
+	EXIT_NOT_IMPLEMENTED(!Config::IsPrimaryUserId(user_id));
 	EXIT_NOT_IMPLEMENTED(size < 5);
 
 	const auto& user_name = Config::GetUserName();
@@ -109,7 +109,7 @@ static KYTY_SYSV_ABI int UserServiceGetUserNumber(int user_id, int32_t* number) 
 	if (number == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -124,7 +124,7 @@ static KYTY_SYSV_ABI int UserServiceGetGamePresets(int user_id, UserServiceGameP
 	if (presets == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -145,7 +145,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityVibration(int user_id, int32
 	if (vibration == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -161,7 +161,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityTriggerEffect(int      user_
 	if (trigger_effect == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -176,7 +176,7 @@ static KYTY_SYSV_ABI int UserServiceGetAgeLevel(int user_id, uint32_t* age_level
 	if (age_level == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -192,7 +192,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityChatTranscription(int      u
 	if (chat_transcription == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -208,7 +208,7 @@ UserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hol
 	if (press_and_hold_delay == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -224,7 +224,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomEnabled(int      user_id
 	if (zoom_enabled == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -240,7 +240,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomFollowFocus(int      use
 	if (zoom_follow_focus == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (!Config::IsPrimaryUserId(user_id)) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 

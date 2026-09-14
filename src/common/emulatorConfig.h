@@ -76,6 +76,7 @@ uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
+bool     IsPrimaryUserId(int32_t user_id);
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();

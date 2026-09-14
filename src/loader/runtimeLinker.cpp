@@ -1592,6 +1592,30 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 
 			EXIT("l == nullptr || m == nullptr");
 		}
+	} else if ((ids.size() == 1 || ids.size() == 2) && !ids.at(0).empty()) {
+		if (m_symbols != nullptr) {
+			if (const auto* rec = m_symbols->FindByNid(ids.at(0), type); rec != nullptr) {
+				*out_info = *rec;
+				return;
+			}
+		}
+
+		for (auto* p: m_programs) {
+			if (p != nullptr && p->export_symbols != nullptr) {
+				if (const auto* rec = p->export_symbols->FindByNid(ids.at(0), type);
+				    rec != nullptr) {
+					*out_info = *rec;
+					if (bind_self != nullptr) {
+						*bind_self = (p == program);
+					}
+					return;
+				}
+			}
+		}
+
+		out_info->vaddr    = 0;
+		out_info->name     = name;
+		out_info->dbg_name = "";
 	} else {
 		out_info->vaddr    = 0;
 		out_info->name     = name;
@@ -2471,6 +2495,15 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 			return;
 		}
 
+		auto resolve_symbol_type = [](uint8_t t) {
+			switch (t) {
+				case STT_NOTYPE: return SymbolType::NoType;
+				case STT_FUNC: return SymbolType::Func;
+				case STT_OBJECT: return SymbolType::Object;
+				default: return SymbolType::Unknown;
+			}
+		};
+
 		for (auto* sym = program->dynamic_info->symbol_table;
 		     reinterpret_cast<uint8_t*>(sym) <
 		     reinterpret_cast<uint8_t*>(program->dynamic_info->symbol_table) +
@@ -2495,12 +2528,22 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 					sr.module               = m->name;
 					sr.module_version_major = m->version_major;
 					sr.module_version_minor = m->version_minor;
-					switch (type) {
-						case STT_NOTYPE: sr.type = SymbolType::NoType; break;
-						case STT_FUNC: sr.type = SymbolType::Func; break;
-						case STT_OBJECT: sr.type = SymbolType::Object; break;
-						default: sr.type = SymbolType::Unknown; break;
-					}
+					sr.type                 = resolve_symbol_type(type);
+					symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
+				}
+			} else if ((ids.size() == 1 || ids.size() == 2) && !ids.at(0).empty()) {
+				if ((bind == STB_GLOBAL || bind == STB_WEAK) &&
+				    (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE) &&
+				    is_export == (sym->st_value != 0)) {
+					const auto*   l = ids.size() == 2 ? FindLibrary(*program, ids.at(1)) : nullptr;
+					SymbolResolve sr {};
+					sr.name                 = ids.at(0);
+					sr.library              = l != nullptr ? l->name : "";
+					sr.library_version      = l != nullptr ? l->version : 1;
+					sr.module               = "";
+					sr.module_version_major = 1;
+					sr.module_version_minor = 1;
+					sr.type                 = resolve_symbol_type(type);
 					symbols->Add(sr, (is_export ? sym->st_value + program->base_vaddr : 0));
 				}
 			}

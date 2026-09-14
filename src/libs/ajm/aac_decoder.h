@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 
 namespace Libs::Audio::Ajm {
@@ -88,6 +89,9 @@ public:
 		return result;
 	}
 
+	size_t m_channel_config_index  = 0;
+	bool   m_channel_config_locked = false;
+
 	void Reset() override {
 		Release();
 		m_skip_frames =
@@ -122,8 +126,21 @@ public:
 		}
 
 		size_t output_offset = 0;
-		if (!DecodePacket(static_cast<const uint8_t*>(input), static_cast<int>(input_size), output,
-		                  output_size, &output_offset, gapless, &result)) {
+		bool   decoded = DecodePacket(static_cast<const uint8_t*>(input),
+		                              static_cast<int>(input_size), output, output_size,
+		                              &output_offset, gapless, &result);
+		while (!decoded && !m_channel_config_locked && AdvanceChannelConfig()) {
+			output_offset = 0;
+			result        = MakeResult();
+			decoded = DecodePacket(static_cast<const uint8_t*>(input), static_cast<int>(input_size),
+			                       output, output_size, &output_offset, gapless, &result);
+		}
+		if (decoded && result.frames > 0) {
+			// A layout that produced audio is the stream's own; stop reconsidering it so a later
+			// corrupt packet cannot walk the decoder onto a different one.
+			m_channel_config_locked = true;
+		}
+		if (!decoded) {
 			result.input_consumed        = input_size;
 			result.output_written        = output_offset;
 			result.total_decoded_samples = m_total_decoded_samples;
@@ -179,6 +196,43 @@ private:
 		}
 	}
 
+	// AudiodecParamM4aac::uiMaxChannels states how many channels the port can emit, not how many
+	// the stream carries, so it cannot be used as an AudioSpecificConfig channelConfiguration: a
+	// stereo stream declared as 7.1 dies on its first channel pair element. The stream's own
+	// layout lives in its element headers, which a two-byte config cannot defer to -- expressing
+	// that needs channelConfiguration 0 plus a program config element. So try the plausible
+	// layouts in turn and keep the first that decodes.
+	static constexpr uint32_t CHANNEL_CONFIG_CANDIDATES[] = {2u, 1u, 6u, 7u, 3u, 4u, 5u};
+
+	static constexpr uint32_t ChannelConfigChannels(uint32_t config) {
+		return config == 7u ? 8u : config;
+	}
+
+	[[nodiscard]] uint32_t CurrentChannelConfig() const {
+		const auto index = std::min(m_channel_config_index,
+		                            std::size(CHANNEL_CONFIG_CANDIDATES) - 1u);
+		return CHANNEL_CONFIG_CANDIDATES[index];
+	}
+
+	// Steps to the next layout that the instance is wide enough to emit, reopening the decoder on
+	// it. Returns false once the candidates are exhausted.
+	bool AdvanceChannelConfig() {
+		const auto cap = std::clamp<uint32_t>(m_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
+		while (++m_channel_config_index < std::size(CHANNEL_CONFIG_CANDIDATES)) {
+			if (ChannelConfigChannels(CHANNEL_CONFIG_CANDIDATES[m_channel_config_index]) > cap) {
+				continue;
+			}
+			Release();
+			OpenDecoder();
+			if (m_codec_context != nullptr) {
+				LOGF("AJM AAC: retrying with channelConfiguration=%" PRIu32 "\n",
+				     CurrentChannelConfig());
+				return true;
+			}
+		}
+		return false;
+	}
+
 	void OpenDecoder() {
 		if (m_codec == nullptr) {
 			return;
@@ -192,8 +246,8 @@ private:
 		if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_RAW) {
 			const auto sample_index =
 			    std::min(m_sampling_freq_index, AJM_DEC_M4AAC_MAX_SAMPLING_FREQ_INDEX);
-			const auto channels = std::clamp<uint32_t>(m_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
 			constexpr uint32_t audio_object_type = 2;
+			const auto         channel_configuration = CurrentChannelConfig();
 
 			auto* extradata = static_cast<uint8_t*>(av_mallocz(2 + AV_INPUT_BUFFER_PADDING_SIZE));
 			if (extradata == nullptr) {
@@ -203,10 +257,11 @@ private:
 
 			extradata[0] = static_cast<uint8_t>((audio_object_type << 3u) | (sample_index >> 1u));
 			extradata[1] = static_cast<uint8_t>(((sample_index & 0x1u) << 7u) |
-			                                    (std::min(channels, 7u) << 3u));
+			                                    (channel_configuration << 3u));
 			m_codec_context->extradata      = extradata;
 			m_codec_context->extradata_size = 2;
-			SetFormat(channels, SamplingRateFromIndex(sample_index), m_sample_encoding);
+			SetFormat(ChannelConfigChannels(channel_configuration),
+			          SamplingRateFromIndex(sample_index), m_sample_encoding);
 		}
 
 		if (avcodec_open2(m_codec_context, m_codec, nullptr) < 0) {

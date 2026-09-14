@@ -20,7 +20,6 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1199,48 +1198,6 @@ void TextureCache::UploadStencil(Image& image, Buffer& source, uint64_t source_o
 
 namespace {
 
-// PPSA21564 diagnostic: pair each uploaded BC7 atlas with how much of it is untouched
-// memory, so an offline join against the APR destination log can say whether the empty
-// pages are exactly the pages APR never wrote.
-void NoteAtlasUpload(const ImageInfo& info) {
-	if (!info.IsBlock() || info.resources.levels <= 1 || info.data.Empty() ||
-	    info.guest_format != Prospero::BufferFormat::kBc7UNorm) {
-		if (info.guest_format != Prospero::BufferFormat::kBc7Srgb) {
-			return;
-		}
-	}
-	static std::mutex            mutex;
-	static std::vector<uint64_t> seen;
-	std::scoped_lock             lock(mutex);
-	if (std::find(seen.begin(), seen.end(), info.data.address) != seen.end()) {
-		return;
-	}
-	seen.push_back(info.data.address);
-	std::vector<uint8_t> bytes(static_cast<size_t>(info.data.size));
-	if (!Libs::LibKernel::Memory::TryReadBacking(info.data.address, bytes.data(), info.data.size)) {
-		return;
-	}
-	uint32_t empty = 0;
-	uint32_t total = 0;
-	for (size_t o = 0; o + 16 <= bytes.size(); o += 16) {
-		total++;
-		if (bytes[o] == 0) {
-			empty++;
-		}
-	}
-	if (auto* out = std::fopen("J:/tmp/atlas_up.txt", "at"); out != nullptr) {
-		std::fprintf(out, "0x%016llx size=%llu %ux%u mips=%u empty=%u/%u\n",
-		             static_cast<unsigned long long>(info.data.address),
-		             static_cast<unsigned long long>(info.data.size), info.extent.width,
-		             info.extent.height, info.resources.levels, empty, total);
-		std::fclose(out);
-	}
-}
-
-} // namespace
-
-namespace {
-
 // A BC7 block encodes its mode as the position of the lowest set bit of its first byte, so a
 // zero first byte is not a legal block - it is memory nobody wrote. A streaming title only
 // backs the levels it has pulled in and packs other textures immediately behind them, and
@@ -1293,7 +1250,6 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	TrackImage(id);
-	NoteAtlasUpload(image.info);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
 			image.RefreshComplete();

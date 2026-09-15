@@ -255,6 +255,34 @@ ctest --test-dir _Build/windows --output-on-failure
 
 Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 
+To build and run only the CPU regressions (no GPU or display required):
+
+```powershell
+cmake --build _Build/windows --target kyty_cpu_tests
+ctest --test-dir _Build/windows --output-on-failure --no-tests=error -L "^cpu$"
+```
+
+GitHub Actions runs this CPU suite on Windows, Linux, and macOS for every pull request
+and push to `main` or `master`. On macOS, use `_Build/macos`; the page-manager and
+memory-tracker tests are excluded there because their host-memory harness currently
+supports only Windows and Linux. The shader compiler and selected graphics metadata
+tests run on the CPU even though their executables link Vulkan code. Tests that create
+a Vulkan device or window, including the filesystem integration test, remain available
+through the full suite and are not run on the standard GitHub-hosted runners.
+
+Register new CPU-only tests with `add_kyty_cpu_test` in `CMakeLists.txt` so their executable
+is built by `kyty_cpu_tests` and their test receives the `cpu` label used by CI.
+
+CI uses [sccache](https://github.com/mozilla/sccache) with GitHub Actions cache storage
+for C and C++ compilation on all three platforms. Unchanged compilation results can be
+reused across runs; compiler, option, source, or relevant header changes cause recompilation.
+Builds on the default branch populate a cache that pull requests can read, while caches
+created by a pull request are available only to subsequent runs of that PR. The first run
+may therefore be cold, and cache eviction or toolchain updates can reduce reuse.
+Linking, installation/package checks, and CPU tests still run. Cache statistics appear in
+the sccache action's post-job report. Updating a PR also cancels its superseded workflow run;
+push and release runs are not cancelled in progress by this setting.
+
 ### Visual Studio Code
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake

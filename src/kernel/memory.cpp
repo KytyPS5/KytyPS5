@@ -878,6 +878,20 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	if (!Graphics::GuestGpu::IsGpuThread() ||
+	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
+	}
+	return true;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

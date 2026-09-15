@@ -456,6 +456,17 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(srt_evaluator_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SrtEvaluatorMemoTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+target_link_libraries(srt_evaluator_memo_tests fmt::fmt)
+target_include_directories(srt_evaluator_memo_tests PRIVATE ${inc_headers})
+target_compile_definitions(srt_evaluator_memo_tests PRIVATE KYTY_SRT_TEST_HOOKS=1)
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -517,7 +528,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests srt_evaluator_memo_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
@@ -544,6 +555,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME srt_evaluator_memo COMMAND $<TARGET_FILE:srt_evaluator_memo_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
@@ -606,6 +618,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		srt_evaluator_memo_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

@@ -196,6 +196,10 @@ void Run(const RunOptions& options) {
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
+	std::string title_id;
+	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
+	}
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);

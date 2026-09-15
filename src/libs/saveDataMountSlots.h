@@ -29,6 +29,11 @@ public:
 	}
 
 	void Mount(size_t slot, std::string_view directory) { m_directories[slot] = directory; }
+	// The directory a slot is mounted from, so save metadata can be written next to its data.
+	[[nodiscard]] std::string Directory(size_t slot) const {
+		return slot < m_directories.size() && m_directories[slot].has_value() ? *m_directories[slot]
+		                                                                     : std::string {};
+	}
 
 	void Release(size_t slot) {
 		if (slot < m_directories.size()) {

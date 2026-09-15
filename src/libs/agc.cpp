@@ -1,4 +1,5 @@
 #include "libs/agc.h"
+#include "libs/agcCommandBuffer.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -263,15 +264,8 @@ struct CommandBuffer {
 	}
 
 	[[nodiscard]] KYTY_SYSV_ABI uint32_t GetAvailableSizeDW() const {
-		if (cursor_up == nullptr || cursor_down == nullptr || cursor_down <= cursor_up) {
-			return 0;
-		}
-
-		auto available = static_cast<uint64_t>(cursor_down - cursor_up);
-		if (available <= reserved_dw) {
-			return 0;
-		}
-		if (available - reserved_dw > UINT32_MAX) {
+		const auto available = CommandBufferAvailableDW(bottom, top, cursor_up, cursor_down, reserved_dw);
+		if (available > UINT32_MAX) {
 			LOGF_COLOR(
 			    Log::Color::Red,
 			    "\t command buffer has suspiciously large free space: cursor_up = 0x%016" PRIx64
@@ -280,7 +274,7 @@ struct CommandBuffer {
 			    reserved_dw);
 			return UINT32_MAX;
 		}
-		return static_cast<uint32_t>(available - reserved_dw);
+		return static_cast<uint32_t>(available);
 	}
 
 	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {

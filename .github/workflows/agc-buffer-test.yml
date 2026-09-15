@@ -1,0 +1,142 @@
+name: AGC buffer Linux test build
+on:
+  push:
+    branches: [fix/agc-null-cursor-boundary]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  KYTY_BUILD_ORIGIN: Fork
+  KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+jobs:
+  linux:
+    name: Build KytyPS5 (Linux)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang \
+            glslang-tools \
+            libasound2-dev \
+            libdbus-1-dev \
+            libgl1-mesa-dev \
+            libpulse-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxss-dev \
+            lld \
+            ninja-build \
+            wayland-protocols
+
+      - name: Install Qt 6.10.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          git --version
+          cmake --version
+          ninja --version
+          clang++ --version
+          ld.lld --version
+          glslangValidator --version
+          echo "Qt6_DIR=$Qt6_DIR"
+
+      - name: Configure
+        shell: bash
+        run: |
+          mkdir -p _Build
+          cmake -S . -B _Build/linux \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
+            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
+            -DKYTY_RELEASE_TAG="buffer-test" \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Verify SDL2 backends
+        shell: bash
+        run: |
+          status=0
+          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
+            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
+              echo "ok   ${feature}"
+            else
+              echo "FAIL ${feature} is not enabled"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build _Build/linux \
+            --target launcher agc_command_buffer_tests page_manager_tests memory_tracker_tests \
+              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --parallel
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir _Build/linux --output-on-failure \
+            -R '^(agc_command_buffer|audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+
+      - name: Install
+        shell: bash
+        run: |
+          cmake --install _Build/linux --prefix _Build/linux/install
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          file _Build/linux/install/launcher
+          file _Build/linux/install/kyty_emulator
+          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
+          ldd _Build/linux/install/kyty_emulator > /dev/null
+          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          while IFS= read -r -d '' binary; do
+            while read -r dependency; do
+              test -e "_Build/linux/install/lib/$dependency"
+            done < <(
+              readelf -d "$binary" |
+                sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
+            )
+          done < <(
+            find _Build/linux/install/launcher _Build/linux/install/plugins \
+              -type f \( -name launcher -o -name '*.so' \) -print0
+          )
+          _Build/linux/install/kyty_emulator --help > /dev/null
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: _Build/linux/install/**
+          if-no-files-found: error

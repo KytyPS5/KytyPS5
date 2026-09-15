@@ -1569,6 +1569,8 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  Require(test.name, "translation", translated.status.ok,
+          "pc " + Hex(translated.status.pc) + ": " + translated.status.reason);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -18964,13 +18966,15 @@ TestCase VectorBfeI32SignExtendsField() {
   return test;
 }
 
-TestCase VectorAlignByteUsesFiveBitByteOffset() {
+TestCase VectorAlignByteUsesAddressLowBits() {
   using O = ShaderOpcode;
 
+  // The offset operand is a byte address whose (address & -4) loaded LO, so only its low
+  // two bits count: offsets 4, 8 and 0x3a5 must read like 0 and 1, never zero or HI bytes.
   std::vector<u32> code;
   AppendVMovLiteral(&code, 0, 0x11223344u);
   AppendVMovLiteral(&code, 1, 0x55667788u);
-  constexpr u32 offsets[] = {0, 1, 3, 4, 5, 7, 8, 31};
+  constexpr u32 offsets[] = {0, 1, 3, 4, 5, 7, 8, 31, 0x3a5};
   for (u32 i = 0; i < static_cast<u32>(std::size(offsets)); i++) {
     AppendVMovU32(&code, 2, offsets[i]);
     AppendVop3(&code, 0x14f, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
@@ -18979,12 +18983,529 @@ TestCase VectorAlignByteUsesFiveBitByteOffset() {
   AppendEnd(&code);
 
   return {
-      "VectorAlignByteUsesFiveBitByteOffset",
+      "VectorAlignByteUsesAddressLowBits",
       code,
       {},
-      {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
-       0x00000011u, 0u, 0u},
+      {0x55667788u, 0x44556677u, 0x22334455u, 0x55667788u, 0x44556677u,
+       0x22334455u, 0x55667788u, 0x22334455u, 0x44556677u},
       {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorAlignByteNaniteVertexByteStream() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f Nanite page transcode d7874b7861593ec2 pc 0x89c..0x8d4, verbatim except that
+  // the load names the test buffer: three bytes per vertex from a stream at an odd address.
+  constexpr u32 guest[] = {
+      0xd7460001u, 0x04010300u, // V_LSHL_ADD_U32 v1, v0, 1, v0
+      0xd76d0003u, 0x0404000du, // V_ADD3_U32 v3, s13, s0, v1
+      0x360206c4u,              // V_AND_B32 v1, -4, v3
+      0xe0341000u, 0x800c0101u, // BUFFER_LOAD_DWORDX2 v1, v1, s48
+      0xbf8c3f70u,              // S_WAITCNT 0x3f70
+      0xd54f0001u, 0x040e0302u, // V_ALIGNBYTE_B32 v1, v2, v1, v3
+      0x340a02f9u, 0x00860690u, // V_LSHLREV_B32 v5, 16, v1.sdwa(sel=0)
+      0x340602f9u, 0x01860690u, // V_LSHLREV_B32 v3, 16, v1.sdwa(sel=1)
+      0x340802f9u, 0x02860690u, // V_LSHLREV_B32 v4, 16, v1.sdwa(sel=2)
+  };
+  constexpr u32 stream_dword = 4;
+  constexpr u32 out = 64;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 13, stream_dword * 4u + 1u);
+  AppendSMovLiteral(&code, 0, 0);
+  code.insert(code.end(), std::begin(guest), std::end(guest));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, out);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, out + 16);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, out + 32);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorAlignByteNaniteVertexByteStream";
+  test.code = std::move(code);
+  test.initial.assign(out + 48, 0);
+  for (u32 i = 0; i < 16; i++) {
+    test.initial[stream_dword + i] = 0x03020100u + i * 0x04040404u;
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < 16; lane++) {
+    const u32 address = stream_dword * 4u + 1u + lane * 3u;
+    for (u32 b = 0; b < 3; b++) {
+      const u32 byte = (test.initial[(address + b) / 4u] >> (((address + b) % 4u) * 8u)) & 0xffu;
+      test.expected[out + b * 16u + lane] = byte << 16u;
+    }
+  }
+  test.opcodes = {O::S_MOV_B32, O::V_LSHL_ADD_U32, O::V_ADD3_U32, O::V_AND_B32,
+                  O::BUFFER_LOAD_DWORDX2, O::S_WAITCNT, O::V_ALIGNBYTE_B32,
+                  O::V_LSHLREV_B32, O::V_MOV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 16;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+void AppendLoadLaneInput(std::vector<u32> *code, u32 dst_vgpr, u32 dword_base) {
+  AppendVMovU32(code, 31, dword_base);
+  code->push_back(EncodeVop2(0x25, 31, Vgpr(0), 31));
+  code->push_back(EncodeVop2(0x1a, 31, InlineU32(2), 31));
+  AppendBufferLoadDword(code, dst_vgpr, 31);
+}
+
+u32 HlslFirstBitHigh(u32 value) {
+  return value == 0 ? 0xffffffffu
+                    : 31u - static_cast<u32>(std::countl_zero(value));
+}
+
+u32 HlslFirstBitHighSigned(u32 value) {
+  return HlslFirstBitHigh((value & 0x80000000u) != 0 ? ~value : value);
+}
+
+u32 LowMask32(u32 bits) {
+  return bits >= 32u ? 0xffffffffu : (1u << bits) - 1u;
+}
+
+TestCase GuestNaniteStripFirstBitHigh() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f Nanite transcode d7874b7861593ec2 pc 0x448..0x47c: find the
+  // last strip bit below the triangle's bit index, then pick up the bits below
+  // and at it.
+  constexpr u32 guest[] = {
+      0xd548000fu, 0x0419010cu, // V_BFE_U32 v15, v12, 0, v6
+      0x36181d0du,              // V_AND_B32 v12, v13, v14
+      0x7e1a730fu,              // V_FFBH_U32 v13, v15
+      0x7d8a1ac1u,              // V_CMP_NE_U32 vcc_lo, -1, v13
+      0x4c1a1a9fu,              // V_SUB_NC_U32 v13, 31, v13
+      0x021a1ac1u,              // V_CNDMASK_B32 v13, -1, v13
+      0xd548000eu, 0x0435010bu, // V_BFE_U32 v14, v11, 0, v13
+      0xd548000bu, 0x04350103u, // V_BFE_U32 v11, v3, 0, v13
+      0xd5480003u, 0x02061b03u, // V_BFE_U32 v3, v3, v13, 1
+      0xd5480002u, 0x02061b02u, // V_BFE_U32 v2, v2, v13, 1
+  };
+  constexpr u32 lanes = 16;
+  constexpr u32 in_mask = 0, in_index = 16, in_v3 = 32, in_v11 = 48, in_v2 = 64,
+                out = 80;
+  constexpr std::array<u32, lanes> masks = {
+      0xdeadbeefu, 0x00000001u, 0x00000002u, 0xffffffffu,
+      0x80000000u, 0x0000f000u, 0x12345678u, 0x00000000u,
+      0x7fffffffu, 0x00010000u, 0xa5a5a5a5u, 0x00000100u,
+      0xfffffffeu, 0x0f0f0f0fu, 0x00008000u, 0x40000001u};
+  constexpr std::array<u32, lanes> indices = {0,  1,  2, 31, 31, 16, 29, 20,
+                                              31, 16, 9, 8,  1,  27, 15, 30};
+  std::vector<u32> code;
+  AppendLoadLaneInput(&code, 12, in_mask);
+  AppendLoadLaneInput(&code, 6, in_index);
+  AppendLoadLaneInput(&code, 3, in_v3);
+  AppendLoadLaneInput(&code, 11, in_v11);
+  AppendLoadLaneInput(&code, 2, in_v2);
+  code.insert(code.end(), std::begin(guest), std::end(guest));
+  const u32 results[] = {13, 14, 11, 3, 2};
+  for (u32 i = 0; i < std::size(results); i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, results[i], 0, out + i * lanes);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GuestNaniteStripFirstBitHigh";
+  test.code = std::move(code);
+  test.initial.assign(out + std::size(results) * lanes, 0);
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const u32 below = masks[lane] & LowMask32(indices[lane]);
+    const u32 other = 0x9e3779b9u * (lane + 1u);
+    test.initial[in_mask + lane] = masks[lane];
+    test.initial[in_index + lane] = indices[lane];
+    test.initial[in_v3 + lane] = below == 0 ? 0 : other;
+    test.initial[in_v11 + lane] = below == 0 ? 0 : ~other;
+    test.initial[in_v2 + lane] = below == 0 ? 0 : std::rotl(other, 7);
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const u32 below = masks[lane] & LowMask32(indices[lane]);
+    const u32 high = HlslFirstBitHigh(below);
+    const u32 v3 = test.initial[in_v3 + lane];
+    const u32 v11 = test.initial[in_v11 + lane];
+    const u32 v2 = test.initial[in_v2 + lane];
+    const bool found = high != 0xffffffffu;
+    test.expected[out + lane] = high;
+    test.expected[out + lanes + lane] = found ? v11 & LowMask32(high) : 0;
+    test.expected[out + 2 * lanes + lane] = found ? v3 & LowMask32(high) : 0;
+    test.expected[out + 3 * lanes + lane] = found ? (v3 >> high) & 1u : 0;
+    test.expected[out + 4 * lanes + lane] = found ? (v2 >> high) & 1u : 0;
+  }
+  test.opcodes = {O::V_MOV_B32,         O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+                  O::BUFFER_LOAD_DWORD, O::V_BFE_U32,          O::V_AND_B32,
+                  O::V_FFBH_U32,        O::V_CMP_NE_U32,       O::V_SUB_NC_U32,
+                  O::V_CNDMASK_B32,     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase GuestSignedFirstBitHighShift() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f compute 43a900f7266e02a0 pc 0x1f0c..0x1f48 without the exec
+  // save at 0x1f14: the smallest arithmetic shift that brings two signed
+  // differences under their top bit.
+  constexpr u32 guest[] = {
+      0x4c108f3fu,              // V_SUB_NC_U32 v8, v63, v71
+      0x4c127d40u,              // V_SUB_NC_U32 v9, v64, v62
+      0x7e107708u,              // V_FFBH_I32 v8, v8
+      0x7e127709u,              // V_FFBH_I32 v9, v9
+      0x7d8a10c1u,              // V_CMP_NE_U32 vcc_lo, -1, v8
+      0x4c10109fu,              // V_SUB_NC_U32 v8, 31, v8
+      0x021010c1u,              // V_CNDMASK_B32 v8, -1, v8
+      0x7d8a12c1u,              // V_CMP_NE_U32 vcc_lo, -1, v9
+      0x4c12129fu,              // V_SUB_NC_U32 v9, 31, v9
+      0x021212c1u,              // V_CNDMASK_B32 v9, -1, v9
+      0xd5550008u, 0x04210109u, // V_MAX3_I32 v8, v9, 0, v8
+      0x30147f08u,              // V_ASHRREV_I32 v10, v8, v63
+      0x30128f08u,              // V_ASHRREV_I32 v9, v8, v71
+      0x30168108u,              // V_ASHRREV_I32 v11, v8, v64
+  };
+  constexpr u32 lanes = 16;
+  constexpr u32 out = 64;
+  constexpr std::array<u32, lanes> v63 = {
+      0,           5,           0xffffffffu, 0x7fffffffu,
+      0x80000000u, 1000,        0xfffff000u, 3,
+      0x00012345u, 0xffffff00u, 17,          0x40000000u,
+      0x00000800u, 0xffff8000u, 99,          0};
+  constexpr std::array<u32, lanes> v71 = {
+      0,           4, 0,   0xffffffffu, 0,           0xfffffc18u,
+      0,           0, 1,   0xfffffe00u, 0x00000011u, 0xc0000000u,
+      0x00000400u, 0, 100, 0x80000000u};
+  constexpr std::array<u32, lanes> v64 = {
+      0,           0xffffffffu, 2,           0,          0x00001000u, 7,
+      0x00000100u, 0xfffffffdu, 0x00000fffu, 12,         17,          0,
+      0xffffc000u, 0x00004000u, 1,           0x7fffffffu};
+  constexpr std::array<u32, lanes> v62 = {
+      0,           0,  0xffffffffu, 0, 0, 0, 0xffffff00u, 0,
+      0x00000800u, 13, 17,          0, 0, 0, 0,           0xfffffffeu};
+  std::vector<u32> code;
+  AppendLoadLaneInput(&code, 63, 0);
+  AppendLoadLaneInput(&code, 71, 16);
+  AppendLoadLaneInput(&code, 64, 32);
+  AppendLoadLaneInput(&code, 62, 48);
+  code.insert(code.end(), std::begin(guest), std::end(guest));
+  const u32 results[] = {8, 10, 9, 11};
+  for (u32 i = 0; i < std::size(results); i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, results[i], 0, out + i * lanes);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GuestSignedFirstBitHighShift";
+  test.code = std::move(code);
+  test.initial.assign(out + std::size(results) * lanes, 0);
+  for (u32 lane = 0; lane < lanes; lane++) {
+    test.initial[lane] = v63[lane];
+    test.initial[16 + lane] = v71[lane];
+    test.initial[32 + lane] = v64[lane];
+    test.initial[48 + lane] = v62[lane];
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const auto a =
+        static_cast<int32_t>(HlslFirstBitHighSigned(v63[lane] - v71[lane]));
+    const auto b =
+        static_cast<int32_t>(HlslFirstBitHighSigned(v64[lane] - v62[lane]));
+    const u32 shift = static_cast<u32>(std::max({b, 0, a}));
+    test.expected[out + lane] = shift;
+    test.expected[out + lanes + lane] =
+        static_cast<u32>(static_cast<int32_t>(v63[lane]) >> shift);
+    test.expected[out + 2 * lanes + lane] =
+        static_cast<u32>(static_cast<int32_t>(v71[lane]) >> shift);
+    test.expected[out + 3 * lanes + lane] =
+        static_cast<u32>(static_cast<int32_t>(v64[lane]) >> shift);
+  }
+  test.opcodes = {O::V_MOV_B32,         O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+                  O::BUFFER_LOAD_DWORD, O::V_SUB_NC_U32,       O::V_FFBH_I32,
+                  O::V_CMP_NE_U32,      O::V_CNDMASK_B32,      O::V_MAX3_I32,
+                  O::V_ASHRREV_I32,     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase GuestScalarFirstBitHigh() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f compute 8e27ba66380738ab pc 0x0f8..0x108.
+  constexpr u32 guest[] = {
+      0xbeea156au, // S_FLBIT_I32_B32 vcc_lo, vcc_lo
+      0x80eb6a9fu, // S_SUB_U32 vcc_hi, 31, vcc_lo
+      0xbf06c16au, // S_CMP_EQ_U32 vcc_lo, -1
+      0xbf800000u, // S_NOP
+      0x85096bc1u, // S_CSELECT_B32 s9, -1, vcc_hi
+  };
+  constexpr std::array inputs = {0x00000000u, 0x00000001u, 0x80000000u,
+                                 0x7fffffffu, 0x0000ccccu, 0x00010000u,
+                                 0x00000003u, 0xffffffffu};
+  std::vector<u32> code;
+  TestCase test;
+  test.name = "GuestScalarFirstBitHigh";
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendSMovLiteral(&code, 106, inputs[i]);
+    code.insert(code.end(), std::begin(guest), std::end(guest));
+    AppendStoreSgpr(&code, 9, i);
+    test.expected.push_back(HlslFirstBitHigh(inputs[i]));
+  }
+  AppendEnd(&code);
+  test.code = std::move(code);
+  test.opcodes = {
+      O::S_MOV_B32, O::S_FLBIT_I32_B32, O::S_SUB_U32, O::S_CMP_EQ_U32,
+      O::S_NOP,     O::S_CSELECT_B32,   O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM};
+  return test;
+}
+
+TestCase GuestWave64LanePrefixCount() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f Nanite compute 6e5845fe4f0e30df pc 0x10c..0x11c: each
+  // selected lane's compacted output slot is the number of selected lanes below
+  // it.
+  constexpr u32 guest[] = {
+      0xd7660002u, 0x00010011u, // V_MBCNT_HI_U32_B32 v2, s17, 0, s0
+      0xd7650002u, 0x00020410u, // V_MBCNT_LO_U32_B32 v2, s16, v2, s0
+      0xd7470002u, 0x020a041du, // V_ADD_LSHL_U32 v2, s29, v2, 2
+  };
+  constexpr uint64_t selected = 0xb5a10f3c80006e59ull;
+  constexpr u32 base = 5;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 16, static_cast<u32>(selected));
+  AppendSMovLiteral(&code, 17, static_cast<u32>(selected >> 32u));
+  AppendSMovLiteral(&code, 29, base);
+  code.insert(code.end(), std::begin(guest), std::end(guest));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GuestWave64LanePrefixCount";
+  test.code = std::move(code);
+  test.initial.assign(64, 0);
+  for (u32 lane = 0; lane < 64; lane++) {
+    const uint64_t below =
+        lane == 0 ? 0 : selected & ((uint64_t{1} << lane) - 1u);
+    test.expected.push_back((base + static_cast<u32>(std::popcount(below)))
+                            << 2u);
+  }
+  test.opcodes = {
+      O::S_MOV_B32,      O::V_MBCNT_HI_U32_B32, O::V_MBCNT_LO_U32_B32,
+      O::V_ADD_LSHL_U32, O::V_LSHLREV_B32,      O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase GuestNaniteBitReaderAlignBit() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f Nanite compute 6e5845fe4f0e30df pc 0x550..0x598, verbatim
+  // except that the load names the test buffer: a 96-bit window at element *
+  // bits_per_element, one field read.
+  constexpr u32 guest[] = {
+      0xd5690018u, 0x00020d0eu, // V_MUL_LO_U32 v24, v14, v6
+      0x30083085u,              // V_ASHRREV_I32 v4, 5, v24
+      0x34080882u,              // V_LSHLREV_B32 v4, 2, v4
+      0xd76d0004u, 0x04120b0bu, // V_ADD3_U32 v4, v11, v5, v4
+      0x360808c4u,              // V_AND_B32 v4, -4, v4
+      0xe03c1000u, 0x800c0404u, // BUFFER_LOAD_DWORDX3 v4, v4
+      0xbf8c3f70u,              // S_WAITCNT 0x3f70
+      0xd54e0004u, 0x04620905u, // V_ALIGNBIT_B32 v4, v5, v4, v24
+      0xd54e0005u, 0x04620b06u, // V_ALIGNBIT_B32 v5, v6, v5, v24
+      0xd5480006u, 0x045d0104u, // V_BFE_U32 v6, v4, 0, v23
+      0xd54e0004u, 0x045e0905u, // V_ALIGNBIT_B32 v4, v5, v4, v23
+      0x2c0a0b17u,              // V_LSHRREV_B32 v5, v23, v5
+  };
+  constexpr u32 lanes = 16;
+  constexpr u32 in = 0, stream = 128, stream_dwords = 64, out = 256;
+  std::vector<u32> code;
+  AppendLoadLaneInput(&code, 14, in);
+  AppendLoadLaneInput(&code, 6, in + lanes);
+  AppendLoadLaneInput(&code, 11, in + 2 * lanes);
+  AppendLoadLaneInput(&code, 5, in + 3 * lanes);
+  AppendLoadLaneInput(&code, 23, in + 4 * lanes);
+  code.insert(code.end(), std::begin(guest), std::end(guest));
+  const u32 results[] = {24, 6, 4, 5};
+  for (u32 i = 0; i < std::size(results); i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, results[i], 0, out + i * lanes);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GuestNaniteBitReaderAlignBit";
+  test.code = std::move(code);
+  test.initial.assign(out + std::size(results) * lanes, 0);
+  u32 seed = 0x2545f491u;
+  for (u32 i = 0; i < stream_dwords; i++) {
+    seed = seed * 1664525u + 1013904223u;
+    test.initial[stream + i] = seed ^ std::rotl(seed, 13);
+  }
+  constexpr std::array<u32, lanes> element = {0, 1, 2,  3,  7,  10, 33, 40,
+                                              5, 0, 17, 29, 38, 1,  12, 21};
+  constexpr std::array<u32, lanes> bits = {32, 5, 16, 31, 9, 24, 3,  17,
+                                           1,  0, 11, 13, 7, 30, 20, 8};
+  constexpr std::array<u32, lanes> width = {1, 5, 16, 31, 9, 24, 3,  17,
+                                            1, 7, 11, 13, 7, 30, 20, 8};
+  for (u32 lane = 0; lane < lanes; lane++) {
+    test.initial[in + lane] = element[lane];
+    test.initial[in + lanes + lane] = bits[lane];
+    test.initial[in + 2 * lanes + lane] = stream * 4u - 8u;
+    test.initial[in + 3 * lanes + lane] = 8u;
+    test.initial[in + 4 * lanes + lane] = width[lane];
+  }
+  const auto read = [&](uint64_t bit, u32 count) {
+    uint64_t value = 0;
+    for (u32 i = 0; i < count; i++) {
+      const auto b = bit + i;
+      value |= static_cast<uint64_t>(
+                   (test.initial[stream + (b >> 5u)] >> (b & 31u)) & 1u)
+               << i;
+    }
+    return static_cast<u32>(value);
+  };
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const uint64_t position = element[lane] * bits[lane];
+    const u32 n = width[lane];
+    test.expected[out + lane] = static_cast<u32>(position);
+    test.expected[out + lanes + lane] = read(position, n);
+    test.expected[out + 2 * lanes + lane] = read(position + n, 32);
+    test.expected[out + 3 * lanes + lane] = read(position + 32 + n, 32 - n);
+  }
+  test.opcodes = {
+      O::V_MOV_B32,         O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+      O::BUFFER_LOAD_DWORD, O::V_MUL_LO_U32,       O::V_ASHRREV_I32,
+      O::V_ADD3_U32,        O::V_AND_B32,          O::BUFFER_LOAD_DWORDX3,
+      O::S_WAITCNT,         O::V_ALIGNBIT_B32,     O::V_BFE_U32,
+      O::V_LSHRREV_B32,     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase GuestScalarBitfieldFieldMatchesMask() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f Nanite mesh shader 00ff251d55efea81 reads the same s3 field
+  // twice: pc 0x28 extracts it, pc 0x530 masks it in place.
+  constexpr u32 guest[] = {
+      0x93eaff03u, 0x00040018u, // S_BFE_U32 vcc_lo, s3, 0x00040018
+      0x870cff03u, 0x0f000000u, // S_AND_B32 s12, s3, 0x0f000000
+  };
+  constexpr std::array inputs = {0x00000000u, 0xffffffffu, 0x0a000000u,
+                                 0xf5ffffffu, 0x12345678u, 0x01000000u,
+                                 0x0f000000u, 0x80800000u};
+  std::vector<u32> code;
+  TestCase test;
+  test.name = "GuestScalarBitfieldFieldMatchesMask";
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendSMovLiteral(&code, 3, inputs[i]);
+    code.insert(code.end(), std::begin(guest), std::end(guest));
+    AppendStoreSgpr(&code, 106, 2 * i);
+    AppendStoreSgpr(&code, 12, 2 * i + 1);
+    const u32 field = inputs[i] & 0x0f000000u;
+    test.expected.push_back(field >> 24u);
+    test.expected.push_back(field);
+  }
+  AppendEnd(&code);
+  test.code = std::move(code);
+  test.opcodes = {O::S_MOV_B32, O::S_BFE_U32,          O::S_AND_B32,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase GuestWave64CornerLaneMasks() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f compute a71ba187c82dee46 pc 0x4..0x2c on a 4x4x4 wave64
+  // thread group: the three masks select x == 0, y == 0 and z == 0, so only
+  // lane 0 survives.
+  constexpr u32 guest[] = {
+      0xbefe04c1u, // S_MOV_B64 exec_lo, -1 (00ff251d55efea81 pc 0x4)
+      0xbeea3bffu, 0x03030303u, // S_BITREPLICATE_B64_B32 vcc_lo, 0x03030303
+      0xbe9003ffu, 0x11111111u, // S_MOV_B32 s16, 0x11111111
+      0x87926a7eu,              // S_AND_B64 s18, exec_lo, vcc_lo
+      0x87eaff7eu, 0x0000ffffu, // S_AND_B64 vcc_lo, exec_lo, 0x0000ffff
+      0xbe910310u,              // S_MOV_B32 s17, s16
+      0x87ea6a12u,              // S_AND_B64 vcc_lo, s18, vcc_lo
+      0x8790107eu,              // S_AND_B64 s16, exec_lo, s16
+      0x87c86a10u,              // S_AND_B64 s72, s16, vcc_lo
+  };
+  std::vector<u32> code(std::begin(guest), std::end(guest));
+  const u32 results[] = {18, 19, 16, 17, 106, 107, 72, 73};
+  for (u32 i = 0; i < std::size(results); i++) {
+    AppendStoreSgpr(&code, results[i], i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GuestWave64CornerLaneMasks";
+  test.code = std::move(code);
+  test.expected = {0x000f000fu, 0x000f000fu, 0x11111111u, 0x11111111u,
+                   0x0000000fu, 0,           1,           0};
+  test.opcodes = {
+      O::S_MOV_B64, O::S_BITREPLICATE_B64_B32, O::S_MOV_B32, O::S_AND_B64,
+      O::V_MOV_B32, O::BUFFER_STORE_DWORD,     O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 4;
+  test.compute_info.threads_num[2] = 4;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 3;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase GuestScalarLowestBitIterate() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f compute e818ca665639ba96 pc 0x76c..0x788: take the lowest set
+  // bit of the pending mask, then clear it.
+  constexpr u32 isolate[] = {
+      0xbeea1306u, // S_FF1_I32_B32 vcc_lo, s6
+      0xbefe04c1u, // S_MOV_B64 exec_lo, -1
+      0x8f6a6a81u, // S_LSHL_B32 vcc_lo, 1, vcc_lo
+  };
+  constexpr u32 clear[] = {
+      0x816ac106u, // S_ADD_I32 vcc_lo, s6, -1
+      0x87086a06u, // S_AND_B32 s8, s6, vcc_lo
+  };
+  constexpr std::array inputs = {0x00000001u, 0x80000000u, 0x00000c00u,
+                                 0xfffffffeu, 0x12345678u, 0x00010001u};
+  std::vector<u32> code;
+  TestCase test;
+  test.name = "GuestScalarLowestBitIterate";
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendSMovLiteral(&code, 6, inputs[i]);
+    code.insert(code.end(), std::begin(isolate), std::end(isolate));
+    AppendStoreSgpr(&code, 106, 2 * i);
+    code.insert(code.end(), std::begin(clear), std::end(clear));
+    AppendStoreSgpr(&code, 8, 2 * i + 1);
+    test.expected.push_back(inputs[i] & (0u - inputs[i]));
+    test.expected.push_back(inputs[i] & (inputs[i] - 1u));
+  }
+  AppendEnd(&code);
+  test.code = std::move(code);
+  test.opcodes = {O::S_MOV_B32,  O::S_FF1_I32_B32,      O::S_MOV_B64,
+                  O::S_LSHL_B32, O::S_ADD_I32,          O::S_AND_B32,
+                  O::V_MOV_B32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase VectorCarryAndBitCountOps() {
@@ -27542,7 +28063,16 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
-  AddCase(VectorAlignByteUsesFiveBitByteOffset);
+  AddCase(VectorAlignByteUsesAddressLowBits);
+  AddCase(VectorAlignByteNaniteVertexByteStream);
+  AddCase(GuestNaniteStripFirstBitHigh);
+  AddCase(GuestSignedFirstBitHighShift);
+  AddCase(GuestScalarFirstBitHigh);
+  AddCase(GuestWave64LanePrefixCount);
+  AddCase(GuestNaniteBitReaderAlignBit);
+  AddCase(GuestScalarBitfieldFieldMatchesMask);
+  AddCase(GuestWave64CornerLaneMasks);
+  AddCase(GuestScalarLowestBitIterate);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -32441,6 +32971,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -32639,9 +33171,22 @@ int main(int argc, char **argv) {
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-bit-ops-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, GuestNaniteStripFirstBitHigh());
+    RunCase(&vulkan, GuestSignedFirstBitHighShift());
+    RunCase(&vulkan, GuestScalarFirstBitHigh());
+    RunCase(&vulkan, GuestWave64LanePrefixCount());
+    RunCase(&vulkan, GuestNaniteBitReaderAlignBit());
+    RunCase(&vulkan, GuestScalarBitfieldFieldMatchesMask());
+    RunCase(&vulkan, GuestWave64CornerLaneMasks());
+    RunCase(&vulkan, GuestScalarLowestBitIterate());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    RunCase(&vulkan, VectorAlignByteUsesAddressLowBits());
+    RunCase(&vulkan, VectorAlignByteNaniteVertexByteStream());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {

@@ -3929,10 +3929,11 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	auto vaddr = reinterpret_cast<uint64_t>(address);
-	auto op    = (cmd[0] >> 8u) & 0xffu;
+	const auto vaddr  = reinterpret_cast<uint64_t>(address);
+	const auto header = cmd[0];
+	const auto op     = (header >> 8u) & 0xffu;
 
-	if ((op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM) ||
+	if ((op == Pm4::IT_NOP && KYTY_PM4_R(header) == Pm4::R_RELEASE_MEM) ||
 	    op == Pm4::IT_RELEASE_MEM) {
 		cmd[3] = static_cast<uint32_t>(vaddr & 0xffffffffu);
 		cmd[4] = static_cast<uint32_t>((vaddr >> 32u) & 0xffffffffu);
@@ -3940,8 +3941,8 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 		cmd[2] = static_cast<uint32_t>(vaddr & 0xffffffffu);
 		cmd[3] = (cmd[3] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
 	} else {
-		EXIT("unsupported queueEndOfPipeAction packet for address patch: 0x%08" PRIx32 "\n",
-		     cmd[0]);
+		// Size-measuring passes emit into a shared scratch that other threads overwrite.
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	return OK;

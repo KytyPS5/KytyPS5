@@ -215,6 +215,69 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
 	emit({0x0f, 0x94, 0xc0});                 // sete al
 	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
+	// Only the first function is described to the patcher; the rest have to be discovered from
+	// the int3 alignment padding between them or from a code pointer, as in SILENT HILL f.
+	const auto pad = [&code]() {
+		do {
+			code.push_back(0xcc);
+		} while (code.size() % 16 != 0);
+	};
+	pad();
+
+	// The same body in clang's small-frame layout, which is what SILENT HILL 2 trips over: a
+	// frame pointer, no `sub rsp`, and every local addressed as [rbp - disp] below rsp.
+	const auto frame_offset = code.size();
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x41, 0x57});                       // push r15
+	emit({0x41, 0x56});                       // push r14
+	emit({0x41, 0x55});                       // push r13
+	emit({0x41, 0x54});                       // push r12
+	emit({0x53});                             // push rbx  (rbp - rsp is now 0x28)
+	emit({0x48, 0xb8});
+	emit64(SENTINEL);                         // movabs rax, sentinel
+	emit({0x48, 0xb9});
+	emit64(SENTINEL);                         // movabs rcx, sentinel
+	emit({0x48, 0x89, 0x45, 0xc0});           // mov [rbp-0x40], rax  (== [rsp-0x18])
+	emit({0x48, 0x89, 0x45, 0xb8});           // mov [rbp-0x48], rax  (== [rsp-0x20])
+	emit({0xc7, 0x45, 0xcc, 0x44, 0x33, 0x22, 0x11}); // mov dword [rbp-0x34], 0x11223344
+	emit({0xc6, 0x45, 0xd6, 0x5a});           // mov byte [rbp-0x2a], 0x5a
+	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8b, 0x45, 0xc0});           // mov rax, [rbp-0x40]
+	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
+	emit({0x0f, 0x94, 0xc0});                 // sete al
+	emit({0x0f, 0xb6, 0xc0});                 // movzx eax, al
+	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});     // pop rbx; pop r12; pop r13
+	emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+	pad();
+
+	// Same prologue, but every rbp-relative access lands at or above rsp: [rbp-0x08] and
+	// [rbp-0x28] are saved registers and [rbp+0x10] is an incoming argument. None of them is
+	// red zone, so this function must not be counted. Analyzed only, never called.
+	const auto above_offset = code.size();
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x41, 0x57, 0x41, 0x56, 0x41, 0x55}); // push r15; push r14; push r13
+	emit({0x41, 0x54, 0x53});                 // push r12; push rbx
+	emit({0x48, 0x8b, 0x45, 0xf8});           // mov rax, [rbp-0x08]
+	emit({0x48, 0x8b, 0x4d, 0xd8});           // mov rcx, [rbp-0x28]
+	emit({0x48, 0x03, 0x45, 0x10});           // add rax, [rbp+0x10]
+	emit({0x48, 0x8b, 0x17});                 // mov rdx, [rdi] (faultable, 3 bytes)
+	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});     // pop rbx; pop r12; pop r13
+	emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+	pad();
+
+	// An rsp adjustment the patcher cannot model must poison the frame-pointer distance, so the
+	// [rbp-0x48] below is left alone rather than folded onto a guessed offset. Analyzed only.
+	const auto unknown_offset = code.size();
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x53});                             // push rbx
+	emit({0x48, 0x83, 0xe4, 0xe0});           // and rsp, -0x20
+	emit({0x48, 0x8b, 0x45, 0xb8});           // mov rax, [rbp-0x48]
+	emit({0x48, 0x8b, 0x0f});                 // mov rcx, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8d, 0x65, 0xf8});           // lea rsp, [rbp-0x08]
+	emit({0x5b, 0x5d, 0xc3});                 // pop rbx; pop rbp; ret
 	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
 	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
 	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
@@ -227,18 +290,34 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 
 	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const auto frame_function = reinterpret_cast<GuestFunction>(mapping + frame_offset);
+	const auto reset_fault_page = [test]() {
+		DWORD old_protection = 0;
+		Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+	};
 	const bool unpatched_was_corrupted = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
+	reset_fault_page();
+	const bool unpatched_frame_was_corrupted =
+	    frame_function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
 
-	DWORD old_protection = 0;
-	Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
-	      "failed to reset fault page protection");
+	reset_fault_page();
 	Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
 	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
 	                                   TRAMPOLINE_SIZE);
-	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
+	const std::array<Loader::RedZoneFunctionRange, 1> unwind_functions = {
+	    Loader::RedZoneFunctionRange {.start = static_cast<uintptr_t>(mapping), .size = frame_offset}};
+	const std::array<uintptr_t, 1> code_pointers = {static_cast<uintptr_t>(mapping + unknown_offset)};
 	const auto result = Loader::PatchGuestInstructions(
-	    mapping, code.size(), function_starts, true, false);
+	    mapping, code.size(),
+	    {.unwind_functions = unwind_functions, .code_pointers = code_pointers, .execute_only = true},
+	    true, false);
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
+	      "failed to flush patched test code");
 	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+	reset_fault_page();
+	const bool patched_frame_preserved =
+	    frame_function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
 
 	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
 	RemoveVectoredExceptionHandler(handler);
@@ -247,11 +326,20 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
 
 	Check(test, unpatched_was_corrupted, "test harness did not reproduce red-zone corruption");
-	Check(test, result.red_zone_function_count == 1 && result.memory_instruction_count >= 1 &&
-	                result.patched_memory_instruction_count >= 1 &&
+	Check(test, unpatched_frame_was_corrupted,
+	      "test harness did not reproduce frame-pointer red-zone corruption");
+	Check(test, result.red_zone_function_count == 2 && result.memory_instruction_count >= 2 &&
+	                result.patched_memory_instruction_count >= 2 &&
 	                result.unrelocatable_memory_instruction_count == 0,
 	      "static patcher did not cover the faultable instruction");
+	Check(test, result.frame_pointer_red_zone_function_count == 1,
+	      "static patcher mis-classified a frame-pointer addressed red zone");
+	Check(test, result.sweep_trusted && result.function_count == 4 &&
+	                result.padding_function_count == 2 && result.code_pointer_function_count == 1,
+	      "static patcher did not discover the undescribed functions");
 	Check(test, patched_preserved, "patched fault still corrupted the guest red zone");
+	Check(test, patched_frame_preserved,
+	      "patched fault still corrupted the frame-pointer addressed red zone");
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -2705,12 +2793,13 @@ void TestPackedReciprocalSquareRoot() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), code_size,
 		                                   reinterpret_cast<void*>(mapping + code_size), code_size);
-		const std::array<uintptr_t, 1> function_starts {mapping};
+		const std::array<Loader::RedZoneFunctionRange, 1> unwind_functions {
+		    Loader::RedZoneFunctionRange {.start = mapping, .size = code.getSize()}};
 		// The extended-register case also relocates ordinary memory accesses while
 		// red-zone data is live, exercising both enabled patchers in one function.
 		const bool protect_memory = source == 9;
 		const auto patched = Loader::PatchGuestInstructions(
-		    mapping, code.getSize(), function_starts, protect_memory, true);
+		    mapping, code.getSize(), {.unwind_functions = unwind_functions}, protect_memory, true);
 		Check(test, patched.reciprocal_sqrt_instruction_count == 1 &&
 		                patched.unrelocatable_memory_instruction_count == 0 &&
 		                (protect_memory ? patched.patched_memory_instruction_count > 0

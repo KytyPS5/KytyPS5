@@ -523,9 +523,15 @@ struct PipelineCache::ProgramCache {
 			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
 				options.user_data_base = 0;
 				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+				if (stage == ShaderType::Mesh) {
+					options.host_subgroup_size = input_info.mesh.host_subgroup_size;
+				}
 			}
 		} else {
 			options.wave_size = input_info.wave_size;
+			if constexpr (requires { input_info.host_subgroup_size; }) {
+				options.host_subgroup_size = input_info.host_subgroup_size;
+			}
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;

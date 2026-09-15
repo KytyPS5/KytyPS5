@@ -19,6 +19,8 @@ namespace Libs::Graphics::ShaderRecompiler {
 struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
+	// See IR::ResourcePlan::host_subgroup_size.
+	uint32_t                    host_subgroup_size         = 64;
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;

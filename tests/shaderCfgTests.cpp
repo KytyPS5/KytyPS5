@@ -1856,10 +1856,8 @@ void TestShaderStageBarriers() {
         "SPIR-V binary does not contain OpControlBarrier");
   // AcquireRelease | WorkgroupMemory | UniformMemory: s_barrier orders buffer traffic too.
   Check(
-      std::find(result.spirv.begin(), result.spirv.end(), 264u) !=
       std::find(result.spirv.begin(), result.spirv.end(), 328u) !=
           result.spirv.end(),
-      "SPIR-V barrier does not use workgroup acquire-release memory semantics");
       "SPIR-V barrier does not order workgroup and buffer memory with acquire-release");
   CheckSpirvBinaryValidates(result.spirv);
 
@@ -10952,17 +10950,21 @@ void TestMemoryFedScalarLeafCall() {
   const auto options = MakeCompileOptions(ShaderType::Compute);
   const uint32_t gpu_callable[] = {EncodeVop1(0x02, 4, 256),
       EncodeSmem0(0x09, 14, 0), 4u << 25u, EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  const auto skipped = PrepareShaderSource(gpu_callable, options);
-  Check(skipped.unsupported_call_pc == 12u && skipped.calls.empty(),
-        "GPU-buffer callable did not report its unsupported call site");
+  const auto stubbed = PrepareShaderSource(gpu_callable, options);
+  const auto& stub_site = stubbed.decoded.instructions[2];
+  Check(stub_site.pc == 12u && stub_site.call_stub && stub_site.branch_target == UINT32_MAX &&
+            stubbed.calls.empty(),
+        "GPU-buffer callable was not stubbed at its call site");
+  const auto stub_result = RecompileForTest(gpu_callable, options);
+  Check(!stub_result.spirv.empty() && stub_result.program.uses_call_stub,
+        "GPU-buffer callable was not compiled with the any-hit stub");
   auto source = PrepareShaderSource(shader, options);
   Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
             source.decoded.instructions[source.calls.front().instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
-              "unresolved SWAPPC silently fell through");
-#endif
+  // Translating before the refresh links the call is refused, not run as a fall-through.
+  Check(!TranslateProgram(source.decoded, options).status.ok,
+        "unresolved SWAPPC silently fell through");
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
             linked.instructions[source.calls.front().instruction].branch_target == 0x44 &&
@@ -11031,25 +11033,30 @@ void TestMemoryFedScalarLeafCall() {
   (void)RefreshShaderSource(source, runtime);
   Check(source.revision == 3 && source.reads.back().second == 8,
         "shorter exact-boundary leaf was not decoded after a failed old-span read");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // An unlinkable call takes the any-hit stub while unlinkable and links again once it can.
+  const auto takes_stub = [&](const Decoder::Program &program) {
+    const auto &call = program.instructions[source.calls.front().instruction];
+    return source.linked->functions.empty() && call.call_stub && call.branch_target == UINT32_MAX;
+  };
   memory.clean = false;
-  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
-              "unreadable call dependencies reused stale linked code");
+  Check(takes_stub(RefreshShaderSource(source, runtime)) && source.revision == 4,
+        "unreadable call dependencies reused stale linked code");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 4, "a still-unlinkable call rebuilt its stub");
   memory.clean = true;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 5 && !source.linked->functions.empty(),
+        "a readable leaf was not linked again after the stub");
   auto ordinary = runtime;
   ordinary.read_specialization_memory = nullptr;
-  ExpectFatal([&] { (void)RefreshShaderSource(source, ordinary); },
-              "call target query accepted an ordinary non-strict memory reader");
+  Check(takes_stub(RefreshShaderSource(source, ordinary)) && source.revision == 6,
+        "call target query accepted an ordinary non-strict memory reader");
   std::vector<uint32_t> escaping(std::begin(shader), std::end(shader) - 1);
   escaping.insert(escaping.end(), {EncodeVop1(0x01, 1, 14),
       EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0), EncodeSopp(0x01)});
-  ExpectFatal([&] {
-    auto escaping_source = PrepareShaderSource(escaping, options);
-    (void)TranslateProgram(RefreshShaderSource(escaping_source, runtime), options);
-  }, "saved native return PC escaped into GPU data");
-  memory.words[96] = EncodeSMovB32(14, 129);
-  ExpectFatal([&] { (void)RefreshShaderSource(source, runtime); },
-              "leaf clobbering its return pair was linked");
+  auto escaping_source = PrepareShaderSource(escaping, options);
+  Check(!TranslateProgram(RefreshShaderSource(escaping_source, runtime), options).status.ok,
+        "saved native return PC escaped into GPU data");
   // AND_B64 must replace the preceding high-half definition.
   const uint32_t high_writer[] = {
       EncodeSMovB32(15, 129), EncodeSop2(0x0f, 14, 128, 128),
@@ -11062,12 +11069,24 @@ void TestMemoryFedScalarLeafCall() {
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
-              "ambiguous reaching definitions were accepted for a call target");
+  // A target the host cannot pin to one definition is not linked: every call takes the stub.
+  const auto all_stubbed = [](const ShaderSource &prepared) {
+    return prepared.calls.empty() &&
+           std::ranges::all_of(prepared.decoded.instructions, [](const auto &inst) {
+             return inst.opcode != Decoder::Opcode::S_SWAPPC_B64 || inst.call_stub;
+           });
+  };
+  Check(all_stubbed(PrepareShaderSource(joined, options)),
+        "ambiguous reaching definitions were accepted for a call target");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
-              "a native return pair was accepted as a later call target");
-#endif
+  Check(all_stubbed(PrepareShaderSource(multiple, options)),
+        "a native return pair was accepted as a later call target");
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 7 && !source.linked->functions.empty(),
+        "a call target read through a strict reader was not linked again");
+  memory.words[96] = EncodeSMovB32(14, 129);
+  Check(takes_stub(RefreshShaderSource(source, runtime)) && source.revision == 8,
+        "leaf clobbering its return pair was linked");
 }
 
 void TestNewShaderRecompilerSetpcBranch() {
@@ -11087,6 +11106,76 @@ void TestNewShaderRecompilerSetpcBranch() {
   Check((result.ir_dump.find("successors=[") != std::string::npos),
         "S_SETPC_B64 did not participate in CFG");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestPlainSetpcThroughS6DecodesFollowingCode() {
+  using namespace ShaderRecompiler::Decoder;
+  // Only a merged-stage front half stops at s6; plain code continues.
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 6, 0),      // s_getpc_b64 s[6:7]
+      EncodeSop2(0x00, 6, 6, 140), // s_add_u32 s6, s6, 12
+      EncodeSop1(0x20, 0, 6),      // s_setpc_b64 s[6:7]
+      EncodeSMovB32(0, 129),       0xbf810000u,
+  };
+
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions.size() == 5u &&
+            program.instructions[2].opcode == Opcode::S_SETPC_B64 &&
+            program.instructions[2].src0.kind == OperandKind::Sgpr &&
+            program.instructions[2].src0.reg == 6u &&
+            program.instructions.back().opcode == Opcode::S_ENDPGM,
+        "plain s_setpc_b64 s6 stopped decoding the code after it");
+  const Program front_half = DecodeFrontProgram(shader);
+  Check(front_half.instructions.size() == 3u,
+        "front half decode did not stop at s_setpc_b64 s6");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("s_endpgm") != std::string::npos,
+        "plain s_setpc_b64 s6 lost the code after it");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestFrontHalfDecodeStopsAtHandoff() {
+  using namespace ShaderRecompiler::Decoder;
+  // s_setpc_b64 s6 at word 103, then padding and the "sl00" metadata tag at word 112.
+  const uint32_t code[] = {
+      0xbfa00003u, 0x8f6a9003u, 0x94fe6ac1u, 0xbf880062u, 0xd7650007u, 0x000100c1u, 0xf4040607u,
+      0xfa000000u, 0xbf8cc07fu, 0x8f6b8419u, 0x93eaff19u, 0x0001001au, 0x876bff6bu, 0x000001f0u,
+      0xbf066a80u, 0xf4080406u, 0xd6000000u, 0xbe8e03ffu, 0x022c0204u, 0xbe8f03ffu, 0x0fac03acu,
+      0x8594807eu, 0x9396ff19u, 0x00070007u, 0x93ebff19u, 0x00020005u, 0x8f6a8c16u, 0x98ebff6bu,
+      0x000c0000u, 0xbf8cc07fu, 0x8717ff13u, 0xfff80000u, 0xd5010006u, 0x00520b08u, 0x88146a17u,
+      0x94ea6b0eu, 0x9399ff19u, 0x000c000eu, 0x886a6a14u, 0xbf068016u, 0xd7660009u, 0x00020ec1u,
+      0x85136a13u, 0x8f6b8418u, 0x93eaff18u, 0x0001001au, 0x876bff6bu, 0x000001f0u, 0xbf066a80u,
+      0xf4080506u, 0xd6000000u, 0x858c807eu, 0x939aff18u, 0x00070007u, 0x93ebff18u, 0x00020005u,
+      0xbf8cc07fu, 0x871bff17u, 0xfff80000u, 0x8f6a8c1au, 0x98ebff6bu, 0x000c0000u, 0x881b6a1bu,
+      0x94ea6b0eu, 0xe0042000u, 0x19040606u, 0xd501000au, 0x00320b08u, 0x886b6a1bu, 0x9398ff18u,
+      0x000c000eu, 0x93eaff03u, 0x00040018u, 0xbf06801au, 0xd7460005u, 0x04250c6au, 0x85176b17u,
+      0xf4280704u, 0xfa000010u, 0xe0042000u, 0x1805090au, 0xf4201a84u, 0xfa000000u, 0x160a0a9cu,
+      0xbf8cc07fu, 0x4a10106au, 0x7e160280u, 0x7e1802f2u, 0xd8340018u, 0x00000805u, 0xd8380504u,
+      0x000c0b05u, 0xbf8c3f71u, 0xd5410007u, 0x007c3b07u, 0xd5410006u, 0x00783906u, 0xd8380100u,
+      0x00070605u, 0xbf8c3f70u, 0xd8380302u, 0x000a0905u, 0xbf8cc07fu, 0xbe802006u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0x00000000u, 0x00000000u, 0x00000000u,
+      0x30306c73u, 0x000000cdu, 0x000000e8u, 0x00000000u, 0x00102961u, 0x10204900u, 0x10254024u,
+      0x00001041u, 0x100401a6u, 0x40401009u, 0x10462042u, 0x104c104bu, 0x104e104du, 0x1079606fu,
+      0x1085107au, 0x006e0000u, 0x10255700u, 0x0f650000u, 0x22102120u, 0x00402420u, 0x200f6500u,
+      0x40241021u, 0x0f640000u, 0x24102120u, 0x45000040u, 0x00004024u, 0x2b10294du, 0x44000010u,
+      0x00004024u, 0xe00da0c1u, 0x88181000u, 0xd2f2c70fu, 0x00208574u, 0x818f6f04u, 0x85680080u,
+      0x15010901u, 0x8a04018au, 0x63030801u, 0x819e018fu, 0x97150080u, 0x81a81001u, 0x03200080u,
+      0x00019e10u, 0x0501a810u, 0x8518285au, 0x01b05101u, 0x01971017u, 0x0201b546u, 0x01ac0000u,
+      0xbc01ac41u, 0xc43e2001u, 0x01ca2001u, 0x01c40100u, 0xa80b0001u, 0x0404a946u, 0x8a801174u,
+      0xa32040a0u, 0x01c5d985u, 0x00000000u, 0x00000000u, 0x65726162u, 0x746f6f66u, 0xa287d836u,
+      0x00000000u, 0x00000001u, 0x000001b4u, 0x00000000u, 0x000000e8u, 0xa89d1c6eu, 0x18b642a3u,
+      0x00000000u, 0x00000000u,
+  };
+  Check(code[112] == 0x30306c73u, "front half fixture lost its metadata tag");
+  const Program program = DecodeFrontProgram(code);
+  const auto &last = program.instructions.back();
+  Check(last.opcode == Opcode::S_SETPC_B64 && last.src0.kind == OperandKind::Sgpr &&
+            last.src0.reg == 6u && last.pc == 103u * 4u && last.word_count == 1u,
+        "front half decode did not stop at its stage hand-off");
 }
 
 void TestFusedShaderHandoffPreservesRegisters() {
@@ -11133,14 +11222,22 @@ void TestFusedShaderHandoffPreservesRegisters() {
   const uint32_t call_front[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x20, 0, 6)};
   Check(Decoder::DecodeFrontProgram(call_front).has_swap_pc,
         "front decoder omitted its scalar call");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ExpectFatal([&] { (void)PrepareShaderSource(call_front, options); },
-              "fused front call bypassed the non-compute rejection");
+  // The host re-executes only compute call targets; a graphics-stage call is an any-hit stub.
+  const auto stubbed_call = [](const ShaderSource &source) {
+    return source.decoded.has_swap_pc && source.calls.empty() &&
+           std::ranges::all_of(source.decoded.instructions, [](const auto &inst) {
+             return inst.opcode != Decoder::Opcode::S_SWAPPC_B64 || inst.call_stub;
+           });
+  };
+  Check(stubbed_call(PrepareShaderSource(call_front, options)),
+        "fused front call bypassed the non-compute rejection");
   const uint32_t call_back[] = {EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   options.back_code = call_back;
-  ExpectFatal([&] { (void)PrepareShaderSource(front, options); },
-              "fused back call metadata was not propagated");
-#endif
+  const auto back_call = PrepareShaderSource(front, options);
+  Check(stubbed_call(back_call) &&
+            back_call.decoded.code.size() ==
+                Decoder::DecodeFrontProgram(front).code.size() + std::size(call_back),
+        "fused back call metadata was not propagated");
 }
 
 void TestMeshExportStorage() {
@@ -16982,6 +17079,8 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestPlainSetpcThroughS6DecodesFollowingCode();
+  TestFrontHalfDecodeStopsAtHandoff();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();

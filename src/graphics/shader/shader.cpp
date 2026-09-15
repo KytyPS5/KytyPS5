@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderGsAssembly.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 
@@ -438,7 +439,6 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -576,27 +576,27 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                     group.primitive_group_size != 1u || group.vertex_group_size != 1u ||
 		                     user_vgpr.vgpr1 || user_vgpr.vgpr2 || user_vgpr.vgpr3 ||
 		                     mesh.max_vertices != sh.m_vgtGsMaxVertOut);
-	} else if (merged) {
-		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
-	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
-	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
-	    mesh.max_vertices == 0u) {
-		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
-		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
-		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
+	const ShaderGsAssemblyRegisters gs_regs {
+	    .gs_vgpr_component_count = regs.gs_regs.rsrc1.gs_vgpr_component_count,
+	    .es_vgpr_component_count = regs.gs_regs.rsrc2.es_vgpr_component_count,
+	    .gs_out_prim_type        = sh.m_vgtGsOutPrimType,
+	    .gs_max_vert_out         = sh.m_vgtGsMaxVertOut,
+	    .primitive_group_size    = group.primitive_group_size,
+	    .vertex_group_size       = group.vertex_group_size,
+	};
+	if (const char* error = ShaderBuildGsAssembly(gs_regs, mesh); error != nullptr) {
+		LOGF("\t warning: dropping GS draw: %s\n", error);
+		return {};
 	}
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices) :
 	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
-	EXIT_IF(mesh.primitives_per_group == 0u);
+	if (mesh.primitives_per_group == 0u) {
+		LOGF("\t warning: dropping GS draw: subgroup holds no complete output primitive\n");
+		return {};
+	}
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
 	mesh.max_primitives = mesh.primitives_per_group * (sh.m_geNggSubgrpCntl & 0x1ffu);
 	const auto threads = std::max(native_ngg && !mesh.fast_launch ? mesh.vertices_per_group

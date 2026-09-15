@@ -690,6 +690,7 @@ struct ResourcePlan {
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
 	// On the plan because the host walk re-executes a readfirstlane once per lane.
+	bool                                                   upper_lane_half_is_ghost = false;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;

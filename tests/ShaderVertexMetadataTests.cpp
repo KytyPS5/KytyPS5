@@ -1,3 +1,4 @@
+#include "graphics/shader/shaderGsAssembly.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 
 #include <array>
@@ -108,10 +109,91 @@ void TestValidAndInvalidMetadata() {
 	CheckRejected(missing_semantics.mapped, "missing vertex semantic array was accepted");
 }
 
+void CheckAccepted(const char* reason, const char* text) {
+	if (reason != nullptr) {
+		std::fprintf(stderr, "ShaderVertexMetadataTests: failed: %s: %s\n", text, reason);
+		std::abort();
+	}
+}
+
+// A triangle list feeding a GS that emits one triangle per input primitive into 32-lane waves.
+ShaderGsAssemblyRegisters ValidGsRegisters() {
+	return {
+	    .gs_vgpr_component_count = 3,
+	    .es_vgpr_component_count = 3,
+	    .gs_out_prim_type        = 2,
+	    .gs_max_vert_out         = 3,
+	    .primitive_group_size    = 16,
+	    .vertex_group_size       = 48,
+	};
+}
+
+ShaderMeshInputInfo ValidGsMesh() {
+	ShaderMeshInputInfo mesh;
+	mesh.input_primitive  = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
+	mesh.wave_size        = 32;
+	mesh.max_vertices     = 96;
+	mesh.provoking_vertex = 0;
+	return mesh;
+}
+
+void CheckGsRejected(const ShaderGsAssemblyRegisters& regs, const ShaderMeshInputInfo& input,
+                     const char* text) {
+	auto mesh = input;
+	Check(ShaderBuildGsAssembly(regs, mesh) != nullptr, text);
+	Check(mesh.threads_num[0] == 0, "a rejected GS assembly still claimed a mesh thread count");
+}
+
+// The VGPR component counts only say how many VGPRs the SPI pre-loads; none may change the assembly.
+void TestGsVgprComponentCounts() {
+	ShaderMeshInputInfo reference = ValidGsMesh();
+	CheckAccepted(ShaderBuildGsAssembly(ValidGsRegisters(), reference),
+	              "the reference GS assembly was rejected");
+
+	for (uint32_t gs_count = 0; gs_count < SHADER_GS_VGPR_MAX_COMPONENTS; gs_count++) {
+		for (uint32_t es_count = 0; es_count < SHADER_ES_VGPR_MAX_COMPONENTS; es_count++) {
+			auto regs                    = ValidGsRegisters();
+			regs.gs_vgpr_component_count = gs_count;
+			regs.es_vgpr_component_count = es_count;
+			auto mesh                    = ValidGsMesh();
+			CheckAccepted(ShaderBuildGsAssembly(regs, mesh),
+			              "a legal GS/ES VGPR component count was rejected");
+			Check(mesh.gs_vgpr_component_count == gs_count &&
+			          mesh.es_vgpr_component_count == es_count,
+			      "the GS/ES VGPR component counts were not carried into the mesh assembly");
+		}
+	}
+}
+
+void TestGsUnsupportedAssemblyIsRejected() {
+	auto adjacency = ValidGsMesh();
+	adjacency.input_primitive =
+	    static_cast<uint32_t>(Prospero::PrimitiveType::kTriListAdjacency);
+	CheckGsRejected(ValidGsRegisters(), adjacency, "an adjacency input primitive was accepted");
+
+	auto lines             = ValidGsRegisters();
+	lines.gs_out_prim_type = 1;
+	CheckGsRejected(lines, ValidGsMesh(), "a non-triangle GS output primitive was accepted");
+
+	auto short_output          = ValidGsRegisters();
+	short_output.gs_max_vert_out = 2;
+	CheckGsRejected(short_output, ValidGsMesh(), "a GS emitting no triangle was accepted");
+
+	auto small_group             = ValidGsRegisters();
+	small_group.vertex_group_size = 2;
+	CheckGsRejected(small_group, ValidGsMesh(), "a GE vertex group below one primitive was accepted");
+
+	auto no_output        = ValidGsMesh();
+	no_output.max_vertices = 0;
+	CheckGsRejected(ValidGsRegisters(), no_output, "an empty GS subgroup was accepted");
+}
+
 } // namespace
 
 int main() {
 	TestValidAndInvalidMetadata();
+	TestGsVgprComponentCounts();
+	TestGsUnsupportedAssemblyIsRejected();
 	std::puts("ShaderVertexMetadataTests: all cases passed");
 	return 0;
 }

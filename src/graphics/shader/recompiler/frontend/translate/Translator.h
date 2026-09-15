@@ -251,6 +251,7 @@ private:
 	void EmitMemory(const Decoder::Instruction& inst);
 	static void FailMissingTranslation(const Decoder::Instruction& inst);
 
+	IR::U32         ClampGhostLanes(IR::U32 high_word);
 	IR::Program&    program;
 	IR::IREmitter   ir;
 	IR::U1          instruction_branch_condition;

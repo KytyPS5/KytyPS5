@@ -25,6 +25,12 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
+// Every Value handed to the functions below must belong to the ResourcePlan passed alongside it:
+// ExtractResourcePlan clones each reachable instruction into the plan it builds, and evaluation
+// resolves SRT slots, clean-slot flags and descriptor sources against that same plan. Mixing a
+// Value from one plan with another plan was already meaningless; it additionally aliases the dense
+// memo slot instructions carry, so it is a precondition rather than a checked error.
+
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
@@ -56,6 +62,16 @@ namespace SrtTestHooks {
 // Test builds only: evaluators created on the calling thread take their memo storage from
 // `resource` instead of the thread's pool; nullptr restores the pool.
 void SetMemoResource(std::pmr::memory_resource* resource);
+// Test builds only: when disabled, evaluators on the calling thread memoize every instruction
+// through the pointer-keyed map instead of the plan's dense slots. The two must agree.
+void SetDenseMemo(bool enabled);
+// Test builds only: returns the calling thread's memo arenas to a pristine state (every slot
+// invalid, counter at zero), which is the state a fresh thread starts in.
+void ResetMemoArenas();
+// Test builds only: moves the calling thread's memo counter WITHOUT invalidating any slot, so the
+// wrap is reachable. Only a value the counter could legitimately reach next is meaningful;
+// production never reuses a generation, which is precisely what the wrap must preserve.
+void SetMemoGeneration(uint32_t generation);
 } // namespace SrtTestHooks
 #endif
 

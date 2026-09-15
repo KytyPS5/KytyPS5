@@ -8,11 +8,13 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory>
 #include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
@@ -453,12 +455,14 @@ private:
 
 #ifdef KYTY_SRT_TEST_HOOKS
 thread_local std::pmr::memory_resource* t_memo_resource_override = nullptr;
+thread_local bool                       t_dense_memo             = true;
 #endif
 
-// Each Evaluator owns a private memo map. The maps take their nodes and bucket arrays from one
-// pool per thread, so evaluating on a warm thread stops calling the system allocator for memo
-// entries. The pool keeps its high-water mark until the thread exits; its upstream is the static
-// new/delete resource, so thread-exit teardown only returns memory to ::operator delete.
+// Fallback memo storage, for instructions no ResourcePlan cloned and which therefore carry no
+// dense slot. Those maps take their nodes and bucket arrays from one pool per thread, so evaluating
+// on a warm thread does not call the system allocator for memo entries. The pool keeps its
+// high-water mark until the thread exits; its upstream is the static new/delete resource, so
+// thread-exit teardown only returns memory to ::operator delete.
 std::pmr::memory_resource* MemoResource() {
 #ifdef KYTY_SRT_TEST_HOOKS
 	if (t_memo_resource_override != nullptr) {
@@ -469,6 +473,73 @@ std::pmr::memory_resource* MemoResource() {
 	return &pool;
 }
 
+// Dense evaluator memo. Plan-cloned instructions carry a stable slot, so an evaluation memoizes
+// into an array instead of a hash map. The arrays are one per thread and are reused; each evaluator
+// takes a fresh generation, which is what keeps the memo namespaces apart - the main evaluator, the
+// clean evaluator and every ReadFirstLane child see only their own entries, exactly as they saw
+// only their own map before.
+struct MemoArena {
+	std::vector<uint64_t> values;
+	std::vector<uint32_t> stamps;
+	uint32_t              generation = 0;
+
+	// A reused arena is invalidated in O(1) by moving to a stamp no slot carries yet.
+	void Advance() {
+		if (generation == UINT32_MAX) {
+			std::fill(stamps.begin(), stamps.end(), 0u);
+			generation = 0;
+		}
+		generation++;
+	}
+	void Reserve(uint32_t slots) {
+		if (slots > values.size()) {
+			values.resize(slots);
+			stamps.resize(slots, 0u); // a fresh slot never matches a live generation
+		}
+	}
+};
+
+// Evaluators are stack locals, so their lifetimes are strictly LIFO on a thread: the clean
+// evaluator and the main evaluator in EvaluateRuntimeSourcesImpl, every ReadFirstLane child, and
+// any nested EvaluateRuntimeSourcesImpl. Handing each one the arena at its own depth gives every
+// memo namespace private storage, so no evaluator can evict another's entries, and the arenas are
+// reused for the life of the thread instead of being rebuilt per draw.
+struct MemoArenaStack {
+	std::vector<std::unique_ptr<MemoArena>> arenas;
+	uint32_t                                depth = 0;
+
+	MemoArena& Acquire() {
+		if (depth == arenas.size()) {
+			arenas.push_back(std::make_unique<MemoArena>());
+		}
+		auto& arena = *arenas[depth++];
+		arena.Advance();
+		return arena;
+	}
+	void Release() { depth--; }
+};
+
+MemoArenaStack& Arenas() {
+	thread_local MemoArenaStack stack;
+	return stack;
+}
+
+// Holds an evaluator's arena for exactly its lifetime, including when a later member's constructor
+// throws, which a destructor on Evaluator itself would not cover.
+class ArenaLease {
+public:
+	ArenaLease(): m_arena(Arenas().Acquire()) {}
+	~ArenaLease() { Arenas().Release(); }
+	ArenaLease(const ArenaLease&)            = delete;
+	ArenaLease& operator=(const ArenaLease&) = delete;
+
+	[[nodiscard]] MemoArena& Arena() const { return m_arena; }
+	[[nodiscard]] uint32_t   Generation() const { return m_arena.generation; }
+
+private:
+	MemoArena& m_arena;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -476,6 +547,7 @@ public:
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
 	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_generation(m_lease.Generation()),
 	      m_cache(MemoMap::allocator_type(MemoResource())) {}
 
 	// The memo map is bound to this thread's pool; a copy would rebind it to the default resource.
@@ -516,7 +588,7 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
+			m_lease.Arena().Reserve(m_program.memo_slot_count);
 			m_visiting.reserve(m_program.value_storage.size());
 			m_reserved = true;
 		}
@@ -524,7 +596,18 @@ private:
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
+		const uint32_t slot = inst->MemoSlot();
+#ifdef KYTY_SRT_TEST_HOOKS
+		const bool dense = t_dense_memo && slot < m_program.memo_slot_count;
+#else
+		const bool dense = slot < m_program.memo_slot_count;
+#endif
+		if (dense) {
+			if (m_lease.Arena().stamps[slot] == m_generation) {
+				result = m_lease.Arena().values[slot];
+				return true;
+			}
+		} else if (const auto found = m_cache.find(inst); found != m_cache.end()) {
 			result = found->second;
 			return true;
 		}
@@ -538,7 +621,12 @@ private:
 		if (!evaluated) {
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		if (dense) {
+			m_lease.Arena().values[slot] = out;
+			m_lease.Arena().stamps[slot] = m_generation;
+		} else {
+			m_cache.emplace(inst, out);
+		}
 		result = out;
 		return true;
 	}
@@ -987,6 +1075,8 @@ private:
 	std::span<const uint8_t> m_clean_flat_slots;
 	Evaluator*               m_clean_evaluator = nullptr;
 	Value                    m_active_mask;
+	ArenaLease               m_lease;
+	uint32_t                 m_generation = 0;
 	MemoMap                  m_cache;
 	std::vector<const Inst*> m_visiting;
 	bool                     m_reserved = false;
@@ -1124,6 +1214,20 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 namespace SrtTestHooks {
 void SetMemoResource(std::pmr::memory_resource* resource) {
 	t_memo_resource_override = resource;
+}
+void SetDenseMemo(bool enabled) {
+	t_dense_memo = enabled;
+}
+void ResetMemoArenas() {
+	for (auto& arena: Arenas().arenas) {
+		std::fill(arena->stamps.begin(), arena->stamps.end(), 0u);
+		arena->generation = 0;
+	}
+}
+void SetMemoGeneration(uint32_t generation) {
+	for (auto& arena: Arenas().arenas) {
+		arena->generation = generation;
+	}
 }
 } // namespace SrtTestHooks
 #endif

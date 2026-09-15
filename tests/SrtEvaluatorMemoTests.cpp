@@ -1,12 +1,14 @@
 // SRT evaluator memo storage tests.
 //
-// Every Evaluator owns a private memo map whose storage comes from a per-thread pool. These tests
-// run each evaluation with pooled storage (the production path) and with unpooled storage (the
-// new/delete resource, i.e. the previous allocation behaviour; the container type is the same) and
-// require identical return status, outputs and reader-call order. They also pin down the memo
-// semantics that pooling must not disturb: separate main/clean and parent/ReadFirstLane contexts,
-// dependencies that survive an enclosing failure, re-entrant and concurrent evaluation, allocation
-// failure, and thread exit.
+// Every Evaluator owns a private memo namespace. Instructions a ResourcePlan cloned carry a dense
+// slot and memoize into a per-evaluator generation-stamped array; anything else (evaluation over a
+// raw Program) memoizes through the pointer-keyed map. These tests run each evaluation three ways
+// - dense slots, the map with pooled storage, and the map with unpooled storage - and require
+// identical return status, outputs and reader-call order, so the dense memo is held to the map's
+// behaviour case by case. They also pin down the memo semantics neither representation may
+// disturb: separate main/clean and parent/ReadFirstLane contexts, dependencies that survive an
+// enclosing failure, re-entrant and concurrent evaluation, allocation failure, thread exit,
+// generation wrap, and plans of different slot counts interleaved on one thread.
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -274,18 +276,22 @@ MaterializeOutcome Materialize(const ResourcePlan& plan, Readers& readers,
 	return out;
 }
 
-// Runs `run` with unpooled storage, then twice with the thread's pool (cold, then warm), and
-// requires identical outcomes.
+// Runs `run` through the map with unpooled storage, the map with the thread's pool, and the dense
+// slot memo (twice, so a reused arena is covered), and requires identical outcomes.
 template <typename Outcome, typename Run>
 Outcome Differential(const std::string& name, Run&& run) {
+	SrtTestHooks::SetDenseMemo(false);
 	SrtTestHooks::SetMemoResource(std::pmr::new_delete_resource());
 	const Outcome unpooled = run();
 	SrtTestHooks::SetMemoResource(nullptr);
-	const Outcome pooled       = run();
-	const Outcome pooled_again = run();
+	const Outcome pooled = run();
+	SrtTestHooks::SetDenseMemo(true);
+	const Outcome dense       = run();
+	const Outcome dense_again = run();
 	Check(Same(unpooled, pooled), name + ": pooled storage changed the result");
-	Check(Same(pooled, pooled_again), name + ": reusing the pool changed the result");
-	return pooled;
+	Check(Same(pooled, dense), name + ": the dense memo changed the result");
+	Check(Same(dense, dense_again), name + ": reusing a memo arena changed the result");
+	return dense;
 }
 
 // Forwards to new/delete, counts blocks, and throws std::bad_alloc at allocation `fail_at`.
@@ -699,6 +705,92 @@ void TestResultSurvivesAndWideValues() {
 	      "a memoized 64-bit value must keep its high bits");
 }
 
+// The dense memo must survive the generation counter wrapping, which is otherwise unreachable.
+void TestGenerationWrap() {
+	const auto plan = MakeBufferPlan(ShaderType::Pixel);
+	auto       a    = MakeInput(1);
+	auto       b    = MakeInput(2);
+	SrtTestHooks::SetDenseMemo(true);
+	const auto first  = Materialize(plan, a.readers, a.user_data);
+	const auto second = Materialize(plan, b.readers, b.user_data);
+	Check(first.ok && second.ok, "wrap fixture: materialization failed");
+	Check(!SameSnapshot(first.snapshot, second.snapshot),
+	      "wrap fixture: the two inputs must produce different snapshots");
+	for (uint32_t round = 0; round < 4; round++) {
+		// From a pristine arena the next evaluator takes generation 1 and leaves every slot it
+		// touched stamped 1 - which is exactly the stamp the wrap is about to restart at. Moving
+		// the counter to its last value without invalidating anything then makes the next
+		// evaluator cross the wrap, so unless the wrap clears the stamps it reads these values
+		// back instead of evaluating the new input.
+		SrtTestHooks::ResetMemoArenas();
+		Check(Same(Materialize(plan, a.readers, a.user_data), first),
+		      "evaluation from a pristine arena was wrong");
+		SrtTestHooks::SetMemoGeneration(UINT32_MAX);
+		Check(Same(Materialize(plan, b.readers, b.user_data), second),
+		      "the generation wrap returned the previous evaluation's memo");
+		// And across the wrap in the other direction.
+		SrtTestHooks::ResetMemoArenas();
+		Check(Same(Materialize(plan, b.readers, b.user_data), second),
+		      "evaluation from a pristine arena was wrong");
+		SrtTestHooks::SetMemoGeneration(UINT32_MAX);
+		Check(Same(Materialize(plan, a.readers, a.user_data), first),
+		      "the generation wrap returned the previous evaluation's memo");
+	}
+	SrtTestHooks::ResetMemoArenas();
+}
+
+// Two plans with different slot counts, evaluated alternately on one thread, must not see each
+// other's slots.
+void TestInterleavedPlansWithDifferentSlotCounts() {
+	const auto small = MakeBufferPlan(ShaderType::Pixel);
+	const auto large = MakeBufferPlan(ShaderType::Pixel, 6);
+	Check(small.memo_slot_count != large.memo_slot_count,
+	      "interleave fixture: the two plans must differ in slot count");
+	Check(small.memo_slot_count == small.value_storage.size() &&
+	          large.memo_slot_count == large.value_storage.size(),
+	      "a plan handed out a slot per cloned value");
+	auto a = MakeInput(1);
+	auto b = MakeInput(3);
+	SrtTestHooks::SetDenseMemo(true);
+	const auto small_alone = Materialize(small, a.readers, a.user_data);
+	const auto large_alone = Materialize(large, b.readers, b.user_data);
+	Check(small_alone.ok && large_alone.ok, "interleave fixture: materialization failed");
+	for (uint32_t round = 0; round < 4; round++) {
+		Check(Same(Materialize(small, a.readers, a.user_data), small_alone),
+		      "interleaving a larger plan changed the smaller plan's result");
+		Check(Same(Materialize(large, b.readers, b.user_data), large_alone),
+		      "interleaving a smaller plan changed the larger plan's result");
+	}
+}
+
+// Instructions that no ResourcePlan cloned carry no slot and must still memoize correctly.
+void TestForeignInstructionsUseTheMap() {
+	Fixture    f;
+	const auto handle = f.Handle(f.UserData(0), f.UserData(1));
+	const auto read   = f.RawRead(handle, 0);
+	const auto shared = f.Add(read, 0x10u);
+	f.Source({shared, shared, shared, shared});
+	f.program.materialization_sources.push_back(0);
+	Check(f.program.memo_slot_count == 0,
+	      "a raw Program must not hand out dense slots");
+	for (auto& inst: f.program.value_storage) {
+		Check(inst.MemoSlot() == Inst::NoMemoSlot, "a raw Program value carried a dense slot");
+	}
+	auto       input = MakeInput(1);
+	const auto direct =
+	    EvalSources(f.program, {0}, input.readers, input.user_data);
+	Check(direct.ok, "evaluation over a raw Program failed");
+	// One shared subexpression behind four descriptor dwords: the map must have memoized it, so
+	// the guest read happened once.
+	uint32_t reads = 0;
+	for (const auto& entry: direct.trace) {
+		reads += entry.first == 'r' ? 1u : 0u;
+	}
+	Check(reads == 1, "the map memo did not coalesce a shared foreign subexpression");
+	Check(direct.results.size() == 1 && direct.results[0].dwords[0] == direct.results[0].dwords[3],
+	      "foreign evaluation produced inconsistent dwords");
+}
+
 int RunAll() {
 	TestSameEvaluationInputsAndBindings();
 	TestRawAndCleanEvaluatorsStaySeparate();
@@ -708,6 +800,9 @@ int RunAll() {
 	TestTwoThreadsAndThreadExit();
 	TestAllocationFailure();
 	TestResultSurvivesAndWideValues();
+	TestGenerationWrap();
+	TestInterleavedPlansWithDifferentSlotCounts();
+	TestForeignInstructionsUseTheMap();
 	std::printf("SrtEvaluatorMemoTests: all cases passed (%d checks)\n", g_checks);
 	return 0;
 }

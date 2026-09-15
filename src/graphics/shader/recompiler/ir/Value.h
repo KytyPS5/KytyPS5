@@ -111,6 +111,12 @@ public:
 	Inst& operator=(Inst&&)      = delete;
 
 	[[nodiscard]] ValueOpcode             GetOpcode() const;
+	// Dense memo slot for the SRT evaluator, assigned once when ExtractResourcePlan clones this
+	// instruction into a ResourcePlan. NoMemoSlot on every other instruction, which the evaluator
+	// then memoizes by pointer instead.
+	static constexpr uint32_t             NoMemoSlot = UINT32_MAX;
+	[[nodiscard]] uint32_t                MemoSlot() const { return memo_slot; }
+	void                                  SetMemoSlot(uint32_t slot) { memo_slot = slot; }
 	[[nodiscard]] Type                    GetType() const;
 	[[nodiscard]] bool                    MayHaveSideEffects() const;
 	[[nodiscard]] bool                    HasUses() const;
@@ -150,6 +156,7 @@ private:
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	uint32_t            memo_slot = NoMemoSlot;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;

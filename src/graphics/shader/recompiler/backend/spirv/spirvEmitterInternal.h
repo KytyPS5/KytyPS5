@@ -387,8 +387,7 @@ uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::Storag
 void     DefineModule(EmitterState& state);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
-void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
-                           uint32_t cull_distance_count);
+void     DefineMeshOutputs(EmitterState& state);
 void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);

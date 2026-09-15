@@ -622,7 +622,7 @@ void DefineOutputs(EmitterState& state) {
 		}
 	}
 	if (state.program.stage == ShaderType::Mesh) {
-		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
+		DefineMeshOutputs(state);
 		return;
 	}
 	if (state.program.stage == ShaderType::Vertex &&

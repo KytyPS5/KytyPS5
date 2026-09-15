@@ -369,7 +369,7 @@ static int32_t KYTY_SYSV_ABI PngDecParseHeader(const PngDecParseParam* param,
 } // namespace PngDec
 
 LIB_DEFINE(InitPngDec_1) {
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE_ALL(true);
 
 	LIB_FUNC("-6srIGbLTIU", PngDec::PngDecQueryMemorySize);
 	LIB_FUNC("m0uW+8pFyaw", PngDec::PngDecCreate);

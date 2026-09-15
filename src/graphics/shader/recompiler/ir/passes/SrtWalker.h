@@ -25,11 +25,10 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
-// Every Value handed to the functions below must belong to the ResourcePlan passed alongside it:
-// ExtractResourcePlan clones each reachable instruction into the plan it builds, and evaluation
-// resolves SRT slots, clean-slot flags and descriptor sources against that same plan. Mixing a
-// Value from one plan with another plan was already meaningless; it additionally aliases the dense
-// memo slot instructions carry, so it is a precondition rather than a checked error.
+// The functions below resolve SRT slots, clean-slot flags and descriptor sources against the
+// ResourcePlan they are given, so a Value that plan does not own only evaluates meaningfully when
+// it needs none of those - but it is always memoized correctly: an instruction that holds none of
+// this plan's dense memo slots, including one another plan cloned, is memoized by pointer.
 
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.

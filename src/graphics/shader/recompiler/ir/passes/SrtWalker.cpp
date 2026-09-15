@@ -458,9 +458,9 @@ thread_local std::pmr::memory_resource* t_memo_resource_override = nullptr;
 thread_local bool                       t_dense_memo             = true;
 #endif
 
-// Fallback memo storage, for instructions no ResourcePlan cloned and which therefore carry no
-// dense slot. Those maps take their nodes and bucket arrays from one pool per thread, so evaluating
-// on a warm thread does not call the system allocator for memo entries. The pool keeps its
+// Fallback memo storage, for instructions that hold no dense slot of the evaluator's own plan.
+// Those maps take their nodes and bucket arrays from one pool per thread, so evaluating on a warm
+// thread does not call the system allocator for memo entries. The pool keeps its
 // high-water mark until the thread exits; its upstream is the static new/delete resource, so
 // thread-exit teardown only returns memory to ::operator delete.
 std::pmr::memory_resource* MemoResource() {
@@ -473,28 +473,38 @@ std::pmr::memory_resource* MemoResource() {
 	return &pool;
 }
 
+// A slot number only means something inside the plan that handed it out, so an entry also records
+// the instruction that claimed it. `owner` is meaningful only while `stamp` is the live generation,
+// and is only read under that condition, so an entry never compares against an instruction that
+// has since been destroyed.
+struct MemoEntry {
+	const Inst* owner = nullptr;
+	uint64_t    value = 0;
+	uint32_t    stamp = 0;
+};
+
 // Dense evaluator memo. Plan-cloned instructions carry a stable slot, so an evaluation memoizes
 // into an array instead of a hash map. The arrays are one per thread and are reused; each evaluator
 // takes a fresh generation, which is what keeps the memo namespaces apart - the main evaluator, the
 // clean evaluator and every ReadFirstLane child see only their own entries, exactly as they saw
 // only their own map before.
 struct MemoArena {
-	std::vector<uint64_t> values;
-	std::vector<uint32_t> stamps;
-	uint32_t              generation = 0;
+	std::vector<MemoEntry> entries;
+	uint32_t               generation = 0;
 
 	// A reused arena is invalidated in O(1) by moving to a stamp no slot carries yet.
 	void Advance() {
 		if (generation == UINT32_MAX) {
-			std::fill(stamps.begin(), stamps.end(), 0u);
+			for (auto& entry: entries) {
+				entry.stamp = 0u;
+			}
 			generation = 0;
 		}
 		generation++;
 	}
-	void Reserve(uint32_t slots) {
-		if (slots > values.size()) {
-			values.resize(slots);
-			stamps.resize(slots, 0u); // a fresh slot never matches a live generation
+	void Reserve(size_t slots) {
+		if (slots > entries.size()) {
+			entries.resize(slots); // a fresh slot never matches a live generation
 		}
 	}
 };
@@ -596,20 +606,32 @@ private:
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		const uint32_t slot = inst->MemoSlot();
+		const uint32_t slot  = inst->MemoSlot();
+		auto&          arena = m_lease.Arena();
 #ifdef KYTY_SRT_TEST_HOOKS
-		const bool dense = t_dense_memo && slot < m_program.memo_slot_count;
+		const bool slotted = t_dense_memo && slot < m_program.memo_slot_count;
 #else
-		const bool dense = slot < m_program.memo_slot_count;
+		const bool slotted = slot < m_program.memo_slot_count;
 #endif
-		if (dense) {
-			if (m_lease.Arena().stamps[slot] == m_generation) {
-				result = m_lease.Arena().values[slot];
+		// A slot this generation left free is this instruction's to claim. A slot another
+		// instruction already claimed - which only an instruction another plan cloned can reach,
+		// since a plan's own slots are unique - leaves this one to the map, so every instruction
+		// is still memoized exactly once.
+		bool dense = false;
+		if (slotted) {
+			const auto& entry = arena.entries[slot];
+			if (entry.stamp != m_generation) {
+				dense = true;
+			} else if (entry.owner == inst) {
+				result = entry.value;
 				return true;
 			}
-		} else if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
-			return true;
+		}
+		if (!dense) {
+			if (const auto found = m_cache.find(inst); found != m_cache.end()) {
+				result = found->second;
+				return true;
+			}
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
 			return false;
@@ -621,9 +643,11 @@ private:
 		if (!evaluated) {
 			return false;
 		}
-		if (dense) {
-			m_lease.Arena().values[slot] = out;
-			m_lease.Arena().stamps[slot] = m_generation;
+		// A plan's own slots are unique and its instructions only reference each other, so no
+		// recursive step can have claimed this slot; re-checking keeps the store from
+		// overwriting a claim it did not make without resting on that argument.
+		if (dense && arena.entries[slot].stamp != m_generation) {
+			arena.entries[slot] = {.owner = inst, .value = out, .stamp = m_generation};
 		} else {
 			m_cache.emplace(inst, out);
 		}
@@ -1220,7 +1244,9 @@ void SetDenseMemo(bool enabled) {
 }
 void ResetMemoArenas() {
 	for (auto& arena: Arenas().arenas) {
-		std::fill(arena->stamps.begin(), arena->stamps.end(), 0u);
+		for (auto& entry: arena->entries) {
+			entry.stamp = 0u;
+		}
 		arena->generation = 0;
 	}
 }

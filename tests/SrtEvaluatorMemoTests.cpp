@@ -736,6 +736,21 @@ void TestGenerationWrap() {
 		Check(Same(Materialize(plan, a.readers, a.user_data), first),
 		      "the generation wrap returned the previous evaluation's memo");
 	}
+	// And across the wrap with a plan of a different size than the one that stamped the arena,
+	// so the wrap must also hold when the arena grows or shrinks its used prefix around it.
+	const auto large     = MakeBufferPlan(ShaderType::Pixel, 6);
+	SrtTestHooks::ResetMemoArenas();
+	const auto large_alone = Materialize(large, b.readers, b.user_data);
+	SrtTestHooks::ResetMemoArenas();
+	(void)Materialize(plan, a.readers, a.user_data);
+	SrtTestHooks::SetMemoGeneration(UINT32_MAX);
+	Check(Same(Materialize(large, b.readers, b.user_data), large_alone),
+	      "a wrap after a smaller plan stamped the arena returned its memo");
+	SrtTestHooks::ResetMemoArenas();
+	(void)Materialize(large, b.readers, b.user_data);
+	SrtTestHooks::SetMemoGeneration(UINT32_MAX);
+	Check(Same(Materialize(plan, a.readers, a.user_data), first),
+	      "a wrap after a larger plan stamped the arena returned its memo");
 	SrtTestHooks::ResetMemoArenas();
 }
 
@@ -749,6 +764,14 @@ void TestInterleavedPlansWithDifferentSlotCounts() {
 	Check(small.memo_slot_count == small.value_storage.size() &&
 	          large.memo_slot_count == large.value_storage.size(),
 	      "a plan handed out a slot per cloned value");
+	for (const auto* plan: {&small, &large}) {
+		std::vector<uint8_t> seen(plan->memo_slot_count);
+		for (const auto& inst: plan->value_storage) {
+			Check(inst.MemoSlot() < plan->memo_slot_count && seen.at(inst.MemoSlot()) == 0u,
+			      "a plan handed the same dense slot to two instructions");
+			seen[inst.MemoSlot()] = 1u;
+		}
+	}
 	auto a = MakeInput(1);
 	auto b = MakeInput(3);
 	SrtTestHooks::SetDenseMemo(true);
@@ -771,10 +794,12 @@ void TestForeignInstructionsUseTheMap() {
 	const auto shared = f.Add(read, 0x10u);
 	f.Source({shared, shared, shared, shared});
 	f.program.materialization_sources.push_back(0);
-	Check(f.program.memo_slot_count == 0,
-	      "a raw Program must not hand out dense slots");
-	for (auto& inst: f.program.value_storage) {
-		Check(inst.MemoSlot() == Inst::NoMemoSlot, "a raw Program value carried a dense slot");
+	Check(f.program.memo_slot_count == 0, "a raw Program must not hand out dense slots");
+	for (const auto* block: f.program.blocks) {
+		for (const auto& inst: *block) {
+			Check(inst.MemoSlot() == Inst::NoMemoSlot,
+			      "a raw Program value carried a dense slot");
+		}
 	}
 	auto       input = MakeInput(1);
 	const auto direct =
@@ -791,6 +816,113 @@ void TestForeignInstructionsUseTheMap() {
 	      "foreign evaluation produced inconsistent dwords");
 }
 
+// A slot number only means something inside the plan that handed it out. EvaluateUniformValues
+// takes Values from its caller - ResourceTrackingTests already hands it instructions a plan never
+// cloned - so an instruction another plan cloned can reach an evaluator, and must not alias the
+// equally numbered slot in the evaluator's own plan.
+void TestValuesFromAnotherPlan() {
+	Fixture first_fixture;
+	first_fixture.Source({first_fixture.UserData(0)});
+	const auto first = ExtractResourcePlan(first_fixture.program);
+	Fixture    second_fixture;
+	second_fixture.Source({second_fixture.UserData(1)});
+	const auto second = ExtractResourcePlan(second_fixture.program);
+	const auto from_first  = first.descriptor_sources[0].dwords[0];
+	const auto from_second = second.descriptor_sources[0].dwords[0];
+	Check(from_first.Instruction()->MemoSlot() == from_second.Instruction()->MemoSlot(),
+	      "cross-plan fixture: the two plans must hand out the same slot number");
+
+	// GetUserData resolves against the runtime, not against any plan-side table, so both
+	// instructions evaluate meaningfully under `first` and must give different answers.
+	const std::array              values {from_first, from_second};
+	const std::array<uint32_t, 2> user_data {11u, 22u};
+	std::array<uint32_t, 2>       results {};
+	SrtTestHooks::SetDenseMemo(false);
+	Check(EvaluateUniformValues(first, values, {.user_data = user_data}, results) &&
+	          results == std::array<uint32_t, 2> {11u, 22u},
+	      "the pointer memo must tell instructions of different plans apart");
+	results = {};
+	SrtTestHooks::SetDenseMemo(true);
+	Check(EvaluateUniformValues(first, values, {.user_data = user_data}, results) &&
+	          results == std::array<uint32_t, 2> {11u, 22u},
+	      "the dense memo aliased equally numbered slots of different plans");
+
+	// The same aliasing reached through an argument rather than a root value.
+	Fixture    outside;
+	const auto through_foreign = outside.Add(from_second, 5u);
+	const std::array              nested {from_first, through_foreign};
+	std::array<uint32_t, 2>       nested_results {};
+	SrtTestHooks::SetDenseMemo(false);
+	Check(EvaluateUniformValues(first, nested, {.user_data = user_data}, nested_results) &&
+	          nested_results == std::array<uint32_t, 2> {11u, 27u},
+	      "the pointer memo must tell instructions of different plans apart under a foreign node");
+	nested_results = {};
+	SrtTestHooks::SetDenseMemo(true);
+	Check(EvaluateUniformValues(first, nested, {.user_data = user_data}, nested_results) &&
+	          nested_results == std::array<uint32_t, 2> {11u, 27u},
+	      "the dense memo aliased a foreign plan's slot reached through an argument");
+
+	// A plan instruction reached from an instruction no plan cloned still memoizes densely.
+	const auto own_through_foreign = outside.Add(from_first, 5u);
+	const std::array              mixed {own_through_foreign, from_first};
+	std::array<uint32_t, 2>       mixed_results {};
+	Check(EvaluateUniformValues(first, mixed, {.user_data = user_data}, mixed_results) &&
+	          mixed_results == std::array<uint32_t, 2> {16u, 11u},
+	      "a pointer-memoized instruction could not recurse into a dense plan instruction");
+}
+
+// The failure, cycle and recovery cases above run over a raw Program, which hands out no dense
+// slots. ExtractResourcePlan derives its own control flow, so the condition case cannot be rebuilt
+// here, but the rest must hold just as well when the instructions carry slots.
+void TestFailuresOverAPlan() {
+	Fixture    f;
+	const auto handle = f.Handle(f.UserData(0), f.UserData(1));
+	const auto a      = f.RawRead(handle, 0x40);
+	const auto b      = f.RawRead(handle, 0x44);
+	f.Flat(a);
+	const auto s0   = f.Source({a});
+	const auto s1   = f.Source({b});
+	const auto plan = ExtractResourcePlan(f.program);
+	Check(plan.memo_slot_count != 0, "failure fixture: the plan must hand out slots");
+	auto                       in = MakeInput(0);
+	const std::vector<uint8_t> clean {1u};
+	const auto                 out = Differential<SourcesOutcome>("dense raw and clean", [&] {
+        return EvalSources(plan, {s0, s1}, in.readers, in.user_data, clean);
+    });
+	Check(out.ok && out.trace == Trace {{'r', Readers::kBase + 0x40},
+	                                    {'r', Readers::kBase + 0x44},
+	                                    {'c', Readers::kBase + 0x40}} &&
+	          out.flat == std::vector<uint32_t> {in.readers.clean[16]},
+	      "the dense slots of one plan must keep the main and clean evaluators apart");
+
+	in.readers.fail_raw_address = Readers::kBase + 0x44;
+	const auto failed           = Differential<SourcesOutcome>("dense failing call", [&] {
+        return EvalSources(plan, {s1}, in.readers, in.user_data);
+    });
+	Check(!failed.ok && !failed.threw && Untouched(failed),
+	      "a failed evaluation over a plan must not change its outputs");
+	in.readers.fail_raw_address = UINT64_MAX;
+	const auto recovered        = Differential<SourcesOutcome>("dense recovered call", [&] {
+        return EvalSources(plan, {s1}, in.readers, in.user_data);
+    });
+	Check(recovered.ok && recovered.results[0].dwords[0] == in.readers.raw[17],
+	      "evaluation over a plan after a failure must see fresh values");
+
+	Fixture h; // a cycle the plan cloned, so the dense slots carry it
+	auto&   inst = h.EmitInst(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
+	inst.SetArg(0, Value(&inst));
+	h.Source({h.Add(Value(&inst), 3u)});
+	{
+		const auto cyclic = ExtractResourcePlan(h.program);
+		Check(cyclic.memo_slot_count == 2, "cycle fixture: two cloned instructions");
+		Readers readers;
+		Check(Untouched(Differential<SourcesOutcome>(
+		          "dense cycle", [&] { return EvalSources(cyclic, {0}, readers, {}); })),
+		      "a cycle through dense slots must fail");
+	}
+	inst.SetArg(0, Value(1u));
+}
+
 int RunAll() {
 	TestSameEvaluationInputsAndBindings();
 	TestRawAndCleanEvaluatorsStaySeparate();
@@ -803,6 +935,8 @@ int RunAll() {
 	TestGenerationWrap();
 	TestInterleavedPlansWithDifferentSlotCounts();
 	TestForeignInstructionsUseTheMap();
+	TestValuesFromAnotherPlan();
+	TestFailuresOverAPlan();
 	std::printf("SrtEvaluatorMemoTests: all cases passed (%d checks)\n", g_checks);
 	return 0;
 }

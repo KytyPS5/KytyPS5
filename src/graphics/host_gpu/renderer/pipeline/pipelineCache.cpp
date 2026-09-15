@@ -815,9 +815,18 @@ struct PipelineCache::ProgramCache {
 			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
 				options.user_data_base = 0;
 				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+				if (stage == ShaderType::Mesh) {
+					// A lowered NGG vertex stage never receives the merged wave info, so the host
+					// subgroup size has to travel with the stage instead.
+					options.host_subgroup_size = input_info.mesh.host_subgroup_size;
+				}
 			}
 		} else {
 			options.wave_size = input_info.wave_size;
+			// Compute carries its own host subgroup size; the pixel stage has none.
+			if constexpr (requires { input_info.host_subgroup_size; }) {
+				options.host_subgroup_size = input_info.host_subgroup_size;
+			}
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
@@ -875,7 +884,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(vk::Device device, uint32_t subgroup_size)
+	    : host_subgroup_size(subgroup_size == 0u ? 64u : subgroup_size), device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -894,12 +904,16 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<uint64_t>                                reported_shaders;
 	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
+	// A vertex or pixel stage has no workgroup input to carry the host subgroup width, and the
+	// translator needs it to know whether a wave64 guest mask has an upper half at all.
+	uint32_t                                                    host_subgroup_size = 64;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.subgroup_size)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();

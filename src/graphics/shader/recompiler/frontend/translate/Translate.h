@@ -24,6 +24,8 @@ struct EmbeddedFetchPlan {
 struct TranslateOptions {
 	ShaderType                    stage               = ShaderType::Unknown;
 	uint32_t                      wave_size           = 64;
+	// See IR::ResourcePlan::host_subgroup_size.
+	uint32_t                      host_subgroup_size  = 64;
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;

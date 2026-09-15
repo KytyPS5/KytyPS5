@@ -588,6 +588,13 @@ struct ResourcePlan {
 	// Kept with the plan, not only with the translated program: the host walk re-executes a
 	// readfirstlane once per lane, so it needs the wave the shader was compiled for.
 	uint32_t                      wave_size       = 64;
+	// With `wave_size` this decides whether the upper 32 lanes of a 64-bit guest mask exist at
+	// all: a wave64 program on a 32-wide subgroup that is not emitted as two halves has no lane
+	// 32..63 any ballot can set, so a mask bit up there is one nothing can clear.
+	uint32_t                      host_subgroup_size = 64;
+	// True when the guest wave is wider than the lanes the emitted module can activate; see
+	// `Translator::ClampGhostLanes`.
+	bool                          upper_lane_half_is_ghost = false;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;

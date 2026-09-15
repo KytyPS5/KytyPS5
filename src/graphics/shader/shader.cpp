@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderGsAssembly.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/errno.h"
 
@@ -522,6 +523,7 @@ static void ShaderGetStaticInputInfoPS(
 	if ((sh.ps_in_control & 0x8000u) != 0) {
 		ps_info.wave_size = 32;
 	}
+	ps_info.wave_size            = ShaderPixelWaveSize(sh.ps_in_control);
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
@@ -629,7 +631,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		                       static_cast<uint32_t>(mesh.fast_launch),
+		                       mesh.gs_vgpr_component_count, mesh.es_vgpr_component_count});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -704,6 +707,40 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
+// Reports, once per distinct register signature, what the merged ES/GS wave says it pre-loads and
+// which of those inputs the mesh lowering cannot reproduce.
+static void ShaderReportGsAssemblyNotes(const ShaderGsAssemblyRegisters& regs,
+                                        const ShaderGsAssemblyNotes&     notes) {
+	const uint32_t signature = (regs.gs_vgpr_component_count & 3u) |
+	                           ((regs.es_vgpr_component_count & 3u) << 2u) |
+	                           (static_cast<uint32_t>(notes.user_vgprs_preloaded) << 4u) |
+	                           (static_cast<uint32_t>(notes.gs_instancing) << 5u) |
+	                           (static_cast<uint32_t>(notes.es_offchip_lds) << 6u);
+	static std::atomic<uint64_t> reported[2] = {};
+	const auto                   previous =
+	    reported[signature >> 6u].fetch_or(uint64_t {1} << (signature & 0x3fu));
+	if ((previous & (uint64_t {1} << (signature & 0x3fu))) != 0) {
+		return;
+	}
+	LOGF("\t NGG GS assembly: gs_vgpr_comp_cnt=%" PRIu32 " (GS VGPR0..%" PRIu32
+	     "), es_vgpr_comp_cnt=%" PRIu32 " (ES VGPR%" PRIu32 "..%" PRIu32 ")\n",
+	     regs.gs_vgpr_component_count, regs.gs_vgpr_component_count,
+	     regs.es_vgpr_component_count, SHADER_ES_VGPR_BASE,
+	     SHADER_ES_VGPR_BASE + regs.es_vgpr_component_count);
+	if (notes.user_vgprs_preloaded) {
+		LOGF("\t temporary: GE user VGPRs are pre-loaded into the ES half and are not tracked\n");
+	}
+	if (notes.gs_instancing) {
+		LOGF("\t temporary: VGT_GS_INSTANCE_CNT = 0x%08" PRIx32
+		     ", running a single GS invocation\n",
+		     regs.gs_instance_count);
+	}
+	if (notes.es_offchip_lds) {
+		LOGF("\t temporary: the ES half reads off-chip LDS, its VGPRs are treated as a vertex "
+		     "shader's\n");
+	}
+}
+
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
 	const auto& sh     = context.GetShaderRegisters();
@@ -751,9 +788,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		params.hash = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
-	const auto& group = user_config.GetGeControl();
+	const auto& group     = user_config.GetGeControl();
+	const auto& user_vgpr = user_config.GetGeUserVgprEn();
 	if (mesh.fast_launch) {
-		const auto& user_vgpr = user_config.GetGeUserVgprEn();
 		EXIT_NOT_IMPLEMENTED(data.type != Prospero::ShaderBinaryType::kGs ||
 		                     regs.gs_regs.rsrc1.gs_vgpr_component_count != 0u ||
 		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 1u ||
@@ -761,34 +798,27 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                     group.primitive_group_size != 1u || group.vertex_group_size != 1u ||
 		                     user_vgpr.vgpr1 || user_vgpr.vgpr2 || user_vgpr.vgpr3 ||
 		                     mesh.max_vertices != sh.m_vgtGsMaxVertOut);
-	} else if (merged) {
-		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
-	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
-	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
-	    mesh.max_vertices == 0u) {
-		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
-		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
-		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
+	const ShaderGsAssemblyRegisters gs_regs {
+	    .gs_vgpr_component_count = regs.gs_regs.rsrc1.gs_vgpr_component_count,
+	    .es_vgpr_component_count = regs.gs_regs.rsrc2.es_vgpr_component_count,
+	    .gs_out_prim_type        = sh.m_vgtGsOutPrimType,
+	    .gs_max_vert_out         = sh.m_vgtGsMaxVertOut,
+	    .gs_instance_count       = sh.m_vgtGsInstanceCnt,
+	    .primitive_group_size    = group.primitive_group_size,
+	    .vertex_group_size       = group.vertex_group_size,
+	    .es_offchip_lds          = regs.gs_regs.rsrc2.offchip_lds,
+	    .user_vgpr1_enabled      = user_vgpr.vgpr1,
+	    .user_vgpr2_enabled      = user_vgpr.vgpr2,
+	    .user_vgpr3_enabled      = user_vgpr.vgpr3,
+	};
+	ShaderGsAssemblyNotes notes;
+	std::string           error;
+	if (!ShaderBuildGsAssembly(gs_regs, mesh, &notes, &error)) {
+		LOGF("\t warning: dropping GS draw: %s\n", error.c_str());
+		return {};
 	}
-	mesh.max_primitives = mesh.fast_launch ? mesh.max_vertices :
-	                      native_ngg ? mesh.InputPrimitiveCount(mesh.max_vertices) :
-	                      group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
-	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
-	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
-	                                      native_ngg ? mesh.max_primitives :
-	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
-	EXIT_IF(mesh.primitives_per_group == 0u);
-	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	const auto threads = native_ngg && !mesh.fast_launch ? mesh.vertices_per_group : mesh.max_vertices;
-	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
-	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
+	ShaderReportGsAssemblyNotes(gs_regs, notes);
 	return params;
 }
 
@@ -924,6 +954,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	LOGF("ShaderDbgDumpInputInfo()\n");
 
 	LOGF("\t input_num            = %u\n"
+	     "\t wave_size            = %u\n"
 	     "\t ps_system_input_base = %u\n"
 	     "\t custom_interpolation_mask = 0x%08" PRIx32 "\n"
 	     "\t ps_perspective_center_vgpr = %" PRIu32 "\n"
@@ -940,10 +971,10 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_pixel_kill_enable = %s\n"
 	     "\t ps_early_z           = %s\n"
 	     "\t ps_execute_on_noop   = %s\n",
-	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
-	     info.ps_perspective_center_vgpr, info.ps_perspective_sample_vgpr,
-	     info.ps_perspective_centroid_vgpr,
+	     info.input_num, info.wave_size, info.ps_system_input_base, info.custom_interpolation_mask,
+	     info.ps_perspective_center_vgpr, info.ps_perspective_centroid_vgpr,
 	     info.ps_pos_x ? "true" : "false",
+
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
 	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
 	     info.ps_ancillary ? "true" : "false",

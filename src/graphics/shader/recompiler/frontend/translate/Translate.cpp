@@ -123,6 +123,13 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	return result;
 }
 
+// A 64-bit guest mask may never claim a lane the emitted module cannot activate: every guest idiom
+// that drains a mask terminates only when the last bit clears, and only a ballot can clear one, so
+// a bit for a lane no ballot can reach hangs the GPU. Applied to EXEC only, never VCC.
+IR::U32 Translator::ClampGhostLanes(IR::U32 high_word) {
+	return program.upper_lane_half_is_ghost ? IR::U32(IR::Value(0u)) : high_word;
+}
+
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
 	const auto mask = ir.Emit(IR::ValueOpcode::Ballot, {value});
 	return {ir.CompositeExtract(mask, 0),
@@ -344,6 +351,8 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetVcc(ThreadBit({value, ir.GetVccHi()}));
 			break;
 		case Decoder::OperandKind::VccHi:
+			// NOT clamped, unlike EXEC below: compilers use VCC's halves as ordinary scalar
+			// registers whenever VCC is dead, so zeroing one would corrupt a live value.
 			ir.SetVccHi(IR::U32(value));
 			ir.SetVcc(ThreadBit({ir.GetVccLo(), value}));
 			break;
@@ -352,10 +361,12 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetExecLo(IR::U32(value));
 			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
 			break;
-		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
+		case Decoder::OperandKind::ExecHi: {
+			const auto clamped = ClampGhostLanes(IR::U32(value));
+			ir.SetExecHi(clamped);
+			ir.SetExec(ThreadBit({ir.GetExecLo(), clamped}));
 			break;
+		}
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
 			break;
@@ -585,12 +596,15 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 		return;
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
+		case Decoder::OperandKind::ExecLo: {
+			const std::array<IR::U32, 2> clamped {value[0], ClampGhostLanes(value[1])};
+			ir.SetExec(ThreadBit(clamped));
+			ir.SetExecLo(clamped[0]);
+			ir.SetExecHi(clamped[1]);
 			return;
+		}
 		case Decoder::OperandKind::VccLo:
+			// Deliberately unclamped; see the VccHi case in WriteRawU32.
 			ir.SetVcc(ThreadBit(value));
 			ir.SetVccLo(value[0]);
 			ir.SetVccHi(value[1]);
@@ -1017,6 +1031,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	result.host_subgroup_size  = options.host_subgroup_size;
+	// The backend splits the wave into two halves only for a workgroup stage running wave64 on a
+	// 32-wide subgroup, so elsewhere guest lanes 32..63 do not exist at all.
+	result.upper_lane_half_is_ghost =
+	    options.wave_size == 64u && options.host_subgroup_size == 32u &&
+	    ShaderWorkgroupInput(options.stage, options.input_info) == nullptr;
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1393,6 +1413,32 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
+			// Every PS5 vertex stage is the ES half of a merged NGG wave, and SGPR3 is the SPI's
+			// MERGED_WAVE_INFO: bits [7:0] the ES vertex count, bits [15:8] the GS primitive
+			// count. Both fields must be the population count of the entry ballot, never
+			// `wave_size`. The guest rebuilds EXEC from each as `(-1) >> (64 - field)` and then
+			// drains it with `s_andn2_b64 mask, mask, ballot`; a ballot can only set bits for lanes
+			// the host subgroup has, so a field of 64 leaves bits nothing can clear and the
+			// waterfall never terminates. Under-counting only loses vertices.
+			const auto imm = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+			if (options.user_data_base > 3u) {
+				const auto counts = entry_ir.BitwiseOr(
+				    vertex_count, entry_ir.ShiftLeftLogical(vertex_count, imm(8u)));
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+				                      entry_ir.BitwiseOr(counts, imm(1u << 28u)));
+			}
+			// VGPR0 and VGPR1 carry the ES vertex offsets of this GS lane's primitive as 14-bit
+			// slots at v0[15:2], v0[31:18] and v1[15:2]. One invocation is one vertex, so the only
+			// primitive a lane can name is its own vertex three times; unwritten they read 0 and
+			// every lane would read lane 0's slot.
+			{
+				const auto own_slot = entry_ir.ShiftLeftLogical(
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::LaneId)), imm(2u));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(0),
+				    entry_ir.BitwiseOr(own_slot, entry_ir.ShiftLeftLogical(own_slot, imm(16u))));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1), own_slot);
+			}
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),

@@ -844,6 +844,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	Frontend::TranslateOptions translate_options {
 	    .stage            = options.stage,
 	    .wave_size        = options.wave_size,
+	    .host_subgroup_size = options.host_subgroup_size,
 	    .shader_hash      = options.shader_hash,
 	    .user_data_base   = options.user_data_base,
 	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),

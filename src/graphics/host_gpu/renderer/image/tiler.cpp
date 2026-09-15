@@ -260,12 +260,8 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const uint32_t                   values[] {1u << element_index, direction_index};
 	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
 	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
-	vk::ShaderModuleCreateInfo       module_info {};
-	module_info.codeSize    = shaders[family_index].words * sizeof(uint32_t);
-	module_info.pCode       = shaders[family_index].code;
-	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-	                     "create TileManager shader module");
+	const auto module =
+	    CompileSPV({shaders[family_index].code, shaders[family_index].words}, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;
 	stage.module              = module;
@@ -472,12 +468,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			code  = GPU_TILER_DEMOTE_D16_SPV;
 			words = std::size(GPU_TILER_DEMOTE_D16_SPV);
 		}
-		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = words * sizeof(uint32_t);
-		module_info.pCode       = code;
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-		                     "create D16 conversion shader module");
+		const auto module = CompileSPV({code, words}, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
 		stage.stage               = vk::ShaderStageFlagBits::eCompute;
 		stage.module              = module;
@@ -611,12 +602,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 
 void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	if (m_swap_bgra16 == nullptr) {
-		vk::ShaderModuleCreateInfo module_info {};
-		module_info.codeSize    = std::size(GPU_TILER_SWAP_BGRA16_SPV) * sizeof(uint32_t);
-		module_info.pCode       = GPU_TILER_SWAP_BGRA16_SPV;
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-		                     "create BGRA16 swap shader module");
+		const auto module = CompileSPV(GPU_TILER_SWAP_BGRA16_SPV, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
 		stage.stage  = vk::ShaderStageFlagBits::eCompute;
 		stage.module = module;

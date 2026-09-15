@@ -231,30 +231,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 
-	vk::ShaderModuleCreateInfo create_info {};
-	vk::Result result {};
 	if (rect_list) {
 		const auto shaders =
 		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
-		create_info.codeSize = shaders.control.size() * 4;
-		create_info.pCode    = shaders.control.data();
-		result =
-		    graphics.device.createShaderModule(&create_info, nullptr, &tess_control_shader_module);
+		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
 		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done result=%s module=%p\n",
-			     vk::to_string(result).c_str(), static_cast<void*>(tess_control_shader_module));
+			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
+			     static_cast<void*>(tess_control_shader_module));
 		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-		create_info.codeSize = shaders.evaluation.size() * 4;
-		create_info.pCode    = shaders.evaluation.data();
-		result =
-		    graphics.device.createShaderModule(&create_info, nullptr, &tess_eval_shader_module);
+		tess_eval_shader_module = CompileSPV(shaders.evaluation, graphics.device);
 		if (graphics_debug_dump_enabled()) {
-			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done result=%s module=%p\n",
-			     vk::to_string(result).c_str(), static_cast<void*>(tess_eval_shader_module));
+			LOGF("PipelineTrace: vkCreateShaderModule RectList TES done module=%p\n",
+			     static_cast<void*>(tess_eval_shader_module));
 		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
 
 	EXIT_NOT_IMPLEMENTED(
@@ -470,8 +460,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     " set_layouts=1 push_constants=%" PRIu32 "\n",
 		     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
 	}
-	result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                              &pipeline.pipeline_layout);
+	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                                   &pipeline.pipeline_layout);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
@@ -487,15 +477,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #else
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
 #endif
-	depth_stencil_info.stencilTestEnable = (static_params.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	depth_stencil_info.front.failOp      = static_params.stencil_front.failOp;
-	depth_stencil_info.front.passOp      = static_params.stencil_front.passOp;
-	depth_stencil_info.front.depthFailOp = static_params.stencil_front.depthFailOp;
-	depth_stencil_info.front.compareOp   = static_params.stencil_front.compareOp;
-	depth_stencil_info.back.failOp       = static_params.stencil_back.failOp;
-	depth_stencil_info.back.passOp       = static_params.stencil_back.passOp;
-	depth_stencil_info.back.depthFailOp  = static_params.stencil_back.depthFailOp;
-	depth_stencil_info.back.compareOp    = static_params.stencil_back.compareOp;
 	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
 	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
@@ -508,6 +489,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eDepthCompareOp,
 	    vk::DynamicState::eDepthBiasEnable,
 	    vk::DynamicState::eDepthBias,
+	    vk::DynamicState::eStencilTestEnable,
+	    vk::DynamicState::eStencilOp,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,

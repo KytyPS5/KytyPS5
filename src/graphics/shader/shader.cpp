@@ -603,9 +603,11 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
-	// SPI_PS_IN_CONTROL.NUM_INTERP occupies bits 5:0. Keep the remaining control
-	// flags in the hardware state and extract only the input count here.
+	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
 	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	if ((sh.ps_in_control & 0x8000u) != 0) {
+		ps_info.wave_size = 32;
+	}
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
@@ -731,6 +733,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.clear();
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.input_num);
+	key.push_back(info.wave_size);
 	key.push_back(info.ps_system_input_base);
 	key.push_back(info.custom_interpolation_mask);
 	key.push_back(info.ps_perspective_center_vgpr);

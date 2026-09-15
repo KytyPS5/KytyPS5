@@ -73,11 +73,8 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] Image* DebugTryGetImage(uint32_t id_index, uint32_t id_generation);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr);
+	[[nodiscard]] bool   IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
-	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -90,17 +87,10 @@ private:
 	struct ImageDownload;
 
 	struct MetaDataInfo {
-		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
-		// PendingDcc retains that exact fill until an image binding classifies the address,
-		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
-		// Keep all surface metadata in one entry so CMask/FMask can be
-		// registered beside HTile and DCC without introducing parallel tracking paths.
-		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
+		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type       = Type::PendingDcc;
-		uint32_t clear_mask = 0;
-		uint32_t fill_value = 0xffffffffu;
-		uint64_t fill_size  = 0;
+		Type     type;
+		uint32_t clear_mask = UINT32_MAX;
 	};
 
 	struct OverlapResult {
@@ -158,7 +148,8 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
+	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -169,8 +160,8 @@ private:
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
-	void ClearImage(CommandBuffer& command, ImageId id, const vk::ImageSubresourceRange& range,
-	                const vk::ClearValue& clear);
+	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
+	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);

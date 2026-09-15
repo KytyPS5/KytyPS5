@@ -34,10 +34,8 @@ struct RenderDepthInfo {
 	bool                        stencil_clear_enable     = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;
-	PipelineStencilStaticState  stencil_static_front;
-	PipelineStencilStaticState  stencil_static_back;
-	PipelineStencilDynamicState stencil_dynamic_front;
-	PipelineStencilDynamicState stencil_dynamic_back;
+	vk::StencilOpState          stencil_front;
+	vk::StencilOpState          stencil_back;
 	ImageId                     image_id;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;

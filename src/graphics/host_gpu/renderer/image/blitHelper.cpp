@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <iterator>
 
 namespace Libs::Graphics {
 
@@ -37,9 +36,8 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_pipeline_layout),
 	    "create BlitHelper pipeline layout");
 
-	m_vertex_shader = CreateShader(GPU_BLIT_FS_TRIANGLE_SPV, std::size(GPU_BLIT_FS_TRIANGLE_SPV));
-	m_fragment_shader =
-	    CreateShader(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, std::size(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV));
+	m_vertex_shader   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_graphics.device);
+	m_fragment_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, m_graphics.device);
 }
 
 BlitHelper::~BlitHelper() {
@@ -58,17 +56,6 @@ BlitHelper::~BlitHelper() {
 	if (m_descriptor_layout != nullptr) {
 		m_graphics.device.destroyDescriptorSetLayout(m_descriptor_layout, nullptr);
 	}
-}
-
-vk::ShaderModule BlitHelper::CreateShader(const uint32_t* code, size_t words) const {
-	EXIT_IF(code == nullptr || words == 0);
-	vk::ShaderModuleCreateInfo create {};
-	create.codeSize         = words * sizeof(uint32_t);
-	create.pCode            = code;
-	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(m_graphics.device.createShaderModule(&create, nullptr, &module),
-	                     "create BlitHelper shader module");
-	return module;
 }
 
 vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {

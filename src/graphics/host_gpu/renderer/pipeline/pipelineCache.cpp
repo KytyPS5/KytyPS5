@@ -265,12 +265,7 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		vk::ShaderModuleCreateInfo create_info {};
-		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
-		create_info.pCode       = result.spirv.data();
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-		                     "create recompiled shader module");
+		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -363,7 +358,7 @@ struct PipelineCache::ProgramCache {
 				options.user_data_base = 0;
 				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
 			}
-		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		} else {
 			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
@@ -763,9 +758,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
-	static_params.stencil_test_enable      = depth.stencil_test_enable;
-	static_params.stencil_front            = depth.stencil_static_front;
-	static_params.stencil_back             = depth.stencil_static_back;
 	const bool rect_list =
 	    command.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kRectList;
 	static_params.cull_back  = !rect_list && mc.cull_back;

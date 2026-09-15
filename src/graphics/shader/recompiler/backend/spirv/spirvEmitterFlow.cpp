@@ -46,8 +46,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value, ConstantU32(state, 1),
-		                          ConstantU32(state, 0));
+		// PS5 initializes v_front_face with float +1.0/-1.0 bits.
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value,
+		                          ConstantU32(state, 0x3f800000u), ConstantU32(state, 0xbf800000u));
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||

@@ -110,7 +110,6 @@ int KYTY_SYSV_ABI     PthreadRename(Pthread thread, const char* name);
 void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
-int                   PthreadGetUniqueId(Pthread thread);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);

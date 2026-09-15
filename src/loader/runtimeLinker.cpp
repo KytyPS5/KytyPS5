@@ -779,6 +779,23 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// A bare guest address is meaningless across builds and ASLR runs; the module it lands in plus
+// the offset inside that module is what makes a fault report actionable.
+static std::string DescribeGuestAddress(uint64_t vaddr) {
+	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+
+	const auto* program = (rt != nullptr ? rt->TryFindProgramByAddr(vaddr) : nullptr);
+
+	if (program == nullptr) {
+		return fmt::format("0x{:016x} (not in a loaded module)", vaddr);
+	}
+
+	return fmt::format(
+	    "0x{:016x} ({}+0x{:x})", vaddr,
+	    Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name)),
+	    vaddr - program->base_vaddr);
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -802,45 +819,70 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
-	// faulted, the register file, the faulting code bytes and the top of its stack.
+	// faulted, which module the faulting pc belongs to, the register file, the faulting code
+	// bytes and the top of its stack. This goes through the fatal log path rather than bare
+	// printf so it reaches the log file attached to bug reports; a console-only dump is lost
+	// whenever the emulator was started from the launcher.
 	{
+		std::string report;
+		report.reserve(4096);
+
 		char thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
+
+		report += "--- Guest fault context ---\n";
+		report += fmt::format("thread: {}\n", thread_name);
+		report += fmt::format("pc:     {}\n", DescribeGuestAddress(info->exception_address));
+
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			report +=
+			    fmt::format("fault:  {} of {}\n", Common::EnumName(info->access_violation_type),
+			                DescribeGuestAddress(info->access_violation_vaddr));
+			if (info->access_violation_vaddr == UINT64_MAX) {
+				report += "        (an all-ones address means a -1 error sentinel was used as a "
+				          "pointer; the\n         guest most likely did not check the result of "
+				          "a call that failed)\n";
+			}
+		}
+
+		report += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+		                      "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+		                      "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+		                      "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+		                      info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi,
+		                      info->rbp, info->rsp, info->r8, info->r9, info->r10, info->r11,
+		                      info->r12, info->r13, info->r14, info->r15);
+
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+			report += "code (pc-48 .. pc+48, fault at byte 48):";
 			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+				report += fmt::format("{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
-			std::printf("\n");
+			report += "\n";
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
+			report += "stack:";
 			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				report += fmt::format("{}{:016x}", (i % 4 == 0) ? "\n " : " ", stack[i]);
 			}
-			std::printf("\n");
+			report += "\n";
 		}
-		std::fflush(stdout);
+
+		Log::WriteFatal(report);
 	}
-	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
-	     " access=%u address=0x%016" PRIx64 "\n",
-	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
-	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+
+	// Names, not raw enum ordinals: "access=1" was routinely misread as a write when it means
+	// AccessViolationType::Read, and the native code is only recognizable in hex.
+	EXIT("Unhandled host exception: type=%s code=0x%08x pc=%s access=%s address=0x%016" PRIx64 "\n",
+	     Common::EnumName(info->type).c_str(), info->native_code,
+	     DescribeGuestAddress(info->exception_address).c_str(),
+	     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr);
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {
@@ -1685,14 +1727,20 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	return nullptr;
 }
 
-Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
-	Common::LockGuard lock(m_mutex);
-
+// Callers include the host exception handler, so a half-built program is skipped rather than
+// asserted on: aborting inside a fault handler would destroy the diagnostic being collected.
+Program* RuntimeLinker::FindProgramByAddrNoLock(uint64_t vaddr) {
 	for (auto* p: m_programs) {
+		if (p == nullptr || p->elf == nullptr) {
+			continue;
+		}
+
 		const auto* ehdr = p->elf->GetEhdr();
 		const auto* phdr = p->elf->GetPhdr();
 
-		EXIT_IF(phdr == nullptr || ehdr == nullptr);
+		if (ehdr == nullptr || phdr == nullptr) {
+			continue;
+		}
 
 		for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 			if (phdr[i].p_memsz != 0 &&
@@ -1708,6 +1756,24 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	}
 
 	return nullptr;
+}
+
+Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
+	Common::LockGuard lock(m_mutex);
+
+	return FindProgramByAddrNoLock(vaddr);
+}
+
+Program* RuntimeLinker::TryFindProgramByAddr(uint64_t vaddr) {
+	if (!m_mutex.TryLock()) {
+		return nullptr;
+	}
+
+	auto* program = FindProgramByAddrNoLock(vaddr);
+
+	m_mutex.Unlock();
+
+	return program;
 }
 
 void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {

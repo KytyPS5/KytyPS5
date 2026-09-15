@@ -46,6 +46,13 @@
 
 namespace Libs::Graphics {
 
+// Debug: the colour target of the draw currently being set up, for correlating with what it
+// samples. Written on the render thread only.
+uint64_t g_dbg_rt_addr   = 0;
+uint32_t g_dbg_rt_format = 0;
+uint32_t g_dbg_rt_width  = 0;
+uint32_t g_dbg_rt_height = 0;
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -493,6 +500,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
+		if (i == 0) {
+			g_dbg_rt_addr   = image.info.data.address;
+			g_dbg_rt_format = static_cast<uint32_t>(image.backing.format);
+			g_dbg_rt_width  = image.info.extent.width;
+			g_dbg_rt_height = image.info.extent.height;
+		}
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     target.target_slot, image.info.data.address, image.info.data.size,

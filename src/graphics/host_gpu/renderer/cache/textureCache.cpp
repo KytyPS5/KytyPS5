@@ -17,6 +17,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <set>
 #include <array>
 #include <bit>
 #include <cinttypes>
@@ -28,6 +30,58 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+// Debug: lets the presenter show a guest render target instead of the scan-out surface.
+static std::mutex             g_dbg_rt_mutex;
+static std::vector<std::pair<uint32_t, uint32_t>> g_dbg_rt_ids;
+
+static std::set<uint64_t> g_dbg_hdr_written;
+static std::set<uint64_t> g_dbg_hdr_sampled;
+
+static std::set<std::pair<uint64_t, uint64_t>> g_dbg_edges;
+
+// Debug: one line per distinct "this target was produced by sampling that texture" edge.
+void DebugRecordEdge(uint64_t tex_address, uint64_t rt_address) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	if (g_dbg_edges.emplace(tex_address, rt_address).second) {
+		LOGF("EDGE: tex=0x%016" PRIx64 " -> rt=0x%016" PRIx64 "\n", tex_address, rt_address);
+	}
+}
+
+void DebugRecordHdrWritten(uint64_t address) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	g_dbg_hdr_written.insert(address);
+}
+
+void DebugRecordHdrSampled(uint64_t address) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	if (!g_dbg_hdr_sampled.insert(address).second) {
+		return;
+	}
+	// Report the orphans each time the sampled set grows.
+	LOGF("HDR SETS: written=%zu sampled=%zu\n", g_dbg_hdr_written.size(),
+	     g_dbg_hdr_sampled.size());
+	for (const auto written: g_dbg_hdr_written) {
+		if (!g_dbg_hdr_sampled.contains(written)) {
+			LOGF("  HDR ORPHAN (written, never sampled): 0x%016" PRIx64 "\n", written);
+		}
+	}
+}
+
+void DebugRegisterRenderTargetId(uint32_t id_index, uint32_t id_generation) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	g_dbg_rt_ids.emplace_back(id_index, id_generation);
+}
+
+bool DebugGetRenderTargetId(size_t index, uint32_t* out_index, uint32_t* out_generation) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	if (index >= g_dbg_rt_ids.size() || out_index == nullptr || out_generation == nullptr) {
+		return false;
+	}
+	*out_index      = g_dbg_rt_ids[index].first;
+	*out_generation = g_dbg_rt_ids[index].second;
+	return true;
+}
 
 namespace {
 
@@ -44,7 +98,8 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.dcc_clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.dcc_clear_word, clear);
+		       !PackedColorClearNeedsHighWord(format) &&
+		       DecodePackedColorClear(format, metadata.dcc_clear_word, 0, clear);
 	}
 	if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0) {
 		return false;
@@ -531,6 +586,24 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
 	m_null_images.emplace(format, id);
+
+	// A null descriptor must read as zero. Leaving the backing uninitialised samples whatever the
+	// allocation happened to contain, which reaches the screen as solid white blocks.
+	auto& command = m_scheduler.Current();
+	if (!command.IsInvalid()) {
+		auto&                     null_image = m_slot_images[id];
+		vk::ImageSubresourceRange range {};
+		range.aspectMask     = null_image.info.IsDepth()
+		                           ? ImageViewOps::DepthAspectMask(null_image.backing.format)
+		                           : vk::ImageAspectFlagBits::eColor;
+		range.baseMipLevel   = 0;
+		range.levelCount     = 1;
+		range.baseArrayLayer = 0;
+		range.layerCount     = 1;
+		// Value-initialised: zero for colour and for depth/stencil alike.
+		const vk::ClearValue clear {};
+		ClearImage(command, id, range, clear);
+	}
 	return id;
 }
 
@@ -1125,26 +1198,63 @@ void TextureCache::InitializeImage(ImageId id) {
 }
 
 void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
-	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
+	const auto kind = desc.info.metadata.kind;
+	if (kind != ImageMetadataKind::Dcc && kind != ImageMetadataKind::Cmask) {
 		return;
 	}
+	const bool cmask     = kind == ImageMetadataKind::Cmask;
+	const auto meta_type = cmask ? MetaDataInfo::Type::CMask : MetaDataInfo::Type::Dcc;
+
 	auto& image            = m_slot_images[id];
 	image.info.metadata    = desc.info.metadata;
-	auto [entry, inserted] = m_surface_metas.try_emplace(
-	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
+	auto [entry, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address,
+	                                                     MetaDataInfo {.type = meta_type});
 	auto& metadata = entry->second;
 	if (!inserted && metadata.type == MetaDataInfo::Type::PendingDcc) {
-		metadata.type = MetaDataInfo::Type::Dcc;
-	} else if (metadata.type != MetaDataInfo::Type::Dcc) {
-		EXIT("TextureCache: image reuses non-DCC metadata\n");
+		// Registering the role is what lets ClearMeta accept a fast clear on this allocation.
+		metadata.type = meta_type;
+	} else if (metadata.type != meta_type) {
+		if (metadata.type != MetaDataInfo::Type::Dcc && metadata.type != MetaDataInfo::Type::CMask) {
+			EXIT("TextureCache: image reuses metadata of another kind\n");
+		}
+		// The guest repurposed this allocation between compression kinds. The recorded clear
+		// state describes the old role, so drop it rather than materialize a stale colour.
+		metadata.type       = meta_type;
+		metadata.clear_mask = 0;
+		metadata.fill_size  = 0;
 	}
-	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
-	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
+	// Debug A/B: KYTY_NO_META_CLEAR=1 skips materializing every deferred metadata clear, to test
+	// whether a clear applied at bind time is erasing content drawn before it.
+	static const bool skip_meta_clear = std::getenv("KYTY_NO_META_CLEAR") != nullptr;
+	if (skip_meta_clear) {
+		return;
+	}
+	if (metadata.clear_mask == 0 || image.info.resources.levels != 1) {
 		return;
 	}
 	vk::ClearValue clear {};
-	if (!DecodeDccClear(desc, image.backing.format, metadata.fill_value, clear.color)) {
-		return;
+	if (cmask) {
+		// Debug A/B: KYTY_NO_CMASK_CLEAR=1 registers the CMask role but skips materializing the
+		// clear, to test whether a late clear is erasing already-drawn content.
+		static const bool skip_cmask_clear = std::getenv("KYTY_NO_CMASK_CLEAR") != nullptr;
+		if (skip_cmask_clear) {
+			return;
+		}
+		// A CMask fast clear writes metadata only; the colour lives in the target's clear
+		// registers. Without materializing it the allocation keeps its previous contents.
+		if (!desc.info.metadata.dcc_clear_register_valid ||
+		    !DecodePackedColorClear(image.backing.format, desc.info.metadata.dcc_clear_word,
+		                            desc.info.metadata.dcc_clear_word_hi, clear.color)) {
+			return;
+		}
+	} else {
+		if (desc.info.metadata.range.size == 0 ||
+		    metadata.fill_size < desc.info.metadata.range.size) {
+			return;
+		}
+		if (!DecodeDccClear(desc, image.backing.format, metadata.fill_value, clear.color)) {
+			return;
+		}
 	}
 	const auto& view           = desc.view_info;
 	const bool  volume_texture = image.info.IsVolume() && view.type == vk::ImageViewType::e3D;
@@ -1166,6 +1276,31 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 		do {
 			mask |= 1u << layer++;
 		} while (layer < first + count && (metadata.clear_mask & (1u << layer)) != 0);
+		// Debug: which surfaces get painted by a DCC fast-clear, and to what colour.
+		{
+			static std::atomic_uint64_t dbg_dcc {0};
+			const auto n = dbg_dcc.fetch_add(1, std::memory_order_relaxed);
+			if (n < 60 || (n % 500) == 0) {
+				LOGF("DCC CLEAR #%" PRIu64 ": addr=0x%016" PRIx64 " %ux%u fmt=%u fill=0x%08" PRIx32
+				     " rgba=%.2f,%.2f,%.2f,%.2f layers=%u..%u\n",
+				     n, image.info.data.address, image.info.extent.width, image.info.extent.height,
+				     static_cast<uint32_t>(image.backing.format), metadata.fill_value,
+				     clear.color.float32[0], clear.color.float32[1], clear.color.float32[2],
+				     clear.color.float32[3], start, layer);
+			}
+		}
+		if (cmask) {
+			static std::atomic_uint64_t dbg_cmask {0};
+			const auto n = dbg_cmask.fetch_add(1, std::memory_order_relaxed);
+			if (n < 20 || (n % 500) == 0) {
+				LOGF("CMASK CLEAR #%" PRIu64 ": cmask=0x%016" PRIx64 " target=0x%016" PRIx64
+				     " %ux%u rgba=%.3f,%.3f,%.3f,%.3f layers=%u..%u\n",
+				     n, image.info.metadata.range.address, image.info.data.address,
+				     image.info.extent.width, image.info.extent.height, clear.color.float32[0],
+				     clear.color.float32[1], clear.color.float32[2], clear.color.float32[3], start,
+				     layer);
+			}
+		}
 		ClearImage(m_scheduler.Current(), id,
 		           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count, start,
 		            layer - start},
@@ -1252,10 +1387,34 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
+		uint32_t dbg_same_backing = 0;
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
+				dbg_same_backing++;
 				result = id;
+			}
+		}
+		// Debug: more than one live image with identical backing means the winner here is
+		// candidate order, not recency -- exactly how a pass can be handed the wrong image.
+		if (dbg_same_backing > 1) {
+			static std::atomic_uint64_t dbg_amb {0};
+			const auto n = dbg_amb.fetch_add(1, std::memory_order_relaxed);
+			if (n < 40 || (n % 500) == 0) {
+				LOGF("TexCache AMBIGUOUS #%" PRIu64 ": addr=0x%016" PRIx64 " size=0x%" PRIx64
+				     " type=%d matches=%" PRIu32 " chosen=%u\n",
+				     n, desc.info.data.address, desc.info.data.size,
+				     static_cast<int>(desc.type), dbg_same_backing,
+				     static_cast<uint32_t>(result.index));
+				for (const auto id: candidates) {
+					const auto& image = m_slot_images[id];
+					if (SameBacking(image.info, desc.info, exact_format)) {
+						LOGF("    cand id=%u tick=%" PRIu64 " gpu_mod=%d rt=%d\n",
+						     static_cast<uint32_t>(id.index),
+						     static_cast<uint64_t>(image.tick_accessed_last),
+						     image.IsGpuModified() ? 1 : 0, image.usage.render_target ? 1 : 0);
+					}
+				}
 			}
 		}
 
@@ -1271,6 +1430,24 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					result     = overlap.image;
 					view_mip   = overlap.mip;
 					view_layer = overlap.layer;
+					// Debug: a bind merged onto an image that starts at a different guest address.
+					// Two surfaces sharing one image overwrite each other.
+					const auto& merged = m_slot_images[result];
+					if (merged.info.data.address != desc.info.data.address &&
+					    desc.info.extent.width >= 640) {
+						static std::atomic_uint64_t dbg_alias {0};
+						const auto n = dbg_alias.fetch_add(1, std::memory_order_relaxed);
+						if (n < 40 || (n % 500) == 0) {
+							LOGF("RT ALIAS #%" PRIu64 ": want=0x%016" PRIx64 " %ux%u fmt=%u"
+							     " -> image=0x%016" PRIx64 " %ux%u fmt=%u mip=%d layer=%d type=%d\n",
+							     n, desc.info.data.address, desc.info.extent.width,
+							     desc.info.extent.height, static_cast<uint32_t>(desc.info.pixel_format),
+							     merged.info.data.address, merged.info.extent.width,
+							     merged.info.extent.height,
+							     static_cast<uint32_t>(merged.info.pixel_format), view_mip, view_layer,
+							     static_cast<int>(desc.type));
+						}
+					}
 				}
 			}
 		}
@@ -1405,6 +1582,24 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
+	// Debug: enumerate the distinct colour targets this run writes.
+	{
+		static std::set<std::pair<uint64_t, uint32_t>> dbg_seen;
+		const std::pair<uint64_t, uint32_t>            key {
+		    image.info.data.address, static_cast<uint32_t>(image.backing.format)};
+		if (dbg_seen.insert(key).second) {
+			LOGF("RT ENUM #%zu: addr=0x%016" PRIx64 " %ux%u fmt=%u layers=%u\n",
+			     dbg_seen.size() - 1, image.info.data.address, image.info.extent.width,
+			     image.info.extent.height, static_cast<uint32_t>(image.backing.format),
+			     image.backing.layers);
+			if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+				DebugRegisterRenderTargetId(id.index, id.generation);
+				if (image.backing.format == vk::Format::eR16G16B16A16Sfloat) {
+					DebugRecordHdrWritten(image.info.data.address);
+				}
+			}
+		}
+	}
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1513,7 +1708,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
+		if (PackedColorClearNeedsHighWord(image.info.pixel_format) ||
+		    !DecodePackedColorClear(image.info.pixel_format, packed_clear, 0, clear.color)) {
 			return false;
 		}
 	} else {
@@ -1872,6 +2068,11 @@ bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	return found != m_surface_metas.end() && found->second.type != MetaDataInfo::Type::PendingDcc;
+}
+
+Image* TextureCache::DebugTryGetImage(uint32_t id_index, uint32_t id_generation) {
+	std::scoped_lock lock {m_lock};
+	return m_slot_images.try_get(ImageId {id_index, id_generation});
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value) {

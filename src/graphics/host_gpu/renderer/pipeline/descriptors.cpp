@@ -45,6 +45,11 @@
 
 namespace Libs::Graphics {
 
+extern uint64_t g_dbg_rt_addr;
+extern uint32_t g_dbg_rt_format;
+extern uint32_t g_dbg_rt_width;
+extern uint32_t g_dbg_rt_height;
+
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -898,6 +903,32 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				desc.view_info.level_count = 1;
 			}
 			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
+		}
+
+		// Debug: record the texture->target edges so the composite chain can be walked.
+		{
+			auto& dbg_img = texture_cache.GetImage(binding.image_id);
+			if (dbg_img.info.extent.width >= 640 && g_dbg_rt_addr != 0) {
+				DebugRecordEdge(dbg_img.info.data.address, g_dbg_rt_addr);
+			}
+			// Debug: the descriptor asked for one address; did the cache hand back that image?
+			const auto requested = binding.desc.info.data.address;
+			if (requested != 0 && requested != dbg_img.info.data.address &&
+			    dbg_img.info.extent.width >= 640) {
+				static std::atomic_uint64_t dbg_mismatch {0};
+				const auto n = dbg_mismatch.fetch_add(1, std::memory_order_relaxed);
+				if (n < 40 || (n % 1000) == 0) {
+					LOGF("BIND MISMATCH #%" PRIu64 ": wanted=0x%016" PRIx64 " got=0x%016" PRIx64
+					     " %ux%u fmt=%u rt=0x%016" PRIx64 "\n",
+					     n, requested, dbg_img.info.data.address, dbg_img.info.extent.width,
+					     dbg_img.info.extent.height, static_cast<uint32_t>(dbg_img.backing.format),
+					     g_dbg_rt_addr);
+				}
+			}
+			if (dbg_img.info.extent.width == 1920 && dbg_img.info.extent.height == 1080 &&
+			    dbg_img.backing.format == vk::Format::eR16G16B16A16Sfloat) {
+				DebugRecordHdrSampled(dbg_img.info.data.address);
+			}
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;

@@ -21,6 +21,13 @@
 
 namespace Libs::Graphics {
 
+// Debug helpers for presenting a guest render target instead of the scan-out surface.
+void DebugRegisterRenderTargetId(uint32_t id_index, uint32_t id_generation);
+void DebugRecordHdrWritten(uint64_t address);
+void DebugRecordEdge(uint64_t tex_address, uint64_t rt_address);
+void DebugRecordHdrSampled(uint64_t address);
+bool DebugGetRenderTargetId(size_t index, uint32_t* out_index, uint32_t* out_generation);
+
 struct GraphicContext;
 class Buffer;
 class BufferCache;
@@ -65,6 +72,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	[[nodiscard]] Image* DebugTryGetImage(uint32_t id_index, uint32_t id_generation);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);

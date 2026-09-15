@@ -8,6 +8,9 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+
+#include <cstdio>
+#include <cstdlib>
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -1446,6 +1449,25 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 }
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
+	// Debug: what paces the thread that drives frames (and enqueues the Wwise render job)?
+	{
+		static std::atomic_uint64_t flip_probe {0};
+		const auto n = flip_probe.fetch_add(1, std::memory_order_relaxed);
+		if ((n % 60) == 0) {
+			LOGF("SubmitFlip: #%" PRIu64 " caller=\"%s\" tid=%d waits_us sleep=%" PRIu64
+			     " condwait=%" PRIu64 " condtimed=%" PRIu64 " mutex=%" PRIu64 " sema=%" PRIu64
+			     " eventflag=%" PRIu64 " equeue=%" PRIu64 "\n",
+			     n, Libs::LibKernel::PthreadGetCurrentNameForKernel(),
+			     Common::Thread::GetThreadIdUnique(),
+			     Common::DebugWaitGet(Common::DebugWaitKind::Sleep),
+			     Common::DebugWaitGet(Common::DebugWaitKind::CondWait),
+			     Common::DebugWaitGet(Common::DebugWaitKind::CondTimedwait),
+			     Common::DebugWaitGet(Common::DebugWaitKind::MutexLock),
+			     Common::DebugWaitGet(Common::DebugWaitKind::Sema),
+			     Common::DebugWaitGet(Common::DebugWaitKind::EventFlag),
+			     Common::DebugWaitGet(Common::DebugWaitKind::Equeue));
+		}
+	}
 	PRINT_NAME();
 
 	uint64_t  request_id = 0;

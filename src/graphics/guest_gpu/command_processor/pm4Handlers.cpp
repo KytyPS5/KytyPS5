@@ -1342,6 +1342,36 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		uint32_t mode = buffer[2];
 
 		EXIT_NOT_IMPLEMENTED(args == nullptr);
+		// Debug: these counts come from a prior GPU pass. Reading them on the CPU here races
+		// with the GPU actually producing them.
+		{
+			static std::atomic_uint64_t dbg_ind {0};
+			static std::atomic_uint64_t dbg_zero {0};
+			const auto n = dbg_ind.fetch_add(1, std::memory_order_relaxed);
+			const bool is_zero = args->thread_group_x == 0 || args->thread_group_y == 0 ||
+			                     args->thread_group_z == 0;
+			if (is_zero) {
+				dbg_zero.fetch_add(1, std::memory_order_relaxed);
+				// Race test: let the GPU finish producing the counts, then look again.
+				static std::atomic_uint64_t dbg_recovered {0};
+				cp.BufferFlushAndWait();
+				if (args->thread_group_x != 0 && args->thread_group_y != 0 &&
+				    args->thread_group_z != 0) {
+					const auto rec = dbg_recovered.fetch_add(1, std::memory_order_relaxed);
+					if (rec < 30 || (rec % 200) == 0) {
+						LOGF("INDIRECT RACE #%" PRIu64 ": was 0, after sync groups=%ux%ux%u\n", rec,
+						     args->thread_group_x, args->thread_group_y, args->thread_group_z);
+					}
+				}
+			}
+			if (n < 40 || (n % 200) == 0) {
+				LOGF("DISPATCH INDIRECT #%" PRIu64 ": args=0x%016" PRIx64 " groups=%ux%ux%u zero=%d"
+				     " zero_total=%" PRIu64 "\n",
+				     n, reinterpret_cast<uint64_t>(args), args->thread_group_x,
+				     args->thread_group_y, args->thread_group_z, is_zero ? 1 : 0,
+				     dbg_zero.load(std::memory_order_relaxed));
+			}
+		}
 		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 
 		return 3;
@@ -3836,6 +3866,13 @@ void GraphicsInitJmpTablesUcIndirect() {
 		};
 		g_hw_uc_indirect_func[Pm4::FSR_WINDOW_LEFT + i] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 			cp.GetUcfg().SetFsrWindow(cmd_offset - Pm4::FSR_WINDOW_LEFT, value);
+			// Debug: does this title drive the display scaler at all?
+			static std::atomic_uint64_t dbg_fsr {0};
+			const auto n = dbg_fsr.fetch_add(1, std::memory_order_relaxed);
+			if (n < 12 || (n % 600) == 0) {
+				LOGF("FSR WINDOW #%" PRIu64 ": idx=%" PRIu32 " value=0x%08" PRIx32 "\n", n,
+				     cmd_offset - Pm4::FSR_WINDOW_LEFT, value);
+			}
 		};
 	}
 

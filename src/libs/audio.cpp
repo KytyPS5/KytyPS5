@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -85,6 +86,7 @@ public:
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
 	bool     AudioOutHasDevice(Id handle);
+	uint32_t AudioOutGetQueuedGrains(Id handle);
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
@@ -157,6 +159,13 @@ void AudioOutClose(int handle) {
 
 bool AudioOutHasDevice(int handle) {
 	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
+}
+
+uint32_t AudioOutGetQueuedGrains(int handle) {
+	if (g_audio == nullptr || handle <= 0) {
+		return 0;
+	}
+	return g_audio->AudioOutGetQueuedGrains(Audio::Id(handle));
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -357,6 +366,35 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
+	// Probe: is the guest actually handing us audio, or silence?
+	{
+		static std::atomic_uint32_t probe_count = 0;
+		const auto probe_index = probe_count.fetch_add(1, std::memory_order_relaxed);
+		if ((probe_index % 20) == 0) {
+			double peak = 0.0;
+			if (FormatIsFloat(port->format)) {
+				const auto* s = static_cast<const float*>(prepared_data);
+				for (uint32_t k = 0; k < output_channels * port->samples_num; k++) {
+					const double a = std::fabs(static_cast<double>(s[k]));
+					if (a > peak) {
+						peak = a;
+					}
+				}
+			} else {
+				const auto* s = static_cast<const int16_t*>(prepared_data);
+				for (uint32_t k = 0; k < output_channels * port->samples_num; k++) {
+					const double a = std::fabs(static_cast<double>(s[k])) / 32768.0;
+					if (a > peak) {
+						peak = a;
+					}
+				}
+			}
+			LOGF("AudioOut: probe #%" PRIu32 " type=%d ch=%u peak=%.6f queued=%u\n", probe_index,
+			     port->type, output_channels, peak,
+			     static_cast<uint32_t>(SDL_GetQueuedAudioSize(port->audio_device)));
+		}
+	}
+
 	std::vector<uint8_t> convert_buffer;
 	const void*          queue_data = prepared_data;
 	uint32_t             queue_size = prepared_size;
@@ -482,6 +520,26 @@ bool Audio::AudioOutHasDevice(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
 	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].audio_device != 0);
+}
+
+uint32_t Audio::AudioOutGetQueuedGrains(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	if (handle.GetId() < 0 || handle.GetId() >= OUT_PORTS_MAX) {
+		return 0;
+	}
+
+	const auto& port = m_out_ports[handle.GetId()];
+	if (!port.used || port.audio_device == 0 || port.samples_num == 0) {
+		return 0;
+	}
+
+	const auto grain_bytes = BytesPerSample(port.format) * OutputChannels(port) * port.samples_num;
+	if (grain_bytes == 0) {
+		return 0;
+	}
+
+	return SDL_GetQueuedAudioSize(port.audio_device) / grain_bytes;
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {

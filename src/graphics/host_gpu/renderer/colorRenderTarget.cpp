@@ -311,6 +311,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.kind                     = ImageMetadataKind::Dcc;
 		desc.info.metadata.range                    = {rt.dcc_addr.addr, metadata_size.size};
 		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.dcc_clear_word_hi        = rt.clear_word1.word1;
+		desc.info.metadata.dcc_clear_register_valid = true;
+		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
+	} else if (rt.info.cmask_fast_clear_enable && rt.cmask.addr != 0) {
+		// A CMask fast clear only marks metadata; its colour comes from the clear registers.
+		// No size is needed: the clear is tracked per slice, not by fill coverage.
+		desc.info.metadata.kind                     = ImageMetadataKind::Cmask;
+		desc.info.metadata.range                    = {rt.cmask.addr, 0};
+		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.dcc_clear_word_hi        = rt.clear_word1.word1;
 		desc.info.metadata.dcc_clear_register_valid = true;
 		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
 	}

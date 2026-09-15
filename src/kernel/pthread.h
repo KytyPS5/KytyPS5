@@ -126,6 +126,7 @@ bool PthreadKillHost(Pthread thread, int host_signal);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();
+const char* PthreadGetCurrentNameForKernel();
 
 int KYTY_SYSV_ABI          KernelUsleep(KernelUseconds microseconds);
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds);

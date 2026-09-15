@@ -385,6 +385,8 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
+	Common::DebugWaitScope _dbg_wait(Common::DebugWaitKind::Equeue);
+
 	PRINT_NAME();
 
 	auto owner = KernelPinEqueue(eq);

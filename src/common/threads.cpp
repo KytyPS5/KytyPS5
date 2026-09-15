@@ -284,7 +284,31 @@ void Thread::Detach() {
 	m_thread->m_thread.detach();
 }
 
+static thread_local uint64_t g_debug_wait[static_cast<int>(DebugWaitKind::Count)] = {};
+
+static uint64_t DebugWaitNowMicros() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void DebugWaitAdd(DebugWaitKind kind, uint64_t micros) {
+	g_debug_wait[static_cast<int>(kind)] += micros;
+}
+
+uint64_t DebugWaitGet(DebugWaitKind kind) {
+	return g_debug_wait[static_cast<int>(kind)];
+}
+
+DebugWaitScope::DebugWaitScope(DebugWaitKind kind): m_kind(kind), m_start(DebugWaitNowMicros()) {}
+
+DebugWaitScope::~DebugWaitScope() {
+	const auto now = DebugWaitNowMicros();
+	DebugWaitAdd(m_kind, now > m_start ? now - m_start : 0);
+}
+
 void Thread::Sleep(uint32_t millis) {
+
 	std::this_thread::sleep_for(std::chrono::milliseconds(millis));
 }
 

@@ -12717,7 +12717,9 @@ public:
                                    vertex_words);
     const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back,
                               bool provoking_last = false,
-                              bool clockwise = false) -> PipelineCache::Pipeline & {
+                              bool clockwise = false,
+                              vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList)
+        -> PipelineCache::Pipeline & {
       HW::ModeControl mode{};
       mode.face = clockwise;
       mode.poly_mode = enabled;
@@ -12727,11 +12729,11 @@ public:
       registers.SetModeControl(mode);
       return context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
-          vk::PrimitiveTopology::eTriangleList, false,
+          topology, false,
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected) {
+    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3) {
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
         RenderExecutorTestAccess::BindRenderTarget(executor, depth.image_id);
@@ -12785,7 +12787,7 @@ public:
                            : vk::ImageAspectFlags{});
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
-      cmd.draw(3, 1, 0, 0);
+      cmd.draw(vertex_count, 1, 0, 0);
       command.EndRendering();
       RenderExecutorTestAccess::ResetBindings(executor);
     };
@@ -13087,6 +13089,66 @@ public:
       Require(name, "pixel wave cache distinction",
               wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
               "wave32 and wave64 pixel programs shared a cache key");
+
+      // Captured Playroom strips contain the fullscreen triangle followed by an
+      // out-of-bounds fetch exporting (0,0,0,0). Additive color reveals any extra triangle.
+      static constexpr std::array<std::array<u32, 4>, 4> fourth_positions{{
+          {0, 0, 0, 0}, {0x80000000u, 0, 0x80000000u, 0x80000000u},
+          {0, 0, 0, 0x3f800000u}, {0xbf800000u, 0xbf800000u, 0, 0}}};
+      static const auto position_shaders = [&] {
+        std::array<std::vector<u32>, fourth_positions.size()> result;
+        for (size_t i = 0; i < result.size(); i++) {
+          auto &code = result[i];
+          const auto position_export = std::ranges::find(native_vertex, EncodeExp0(0x0c, 0xf));
+          code.assign(native_vertex.begin(), position_export);
+          code.push_back(EncodeVopc(0xc2, InlineU32(3), 5));
+          constexpr std::array<u32, 4> position_registers{3, 4, 0, 6};
+          for (size_t component = 0; component < position_registers.size(); component++) {
+            AppendVMovLiteral(&code, 7, fourth_positions[i][component]);
+            const auto reg = position_registers[component];
+            code.push_back(EncodeVop2(0x01, reg, Vgpr(reg), 7));
+          }
+          code.insert(code.end(), position_export, native_vertex.end());
+        }
+        return result;
+      }();
+      auto additive_blend = registers.GetBlendControl(0);
+      additive_blend.enable = true;
+      additive_blend.color_srcblend = additive_blend.color_destblend =
+          additive_blend.alpha_srcblend = additive_blend.alpha_destblend =
+              static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      registers.SetBlendControl(0, additive_blend);
+      auto target_info = registers.GetRenderTarget(0).info;
+      target_info.blend_bypass = false;
+      registers.SetColorInfo(0, target_info);
+      registers.SetPsInControl(0x8008);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriStrip);
+      for (size_t i = 0; i < position_shaders.size(); i++) {
+        const auto &code = position_shaders[i];
+        native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
+            {.type = Prospero::ShaderBinaryType::kGs,
+             .user_data = &native_user_data,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
+        draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4);
+        const auto pixels = read_color();
+        bool second_triangle = false;
+        for (size_t component = 0; component < pixels.size(); component += 4) {
+          Require(name, "fullscreen triangle preserved",
+                  pixels[component] == 0x3e800000u || pixels[component] == 0x3f000000u,
+                  "clipping-error culling removed valid fullscreen coverage");
+          second_triangle |= pixels[component] == 0x3f000000u;
+        }
+        Require(name, "zero homogeneous position culling", second_triangle == (i >= 2),
+                "zero positions drew an extra triangle, or a valid position was culled");
+      }
+
       vertex_shader = owned_vertex_shader;
       pixel_shader = owned_pixel_shader;
     }

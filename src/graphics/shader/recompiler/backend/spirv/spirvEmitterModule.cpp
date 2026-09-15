@@ -476,6 +476,15 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
+		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
+		state.invalid_position_clip_distance = clip_distance_count++;
+		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
+		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
+	}
 	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
 	                         spv::BuiltIn builtin) {
 		if (variable == 0) {

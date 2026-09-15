@@ -129,6 +129,14 @@ static void WriteImpl(std::string_view text, fmt::text_style style = {}) {
 	}
 }
 
+void WriteToConsoleAndLog(std::string_view text) {
+	WriteImpl(text);
+	if (g_initialized && g_direction != Direction::Console) {
+		WriteStdout(text);
+	}
+	Flush();
+}
+
 void WriteFatal(std::string_view text) {
 	if (g_direction == Direction::Silent || !g_initialized) {
 		WriteStdout(text);

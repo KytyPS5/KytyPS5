@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
+#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -500,6 +503,31 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, exp.index),
 			                          value);
 		} else if (exp.kind == IR::ExportTargetKind::Position) {
+			if (state.invalid_position_clip_distance != UINT32_MAX) {
+				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
+				const auto equal = state.builder.AllocateId();
+				const auto invalid = state.builder.AllocateId();
+				const auto distance = state.builder.AllocateId();
+				const auto distance_pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal,
+				                          value, zero);
+				state.builder.AddFunction(spv::OpAll, TypeBool(state), invalid, equal);
+				// Zero at valid vertices makes a primitive containing an invalid position
+				// collapse to its remaining edge, before the undefined 0/0 perspective divide.
+				state.builder.AddFunction(spv::OpSelect, TypeF32(state), distance, invalid,
+				                          ConstantF32Value(state, -1.0f),
+				                          ConstantF32Value(state, 0.0f));
+				state.builder.AddFunction(
+				    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
+				    distance_pointer, state.clip_distance_variable,
+				    ConstantU32(state, state.invalid_position_clip_distance));
+				state.builder.AddFunction(spv::OpStore, distance_pointer, distance);
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(
+					    "Shader: emitted zero-position clip guard\n");
+				}
+			}
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(
 			    spv::OpAccessChain,

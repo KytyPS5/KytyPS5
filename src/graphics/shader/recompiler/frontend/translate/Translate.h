@@ -13,7 +13,6 @@ struct EmbeddedFetchLoad {
 	uint32_t              pc         = 0;
 	int                   attrib_id  = -1;
 	uint32_t              components = 0;
-	std::vector<uint32_t> prolog_loads;
 };
 
 struct EmbeddedFetchPlan {

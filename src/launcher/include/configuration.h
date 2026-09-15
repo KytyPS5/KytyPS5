@@ -87,6 +87,7 @@ public:
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
+	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -115,6 +116,7 @@ public:
 		screen_resolution           = other.screen_resolution;
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
+		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
@@ -160,6 +162,7 @@ public:
 		KYTY_CFG_SET(screen_resolution);
 		KYTY_CFG_SET(user_name);
 		KYTY_CFG_SET(user_id);
+		KYTY_CFG_SET(audio_input_device);
 		KYTY_CFG_SET(present_mode);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
@@ -196,6 +199,7 @@ public:
 		user_id            = user_id_ok && Config::IsConfiguredUserIdValid(saved_user_id)
 		                         ? saved_user_id
 		                         : Config::DEFAULT_USER_ID;
+		audio_input_device = s->value("audio_input_device", audio_input_device).toString();
 		KYTY_CFG_GET(present_mode);
 		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {

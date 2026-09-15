@@ -43,6 +43,10 @@ int32_t GetUserId() {
 	return g_config->user_id;
 }
 
+const std::string& GetAudioInputDevice() {
+	return g_config->audio_input_device;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }

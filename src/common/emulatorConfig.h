@@ -43,6 +43,7 @@ struct ConfigOptions {
 	uint32_t               screen_height               = 720;
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
+	std::string            audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -77,6 +78,7 @@ uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
+const std::string& GetAudioInputDevice();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();

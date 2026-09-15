@@ -75,7 +75,25 @@
        </layout>
       </widget>
      </item>
-     <item row="0" column="1" rowspan="2">
+     <item row="2" column="0">
+      <widget class="QGroupBox" name="audio_group">
+       <property name="title"><string>Audio</string></property>
+       <layout class="QFormLayout" name="audioLayout">
+        <property name="fieldGrowthPolicy">
+         <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+        </property>
+        <item row="0" column="0">
+         <widget class="QLabel" name="label_audio_input_device">
+          <property name="text"><string>Microphone:</string></property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="comboBox_audio_input_device"/>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="0" column="1" rowspan="3">
       <widget class="QGroupBox" name="graphics_group">
        <property name="title">
         <string>Graphics &amp;&amp; display</string>
@@ -152,7 +170,7 @@
        </layout>
       </widget>
      </item>
-     <item row="2" column="0" colspan="2">
+     <item row="3" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>

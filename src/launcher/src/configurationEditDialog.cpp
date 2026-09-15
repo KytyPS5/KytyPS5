@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
+#include "SDL.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -167,6 +168,31 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
+	auto* microphone = m_ui->comboBox_audio_input_device;
+	microphone->clear();
+	microphone->addItem(tr("None"), QString {});
+	microphone->setToolTip(tr("Microphone used by games. None supplies silence."));
+	SDL_SetMainReady();
+	if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+		const int device_count = SDL_GetNumAudioDevices(SDL_TRUE);
+		for (int i = 0; i < device_count; i++) {
+			if (const auto* device = SDL_GetAudioDeviceName(i, SDL_TRUE); device != nullptr) {
+				const auto name = QString::fromUtf8(device);
+				if (microphone->findData(name) < 0) {
+					microphone->addItem(name, name);
+				}
+			}
+		}
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	} else {
+		microphone->setToolTip(tr("Microphones could not be listed: %1")
+		                           .arg(QString::fromUtf8(SDL_GetError())));
+	}
+	if (microphone->findData(info.audio_input_device) < 0) {
+		microphone->addItem(tr("%1 (unavailable)").arg(info.audio_input_device),
+		                    info.audio_input_device);
+	}
+	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
@@ -340,6 +366,7 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
+	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =

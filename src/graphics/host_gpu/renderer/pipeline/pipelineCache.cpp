@@ -89,12 +89,7 @@ template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
-	if (Log::GetDirection() != Log::Direction::Console) {
-		std::fwrite(message.data(), 1, message.size(), stdout);
-		std::fflush(stdout);
-	}
-	Log::Write(message);
-	Log::Flush();
+	Log::WriteToConsoleAndLog(message);
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {

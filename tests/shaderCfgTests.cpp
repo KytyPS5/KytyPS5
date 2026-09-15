@@ -9627,6 +9627,54 @@ void TestMergedShaderUserDataSnapshot() {
   }
 }
 
+void TestEmbeddedFetchPreservesSharedScalarLoad() {
+  using namespace ShaderRecompiler;
+  const uint32_t code[] = {
+      EncodeSMovB32(5, 255), 0x47f,
+      EncodeSmem0(0x03, 0, 11), (125u << 25u) | 4u, // s_load_dwordx8 s[0:7], s[22:23], 4
+      EncodeSop2(0x1e, 9, 0, 132), // s_lshl_b32 s9, s0, 4
+      EncodeSop2(0x0e, 9, 9, 255), 0x1f0,
+      EncodeSmem0(0x02, 24, 10), 9u << 25u,
+      EncodeVop2(0x01, 0, 256 + 8, 5), // vertex/instance index selection
+      EncodeMubuf0(0x02), EncodeMubuf1(9, 6, 0), // replaced vertex fetch
+      EncodeSop2(0x1e, 9, 5, 132), // another component of the same scalar load
+      EncodeSop2(0x0e, 9, 9, 255), 0x1f0,
+      EncodeSmem0(0x02, 28, 10), 9u << 25u,
+      EncodeMubuf0(0x0c), EncodeMubuf1(12, 7, 1),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01),
+  };
+  std::array<std::array<uint32_t, 4>, 32> buffers{};
+  buffers[2] = {0x12340000, 0, 64, 0x00027000};
+  buffers[31] = {0x56780000, 0, 64, 0x00027000};
+  const std::array<uint32_t, 9> attributes = {0, 0, 0, 0, 0, 0, 2, 0, 0};
+  std::array<uint32_t, 16> user_data{};
+  const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffers.data()),
+                             reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(user_data.data() + 12, tables, sizeof(tables));
+  ShaderVertexInputInfo input{};
+  input.fetch_embedded = true;
+  input.fetch_buffer_reg = 12;
+  input.fetch_attrib_reg = 14;
+  input.resources_num = 1;
+  input.resources_dst[0].attr_id = 1;
+  input.resources[0].fields[1] = 12u << 16u;
+  input.resources[0].fields[2] = 1;
+  input.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32Float) << 12u) |
+      DstSel(4, 5, 6, 7);
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.user_data_base = 8;
+  options.user_data = user_data;
+  options.input_info.vertex = &input;
+  auto result = RecompileForTest(code, options);
+  Check(result.program.info.vertex_fetch_components[0] == 3 &&
+            result.resources.buffers.size() == 1 &&
+            std::equal(buffers[2].begin(), buffers[2].end(),
+                       result.resources.buffers[0].dwords.begin()),
+        "embedded fetch discarded a scalar-load component used by another buffer read");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestEmbeddedVertexFormatSwizzle() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -10124,10 +10172,10 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 std::vector<uint32_t>({UINT32_MAX}),
         "MISC point-size/layer stores are missing");
   Check(SpirvStoredBuiltInElements(all.spirv, 3u) ==
-            std::vector<uint32_t>({0u, 3u}) &&
+            std::vector<uint32_t>({0u, 3u, 4u}) &&
             SpirvStoredBuiltInElements(all.spirv, 4u) ==
                 std::vector<uint32_t>({0u, 1u, 2u}),
-        "partial clip/cull exports used the wrong dense elements");
+        "partial clip/cull exports or the appended clipping-error plane used the wrong elements");
   Check(SpirvHasDecorationValue(all.spirv, 11u, 1u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 3u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 4u) &&
@@ -10161,7 +10209,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
   CheckSpirvBinaryValidates(dense.spirv);
   Check(SpirvStoredBuiltInElements(dense.spirv, 0u).size() == 1u &&
             SpirvStoredBuiltInElements(dense.spirv, 3u) ==
-                std::vector<uint32_t>({1u}) &&
+                std::vector<uint32_t>({1u, 2u}) &&
             SpirvStoredBuiltInElements(dense.spirv, 4u) ==
                 std::vector<uint32_t>({0u}),
         "CCDIST1 was not densely packed into POS1");
@@ -10176,10 +10224,23 @@ void TestNewShaderRecompilerAuxPositionExports() {
   CheckSpirvBinaryValidates(shifted.spirv);
   Check(SpirvStoredBuiltInElements(shifted.spirv, 1u).size() == 1u &&
             SpirvStoredBuiltInElements(shifted.spirv, 3u) ==
-                std::vector<uint32_t>({0u}) &&
+                std::vector<uint32_t>({0u, 1u}) &&
             SpirvStoredBuiltInElements(shifted.spirv, 4u) ==
                 std::vector<uint32_t>({0u}),
         "CCDIST1 did not shift across a disabled CCDIST0 vector");
+
+  const uint32_t full_distances[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0xf, false), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0e, 0xf), EncodeExp1(8, 9, 10, 11), 0xbf810000u,
+  };
+  const auto full = compile(full_distances, 0x00c0f00fu);
+  CheckSpirvBinaryValidates(full.spirv);
+  Check(SpirvStoredBuiltInElements(full.spirv, 3u) ==
+            std::vector<uint32_t>({0u, 1u, 2u, 3u}) &&
+            SpirvStoredBuiltInElements(full.spirv, 4u) ==
+                std::vector<uint32_t>({0u, 1u, 2u, 3u}),
+        "clipping-error plane exceeded eight combined components or replaced a guest distance");
 
   const uint32_t unmapped[] = {
       EncodeExp0(0x0d, 0x4, false), EncodeExp1(0, 0, 8, 0),
@@ -13053,7 +13114,8 @@ void TestRepeatedExportsHaveOneInterface() {
     }
     offset += result.spirv[offset] >> spv::WordCountShift;
   }
-  Check(outputs == 1, "repeated exports produced duplicate output variables");
+  Check(outputs == 2 && SpirvHasDecorationValue(result.spirv, 11u, 3u),
+        "repeated exports duplicated Position or its clipping-error plane");
 }
 
 void TestNewShaderRecompilerSpirvSizeBaselines() {
@@ -13269,10 +13331,10 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   };
   const auto wqm_result = compile("wqm", wqm,
                                   {.words = 407,
-                                   .instructions = 98,
+                                   .instructions = 99,
                                    .variables = 4,
                                    .loads = 3,
-                                   .stores = 1,
+                                   .stores = 2,
                                    .labels = 6,
                                    .selection_merges = 1,
                                    .branches = 4,
@@ -13414,6 +13476,7 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+  TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();

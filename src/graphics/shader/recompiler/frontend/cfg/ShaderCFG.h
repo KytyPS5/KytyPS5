@@ -64,6 +64,8 @@ struct BasicBlock {
 	std::vector<uint32_t> dominators;
 	std::vector<uint32_t> post_dominators;
 	Terminator            terminator;
+	// The block's only instruction is its S_BRANCH, so translating it emits nothing.
+	bool branch_only = false;
 };
 
 struct BackEdge {
@@ -102,6 +104,10 @@ struct Graph {
 	// failure describes a block, not an instruction.
 	uint32_t                                failure_pc    = UINT32_MAX;
 	std::string                             unsupported_reason;
+	// Structurize analysis work, in cubed block counts.
+	uint64_t                                structurize_work = 0;
+	// Only the last-resort structurize attempt is held to the work budget.
+	bool                                    structurize_work_limited = false;
 
 	const BasicBlock* FindBlock(uint32_t id) const;
 	BasicBlock*       FindBlock(uint32_t id);

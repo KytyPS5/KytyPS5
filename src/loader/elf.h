@@ -154,6 +154,29 @@ struct SelfSegment {
 	uint64_t decompressed_size;
 };
 
+// Kyty currently supports the two SELF header variants below. Keep validation and loading on the
+// same classification rule so a container cannot be checked as SELF and then parsed as raw ELF.
+inline bool HasSupportedSelfMagic(const SelfHeader& header) {
+	return (header.ident[0] == 0x4f && header.ident[1] == 0x15 &&
+	        header.ident[2] == 0x3d && header.ident[3] == 0x1d) ||
+	       (header.ident[0] == 0x54 && header.ident[1] == 0x14 &&
+	        header.ident[2] == 0xf5 && header.ident[3] == 0xee);
+}
+
+inline bool IsSupportedSelfHeader(const SelfHeader& header) {
+	if (!HasSupportedSelfMagic(header)) {
+		return false;
+	}
+	return (header.ident[4] == 0x00 && header.ident[5] == 0x01 &&
+	        header.ident[6] == 0x01 && header.ident[7] == 0x12 &&
+	        header.ident[8] == 0x01 && header.ident[9] == 0x01 &&
+	        header.ident[10] == 0x00 && header.ident[11] == 0x00 && header.unknown == 0x22) ||
+	       (header.ident[4] == 0x10 && header.ident[5] == 0x01 &&
+	        header.ident[6] == 0x01 && header.ident[7] == 0x12 &&
+	        header.ident[8] == 0x01 && header.ident[9] == 0x01 &&
+	        header.ident[10] == 0x00 && header.ident[11] == 0x10 && header.unknown == 0x32);
+}
+
 struct Elf64_Ehdr // NOLINT(readability-identifier-naming)
 {
 	uint8_t    e_ident[EI_NIDENT]; /* ELF identification */

@@ -643,9 +643,12 @@ private:
 		if (!evaluated) {
 			return false;
 		}
-		// A plan's own slots are unique and its instructions only reference each other, so no
-		// recursive step can have claimed this slot; re-checking keeps the store from
-		// overwriting a claim it did not make without resting on that argument.
+		// A plan's own slots are unique, so no plan-local recursion reaches this slot. A foreign
+		// instruction can: ReadConst resolves its slot against the evaluator's plan, not against
+		// the plan that cloned it, so evaluating one recurses into this plan's srt_read, which may
+		// hold this very slot and claim it on the way back. Re-check, and leave a claim made by
+		// the recursion alone - overwriting it would cost its owner the memo it just stored and
+		// read guest memory a second time - so this instruction takes the map instead.
 		if (dense && arena.entries[slot].stamp != m_generation) {
 			arena.entries[slot] = {.owner = inst, .value = out, .stamp = m_generation};
 		} else {

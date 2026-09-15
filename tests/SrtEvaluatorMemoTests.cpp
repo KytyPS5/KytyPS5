@@ -923,6 +923,69 @@ void TestFailuresOverAPlan() {
 	inst.SetArg(0, Value(1u));
 }
 
+// ReadConst resolves its slot against the EVALUATOR's plan, not against the plan that cloned the
+// instruction. A foreign ReadConst therefore recurses into this plan's own srt_read - and when the
+// two carry the same dense slot number, that recursion claims the slot the foreign instruction is
+// about to store into. The store must leave the claim alone, or the instruction that made it loses
+// its memo and reads guest memory twice.
+void TestForeignReadConstRecursesIntoItsOwnSlot() {
+	Fixture    f;
+	const auto handle = f.Handle(f.UserData(0), f.UserData(1));
+	const auto read   = f.RawRead(handle, 0x40);
+	f.Flat(read);
+	f.Source({f.ReadConst(0)});
+	const auto plan   = ExtractResourcePlan(f.program);
+	const auto own    = plan.srt_reads[0].value;
+	const auto target = own.Instruction()->MemoSlot();
+
+	// A second plan whose ReadConst is numbered exactly like this plan's srt_read.
+	std::unique_ptr<Fixture> other;
+	ResourcePlan             foreign_plan;
+	for (uint32_t pad = 0; pad < 8 && !other; ++pad) {
+		auto       candidate = std::make_unique<Fixture>();
+		for (uint32_t i = 0; i < pad; ++i) {
+			candidate->Source({candidate->UserData(2 + i)});
+		}
+		candidate->Source({candidate->ReadConst(0)});
+		auto built = ExtractResourcePlan(candidate->program);
+		if (built.descriptor_sources.back().dwords[0].Instruction()->MemoSlot() == target) {
+			other        = std::move(candidate);
+			foreign_plan = std::move(built);
+		}
+	}
+	Check(other != nullptr, "foreign ReadConst fixture: no padding produced the colliding slot");
+	const auto foreign = foreign_plan.descriptor_sources.back().dwords[0];
+
+	// The foreign ReadConst is evaluated first, so it finds the slot free and takes the dense
+	// path; its recursion into `own` then claims that very slot.
+	auto                  in = MakeInput(1);
+	const std::array      values {foreign, own, foreign, own};
+	std::array<uint32_t, 4> map_results {};
+	SrtTestHooks::ResetMemoArenas();
+	SrtTestHooks::SetDenseMemo(false);
+	in.readers.trace.clear();
+	const bool map_ok = EvaluateUniformValues(plan, values, Runtime(in.readers, in.user_data),
+	                                          map_results);
+	const auto map_trace = in.readers.trace;
+
+	std::array<uint32_t, 4> dense_results {};
+	SrtTestHooks::ResetMemoArenas();
+	SrtTestHooks::SetDenseMemo(true);
+	in.readers.trace.clear();
+	const bool dense_ok = EvaluateUniformValues(plan, values, Runtime(in.readers, in.user_data),
+	                                            dense_results);
+	const auto dense_trace = in.readers.trace;
+
+	Check(map_ok && dense_ok && map_trace.size() == 1,
+	      "foreign ReadConst fixture: the pointer memo must read guest memory exactly once");
+	Check(dense_results == map_results,
+	      "a foreign ReadConst changed the value its own plan's srt_read evaluates to");
+	Check(dense_trace == map_trace,
+	      "a foreign ReadConst overwrote the dense claim its recursion made, so the instruction "
+	      "that made it read guest memory again");
+	SrtTestHooks::ResetMemoArenas();
+}
+
 int RunAll() {
 	TestSameEvaluationInputsAndBindings();
 	TestRawAndCleanEvaluatorsStaySeparate();
@@ -937,6 +1000,7 @@ int RunAll() {
 	TestForeignInstructionsUseTheMap();
 	TestValuesFromAnotherPlan();
 	TestFailuresOverAPlan();
+	TestForeignReadConstRecursesIntoItsOwnSlot();
 	std::printf("SrtEvaluatorMemoTests: all cases passed (%d checks)\n", g_checks);
 	return 0;
 }

@@ -27,8 +27,11 @@ enum class RuntimeValueType { Any, Integer };
 
 // The functions below resolve SRT slots, clean-slot flags and descriptor sources against the
 // ResourcePlan they are given, so a Value that plan does not own only evaluates meaningfully when
-// it needs none of those - but it is always memoized correctly: an instruction that holds none of
-// this plan's dense memo slots, including one another plan cloned, is memoized by pointer.
+// it needs none of those. It is memoized correctly either way: dense memo slots are numbered per
+// plan, so an entry records the instruction that claimed it and is reused only for that same
+// instruction. An instruction another plan cloned may claim a free slot of equal number, and takes
+// the pointer-keyed memo once another instruction owns it, so values of different plans stay as
+// distinct as their addresses.
 
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.

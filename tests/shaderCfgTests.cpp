@@ -10055,6 +10055,45 @@ void TestMeshExportStorage() {
   }
 }
 
+void TestMeshAuxiliaryPositionOutputs() {
+  // SILENT HILL f mesh shader e48be36d8faa35b8 exports clip distances. Point size, layer,
+  // viewport index and clip and cull distances must all reach the mesh output interface.
+  const uint32_t code[] = {
+      EncodeSMovB32(12, 255), 0x1003u, EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x0d, 0x5, false), EncodeExp1(0, 0, 0, 0), // point size, layer, viewport
+      EncodeExp0(0x0e, 0x7, false), EncodeExp1(0, 0, 0, 0), // clip 0, clip 1, cull 0
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.pa_cl_vs_out_cntl = (1u << 21u) | (1u << 22u) | (1u << 16u) | (1u << 18u) |
+                            (1u << 19u) | 0x3u | (1u << 10u);
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  for (const auto subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(code, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    for (const auto *text :
+         {"Capability ClipDistance", "Capability CullDistance", "BuiltIn ClipDistance",
+          "BuiltIn CullDistance", "BuiltIn PointSize", "BuiltIn Layer",
+          "BuiltIn ViewportIndex", "OpTypeArray %float %uint_2", "OpTypeArray %float %uint_1"}) {
+      Check(Common::ContainsStr(source, text),
+            "mesh auxiliary position output is missing from the SPIR-V interface");
+    }
+  }
+}
+
 void TestMergedShaderUserDataSnapshot() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -14031,6 +14070,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshAuxiliaryPositionOutputs();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

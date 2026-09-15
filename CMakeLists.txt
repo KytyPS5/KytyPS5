@@ -466,6 +466,9 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
 )
 target_link_libraries(sync_on_address_tests common)
+if (WIN32)
+	target_link_libraries(sync_on_address_tests onecore)
+endif()
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
 
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL

@@ -14,6 +14,17 @@
 #include <cstring>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+namespace Libs::LibKernel::Semaphore {
+const char* DebugLastWaitedSemaName();
+uint64_t    DebugLastWaitedSemaSignals();
+uint64_t    DebugLastWaitedSemaWaits();
+} // namespace Libs::LibKernel::Semaphore
+
 namespace Libs::Audio {
 
 namespace {
@@ -228,6 +239,35 @@ static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_DEFAU
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_V2      = 0x01020001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_LIMITER_DEFAULT    = 0x01010003;
 
+static std::atomic_uint64_t g_dbg_calls[6] = {};
+enum DbgCall { DBG_ADVANCE = 0, DBG_PUSH, DBG_QUEUELEVEL, DBG_PORTATTR, DBG_PORTSTATE, DBG_SYSSTATE };
+
+static void audioout2_dbg_tick(int which) {
+	g_dbg_calls[which].fetch_add(1, std::memory_order_relaxed);
+
+	static std::atomic_uint64_t last_dump {0};
+	const auto now = LibKernel::KernelGetProcessTime();
+	auto       prev = last_dump.load(std::memory_order_relaxed);
+	if (prev == 0) {
+		last_dump.compare_exchange_strong(prev, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - prev < 1000000ull) {
+		return;
+	}
+	if (!last_dump.compare_exchange_strong(prev, now, std::memory_order_relaxed)) {
+		return;
+	}
+	LOGF("AudioOut2 rates/s: advance=%" PRIu64 " push=%" PRIu64 " queuelevel=%" PRIu64
+	     " portattr=%" PRIu64 " portstate=%" PRIu64 " sysstate=%" PRIu64 "\n",
+	     g_dbg_calls[DBG_ADVANCE].exchange(0, std::memory_order_relaxed),
+	     g_dbg_calls[DBG_PUSH].exchange(0, std::memory_order_relaxed),
+	     g_dbg_calls[DBG_QUEUELEVEL].exchange(0, std::memory_order_relaxed),
+	     g_dbg_calls[DBG_PORTATTR].exchange(0, std::memory_order_relaxed),
+	     g_dbg_calls[DBG_PORTSTATE].exchange(0, std::memory_order_relaxed),
+	     g_dbg_calls[DBG_SYSSTATE].exchange(0, std::memory_order_relaxed));
+}
+
 static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHandle ctx) {
 	for (auto& state: g_audioout2_contexts) {
 		if (state.used && state.handle == ctx) {
@@ -346,6 +386,23 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    state.pcm_data != nullptr && AudioInternal::AudioOutHasDevice(state.audio_handle)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The synthetic grain counter is only a fallback. When a real device backs the context, its own
+// queue is the truth: reporting the timer's idea of fullness starves the device, because Wwise
+// renders nothing on a RenderAudio() call that finds no free slot.
+static bool audioout2_context_device_queued_grains(AudioOut2ContextHandle ctx, uint32_t* grains) {
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	for (const auto& state: g_audioout2_ports) {
+		if (state.used && state.context == ctx && state.audio_handle > 0 &&
+		    state.pcm_data != nullptr && AudioInternal::AudioOutHasDevice(state.audio_handle)) {
+			if (grains != nullptr) {
+				*grains = AudioInternal::AudioOutGetQueuedGrains(state.audio_handle);
+			}
 			return true;
 		}
 	}
@@ -496,6 +553,7 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+	audioout2_dbg_tick(DBG_ADVANCE);
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
@@ -506,7 +564,42 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	audioout2_dbg_tick(DBG_PUSH);
 	uint32_t sleep_micros = audioout2_grain_micros(512);
+
+	// Probe: how often does the guest push, and how long do we hold it?
+	static std::atomic_uint32_t push_count = 0;
+	static std::atomic_uint64_t push_blocked_us = 0;
+	static std::atomic_uint64_t push_gap_us = 0;
+	static std::atomic_uint64_t push_last_exit = 0;
+	const auto push_index = push_count.fetch_add(1, std::memory_order_relaxed);
+	const auto push_enter = LibKernel::KernelGetProcessTime();
+	if (const auto prev = push_last_exit.load(std::memory_order_relaxed);
+	    prev != 0 && push_enter > prev) {
+		push_gap_us.fetch_add(push_enter - prev, std::memory_order_relaxed);
+	}
+	uint32_t spins = 0;
+
+	// Probe: is this thread burning CPU between pushes, or parked?
+	uint64_t cpu_now_us = 0;
+#ifdef _WIN32
+	{
+		FILETIME ct {};
+		FILETIME et {};
+		FILETIME kt {};
+		FILETIME ut {};
+		if (GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut) != 0) {
+			const auto to_us = [](const FILETIME& ft) {
+				return ((static_cast<uint64_t>(ft.dwHighDateTime) << 32u) |
+				        static_cast<uint64_t>(ft.dwLowDateTime)) /
+				       10ull;
+			};
+			cpu_now_us = to_us(kt) + to_us(ut);
+		}
+	}
+#endif
+	static std::atomic_uint64_t cpu_at_last_report = 0;
+	static std::atomic_uint64_t wall_at_last_report = 0;
 
 	for (;;) {
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
@@ -528,6 +621,45 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 				}
 				g_audioout2_context_mutex.Unlock();
 				audioout2_queue_context_audio(ctx, blocking != 0);
+				{
+					const auto exit_time = LibKernel::KernelGetProcessTime();
+					push_last_exit.store(exit_time, std::memory_order_relaxed);
+					const auto blocked =
+					    push_blocked_us.fetch_add(exit_time > push_enter ? exit_time - push_enter : 0,
+					                              std::memory_order_relaxed);
+					if ((push_index % 20) == 0) {
+						const auto prev_cpu = cpu_at_last_report.exchange(cpu_now_us,
+						                                                  std::memory_order_relaxed);
+						const auto prev_wall =
+						    wall_at_last_report.exchange(push_enter, std::memory_order_relaxed);
+						const auto cpu_delta = (cpu_now_us > prev_cpu ? cpu_now_us - prev_cpu : 0);
+						const auto wall_delta =
+						    (push_enter > prev_wall ? push_enter - prev_wall : 0);
+						LOGF("AudioOut2: push #%" PRIu32 " blocking=%" PRIu32 " spins=%" PRIu32
+						     " in_push_us_total=%" PRIu64 " between_push_us_total=%" PRIu64
+						     " cpu_us=%" PRIu64 " wall_us=%" PRIu64 " busy=%.1f%%\n",
+						     push_index, blocking, spins, blocked,
+						     push_gap_us.load(std::memory_order_relaxed), cpu_delta, wall_delta,
+						     wall_delta != 0 ? (100.0 * static_cast<double>(cpu_delta) /
+						                        static_cast<double>(wall_delta))
+						                     : 0.0);
+						LOGF("AudioOut2: push #%" PRIu32 " waits_us sleep=%" PRIu64
+						     " condwait=%" PRIu64 " condtimed=%" PRIu64 " mutex=%" PRIu64
+						     " sema=%" PRIu64 " eventflag=%" PRIu64 " equeue=%" PRIu64 "\n",
+						     push_index, Common::DebugWaitGet(Common::DebugWaitKind::Sleep),
+						     Common::DebugWaitGet(Common::DebugWaitKind::CondWait),
+						     Common::DebugWaitGet(Common::DebugWaitKind::CondTimedwait),
+						     Common::DebugWaitGet(Common::DebugWaitKind::MutexLock),
+						     Common::DebugWaitGet(Common::DebugWaitKind::Sema),
+						     Common::DebugWaitGet(Common::DebugWaitKind::EventFlag),
+						     Common::DebugWaitGet(Common::DebugWaitKind::Equeue));
+						LOGF("AudioOut2: push #%" PRIu32 " sema=\"%s\" signals=%" PRIu64
+						     " waits=%" PRIu64 "\n",
+						     push_index, LibKernel::Semaphore::DebugLastWaitedSemaName(),
+						     LibKernel::Semaphore::DebugLastWaitedSemaSignals(),
+						     LibKernel::Semaphore::DebugLastWaitedSemaWaits());
+					}
+				}
 				return OK;
 			}
 		}
@@ -537,12 +669,14 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			return AUDIO_OUT2_ERROR_NOT_READY;
 		}
 
+		spins++;
 		Common::Thread::SleepMicro(sleep_micros);
 	}
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	audioout2_dbg_tick(DBG_QUEUELEVEL);
 	if (queue_level != nullptr) {
 		*queue_level = 0;
 	}
@@ -553,15 +687,54 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
+		auto     reported      = state->queued;
+		uint32_t device_grains = 0;
+		static std::atomic_uint64_t dbg_device_path {0};
+		static std::atomic_uint64_t dbg_fallback_path {0};
+		if (audioout2_context_device_queued_grains(ctx, &device_grains)) {
+			reported = std::min(device_grains, state->queue_depth);
+			dbg_device_path.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			dbg_fallback_path.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (((dbg_device_path.load(std::memory_order_relaxed) +
+		      dbg_fallback_path.load(std::memory_order_relaxed)) %
+		     20) == 0) {
+			LOGF("AudioOut2 qlevel path: device=%" PRIu64 " fallback=%" PRIu64 " reported=%" PRIu32
+			     " synthetic=%" PRIu32 " device_grains=%" PRIu32 "\n",
+			     dbg_device_path.load(std::memory_order_relaxed),
+			     dbg_fallback_path.load(std::memory_order_relaxed), reported, state->queued,
+			     device_grains);
+		}
 		if (queue_level != nullptr) {
-			*queue_level = state->queued;
+			*queue_level = reported;
 		}
 		if (available_queues != nullptr) {
-			*available_queues =
-			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
+			*available_queues = (reported < state->queue_depth ? state->queue_depth - reported : 0);
 		}
 	}
 	g_audioout2_context_mutex.Unlock();
+
+	{
+		static std::atomic_uint64_t avail_hist[8] = {};
+		static std::atomic_uint64_t hist_dump {0};
+		const auto a = (available_queues != nullptr ? *available_queues : 0);
+		avail_hist[a < 8 ? a : 7].fetch_add(1, std::memory_order_relaxed);
+		const auto now  = LibKernel::KernelGetProcessTime();
+		auto       prev = hist_dump.load(std::memory_order_relaxed);
+		if (prev == 0) {
+			hist_dump.compare_exchange_strong(prev, now, std::memory_order_relaxed);
+		} else if (now - prev >= 2000000ull &&
+		           hist_dump.compare_exchange_strong(prev, now, std::memory_order_relaxed)) {
+			LOGF("AudioOut2 avail_queues hist: 0=%" PRIu64 " 1=%" PRIu64 " 2=%" PRIu64
+			     " 3=%" PRIu64 " 4=%" PRIu64 "\n",
+			     avail_hist[0].exchange(0, std::memory_order_relaxed),
+			     avail_hist[1].exchange(0, std::memory_order_relaxed),
+			     avail_hist[2].exchange(0, std::memory_order_relaxed),
+			     avail_hist[3].exchange(0, std::memory_order_relaxed),
+			     avail_hist[4].exchange(0, std::memory_order_relaxed));
+		}
+	}
 
 	return OK;
 }
@@ -662,6 +835,7 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 
 int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
+	audioout2_dbg_tick(DBG_PORTATTR);
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
 
 	const void* pcm_data = nullptr;
@@ -688,6 +862,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 }
 
 int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) {
+	audioout2_dbg_tick(DBG_PORTSTATE);
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
@@ -712,6 +887,7 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 }
 
 int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state) {
+	audioout2_dbg_tick(DBG_SYSSTATE);
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 	std::memset(state, 0, sizeof(AudioOut2SystemState));

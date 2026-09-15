@@ -3939,9 +3939,13 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 	} else if (op == Pm4::IT_EVENT_WRITE_EOP) {
 		cmd[2] = static_cast<uint32_t>(vaddr & 0xffffffffu);
 		cmd[3] = (cmd[3] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
+	} else if (cmd[0] == 0) {
+		// The address may be patched into the template before the packet itself is
+		// built. The builder emits the release-mem layout, so patch where it will land.
+		cmd[3] = static_cast<uint32_t>(vaddr & 0xffffffffu);
+		cmd[4] = static_cast<uint32_t>((vaddr >> 32u) & 0xffffffffu);
 	} else {
-		EXIT("unsupported queueEndOfPipeAction packet for address patch: 0x%08" PRIx32 "\n",
-		     cmd[0]);
+		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
 	return OK;
@@ -3960,7 +3964,13 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data)
 	const bool is_release_mem = op == Pm4::IT_RELEASE_MEM ||
 	                            (op == Pm4::IT_NOP && KYTY_PM4_R(cmd[0]) == Pm4::R_RELEASE_MEM);
 	if (!is_release_mem) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		if (cmd[0] != 0) {
+			return GRAPHICS5_ERROR_INVALID_PACKET;
+		}
+		// Same template-before-build case as the address patch.
+		cmd[5] = static_cast<uint32_t>(data & 0xffffffffu);
+		cmd[6] = static_cast<uint32_t>((data >> 32u) & 0xffffffffu);
+		return OK;
 	}
 
 	const auto interrupt = (cmd[2] >> 24u) & 0x7u;

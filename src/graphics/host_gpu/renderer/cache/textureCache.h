@@ -14,11 +14,19 @@
 
 #include <map>
 #include <type_traits>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Debug helpers for presenting a guest render target instead of the scan-out surface.
+void DebugRegisterRenderTargetId(uint32_t id_index, uint32_t id_generation);
+void DebugRecordHdrWritten(uint64_t address);
+void DebugRecordEdge(uint64_t tex_address, uint64_t rt_address);
+void DebugRecordHdrSampled(uint64_t address);
+bool DebugGetRenderTargetId(size_t index, uint32_t* out_index, uint32_t* out_generation);
 
 struct GraphicContext;
 class Buffer;
@@ -64,7 +72,8 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
+	[[nodiscard]] Image* DebugTryGetImage(uint32_t id_index, uint32_t id_generation);
+	[[nodiscard]] bool   IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
@@ -158,6 +167,7 @@ private:
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	void               AssociateStencil(ImageId depth, GuestRange stencil);
+	void               DropStencilAssociation(ImageId id);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 

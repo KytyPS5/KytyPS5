@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -21,6 +22,9 @@ std::condition_variable g_device_cv;
 std::vector<int>        g_live_devices;
 std::vector<int>        g_device_backed_handles;
 std::vector<bool>       g_output_blocking;
+// Grains the fake device still holds, so queue-level queries see a device queue rather than the
+// synthetic grain counter.
+std::map<int, uint32_t>  g_queued_grains;
 int                     g_next_device  = 1;
 int                     g_open_waiters = 0;
 bool                    g_block_opens  = false;
@@ -355,6 +359,7 @@ void AudioOutClose(int handle) {
 	if (device_it != g_device_backed_handles.end()) {
 		g_device_backed_handles.erase(device_it);
 	}
+	g_queued_grains.erase(handle);
 }
 
 bool AudioOutHasDevice(int handle) {
@@ -363,10 +368,21 @@ bool AudioOutHasDevice(int handle) {
 	       g_device_backed_handles.end();
 }
 
-uint32_t AudioOutOutputs(const OutputParam* /*params*/, uint32_t /*num*/, bool blocking) {
+uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	for (uint32_t i = 0; i < num; i++) {
+		if (params != nullptr && params[i].data != nullptr) {
+			g_queued_grains[params[i].handle]++;
+		}
+	}
 	return 0;
+}
+
+uint32_t AudioOutGetQueuedGrains(int handle) {
+	std::lock_guard lock(g_device_mutex);
+	const auto      found = g_queued_grains.find(handle);
+	return found != g_queued_grains.end() ? found->second : 0;
 }
 
 } // namespace Libs::Audio::AudioInternal
@@ -379,6 +395,24 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 }
 
 } // namespace Libs::LibKernel
+
+// Debug instrumentation reached by AudioOut2ContextPush; the emulator supplies these from the
+// kernel semaphore implementation, which this test does not link.
+namespace Libs::LibKernel::Semaphore {
+
+const char* DebugLastWaitedSemaName() {
+	return "<none>";
+}
+
+uint64_t DebugLastWaitedSemaSignals() {
+	return 0;
+}
+
+uint64_t DebugLastWaitedSemaWaits() {
+	return 0;
+}
+
+} // namespace Libs::LibKernel::Semaphore
 
 int main() {
 	TestSlotReuse();

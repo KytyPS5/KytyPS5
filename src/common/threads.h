@@ -10,6 +10,34 @@ namespace Common {
 
 void InitializeThreads();
 
+// Debug instrumentation: per-thread accounting of time parked in guest blocking primitives.
+enum class DebugWaitKind : int {
+	Sleep = 0,
+	CondWait,
+	CondTimedwait,
+	MutexLock,
+	Sema,
+	EventFlag,
+	Equeue,
+	Count
+};
+
+void     DebugWaitAdd(DebugWaitKind kind, uint64_t micros);
+uint64_t DebugWaitGet(DebugWaitKind kind);
+
+class DebugWaitScope {
+public:
+	explicit DebugWaitScope(DebugWaitKind kind);
+	~DebugWaitScope();
+
+	KYTY_CLASS_NO_COPY(DebugWaitScope);
+
+private:
+	DebugWaitKind m_kind;
+	uint64_t      m_start;
+};
+
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

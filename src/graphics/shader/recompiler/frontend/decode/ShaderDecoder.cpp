@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <fmt/format.h>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
@@ -144,6 +145,7 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
 		case Opcode::IMAGE_GATHER4_C_LZ:
@@ -224,6 +226,11 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		operand.reg  = code;
 		return;
 	}
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Ttmp;
+		operand.reg  = code - 108u;
+		return;
+	}
 	if (code >= 128u && code <= 192u) {
 		operand.kind       = OperandKind::IntegerInlineConstant;
 		operand.signed_val = static_cast<int32_t>(code - 128u);
@@ -273,6 +280,11 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
+		return;
+	}
+	if (code >= 108u && code <= 123u) {
+		operand.kind = OperandKind::Ttmp;
+		operand.reg  = code - 108u;
 		return;
 	}
 
@@ -355,6 +367,30 @@ Family GetInstructionFamily(uint32_t word) {
 	}
 }
 
+namespace {
+
+// A decode failure usually means the walk desynchronized earlier, so the failing word alone is
+// not enough to diagnose it. Print the surrounding machine words with their program counters.
+std::string CodeWindowToString(std::span<const uint32_t> code, uint32_t word_index) {
+	// Small programs are printed whole: the desynchronizing instruction is usually far from the
+	// word that finally fails to decode.
+	constexpr uint32_t WholeProgramWords = 512u;
+	constexpr uint32_t Context           = 24u;
+	const bool         whole             = code.size() <= WholeProgramWords;
+	const uint32_t     first = whole || word_index <= Context ? 0u : word_index - Context;
+	const uint32_t     last =
+	    whole ? static_cast<uint32_t>(code.size())
+	          : std::min<uint32_t>(static_cast<uint32_t>(code.size()), word_index + Context + 1u);
+	std::string text;
+	for (uint32_t index = first; index < last; index++) {
+		text += fmt::format("\n  0x{:08x}: 0x{:08x}{}", index * sizeof(uint32_t),
+		                    code[index], index == word_index ? "  <== here" : "");
+	}
+	return text;
+}
+
+} // namespace
+
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
 	switch (GetInstructionFamily(code[word_index])) {
@@ -377,8 +413,16 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
-			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x, words=%u, code:%s", pc,
+			     code[word_index], static_cast<uint32_t>(code.size()),
+			     CodeWindowToString(code, word_index).c_str());
 	}
+}
+
+// Both handoff forms jump to the back half; the compute chain discards the return address
+// S_SWAPPC_B64 would write, which makes it a tail call like the graphics S_SETPC_B64.
+static bool IsFrontHandoff(const Instruction& inst) {
+	return inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64;
 }
 
 Program DecodeFrontProgram(std::span<const uint32_t> front) {
@@ -388,14 +432,15 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 		auto& inst = result.instructions.emplace_back();
 		DecodeInstruction(front, front_words, inst);
 		front_words += inst.word_count;
-		if (inst.opcode == Opcode::S_SETPC_B64) {
+		if (IsFrontHandoff(inst)) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
+			EXIT_NOT_IMPLEMENTED(inst.opcode == Opcode::S_SWAPPC_B64 &&
+			                     inst.dst.kind != OperandKind::Null);
 			break;
 		}
 		EXIT_NOT_IMPLEMENTED(inst.opcode == Opcode::S_ENDPGM);
 	}
-	EXIT_IF(result.instructions.empty() ||
-	        result.instructions.back().opcode != Opcode::S_SETPC_B64);
+	EXIT_IF(result.instructions.empty() || !IsFrontHandoff(result.instructions.back()));
 	result.code = front.first(front_words);
 	return result;
 }
@@ -407,8 +452,26 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
+		if (GetInstructionFamily(code[word_index]) == Family::Unknown) {
+			std::string decoded;
+			for (const auto& done: program.instructions) {
+				decoded += "\n  " + InstructionToString(done);
+			}
+			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x, words=%u"
+			     "\ndecoded so far:%s\ncode:%s",
+			     word_index * static_cast<uint32_t>(sizeof(uint32_t)), code[word_index],
+			     static_cast<uint32_t>(code.size()), decoded.c_str(),
+			     CodeWindowToString(code, word_index).c_str());
+		}
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
+
+		// S_CODE_END pads the tail of every RDNA2 shader; the hardware never executes it and the
+		// bytes behind it are the binary's metadata, not instructions.
+		if (program.instructions.back().opcode == Opcode::S_CODE_END) {
+			program.instructions.pop_back();
+			return;
+		}
 
 		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
@@ -426,7 +489,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		}
 	}
 
-	EXIT("shader decode reached the code boundary before S_ENDPGM");
+	EXIT("shader decode reached the code boundary before S_ENDPGM or S_CODE_END");
 }
 
 std::string OperandToString(const Operand& operand) {
@@ -440,6 +503,7 @@ std::string OperandToString(const Operand& operand) {
 			text = fmt::format("{:f}", std::bit_cast<float>(operand.value));
 			break;
 		case OperandKind::Sgpr: text = fmt::format("s{}", operand.reg); break;
+		case OperandKind::Ttmp: text = fmt::format("ttmp{}", operand.reg); break;
 		case OperandKind::Vgpr: text = fmt::format("v{}", operand.reg); break;
 		case OperandKind::VccLo: text = "vcc_lo"; break;
 		case OperandKind::VccHi: text = "vcc_hi"; break;
@@ -525,6 +589,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SETPC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_SWAPPC_B64:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_swappc_b64 {}, {}", inst.pc,
+			                                               OperandToString(inst.dst).c_str(),
+			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_CODE_END:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_code_end", inst.pc));
 		case Opcode::S_SETREG_B32:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),
@@ -547,6 +617,10 @@ std::string InstructionToString(const Instruction& inst) {
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
 		case Opcode::S_ENDPGM:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_endpgm", inst.pc));
+		case Opcode::S_CBRANCH_CDBGSYS:
+			return WithUnsupportedReason(
+			    inst, fmt::format("0x{:08x}: s_cbranch_cdbgsys 0x{:08x}", inst.pc,
+			                      inst.branch_target));
 		case Opcode::S_BRANCH:
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
@@ -577,6 +651,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
 		case Opcode::IMAGE_GATHER4_C_LZ:

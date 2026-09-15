@@ -226,6 +226,13 @@ void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 				     inst.pc);
 			}
 			break;
+		case Decoder::OperandKind::Ttmp:
+			if (inst.dst.reg + 1u >= IR::NumTtmpRegs) {
+				EXIT("S_GETPC_B64 destination does not name a valid scalar pair at pc 0x%08x",
+				     inst.pc);
+			}
+			high.reg++;
+			break;
 		case Decoder::OperandKind::VccLo: high.kind = Decoder::OperandKind::VccHi; break;
 		case Decoder::OperandKind::M0: high.kind = Decoder::OperandKind::Null; break;
 		case Decoder::OperandKind::ExecLo: high.kind = Decoder::OperandKind::ExecHi; break;

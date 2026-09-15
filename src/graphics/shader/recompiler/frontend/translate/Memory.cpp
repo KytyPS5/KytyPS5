@@ -232,8 +232,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
 			case Decoder::Opcode::DS_MIN_F32:
-			case Decoder::Opcode::DS_MAX_F32:
-				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
+			case Decoder::Opcode::DS_MAX_F32: return index == 0u ? decoded.src1 : decoded.src0;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
 			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
@@ -245,6 +244,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
+			case Decoder::Opcode::DS_MSKOR_B32:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			default:
 				if (decoded.opcode >= Decoder::Opcode::DS_ADD_U32 &&
@@ -866,8 +866,18 @@ bool Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 }
 
 bool Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+	// ds_min_f32 and ds_max_f32 are single-data-operand atomics: the encoded data1 field is
+	// unused, so only the address and data0 are read.
 	const auto memory = MemoryInfoFromDecoded(inst);
 	ir.Emit(opcode,
+	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
+	        AddMemoryInfo(memory, inst.pc));
+	return true;
+}
+
+bool Translator::DS_MSKOR_B32(const Decoder::Instruction& inst) {
+	const auto memory = MemoryInfoFromDecoded(inst);
+	ir.Emit(IR::ValueOpcode::SharedAtomicMaskedOr32,
 	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
 	         ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
@@ -910,6 +920,13 @@ bool Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
 	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
 	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::BpermuteU32,
+	                               {ReadU32(inst.src1), address, ir.GetExec()}));
+	return true;
+}
+
+bool Translator::DS_PERMUTE_B32(const Decoder::Instruction& inst) {
+	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
+	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::PermuteU32,
 	                               {ReadU32(inst.src1), address, ir.GetExec()}));
 	return true;
 }
@@ -1032,6 +1049,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
+		case Decoder::Opcode::DS_MSKOR_B32: return DS_MSKOR_B32(inst);
 
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32,
@@ -1087,6 +1105,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMax32);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
 		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_BPERMUTE_B32(inst);
+		case Decoder::Opcode::DS_PERMUTE_B32: return DS_PERMUTE_B32(inst);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:

@@ -672,10 +672,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
 		case Opcode::DS_WRXCHG_RTN_B32:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
 		case Opcode::DS_BPERMUTE_B32:
+		case Opcode::DS_PERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:
 		case Opcode::DS_READ_I16:

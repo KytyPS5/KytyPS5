@@ -274,6 +274,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					break;
 				}
 				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::PermuteU32:
 				case IR::ValueOpcode::BpermuteU32: {
 					requirements.subgroup_ballot              = true;
 					requirements.subgroup_shuffle             = true;

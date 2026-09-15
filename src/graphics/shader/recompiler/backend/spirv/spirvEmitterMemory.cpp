@@ -27,6 +27,63 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
 }
 
+// ds_permute_b32 scatters, and SPIR-V only gathers: ballot each bit of the target lane index
+// and intersect, leaving the one source lane that selected this one.
+uint32_t EmitDsForwardPermute(EmitterState& state, uint32_t value, uint32_t address,
+                              uint32_t exec) {
+	const auto u32       = TypeU32(state);
+	const auto boolean   = TypeBool(state);
+	const auto ballot_ty = TypeU32Vector(state, 4);
+	const auto scope     = ConstantU32(state, spv::ScopeSubgroup);
+	const auto id        = EmitSubgroupLocalInvocationId(state);
+	const auto row       = Binary(state, spv::OpBitwiseAnd, u32, id, ConstantU32(state, ~31u));
+	const auto lane      = Binary(
+	    state, spv::OpBitwiseAnd, u32,
+	    Binary(state, spv::OpShiftRightLogical, u32, address, ConstantU32(state, 2)),
+	    ConstantU32(state, 31));
+	const auto target = Binary(state, spv::OpBitwiseOr, u32, row, lane);
+	const auto ballot = [&](uint32_t predicate) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_ty, result, scope, predicate);
+		return result;
+	};
+	const auto bit_of = [&](uint32_t word, uint32_t index) {
+		const auto bit =
+		    Binary(state, spv::OpBitwiseAnd, u32,
+		           Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, index)),
+		           ConstantU32(state, 1));
+		return Binary(state, spv::OpINotEqual, boolean, bit, ConstantU32(state, 0));
+	};
+	auto matches = ballot(exec);
+	// Bit 5 keeps a native 64-lane subgroup from matching sources aimed at the other half.
+	const auto bits = state.lane_count == 2 ? 5u : 6u;
+	for (uint32_t index = 0; index < bits; index++) {
+		const auto sources = ballot(bit_of(target, index));
+		const auto wanted  = Select(state, u32, bit_of(id, index), ConstantU32(state, 0xffffffffu),
+		                            ConstantU32(state, 0));
+		const auto spread  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, ballot_ty, spread, wanted, wanted,
+		                          wanted, wanted);
+		const auto same = Unary(state, spv::OpNot, ballot_ty,
+		                        Binary(state, spv::OpBitwiseXor, ballot_ty, sources, spread));
+		matches         = Binary(state, spv::OpBitwiseAnd, ballot_ty, matches, same);
+	}
+	const auto low = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, low, matches, 0);
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, u32, high, matches, 1);
+	const auto found = Binary(state, spv::OpINotEqual, boolean,
+	                          Binary(state, spv::OpBitwiseOr, u32, low, high), ConstantU32(state, 0));
+	// The ISA gives a destination selected by several sources to the highest-numbered one.
+	const auto msb = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallotFindMSB, u32, msb, scope, matches);
+	const auto source_lane = Select(state, u32, found, msb, ConstantU32(state, 0));
+	const auto shuffled    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, u32, shuffled, scope, value,
+	                          source_lane);
+	return Select(state, u32, found, shuffled, ConstantU32(state, 0));
+}
+
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                            uint32_t index, uint32_t offset, uint32_t soffset) {
 	auto&          state   = ctx.state;
@@ -1200,19 +1257,29 @@ void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    AtomicUpdate(
 			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
 			        mem.kind, [&](uint32_t old) {
-				        const auto old_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-				        const auto compare_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-				        const auto data_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-				        const auto compare = Binary(
-				            ctx.state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-				            TypeBool(ctx.state), max_value ? old_f : compare_f,
-				            max_value ? compare_f : old_f);
-				        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
+				        return EmitFloatAtomicReplacement(ctx.state, old, data, max_value);
 			        });
+		    });
+	});
+}
+
+void EmitSharedMaskedOr(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto& mem = ctx.Memory(inst);
+	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		EmitIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto mask  = ctx.Arg(inst, 1);
+			    const auto value = ctx.Arg(inst, 2);
+			    const auto keep  = Unary(ctx.state, spv::OpNot, TypeU32(ctx.state), mask);
+			    AtomicUpdate(ctx.state,
+			                 EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			                 mem.kind, [&](uint32_t old) {
+				                 return Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state),
+				                               Binary(ctx.state, spv::OpBitwiseAnd,
+				                                      TypeU32(ctx.state), old, keep),
+				                               value);
+			                 });
 		    });
 	});
 }
@@ -1388,6 +1455,10 @@ uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                           EmitSubgroupLocalInvocationId(state), ConstantU32(state, ~31u));
 	const auto target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
+}
+
+uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitDsForwardPermute(ctx.state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

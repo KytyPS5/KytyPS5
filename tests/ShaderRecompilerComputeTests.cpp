@@ -16588,6 +16588,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_XOR_B32:
   case Opcode::DS_XOR_RTN_B32:
   case Opcode::DS_WRXCHG_RTN_B32:
+  case Opcode::DS_MSKOR_B32:
   case Opcode::DS_SWIZZLE_B32:
   case Opcode::DS_BPERMUTE_B32:
   case Opcode::DS_READ_I8:
@@ -25290,38 +25291,93 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
+TestCase DsMskorB32ClearsMaskThenOrsValue() {
   using O = ShaderOpcode;
 
+  // MEM = (MEM & ~DATA0) | DATA1, with DATA1 not limited to the mask.
   std::vector<u32> code;
   AppendVMovU32(&code, 1, 0);
-  AppendVMovLiteral(&code, 2, 0x40800000u);
+  AppendVMovU32(&code, 2, 4);
+  AppendVMovLiteral(&code, 3, 0x11223344u);
   code.push_back(EncodeDs0(0x0d, 0));
-  code.push_back(EncodeDs1(0, 2, 1));
-  AppendVMovLiteral(&code, 3, 0x40800000u);
-  code.push_back(EncodeDs0(0x0d, 4));
   code.push_back(EncodeDs1(0, 3, 1));
-  AppendVMovLiteral(&code, 4, 0x41100000u);
-  AppendVMovLiteral(&code, 5, 0x40000000u);
-  code.push_back(EncodeDs0(0x12, 0));
-  code.push_back(EncodeDs1Ex(0, 5, 4, 1));
-  AppendVMovLiteral(&code, 6, 0x3f800000u);
-  AppendVMovLiteral(&code, 7, 0x40400000u);
-  code.push_back(EncodeDs0(0x13, 4));
-  code.push_back(EncodeDs1Ex(0, 7, 6, 1));
+  AppendVMovLiteral(&code, 4, 0xaabbccddu);
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 4, 2));
+  AppendVMovLiteral(&code, 5, 0x0000ff00u);
+  AppendVMovLiteral(&code, 6, 0x00005500u);
+  code.push_back(EncodeDs0(0x0c, 0));
+  code.push_back(EncodeDs1Ex(0, 6, 5, 1));
+  AppendVMovLiteral(&code, 7, 0xff000000u);
+  AppendVMovLiteral(&code, 8, 0x7f000002u);
+  code.push_back(EncodeDs0(0x0c, 0));
+  code.push_back(EncodeDs1Ex(0, 8, 7, 2));
   code.push_back(EncodeDs0(0x36, 0));
-  code.push_back(EncodeDs1(8, 0, 1));
-  code.push_back(EncodeDs0(0x36, 4));
   code.push_back(EncodeDs1(9, 0, 1));
-  AppendStoreVgpr(&code, 8, 0);
-  AppendStoreVgpr(&code, 9, 1);
+  code.push_back(EncodeDs0(0x36, 4));
+  code.push_back(EncodeDs1(10, 0, 1));
+  AppendStoreVgpr(&code, 9, 0);
+  AppendStoreVgpr(&code, 10, 1);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxUsesSeparateCompareOperand";
+  test.name = "DsMskorB32ClearsMaskThenOrsValue";
   test.code = code;
-  test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x41100000u, 0x3f800000u};
+  test.initial = std::vector<u32>(4, 0);
+  test.expected = {0x11225544u, 0x7fbbccdfu, 0, 0};
+  test.opcodes = {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_MSKOR_B32, O::DS_READ_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsFloatMinMaxIgnoresSecondDataOperand() {
+  using O = ShaderOpcode;
+
+  // ds_min_f32 and ds_max_f32 reduce the destination against data0 only. Every slot is seeded
+  // with 4.0f and then reduced with a data0/data1 pair chosen so that a compare against data1
+  // would give a different answer than the reduction against data0.
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x40800000u); // 4.0f
+  for (u32 slot = 0; slot < 4u; slot++) {
+    code.push_back(EncodeDs0(0x0d, slot * 4u));
+    code.push_back(EncodeDs1(0, 2, 1));
+  }
+  AppendVMovLiteral(&code, 3, 0x41100000u); // 9.0f
+  AppendVMovLiteral(&code, 4, 0x40000000u); // 2.0f
+  AppendVMovLiteral(&code, 5, 0x3f800000u); // 1.0f
+  AppendVMovLiteral(&code, 6, 0x40400000u); // 3.0f
+  AppendVMovLiteral(&code, 7, 0x40c00000u); // 6.0f
+  // min(4.0f, 9.0f) keeps 4.0f; a data1 compare against 2.0f would have stored 9.0f.
+  code.push_back(EncodeDs0(0x12, 0));
+  code.push_back(EncodeDs1Ex(0, 4, 3, 1));
+  // max(4.0f, 1.0f) keeps 4.0f; a data1 compare against 3.0f would have stored 1.0f.
+  code.push_back(EncodeDs0(0x13, 4));
+  code.push_back(EncodeDs1Ex(0, 6, 5, 1));
+  // min(4.0f, 2.0f) stores 2.0f even though data1 is above the destination.
+  code.push_back(EncodeDs0(0x12, 8));
+  code.push_back(EncodeDs1Ex(0, 3, 4, 1));
+  // max(4.0f, 6.0f) stores 6.0f even though data1 is below the destination.
+  code.push_back(EncodeDs0(0x13, 12));
+  code.push_back(EncodeDs1Ex(0, 5, 7, 1));
+  for (u32 slot = 0; slot < 4u; slot++) {
+    code.push_back(EncodeDs0(0x36, slot * 4u));
+    code.push_back(EncodeDs1(8u + slot, 0, 1));
+  }
+  for (u32 slot = 0; slot < 4u; slot++) {
+    AppendStoreVgpr(&code, 8u + slot, slot);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsFloatMinMaxIgnoresSecondDataOperand";
+  test.code = code;
+  test.initial = std::vector<u32>(4, 0);
+  test.expected = {0x40800000u, 0x40800000u, 0x40000000u, 0x40c00000u};
   test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -25438,6 +25494,134 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
+}
+
+// The RDNA 2 ISA DS_PERMUTE_B32 examples: SRC0 {A, B, C, D}, ADDR {0, 0, 12, 4}.
+TestCase DsPermuteIsaExamples() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 17, 30);
+  AppendVMovLiteral(&code, 1, 0xdeadbeefu);
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  // EXEC = 0xA: VDST := {-, D, -, 0}.
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeVop2(0x1b, 18, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(1), 18));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeDs0(0xb2, 0));
+  code.push_back(EncodeDs1(1, 3, 17));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 4);
+  // lane * 4 + 124 with offset 4 wraps back onto the source lane.
+  AppendVMovU32(&code, 17, 124);
+  code.push_back(EncodeVop2(0x25, 17, Vgpr(30), 17));
+  code.push_back(EncodeDs0(0xb2, 4));
+  code.push_back(EncodeDs1(2, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 8);
+  // EXEC = 0xF: VDST := {B, D, 0, C}; B, the higher source, beats A.
+  AppendBufferLoadDword(&code, 17, 30);
+  code.push_back(EncodeDs0(0xb2, 0));
+  code.push_back(EncodeDs1(5, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 12);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsPermuteIsaExamples";
+  test.code = code;
+  test.initial = {0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  test.expected = {0,   0,   12,  4,   0xdeadbeefu, 103, 0xdeadbeefu, 0,
+                   100, 101, 102, 103, 101,         103, 0,           102};
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::V_MOV_B32,
+                  O::V_ADD_NC_U32,  O::V_AND_B32,         O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,     O::DS_PERMUTE_B32,    O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"DS_PERMUTE_B32", 3}};
+  test.ir_counts = {{"PermuteU32", 3}};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsPermuteWave64UsesIndependentHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendVMovU32(&code, 17, 128);
+  code.push_back(EncodeVop2(0x25, 17, Vgpr(30), 17));
+  code.push_back(EncodeDs0(0xb2, 0));
+  code.push_back(EncodeDs1(1, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsPermuteWave64UsesIndependentHalves";
+  test.code = code;
+  test.initial = std::vector<u32>(64, 0);
+  for (u32 lane = 0; lane < 64u; lane++) {
+    test.expected.push_back(100u + lane);
+  }
+  test.opcodes = {O::V_MOV_B32,      O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+                  O::DS_PERMUTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A native 64-lane subgroup may be unavailable, so count emitted ballots.
+void CheckDsPermuteBallotWidth() {
+  const auto single = DsPermuteWave64UsesIndependentHalves();
+  auto chained = single;
+  const auto permute = std::ranges::find(chained.code, EncodeDs1(1, 3, 17));
+  Require(single.name, "fixture", permute != chained.code.end(),
+          "ds_permute_b32 source word not found");
+  const u32 again[] = {EncodeDs0(0xb2, 0), EncodeDs1(1, 1, 17)};
+  chained.code.insert(permute + 1, std::begin(again), std::end(again));
+  const auto count = [](const TestCase &test, u32 host_subgroup_size,
+                        const char *needle) {
+    const auto compiled = CompileCase(test, host_subgroup_size);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(test.name, "SPIR-V disassembly",
+            tools.Disassemble(compiled.spirv, &text),
+            "failed to disassemble emitted SPIR-V");
+    return CountText(text, needle);
+  };
+  const auto check = [&](u32 host_subgroup_size, size_t ballots, size_t msbs) {
+    const auto ballot_delta =
+        count(chained, host_subgroup_size, "OpGroupNonUniformBallot ") -
+        count(single, host_subgroup_size, "OpGroupNonUniformBallot ");
+    const auto msb_delta =
+        count(chained, host_subgroup_size, "OpGroupNonUniformBallotFindMSB ") -
+        count(single, host_subgroup_size, "OpGroupNonUniformBallotFindMSB ");
+    const auto lsb_delta =
+        count(chained, host_subgroup_size, "OpGroupNonUniformBallotFindLSB ") -
+        count(single, host_subgroup_size, "OpGroupNonUniformBallotFindLSB ");
+    Require(single.name, "ds_permute ballot width",
+            ballot_delta == ballots && msb_delta == msbs && lsb_delta == 0u,
+            "host_subgroup_size=" + std::to_string(host_subgroup_size) +
+                " ballots=" + std::to_string(ballot_delta) +
+                " find_msb=" + std::to_string(msb_delta) +
+                " find_lsb=" + std::to_string(lsb_delta));
+  };
+  // A native 64-lane subgroup ballots EXEC and all six target lane bits.
+  check(64u, 7u, 1u);
+  // Each split half ballots EXEC and five target lane bits.
+  check(32u, 12u, 2u);
+  std::printf("[compute] %-32s ok\n", "DsPermuteBallotWidth");
 }
 
 TestCase Wave64CrossHalfLaneAndLds() {
@@ -28417,10 +28601,13 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
+  AddCase(DsFloatMinMaxIgnoresSecondDataOperand);
+  AddCase(DsMskorB32ClearsMaskThenOrsValue);
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
+  AddCase(DsPermuteIsaExamples);
+  AddCase(DsPermuteWave64UsesIndependentHalves);
   AddCase(Wave64CrossHalfLaneAndLds);
   AddCase(Wave64RawMasksAndScalarBranch);
   AddCase(Wave64PartialMultidimensionalWorkgroup);
@@ -33639,6 +33826,7 @@ int main(int argc, char **argv) {
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
   CheckRectListShaders();
+  CheckDsPermuteBallotWidth();
   CheckIndirectImageKeySwitch();
   CheckGlcBufferAccessIsCoherent();
   CheckPs5GameExampleImageClearRuntimeShape();

@@ -4097,6 +4097,72 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
 #endif
 }
 
+void TestCodeEndTerminatesDecode() {
+  using namespace ShaderRecompiler::Decoder;
+
+  // Real shader binaries pad the instruction stream with S_CODE_END and then store metadata in
+  // the remaining bytes the header counts as shader size. Decoding must stop at the marker.
+  const uint32_t shader[] = {
+      EncodeSop1(0x03, 0, 129), // s_mov_b32 s0, 1
+      EncodeSopp(0x1f, 0),      // s_code_end
+      EncodeSopp(0x1f, 0),      // s_code_end
+      0x30306c73u,              // "sl00" metadata magic
+      0x000000cdu,
+      0x00000000u,
+  };
+
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions.size() == 1u &&
+            program.instructions.front().opcode == Opcode::S_MOV_B32,
+        "decoder did not stop at S_CODE_END");
+
+  const uint32_t swappc_code[] = {EncodeSop1(0x21, 125, 6)}; // s_swappc_b64 null, s[6:7]
+  Instruction swappc;
+  DecodeInstruction(swappc_code, 0u, swappc);
+  Check(swappc.opcode == Opcode::S_SWAPPC_B64 &&
+            swappc.dst.kind == OperandKind::Null &&
+            swappc.src0.kind == OperandKind::Sgpr && swappc.src0.reg == 6u,
+        "decoder did not decode S_SWAPPC_B64");
+}
+
+void TestTrapTemporaryOperands() {
+  using namespace ShaderRecompiler::Decoder;
+
+  const uint32_t read_code[] = {EncodeSop1(0x03, 0, 115)}; // s_mov_b32 s0, ttmp7
+  Instruction read_ttmp;
+  DecodeInstruction(read_code, 0u, read_ttmp);
+  Check(read_ttmp.opcode == Opcode::S_MOV_B32 &&
+            read_ttmp.src0.kind == OperandKind::Ttmp &&
+            read_ttmp.src0.reg == 7u,
+        "decoder did not decode TTMP7 as a scalar source");
+
+  const uint32_t write_code[] = {EncodeSop1(0x03, 115, 0)}; // s_mov_b32 ttmp7, s0
+  Instruction write_ttmp;
+  DecodeInstruction(write_code, 0u, write_ttmp);
+  Check(write_ttmp.dst.kind == OperandKind::Ttmp && write_ttmp.dst.reg == 7u,
+        "decoder did not decode TTMP7 as a scalar destination");
+
+  const uint32_t shader[] = {
+      EncodeSop1(0x03, 115, 129),     // s_mov_b32 ttmp7, 1
+      EncodeSop2(0x00, 0, 115, 115),  // s_add_u32 s0, ttmp7, ttmp7
+      EncodeVop1(0x01, 0, 114),       // v_mov_b32 v0, ttmp6
+      EncodeSopp(0x01, 0),            // s_endpgm
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "S_MOV_B32 ttmp7, 1"),
+        "decoder did not disassemble a TTMP destination");
+  Check(Common::ContainsStr(result.decoded_dump, "S_ADD_U32 s0, ttmp7, ttmp7"),
+        "decoder did not disassemble TTMP sources");
+  Check(Common::ContainsStr(result.decoded_dump, "V_MOV_B32 v0, ttmp6"),
+        "decoder did not disassemble a TTMP source in the vector namespace");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderDecoderArchitecture() {
   using namespace ShaderRecompiler::Decoder;
 
@@ -13410,6 +13476,8 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
+  TestTrapTemporaryOperands();
+  TestCodeEndTerminatesDecode();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();

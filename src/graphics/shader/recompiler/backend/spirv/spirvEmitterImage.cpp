@@ -428,6 +428,98 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	return result;
 }
 
+// OpImageGather takes no Lod operand outside SPV_AMD_texture_gather_bias_lod, so an explicit-LOD
+// gather is built from the four samples it is defined to return. Sampling rather than fetching
+// keeps the sampler's address modes applied at the edges, and placing each coordinate on a texel
+// centre of the requested level makes every sample land on exactly one texel.
+uint32_t EmitTwoDimensionalGatherLod(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                     uint32_t coord, uint32_t lod,
+                                     Prospero::TextureNumericClass numeric_class) {
+	constexpr uint32_t F32_HALF = 0x3f000000u;
+	auto&              state    = ctx.state;
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+
+	const auto image = LoadSampledImageDescriptor(state, mem.resource);
+	// One level serves the size query and every sample: a gather reads a single level, so a
+	// fractional LOD is floored rather than allowed to select or blend two.
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450Floor, lod);
+	const auto at_least_zero = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), at_least_zero, GlslStd450(state),
+	                          GLSLstd450FMax, floored, ZeroF32(state));
+	// Sampling clamps a LOD past the top level while OpImageQuerySizeLod is undefined there, so
+	// the level is bounded by the image before either sees it.
+	const auto level_count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), level_count, image);
+	const auto last_level = Unary(
+	    state, spv::OpConvertUToF, TypeF32(state),
+	    Binary(state, spv::OpISub, TypeU32(state), level_count, ConstantU32(state, 1)));
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), level, GlslStd450(state),
+	                          GLSLstd450FMin, at_least_zero, last_level);
+	const auto lod_int = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), lod_int, level);
+	const auto size = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 2), size, image,
+	                          lod_int);
+
+	uint32_t extent[2] {};
+	uint32_t base[2] {};
+	for (uint32_t axis = 0; axis < 2u; axis++) {
+		const auto axis_size = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), axis_size, size, axis);
+		extent[axis] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), extent[axis], axis_size);
+		const auto axis_coord = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), axis_coord, coord, axis);
+		base[axis] = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpExtInst, TypeF32(state), base[axis], GlslStd450(state), GLSLstd450Floor,
+		    Binary(state, spv::OpFSub, TypeF32(state),
+		           Binary(state, spv::OpFMul, TypeF32(state), axis_coord, extent[axis]),
+		           ConstantF32(state, F32_HALF)));
+	}
+
+	const auto sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
+	const auto vector_type = ImageVectorType(state, numeric_class, 4);
+	const auto scalar_type = ImageScalarType(state, numeric_class);
+	const auto component =
+	    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
+	        ? ImageGatherComponent(mem.dmask)
+	        : 0u;
+
+	// The order a gather returns its texels in: (0,1), (1,1), (1,0), (0,0).
+	constexpr uint32_t OFFSETS[4][2] = {{0u, 1u}, {1u, 1u}, {1u, 0u}, {0u, 0u}};
+	uint32_t           values[4] {};
+	for (uint32_t texel_index = 0; texel_index < 4u; texel_index++) {
+		uint32_t axis_coord[2] {};
+		for (uint32_t axis = 0; axis < 2u; axis++) {
+			// base + offset + 0.5 lands on the texel centre; dividing returns it to normalised
+			// space, which is what OpImageSampleExplicitLod expects.
+			const auto offset = std::bit_cast<uint32_t>(
+			    static_cast<float>(OFFSETS[texel_index][axis]) + 0.5f);
+			axis_coord[axis] = Binary(state, spv::OpFDiv, TypeF32(state),
+			                          Binary(state, spv::OpFAdd, TypeF32(state), base[axis],
+			                                 ConstantF32(state, offset)),
+			                          extent[axis]);
+		}
+		const auto sample_coord = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), sample_coord,
+		                          axis_coord[0], axis_coord[1]);
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageSampleExplicitLod, vector_type, texel, sampled,
+		                          sample_coord, spv::ImageOperandsLodMask, level);
+		values[texel_index] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, values[texel_index], texel,
+		                          component);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, values[0], values[1],
+	                          values[2], values[3]);
+	return result;
+}
+
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                     uint32_t coord, Prospero::TextureNumericClass numeric_class) {
 	auto& state = ctx.state;
@@ -547,6 +639,13 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::ImageAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
+		case IR::ValueOpcode::ImageAtomicSwap64: return spv::OpAtomicExchange;
+		case IR::ValueOpcode::ImageAtomicIAdd64: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicUMin64: return spv::OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicUMax64: return spv::OpAtomicUMax;
+		case IR::ValueOpcode::ImageAtomicAnd64: return spv::OpAtomicAnd;
+		case IR::ValueOpcode::ImageAtomicOr64: return spv::OpAtomicOr;
+		case IR::ValueOpcode::ImageAtomicXor64: return spv::OpAtomicXor;
 		default: return spv::OpNop;
 	}
 }
@@ -660,6 +759,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			if (dimension == ImageDimension::Dim1DArray) {
 				ctx.Fail(inst, "has an unsupported 1D-array gather");
+				return;
+			}
+			if (HasFlag(mem, Decoder::ImageSampleFlagLod)) {
+				if (dimension != ImageDimension::Dim2D || dref ||
+				    layout.lod == NoImageComponent ||
+				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					ctx.Fail(inst, "has an unsupported explicit-LOD gather variant");
+					return;
+				}
+				const auto sample = EmitTwoDimensionalGatherLod(
+				    ctx, mem, coord, AddressF32(ctx, mem, *address, layout.lod), numeric_class);
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+				                              numeric_class, false, mem, true));
 				return;
 			}
 			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
@@ -865,21 +978,38 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != spv::OpNop) {
 		const auto dimension = image.dimension;
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+		// The texel is a genuine 64-bit scalar, while the IR carries the value as a pair of u32.
+		// Both are 64 bits wide, so a bitcast moves between them in each direction, with the
+		// pair's first component staying the low half.
+		const bool wide       = image.atomic64;
+		const auto value_type = wide ? TypeScalarU64(state) : TypeU32(state);
+		// The inactive-lane default has to match the value's own type, which for a 64-bit atomic
+		// is the IR's pair-of-u32 rather than a plain u32.
+		const auto result_type = wide ? TypeU64(state) : TypeU32(state);
+		const auto zero_result =
+		    wide ? state.builder.Constant(spv::OpConstantComposite, TypeU64(state),
+		                                 std::vector<uint32_t> {ConstantU32(state, 0),
+		                                                        ConstantU32(state, 0)})
+		         : ConstantU32(state, 0);
+		ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 3), result_type,
+		                                              zero_result, [&]() {
 			           const auto pointer      = state.builder.AllocateId();
 			           const auto pointer_type = state.builder.Type(
-			               spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
+			               spv::OpTypePointer, spv::StorageClassImage, value_type);
 			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
 			                                     StorageImageDescriptorPointer(state, mem.resource),
 			                                     CoordU32(ctx, mem, *address, dimension),
 			                                     ConstantU32(state, 0));
+			           const auto value =
+			               wide ? Unary(state, spv::OpBitcast, value_type, ctx.Arg(inst, 2))
+			                    : ctx.Arg(inst, 2);
 			           const auto old = state.builder.AllocateId();
-			           state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
+			           state.builder.AddFunction(atomic_opcode, value_type, old, pointer,
 			                                     ConstantU32(state, spv::ScopeDevice),
 			                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                                     ctx.Arg(inst, 2));
+			                                     value);
 			           EmitDeviceAtomicMemoryBarrier(state);
-			           return old;
+			           return wide ? Unary(state, spv::OpBitcast, TypeU64(state), old) : old;
 		           }));
 		return;
 	}

@@ -46,6 +46,16 @@ public:
 
 	[[nodiscard]] const std::string& GetName() const { return m_name; }
 
+	// Debug instrumentation.
+	std::atomic_uint64_t m_signal_count {0};
+	std::atomic_uint64_t m_attempt_count {0};
+	[[nodiscard]] int DebugCount() {
+		Common::LockGuard lock(m_mutex);
+		return m_count;
+	}
+	[[nodiscard]] int DebugMaxCount() const { return m_max_count; }
+	std::atomic_uint64_t m_wait_count {0};
+
 private:
 	enum class Status { Set, Deleted };
 
@@ -142,6 +152,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	}
 
 	m_count += signal_count;
+	m_signal_count.fetch_add(1, std::memory_order_relaxed);
 
 	WakeWaiters();
 
@@ -286,10 +297,34 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 	return OK;
 }
 
+static thread_local KernelSema g_debug_last_waited_sema = nullptr;
+
+const char* DebugLastWaitedSemaName() {
+	return g_debug_last_waited_sema != nullptr ? g_debug_last_waited_sema->GetName().c_str()
+	                                          : "<none>";
+}
+
+uint64_t DebugLastWaitedSemaSignals() {
+	return g_debug_last_waited_sema != nullptr
+	           ? g_debug_last_waited_sema->m_signal_count.load(std::memory_order_relaxed)
+	           : 0;
+}
+
+uint64_t DebugLastWaitedSemaWaits() {
+	return g_debug_last_waited_sema != nullptr
+	           ? g_debug_last_waited_sema->m_wait_count.load(std::memory_order_relaxed)
+	           : 0;
+}
+
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	Common::DebugWaitScope _dbg_wait(Common::DebugWaitKind::Sema);
+
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+
+	g_debug_last_waited_sema = sem;
+	sem->m_wait_count.fetch_add(1, std::memory_order_relaxed);
 
 	auto result = sem->Wait(need, time);
 
@@ -333,7 +368,33 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	// Debug: who drives the Wwise pump, and are any signals being rejected?
+	if (sem->GetName() == "AkSemaphore") {
+		const auto attempts = sem->m_attempt_count.fetch_add(1, std::memory_order_relaxed);
+		const auto n        = sem->m_signal_count.load(std::memory_order_relaxed);
+		if ((attempts % 20) == 0) {
+			LOGF("SignalSema: AkSemaphore attempts=%" PRIu64 " accepted=%" PRIu64 " count=%d max=%d caller=\"%s\" tid=%d\n",
+			     attempts, n, sem->DebugCount(), sem->DebugMaxCount(),
+			     Libs::LibKernel::PthreadGetCurrentNameForKernel(),
+			     Common::Thread::GetThreadIdUnique());
+		}
+		if ((n % 20) == 0) {
+			LOGF("SignalSema: AkSemaphore #%" PRIu64 " by thread %d waits_us sleep=%" PRIu64
+			     " condwait=%" PRIu64 " condtimed=%" PRIu64 " mutex=%" PRIu64 " sema=%" PRIu64
+			     " eventflag=%" PRIu64 " equeue=%" PRIu64 "\n",
+			     n, Common::Thread::GetThreadIdUnique(),
+			     Common::DebugWaitGet(Common::DebugWaitKind::Sleep),
+			     Common::DebugWaitGet(Common::DebugWaitKind::CondWait),
+			     Common::DebugWaitGet(Common::DebugWaitKind::CondTimedwait),
+			     Common::DebugWaitGet(Common::DebugWaitKind::MutexLock),
+			     Common::DebugWaitGet(Common::DebugWaitKind::Sema),
+			     Common::DebugWaitGet(Common::DebugWaitKind::EventFlag),
+			     Common::DebugWaitGet(Common::DebugWaitKind::Equeue));
+		}
+	}
+
 	auto result = sem->Signal(count);
+
 
 	int ret = OK;
 

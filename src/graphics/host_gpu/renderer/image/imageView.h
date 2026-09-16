@@ -11,6 +11,10 @@ namespace Libs::Graphics {
 namespace ImageViewOps {
 
 [[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
+
+// True for the formats a stencil plane can be read through. A stencil association only redirects
+// a view shaped like this; any other format names a different surface sharing the address.
+[[nodiscard]] bool IsStencilViewFormat(vk::Format format);
 [[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
 
 [[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {

@@ -558,8 +558,32 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	// RDNA selects a 64-bit image atomic through DMASK; without this feature such a shader cannot
+	// be translated at all, so the guest's 64-bit visibility-buffer passes depend on it.
+	const bool image_atomic_int64_extension =
+	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT supported_image_atomic_int64 {};
+	if (image_atomic_int64_extension) {
+		supported_image_atomic_int64.pNext = supported_features2.pNext;
+		supported_features2.pNext          = &supported_image_atomic_int64;
+	}
+	// Viewing a block-compressed array through an uncompressed format is limited to a single layer
+	// unless maintenance6 says otherwise, and guests do view whole BC arrays that way.
+	const bool maintenance6_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance6FeaturesKHR supported_maintenance6 {};
+	if (maintenance6_extension) {
+		supported_maintenance6.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &supported_maintenance6;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	graphics.image_atomic_int64_enabled =
+	    image_atomic_int64_extension && supported_image_atomic_int64.shaderImageInt64Atomics == VK_TRUE;
+	LOGF("Vulkan 64-bit image atomics: %s\n",
+	     graphics.image_atomic_int64_enabled ? "Yes" : "No");
+
+	graphics.maintenance6_enabled = maintenance6_extension && supported_maintenance6.maintenance6;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -572,7 +596,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	vk::PhysicalDeviceMaintenance6PropertiesKHR maintenance6_properties {};
+	if (graphics.maintenance6_enabled) {
+		maintenance6_properties.pNext = properties2.pNext;
+		properties2.pNext             = &maintenance6_properties;
+	}
 	physical_device.getProperties2(&properties2);
+	graphics.block_texel_view_multiple_layers =
+	    graphics.maintenance6_enabled &&
+	    maintenance6_properties.blockTexelViewCompatibleMultipleLayers == VK_TRUE;
+	LOGF("Vulkan block texel view multiple layers: %s\n",
+	     graphics.block_texel_view_multiple_layers ? "Yes" : "No");
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -672,6 +706,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
+	if (graphics.image_atomic_int64_enabled) {
+		image_atomic_int64.pNext                  = const_cast<void*>(create_info.pNext);
+		image_atomic_int64.shaderImageInt64Atomics = VK_TRUE;
+		create_info.pNext                          = &image_atomic_int64;
+	}
+	vk::PhysicalDeviceMaintenance6FeaturesKHR maintenance6 {};
+	if (graphics.maintenance6_enabled) {
+		maintenance6.pNext        = const_cast<void*>(create_info.pNext);
+		maintenance6.maintenance6 = VK_TRUE;
+		create_info.pNext         = &maintenance6;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1048,7 +1094,9 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+		                             VK_KHR_MAINTENANCE_6_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

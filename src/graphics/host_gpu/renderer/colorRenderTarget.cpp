@@ -311,6 +311,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.kind                     = ImageMetadataKind::Dcc;
 		desc.info.metadata.range                    = {rt.dcc_addr.addr, metadata_size.size};
 		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.dcc_clear_word_hi        = rt.clear_word1.word1;
 		desc.info.metadata.dcc_clear_register_valid = true;
 		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
 	}

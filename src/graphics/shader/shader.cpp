@@ -22,6 +22,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -89,6 +90,35 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
+}
+
+static bool ShaderTryGetMappedData(uint64_t addr, ShaderMappedData& data) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+
+	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		data = iter->second;
+		return true;
+	}
+
+	return false;
+}
+
+// A merged shader hands control to its back half with a tail call through s[6:7]. The handoff is
+// the last instruction of the code, which S_CODE_END separates from the binary's metadata.
+static bool ShaderEndsWithHandoff(std::span<const uint32_t> code) {
+	constexpr uint32_t CodeEnd = 0xbf9f0000u;
+	const auto         end     = std::find(code.begin(), code.end(), CodeEnd);
+	if (end == code.begin() || end == code.end()) {
+		return false;
+	}
+	const uint32_t word = *(end - 1);
+	if (((word >> 23u) & 0x1ffu) != 0x17du) { // SOP1
+		return false;
+	}
+	const uint32_t opcode = (word >> 8u) & 0xffu;
+	return (opcode == 0x20u || opcode == 0x21u) && (word & 0xffu) == 6u;
 }
 
 static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
@@ -893,9 +923,34 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
                             ShaderComputeInputInfo& info) {
 	const auto data = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
-	return GetShaderParams(
-	    regs.cs_regs.data_addr, "ShaderRecompiler CS", GetDeclaredShaderHash(regs.cs_regs.data_addr),
-	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
+	const std::span<const uint32_t> user_data(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr);
+	auto                            params = GetShaderParams(
+        regs.cs_regs.data_addr, "ShaderRecompiler CS", GetDeclaredShaderHash(regs.cs_regs.data_addr),
+        user_data, data);
+	if (!ShaderEndsWithHandoff(params.code)) {
+		return params;
+	}
+	// The dispatch passes the back half's address in the user data that preloads s[6:7].
+	if (user_data.size() < 8) {
+		EXIT("ShaderRecompiler CS shader=0x%016" PRIx64
+		     " tail-calls s[6:7] but the dispatch preloads only %" PRIu64 " user SGPRs\n",
+		     regs.cs_regs.data_addr, static_cast<uint64_t>(user_data.size()));
+	}
+	const auto back_addr =
+	    static_cast<uint64_t>(user_data[6]) | (static_cast<uint64_t>(user_data[7]) << 32u);
+	ShaderMappedData back {};
+	if (!ShaderTryGetMappedData(back_addr, back)) {
+		EXIT("ShaderRecompiler CS shader=0x%016" PRIx64
+		     " tail-calls 0x%016" PRIx64 ", which is not a registered shader\n",
+		     regs.cs_regs.data_addr, back_addr);
+	}
+	const auto back_params = GetShaderParams(back_addr, "ShaderRecompiler CS back",
+	                                         GetDeclaredShaderHash(back_addr), {}, back);
+	params.back_code       = back_params.code;
+	const uint64_t hashes[] = {params.hash, back_params.hash};
+	params.hash             = XXH3_64bits(hashes, sizeof(hashes));
+	info.scratch_size_dwords = std::max(info.scratch_size_dwords, back.scratch_size_dwords);
+	return params;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

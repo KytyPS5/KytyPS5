@@ -14,6 +14,10 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -388,15 +392,23 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
+	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Srgb, vk::ColorSpaceKHR::eSrgbNonlinear};
+	if (surface.formats.size() == 1 && surface.formats.front().format == vk::Format::eUndefined) {
+		format.colorSpace = surface.formats.front().colorSpace;
+	} else {
+		// Present through an sRGB swapchain. A 10-bit or float scanout holds linear values, which
+		// the blit then encodes; an sRGB guest surface decodes on read and re-encodes on write,
+		// which is a net identity. Presenting linear values raw into a UNORM surface made the
+		// picture far too dark.
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
+			                             return candidate.colorSpace ==
+			                                        vk::ColorSpaceKHR::eSrgbNonlinear &&
+			                                    (candidate.format == vk::Format::eB8G8R8A8Unorm ||
+			                                     candidate.format == vk::Format::eR8G8B8A8Unorm);
 		                             });
 		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
+			EXIT("no supported sRGB swapchain format\n");
 		}
 		format = *it;
 	}
@@ -713,15 +725,55 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
-	auto frame_format = info.pixel_format;
-	switch (frame_format) {
-		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
-		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
-		default: break;
-	}
+	// The prepared frame keeps the guest surface's own format, transfer function included, so the
+	// present blit converts exactly once.
+	const auto frame_format = info.pixel_format;
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
-	frame->CopyFrom(buffer, image);
+	// Debug: the file named by KYTY_DEBUG_RT_FILE holds an index; present that guest render
+	// target instead of the scan-out surface. Substituted after ResolveSurface so the scan-out
+	// description still validates normally.
+	Image* copy_source = &image;
+	if (const char* sel_path = std::getenv("KYTY_DEBUG_RT_FILE"); sel_path != nullptr) {
+		static std::atomic_uint64_t frame_counter {0};
+		static std::atomic_int      selected {-1};
+		if ((frame_counter.fetch_add(1, std::memory_order_relaxed) % 15) == 0) {
+			if (FILE* f = std::fopen(sel_path, "r"); f != nullptr) {
+				int value = -1;
+				if (std::fscanf(f, "%d", &value) == 1) {
+					selected.store(value, std::memory_order_relaxed);
+				}
+				(void)std::fclose(f);
+			}
+		}
+		if (const auto index = selected.load(std::memory_order_relaxed); index >= 0) {
+			uint32_t id_index      = 0;
+			uint32_t id_generation = 0;
+			if (DebugGetRenderTargetId(static_cast<size_t>(index), &id_index, &id_generation)) {
+				auto& cache = m_impl->renderer.GetTextureCache();
+				auto* picked_image = cache.DebugTryGetImage(id_index, id_generation);
+				static std::atomic_uint64_t dbg_sub {0};
+				if ((dbg_sub.fetch_add(1, std::memory_order_relaxed) % 60) == 0) {
+					LOGF("PRESENT DEBUG: index=%d id=%u alive=%d\n", index, id_index,
+					     picked_image != nullptr ? 1 : 0);
+				}
+				if (picked_image != nullptr &&
+				    picked_image->backing.format != vk::Format::eUndefined) {
+					copy_source = picked_image;
+				}
+			}
+		}
+	}
+	{
+		static std::atomic_uint64_t dbg_present {0};
+		if ((dbg_present.fetch_add(1, std::memory_order_relaxed) % 120) == 0) {
+			LOGF("PRESENTED: addr=0x%016" PRIx64 " %ux%u fmt=%u\n", copy_source->info.data.address,
+			     copy_source->info.extent.width, copy_source->info.extent.height,
+			     static_cast<uint32_t>(copy_source->backing.format));
+		}
+	}
+	frame->CopyFrom(buffer, *copy_source);
+
 	return *frame;
 }
 

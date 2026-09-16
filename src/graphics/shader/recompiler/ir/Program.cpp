@@ -112,6 +112,10 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
+	// Planning expressions can refer to block values but outlive block storage in the base class.
+	for (auto& inst: value_storage) {
+		inst.Invalidate();
+	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
 	for (auto* block: blocks) {
@@ -182,6 +186,22 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 		}
 	}
 	return invariant;
+}
+
+bool HasShaderMemoryWrites(const Program& program) {
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+			    image == ImageAccess::Write || image == ImageAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

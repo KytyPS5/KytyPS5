@@ -4206,8 +4206,8 @@ void TestBvhIntersections() {
       case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
       case ValueOpcode::IAdd64: result = a + b; break;
       case ValueOpcode::ISub64: result = a - b; break;
-      case ValueOpcode::ShiftLeftLogical32: result = static_cast<uint32_t>(a << b); break;
-      case ValueOpcode::ShiftRightLogical32: result = static_cast<uint32_t>(a) >> b; break;
+      case ValueOpcode::ShiftLeftLogical32: result = static_cast<uint32_t>(a) << (b & 31); break;
+      case ValueOpcode::ShiftRightLogical32: result = static_cast<uint32_t>(a) >> (b & 31); break;
       case ValueOpcode::ShiftLeftLogical64: result = a << b; break;
       case ValueOpcode::ShiftRightLogical64: result = a >> b; break;
       case ValueOpcode::BitwiseAnd32:
@@ -9125,6 +9125,54 @@ void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation() {
+  // PS d6fb5f22c689ceff: an outer EXEC skip and an inner SCC exit share the
+  // continuing arm, which contains another loop and reaches a different return.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 7), // outer -> shared loop or preceding work
+      EncodeSMovB32(2, 129),
+      EncodeSopc(0x06, 2, 128), // preceding work loop
+      EncodeSopp(0x04, 2),      // loop -> early-return condition or body
+      EncodeSop2(0x01, 2, 2, 129),
+      EncodeSopp(0x02, -4),
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 5),      // inner -> private return or shared loop
+      EncodeSopc(0x06, 3, 128), // shared loop header
+      EncodeSopp(0x04, 2),      // loop -> normal return or body
+      EncodeSop2(0x01, 3, 3, 129),
+      EncodeSopp(0x02, -4),  // body -> loop header
+      0xbf810000u,           // normal return
+      EncodeSMovB32(4, 130), // private return epilogue
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+                original_coverage &&
+            graph.natural_loops.size() == 2u,
+        "shared-continuation gateway changed semantic blocks or the loops");
+  Check(std::ranges::none_of(graph.blocks,
+                             [](const auto &block) {
+                               return block.terminator.goto_variable !=
+                                      UINT32_MAX;
+                             }),
+        "private early return introduced unnecessary routing state");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "early return with a shared loop continuation selected the dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // outer early-exit condition
@@ -13858,6 +13906,7 @@ int main() {
   TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
+  TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph();

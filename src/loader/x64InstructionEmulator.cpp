@@ -546,7 +546,11 @@ static bool TryEmulateSse4a(Context& context) {
 	if ((rip[offset] & 0xf0u) == 0x40u) {
 		rex = rip[offset++];
 	}
-	if (rip[offset] != 0x0f || rip[offset + 1] != 0x78) {
+	if (rip[offset] != 0x0f) {
+		return false;
+	}
+	const bool register_extract = prefix == 0x66 && rip[offset + 1] == 0x79;
+	if (rip[offset + 1] != 0x78 && !register_extract) {
 		return false;
 	}
 
@@ -555,14 +559,12 @@ static bool TryEmulateSse4a(Context& context) {
 		return false;
 	}
 
-	const uint8_t reg    = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm     = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
-	const uint8_t length = rip[offset + 3];
-	const uint8_t index  = rip[offset + 4];
+	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
 
-	// AMD SSE4a immediate-form EXTRQ/INSERTQ.
+	// Immediate EXTRQ encodes its destination in r/m; the two-register form uses reg.
 	uint8_t dest_index = reg;
-	if (prefix == 0x66) {
+	if (prefix == 0x66 && !register_extract) {
 		dest_index = rm;
 	}
 	auto* dest_xmm = context.Xmm(dest_index);
@@ -574,6 +576,17 @@ static bool TryEmulateSse4a(Context& context) {
 	uint64_t source = 0;
 	std::memcpy(dest, dest_xmm, sizeof(dest));
 	std::memcpy(&source, src_xmm, sizeof(source));
+	uint8_t length             = 0;
+	uint8_t index              = 0;
+	size_t  instruction_length = offset + 3;
+	if (register_extract) {
+		length = static_cast<uint8_t>(source);
+		index  = static_cast<uint8_t>(source >> 8u);
+	} else {
+		length = rip[offset + 3];
+		index  = rip[offset + 4];
+		instruction_length += 2;
+	}
 	if (prefix == 0x66) {
 		dest[0] = ExtractBitField(dest[0], length, index);
 		dest[1] = 0;
@@ -581,7 +594,7 @@ static bool TryEmulateSse4a(Context& context) {
 		dest[0] = InsertBitField(dest[0], source, length, index);
 	}
 	std::memcpy(dest_xmm, dest, sizeof(dest));
-	context.Advance(offset + 5);
+	context.Advance(instruction_length);
 	return true;
 }
 

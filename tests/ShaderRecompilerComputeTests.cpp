@@ -379,6 +379,11 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
+                       const DrawAutoArgs &args) {
+    executor.DrawAuto(0, command, args);
+  }
+
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -4476,6 +4481,17 @@ public:
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
+
+    // An empty dispatch must not inspect even an unreadable shader address.
+    shaders.SetCsShader({.data_addr = 1});
+    constexpr std::array<std::array<uint32_t, 3>, 3> empty_dispatches{{
+        {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+    for (const auto mode : {0x41u, 0x61u}) {
+      for (const auto &groups : empty_dispatches) {
+        context.GetRenderExecutor().DispatchDirect(
+            0, scheduler.Current(), groups[0], groups[1], groups[2], mode);
+      }
+    }
     Require(name, "HTile fixture",
             texture_cache.IsMeta(read_only_meta) &&
                 texture_cache.IsMeta(read_write_meta) &&
@@ -8583,7 +8599,8 @@ public:
 
   std::vector<u32> ReadCachedTexel(const char *name, RenderContext &context,
                                  ImageId id, vk::Offset3D offset = {},
-                                 vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0) {
+                                 vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0,
+                                 uint32_t mip = 0) {
     auto &scheduler = context.GetCommandScheduler();
     auto &image = context.GetTextureCache().GetImage(id);
     const auto bytes = image.info.bytes_per_block * extent.width *
@@ -8596,7 +8613,7 @@ public:
                   scheduler.Current().Handle());
     vk::BufferImageCopy copy{};
     copy.imageSubresource = {image.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
-                                                : vk::ImageAspectFlagBits::eColor, 0, layer, 1};
+                                                : vk::ImageAspectFlagBits::eColor, mip, layer, 1};
     copy.imageOffset = offset;
     copy.imageExtent = extent;
     scheduler.Current().Handle().copyImageToBuffer(
@@ -9591,6 +9608,9 @@ public:
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
+    constexpr uint64_t mipped_storage_address = base + 0x100000;
+    constexpr uint32_t tail_backing_value = 0x2468ace0u;
+    constexpr uint32_t tail_gpu_value = 0x13579bdfu;
     EnsureRuntimeContext();
 
     int64_t direct_offset = -1;
@@ -9607,6 +9627,8 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "descriptor discovery fixed mapping failed");
     std::memset(mapped, 0, allocation_size);
+    std::fill_n(reinterpret_cast<uint32_t *>(mipped_storage_address),
+                0x10000 / 4, tail_backing_value);
 
     {
       RenderContext context(m_runtime_context);
@@ -9873,17 +9895,17 @@ public:
                 storage_descriptor.dwords.begin());
       storage_descriptor.dword_count = 8;
       auto mipped_storage = storage;
-      constexpr uint64_t mipped_storage_address = base + 0x100000;
       const auto encoded_mipped_storage_address = mipped_storage_address >> 8u;
       mipped_storage.fields[0] =
           static_cast<uint32_t>(encoded_mipped_storage_address);
       mipped_storage.fields[1] =
           static_cast<uint32_t>(encoded_mipped_storage_address >> 32u) |
-          (static_cast<uint32_t>(stencil_format) << 20u) | (3u << 30u);
-      mipped_storage.fields[2] = 1u | (7u << 14u);
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u) |
+          (3u << 30u);
+      mipped_storage.fields[2] = 15u | (63u << 14u);
       mipped_storage.fields[3] =
           DstSel(4, 5, 6, 7) | (1u << 12u) | (3u << 16u) |
-          (static_cast<uint32_t>(linear) << 20u) |
+          (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 20u) |
           (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
       mipped_storage.fields[5] = 0x00700000u | (3u << 4u);
       ShaderRecompiler::IR::DescriptorValue mipped_storage_descriptor{};
@@ -9900,6 +9922,14 @@ public:
                 std::end(overwide_mipped_storage.fields),
                 overwide_mipped_storage_descriptor.dwords.begin());
       overwide_mipped_storage_descriptor.dword_count = 8;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
+        auto linear_view = overwide_mipped_storage_descriptor;
+        linear_view.dwords[3] &= ~(0x1fu << 20u);
+        (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
+                                                       linear_view);
+      });
+#endif
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
@@ -9914,6 +9944,11 @@ public:
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);
+      vk::ClearValue tail_clear{};
+      tail_clear.color.uint32[0] = tail_gpu_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), plain_mipped_storage_binding.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 4, 0, 1}, tail_clear);
       auto mipped_storage_binding = RenderExecutorTestAccess::ResolveTexture(
           executor, mipped_storage_resource, mipped_storage_descriptor);
       auto overwide_mipped_storage_binding =
@@ -9922,6 +9957,16 @@ public:
       auto sampled_overwide_resolved = RenderExecutorTestAccess::ResolveTexture(
           executor, sampled_overwide_resource,
           overwide_mipped_storage_descriptor);
+      const auto tail0 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id);
+      const auto tail3 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+                                        {}, {1, 1, 1}, 0, 3);
+      const auto tail4 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+                                        {}, {1, 1, 1}, 0, 4);
+      Require(name, "expanded tail preserves GPU and backing data",
+              tail0 == std::vector<u32>{tail_gpu_value} &&
+                  tail3 == std::vector<u32>{tail_gpu_value} &&
+                  tail4 == std::vector<u32>{tail_backing_value},
+              "expanding a shared mip tail lost GPU writes or the added mip's backing bytes");
       PreparedBindings mipped_prepared{};
       ShaderRecompiler::IR::CompiledShaderInfo mipped_program{};
       mipped_program.info.images.push_back(storage_resource);
@@ -9983,23 +10028,129 @@ public:
                   overwide_mipped_storage.MaxMip() == 3 &&
                   overwide_mipped_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  overwide_mipped_binding.desc.info.resources.levels == 4 &&
+                  overwide_mipped_binding.desc.info.resources.levels == 5 &&
                   overwide_mipped_binding.desc.view_info.base_level == 1 &&
-                  overwide_mipped_binding.desc.view_info.level_count == 3 &&
+                  overwide_mipped_binding.desc.view_info.level_count == 4 &&
                   overwide_mipped_binding.mip_views.empty() &&
                   overwide_mipped_binding.image_view ==
                       plain_mipped_binding.image_view,
-              "fixed storage view was not intersected with its physical mip "
-              "range before Vulkan acquisition");
+              "fixed storage view lost addressable mips in the allocated tail");
       Require(name, "over-wide sampled mip view",
               sampled_overwide_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  sampled_overwide_binding.desc.info.resources.levels == 4 &&
+                  sampled_overwide_binding.desc.info.resources.levels == 5 &&
                   sampled_overwide_binding.desc.view_info.base_level == 1 &&
-                  sampled_overwide_binding.desc.view_info.level_count == 3 &&
+                  sampled_overwide_binding.desc.view_info.level_count == 4 &&
                   sampled_overwide_binding.mip_views.empty() &&
                   sampled_overwide_binding.image_view != nullptr,
-              "sampled view was not intersected with its physical mip range");
+              "sampled view lost addressable mips in the allocated tail");
+      // Streaming T# clamps apply after S# max LOD, without changing the view
+      // base.
+      {
+        constexpr uint64_t lod_address = base + 0x170000;
+        auto lod_descriptor = mipped_storage_descriptor;
+        lod_descriptor.dwords[0] = static_cast<uint32_t>(lod_address >> 8u);
+        lod_descriptor.dwords[1] =
+            static_cast<uint32_t>(lod_address >> 40u) |
+            (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+            (3u << 30u);
+        lod_descriptor.dwords[3] &= ~(0xfu << 12u);
+        ShaderSamplerResource lod_sampler{
+            {0, 0,
+             static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear) << 26u,
+             0}};
+        TestCase lod_test;
+        lod_test.name = "TextureMinLodAfterSamplerClamp";
+        lod_test.has_user_data = true;
+        lod_test.image_descriptor_swizzle = mipped_storage.DstSelXYZW();
+        std::copy_n(lod_descriptor.dwords.begin(), 8,
+                    lod_test.user_data.begin());
+        std::copy_n(lod_sampler.fields, 4, lod_test.user_data.begin() + 8);
+        lod_test.user_data[50] = sizeof(uint32_t);
+        lod_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                            ShaderOpcode::BUFFER_STORE_DWORD,
+                            ShaderOpcode::S_ENDPGM};
+        lod_test.required_spirv = {"OpImageSampleExplicitLod"};
+        AppendVMovLiteral(&lod_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&lod_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+        lod_test.code.push_back(EncodeMimg0(0x27, 1));
+        lod_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+        AppendStoreVgpr(&lod_test.code, 0, 0);
+        AppendEnd(&lod_test.code);
+        const auto lod_program = CompileCase(lod_test, SubgroupSize());
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        ExpectFatal("TextureMinLodBeyondView", [&] {
+          auto invalid_lod = lod_descriptor;
+          invalid_lod.dwords[1] |= 1024u << 8u;
+          (void)RenderExecutorTestAccess::ResolveTexture(
+              executor, lod_program.program.info.images[0], invalid_lod);
+        });
+#endif
+        const auto lod_binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, lod_program.program.info.images[0], lod_descriptor);
+        for (uint32_t mip = 0; mip < 4; ++mip) {
+          vk::ClearValue clear{};
+          clear.color.float32[0] = static_cast<float>(1u << mip);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), lod_binding.image_id,
+              {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
+        }
+        const auto sampler = context.GetSamplerCache().GetSampler(lod_sampler);
+        auto output = CreateStorageBuffer(lod_test.name, {}, 1);
+        struct LodCase {
+          uint32_t base_level;
+          uint32_t min_lod;
+          float expected;
+          float integer_min_lod_expected;
+        };
+        constexpr std::array lod_cases{
+            LodCase{0, 0, 1.0f, 1.0f},   LodCase{0, 256, 2.0f, 2.0f},
+            LodCase{0, 384, 3.0f, 2.0f}, LodCase{1, 384, 3.0f, 2.0f},
+            LodCase{1, 512, 4.0f, 4.0f}, LodCase{1, 0, 2.0f, 2.0f},
+            LodCase{0, 256, 2.0f, 2.0f}};
+        std::array<vk::ImageView, lod_cases.size()> views{};
+        for (size_t index = 0; index < lod_cases.size(); ++index) {
+          const auto &test = lod_cases[index];
+          lod_descriptor.dwords[1] =
+              (lod_descriptor.dwords[1] & ~0xfff00u) | (test.min_lod << 8u);
+          lod_descriptor.dwords[3] =
+              (lod_descriptor.dwords[3] & ~(0xfu << 12u)) |
+              (test.base_level << 12u);
+          std::copy_n(lod_descriptor.dwords.begin(), 8,
+                      lod_test.user_data.begin());
+          const auto binding = RenderExecutorTestAccess::ResolveTexture(
+              executor, lod_program.program.info.images[0], lod_descriptor);
+          views[index] =
+              texture_cache.FindTexture(binding.image_id, binding.desc);
+          auto &image = texture_cache.GetImage(binding.image_id);
+          image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::AccessFlagBits2::eShaderRead, {},
+                        scheduler.Current().Handle());
+          Image sampled;
+          sampled.view = views[index];
+          sampled.layout = image.backing.state.layout;
+          scheduler.Finish();
+          Dispatch(lod_test, lod_program, output, nullptr, &sampled, nullptr,
+                   nullptr, sampler);
+          const auto result = ReadBuffer(lod_test.name, output, 1)[0];
+          // Vulkan permits flooring imageViewMinLod instead of retaining its
+          // fraction.
+          Require(lod_test.name, "sampled mip",
+                  result == std::bit_cast<uint32_t>(test.expected) ||
+                      result == std::bit_cast<uint32_t>(
+                                    test.integer_min_lod_expected),
+                  "texture clamp was lost, applied before sampler max LOD, or "
+                  "rebased incorrectly");
+        }
+        Require(lod_test.name, "view identity",
+                views[0] != views[1] && views[1] != views[2] &&
+                    views[2] != views[3] && views[1] == views.back(),
+                "different texture clamps aliased or identical clamped views "
+                "were not reused");
+        DestroyBuffer(&output);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+
       auto srgb_storage = storage;
       constexpr auto srgb_format =
           static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb);
@@ -13056,8 +13207,6 @@ public:
       check_stencil("masked compare passes", false, 0xb8, 0xb9);
       check_stencil("masked compare fails", false, 0xb0, 0xb0);
 
-      DestroyBuffer(&stencil_readback);
-
       // SPI_PS_IN_CONTROL must select the native wave width through the actual
       // program cache. In wave32 a low-word compare preserves scalar VCC_HI.
       static const auto native_vertex = [] {
@@ -13208,6 +13357,117 @@ public:
         Require(name, "zero homogeneous position culling", second_triangle == (i >= 2),
                 "zero positions drew an extra triangle, or a valid position was culled");
       }
+
+      // A NULL-export stencil pass must ignore smaller stale color targets,
+      // materialize the whole pending HTile clear, and still execute pixel discard.
+      static const auto null_pixels = [] {
+        std::array<std::vector<u32>, 2> result;
+        for (uint32_t discard = 0; discard < result.size(); discard++) {
+          auto &code = result[discard];
+          if (discard != 0) {
+            code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+          }
+          code.push_back(EncodeExp0(0x09, 0, true, false, true));
+          code.push_back(EncodeExp1(0, 0, 0, 0));
+          AppendEnd(&code);
+        }
+        return result;
+      }();
+      registers.Reset();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2,
+                                       extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf00f);
+      registers.SetShaderMask(0xf00f);
+      registers.SetPsInControl(0x8000);
+      registers.SetDepthShaderControl({.shader_kill_enable = true});
+      for (const auto slot : {0u, 3u}) {
+        registers.SetColorBase(slot,
+            {.addr = depth_address + (slot == 0 ? 0x38000 : 0x10000)});
+        registers.SetColorInfo(slot,
+            {.format = Prospero::ChannelLayout::k32_32_32_32,
+             .channel_type = Prospero::ChannelType::kFloat,
+             .channel_order = Prospero::ChannelOrder::kStandard});
+        const auto side = slot == 0 ? extent / 4 : extent;
+        registers.SetColorAttrib2(slot, {.height = side - 1, .width = side - 1});
+        registers.SetColorAttrib3(slot,
+            {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetTargetOutputMode(slot, 4);
+      }
+      stencil_target.z_info.htile_acceleration = true;
+      stencil_target.htile_data_base_addr = depth_address + 0x30000;
+      registers.SetDepthRenderTarget(stencil_target);
+      registers.SetDepthClearValue(1);
+      stencil_control = {};
+      stencil_control.stencil_enable = true;
+      stencil_control.stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+      registers.SetDepthControl(stencil_control);
+      registers.SetStencilControl({3, 3, 3, 3, 3, 3});
+      registers.SetStencilMask({0x80, 0, 0x80, 1, 0x80, 0, 0x80, 1});
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      for (uint32_t discard = 0; discard < null_pixels.size(); discard++) {
+        const auto &code = null_pixels[discard];
+        const auto address = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(address,
+            {.type = Prospero::ShaderBinaryType::kPs,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        shaders.SetPsShaderBase(address);
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+        (void)cache.FindDepthTarget(depth.image_id, depth.desc);
+        vk::ClearValue zero{};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+             0, 1, 0, 1}, zero);
+        Require(name, "pending stencil-pass HTile clear",
+                cache.ClearMeta(stencil_target.htile_data_base_addr),
+                "the stencil pass did not retain its HTile metadata");
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto depth_pixels = ReadCachedTexel(name, context, depth.image_id,
+                                                  {}, {extent, extent, 1});
+        Require(name, "NULL-export full depth clear",
+                std::ranges::all_of(depth_pixels, [](u32 v) { return v == 0x3f800000u; }),
+                "an unexported color target clipped the pending depth clear");
+        const auto stencil = read_stencil();
+        const auto expected = discard == 0 ? 0x80808080u : 0u;
+        Require(name, "NULL-export stencil coverage and discard",
+                std::ranges::all_of(stencil, [=](u32 v) { return v == expected; }),
+                "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
+      }
+
+      // With MRT0 still bound, an MRT3-only export must retain location3 in
+      // rendering attachments, pipeline formats, blend masks and dynamic write enables.
+      static const auto sparse_pixel = [] {
+        auto code = native_pixel;
+        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x03, 0xf);
+        return code;
+      }();
+      const auto sparse_address = reinterpret_cast<uint64_t>(sparse_pixel.data());
+      ShaderMapUserData(sparse_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(sparse_pixel.size() * sizeof(u32))});
+      shaders.SetPsShaderBase(sparse_address);
+      registers.SetDepthControl({});
+      registers.SetDepthShaderControl({});
+      RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      RenderColorInfo sparse_color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), sparse_color, 3);
+      const auto sparse_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+      for (size_t component = 0; component < sparse_pixels.size(); component++) {
+        const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+        Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
+                "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      }
+      DestroyBuffer(&stencil_readback);
 
       vertex_shader = owned_vertex_shader;
       pixel_shader = owned_pixel_shader;
@@ -14662,9 +14922,11 @@ private:
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
+    vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
+    available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_provoking_vertex;
+    available_features2.pNext = &available_min_lod;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -14690,6 +14952,8 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
+    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
+            "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
@@ -14748,7 +15012,10 @@ private:
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
     provoking_vertex.pNext = &feedback_dynamic;
     provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
-    device_info.pNext = &provoking_vertex;
+    vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
+    min_lod.pNext = &provoking_vertex;
+    min_lod.minLod = true;
+    device_info.pNext = &min_lod;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -14765,7 +15032,8 @@ private:
         VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
-        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
+        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     device_info.enabledExtensionCount = std::size(device_extensions);
     device_info.ppEnabledExtensionNames = device_extensions;
     RequireVk("VulkanHarness", "dispatch",
@@ -20910,15 +21178,17 @@ TestCase ScalarMemoryLoadVariants() {
   std::vector<u32> expected = initial;
   expected.insert(expected.end(), initial.begin(), initial.end());
 
-  return {"ScalarMemoryLoadVariants",
-          code,
-          initial,
-          expected,
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
-           O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
-           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
-           O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemoryLoadVariants",
+              code,
+              initial,
+              expected,
+              {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
+               O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
+               O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
+               O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
+               O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  return test;
 }
 
 TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
@@ -20933,11 +21203,13 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  return {"ScalarLoadSignedImmediateOffsetAddsSoffset",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x22222222u, 0x22222222u},
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarLoadSignedImmediateOffsetAddsSoffset",
+              code,
+              {0x11111111u, 0x22222222u},
+              {0x22222222u, 0x22222222u},
+              {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  return test;
 }
 
 TestCase BufferLoadStore() {
@@ -22607,11 +22879,13 @@ TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  return {"ScalarLoadAlignsComponentsAndMasksAddress",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x11111111u, 0x22222222u},
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarLoadAlignsComponentsAndMasksAddress",
+              code,
+              {0x11111111u, 0x22222222u},
+              {0x11111111u, 0x22222222u},
+              {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  return test;
 }
 
 TestCase FlatVirtualAddressRebasesGuestAllocation() {
@@ -28030,12 +28304,6 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~(0x1fu << 20u)) |
         (static_cast<uint32_t>(Prospero::TileMode::kStandard256B) << 20u);
-  } else if (std::strcmp(kind, "base-mip-out-of-resource") == 0) {
-    descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
-  } else if (std::strcmp(kind, "dynamic-mip-out-of-resource") == 0) {
-    resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-    resource.mip_count = 2;
-    descriptor.fields[3] |= 1u << 16u;
   } else if (std::strcmp(kind, "inverted-mip-range") == 0) {
     descriptor.fields[3] |= 1u << 12u;
     descriptor.fields[5] |= 1u << 4u;
@@ -28507,8 +28775,6 @@ void CheckBasicStorageTextureDescriptor() {
   for (const char *kind : {"resource",
                            "type",
                            "standard256b-volume",
-                           "base-mip-out-of-resource",
-                           "dynamic-mip-out-of-resource",
                            "inverted-mip-range",
                            "swizzle",
                            "linear-rgb1-read",
@@ -31224,6 +31490,32 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, MimgBvhIntersectRayTriangle());
+    return 0;
+  }
+  const auto scalar_memory_cases = [] {
+    return std::vector<TestCase>{ScalarMemoryLoadVariants(),
+                                  ScalarLoadSignedImmediateOffsetAddsSoffset(),
+                                  ScalarLoadAlignsComponentsAndMasksAddress()};
+  };
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-memory-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : scalar_memory_cases()) {
+      RunCase(&vulkan, test);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-memory-host-only") == 0) {
+    for (const auto &test : scalar_memory_cases()) {
+      const auto compiled = CompileCase(test);
+      Require(test.name, "host scalar memory", compiled.program.info.uses_dma,
+              "scalar memory case did not use the GPU address path");
+      Require(test.name, "host scalar memory", test.bda_mappings.size() == 1u,
+              "scalar memory case did not declare exactly one guest mapping");
+      Require(test.name, "host scalar memory",
+              test.bda_mappings[0].guest_base == 0u && test.bda_mappings[0].backing_offset == 0u,
+              "scalar memory guest mapping must be guest 0 to backing 0");
+      std::printf("[host]    %-32s ok\n", test.name);
+    }
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

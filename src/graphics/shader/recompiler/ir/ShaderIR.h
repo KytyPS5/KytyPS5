@@ -560,6 +560,7 @@ struct Program: ResourcePlan {
 };
 
 std::string ProgramToString(const Program& program);
+bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);

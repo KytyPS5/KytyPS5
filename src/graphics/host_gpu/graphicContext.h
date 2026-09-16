@@ -19,29 +19,31 @@ struct VulkanImage;
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
 struct GraphicContext {
-	vk::Instance                       instance                              = nullptr;
-	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
-	vk::PhysicalDevice                 physical_device                       = nullptr;
-	vk::PhysicalDeviceProperties       physical_device_properties            = {};
-	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
-	vk::Device                         device                                = nullptr;
-	VmaAllocator                       allocator                             = nullptr;
-	bool                               memory_budget_ext_enabled             = false;
-	bool                               compute_subgroup_size_control_enabled = false;
-	bool                               sample_rate_shading_enabled           = false;
-	bool                               attachment_feedback_loop_enabled      = false;
-	bool                               provoking_vertex_last_enabled         = false;
-	bool                               supports_block_texel_view              = false;
+	vk::Instance                              instance                              = nullptr;
+	vk::DebugUtilsMessengerEXT                debug_messenger                       = nullptr;
+	vk::PhysicalDevice                        physical_device                       = nullptr;
+	vk::PhysicalDeviceProperties              physical_device_properties            = {};
+	vk::PhysicalDeviceMemoryProperties        physical_device_memory_properties     = {};
+	vk::Device                                device                                = nullptr;
+	VmaAllocator                              allocator                             = nullptr;
+	bool                                      memory_budget_ext_enabled             = false;
+	bool                                      compute_subgroup_size_control_enabled = false;
+	bool                                      sample_rate_shading_enabled           = false;
+	bool                                      shader_buffer_int64_atomics_enabled   = false;
+	bool                                      shader_cull_distance_enabled          = false;
+	bool                                      attachment_feedback_loop_enabled      = false;
+	bool                                      provoking_vertex_last_enabled         = false;
+	bool                                      supports_block_texel_view             = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
-	uint32_t                           subgroup_size                         = 0;
-	uint32_t                           min_subgroup_size                     = 0;
-	uint32_t                           max_subgroup_size                     = 0;
-	uint32_t                           max_push_descriptors                  = 0;
-	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
-	Common::Mutex                      queue_mutex;
-	uint32_t                           queue_family = static_cast<uint32_t>(-1);
-	vk::Queue                          queue        = nullptr;
+	uint32_t                                  subgroup_size                         = 0;
+	uint32_t                                  min_subgroup_size                     = 0;
+	uint32_t                                  max_subgroup_size                     = 0;
+	uint32_t                                  max_push_descriptors                  = 0;
+	vk::ShaderStageFlags                      required_subgroup_size_stages         = {};
+	Common::Mutex                             queue_mutex;
+	uint32_t                                  queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                                 queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -122,21 +124,19 @@ struct VulkanImage {
 	VulkanImage() = default;
 	KYTY_CLASS_NO_COPY(VulkanImage);
 
-	vk::Format                    format      = vk::Format::eUndefined;
-	vk::ImageType                 image_type  = vk::ImageType::e2D;
-	vk::Extent3D                  extent      = {1, 1, 1};
-	uint32_t                      layers      = 1;
-	uint32_t                      mip_levels  = 1;
-	uint32_t                      samples     = 1;
-	vk::ImageUsageFlags           usage       = {};
-	vk::ImageCreateFlags          flags       = {};
-	vk::Image                     image       = nullptr;
+	vk::Format                    format     = vk::Format::eUndefined;
+	vk::ImageType                 image_type = vk::ImageType::e2D;
+	vk::Extent3D                  extent     = {1, 1, 1};
+	uint32_t                      layers     = 1;
+	uint32_t                      mip_levels = 1;
+	uint32_t                      samples    = 1;
+	vk::ImageUsageFlags           usage      = {};
+	vk::ImageCreateFlags          flags      = {};
+	vk::Image                     image      = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
-	VmaAllocation                allocation = nullptr;
+	VmaAllocation                 allocation = nullptr;
 };
-
-
 
 } // namespace Libs::Graphics
 

@@ -24,9 +24,19 @@ namespace Libs::Graphics {
 // Debug helpers for presenting a guest render target instead of the scan-out surface.
 void DebugRegisterRenderTargetId(uint32_t id_index, uint32_t id_generation);
 void DebugRecordHdrWritten(uint64_t address);
-void DebugRecordEdge(uint64_t tex_address, uint64_t rt_address);
+void DebugRecordEdge(uint64_t tex_address, uint32_t tex_width, uint32_t tex_height,
+                     uint32_t tex_format, uint64_t rt_address, uint32_t rt_width,
+                     uint32_t rt_height, uint32_t rt_format);
 void DebugRecordHdrSampled(uint64_t address);
 bool DebugGetRenderTargetId(size_t index, uint32_t* out_index, uint32_t* out_generation);
+// Debug: correlation clock shared by the CONSUME/PRODUCE probes.
+extern std::atomic_uint64_t g_dbg_frame;
+extern std::atomic_uint64_t g_dbg_seq;
+
+void DebugRegisterRenderTargetAddress(uint64_t address, uint32_t format, uint32_t id_index,
+                                      uint32_t id_generation);
+bool DebugFindRenderTarget(uint32_t format, uint32_t index, uint32_t* out_index,
+                           uint32_t* out_generation, uint64_t* out_address);
 
 struct GraphicContext;
 class Buffer;

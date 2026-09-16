@@ -19,11 +19,13 @@
 #include <algorithm>
 #include <cstdlib>
 #include <set>
+#include <string>
 #include <array>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <cstdio>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -38,13 +40,34 @@ static std::vector<std::pair<uint32_t, uint32_t>> g_dbg_rt_ids;
 static std::set<uint64_t> g_dbg_hdr_written;
 static std::set<uint64_t> g_dbg_hdr_sampled;
 
-static std::set<std::pair<uint64_t, uint64_t>> g_dbg_edges;
+// A guest address is an allocation, not a resource identity: the game recycles one address for
+// surfaces of different extent and format, so an address-keyed graph merges unrelated resources
+// into one node. Key edges on (address, extent, format) at both ends instead.
+struct DebugEdgeKey {
+	uint64_t tex_address;
+	uint32_t tex_width;
+	uint32_t tex_height;
+	uint32_t tex_format;
+	uint64_t rt_address;
+	uint32_t rt_width;
+	uint32_t rt_height;
+	uint32_t rt_format;
+
+	[[nodiscard]] auto operator<=>(const DebugEdgeKey&) const = default;
+};
+static std::set<DebugEdgeKey> g_dbg_edges;
 
 // Debug: one line per distinct "this target was produced by sampling that texture" edge.
-void DebugRecordEdge(uint64_t tex_address, uint64_t rt_address) {
+void DebugRecordEdge(uint64_t tex_address, uint32_t tex_width, uint32_t tex_height,
+                     uint32_t tex_format, uint64_t rt_address, uint32_t rt_width,
+                     uint32_t rt_height, uint32_t rt_format) {
 	std::scoped_lock lock {g_dbg_rt_mutex};
-	if (g_dbg_edges.emplace(tex_address, rt_address).second) {
-		LOGF("EDGE: tex=0x%016" PRIx64 " -> rt=0x%016" PRIx64 "\n", tex_address, rt_address);
+	const DebugEdgeKey key {tex_address, tex_width, tex_height, tex_format,
+	                        rt_address,  rt_width,  rt_height,  rt_format};
+	if (g_dbg_edges.insert(key).second) {
+		LOGF("EDGE: tex=0x%016" PRIx64 " %ux%u fmt=%u -> rt=0x%016" PRIx64 " %ux%u fmt=%u\n",
+		     tex_address, tex_width, tex_height, tex_format, rt_address, rt_width, rt_height,
+		     rt_format);
 	}
 }
 
@@ -71,6 +94,61 @@ void DebugRecordHdrSampled(uint64_t address) {
 void DebugRegisterRenderTargetId(uint32_t id_index, uint32_t id_generation) {
 	std::scoped_lock lock {g_dbg_rt_mutex};
 	g_dbg_rt_ids.emplace_back(id_index, id_generation);
+}
+
+// Guest addresses shift between runs, so the viewer cannot select by address: you would have to
+// run once to learn the address, by which time it is stale. Select by format and by index among
+// the 1080p targets of that format instead, which is stable enough to cycle through live.
+struct DebugRenderTargetEntry {
+	uint64_t address;
+	uint32_t format;
+	uint32_t id_index;
+	uint32_t id_generation;
+};
+static std::vector<DebugRenderTargetEntry> g_dbg_rt_table;
+
+void DebugRegisterRenderTargetAddress(uint64_t address, uint32_t format, uint32_t id_index,
+                                      uint32_t id_generation) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	for (auto& entry: g_dbg_rt_table) {
+		if (entry.address == address && entry.format == format) {
+			// Keep the newest id: the cache recycles slots, and a generation captured once is
+			// dead by present time.
+			entry.id_index      = id_index;
+			entry.id_generation = id_generation;
+			return;
+		}
+	}
+	uint32_t index = 0;
+	for (const auto& entry: g_dbg_rt_table) {
+		if (entry.format == format) {
+			index++;
+		}
+	}
+	g_dbg_rt_table.push_back({address, format, id_index, id_generation});
+	LOGF("RT REGISTER: fmt=%u index=%u addr=0x%016" PRIx64 "\n", format, index, address);
+}
+
+bool DebugFindRenderTarget(uint32_t format, uint32_t index, uint32_t* out_index,
+                           uint32_t* out_generation, uint64_t* out_address) {
+	std::scoped_lock lock {g_dbg_rt_mutex};
+	if (out_index == nullptr || out_generation == nullptr || out_address == nullptr) {
+		return false;
+	}
+	uint32_t seen = 0;
+	for (const auto& entry: g_dbg_rt_table) {
+		if (entry.format != format) {
+			continue;
+		}
+		if (seen == index) {
+			*out_index      = entry.id_index;
+			*out_generation = entry.id_generation;
+			*out_address    = entry.address;
+			return true;
+		}
+		seen++;
+	}
+	return false;
 }
 
 bool DebugGetRenderTargetId(size_t index, uint32_t* out_index, uint32_t* out_generation) {
@@ -224,13 +302,26 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 
 } // namespace
 
+// Debug: correlation clock. A frame number alone cannot order an upload against the GPU writes
+// inside the same frame, so every correlated event also carries a monotonic sequence number.
+std::atomic_uint64_t g_dbg_frame {0};
+std::atomic_uint64_t g_dbg_seq {0};
+
+// EXPERIMENT (diagnostic): force readback enrolment on regardless of the launcher checkbox,
+// which did not take effect in testing. Set to false to restore normal config-driven behaviour.
+static constexpr bool kKytyExperimentForceReadback = false;
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_readback_linear_images(Config::ReadbackLinearImagesEnabled() ||
+                               kKytyExperimentForceReadback) {
+	// Debug: readback enrolment is gated on this, so its value decides whether the tiled-download
+	// experiment is active at all.
+	LOGF("READBACK CONFIG: readback_linear_images=%d\n", m_readback_linear_images ? 1 : 0);
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -524,7 +615,21 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
+	// EXPERIMENT (diagnostic, not a fix): the `!image.info.IsTiled()` condition used to stand
+	// here, which excluded every render target, since they are all tiled. The game renders with
+	// the GPU and then reads that memory back as a texture, so with tiled targets barred from
+	// readback the guest range is never populated and the later UploadImage supplies stale RAM.
+	// One run measured 667 guest->image uploads against a single image->guest download. Dropping
+	// the condition lets tiled targets enrol, to test whether that closes the loop. It detiles
+	// and reads back GPU targets, which is why the condition existed: revert if the cost is
+	// unacceptable. Still gated by the readback_linear_images config flag.
+	// Narrowed to 1080p targets: enrolling every GPU-modified image exhausts the reusable
+	// download buffer ("failed to map reusable download buffer"). The hypothesis only concerns
+	// the 1920x1080 surfaces that feed the displayed texture, so test those alone.
+	const bool dbg_experiment_shape =
+	    image.info.extent.width == 1920 && image.info.extent.height == 1080;
+	if (m_readback_linear_images && !image.info.data.Empty() &&
+	    (!image.info.IsTiled() || dbg_experiment_shape)) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -1095,6 +1200,23 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const auto& info    = image.info;
 	const auto  binding = UploadBinding(image);
+	// Debug: this is the guest-memory -> image path. An instance with no GPU producer and no
+	// upload has no source at all; one with an upload is externally supplied data. Keyed by
+	// (address, extent, format) so it lines up with the shape-keyed graph.
+	// NOT deduplicated: collapsing occurrences is what made an earlier pass unable to tell
+	// allocation reuse over time from genuine simultaneous aliasing. Restricted to 1080p so the
+	// volume stays usable.
+	// 1620 rows is a 1920x1080 NV12 frame seen as one R8 plane, which is how the decoded
+	// movie is bound; include it so the movie texture's upload cadence is visible.
+	if (info.extent.width == 1920 && (info.extent.height == 1080 || info.extent.height == 1620)) {
+		LOGF("CONSUME: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
+		     " %ux%u fmt=%u guest_fmt=%u mips=%u layers=%u binding=%u\n",
+		     g_dbg_frame.load(std::memory_order_relaxed),
+		     g_dbg_seq.fetch_add(1, std::memory_order_relaxed), info.data.address, info.data.size,
+		     info.extent.width, info.extent.height, static_cast<uint32_t>(image.backing.format),
+		     static_cast<uint32_t>(info.guest_format), info.resources.levels,
+		     info.resources.layers, static_cast<uint32_t>(binding));
+	}
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
@@ -1202,6 +1324,57 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
 	}
+	// Painting the fast clear is disabled by default, because the metadata association feeding it
+	// is not trustworthy yet and every measurement says the paint costs picture and gains
+	// nothing. On Beast of Reincarnation the surfaces it paints include a 4096x4096 fmt=122
+	// texture, 1920x1088 fmt=74 compute working buffers and the 3840x2160 scan-out, which are not
+	// fast-clearable render targets - the metadata region for those allocations merely happens to
+	// read as uniform. Every colour it ever decoded was pure black. Skipping the paint entirely
+	// is the only configuration in which the game's title screen and character render.
+	//
+	// Two narrower gates were tried and both still lost the picture: restricting the paint to
+	// render-target acquisitions, and skipping it when the image is already GPU-modified. They
+	// are kept below, so that whoever fixes the association gets the least-bad behaviour when
+	// they turn this back on with KYTY_DCC_CLEAR or a dcc_clear.txt file beside the executable.
+	// The file form exists because the launcher spawns the emulator as a child, so an env var set
+	// in another shell never reaches it.
+	static const bool paint_dcc_clear = [] {
+		if (std::getenv("KYTY_DCC_CLEAR") != nullptr) {
+			return true;
+		}
+		FILE* f = std::fopen("dcc_clear.txt", "r");
+		if (f == nullptr) {
+			return false;
+		}
+		(void)std::fclose(f);
+		LOGF("DCC CLEAR PAINT: re-enabled by dcc_clear.txt\n");
+		return true;
+	}();
+	const auto register_only = [&] {
+		std::scoped_lock lock {m_lock};
+		m_slot_images[id].info.metadata = desc.info.metadata;
+		m_surface_metas.erase(desc.info.metadata.range.address);
+	};
+	if (!paint_dcc_clear) {
+		register_only();
+		return;
+	}
+	// A fast clear belongs to a target acquisition, not to a surface being acquired to be read.
+	if (desc.type != BindingType::RenderTarget && desc.type != BindingType::DepthTarget) {
+		register_only();
+		return;
+	}
+	// The metadata says "uniformly cleared", which stops being true the moment the GPU writes the
+	// surface. Kyty re-reads it on every acquisition, so an image the GPU already owns would be
+	// repainted from stale information.
+	{
+		std::scoped_lock lock {m_lock};
+		if (m_slot_images[id].IsGpuModified()) {
+			m_slot_images[id].info.metadata = desc.info.metadata;
+			m_surface_metas.erase(desc.info.metadata.range.address);
+			return;
+		}
+	}
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
@@ -1253,6 +1426,49 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		}
 		{
 			std::scoped_lock lock {m_lock};
+			// Debug: a fast clear paints a whole slice. If the colour is at or above white this
+			// is a candidate for the glowing blocks, so record what colour lands on which image.
+			const auto& image = m_slot_images[id];
+			if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+				LOGF("DCC CLEAR: frame=%" PRIu64 " seq=%" PRIu64 " image=0x%016" PRIx64
+				     " %ux%u fmt=%u slice=%u code=0x%02x rgba=%g,%g,%g,%g\n",
+				     g_dbg_frame.load(std::memory_order_relaxed),
+				     g_dbg_seq.fetch_add(1, std::memory_order_relaxed), image.info.data.address,
+				     image.info.extent.width, image.info.extent.height,
+				     static_cast<uint32_t>(image.backing.format), image_first + slice, code,
+				     static_cast<double>(clear.color.float32[0]),
+				     static_cast<double>(clear.color.float32[1]),
+				     static_cast<double>(clear.color.float32[2]),
+				     static_cast<double>(clear.color.float32[3]));
+			}
+			// Debug: the 1080p filter above hides the small surfaces, and the glowing blocks are
+			// block-shaped, so report every distinct (image, extent, format, colour) once. That
+			// is what says whether anything is being fast-cleared to white.
+			{
+				static std::mutex dbg_mutex;
+				static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t>>
+				     dbg_seen;
+				bool first = false;
+				{
+					std::scoped_lock dbg_lock {dbg_mutex};
+					first = dbg_seen
+					            .emplace(image.info.data.address, image.info.extent.width,
+					                     image.info.extent.height,
+					                     static_cast<uint32_t>(image.backing.format), code)
+					            .second;
+				}
+				if (first) {
+					LOGF("DCC PAINT: binding=%d image=0x%016" PRIx64 " %ux%u fmt=%u code=0x%02x"
+					     " rgba=%g,%g,%g,%g\n",
+					     static_cast<int>(desc.type), image.info.data.address,
+					     image.info.extent.width, image.info.extent.height,
+					     static_cast<uint32_t>(image.backing.format), code,
+					     static_cast<double>(clear.color.float32[0]),
+					     static_cast<double>(clear.color.float32[1]),
+					     static_cast<double>(clear.color.float32[2]),
+					     static_cast<double>(clear.color.float32[3]));
+				}
+			}
 			ClearImage(m_scheduler.Current(), id, view.format,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
@@ -1260,6 +1476,39 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
 		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
 		m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+		// Debug: the publish is what stops this surface being re-read as "still fast
+		// cleared" on the next acquisition. If it does not land in guest memory the same clear
+		// repaints every frame forever, which is exactly what one image did 1392 times. Read the
+		// byte back through the same path the next frame will use and report a mismatch.
+		{
+			uint8_t after = 0;
+			const bool read_ok = LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
+			if (!read_ok || after != 0xffu) {
+				static std::mutex           dbg_mutex;
+				static std::set<uint64_t>   dbg_seen;
+				bool                        first = false;
+				{
+					std::scoped_lock dbg_lock {dbg_mutex};
+					first = dbg_seen.emplace(address).second;
+				}
+				if (first) {
+					LOGF("DCC PUBLISH FAILED: metadata=0x%016" PRIx64 " size=0x%" PRIx64
+					     " wrote=0xff read_back=0x%02x read_ok=%d (this surface will re-clear"
+					     " every frame)\n",
+					     address, slice_size, after, read_ok ? 1 : 0);
+				}
+			}
+		}
+		// That publish writes the guest mapping directly so page faults invalidate stale readers.
+		// The metadata lives inside this surface's own padded guest range, so the faults also
+		// condemn the image the clear just wrote: InvalidateCpuAliases sets cpu_dirty on it, and
+		// the next bind uploads guest memory over the clear and everything drawn after it.
+		// Measured on Beast of Reincarnation: 40636 such invalidations in 542 frames, every one a
+		// single byte discarding an 8.44 MiB GPU-owned image, all of them inside 80 sequence
+		// numbers of a clear. The clear is the authoritative content at this point, so re-assert
+		// the image's ownership of it. Aliases of the metadata range keep their invalidation,
+		// which is what they want.
+		MarkGpuWritten(id);
 	}
 }
 
@@ -1283,6 +1532,21 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	if (!cpu_dirty) {
 		return;
+	}
+	// Debug: this is the only place a live image's contents are replaced from guest memory, and
+	// it is what erases a compute result before the compositor samples it. Name which of the two
+	// flags forced it, so a black or striped frame can be traced to the write that caused it.
+	if (image.info.extent.width == 1920 &&
+	    (image.info.extent.height == 1080 || image.info.extent.height == 1620)) {
+		LOGF("REFRESH UPLOAD: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64
+		     " size=0x%" PRIx64 " %ux%u fmt=%u buffer_modified=%d cpu_dirty=%d maybe_cpu=%d"
+		     " gpu_modified=%d\n",
+		     g_dbg_frame.load(std::memory_order_relaxed),
+		     g_dbg_seq.fetch_add(1, std::memory_order_relaxed), image.info.data.address,
+		     image.info.data.size, image.info.extent.width, image.info.extent.height,
+		     static_cast<uint32_t>(image.backing.format), image.IsBufferModified() ? 1 : 0,
+		     image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+		     image.IsGpuModified() ? 1 : 0);
 	}
 	InitializeImage(id);
 }
@@ -1554,6 +1818,23 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 				}
 			}
 		}
+	}
+	if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+		LOGF("PRODUCE: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
+		     " %ux%u fmt=%u guest_fmt=%u mips=%u layers=%u\n",
+		     g_dbg_frame.load(std::memory_order_relaxed),
+		     g_dbg_seq.fetch_add(1, std::memory_order_relaxed), image.info.data.address,
+		     image.info.data.size, image.info.extent.width, image.info.extent.height,
+		     static_cast<uint32_t>(image.backing.format),
+		     static_cast<uint32_t>(image.info.guest_format), image.info.resources.levels,
+		     image.info.resources.layers);
+	}
+	// Refresh the address->id map on every acquisition, not just the first: the cache recycles
+	// slots, so a generation captured once is dead by present time.
+	if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+		DebugRegisterRenderTargetAddress(image.info.data.address,
+		                                 static_cast<uint32_t>(image.backing.format), id.index,
+		                                 id.generation);
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1915,12 +2196,59 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
+	// Debug: the image -> guest memory direction. A later UploadImage of the same guest range can
+	// only see GPU results if this ran first and covered the bytes. Logged with the reason when
+	// it is skipped, keyed like UPLOAD so the two correlate.
+	const auto dbg_report = [&](const char* outcome) {
+		static std::mutex                                                           dbg_mutex;
+		static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, std::string>> dbg_seen;
+		const std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, std::string> key {
+		    image.info.data.address, image.info.extent.width, image.info.extent.height,
+		    static_cast<uint32_t>(image.backing.format), outcome};
+		bool first = false;
+		{
+			std::scoped_lock lock {dbg_mutex};
+			first = dbg_seen.insert(key).second;
+		}
+		if (first) {
+			LOGF("DOWNLOAD: image->guest addr=0x%016" PRIx64 " %ux%u fmt=%u"
+			     " range=0x%016" PRIx64 "-0x%016" PRIx64 " size=0x%" PRIx64 " outcome=%s\n",
+			     image.info.data.address, image.info.extent.width, image.info.extent.height,
+			     static_cast<uint32_t>(image.backing.format), image.info.data.address,
+			     image.info.data.address + image.info.data.size, image.info.data.size, outcome);
+		}
+	};
 	if (image.depth_id) {
+		dbg_report("skipped:depth");
 		return false;
 	}
 	auto transfer = BuildDownload(image);
-	if (!transfer.valid || !SafeToDownload(image)) {
+	if (!transfer.valid) {
+		dbg_report("skipped:invalid-transfer");
 		return false;
+	}
+	if (!image.SafeToDownload()) {
+		dbg_report("skipped:image-unsafe");
+		return false;
+	}
+	// EXPERIMENT: flush instead of refusing. HasGpuDirtyBytes is an Intersects test, so a single
+	// pending buffer write anywhere in the range vetoes the whole readback -- measured at 4 bytes
+	// blocking an 8.7 MiB image, and three 1080p targets blocked with 0.6% of their range dirty.
+	// Draining those writes into guest memory first preserves the coherency invariant rather than
+	// overwriting them, which is the same order MaterializeDccClear already uses.
+	{
+		const auto image_range = image.info.data;
+		if (m_buffer_cache.IsRegionGpuModified(image_range.address, image_range.size)) {
+			m_buffer_cache.ReadMemory(image_range.address, image_range.size, false);
+			// Diagnostic: did the flush actually drain the condition that caused the refusal?
+			if (m_buffer_cache.IsRegionGpuModified(image_range.address, image_range.size)) {
+				dbg_report("skipped:still-dirty-after-flush");
+				return false;
+			}
+			dbg_report("performed:after-flush");
+		} else {
+			dbg_report("performed");
+		}
 	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
@@ -1931,6 +2259,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	}
 	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+		dbg_report("failed:read-backing");
 		return false;
 	}
 	download.Flush(offset, range.size);
@@ -1966,6 +2295,45 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		if (image.depth_id || !image.Overlaps(address, size)) {
 			continue;
 		}
+		// Debug: a buffer write of any size surrenders the whole image's GPU ownership here. Log
+		// the size of the write against the size of the image so a 4-byte write discarding 8 MiB
+		// of compute output is visible rather than inferred.
+		if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+			const auto overlap_start = std::max(address, image.info.data.address);
+			const auto overlap_end =
+			    std::min(address + size, image.info.data.address + image.info.data.size);
+			LOGF("IMAGE INVALIDATE: frame=%" PRIu64 " seq=%" PRIu64 " image=0x%016" PRIx64
+			     " size=0x%" PRIx64 " %ux%u fmt=%u by_buffer=0x%016" PRIx64 " size=0x%" PRIx64
+			     " overlap=0x%" PRIx64 " was_gpu_modified=%d\n",
+			     g_dbg_frame.load(std::memory_order_relaxed),
+			     g_dbg_seq.fetch_add(1, std::memory_order_relaxed), image.info.data.address,
+			     image.info.data.size, image.info.extent.width, image.info.extent.height,
+			     static_cast<uint32_t>(image.backing.format), address, size,
+			     overlap_end > overlap_start ? overlap_end - overlap_start : 0,
+			     image.IsGpuModified() ? 1 : 0);
+		}
+		// A buffer write that covers only part of a GPU-owned image does not make the rest of it
+		// stale, but surrendering ownership here discards all of it and the next bind re-uploads
+		// the whole surface from guest memory. Measured on Beast of Reincarnation: a 4-byte texel
+		// buffer write at an image's base address discarded 8.44 MiB of compute output 736 times,
+		// once per frame, and 4 KiB writes inside 1080p targets did the same 1047 times each.
+		// Keep ownership unless the write covers the whole image.
+		//
+		// This is narrower than the write deserves: strictly, the overlapping bytes are stale and
+		// should be re-uploaded on their own. Doing that needs per-image dirty ranges and a
+		// partial detile path, which the tiler cannot do yet, so the overlap is currently held
+		// rather than refreshed. KYTY_INVALIDATE_WHOLE_IMAGE restores the old behaviour for
+		// anyone bisecting a surface that goes stale.
+		static const bool invalidate_whole_image =
+		    std::getenv("KYTY_INVALIDATE_WHOLE_IMAGE") != nullptr;
+		if (!invalidate_whole_image && image.IsGpuModified()) {
+			const auto covers_whole_image =
+			    address <= image.info.data.address &&
+			    address + size >= image.info.data.address + image.info.data.size;
+			if (!covers_whole_image) {
+				continue;
+			}
+		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
@@ -1996,6 +2364,23 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
+			// Debug: the other half of the "who erased the compute result" question. With the
+			// buffer route suppressed, cpu_dirty alone still forces uploads, and this is where it
+			// is set. Log the CPU write against the image it condemns.
+			if (owner->info.extent.width == 1920 && owner->info.extent.height == 1080) {
+				const auto overlap_start = std::max(address, owner->info.data.address);
+				const auto overlap_end =
+				    std::min(address + size, owner->info.data.address + owner->info.data.size);
+				LOGF("CPU INVALIDATE: frame=%" PRIu64 " seq=%" PRIu64 " image=0x%016" PRIx64
+				     " size=0x%" PRIx64 " %ux%u fmt=%u by_cpu=0x%016" PRIx64 " size=0x%" PRIx64
+				     " overlap=0x%" PRIx64 " was_gpu_modified=%d\n",
+				     g_dbg_frame.load(std::memory_order_relaxed),
+				     g_dbg_seq.fetch_add(1, std::memory_order_relaxed), owner->info.data.address,
+				     owner->info.data.size, owner->info.extent.width, owner->info.extent.height,
+				     static_cast<uint32_t>(owner->backing.format), address, size,
+				     overlap_end > overlap_start ? overlap_end - overlap_start : 0,
+				     owner->IsGpuModified() ? 1 : 0);
+			}
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);
 			continue;

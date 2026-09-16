@@ -392,14 +392,14 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Srgb, vk::ColorSpaceKHR::eSrgbNonlinear};
+	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
 	if (surface.formats.size() == 1 && surface.formats.front().format == vk::Format::eUndefined) {
 		format.colorSpace = surface.formats.front().colorSpace;
 	} else {
-		// Present through an sRGB swapchain. A 10-bit or float scanout holds linear values, which
-		// the blit then encodes; an sRGB guest surface decodes on read and re-encodes on write,
-		// which is a net identity. Presenting linear values raw into a UNORM surface made the
-		// picture far too dark.
+		// Present through a UNORM swapchain. The guest hands us pixels that already carry its own
+		// transfer function, so the blit has to copy them through untouched. An sRGB destination
+		// makes vkCmdBlitImage encode them a second time, which crushed the dark end: a
+		// calibration screen's low-luminance image went to black while loading screens blew out.
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
 		                             [](const vk::SurfaceFormatKHR& candidate) {
 			                             return candidate.colorSpace ==
@@ -408,7 +408,7 @@ void Swapchain::Create() {
 			                                     candidate.format == vk::Format::eR8G8B8A8Unorm);
 		                             });
 		if (it == surface.formats.end()) {
-			EXIT("no supported sRGB swapchain format\n");
+			EXIT("no supported UNORM swapchain format\n");
 		}
 		format = *it;
 	}
@@ -733,28 +733,43 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	// Debug: the file named by KYTY_DEBUG_RT_FILE holds an index; present that guest render
 	// target instead of the scan-out surface. Substituted after ResolveSurface so the scan-out
 	// description still validates normally.
+	// Debug: advance the correlation clock once per presented frame.
+	g_dbg_frame.fetch_add(1, std::memory_order_relaxed);
 	Image* copy_source = &image;
-	if (const char* sel_path = std::getenv("KYTY_DEBUG_RT_FILE"); sel_path != nullptr) {
+	{
+		// The launcher spawns the emulator as a child, so an env var set in another shell never
+		// reaches it. Default to a file beside the executable and let the env var override.
+		const char* env_path = std::getenv("KYTY_DEBUG_RT_FILE");
+		const char* sel_path = env_path != nullptr ? env_path : "rt_select.txt";
 		static std::atomic_uint64_t frame_counter {0};
-		static std::atomic_int      selected {-1};
+		static std::atomic_uint64_t selected {0};
 		if ((frame_counter.fetch_add(1, std::memory_order_relaxed) % 15) == 0) {
 			if (FILE* f = std::fopen(sel_path, "r"); f != nullptr) {
-				int value = -1;
-				if (std::fscanf(f, "%d", &value) == 1) {
-					selected.store(value, std::memory_order_relaxed);
+				// The file holds "<vk_format> <index>", e.g. "64 2" for the third 1080p
+				// A2B10G10R10 target. Addresses shift between runs, so they cannot be used.
+				unsigned int fmt = 0;
+				unsigned int idx = 0;
+				if (std::fscanf(f, "%u %u", &fmt, &idx) == 2) {
+					selected.store((static_cast<uint64_t>(fmt) << 32u) | idx,
+					               std::memory_order_relaxed);
 				}
 				(void)std::fclose(f);
 			}
 		}
-		if (const auto index = selected.load(std::memory_order_relaxed); index >= 0) {
+		if (const auto packed = selected.load(std::memory_order_relaxed); packed != 0) {
+			const auto format  = static_cast<uint32_t>(packed >> 32u);
+			const auto index   = static_cast<uint32_t>(packed & 0xffffffffu);
 			uint32_t id_index      = 0;
 			uint32_t id_generation = 0;
-			if (DebugGetRenderTargetId(static_cast<size_t>(index), &id_index, &id_generation)) {
+			uint64_t picked_address = 0;
+			if (DebugFindRenderTarget(format, index, &id_index, &id_generation, &picked_address)) {
 				auto& cache = m_impl->renderer.GetTextureCache();
 				auto* picked_image = cache.DebugTryGetImage(id_index, id_generation);
 				static std::atomic_uint64_t dbg_sub {0};
 				if ((dbg_sub.fetch_add(1, std::memory_order_relaxed) % 60) == 0) {
-					LOGF("PRESENT DEBUG: index=%d id=%u alive=%d\n", index, id_index,
+					LOGF("PRESENT DEBUG: fmt=%u index=%u addr=0x%016" PRIx64 " id=%u gen=%u"
+					     " alive=%d\n",
+					     format, index, picked_address, id_index, id_generation,
 					     picked_image != nullptr ? 1 : 0);
 				}
 				if (picked_image != nullptr &&

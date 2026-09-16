@@ -38,7 +38,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <cinttypes>
 #include <mutex>
+#include <set>
+#include <string>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -438,6 +441,25 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		vk_buffer.setColorWriteEnableEXT(color_count, enable);
 	}
 #endif
+}
+
+// Debug: the draw path drops a draw silently in several places, which is exactly how one object
+// goes missing while everything around it renders. Report each (reason, vertex shader) pair once.
+static void DebugReportDroppedDraw(const char* reason, const HW::Shader& sh_ctx,
+                                   uint32_t index_count, uint32_t instance_count) {
+	const auto vs_addr = sh_ctx.GetVs().es_regs.data_addr;
+	static std::mutex                               dbg_mutex;
+	static std::set<std::pair<std::string, uint64_t>> dbg_seen;
+	bool first = false;
+	{
+		std::scoped_lock lock {dbg_mutex};
+		first = dbg_seen.emplace(reason, vs_addr).second;
+	}
+	if (first) {
+		LOGF("DRAW DROPPED (%s): vs=0x%016" PRIx64 " index_count=%" PRIu32
+		     " instance_count=%" PRIu32 "\n",
+		     reason, vs_addr, index_count, instance_count);
+	}
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -1245,6 +1267,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		// Debug: a silently dropped draw is how a whole object goes missing while everything
+		// around it renders. Report each distinct reason once per vertex-shader address.
+		DebugReportDroppedDraw("no-valid-vertex-shader", sh_ctx, args.index_count,
+		                       args.instance_count);
 		return;
 	}
 
@@ -1271,6 +1297,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, false, topology)) {
+		DebugReportDroppedDraw("unsupported-topology", sh_ctx, args.index_count,
+		                       args.instance_count);
 		return;
 	}
 

@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -367,6 +368,36 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	// Debug: the edge graph only records colour-target bindings, so a composite produced by a
+	// compute shader writing a storage image is invisible in it. Name every image a dispatch
+	// binds, with its access mode, so those writes can be matched against the addresses the
+	// compositor consumes.
+	{
+		static std::atomic_uint64_t dbg_dispatch {0};
+		const auto                  dispatch_id = dbg_dispatch.fetch_add(1, std::memory_order_relaxed);
+		for (uint32_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
+			const auto& resource = program.info.images[i];
+			const auto& desc     = bindings.images[i].desc;
+			const char* access   = resource.atomic    ? "atomic"
+			                       : resource.written && resource.read ? "readwrite"
+			                       : resource.written ? "write"
+			                       : resource.read    ? "read"
+			                                          : "none";
+			LOGF("COMPUTE IMG: frame=%" PRIu64 " seq=%" PRIu64 " dispatch=%" PRIu64
+			     " shader=0x%016" PRIx64 " slot=%u"
+			     " addr=0x%016" PRIx64 " %ux%u fmt=%d"
+			     " mip=%u+%u layer=%u+%u access=%s storage=%d groups=%ux%ux%u\n",
+			     g_dbg_frame.load(std::memory_order_relaxed),
+			     g_dbg_seq.fetch_add(1, std::memory_order_relaxed),
+			     dispatch_id, sh_ctx.GetCs().cs_regs.data_addr, i, desc.info.data.address,
+			     desc.info.extent.width,
+			     desc.info.extent.height, static_cast<int>(desc.info.pixel_format),
+			     desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+			     desc.view_info.layer_count, access,
+			     desc.type == TextureCache::BindingType::Storage ? 1 : 0, thread_group_x,
+			     thread_group_y, thread_group_z);
+		}
+	}
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();

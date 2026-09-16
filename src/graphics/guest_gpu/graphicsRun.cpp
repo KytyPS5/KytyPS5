@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -844,6 +845,28 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				case 0x00: m_predicate_skip = (value != 0); break;
 				case 0x01: m_predicate_skip = (value == 0); break;
 				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+			}
+			// Debug A/B: KYTY_NO_PREDICATION, or a no_predication.txt file beside the executable,
+			// forces every predicated block to draw. Measured on Beast of Reincarnation: all 128
+			// logged evaluations read value=0 with condition=1, so every one skips, and 1862
+			// predicated packets were dropped in a single run. If the predicate is a GPU query
+			// result that never reaches guest memory, the game is skipping geometry it should be
+			// drawing. The file form exists because the launcher spawns the emulator as a child,
+			// so an env var set in another shell never reaches it.
+			static const bool ignore_predication = [] {
+				if (std::getenv("KYTY_NO_PREDICATION") != nullptr) {
+					return true;
+				}
+				FILE* f = std::fopen("no_predication.txt", "r");
+				if (f == nullptr) {
+					return false;
+				}
+				(void)std::fclose(f);
+				LOGF("NO PREDICATION: enabled (A/B experiment)\n");
+				return true;
+			}();
+			if (ignore_predication) {
+				m_predicate_skip = false;
 			}
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1) < 128) {

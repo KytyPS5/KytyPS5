@@ -4,8 +4,16 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include "common/logging/log.h"
+#include "kernel/memory.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -243,6 +251,53 @@ static int32_t MapDecoderResult(Decoder::Result result) {
 	return VIDEODEC2_ERROR_API_FAIL;
 }
 
+// The decoder writes the picture into guest memory from host code, behind the page watcher that
+// would otherwise notice a CPU write. Without telling the caches, the texture cache uploads each
+// frame buffer once, on first use, and then treats it as clean forever: measured on Beast of
+// Reincarnation, 16 uploads against 400+ decoded frames, so the movie froze on whatever the pool
+// held first. LibKernel::Memory::InvalidateMemory is the same notification the file system does
+// after a read fills a guest buffer.
+static void PublishDecodedFrame(const Decoder::Output& decoded,
+                                const Videodec2FrameBuffer* frame_buffer) {
+	if (!decoded.valid || frame_buffer == nullptr || frame_buffer->frame_buffer == nullptr) {
+		return;
+	}
+	// A/B: KYTY_NO_VIDEO_PUBLISH, or a no_video_publish.txt file beside the executable, restores
+	// the old behaviour of not telling the caches. Keeps the baseline measurable - 16 uploads
+	// against 400+ decodes - without rebuilding.
+	static const bool suppress = [] {
+		if (std::getenv("KYTY_NO_VIDEO_PUBLISH") != nullptr) {
+			return true;
+		}
+		FILE* f = std::fopen("no_video_publish.txt", "r");
+		if (f == nullptr) {
+			return false;
+		}
+		(void)std::fclose(f);
+		LOGF("NO VIDEO PUBLISH: enabled (A/B experiment)\n");
+		return true;
+	}();
+	if (suppress) {
+		return;
+	}
+	// Only the picture was written, not the whole allocation: the decoder fills
+	// pitch*height luma followed by pitch*ceil(height/2) chroma, which for 1920x1080 at pitch
+	// 2048 is 0x32a000 out of a 0x1000000 frame buffer. `decoded.buffer_size` is the size of the
+	// buffer, not of the picture, so invalidating that would condemn several megabytes of
+	// neighbouring pool memory this game also uses for render targets.
+	const auto chroma_rows = (static_cast<uint64_t>(decoded.height) + 1u) / 2u;
+	const auto picture_size =
+	    static_cast<uint64_t>(decoded.pitch) * decoded.height + decoded.pitch * chroma_rows;
+	const auto limit = decoded.buffer_size != 0 ? static_cast<uint64_t>(decoded.buffer_size)
+	                                            : frame_buffer->frame_buffer_size;
+	const auto size  = picture_size != 0 ? std::min(picture_size, limit) : limit;
+	if (size == 0) {
+		return;
+	}
+	LibKernel::Memory::InvalidateMemory(reinterpret_cast<uint64_t>(frame_buffer->frame_buffer),
+	                                    size);
+}
+
 static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuffer* frame_buffer,
                                Videodec2OutputInfo* output_info) {
 	frame_buffer->is_accepted = decoded.buffer_accepted;
@@ -425,6 +480,16 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 
 	auto* state =
 	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height});
+	// Debug: PRINT_NAME() is thread-local and off by default, so this library is silent in a
+	// normal run and a movie that never decodes looks identical to one that decodes fine.
+	LOGF("VIDEODEC2 CreateDecoder: codec=%u max=%dx%d cpu=0x%" PRIx64 " gpu=0x%" PRIx64
+	     " cpu_gpu=0x%" PRIx64 " max_frame_buffer=0x%" PRIx64 " -> %s\n",
+	     config->codec_type, config->max_frame_width, config->max_frame_height,
+	     static_cast<uint64_t>(memory_info->cpu_memory_size),
+	     static_cast<uint64_t>(memory_info->gpu_memory_size),
+	     static_cast<uint64_t>(memory_info->cpu_gpu_memory_size),
+	     static_cast<uint64_t>(memory_info->max_frame_buffer_size),
+	     state != nullptr ? "ok" : "FAILED");
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_API_FAIL;
 	}
@@ -503,6 +568,26 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
 	                     input_data->dts_data, input_data->attached_data},
 	                    {frame_buffer->frame_buffer, frame_buffer->frame_buffer_size}, &decoded);
 	ApplyDecodedOutput(decoded, frame_buffer, output_info);
+	PublishDecodedFrame(decoded, frame_buffer);
+	// Debug: one line per decoded frame is too much for a whole movie, so report the first
+	// twenty and then every hundredth. The frame buffer address matters most: it says where the
+	// picture lands in guest memory, which is what the texture cache then has to deliver to the
+	// shader that samples it.
+	{
+		static std::atomic_uint64_t calls {0};
+		const auto                  n = calls.fetch_add(1, std::memory_order_relaxed);
+		if (n < 20 || (n % 100) == 0) {
+			LOGF("VIDEODEC2 Decode #%" PRIu64 ": au_size=0x%" PRIx64 " pts=%" PRIu64
+			     " -> result=%d valid=%d error_frame=%d accepted=%d %ux%u pitch=%u"
+			     " frame_buffer=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+			     n, static_cast<uint64_t>(input_data->au_size),
+			     static_cast<uint64_t>(input_data->pts_data), static_cast<int>(result),
+			     decoded.valid ? 1 : 0, decoded.error_frame ? 1 : 0,
+			     decoded.buffer_accepted ? 1 : 0, decoded.width, decoded.height, decoded.pitch,
+			     reinterpret_cast<uint64_t>(frame_buffer->frame_buffer),
+			     static_cast<uint64_t>(frame_buffer->frame_buffer_size));
+		}
+	}
 	return MapDecoderResult(result);
 }
 
@@ -539,6 +624,10 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 	const auto      result = Decoder::Flush(
 	    state, {frame_buffer->frame_buffer, frame_buffer->frame_buffer_size}, &decoded);
 	ApplyDecodedOutput(decoded, frame_buffer, output_info);
+	PublishDecodedFrame(decoded, frame_buffer);
+	LOGF("VIDEODEC2 Flush: result=%d valid=%d %ux%u pitch=%u frame_buffer=0x%016" PRIx64 "\n",
+	     static_cast<int>(result), decoded.valid ? 1 : 0, decoded.width, decoded.height,
+	     decoded.pitch, reinterpret_cast<uint64_t>(frame_buffer->frame_buffer));
 	return MapDecoderResult(result);
 }
 

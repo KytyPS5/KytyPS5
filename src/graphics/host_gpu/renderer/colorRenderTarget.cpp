@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 namespace Libs::Graphics {
 
@@ -280,8 +283,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
-	auto decision_log_id = g_render_color_log_count.fetch_add(1);
-	if (decision_log_id < 128) {
+	// Debug: a flat first-128 budget is spent entirely on the 4K scan-out during boot, so no
+	// 1080p target ever got logged and the guest's own CB format for them stayed invisible. Key
+	// on the surface instead: one line per distinct (address, extent, format, type, order), which
+	// is what says whether a target the compositor later samples as B10G11R11 was decoded as
+	// something else here.
+	bool decision_log_first = false;
+	{
+		static std::mutex dbg_mutex;
+		static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>
+		    dbg_seen;
+		std::scoped_lock dbg_lock {dbg_mutex};
+		decision_log_first =
+		    dbg_seen
+		        .emplace(rt.base.addr, width, height, static_cast<uint32_t>(rt.info.format),
+		                 static_cast<uint32_t>(rt.info.channel_type),
+		                 static_cast<uint32_t>(rt.info.channel_order))
+		        .second;
+	}
+	if (decision_log_first) {
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
@@ -289,6 +309,9 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     view_extent.width, view_extent.height, levels, pitch,
 		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
 		     static_cast<uint32_t>(rt.info.channel_order), samples, tile ? "tiled" : "linear");
+		LOGF("RenderColorTarget host: addr=0x%010" PRIx64 " %ux%u -> vk_fmt=%u bpe=%u\n",
+		     rt.base.addr, width, height, static_cast<uint32_t>(target_format.format),
+		     target_format.bytes_per_element);
 	}
 
 	TextureCache::ImageDesc desc {};

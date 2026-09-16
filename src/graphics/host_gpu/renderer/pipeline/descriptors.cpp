@@ -31,6 +31,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
@@ -788,6 +791,21 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		// Debug: keep the viewer's address->id map fresh. A target written only by compute is
+		// never re-acquired through FindRenderTarget, so an id captured there goes stale as soon
+		// as the cache recycles the slot and the substitution silently stops.
+		if (binding.image_id) {
+			auto& cache = m_context.GetTextureCache();
+			if (const auto* bound = cache.DebugTryGetImage(binding.image_id.index,
+			                                              binding.image_id.generation);
+			    bound != nullptr && bound->info.extent.width == 1920 &&
+			    bound->info.extent.height == 1080) {
+				DebugRegisterRenderTargetAddress(bound->info.data.address,
+				                                 static_cast<uint32_t>(bound->backing.format),
+				                                 binding.image_id.index,
+				                                 binding.image_id.generation);
+			}
+		}
 		prepared.images.push_back(std::move(binding));
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
@@ -909,8 +927,13 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		// Debug: record the texture->target edges so the composite chain can be walked.
 		{
 			auto& dbg_img = texture_cache.GetImage(binding.image_id);
-			if (dbg_img.info.extent.width >= 640 && g_dbg_rt_addr != 0) {
-				DebugRecordEdge(dbg_img.info.data.address, g_dbg_rt_addr);
+			// No width filter: a complete graph is needed, and the edges are deduplicated by
+			// their full (address, extent, format) key anyway.
+			if (g_dbg_rt_addr != 0) {
+				DebugRecordEdge(dbg_img.info.data.address, dbg_img.info.extent.width,
+				                dbg_img.info.extent.height,
+				                static_cast<uint32_t>(dbg_img.backing.format), g_dbg_rt_addr,
+				                g_dbg_rt_width, g_dbg_rt_height, g_dbg_rt_format);
 			}
 			// Debug: the descriptor asked for one address; did the cache hand back that image?
 			const auto requested = binding.desc.info.data.address;
@@ -933,6 +956,28 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		// Debug: COMPUTE IMG only covers dispatches and the edge graph only fires for colour
+		// targets, so a texture a pixel shader samples is invisible in both. Report every bound
+		// image once per (address, extent, format). This is what says whether an address the
+		// guest wrote - a decoded movie frame, for instance - is ever handed to a shader at all.
+		{
+			static std::mutex                                                dbg_mutex;
+			static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> dbg_seen;
+			bool first = false;
+			{
+				std::scoped_lock dbg_lock {dbg_mutex};
+				first = dbg_seen
+				            .emplace(image.info.data.address, image.info.extent.width,
+				                     image.info.extent.height,
+				                     static_cast<uint32_t>(image.backing.format))
+				            .second;
+			}
+			if (first) {
+				LOGF("BOUND IMG: addr=0x%016" PRIx64 " %ux%u fmt=%u storage=%d\n",
+				     image.info.data.address, image.info.extent.width, image.info.extent.height,
+				     static_cast<uint32_t>(image.backing.format), storage ? 1 : 0);
+			}
+		}
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 	}

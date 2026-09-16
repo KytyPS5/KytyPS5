@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstdint>
 #include <xxhash.h>
 
@@ -332,6 +333,12 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 }
 
 void Image::CopyImage(Image& source) {
+	// Debug: draws are already logged as texture->target edges, but these transfers move pixels
+	// between images without a draw, so a chain that looks orphaned may in fact be joined here.
+	LOGF("XFER %s: src=0x%016" PRIx64 " %ux%u fmt=%d -> dst=0x%016" PRIx64 " %ux%u fmt=%d\n",
+	     "CopyImage", source.info.data.address, source.info.extent.width, source.info.extent.height,
+	     static_cast<int>(source.backing.format), info.data.address, info.extent.width,
+	     info.extent.height, static_cast<int>(backing.format));
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -385,6 +392,12 @@ void Image::CopyImage(Image& source) {
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
+	// Debug: draws are already logged as texture->target edges, but these transfers move pixels
+	// between images without a draw, so a chain that looks orphaned may in fact be joined here.
+	LOGF("XFER %s: src=0x%016" PRIx64 " %ux%u fmt=%d -> dst=0x%016" PRIx64 " %ux%u fmt=%d\n",
+	     "Resolve", source.info.data.address, source.info.extent.width, source.info.extent.height,
+	     static_cast<int>(source.backing.format), info.data.address, info.extent.width,
+	     info.extent.height, static_cast<int>(backing.format));
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
 	        destination_range.level_count != 1 ||
@@ -450,6 +463,12 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
+	// Debug: draws are already logged as texture->target edges, but these transfers move pixels
+	// between images without a draw, so a chain that looks orphaned may in fact be joined here.
+	LOGF("XFER %s: src=0x%016" PRIx64 " %ux%u fmt=%d -> dst=0x%016" PRIx64 " %ux%u fmt=%d\n",
+	     "CopyImageWithBuffer", source.info.data.address, source.info.extent.width, source.info.extent.height,
+	     static_cast<int>(source.backing.format), info.data.address, info.extent.width,
+	     info.extent.height, static_cast<int>(backing.format));
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -541,6 +560,12 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	// Debug: draws are already logged as texture->target edges, but these transfers move pixels
+	// between images without a draw, so a chain that looks orphaned may in fact be joined here.
+	LOGF("XFER %s: src=0x%016" PRIx64 " %ux%u fmt=%d -> dst=0x%016" PRIx64 " %ux%u fmt=%d\n",
+	     "CopyMip", source.info.data.address, source.info.extent.width, source.info.extent.height,
+	     static_cast<int>(source.backing.format), info.data.address, info.extent.width,
+	     info.extent.height, static_cast<int>(backing.format));
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();

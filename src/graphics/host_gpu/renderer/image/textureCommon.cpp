@@ -293,10 +293,20 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 	const auto& description    = layout.surface.description;
 	const bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
 	const auto  depth          = volume_texture ? description.depth : description.layers;
+	// Debug: this function has four distinct rejections and the caller only reports that the
+	// upload was invalid, so name the one that fired.
+	const auto reject = [&](const char* why) {
+		LOGF("TILE INFO REJECT (%s): fmt=%u tiled_size=0x%" PRIx64 " levels=%u surface_levels=%u"
+		     " depth=%u regions=%zu expected=%u volume=%d\n",
+		     why, static_cast<uint32_t>(description.format), tiled_size, levels,
+		     description.levels, depth, regions.size(),
+		     GetTextureRegionCount(depth, levels, volume_texture), volume_texture ? 1 : 0);
+		return false;
+	};
 	if (tiled_size == 0 || levels == 0 || levels > 16 || depth == 0 ||
 	    regions.size() != GetTextureRegionCount(depth, levels, volume_texture) ||
 	    Prospero::IsFmaskTextureFormat(description.format)) {
-		return false;
+		return reject("shape");
 	}
 
 	const auto& surface = layout.surface;
@@ -304,7 +314,7 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 	const auto& block   = texture.block;
 	if (surface.description.levels < levels || block.bytes_per_element == 0 ||
 	    block.family == TileBlockFamily::Count) {
-		return false;
+		return reject("block");
 	}
 
 	std::vector<GpuTileInfo> tile_infos;
@@ -336,7 +346,7 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 				                               ? layout.source_slice_stride
 				                               : surface.block_slice_size;
 				if (slice_index > (UINT64_MAX - mip.offset) / source_stride) {
-					return false;
+					return reject("slice overflow");
 				}
 				tile_info.tiled_offset =
 				    mip.offset + static_cast<uint64_t>(slice_index) * source_stride;
@@ -347,6 +357,11 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 			}
 			if (!FitsBufferRange(tile_info.linear_offset, tile_info.linear_size, UINT64_MAX) ||
 			    !FitsBufferRange(tile_info.tiled_offset, tile_info.tiled_size, tiled_size)) {
+				LOGF("TILE INFO REJECT (range): mip=%u slice=%u linear_off=0x%" PRIx64
+				     " linear_size=0x%" PRIx64 " tiled_off=0x%" PRIx64 " tiled_size=0x%" PRIx64
+				     " limit=0x%" PRIx64 "\n",
+				     mip_level, slice_index, tile_info.linear_offset, tile_info.linear_size,
+				     tile_info.tiled_offset, tile_info.tiled_size, tiled_size);
 				return false;
 			}
 			const auto row_length =

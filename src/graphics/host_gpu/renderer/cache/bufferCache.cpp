@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <mutex>
+#include <set>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -121,6 +123,20 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
+		    {
+			    static std::mutex                             dbg_mutex;
+			    static std::set<std::pair<uint64_t, uint64_t>> dbg_seen;
+			    bool first = false;
+			    {
+				    std::scoped_lock lock {dbg_mutex};
+				    first = dbg_seen.emplace(address, bytes).second;
+			    }
+			    if (first) {
+				    LOGF("BUFFER CLEAN: addr=0x%016" PRIx64 " size=0x%" PRIx64
+				         " range=0x%016" PRIx64 "-0x%016" PRIx64 " reason=buffer-download\n",
+				         address, bytes, address, address + bytes);
+			    }
+		    }
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -461,6 +477,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		// Debug: this is the only place guest bytes become GPU-dirty, and that state is what
+		// makes TextureCache::SafeToDownload refuse an image->guest readback. Log the origin so a
+		// skipped image download can be traced to the buffer write that poisoned its range.
+		{
+			static std::mutex                                  dbg_mutex;
+			static std::set<std::pair<uint64_t, uint64_t>>      dbg_seen;
+			bool first = false;
+			{
+				std::scoped_lock lock {dbg_mutex};
+				first = dbg_seen.emplace(vaddr, size).second;
+			}
+			if (first) {
+				LOGF("BUFFER DIRTY: addr=0x%016" PRIx64 " size=0x%" PRIx64
+				     " range=0x%016" PRIx64 "-0x%016" PRIx64 " reason=obtain-buffer-write"
+				     " texel=%d\n",
+				     vaddr, size, vaddr, vaddr + size, is_texel_buffer ? 1 : 0);
+			}
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};

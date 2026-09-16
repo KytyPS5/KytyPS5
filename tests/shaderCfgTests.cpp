@@ -1839,6 +1839,8 @@ void TestNewShaderRecompilerRdna2ScalarOpcodes() {
       EncodeSopp(0x0e, 0), // s_sleep 0
       EncodeSop2(0x02, 106, 239,
                  2),       // s_add_i32 vcc_lo, pops_exiting_wave_id, s2
+      EncodeSMovB32(115, 108), // s_mov_b32 ttmp7, ttmp0
+      EncodeSop1(0x03, 111, 2), // s_mov_b32 ttmp3, s2
       EncodeSopp(0x01, 0), // s_endpgm
   };
 
@@ -1846,6 +1848,10 @@ void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "s_mov_b32 ttmp7, ttmp0"),
+        "new decoder did not decode scalar codes 108-123 as TTMP0-15");
+  Check(Common::ContainsStr(result.decoded_dump, "s_mov_b32 ttmp3, s2"),
+        "new decoder did not decode a mixed TTMP/SGPR scalar move");
   Check(Common::ContainsStr(result.decoded_dump, "s_bitset1_b32 vcc_lo, 0"),
         "new decoder did not decode RDNA2 S_BITSET1_B32");
   Check(Common::ContainsStr(result.decoded_dump,

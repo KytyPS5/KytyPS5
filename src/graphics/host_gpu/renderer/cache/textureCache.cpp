@@ -333,10 +333,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 void TextureCache::ConfigureGarbageCollectionBudget(uint64_t available_budget) {
-	constexpr int64_t GiB       = 1024ll * 1024 * 1024;
-	const auto        budget    = static_cast<int64_t>(std::min<uint64_t>(available_budget, INT64_MAX));
-	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
-	m_pressure_gc_memory        = static_cast<uint64_t>(
+	constexpr int64_t GiB = 1024ll * 1024 * 1024;
+	const auto        budget =
+	    static_cast<int64_t>(std::min<uint64_t>(available_budget, INT64_MAX));
+	const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+	m_pressure_gc_memory = static_cast<uint64_t>(
 	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 	m_critical_gc_memory = static_cast<uint64_t>(
 	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
@@ -1226,7 +1227,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	// volume stays usable.
 	// 1620 rows is a 1920x1080 NV12 frame seen as one R8 plane, which is how the decoded
 	// movie is bound; include it so the movie texture's upload cadence is visible.
-	if (info.extent.width == 1920 && (info.extent.height == 1080 || info.extent.height == 1620)) {
+	if (DebugGfxTraceEnabled() && info.extent.width == 1920 &&
+	    (info.extent.height == 1080 || info.extent.height == 1620)) {
 		LOGF("CONSUME: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
 		     " %ux%u fmt=%u guest_fmt=%u mips=%u layers=%u binding=%u\n",
 		     g_dbg_frame.load(std::memory_order_relaxed),
@@ -1678,7 +1680,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	// Debug: this is the only place a live image's contents are replaced from guest memory, and
 	// it is what erases a compute result before the compositor samples it. Name which of the two
 	// flags forced it, so a black or striped frame can be traced to the write that caused it.
-	if (image.info.extent.width == 1920 &&
+	if (DebugGfxTraceEnabled() && image.info.extent.width == 1920 &&
 	    (image.info.extent.height == 1080 || image.info.extent.height == 1620)) {
 		LOGF("REFRESH UPLOAD: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64
 		     " size=0x%" PRIx64 " %ux%u fmt=%u buffer_modified=%d cpu_dirty=%d maybe_cpu=%d"
@@ -1782,12 +1784,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		uint32_t dbg_same_backing = 0;
+		ImageId  gpu_owner {};
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				dbg_same_backing++;
 				result = id;
+				if (image.IsGpuModified()) {
+					gpu_owner = id;
+				}
 			}
+		}
+		// Several live images can share identical backing. Candidate order then decides the
+		// winner, which is how a pass samples an image that never received the pixels drawn
+		// at that address. Whoever holds GPU output owns those bytes; prefer it.
+		if (gpu_owner) {
+			result = gpu_owner;
 		}
 		// Debug: more than one live image with identical backing means the winner here is
 		// candidate order, not recency -- exactly how a pass can be handed the wrong image.
@@ -1994,7 +2006,8 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 			}
 		}
 	}
-	if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+	if (DebugGfxTraceEnabled() && image.info.extent.width == 1920 &&
+	    image.info.extent.height == 1080) {
 		LOGF("PRODUCE: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
 		     " %ux%u fmt=%u guest_fmt=%u mips=%u layers=%u\n",
 		     g_dbg_frame.load(std::memory_order_relaxed),
@@ -2497,13 +2510,14 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.depth_id || !image.Overlaps(address, size)) {
+		if (!image.Overlaps(address, size)) {
 			continue;
 		}
 		// Debug: a buffer write of any size surrenders the whole image's GPU ownership here. Log
 		// the size of the write against the size of the image so a 4-byte write discarding 8 MiB
 		// of compute output is visible rather than inferred.
-		if (image.info.extent.width == 1920 && image.info.extent.height == 1080) {
+		if (DebugGfxTraceEnabled() && image.info.extent.width == 1920 &&
+		    image.info.extent.height == 1080) {
 			const auto overlap_start = std::max(address, image.info.data.address);
 			const auto overlap_end =
 			    std::min(address + size, image.info.data.address + image.info.data.size);

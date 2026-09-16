@@ -723,7 +723,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
-		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+		// Every predicated packet this title emits is an INDIRECT_BUFFER call, so a false predicate
+		// discards whole child buffers rather than individual draws. Descending into them instead
+		// was tried and draws work the title meant to cull, which corrupts menu text, so the
+		// hardware behaviour stands and the experiment is opt-in.
+		static const bool descend_predicated_indirect_buffers =
+		    std::getenv("KYTY_PREDICATE_DESCEND_INDIRECT_BUFFER") != nullptr;
+		const bool predicated_call = descend_predicated_indirect_buffers &&
+		                             (opcode == Pm4::IT_INDIRECT_BUFFER ||
+		                              opcode == Pm4::IT_INDIRECT_BUFFER_CNST);
+		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets() && !predicated_call) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
@@ -822,46 +831,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	(void)count_in_dwords;
 	uint64_t value = 0;
 
-	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
-		case 0x01: {
-			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			// One begin/end pair per DB; bit 63 marks each counter ready.
-			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
-			for (uint32_t db = 0; db < 16u; db++) {
-				const auto begin = results[db * 2u];
-				const auto end   = results[db * 2u + 1u];
-				if ((begin & end & ready_bit) == 0) {
-					if (wait_op == 0) {
-						SuspendPm4();
-					} else {
-						m_predicate_skip = false;
-					}
-					return;
-				}
-				value += end - begin;
-			}
-		} break;
-		case 0x03:
-			if (wait_op != 0) {
-				BufferFlushAndWait();
-			}
-			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
-			break;
-		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
-	}
-	switch (condition) {
-		case 0x00: m_predicate_skip = (value != 0); break;
-		case 0x01: m_predicate_skip = (value == 0); break;
-		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
-	}
 	// Debug A/B: KYTY_NO_PREDICATION, or a no_predication.txt file beside the executable,
-	// forces every predicated block to draw. The file form exists because the launcher spawns
-	// the emulator as a child, so an env var set in another shell never reaches it.
+	// forces every predicated block to draw. This is checked before the Z-pass counters are
+	// read, so it also escapes the suspend below: if the counters never report ready, waiting
+	// on them stalls the command processor and the override is the only way past it. The file
+	// form exists because the launcher spawns the emulator as a child, so an env var set in
+	// another shell never reaches it.
 	static const bool ignore_predication = [] {
 		if (std::getenv("KYTY_NO_PREDICATION") != nullptr) {
 			return true;
@@ -876,6 +851,79 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}();
 	if (ignore_predication) {
 		m_predicate_skip = false;
+		return;
+	}
+
+	switch (op) {
+		case 0x00:
+			m_predicate_skip = false;
+			return;
+		case 0x01: {
+			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			// One begin/end pair per DB; bit 63 marks each counter ready.
+			constexpr uint64_t ready_bit = 1ull << 63u;
+			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			for (uint32_t db = 0; db < 16u; db++) {
+				const auto begin = results[db * 2u];
+				const auto end   = results[db * 2u + 1u];
+				if ((begin & end & ready_bit) == 0) {
+					// A counter that never reports ready suspends the command processor forever, which
+					// looks like a hang rather than a rendering fault. Report the spin.
+					static std::atomic<uint64_t> not_ready {0};
+					const auto spins = not_ready.fetch_add(1, std::memory_order_relaxed);
+					if (spins < 8 || (spins % 4096) == 0) {
+						LOGF("PREDICATION NOT READY #%" PRIu64 ": addr=0x%016" PRIx64 " db=%" PRIu32
+						     " begin=0x%016" PRIx64 " end=0x%016" PRIx64 " wait_op=%" PRIu32
+						     " action=%s\n",
+						     spins, reinterpret_cast<uint64_t>(address), db, begin, end, wait_op,
+						     wait_op == 0 ? "suspend" : "draw");
+					}
+					if (wait_op == 0) {
+						SuspendPm4();
+					} else {
+						m_predicate_skip = false;
+					}
+					return;
+				}
+				value += end - begin;
+			}
+		} break;
+		case 0x03: {
+			if (wait_op != 0) {
+				BufferFlushAndWait();
+			}
+			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			// The predicate is written by the GPU. Flushing only waits for submission to retire;
+			// the bytes can still be sitting in a cached buffer, leaving guest memory stale. Read
+			// it back before it decides whether a draw happens at all.
+			const auto predicate_address = reinterpret_cast<uint64_t>(address);
+			const auto before = *reinterpret_cast<const volatile uint64_t*>(address);
+			const bool synced =
+			    Libs::LibKernel::Memory::SyncGpuCleanBacking(predicate_address, sizeof(uint64_t));
+			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			{
+				static std::atomic<uint64_t> probe_logs {0};
+				if (probe_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+					Libs::LibKernel::Memory::DebugReportGpuBackingState(predicate_address,
+					                                                    sizeof(uint64_t), "predicate");
+				}
+			}
+			if (!synced || value != before) {
+				static std::atomic<uint64_t> sync_logs {0};
+				const auto n = sync_logs.fetch_add(1, std::memory_order_relaxed);
+				if (n < 32 || (n % 1024) == 0) {
+					LOGF("PREDICATE SYNC #%" PRIu64 ": addr=0x%016" PRIx64 " before=0x%016" PRIx64
+					     " after=0x%016" PRIx64 " synced=%u\n",
+					     n, predicate_address, before, value, synced ? 1u : 0u);
+				}
+			}
+		} break;
+		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
+	}
+	switch (condition) {
+		case 0x00: m_predicate_skip = (value != 0); break;
+		case 0x01: m_predicate_skip = (value == 0); break;
+		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
 	}
 	if (op == 0x03) {
 		static std::atomic<uint32_t> log_count {0};

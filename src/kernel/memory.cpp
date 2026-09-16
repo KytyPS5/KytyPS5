@@ -878,6 +878,44 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+// Publish GPU writes covering a range back into its guest backing, so a subsequent direct read
+// observes what the GPU produced rather than whatever the CPU last left there. Returns false
+// when the range cannot be made current -- off the GPU thread, or owned by an image whose
+// contents live only in a Vulkan image -- and the caller then reads possibly stale memory.
+bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	if (!Graphics::GuestGpu::IsGpuThread() ||
+	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
+	}
+	return true;
+}
+
+// Debug: says which of the four conditions describes a range, so a read that returns zeros can
+// be told apart from a range the GPU never owned, one nothing registered, and one whose bytes
+// are still held in a cached buffer or a Vulkan image.
+void DebugReportGpuBackingState(uint64_t vaddr, uint64_t size, const char* tag) {
+	const bool gpu_range =
+	    g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size);
+	bool registered    = false;
+	bool buffer_dirty  = false;
+	bool image_owned   = false;
+	if (gpu_range) {
+		registered   = GetGpuResources().GetBufferCache().IsRegionRegistered(vaddr, size);
+		buffer_dirty = GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+		image_owned  = GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
+	}
+	LOGF("GPU BACKING [%s]: addr=0x%016" PRIx64 " size=0x%" PRIx64 " gpu_range=%d"
+	     " registered=%d buffer_dirty=%d image_owned=%d gpu_thread=%d\n",
+	     tag, vaddr, size, gpu_range ? 1 : 0, registered ? 1 : 0, buffer_dirty ? 1 : 0,
+	     image_owned ? 1 : 0, Graphics::GuestGpu::IsGpuThread() ? 1 : 0);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

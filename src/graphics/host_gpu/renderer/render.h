@@ -12,6 +12,8 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -220,6 +222,26 @@ private:
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
+
+// The per-draw resource trace costs more than what it measures: a menu frame emits roughly 2500
+// lines, so a short run writes hundreds of megabytes and the frame rate reflects the logging
+// rather than the renderer. Off unless KYTY_DEBUG_GFX_TRACE is set.
+[[nodiscard]] inline bool DebugGfxTraceEnabled() noexcept {
+	static const bool enabled = [] {
+		if (std::getenv("KYTY_DEBUG_GFX_TRACE") != nullptr) {
+			return true;
+		}
+		// The launcher spawns the emulator as a child, so an env var set in another shell never
+		// reaches it; a marker file beside the executable does.
+		FILE* f = std::fopen("gfx_trace.txt", "r");
+		if (f == nullptr) {
+			return false;
+		}
+		(void)std::fclose(f);
+		return true;
+	}();
+	return enabled;
+}
 
 } // namespace Libs::Graphics
 

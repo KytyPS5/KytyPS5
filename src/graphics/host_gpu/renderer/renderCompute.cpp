@@ -372,7 +372,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// compute shader writing a storage image is invisible in it. Name every image a dispatch
 	// binds, with its access mode, so those writes can be matched against the addresses the
 	// compositor consumes.
-	{
+	if (DebugGfxTraceEnabled()) {
 		static std::atomic_uint64_t dbg_dispatch {0};
 		const auto                  dispatch_id = dbg_dispatch.fetch_add(1, std::memory_order_relaxed);
 		for (uint32_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {

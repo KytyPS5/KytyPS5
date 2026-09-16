@@ -949,6 +949,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 					     g_dbg_rt_addr);
 				}
 			}
+			texture_cache.DebugReportStaleBind(binding.image_id, g_dbg_rt_addr);
 			if (dbg_img.info.extent.width == 1920 && dbg_img.info.extent.height == 1080 &&
 			    dbg_img.backing.format == vk::Format::eR16G16B16A16Sfloat) {
 				DebugRecordHdrSampled(dbg_img.info.data.address);

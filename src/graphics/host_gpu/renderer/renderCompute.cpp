@@ -206,6 +206,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
+			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
+			     thread_group_x, thread_group_y, thread_group_z, mode,
+			     sh_ctx.GetCs().cs_regs.data_addr);
+		}
+		return;
+	}
+
 	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
@@ -345,17 +356,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			     std::max(cs_regs.cs_regs.num_thread_z, 1u), thread_group_x, thread_group_y,
 			     thread_group_z);
 		}
-	}
-
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
-			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
-			     thread_group_x, thread_group_y, thread_group_z, mode,
-			     sh_ctx.GetCs().cs_regs.data_addr);
-		}
-		return;
 	}
 
 	buffer.EndRendering();

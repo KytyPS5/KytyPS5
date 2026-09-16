@@ -1206,13 +1206,12 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 					return false_target;
 				}
 				// A return can leave a selection without reaching its merge. Keep the
-				// continuing arm as the merge instead of joining live state with a return.
-				if (graph.Dominates(block.id, false_target) &&
-				    HasLinearPathToTerminal(graph, true_target)) {
+				// continuing arm as the merge. Shared continuations receive a dedicated
+				// gateway in SplitSharedMergeBlock before structured control is emitted.
+				if (HasLinearPathToTerminal(graph, true_target)) {
 					return false_target;
 				}
-				if (graph.Dominates(block.id, true_target) &&
-				    HasLinearPathToTerminal(graph, false_target)) {
+				if (HasLinearPathToTerminal(graph, false_target)) {
 					return true_target;
 				}
 			}

@@ -293,6 +293,16 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		return false;
 	}
 
+	for (size_t i = 0; i < program.bvh_sources.size(); ++i) {
+		const auto& descriptor = values[values.size() - program.bvh_sources.size() + i];
+		if (!active_sources[program.bvh_sources[i]]) continue;
+		const auto& d = descriptor.dwords;
+		if (d[0] == 0 && (d[1] & 0xffu) == 0) continue;
+		if ((d[3] >> 28) != 8 || (d[3] & (1u << 24)) == 0) {
+			return SpecializationFail(
+			    "BVH intersection requires TYPE=8 and triangle return mode 1");
+		}
+	}
 	auto&                   next  = snapshot.resources;
 	const auto&             fill  = program.uniform_fill;
 	const auto              words = fill.fill.words;
@@ -510,8 +520,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
 		}
-		const bool storage      = base.resource_class == ImageResourceClass::Storage;
-		image.fmask             = Prospero::IsFmaskTextureFormat(format);
+		const bool storage = base.resource_class == ImageResourceClass::Storage;
+		image.fmask        = Prospero::IsFmaskTextureFormat(format);
 		if (image.fmask) {
 			if (storage || base.depth_compare ||
 			    image.indirect_root != ImageResource::NoIndirectImage ||
@@ -684,7 +694,11 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 			block.successors.push_back(found->second);
 		}
 		for (const auto& inst: *program.blocks[i]) {
-			const auto op     = inst.GetOpcode();
+			const auto op = inst.GetOpcode();
+			if (op == ValueOpcode::ValidateBvhDescriptor) {
+				block.sources.push_back(inst.Flags<uint32_t>());
+				continue;
+			}
 			const auto buffer = BufferAccessOf(op);
 			const auto image  = ImageOpcodeInfoOf(op);
 			// Any shader write may alias a scalar predicate read, including on a later loop visit.
@@ -723,7 +737,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
 // arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
 static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis,
-                                                      uint32_t depth = 0) {
+                                                        uint32_t depth = 0) {
 	value = value.Resolve();
 	if (depth > 32 || value.GetType() != Type::U32) {
 		return {};
@@ -801,7 +815,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	for (const auto& buffer: program.info.buffers) {
 		if (buffer.read && (!buffer.scalar || buffer.written)) return {};
 	}
-	const auto& memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
+	const auto&     memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
 	UniformFillPlan result;
 	result.fill.resource = memory.resource;
 	Value data;
@@ -809,7 +823,8 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    store->Arg(3).Resolve() != Value(true)) return {};
+		    store->Arg(3).Resolve() != Value(true))
+			return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();
@@ -829,7 +844,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 			return {};
 		result.fill.kind  = UniformFillKind::Image;
 		result.fill.words = 1;
-		data = values->Arg(0);
+		data              = values->Arg(0);
 	} else {
 		if (!program.info.images.empty()) return {};
 		const auto           op = store->GetOpcode();
@@ -839,18 +854,18 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
 		    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
 			return {};
-		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
-		    memory.data_bits != 32 ||
+		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen ||
+		    memory.offset != 0 || memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
 			return {};
 		const auto address = FillIndex(store->Arg(1), 0);
 		if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
-		result.fill.kind = UniformFillKind::Buffer;
+		result.fill.kind            = UniformFillKind::Buffer;
 		result.fill.group_stride[0] = static_cast<uint32_t>((*address)[2]);
-		result.fill.words = memory.data_dwords;
-		data = store->Arg(4);
+		result.fill.words           = memory.data_dwords;
+		data                        = store->Arg(4);
 	}
-	data = data.Resolve();
+	data                        = data.Resolve();
 	const auto*          vector = data.TryInstruction();
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
 	                                 ValueOpcode::CompositeConstructU32x3,
@@ -875,6 +890,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_base             = program.user_data_base;
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
+	plan.bvh_sources                = program.bvh_sources;
 	plan.memory_info                = program.memory_info;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
@@ -947,6 +963,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& sampler: plan.info.samplers) {
 		plan.materialization_sources.push_back(sampler.source);
 	}
+	plan.materialization_sources.insert(plan.materialization_sources.end(),
+	                                    plan.bvh_sources.begin(), plan.bvh_sources.end());
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
@@ -1037,11 +1055,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 	}
 
-	auto memory_info = program.memory_info;
+	auto             memory_info = program.memory_info;
 	const ImageRemap image_remap(specialization);
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
-			auto& inst = *it;
+			auto&      inst         = *it;
 			const auto image_opcode = ImageOpcodeInfoOf(inst.GetOpcode());
 			if (image_opcode.access == ImageAccess::None) {
 				continue;
@@ -1055,16 +1073,17 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
 				// Vulkan MSAA stores each sample directly; FMASK's four-bit fragment indices
 				// therefore map each coverage sample to the same host sample.
-				constexpr uint32_t indices[] = {0x76543210u, 0xfedcba98u};
+				constexpr uint32_t   indices[] = {0x76543210u, 0xfedcba98u};
 				std::array<Value, 2> fragments;
 				for (uint32_t component = 0; component < fragments.size(); component++) {
-					const auto selected = block->PrependNewInst(
-					    it, ValueOpcode::SelectU32, {inst.Arg(2), Value(indices[component]), Value(0u)});
+					const auto selected =
+					    block->PrependNewInst(it, ValueOpcode::SelectU32,
+					                          {inst.Arg(2), Value(indices[component]), Value(0u)});
 					fragments[component] = Value(&*selected);
 				}
-				const auto result = block->PrependNewInst(
-				    it, ValueOpcode::CompositeConstructU32x4,
-				    {fragments[0], fragments[1], Value(0u), Value(0u)});
+				const auto result =
+				    block->PrependNewInst(it, ValueOpcode::CompositeConstructU32x4,
+				                          {fragments[0], fragments[1], Value(0u), Value(0u)});
 				inst.ReplaceUsesWith(Value(&*result));
 				continue;
 			}

@@ -4,6 +4,8 @@ VALUE_OPCODE(Identity, Opaque, Opaque)
 VALUE_OPCODE(Void, Void)
 VALUE_OPCODE(Reference, Void, U1)
 VALUE_OPCODE(ReferenceU32, Void, U32)
+// Checked during resource materialization; emits no SPIR-V instruction.
+VALUE_OPCODE(ValidateBvhDescriptor, Void, U32, U32, U32, U32)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)

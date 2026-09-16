@@ -296,6 +296,51 @@ void TestControlDependentStandaloneLoadStaysTyped() {
         "snapshot");
 }
 
+void TestDynamicBvhAddressStaysOnGpu() {
+  Fixture fixture(3);
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
+  auto &base = fixture.BlockAt(2).AppendNewInst(ValueOpcode::Phi);
+  base.SetFlags(Type::U32);
+  base.AddPhiOperand(&fixture.BlockAt(0), Value(0x1000u));
+  const auto next = fixture.Emit(ValueOpcode::IAdd32, {Value(&base), Value(4u)}, 0, 2);
+  base.AddPhiOperand(&fixture.BlockAt(2), next);
+  const auto read = RawRead(fixture, Address(fixture, Value(&base), Value(0u), 2), Value(0u), memory, 2);
+  Address(fixture, read, Value(0u), 2);
+  const auto size = fixture.Emit(ValueOpcode::BitwiseAnd32, {read, Value(0x3ffu)}, 0, 2);
+  const auto flags = fixture.Emit(ValueOpcode::BitwiseOr32, {size, Value(0x81000000u)}, 0, 2);
+  auto& marker = fixture.BlockAt(2).AppendNewInst(ValueOpcode::ValidateBvhDescriptor, {read, Value(0u), Value(0u), flags});
+  fixture.Plan();
+  Check(marker.GetOpcode() == ValueOpcode::Void, "known BVH flags were not removed before SRT planning");
+  Check(fixture.program.srt_reads.empty(),
+        "loop-dependent BVH address was flattened into a CPU snapshot");
+  Check(read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 && !fixture.program.memory_info[memory].planning_only,
+        "dynamic BVH scalar read lost its GPU memory operation");
+
+  Fixture uncertain;
+  const auto unknown = uncertain.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  const auto flags_or = uncertain.Emit(ValueOpcode::BitwiseOr32, {unknown, Value(0x81000000u)});
+  auto& unproven = uncertain.BlockAt().AppendNewInst(ValueOpcode::ValidateBvhDescriptor, {Value(0x1000u), Value(0u), Value(0u), flags_or});
+  uncertain.Plan();
+  Check(unproven.GetOpcode() == ValueOpcode::ValidateBvhDescriptor, "BVH type validation was removed without proof");
+}
+
+void TestGpuDataPointersAreNotSnapshotted() {
+  Fixture fixture;
+  const auto scalar_memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x30);
+  const auto pointer = RawRead(fixture, Address(fixture, Value(0u), Value(0u)), Value(0u), scalar_memory);
+  const auto flat_memory = fixture.AddMemory(ResourceKind::Flat);
+  const auto data = RawRead(fixture, Address(fixture, pointer, Value(0u)), Value(0u), flat_memory);
+  fixture.Emit(ValueOpcode::ReferenceU32, {data});
+  fixture.Plan();
+  Check(fixture.program.srt_reads.empty() && !fixture.program.memory_info[scalar_memory].planning_only,
+        "GPU-only pointer chain was speculatively snapshotted on the CPU");
+  TestMemory memory;
+  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory};
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(fixture.program, runtime, flat) && flat.empty() && memory.reads == 0,
+        "GPU data pointer was dereferenced during resource materialization");
+}
+
 void TestRuntime64BitDescriptorOps() {
   Fixture fixture;
   const auto shifted = fixture.Emit(ValueOpcode::ShiftLeftLogical64,
@@ -595,6 +640,8 @@ int main() {
     TestCarryAndBitFields();
     TestInvariantAndDivergentPhi();
     TestControlDependentStandaloneLoadStaysTyped();
+    TestDynamicBvhAddressStaysOnGpu();
+    TestGpuDataPointersAreNotSnapshotted();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
     TestSharedIntegerRuntimeDependencies();

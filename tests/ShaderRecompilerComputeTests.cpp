@@ -9178,7 +9178,7 @@ public:
       std::memset(mapped, 0, allocation_size);
       for (uint32_t face = 0; face < layers; face++) {
         const auto depth = depth_at(face, false);
-        for (const auto address : {base, ordinary_address}) {
+        for (const auto address : std::array<uint64_t, 2>{base, ordinary_address}) {
           std::memcpy(reinterpret_cast<void *>(address + face * 0x100),
                       &depth, sizeof(depth));
         }
@@ -26017,6 +26017,63 @@ TestCase DispatcherIrreducibleControlFlow() {
   return test;
 }
 
+// Exercise the captured BVH instruction through the GPU BDA path and compare its four outputs.
+TestCase MimgBvhIntersectRayTriangle() {
+  using O = ShaderOpcode;
+
+  // MIMG 0xe6, NSA, dmask 0xf, vdata/vaddr v5, T# s16, three NSA dwords.
+  constexpr std::array<u32, 5> image{0xf1989f07u, 0x00040505u, 0x4442413du,
+                                    0x4543403eu, 0x00004746u};
+  constexpr uint64_t guest_base = 0x12ffffc000ull;
+  constexpr uint32_t node = 8u; // triangle node, index 1
+  constexpr size_t node_offset = (node & ~7u) << 3u;
+  constexpr size_t backing = 64u;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 16, static_cast<u32>(guest_base >> 8u));
+  AppendSMovLiteral(&code, 17, static_cast<u32>(guest_base >> 40u));
+  AppendSMovLiteral(&code, 18, 1u); // last node index
+  AppendSMovLiteral(&code, 19, 0x81000000u);
+  AppendVMovU32(&code, 5, node);
+  AppendVMovU32(&code, 61, 0x42c80000u); // ray extent
+  AppendVMovU32(&code, 65, 0x3e800000u); // ray origin
+  AppendVMovU32(&code, 66, 0x3e800000u);
+  AppendVMovU32(&code, 68, 0xbf800000u);
+  AppendVMovU32(&code, 62, 0x00000000u); // ray direction
+  AppendVMovU32(&code, 64, 0x00000000u);
+  AppendVMovU32(&code, 67, 0x3f800000u);
+  AppendVMovU32(&code, 69, 0x7f800000u); // ray inverse direction
+  AppendVMovU32(&code, 70, 0x7f800000u);
+  AppendVMovU32(&code, 71, 0x3f800000u);
+  code.insert(code.end(), image.begin(), image.end());
+  AppendStoreVgpr(&code, 5, 0);
+  AppendStoreVgpr(&code, 6, 1);
+  AppendStoreVgpr(&code, 7, 2);
+  AppendStoreVgpr(&code, 8, 3);
+  AppendEnd(&code);
+
+  std::vector<u32> node_data(16u, 0u);
+  node_data[3] = 0x3f800000u; // (0,0,0), (1,0,0), (0,1,0) triangle quad
+  node_data[7] = 0x3f800000u;
+  node_data[9] = 0x3f800000u;
+  node_data[10] = 0x3f800000u;
+  node_data[15] = 0x00000909u; // I/J barycentric selectors
+
+  const auto node_dword = (backing + node_offset) / sizeof(u32);
+  std::vector<u32> initial(node_dword + node_data.size(), 0u);
+  std::copy(node_data.begin(), node_data.end(), initial.begin() + node_dword);
+
+  TestCase test;
+  test.name = "MimgBvhIntersectRayTriangle";
+  test.code = std::move(code);
+  test.initial = std::move(initial);
+  test.expected = {0xbf800000u, 0xbf800000u, 0xbe800000u, 0xbe800000u};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::IMAGE_BVH_INTERSECT_RAY,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.bda_mappings = {{guest_base, static_cast<u32>(backing)}};
+  return test;
+}
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -26333,6 +26390,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
   AddCase(DispatcherIrreducibleControlFlow);
+  AddCase(MimgBvhIntersectRayTriangle);
 
   return cases;
 }
@@ -31161,6 +31219,11 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, MimgBvhIntersectRayTriangle());
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

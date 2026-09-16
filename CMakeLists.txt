@@ -474,6 +474,18 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+# Test Darwin signal-context restoration for SSE4a instructions.
+set(kyty_macos_sse4a_test_targets "")
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
+	add_executable(macos_sse4a_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/MacosSse4aTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis)
+	target_include_directories(macos_sse4a_tests PRIVATE ${inc_headers})
+	list(APPEND kyty_macos_sse4a_test_targets macos_sse4a_tests)
+endif()
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -534,6 +546,10 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	if(kyty_macos_sse4a_test_targets)
+		add_test(NAME macos_sse4a COMMAND $<TARGET_FILE:macos_sse4a_tests>)
+		set_tests_properties(macos_sse4a PROPERTIES TIMEOUT 15)
+	endif()
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -598,6 +614,7 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		${kyty_macos_sse4a_test_targets}
 	)
 endif()
 

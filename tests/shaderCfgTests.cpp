@@ -6169,6 +6169,53 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestPerspectiveCentroidInputs() {
+  constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
+                             std::array{5u, UINT32_MAX, 2u},
+                             std::array{6u, 0u, 2u}, std::array{7u, 2u, 4u}};
+  for (const auto &[inputs, center, centroid] : cases) {
+    const uint32_t other = center == UINT32_MAX ? centroid : center;
+    const std::vector<uint32_t> shader = {
+        EncodeExp0(0x00, 0xf), EncodeExp1(centroid, centroid + 1, other, other + 1),
+        EncodeSopp(0x01)};
+    HW::PixelShaderInfo regs{};
+    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
+    ShaderMappedData mapped{};
+    mapped.code_size_bytes = shader.size() * sizeof(uint32_t);
+    ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+    HW::ShaderRegisters sh{};
+    sh.ps_input_ena = sh.ps_input_addr = inputs;
+    const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+    ShaderPixelInputInfo pixel{};
+    (void)PrepareProgram(regs, sh, mappings, pixel);
+    Check(pixel.ps_perspective_centroid_vgpr == centroid &&
+              pixel.ps_perspective_center_vgpr == center &&
+              pixel.ps_system_input_base == centroid + 2,
+          "perspective-centroid pair did not follow enabled sample/center inputs");
+    const auto key = MakeStageStaticKey(pixel);
+    pixel.ps_perspective_centroid_vgpr = UINT32_MAX;
+    Check(key != MakeStageStaticKey(pixel), "centroid input is missing from shader key");
+    pixel.ps_perspective_centroid_vgpr = centroid;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel;
+    const auto result = RecompileForTest(shader, options);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(SpirvContainsCapability(result.spirv, 52u) &&
+              SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
+              Common::ContainsStr(source, "InterpolateAtCentroid %gl_BaryCoordKHR") &&
+              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
+              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
+          "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+    Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
+          "centroid input changed the shared center builtin's interpolation location");
+    if (center != UINT32_MAX) {
+      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
+            "center pair lost its ordinary barycentric loads when centroid was enabled");
+    }
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestPsInputCountRegisterDecode() {
   HW::Context context;
   // NUM_INTERP is 3 while bit 14 is an independent control flag that must be
@@ -13512,6 +13559,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestPerspectiveCentroidInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

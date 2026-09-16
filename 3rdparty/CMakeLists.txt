@@ -88,6 +88,13 @@ set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 set(SPDLOG_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
 add_subdirectory(spdlog EXCLUDE_FROM_ALL)
 
+if (NOT TARGET FFmpeg::ffmpeg AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	find_package(PkgConfig REQUIRED)
+	pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
+		libavformat libavcodec libswscale libavutil libavfilter libswresample)
+	add_library(FFmpeg::ffmpeg ALIAS PkgConfig::FFMPEG)
+endif()
+
 if (NOT TARGET FFmpeg::ffmpeg)
 	# On macOS the target arch is driven by CMAKE_OSX_ARCHITECTURES, not the host
 	# CMAKE_SYSTEM_PROCESSOR (which reports arm64 even for an x86_64/Rosetta build).

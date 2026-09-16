@@ -384,6 +384,16 @@ static bool codec_is_supported_for_source(AvPlayerSourceType source_type, AVMedi
 	}
 }
 
+static const AVCodec* find_decoder(AVCodecID codec_id) {
+	const auto* decoder = avcodec_find_decoder(codec_id);
+	if (decoder == nullptr && codec_id == AV_CODEC_ID_VP9) {
+		Log::WriteToConsoleAndLog(
+		    "WARNING: AvPlayer: The game requested VP9 video, but FFmpeg has no VP9 "
+		    "decoder. Use FFmpeg with VP9 decoding enabled.\n");
+	}
+	return decoder;
+}
+
 struct PacketDeleter {
 	void operator()(AVPacket* packet) const { av_packet_free(&packet); }
 };
@@ -1064,7 +1074,7 @@ private:
 			     static_cast<int>(s->codecpar->codec_id), static_cast<uint32_t>(source_type));
 			return false;
 		}
-		if (avcodec_find_decoder(s->codecpar->codec_id) == nullptr) {
+		if (find_decoder(s->codecpar->codec_id) == nullptr) {
 			LOGF("\t decoder not found: stream=%d codec=%d\n", id,
 			     static_cast<int>(s->codecpar->codec_id));
 			return false;
@@ -1073,7 +1083,7 @@ private:
 	}
 	bool OpenCodec(int id, AVCodecContext** out) {
 		auto* s   = fmt->streams[id];
-		auto* dec = avcodec_find_decoder(s->codecpar->codec_id);
+		auto* dec = find_decoder(s->codecpar->codec_id);
 		if (dec == nullptr) {
 			LOGF("\t avcodec_find_decoder failed: stream=%d codec=%d\n", id,
 			     static_cast<int>(s->codecpar->codec_id));

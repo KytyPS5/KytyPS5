@@ -6,7 +6,12 @@ on:
     branches: [ main, master ]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
+  SCCACHE_GHA_ENABLED: "true"
   KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
@@ -78,6 +83,9 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: cmd
         run: |
@@ -100,6 +108,8 @@ jobs:
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build
@@ -156,6 +166,9 @@ jobs:
           arch: clang_64
           cache: true
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: bash
         run: |
@@ -180,6 +193,8 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build
@@ -289,9 +304,15 @@ jobs:
             clang \
             glslang-tools \
             libasound2-dev \
+            libavcodec-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
             libdbus-1-dev \
             libgl1-mesa-dev \
             libpulse-dev \
+            libswresample-dev \
+            libswscale-dev \
             libudev-dev \
             libwayland-dev \
             libx11-dev \
@@ -304,6 +325,7 @@ jobs:
             libxss-dev \
             lld \
             ninja-build \
+            pkg-config \
             wayland-protocols
 
       - name: Install Qt 6.10.3
@@ -314,6 +336,9 @@ jobs:
           target: desktop
           arch: linux_gcc_64
           cache: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -339,6 +364,8 @@ jobs:
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
 

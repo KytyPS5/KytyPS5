@@ -1223,13 +1223,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::PrimitiveId));
 		} else if (options.stage == ShaderType::Pixel) {
 			const auto* ps = options.input_info.pixel;
-			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr),
-				                      builtin(IR::StageInputKind::BaryCoordSmooth, 0));
-				entry_ir.SetVectorReg(
-				    static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr + 1u),
-				    builtin(IR::StageInputKind::BaryCoordSmooth, 1));
-			}
+			const auto barycentric_pair = [&](uint32_t reg, IR::StageInputKind kind) {
+				if (reg != UINT32_MAX) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg), builtin(kind, 0));
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg + 1u), builtin(kind, 1));
+				}
+			};
+			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
+			barycentric_pair(ps->ps_perspective_centroid_vgpr,
+			                 IR::StageInputKind::BaryCoordSmoothCentroid);
 			uint32_t reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),

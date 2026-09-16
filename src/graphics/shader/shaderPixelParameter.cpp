@@ -19,19 +19,31 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input) {
 	std::array<bool, 32> used_locations {};
 	for (const auto active_input: active_inputs) {
-		auto location = ShaderPixelParameterMappedLocation(info, active_input);
-		if (location < used_locations.size() && used_locations[location]) {
-			location = active_input;
-			while (location < used_locations.size() && used_locations[location]) {
-				location++;
+		used_locations[ShaderPixelParameterMappedLocation(info, active_input)] = true;
+	}
+	std::array<uint32_t, 64> group_locations;
+	group_locations.fill(UINT32_MAX);
+	for (const auto active_input: active_inputs) {
+		const auto mapped = ShaderPixelParameterMappedLocation(info, active_input);
+		const auto group  = mapped * 2u + ShaderPixelParameterIsFlat(info, active_input);
+		auto&      location = group_locations[group];
+		if (location == UINT32_MAX) {
+			location = mapped;
+			// Smooth and custom interpolation read the same vertex output. Only
+			// differing flat/smooth rectangle outputs need separate locations.
+			if (group_locations[group ^ 1u] != UINT32_MAX) {
+				location = 0;
+				while (location < used_locations.size() && used_locations[location]) {
+					location++;
+				}
+				EXIT_NOT_IMPLEMENTED(location >= used_locations.size());
 			}
-			EXIT_NOT_IMPLEMENTED(location >= used_locations.size());
+			used_locations[location] = true;
 		}
 
 		if (active_input == input) {
 			return location;
 		}
-		used_locations[location] = true;
 	}
 	return ShaderPixelParameterMappedLocation(info, input);
 }

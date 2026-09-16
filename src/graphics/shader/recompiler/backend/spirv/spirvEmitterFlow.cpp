@@ -41,7 +41,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return EmitAddU32(state, local,
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
 	}
-	const auto variable = InputVariableForKind(state, kind);
+	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
+	const auto variable = InputVariableForKind(
+	    state, centroid ? IR::StageInputKind::BaryCoordSmooth : kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
@@ -74,15 +76,24 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}
-	if (kind == IR::StageInputKind::BaryCoordSmooth ||
+	if (centroid || kind == IR::StageInputKind::BaryCoordSmooth ||
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
-		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain,
-		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
-		                          pointer, variable, ConstantU32(state, component + 1u));
-		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+		if (centroid) {
+			const auto coordinates = state.builder.AllocateId();
+			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
+			state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
+			                          GlslStd450(state), GLSLstd450InterpolateAtCentroid, variable);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value,
+			                          coordinates, component + 1u);
+		} else {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+			                          pointer, variable, ConstantU32(state, component + 1u));
+			state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+		}
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}

@@ -673,20 +673,16 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
-	ProcessPm4(execution, 0);
+	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
 
-void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands) {
+void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
-	if (commands.empty()) {
-		return;
-	}
-	auto&      execution  = *g_current_execution;
-	const auto stop_depth = execution.m_buffer_stack.size();
-	execution.m_buffer_stack.push_back({commands});
-	ProcessPm4(execution, stop_depth);
+	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	g_current_execution->m_next_buffer = commands;
+	g_current_execution->m_chain       = chain;
 }
 
 void CommandProcessor::SuspendPm4() {
@@ -694,21 +690,13 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
-void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
-	while (execution.m_buffer_stack.size() > stop_depth) {
+void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}
-		const auto buffer_index = execution.m_buffer_stack.size() - 1;
-		auto&      cursor       = execution.m_buffer_stack[buffer_index];
+		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
-		if (cursor.deferred_advance_dw != 0) {
-			EXIT_IF(cursor.deferred_advance_dw > cursor.commands.size() - cursor.offset_dw);
-			cursor.offset_dw += cursor.deferred_advance_dw;
-			cursor.deferred_advance_dw = 0;
-			execution.m_made_progress  = true;
-			continue;
-		}
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
 			continue;
@@ -784,14 +772,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
-			if (execution.m_buffer_stack.size() > buffer_index + 1) {
-				execution.m_buffer_stack[buffer_index].deferred_advance_dw = packet_dw;
-			}
 			return;
 		}
-		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
-		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
+		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (!execution.m_next_buffer.empty()) {
+			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
+			if (execution.m_chain) {
+				cursor = {execution.m_next_buffer};
+			} else {
+				execution.m_buffer_stack.push_back({execution.m_next_buffer});
+			}
+			execution.m_next_buffer = {};
+		}
 	}
 }
 
@@ -826,57 +819,72 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
-	}
-
 	(void)count_in_dwords;
+	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00: {
+		case 0x00:
 			m_predicate_skip = false;
-		} break;
-		case 0x03: {
+			return;
+		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-
-			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
-
-			switch (condition) {
-				case 0x00: m_predicate_skip = (value != 0); break;
-				case 0x01: m_predicate_skip = (value == 0); break;
-				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
-			}
-			// Debug A/B: KYTY_NO_PREDICATION, or a no_predication.txt file beside the executable,
-			// forces every predicated block to draw. Measured on Beast of Reincarnation: all 128
-			// logged evaluations read value=0 with condition=1, so every one skips, and 1862
-			// predicated packets were dropped in a single run. If the predicate is a GPU query
-			// result that never reaches guest memory, the game is skipping geometry it should be
-			// drawing. The file form exists because the launcher spawns the emulator as a child,
-			// so an env var set in another shell never reaches it.
-			static const bool ignore_predication = [] {
-				if (std::getenv("KYTY_NO_PREDICATION") != nullptr) {
-					return true;
+			// One begin/end pair per DB; bit 63 marks each counter ready.
+			constexpr uint64_t ready_bit = 1ull << 63u;
+			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			for (uint32_t db = 0; db < 16u; db++) {
+				const auto begin = results[db * 2u];
+				const auto end   = results[db * 2u + 1u];
+				if ((begin & end & ready_bit) == 0) {
+					if (wait_op == 0) {
+						SuspendPm4();
+					} else {
+						m_predicate_skip = false;
+					}
+					return;
 				}
-				FILE* f = std::fopen("no_predication.txt", "r");
-				if (f == nullptr) {
-					return false;
-				}
-				(void)std::fclose(f);
-				LOGF("NO PREDICATION: enabled (A/B experiment)\n");
-				return true;
-			}();
-			if (ignore_predication) {
-				m_predicate_skip = false;
-			}
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 128) {
-				LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
-				     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-				     reinterpret_cast<uint64_t>(address), value, condition,
-				     m_predicate_skip ? 1u : 0u, wait_op);
+				value += end - begin;
 			}
 		} break;
+		case 0x03:
+			if (wait_op != 0) {
+				BufferFlushAndWait();
+			}
+			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
+	}
+	switch (condition) {
+		case 0x00: m_predicate_skip = (value != 0); break;
+		case 0x01: m_predicate_skip = (value == 0); break;
+		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+	}
+	// Debug A/B: KYTY_NO_PREDICATION, or a no_predication.txt file beside the executable,
+	// forces every predicated block to draw. The file form exists because the launcher spawns
+	// the emulator as a child, so an env var set in another shell never reaches it.
+	static const bool ignore_predication = [] {
+		if (std::getenv("KYTY_NO_PREDICATION") != nullptr) {
+			return true;
+		}
+		FILE* f = std::fopen("no_predication.txt", "r");
+		if (f == nullptr) {
+			return false;
+		}
+		(void)std::fclose(f);
+		LOGF("NO PREDICATION: enabled (A/B experiment)\n");
+		return true;
+	}();
+	if (ignore_predication) {
+		m_predicate_skip = false;
+	}
+	if (op == 0x03) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 128) {
+			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
+			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
+			     reinterpret_cast<uint64_t>(address), value, condition,
+			     m_predicate_skip ? 1u : 0u, wait_op);
+		}
 	}
 }
 

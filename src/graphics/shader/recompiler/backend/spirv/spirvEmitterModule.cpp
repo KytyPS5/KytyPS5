@@ -388,6 +388,19 @@ void DefineInputs(EmitterState& state) {
 		}
 	}
 	for (auto& input: state.inputs) {
+		if (state.program.stage == ShaderType::Pixel &&
+		    input.kind == IR::StageInputKind::Parameter) {
+			const auto location = PixelParameterLocation(state, input.location);
+			const auto alias = std::ranges::find_if(state.inputs, [&](const InputBinding& other) {
+				return other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&
+				       PixelParameterLocation(state, other.location) == location;
+			});
+			if (alias != state.inputs.end()) {
+				EXIT_IF(alias->per_vertex != input.per_vertex);
+				input.variable_id = alias->variable_id;
+				continue;
+			}
+		}
 		uint32_t type = TypeU32(state);
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:

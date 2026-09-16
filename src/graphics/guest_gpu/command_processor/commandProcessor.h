@@ -32,11 +32,12 @@ private:
 
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
-		uint32_t                  offset_dw           = 0;
-		uint32_t                  deferred_advance_dw = 0;
+		uint32_t                  offset_dw = 0;
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
+	std::span<const uint32_t> m_next_buffer;
+	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
 };
@@ -129,7 +130,7 @@ public:
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
-	void             ProcessIndirectBuffer(std::span<const uint32_t> commands);
+	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
 
@@ -143,7 +144,7 @@ private:
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
-	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }

@@ -1219,6 +1219,8 @@ struct GraphicsCase {
   bool pixel_position_w = false;
   float vertex_clip_w = 1.0f;
   bool pixel_depth_export = false;
+  u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
+  u32 pixel_custom_interpolation_mask = 0;
 };
 
 struct CompiledShader {
@@ -1272,6 +1274,43 @@ size_t CountText(const std::string &text, const std::string &needle) {
     count++;
   }
   return count;
+}
+
+void CheckPixelParameterAliases() {
+  constexpr const char *name = "PixelParameterAliases";
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 2;
+  const std::array<uint32_t, 2> pair = {0, 1};
+  for (const auto flat : {0u, 0x400u}) {
+    pixel.interpolator_settings[0] = flat | 3u;
+    pixel.interpolator_settings[1] = flat | 3u;
+    Require(name, "same-mode nonidentity alias",
+            ShaderPixelParameterLocation(pixel, pair, 0) == 3u &&
+                ShaderPixelParameterLocation(pixel, pair, 1) == 3u,
+            "aliases of one export with the same interpolation mode must "
+            "share that physical location");
+  }
+  pixel.interpolator_settings[0] = 3u;
+  pixel.interpolator_settings[1] = 0x423u;
+  pixel.custom_interpolation_mask = 2u;
+  Require(name, "smooth/custom alias",
+          ShaderPixelParameterLocation(pixel, pair, 0) == 3u &&
+              ShaderPixelParameterLocation(pixel, pair, 1) == 3u,
+          "custom interpolation must retain its shared vertex export");
+
+  pixel.input_num = 3;
+  pixel.custom_interpolation_mask = 0;
+  pixel.interpolator_settings[0] = 0x400u;
+  pixel.interpolator_settings[1] = 0u;
+  pixel.interpolator_settings[2] = 1u;
+  const std::array<uint32_t, 3> active = {0, 1, 2};
+  Require(name, "reserved physical locations",
+          ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
+              ShaderPixelParameterLocation(pixel, active, 1) == 2u &&
+              ShaderPixelParameterLocation(pixel, active, 2) == 1u,
+          "a synthesized opposite-mode alias must not occupy another "
+          "vertex export's physical location");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckRectListShaders() {
@@ -1354,6 +1393,25 @@ void CheckRectListShaders() {
               CountText(evaluation_text, " Location 1") == 2,
           "duplicate pixel mappings must share one vertex input and keep "
           "distinct patch outputs");
+
+  for (const auto flat : {0u, 0x400u}) {
+    pixel.interpolator_settings[0] = flat;
+    pixel.interpolator_settings[1] = flat;
+    const auto shared = BuildRectListShaders(vertex, &pixel);
+    ValidateSpirv(name, shared.control);
+    ValidateSpirv(name, shared.evaluation);
+    Require(name, "same-mode alias disassembly",
+            tools.Disassemble(shared.control, &control_text) &&
+                tools.Disassemble(shared.evaluation, &evaluation_text),
+            "failed to disassemble shared rectangle-list parameters");
+    Require(name, "same-mode interface deduplication",
+            CountText(control_text, " Location 0") == 2 &&
+                CountText(evaluation_text, " Location 0") == 2 &&
+                control_text.find(" Location 1") == std::string::npos &&
+                evaluation_text.find(" Location 1") == std::string::npos,
+            "same-mode aliases must produce one input and one output at "
+            "the shared location in each rectangle-list stage");
+  }
 
   const auto position_only = BuildRectListShaders(vertex, nullptr);
   ValidateSpirv(name, position_only.control);
@@ -1565,6 +1623,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
   pixel_info.ps_system_input_base = 2;
+  pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
+  pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -17352,6 +17412,45 @@ TestCase Vop1SdwaNotCapturedByte0Source() {
   return test;
 }
 
+TestCase Vop1SdwaMovByteDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 3, 30);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(EncodeVop1(0x01, 1, Vgpr(3)));
+  code.push_back(0x7e0202f9u);
+  code.push_back(0x00861280u); // Captured v_mov_b32 v1.byte2, 0, preserve.
+  AppendStoreVgpr(&code, 1, 2);
+
+  // RDNA2 table 88: select any byte, then pad, sign extend, or preserve.
+  for (u32 dst_u = 0; dst_u < 3; dst_u++) {
+    for (u32 dst_sel = 0; dst_sel < 4; dst_sel++) {
+      code.push_back(EncodeVop1(0x01, 1, Vgpr(3)));
+      code.push_back(EncodeVop1(0x01, 1, 249));
+      code.push_back(EncodeVop1Sdwa(2, dst_sel, dst_u));
+      AppendStoreVgpr(&code, 1, 3 + dst_u * 4 + dst_sel);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaMovByteDestinations";
+  test.code = std::move(code);
+  test.initial = {0xa1b2c3d4u, 0x12345680u};
+  test.expected = {0xa1b2c3d4u, 0x12345680u, 0xa100c3d4u,
+                   0x00000080u, 0x00008000u, 0x00800000u, 0x80000000u,
+                   0xffffff80u, 0xffff8000u, 0xff800000u, 0x80000000u,
+                   0xa1b2c380u, 0xa1b280d4u, 0xa180c3d4u, 0x80b2c3d4u};
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcExactByte2Destination() {
   using O = ShaderOpcode;
 
@@ -25514,6 +25613,91 @@ GraphicsCase GraphicsPositionWExport() {
   return test;
 }
 
+GraphicsCase GraphicsPackedHalfCentroid() {
+  GraphicsCase test;
+  test.name = "GraphicsPackedHalfCentroid";
+  test.pixel_perspective_centroid_vgpr = 0;
+  test.pixel_custom_interpolation_mask = 1;
+  test.pixel_interpolator_settings = {0x420u};
+  // Captured ab810715011baef3 interpolation, with attr3.x remapped to attr0.x.
+  test.fragment_code = {
+      0xc8120002u, 0xc80e0000u,             // raw vertex0/vertex1 packed halves
+      0xcc204007u, 0x9c1206f2u,             // low(vertex1) - low(vertex0)
+      0xcc207005u, 0x9c1206f2u,             // high(vertex1) - high(vertex0)
+      0xc80a0001u,                         // raw vertex2
+      0xcc204006u, 0x9c1204f2u,
+      0xcc207003u, 0x9c1204f2u,
+      0xcc20400eu, 0x04120f00u,             // low = I * delta10 + vertex0
+      0xcc20600fu, 0x04120b00u,             // high = I * delta10 + vertex0
+      0x3e1c0306u, 0x3e1e0303u,             // += J * delta20
+      EncodeExp0(0x00, 0xf), EncodeExp1(14, 15, 14, 15)};
+  AppendEnd(&test.fragment_code);
+  // At the pixel center the vertex weights are (5/8, 1/8, 1/4).
+  // Packed values are (0,1), (1,2), (3,3): expected result (0.875, 1.625).
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3c000000u, 0, 0, 0,
+      0x40e00000u, 0xbf800000u, 0x40003c00u, 0, 0, 0,
+      0xbf800000u, 0x40400000u, 0x42004200u, 0, 0, 0};
+  test.expected_pixel = {0x3f600000u, 0x3fd00000u, 0x3f600000u, 0x3fd00000u};
+  test.opcodes = {ShaderOpcode::V_INTERP_MOV_F32, ShaderOpcode::V_FMA_F32, ShaderOpcode::V_MAC_F32,
+                  ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
+GraphicsCase GraphicsPackedHalfInputAlias(bool second_weights) {
+  auto test = GraphicsPackedHalfCentroid();
+  test.name = second_weights ? "GraphicsPackedHalfAliasSecondWeights"
+                            : "GraphicsPackedHalfInputAlias";
+  test.pixel_custom_interpolation_mask = 2u;
+  test.pixel_interpolator_settings = {0u, 0x420u};
+  // The head shader reads one exported vec4 through two logical inputs:
+  // ordinary interpolation and raw per-vertex packed-half interpolation.
+  // Move the captured raw attr0.x loads to logical attr1.x, still mapped to 0.
+  for (const auto word : {0u, 1u, 6u}) {
+    test.fragment_code[word] |= 1u << 10u;
+  }
+  test.fragment_code.resize(test.fragment_code.size() - 3u);
+  test.fragment_code.push_back(EncodeVintrp(0x00, 16, 0, 1, 0));
+  test.fragment_code.push_back(EncodeVintrp(0x01, 16, 0, 1, 1));
+  AppendVMovLiteral(&test.fragment_code, 17, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(14, 15, 16, 17));
+  AppendEnd(&test.fragment_code);
+  // The smooth component (2,4,8) must vary independently of packed UVs.
+  test.vertices[3] = 0x40000000u;
+  test.vertices[9] = 0x40800000u;
+  test.vertices[15] = 0x41000000u;
+  if (second_weights) {
+    // Change the right vertex from x=7 to x=3: weights become (1/2,1/4,1/4).
+    test.vertices[6] = 0x40400000u;
+    test.expected_pixel = {0x3f800000u, 0x3fe00000u, 0x40800000u, 0x3f800000u};
+  } else {
+    test.expected_pixel = {0x3f600000u, 0x3fd00000u, 0x40700000u, 0x3f800000u};
+  }
+  test.opcodes.insert(test.opcodes.end(),
+                      {ShaderOpcode::V_INTERP_P1_F32, ShaderOpcode::V_INTERP_P2_F32,
+                       ShaderOpcode::V_MOV_B32});
+  return test;
+}
+
+GraphicsCase GraphicsSmoothRawInputAlias() {
+  auto test = GraphicsPackedHalfInputAlias(false);
+  test.name = "GraphicsSmoothRawInputAlias";
+  test.pixel_perspective_centroid_vgpr = UINT32_MAX;
+  // No explicit barycentric builtin: alias promotion must discover that the
+  // ordinary input needs weights while the raw alias returns vertex zero.
+  test.fragment_code = {EncodeVintrp(0x00, 0, 0, 1, 0),
+                        EncodeVintrp(0x01, 0, 0, 1, 1),
+                        EncodeVintrp(0x02, 1, 1, 1, 2),
+                        EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 0, 1)};
+  AppendEnd(&test.fragment_code);
+  test.expected_pixel = {0x40700000u, 0x40000000u, 0x40700000u, 0x40000000u};
+  test.opcodes = {ShaderOpcode::V_INTERP_P1_F32, ShaderOpcode::V_INTERP_P2_F32,
+                  ShaderOpcode::V_INTERP_MOV_F32, ShaderOpcode::EXP,
+                  ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   GraphicsCase test;
   test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
@@ -25891,6 +26075,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
+  AddCase(Vop1SdwaMovByteDestinations);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
@@ -26156,6 +26341,10 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
+      GraphicsPackedHalfCentroid(),
+      GraphicsPackedHalfInputAlias(false),
+      GraphicsPackedHalfInputAlias(true),
+      GraphicsSmoothRawInputAlias(),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
@@ -29374,6 +29563,106 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
 }
 
+void CheckPm4Predication(RenderContext &renderer) {
+  constexpr const char *name = "Pm4Predication";
+  constexpr uint64_t ready = 1ull << 63u;
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  processor.BufferInit();
+  alignas(16) std::array<uint64_t, 32> query{};
+  alignas(16) uint64_t boolean = 0;
+  uint32_t predicated = 0;
+  uint32_t unconditional = 0;
+  const auto commands = [&](uint32_t op, uint32_t condition, uint32_t wait,
+                            const void *source) {
+    const auto address = reinterpret_cast<uint64_t>(source);
+    const auto predicated_address = reinterpret_cast<uint64_t>(&predicated);
+    const auto unconditional_address = reinterpret_cast<uint64_t>(&unconditional);
+    return std::array<uint32_t, 14>{
+        // Captured AGC form: c0022000 00010100 <query low> <query high>.
+        0xc0022000u, (op << 16u) | (wait << 12u) | (condition << 8u),
+        static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | 1u, 0,
+        static_cast<uint32_t>(predicated_address),
+        static_cast<uint32_t>(predicated_address >> 32u), 11,
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+        static_cast<uint32_t>(unconditional_address),
+        static_cast<uint32_t>(unconditional_address >> 32u), 22};
+  };
+  const auto check = [&](const char *stage, uint32_t op, uint32_t condition,
+                         uint32_t wait, const void *source, bool skip) {
+    predicated = unconditional = 0;
+    const auto packet = commands(op, condition, wait, source);
+    Pm4Execution execution;
+    Require(name, stage,
+            processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+                processor.ShouldSkipPredicatedPackets() == skip &&
+                predicated == (skip ? 0u : 11u) && unconditional == 22,
+            "predicate polarity, tagged packet execution, or packet consumption is wrong");
+  };
+  struct Case {
+    uint64_t delta;
+    uint32_t condition;
+    bool skip;
+  };
+  constexpr Case cases[]{{1, 1, false}, {1, 0, true},
+                         {0, 1, true}, {0, 0, false}};
+  for (const auto &test : cases) {
+    query.fill(ready | 0x344u);
+    for (size_t db = 0; db < 16; db++) {
+      query[db * 2 + 1] += test.delta;
+    }
+    boolean = test.delta;
+    for (uint32_t wait : {0u, 1u}) {
+      check("ready Z-pass", 1, test.condition, wait, query.data(), test.skip);
+      check("bool preservation", 3, test.condition, wait, &boolean, test.skip);
+    }
+  }
+  query.fill(ready | 0x344u);
+  query[31]++;
+  check("only last DB visible", 1, 1, 0, query.data(), false);
+  check("inverse last DB visibility", 1, 0, 0, query.data(), true);
+  check("clear", 0, 0, 0, nullptr, false);
+
+  // Every begin AND end counter must be ready; no-wait must discard old skip state.
+  for (size_t missing = 0; missing < query.size(); missing++) {
+    query.fill(ready | 0x344u);
+    query[missing] &= ~ready;
+    for (uint32_t condition : {0u, 1u}) {
+      boolean = 0;
+      processor.SetPredication(1, 3, 0, &boolean, 0);
+      check("unavailable no-wait", 1, condition, 1, query.data(), false);
+    }
+  }
+
+  // Retry the same packet when its last DB's begin or end arrives later.
+  for (size_t missing : {30u, 31u}) {
+    query.fill(ready | 0x344u);
+    query[31]++;
+    query[missing] &= ~ready;
+    boolean = 0;
+    processor.SetPredication(1, 3, 0, &boolean, 0);
+    predicated = unconditional = 0;
+    const auto packet = commands(1, 1, 0, query.data());
+    Pm4Execution execution;
+    for (int retry = 0; retry < 2; retry++) {
+      Require(name, "pending wait suspends",
+              processor.Process(execution, packet) == Pm4ProcessResult::Blocked &&
+                  !execution.MadeProgress() && predicated == 0 && unconditional == 0 &&
+                  processor.ShouldSkipPredicatedPackets(),
+              "pending query advanced its packet or changed the prior predicate");
+    }
+    query[missing] |= ready;
+    Require(name, "ready wait resumes",
+            processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+                execution.MadeProgress() && predicated == 11 && unconditional == 22 &&
+                !processor.ShouldSkipPredicatedPackets(),
+            "ready query did not reevaluate and execute the suspended packet's suffix");
+  }
+  processor.BufferWait();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
@@ -30295,6 +30584,89 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
+void CheckPm4IndirectControlFlow(RenderContext &renderer) {
+  constexpr const char *name = "Pm4IndirectControlFlow";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  uint32_t selected = 0;
+  uint32_t returned = 0;
+  const auto address = [](const void *value) {
+    return reinterpret_cast<uint64_t>(value);
+  };
+  const auto write = [&](uint32_t *destination, uint32_t value) {
+    return std::array<uint32_t, 5>{
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+        static_cast<uint32_t>(address(destination)),
+        static_cast<uint32_t>(address(destination) >> 32u), value};
+  };
+  const auto indirect = [&](std::span<const uint32_t> target, bool chain) {
+    uint32_t control = 0x0f200000u | static_cast<uint32_t>(target.size());
+    if (chain) {
+      control |= 1u << 20u;
+    }
+    return std::array<uint32_t, 4>{
+        KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0),
+        static_cast<uint32_t>(address(target.data())),
+        static_cast<uint32_t>(address(target.data()) >> 32u), control};
+  };
+  const auto then_commands = write(&selected, 11);
+  const auto else_commands = write(&selected, 33);
+  const auto branch_suffix = write(&selected, 44);
+  const auto caller_suffix = write(&returned, 22);
+  alignas(8) uint64_t condition = 0;
+  std::array<uint32_t, 19> branch{
+      KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 0,
+      static_cast<uint32_t>(address(&condition)),
+      static_cast<uint32_t>(address(&condition) >> 32u), UINT32_MAX,
+      UINT32_MAX, 1, 0,
+      static_cast<uint32_t>(address(then_commands.data())),
+      static_cast<uint32_t>(address(then_commands.data()) >> 32u),
+      static_cast<uint32_t>(then_commands.size()),
+      static_cast<uint32_t>(address(else_commands.data())),
+      static_cast<uint32_t>(address(else_commands.data()) >> 32u),
+      static_cast<uint32_t>(else_commands.size())};
+  std::copy(branch_suffix.begin(), branch_suffix.end(), branch.begin() + 14);
+  std::array<uint32_t, 9> caller{};
+  const auto call_branch = indirect(branch, false);
+  std::copy(call_branch.begin(), call_branch.end(), caller.begin());
+  std::copy(caller_suffix.begin(), caller_suffix.end(), caller.begin() + 4);
+  for (uint32_t mode : {1u, 2u}) {
+    branch[1] = mode | (3u << 8u);
+    for (uint64_t value : {0ull, 1ull}) {
+      condition = value;
+      selected = returned = 0;
+      uint32_t expected = 44;
+      if (value == 1) {
+        expected = 11;
+      } else if (mode == 2) {
+        expected = 33;
+      }
+      Pm4Execution execution;
+      Require(name, "conditional fetcher replacement",
+              processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
+                  selected == expected && returned == 22,
+              "taken branch resumed its discarded suffix or lost the caller's return");
+    }
+  }
+
+  // This stream exceeds native recursion capacity, while chains need one fetcher cursor.
+  std::vector<std::array<uint32_t, 4>> links(65536);
+  std::span<const uint32_t> target = then_commands;
+  for (auto &link : links) {
+    link = indirect(target, true);
+    target = link;
+  }
+  const auto call_chain = indirect(target, false);
+  std::copy(call_chain.begin(), call_chain.end(), caller.begin());
+  selected = returned = 0;
+  Pm4Execution execution;
+  Require(name, "long chain and call return",
+          processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 11 && returned == 22,
+          "long chain did not complete and return to the original caller");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -30324,7 +30696,7 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   nested[0] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
   nested[1] = static_cast<uint32_t>(address(child.data()));
   nested[2] = static_cast<uint32_t>(address(child.data()) >> 32u);
-  nested[3] = 0x0f200000u | static_cast<uint32_t>(child.size());
+  nested[3] = 0x0f300000u | static_cast<uint32_t>(child.size());
 
   std::array<uint32_t, 14> commands{};
   commands[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
@@ -30347,6 +30719,10 @@ void CheckPm4WaitResume(RenderContext &renderer) {
           processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
               prefix == 11 && child_observation == 0 && suffix == 0,
           "blocked indirect wait did not preserve its command position");
+  Require("Pm4WaitResume", "still blocked",
+          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
+              !execution.MadeProgress() && suffix == 0,
+          "blocked wait advanced or replayed its caller");
 
   label = 1;
   child[4] = 1;
@@ -30538,6 +30914,21 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
+    CheckPixelParameterAliases();
+    CheckRectListShaders();
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(false));
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(true));
+    RunGraphicsCase(&vulkan, GraphicsSmoothRawInputAlias());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;
@@ -30559,6 +30950,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--predication-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4Predication(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--descriptor-heap-only") == 0) {
@@ -30609,11 +31005,20 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
+    CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaMovByteDestinations());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
@@ -30864,6 +31269,7 @@ int main(int argc, char **argv) {
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+  CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
@@ -30878,12 +31284,14 @@ int main(int argc, char **argv) {
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+  CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
+  CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();

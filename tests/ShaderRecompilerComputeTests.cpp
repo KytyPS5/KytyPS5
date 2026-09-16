@@ -30655,6 +30655,27 @@ void CheckAgcDrawIndirectMultiPacket(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "AgcDrawIndirectMulti");
 }
 
+// Single-ended window ({bottom, top, cursor, null, cb, ...}): the dwords must
+// come from `top`, not from a cursor_down the guest never set.
+void CheckAgcSingleEndedBuffer() {
+  std::array<uint32_t, 6> packet{};
+  AgcCommandBufferLayout dcb{packet.data(),
+                             packet.data() + packet.size(),
+                             packet.data(),
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             0};
+  auto *emitted =
+      Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 6);
+
+  Require("AgcSingleEndedBuffer", "top-bounded NOP",
+          emitted == packet.data() && dcb.cursor_up == packet.data() + 6 &&
+              packet[0] == KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_ZERO),
+          "single-ended command buffer did not honor its top bound");
+  std::printf("[host]    %-32s ok\n", "AgcSingleEndedBuffer");
+}
+
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -31335,6 +31356,10 @@ int main(int argc, char **argv) {
     CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--agc-single-ended-only") == 0) {
+    CheckAgcSingleEndedBuffer();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -31543,6 +31568,7 @@ int main(int argc, char **argv) {
   CheckAgcShaderFusion();
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
+  CheckAgcSingleEndedBuffer();
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());

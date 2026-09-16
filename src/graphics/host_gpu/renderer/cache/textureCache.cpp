@@ -208,6 +208,10 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.extent != requested.extent) {
 		return false;
 	}
+	if (cached.resources.levels < requested.resources.levels ||
+	    cached.resources.layers < requested.resources.layers) {
+		return false;
+	}
 	if (cached.samples != requested.samples) {
 		return false;
 	}
@@ -843,6 +847,16 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// PS5 mip tails can expose more levels without increasing the guest allocation.
+		if (requested.pixel_format == cached.info.pixel_format &&
+		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    (requested.data.size > cached.info.data.size ||
+		     (requested.data.size == cached.info.data.size &&
+		      requested.extent == cached.info.extent &&
+		      cached.info.resources.levels > 1 &&
+		      requested.resources.layers == cached.info.resources.layers))) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
@@ -851,9 +865,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                                                             requested.pixel_format)
 			            ? result_id
 			            : ImageId {}};
-		}
-		if (requested.type == cached.info.type && requested.resources > cached.info.resources) {
-			return {ExpandImage(requested, cached_id)};
 		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "

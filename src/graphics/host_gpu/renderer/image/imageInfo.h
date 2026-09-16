@@ -159,6 +159,7 @@ struct ImageViewInfo {
 	vk::ImageAspectFlags aspect      = vk::ImageAspectFlagBits::eColor;
 	uint32_t             base_level  = 0;
 	uint32_t             level_count = 1;
+	uint32_t             min_lod     = 0; // U4.8 clamp relative to base_level.
 	uint32_t             base_layer  = 0;
 	uint32_t             layer_count = 1;
 	vk::ComponentMapping mapping     = {};
@@ -167,9 +168,10 @@ struct ImageViewInfo {
 	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
 		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
 		       base_level == rhs.base_level && level_count == rhs.level_count &&
-		       base_layer == rhs.base_layer && layer_count == rhs.layer_count &&
-		       mapping.r == rhs.mapping.r && mapping.g == rhs.mapping.g &&
-		       mapping.b == rhs.mapping.b && mapping.a == rhs.mapping.a && usage == rhs.usage;
+		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
+		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
+		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
+		       mapping.a == rhs.mapping.a && usage == rhs.usage;
 	}
 };
 

@@ -16,6 +16,13 @@ namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
+SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	runtime.read_memory = runtime.read_specialization_memory != nullptr
+	                          ? runtime.read_specialization_memory
+	                          : +[](void*, uint64_t, uint32_t*) { return false; };
+	return runtime;
+}
+
 const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "vertex";
@@ -646,8 +653,10 @@ private:
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
-				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1));
+				const auto clean_runtime = CleanRuntime(m_runtime);
+				Evaluator  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
+				Evaluator  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
+				                  inst.Arg(1));
 				return active.EvaluateWide(inst.Arg(0), result);
 			}
 			case ValueOpcode::BitCastU32F32:
@@ -892,12 +901,13 @@ private:
 			}
 			case ValueOpcode::SelectU32:
 			case ValueOpcode::SelectU1:
-			case ValueOpcode::SelectF32:
-				if (ternary()) {
-					result = a != 0u ? b : c;
-					return true;
+			case ValueOpcode::SelectF32: {
+				auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+				if (predicate.EvaluateWide(inst.Arg(0), a)) {
+					return Arg(inst, a != 0u ? 1u : 2u, result);
 				}
 				return false;
+			}
 			case ValueOpcode::IEqual32:
 				if (binary()) {
 					result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
@@ -977,7 +987,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
-                                std::vector<uint8_t>& active_sources) {
+                                std::vector<uint8_t>&    active_sources) {
 	if (!program.srt_plan_complete) {
 		return false;
 	}
@@ -985,8 +995,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    runtime.read_specialization_memory == nullptr) {
 		return false;
 	}
-	SrtRuntime clean_runtime  = runtime;
-	clean_runtime.read_memory = runtime.read_specialization_memory;
+	const auto           clean_runtime = CleanRuntime(runtime);
 	Evaluator            clean_evaluator(program, clean_runtime);
 	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	std::vector<uint8_t> active;
@@ -1081,11 +1090,8 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	if (values.size() != results.size()) {
 		return false;
 	}
-	auto clean = runtime;
-	clean.read_memory = runtime.read_specialization_memory != nullptr
-	                        ? runtime.read_specialization_memory
-	                        : +[](void*, uint64_t, uint32_t*) { return false; };
-	Evaluator evaluator(program, clean);
+	const auto clean = CleanRuntime(runtime);
+	Evaluator  evaluator(program, clean);
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (!evaluator.Evaluate(values[i], results[i])) {
 			return false;

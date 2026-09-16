@@ -647,7 +647,8 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 }
 
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
-	if (program.blocks.size() != program.block_info.size()) {
+	// Any shader write may alias a scalar predicate read, including on a later loop visit.
+	if (program.blocks.size() != program.block_info.size() || HasShaderMemoryWrites(program)) {
 		return {};
 	}
 	std::unordered_map<uint32_t, uint32_t> indices;
@@ -687,12 +688,6 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 			const auto op     = inst.GetOpcode();
 			const auto buffer = BufferAccessOf(op);
 			const auto image  = ImageOpcodeInfoOf(op);
-			// Any shader write may alias a scalar predicate read, including on a later loop visit.
-			if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
-			    image.access == ImageAccess::Write || image.access == ImageAccess::Atomic ||
-			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
-				return {};
-			}
 			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
 				continue;
 			}

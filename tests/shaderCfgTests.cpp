@@ -1795,6 +1795,39 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
+void TestDisabledSystemDebugBranch() {
+  using namespace ShaderRecompiler;
+  // Relocate PPSA08709 MS pc 0x530 to zero, retaining its displacement to the
+  // system validation helper immediately after the main shader's S_ENDPGM.
+  std::array<uint32_t, 274> shader;
+  shader.fill(EncodeSopp(0x00));
+  shader[0] = 0xbf97010fu;
+  shader[1] = EncodeVop1(0x01, 1, 129);
+  shader[2] = EncodeMubuf0(0x1c, 0, false);
+  shader[3] = EncodeMubuf1(1, 0, 0);
+  shader[271] = EncodeSopp(0x01);
+  shader[272] = 0xffffffffu; // System-only helper must not be decoded.
+  shader[273] = 0xffffffffu;
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.front().opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS &&
+            decoded.instructions.front().branch_target == 0x440u &&
+            decoded.instructions.back().pc == 0x43cu &&
+            decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+        "disabled system debug branch reached its post-ENDPGM validation helper");
+  auto graph = CFG::BuildGraph(decoded);
+  Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
+            graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
+        "disabled system debug branch changed normal shader control flow");
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "S_CBRANCH_CDBGSYS 0x00000440") &&
+            Common::ContainsStr(result.ir_dump, "StoreBufferU32"),
+        "disabled system debug branch lost its identity or fallthrough write");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -8729,6 +8762,54 @@ void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation() {
+  // PS d6fb5f22c689ceff: an outer EXEC skip and an inner SCC exit share the
+  // continuing arm, which contains another loop and reaches a different return.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128),
+      EncodeSopp(0x04, 7), // outer -> shared loop or preceding work
+      EncodeSMovB32(2, 129),
+      EncodeSopc(0x06, 2, 128), // preceding work loop
+      EncodeSopp(0x04, 2),      // loop -> early-return condition or body
+      EncodeSop2(0x01, 2, 2, 129),
+      EncodeSopp(0x02, -4),
+      EncodeSopc(0x06, 1, 128),
+      EncodeSopp(0x04, 5),      // inner -> private return or shared loop
+      EncodeSopc(0x06, 3, 128), // shared loop header
+      EncodeSopp(0x04, 2),      // loop -> normal return or body
+      EncodeSop2(0x01, 3, 3, 129),
+      EncodeSopp(0x02, -4),  // body -> loop header
+      0xbf810000u,           // normal return
+      EncodeSMovB32(4, 130), // private return epilogue
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+                original_coverage &&
+            graph.natural_loops.size() == 2u,
+        "shared-continuation gateway changed semantic blocks or the loops");
+  Check(std::ranges::none_of(graph.blocks,
+                             [](const auto &block) {
+                               return block.terminator.goto_variable !=
+                                      UINT32_MAX;
+                             }),
+        "private early return introduced unnecessary routing state");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "early return with a shared loop continuation selected the dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0), // outer early-exit condition
@@ -13493,6 +13574,7 @@ int main() {
   TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
   TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
   TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
+  TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation();
   TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph();
@@ -13505,6 +13587,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestOptionalShaderHostFeatures();
+  TestDisabledSystemDebugBranch();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

@@ -304,15 +304,9 @@ jobs:
             clang \
             glslang-tools \
             libasound2-dev \
-            libavcodec-dev \
-            libavfilter-dev \
-            libavformat-dev \
-            libavutil-dev \
             libdbus-1-dev \
             libgl1-mesa-dev \
             libpulse-dev \
-            libswresample-dev \
-            libswscale-dev \
             libudev-dev \
             libwayland-dev \
             libx11-dev \

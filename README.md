@@ -201,6 +201,28 @@ time.
 
 The CMake source root is the repository root.
 
+### Building on NixOS
+
+A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL2 backend
+libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
+`CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
+needed:
+
+```bash
+nix-shell # or: nix develop
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+cmake --build _Build/linux --target launcher --parallel
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The configure step downloads the FFmpeg prebuilts and the `xbyak`/`zydis` sources, so it needs
+network access; a fully sandboxed `nix build` would require vendoring those inputs. A Vulkan 1.3
+driver must be available at runtime (on NixOS, `hardware.graphics.enable = true`).
+
 ### Building on macOS
 
 macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game

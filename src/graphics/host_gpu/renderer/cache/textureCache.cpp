@@ -2070,40 +2070,6 @@ TextureCache::GcStats TextureCache::CollectGarbage() {
 				pressured = false;
 			}
 		}
-		if (!aggressive || m_total_used_memory < m_critical_gc_memory) {
-			return;
-		}
-		// Still critical: the age gate shields the whole working set during streaming
-		// bursts (ticks advance per submit, so 160 ticks may be under a frame). Sweep
-		// oldest-first ignoring age; only evict what can be preserved — clean images
-		// re-upload from CPU backing, dirty ones need a successful download — so this
-		// trades re-upload churn for survival instead of aborting.
-		constexpr size_t kCriticalSweepMax = 96;
-		std::vector<ImageId> swept;
-		swept.reserve(kCriticalSweepMax);
-		m_lru_cache.ForEachItemBelow(UINT64_MAX, [&](ImageId id) {
-			swept.push_back(id);
-			return swept.size() == kCriticalSweepMax;
-		});
-		stats.candidates += swept.size();
-		for (const auto id: swept) {
-			if (m_total_used_memory < release_threshold) {
-				break;
-			}
-			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
-				stats.skipped_invalid++;
-				continue;
-			}
-			if (owner->IsGpuModified()) {
-				if (!SafeToDownload(*owner) || !DownloadImageMemory(id)) {
-					stats.skipped_download++;
-					continue;
-				}
-			}
-			FreeImage(id);
-			stats.freed++;
-		}
 	};
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {

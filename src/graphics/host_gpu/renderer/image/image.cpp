@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstdint>
 #include <xxhash.h>
 
@@ -686,9 +687,18 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+		// LOGF budget lines are suppressed under --printf-direction Silent (the launcher
+		// default), so include everything needed to triage here: EXIT always prints.
+		const auto texels =
+		    static_cast<uint64_t>(create.extent.width) * create.extent.height * create.extent.depth *
+		    create.arrayLayers * create.mipLevels;
+		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u "
+		     "texels=%" PRIu64 " usage=0x%x flags=0x%x samples=%u type=%d\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels, texels,
+		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples,
+		     static_cast<int>(create.imageType));
 	}
 }
 

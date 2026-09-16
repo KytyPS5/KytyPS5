@@ -63,6 +63,10 @@ bool VrEnabled() {
 	return g_config->vr_enabled;
 }
 
+bool AmdCpuEnabled() {
+	return g_config->amd_cpu_enabled;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

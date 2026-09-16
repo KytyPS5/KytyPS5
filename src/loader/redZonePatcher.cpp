@@ -5,6 +5,8 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/virtualMemory.h"
+#include "loader/x64InstructionEmulator.h"
 
 #include <Zydis/Zydis.h>
 #include <algorithm>
@@ -739,10 +741,512 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 	generator.call(ptr[rsp - GuestRedZoneSize - sizeof(uintptr_t)]);
 	return true;
 }
+
+void CollectRedZoneMemoryInstructions(const DecodedFunction& function,
+                                      std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                      RedZonePatchResult& result) {
+	if (!function.uses_red_zone) {
+		return;
+	}
+	for (const auto& [address, decoded]: function.instructions) {
+		if (!decoded.accesses_memory || !decoded.red_zone_live.any() ||
+		    rewrite_sites.contains(address)) {
+			continue;
+		}
+		++result.memory_instruction_count;
+		if (decoded.instruction.length < NearJumpSize) {
+			++result.short_memory_instruction_count;
+		}
+		if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
+		    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+		    decoded.operands[0].size == sizeof(uintptr_t) * CHAR_BIT &&
+		    !IsStackPointerRegister(decoded.operands[0].mem.base) &&
+		    !IsStackPointerRegister(decoded.operands[0].mem.index)) {
+			rewrite_sites[address] = {
+			    .protect_red_zone        = true,
+			    .protected_indirect_call = true,
+			};
+			continue;
+		}
+		if (decoded.uses_stack_pointer && !decoded.replaces_stack_pointer) {
+			++result.stack_dependent_memory_instruction_count;
+			continue;
+		}
+		if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
+		    IsControlFlowTerminator(decoded.instruction)) {
+			++result.control_flow_memory_instruction_count;
+			continue;
+		}
+		rewrite_sites[address].protect_red_zone = true;
+	}
+}
+
+struct ReciprocalSquareRootSite {
+	uintptr_t address;
+	u8        length;
+	bool      requires_red_zone_protection;
+};
+
+void CollectReciprocalSquareRoots(const DecodedFunction& function,
+                                 std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                 std::vector<ReciprocalSquareRootSite>& sites) {
+	for (const auto& [address, decoded]: function.instructions) {
+		if (!X64InstructionEmulator::IsReciprocalSquareRoot(decoded.instruction,
+		                                                    decoded.operands.data())) {
+			continue;
+		}
+		const bool protect_red_zone = decoded.red_zone_live.any();
+		sites.push_back({address, decoded.instruction.length, protect_red_zone});
+		if (protect_red_zone) {
+			rewrite_sites[address].protect_red_zone = true;
+		}
+	}
+}
+
+uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
+                                        std::span<const ReciprocalSquareRootSite> sites,
+                                        uint64_t trampoline_addr, uint64_t trampoline_size) {
+	// Validate every required relocation before introducing any traps.
+	for (const auto& site: sites) {
+		if (site.requires_red_zone_protection &&
+		    !module.patched.contains(reinterpret_cast<u8*>(site.address))) {
+			EXIT("Cannot preserve the guest red zone at emulated VRSQRTPS 0x%016" PRIx64 "\n",
+			     static_cast<u64>(site.address));
+		}
+	}
+
+	uint64_t patched = 0;
+	for (const auto& site: sites) {
+		if (!module.patched.contains(reinterpret_cast<u8*>(site.address))) {
+			patched += X64InstructionEmulator::PatchReciprocalSquareRoots(site.address, site.length);
+		}
+	}
+	return patched +
+	       X64InstructionEmulator::PatchReciprocalSquareRoots(trampoline_addr, trampoline_size);
+}
+
+void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& function,
+                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                RedZonePatchResult& result) {
+	struct RelocationSpan {
+		std::vector<const DecodedCodeInstruction*> instructions;
+		uintptr_t                                  patch_start {};
+		uintptr_t                                  continuation {};
+		size_t                                     patch_size {};
+	};
+
+	const auto emit_span = [&](const RelocationSpan& span) -> std::optional<size_t> {
+		const size_t trampoline_offset = module->trampoline_gen.getSize();
+		if (module->trampoline_exhausted) {
+			return std::nullopt;
+		}
+		try {
+			for (const auto* decoded: span.instructions) {
+				const auto rewrite = rewrite_sites.find(decoded->address);
+				const bool protected_indirect_call =
+				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
+				const bool protect_red_zone = rewrite != rewrite_sites.end() &&
+				                              rewrite->second.protect_red_zone &&
+				                              !protected_indirect_call;
+				if (protect_red_zone) {
+					module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+				}
+				if (protected_indirect_call) {
+					if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
+						module->trampoline_gen.setSize(trampoline_offset);
+						return std::nullopt;
+					}
+				} else if (!EncodeRelocatedInstruction(*decoded, module->trampoline_gen)) {
+					module->trampoline_gen.setSize(trampoline_offset);
+					return std::nullopt;
+				}
+				if (protect_red_zone && !decoded->replaces_stack_pointer) {
+					module->trampoline_gen.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+				}
+			}
+			module->trampoline_gen.jmp(reinterpret_cast<void*>(span.continuation));
+		} catch (const Xbyak::Error& error) {
+			module->trampoline_gen.setSize(trampoline_offset);
+			if (HandleTrampolineError(module, error)) {
+				return std::nullopt;
+			}
+			throw;
+		}
+		return trampoline_offset;
+	};
+
+	const auto record_rewrites = [&](const RelocationSpan& span) {
+		for (const auto* decoded: span.instructions) {
+			module->patched.insert(reinterpret_cast<u8*>(decoded->address));
+			const auto rewrite = rewrite_sites.find(decoded->address);
+			if (rewrite == rewrite_sites.end()) {
+				continue;
+			}
+			if (rewrite->second.protect_red_zone && decoded->accesses_memory) {
+				++result.patched_memory_instruction_count;
+			}
+		}
+	};
+
+	std::vector<std::pair<uintptr_t, uintptr_t>> patched_spans;
+	std::vector<uintptr_t>                       relay_slots;
+	std::vector<uintptr_t>                       short_relay_slots;
+	std::vector<uintptr_t>                       unresolved_sites;
+	uintptr_t                                    covered_until {};
+	for (auto site_it = rewrite_sites.begin(); site_it != rewrite_sites.end(); ++site_it) {
+		const uintptr_t site = site_it->first;
+		if (site < covered_until) {
+			continue;
+		}
+
+		const auto collect_forward_span = [&]() -> std::optional<RelocationSpan> {
+			RelocationSpan span {.patch_start = site, .continuation = site};
+			while (span.patch_size < NearJumpSize) {
+				const auto decoded_it = function.instructions.find(span.continuation);
+				if (decoded_it == function.instructions.end() ||
+				    (span.continuation != site &&
+				     function.branch_targets.contains(span.continuation))) {
+					return std::nullopt;
+				}
+
+				const auto& decoded = decoded_it->second;
+				span.instructions.push_back(&decoded);
+				span.patch_size += decoded.instruction.length;
+				span.continuation += decoded.instruction.length;
+				if (span.patch_size < NearJumpSize &&
+				    IsControlFlowTerminator(decoded.instruction)) {
+					return std::nullopt;
+				}
+			}
+			return span;
+		};
+
+		const auto collect_backward_span = [&]() -> std::optional<RelocationSpan> {
+			const auto site_instruction = function.instructions.find(site);
+			ASSERT(site_instruction != function.instructions.end());
+			RelocationSpan span {
+			    .instructions = {&site_instruction->second},
+			    .patch_start  = site,
+			    .continuation = site + site_instruction->second.instruction.length,
+			    .patch_size   = site_instruction->second.instruction.length,
+			};
+
+			while (span.patch_size < NearJumpSize) {
+				const auto previous_end = function.instructions.lower_bound(span.patch_start);
+				if (previous_end == function.instructions.begin() ||
+				    function.branch_targets.contains(span.patch_start)) {
+					return std::nullopt;
+				}
+
+				const auto  previous = std::prev(previous_end);
+				const auto& decoded  = previous->second;
+				if (previous->first + decoded.instruction.length != span.patch_start ||
+				    previous->first < covered_until ||
+				    IsControlFlowTerminator(decoded.instruction)) {
+					return std::nullopt;
+				}
+
+				span.instructions.insert(span.instructions.begin(), &decoded);
+				span.patch_start = previous->first;
+				span.patch_size += decoded.instruction.length;
+			}
+			return span;
+		};
+
+		std::optional<RelocationSpan> selected_span;
+		std::optional<size_t>         trampoline_offset;
+		const auto&                   site_instruction       = function.instructions.at(site);
+		const bool                    can_relocate_neighbors = !function.has_indirect_branch;
+		if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
+			auto forward_span = collect_forward_span();
+			if (forward_span) {
+				trampoline_offset = emit_span(*forward_span);
+				if (trampoline_offset) {
+					selected_span = std::move(forward_span);
+				}
+			}
+		}
+		if (!selected_span && can_relocate_neighbors) {
+			if (auto backward_span = collect_backward_span()) {
+				trampoline_offset = emit_span(*backward_span);
+				if (trampoline_offset) {
+					selected_span = std::move(backward_span);
+				}
+			}
+		}
+		if (!selected_span) {
+			unresolved_sites.push_back(site);
+			continue;
+		}
+
+		const auto& span       = *selected_span;
+		const auto* trampoline = module->trampoline_gen.getCode() + *trampoline_offset;
+
+		auto& patch_gen = module->patch_gen;
+		patch_gen.reset();
+		patch_gen.setSize(span.patch_start - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+		patch_gen.jmp(trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
+		patch_gen.nop(span.patch_size - NearJumpSize);
+
+		record_rewrites(span);
+		patched_spans.emplace_back(span.patch_start, span.continuation);
+		if (span.patch_size >= NearJumpSize * 2) {
+			relay_slots.push_back(span.patch_start + NearJumpSize);
+		}
+		if (span.patch_size >= NearJumpSize + ShortJumpSize) {
+			short_relay_slots.push_back(span.patch_start + NearJumpSize);
+		}
+		covered_until = span.continuation;
+	}
+
+	const auto record_unsupported = [&](uintptr_t site) {
+		const auto& decoded = function.instructions.at(site);
+		const auto& rewrite = rewrite_sites.at(site);
+		if (rewrite.protect_red_zone && decoded.accesses_memory) {
+			++result.unrelocatable_memory_instruction_count;
+		}
+	};
+	const auto overlaps_patched_span = [&patched_spans](uintptr_t start, uintptr_t end) {
+		return std::ranges::any_of(patched_spans, [start, end](const auto& patched) {
+			return start < patched.second && patched.first < end;
+		});
+	};
+
+	for (const uintptr_t site: unresolved_sites) {
+		if (module->patched.contains(reinterpret_cast<u8*>(site))) {
+			continue;
+		}
+
+		const auto site_instruction = function.instructions.find(site);
+		ASSERT(site_instruction != function.instructions.end());
+		if (function.has_indirect_branch ||
+		    site_instruction->second.instruction.length < ShortJumpSize) {
+			record_unsupported(site);
+			continue;
+		}
+
+		const RelocationSpan site_span {
+		    .instructions = {&site_instruction->second},
+		    .patch_start  = site,
+		    .continuation = site + site_instruction->second.instruction.length,
+		    .patch_size   = site_instruction->second.instruction.length,
+		};
+		const size_t trampoline_start       = module->trampoline_gen.getSize();
+		const auto   site_trampoline_offset = emit_span(site_span);
+		if (!site_trampoline_offset) {
+			record_unsupported(site);
+			continue;
+		}
+
+		constexpr s64 ShortJumpMin = std::numeric_limits<s8>::min();
+		constexpr s64 ShortJumpMax = std::numeric_limits<s8>::max();
+		const auto    relay_slot = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
+			const s64 displacement =
+			    static_cast<s64>(address) - static_cast<s64>(site + ShortJumpSize);
+			return displacement >= ShortJumpMin && displacement <= ShortJumpMax;
+		});
+		if (relay_slot != relay_slots.end()) {
+			const auto* site_trampoline =
+			    module->trampoline_gen.getCode() + *site_trampoline_offset;
+
+			auto& patch_gen = module->patch_gen;
+			patch_gen.reset();
+			patch_gen.setSize(*relay_slot - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.jmp(site_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
+
+			patch_gen.reset();
+			patch_gen.setSize(site - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.jmp(reinterpret_cast<void*>(*relay_slot),
+			              Xbyak::CodeGenerator::LabelType::T_SHORT);
+			patch_gen.nop(site_span.patch_size - ShortJumpSize);
+
+			record_rewrites(site_span);
+			patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
+			std::erase(short_relay_slots, *relay_slot);
+			relay_slots.erase(relay_slot);
+			continue;
+		}
+
+		const auto find_host = [&](uintptr_t short_jump_address) {
+			std::pair<std::optional<RelocationSpan>, std::optional<size_t>> result;
+			const s64 minimum_host = static_cast<s64>(short_jump_address) +
+			                         static_cast<s64>(ShortJumpSize) -
+			                         static_cast<s64>(NearJumpSize) + ShortJumpMin;
+			const s64 maximum_host = static_cast<s64>(short_jump_address) +
+			                         static_cast<s64>(ShortJumpSize) -
+			                         static_cast<s64>(NearJumpSize) + ShortJumpMax;
+
+			auto candidate = function.instructions.lower_bound(
+			    static_cast<uintptr_t>(std::max<s64>(minimum_host, 0)));
+			for (; candidate != function.instructions.end() &&
+			       static_cast<s64>(candidate->first) <= maximum_host;
+			     ++candidate) {
+				RelocationSpan span {.patch_start  = candidate->first,
+				                     .continuation = candidate->first};
+				while (span.patch_size < NearJumpSize * 2) {
+					const auto instruction = function.instructions.find(span.continuation);
+					if (instruction == function.instructions.end() ||
+					    (span.continuation != span.patch_start &&
+					     function.branch_targets.contains(span.continuation))) {
+						span.instructions.clear();
+						break;
+					}
+					span.instructions.push_back(&instruction->second);
+					span.patch_size += instruction->second.instruction.length;
+					span.continuation += instruction->second.instruction.length;
+					if (span.patch_size < NearJumpSize * 2 &&
+					    IsControlFlowTerminator(instruction->second.instruction)) {
+						span.instructions.clear();
+						break;
+					}
+				}
+				if (span.instructions.empty() ||
+				    !(span.continuation <= site ||
+				      span.patch_start >= site_span.continuation) ||
+				    overlaps_patched_span(span.patch_start, span.continuation)) {
+					continue;
+				}
+
+				const uintptr_t relay_address = span.patch_start + NearJumpSize;
+				const s64 displacement = static_cast<s64>(relay_address) -
+				                         static_cast<s64>(short_jump_address + ShortJumpSize);
+				if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
+					continue;
+				}
+
+				const auto offset = emit_span(span);
+				if (!offset) {
+					continue;
+				}
+				result.first  = std::move(span);
+				result.second = offset;
+				break;
+			}
+			return result;
+		};
+
+		auto [host_span, host_trampoline_offset] = find_host(site);
+		std::optional<uintptr_t>       final_relay_slot;
+		uintptr_t                      final_short_jump = site;
+		std::map<uintptr_t, uintptr_t> relay_parent {{site, site}};
+		std::vector<uintptr_t>         relay_queue {site};
+		for (size_t queue_index = 0;
+		     !host_span && !final_relay_slot && queue_index < relay_queue.size();
+		     ++queue_index) {
+			const uintptr_t current = relay_queue[queue_index];
+			if (current != site) {
+				if (std::ranges::find(relay_slots, current) != relay_slots.end()) {
+					final_relay_slot = current;
+					final_short_jump = relay_parent.at(current);
+					break;
+				}
+				const auto near_slot =
+				    std::ranges::find_if(relay_slots, [current](uintptr_t address) {
+					    const s64 displacement = static_cast<s64>(address) -
+					                             static_cast<s64>(current + ShortJumpSize);
+					    return address != current && displacement >= ShortJumpMin &&
+					           displacement <= ShortJumpMax;
+				    });
+				if (near_slot != relay_slots.end()) {
+					final_relay_slot = *near_slot;
+					final_short_jump = current;
+					break;
+				}
+
+				auto bridge_host = find_host(current);
+				if (bridge_host.first) {
+					host_span              = std::move(bridge_host.first);
+					host_trampoline_offset = bridge_host.second;
+					final_short_jump       = current;
+					break;
+				}
+			}
+
+			for (const uintptr_t slot: short_relay_slots) {
+				if (relay_parent.contains(slot)) {
+					continue;
+				}
+				const s64 displacement =
+				    static_cast<s64>(slot) - static_cast<s64>(current + ShortJumpSize);
+				if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
+					continue;
+				}
+				relay_parent.emplace(slot, current);
+				relay_queue.push_back(slot);
+			}
+		}
+
+		if (!host_span && !final_relay_slot) {
+			module->trampoline_gen.setSize(trampoline_start);
+			record_unsupported(site);
+			continue;
+		}
+
+		const auto* site_trampoline =
+		    module->trampoline_gen.getCode() + *site_trampoline_offset;
+		auto&     patch_gen = module->patch_gen;
+		uintptr_t relay_address {};
+		if (final_relay_slot) {
+			relay_address = *final_relay_slot;
+			patch_gen.reset();
+			patch_gen.setSize(relay_address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.jmp(site_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
+			std::erase(relay_slots, relay_address);
+			std::erase(short_relay_slots, relay_address);
+		} else {
+			ASSERT(host_span && host_trampoline_offset);
+			const auto* host_trampoline =
+			    module->trampoline_gen.getCode() + *host_trampoline_offset;
+			relay_address = host_span->patch_start + NearJumpSize;
+
+			patch_gen.reset();
+			patch_gen.setSize(host_span->patch_start -
+			                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.jmp(host_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
+			patch_gen.jmp(site_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
+			patch_gen.nop(host_span->patch_size - NearJumpSize * 2);
+		}
+
+		uintptr_t jump_target = relay_address;
+		while (final_short_jump != site) {
+			patch_gen.reset();
+			patch_gen.setSize(final_short_jump -
+			                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.jmp(reinterpret_cast<void*>(jump_target),
+			              Xbyak::CodeGenerator::LabelType::T_SHORT);
+			jump_target       = final_short_jump;
+			const auto parent = relay_parent.find(final_short_jump);
+			ASSERT(parent != relay_parent.end());
+			final_short_jump = parent->second;
+			std::erase(relay_slots, jump_target);
+			std::erase(short_relay_slots, jump_target);
+		}
+
+		patch_gen.reset();
+		patch_gen.setSize(site - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+		patch_gen.jmp(reinterpret_cast<void*>(jump_target),
+		              Xbyak::CodeGenerator::LabelType::T_SHORT);
+		patch_gen.nop(site_span.patch_size - ShortJumpSize);
+
+		if (host_span) {
+			record_rewrites(*host_span);
+			patched_spans.emplace_back(host_span->patch_start, host_span->continuation);
+			if (host_span->patch_size >= NearJumpSize * 3) {
+				relay_slots.push_back(host_span->patch_start + NearJumpSize * 2);
+			}
+			if (host_span->patch_size >= NearJumpSize * 2 + ShortJumpSize) {
+				short_relay_slots.push_back(host_span->patch_start + NearJumpSize * 2);
+			}
+		}
+		record_rewrites(site_span);
+		patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
+	}
+}
 } // namespace
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
+                                          std::span<const uintptr_t> function_starts,
+                                          bool protect_memory, bool emulate_rsqrt) {
 	RedZonePatchResult result {};
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
@@ -762,6 +1266,8 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 	starts.erase(unique_end, starts.end());
 
 	std::unique_lock lock {module->mutex};
+	const size_t trampoline_begin = module->trampoline_gen.getSize();
+	std::vector<ReciprocalSquareRootSite> reciprocal_sqrt_sites;
 	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
 		const uintptr_t function_start = starts[function_index];
 		const uintptr_t function_end =
@@ -780,461 +1286,36 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 		if (function.uses_red_zone) {
 			++result.red_zone_function_count;
 			result.indirect_red_zone_function_count += function.has_indirect_branch;
-			for (const auto& [address, decoded]: function.instructions) {
-				if (!decoded.accesses_memory || !decoded.red_zone_live.any() ||
-				    rewrite_sites.contains(address)) {
-					continue;
-				}
-				++result.memory_instruction_count;
-				if (decoded.instruction.length < NearJumpSize) {
-					++result.short_memory_instruction_count;
-				}
-				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
-				    decoded.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-				    decoded.operands[0].size == sizeof(uintptr_t) * CHAR_BIT &&
-				    !IsStackPointerRegister(decoded.operands[0].mem.base) &&
-				    !IsStackPointerRegister(decoded.operands[0].mem.index)) {
-					rewrite_sites[address] = {
-					    .protect_red_zone        = true,
-					    .protected_indirect_call = true,
-					};
-					continue;
-				}
-				if (decoded.uses_stack_pointer && !decoded.replaces_stack_pointer) {
-					++result.stack_dependent_memory_instruction_count;
-					continue;
-				}
-				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
-				    IsControlFlowTerminator(decoded.instruction)) {
-					++result.control_flow_memory_instruction_count;
-					continue;
-				}
-				rewrite_sites[address].protect_red_zone = true;
-			}
 		}
-		if (rewrite_sites.empty()) {
-			continue;
+		if (protect_memory) {
+			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
-
-		struct RelocationSpan {
-			std::vector<const DecodedCodeInstruction*> instructions;
-			uintptr_t                                  patch_start {};
-			uintptr_t                                  continuation {};
-			size_t                                     patch_size {};
-		};
-
-		const auto emit_span = [&](const RelocationSpan& span) -> std::optional<size_t> {
-			const size_t trampoline_offset = module->trampoline_gen.getSize();
-			if (module->trampoline_exhausted) {
-				return std::nullopt;
-			}
-			try {
-				for (const auto* decoded: span.instructions) {
-					const auto rewrite = rewrite_sites.find(decoded->address);
-					const bool protected_indirect_call =
-					    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
-					const bool protect_red_zone = rewrite != rewrite_sites.end() &&
-					                              rewrite->second.protect_red_zone &&
-					                              !protected_indirect_call;
-					if (protect_red_zone) {
-						module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
-					}
-					if (protected_indirect_call) {
-						if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
-							module->trampoline_gen.setSize(trampoline_offset);
-							return std::nullopt;
-						}
-					} else if (!EncodeRelocatedInstruction(*decoded, module->trampoline_gen)) {
-						module->trampoline_gen.setSize(trampoline_offset);
-						return std::nullopt;
-					}
-					if (protect_red_zone && !decoded->replaces_stack_pointer) {
-						module->trampoline_gen.lea(rsp, ptr[rsp + GuestRedZoneSize]);
-					}
-				}
-				module->trampoline_gen.jmp(reinterpret_cast<void*>(span.continuation));
-			} catch (const Xbyak::Error& error) {
-				module->trampoline_gen.setSize(trampoline_offset);
-				if (HandleTrampolineError(module, error)) {
-					return std::nullopt;
-				}
-				throw;
-			}
-			return trampoline_offset;
-		};
-
-		const auto record_rewrites = [&](const RelocationSpan& span) {
-			for (const auto* decoded: span.instructions) {
-				const auto rewrite = rewrite_sites.find(decoded->address);
-				if (rewrite == rewrite_sites.end()) {
-					continue;
-				}
-				if (rewrite->second.protect_red_zone) {
-					++result.patched_memory_instruction_count;
-				}
-				module->patched.insert(reinterpret_cast<u8*>(decoded->address));
-			}
-		};
-
-		std::vector<std::pair<uintptr_t, uintptr_t>> patched_spans;
-		std::vector<uintptr_t>                       relay_slots;
-		std::vector<uintptr_t>                       short_relay_slots;
-		std::vector<uintptr_t>                       unresolved_sites;
-		uintptr_t                                    covered_until {};
-		for (auto site_it = rewrite_sites.begin(); site_it != rewrite_sites.end(); ++site_it) {
-			const uintptr_t site = site_it->first;
-			if (site < covered_until) {
-				continue;
-			}
-
-			const auto collect_forward_span = [&]() -> std::optional<RelocationSpan> {
-				RelocationSpan span {.patch_start = site, .continuation = site};
-				while (span.patch_size < NearJumpSize) {
-					const auto decoded_it = function.instructions.find(span.continuation);
-					if (decoded_it == function.instructions.end() ||
-					    (span.continuation != site &&
-					     function.branch_targets.contains(span.continuation))) {
-						return std::nullopt;
-					}
-
-					const auto& decoded = decoded_it->second;
-					span.instructions.push_back(&decoded);
-					span.patch_size += decoded.instruction.length;
-					span.continuation += decoded.instruction.length;
-					if (span.patch_size < NearJumpSize &&
-					    IsControlFlowTerminator(decoded.instruction)) {
-						return std::nullopt;
-					}
-				}
-				return span;
-			};
-
-			const auto collect_backward_span = [&]() -> std::optional<RelocationSpan> {
-				const auto site_instruction = function.instructions.find(site);
-				ASSERT(site_instruction != function.instructions.end());
-				RelocationSpan span {
-				    .instructions = {&site_instruction->second},
-				    .patch_start  = site,
-				    .continuation = site + site_instruction->second.instruction.length,
-				    .patch_size   = site_instruction->second.instruction.length,
-				};
-
-				while (span.patch_size < NearJumpSize) {
-					const auto previous_end = function.instructions.lower_bound(span.patch_start);
-					if (previous_end == function.instructions.begin() ||
-					    function.branch_targets.contains(span.patch_start)) {
-						return std::nullopt;
-					}
-
-					const auto  previous = std::prev(previous_end);
-					const auto& decoded  = previous->second;
-					if (previous->first + decoded.instruction.length != span.patch_start ||
-					    previous->first < covered_until ||
-					    IsControlFlowTerminator(decoded.instruction)) {
-						return std::nullopt;
-					}
-
-					span.instructions.insert(span.instructions.begin(), &decoded);
-					span.patch_start = previous->first;
-					span.patch_size += decoded.instruction.length;
-				}
-				return span;
-			};
-
-			std::optional<RelocationSpan> selected_span;
-			std::optional<size_t>         trampoline_offset;
-			const auto&                   site_instruction       = function.instructions.at(site);
-			const bool                    can_relocate_neighbors = !function.has_indirect_branch;
-			if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
-				auto forward_span = collect_forward_span();
-				if (forward_span) {
-					trampoline_offset = emit_span(*forward_span);
-					if (trampoline_offset) {
-						selected_span = std::move(forward_span);
-					}
-				}
-			}
-			if (!selected_span && can_relocate_neighbors) {
-				if (auto backward_span = collect_backward_span()) {
-					trampoline_offset = emit_span(*backward_span);
-					if (trampoline_offset) {
-						selected_span = std::move(backward_span);
-					}
-				}
-			}
-			if (!selected_span) {
-				unresolved_sites.push_back(site);
-				continue;
-			}
-
-			const auto& span       = *selected_span;
-			const auto* trampoline = module->trampoline_gen.getCode() + *trampoline_offset;
-
-			auto& patch_gen = module->patch_gen;
-			patch_gen.reset();
-			patch_gen.setSize(span.patch_start - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-			patch_gen.jmp(trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
-			patch_gen.nop(span.patch_size - NearJumpSize);
-
-			record_rewrites(span);
-			patched_spans.emplace_back(span.patch_start, span.continuation);
-			if (span.patch_size >= NearJumpSize * 2) {
-				relay_slots.push_back(span.patch_start + NearJumpSize);
-			}
-			if (span.patch_size >= NearJumpSize + ShortJumpSize) {
-				short_relay_slots.push_back(span.patch_start + NearJumpSize);
-			}
-			covered_until = span.continuation;
+		if (emulate_rsqrt) {
+			CollectReciprocalSquareRoots(function, rewrite_sites, reciprocal_sqrt_sites);
 		}
-
-		const auto record_unsupported = [&](uintptr_t site) {
-			const auto& rewrite = rewrite_sites.at(site);
-			if (rewrite.protect_red_zone) {
-				++result.unrelocatable_memory_instruction_count;
-			}
-		};
-		const auto overlaps_patched_span = [&patched_spans](uintptr_t start, uintptr_t end) {
-			return std::ranges::any_of(patched_spans, [start, end](const auto& patched) {
-				return start < patched.second && patched.first < end;
-			});
-		};
-
-		for (const uintptr_t site: unresolved_sites) {
-			if (module->patched.contains(reinterpret_cast<u8*>(site))) {
-				continue;
-			}
-
-			const auto site_instruction = function.instructions.find(site);
-			ASSERT(site_instruction != function.instructions.end());
-			if (function.has_indirect_branch ||
-			    site_instruction->second.instruction.length < ShortJumpSize) {
-				record_unsupported(site);
-				continue;
-			}
-
-			const RelocationSpan site_span {
-			    .instructions = {&site_instruction->second},
-			    .patch_start  = site,
-			    .continuation = site + site_instruction->second.instruction.length,
-			    .patch_size   = site_instruction->second.instruction.length,
-			};
-			const size_t trampoline_start       = module->trampoline_gen.getSize();
-			const auto   site_trampoline_offset = emit_span(site_span);
-			if (!site_trampoline_offset) {
-				record_unsupported(site);
-				continue;
-			}
-
-			constexpr s64 ShortJumpMin = std::numeric_limits<s8>::min();
-			constexpr s64 ShortJumpMax = std::numeric_limits<s8>::max();
-			const auto    relay_slot = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
-				const s64 displacement =
-				    static_cast<s64>(address) - static_cast<s64>(site + ShortJumpSize);
-				return displacement >= ShortJumpMin && displacement <= ShortJumpMax;
-			});
-			if (relay_slot != relay_slots.end()) {
-				const auto* site_trampoline =
-				    module->trampoline_gen.getCode() + *site_trampoline_offset;
-
-				auto& patch_gen = module->patch_gen;
-				patch_gen.reset();
-				patch_gen.setSize(*relay_slot - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-				patch_gen.jmp(site_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
-
-				patch_gen.reset();
-				patch_gen.setSize(site - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-				patch_gen.jmp(reinterpret_cast<void*>(*relay_slot),
-				              Xbyak::CodeGenerator::LabelType::T_SHORT);
-				patch_gen.nop(site_span.patch_size - ShortJumpSize);
-
-				record_rewrites(site_span);
-				patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
-				std::erase(short_relay_slots, *relay_slot);
-				relay_slots.erase(relay_slot);
-				continue;
-			}
-
-			const auto find_host = [&](uintptr_t short_jump_address) {
-				std::pair<std::optional<RelocationSpan>, std::optional<size_t>> result;
-				const s64 minimum_host = static_cast<s64>(short_jump_address) +
-				                         static_cast<s64>(ShortJumpSize) -
-				                         static_cast<s64>(NearJumpSize) + ShortJumpMin;
-				const s64 maximum_host = static_cast<s64>(short_jump_address) +
-				                         static_cast<s64>(ShortJumpSize) -
-				                         static_cast<s64>(NearJumpSize) + ShortJumpMax;
-
-				auto candidate = function.instructions.lower_bound(
-				    static_cast<uintptr_t>(std::max<s64>(minimum_host, 0)));
-				for (; candidate != function.instructions.end() &&
-				       static_cast<s64>(candidate->first) <= maximum_host;
-				     ++candidate) {
-					RelocationSpan span {.patch_start  = candidate->first,
-					                     .continuation = candidate->first};
-					while (span.patch_size < NearJumpSize * 2) {
-						const auto instruction = function.instructions.find(span.continuation);
-						if (instruction == function.instructions.end() ||
-						    (span.continuation != span.patch_start &&
-						     function.branch_targets.contains(span.continuation))) {
-							span.instructions.clear();
-							break;
-						}
-						span.instructions.push_back(&instruction->second);
-						span.patch_size += instruction->second.instruction.length;
-						span.continuation += instruction->second.instruction.length;
-						if (span.patch_size < NearJumpSize * 2 &&
-						    IsControlFlowTerminator(instruction->second.instruction)) {
-							span.instructions.clear();
-							break;
-						}
-					}
-					if (span.instructions.empty() ||
-					    !(span.continuation <= site ||
-					      span.patch_start >= site_span.continuation) ||
-					    overlaps_patched_span(span.patch_start, span.continuation)) {
-						continue;
-					}
-
-					const uintptr_t relay_address = span.patch_start + NearJumpSize;
-					const s64 displacement = static_cast<s64>(relay_address) -
-					                         static_cast<s64>(short_jump_address + ShortJumpSize);
-					if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
-						continue;
-					}
-
-					const auto offset = emit_span(span);
-					if (!offset) {
-						continue;
-					}
-					result.first  = std::move(span);
-					result.second = offset;
-					break;
-				}
-				return result;
-			};
-
-			auto [host_span, host_trampoline_offset] = find_host(site);
-			std::optional<uintptr_t>       final_relay_slot;
-			uintptr_t                      final_short_jump = site;
-			std::map<uintptr_t, uintptr_t> relay_parent {{site, site}};
-			std::vector<uintptr_t>         relay_queue {site};
-			for (size_t queue_index = 0;
-			     !host_span && !final_relay_slot && queue_index < relay_queue.size();
-			     ++queue_index) {
-				const uintptr_t current = relay_queue[queue_index];
-				if (current != site) {
-					if (std::ranges::find(relay_slots, current) != relay_slots.end()) {
-						final_relay_slot = current;
-						final_short_jump = relay_parent.at(current);
-						break;
-					}
-					const auto near_slot =
-					    std::ranges::find_if(relay_slots, [current](uintptr_t address) {
-						    const s64 displacement = static_cast<s64>(address) -
-						                             static_cast<s64>(current + ShortJumpSize);
-						    return address != current && displacement >= ShortJumpMin &&
-						           displacement <= ShortJumpMax;
-					    });
-					if (near_slot != relay_slots.end()) {
-						final_relay_slot = *near_slot;
-						final_short_jump = current;
-						break;
-					}
-
-					auto bridge_host = find_host(current);
-					if (bridge_host.first) {
-						host_span              = std::move(bridge_host.first);
-						host_trampoline_offset = bridge_host.second;
-						final_short_jump       = current;
-						break;
-					}
-				}
-
-				for (const uintptr_t slot: short_relay_slots) {
-					if (relay_parent.contains(slot)) {
-						continue;
-					}
-					const s64 displacement =
-					    static_cast<s64>(slot) - static_cast<s64>(current + ShortJumpSize);
-					if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
-						continue;
-					}
-					relay_parent.emplace(slot, current);
-					relay_queue.push_back(slot);
-				}
-			}
-
-			if (!host_span && !final_relay_slot) {
-				module->trampoline_gen.setSize(trampoline_start);
-				record_unsupported(site);
-				continue;
-			}
-
-			const auto* site_trampoline =
-			    module->trampoline_gen.getCode() + *site_trampoline_offset;
-			auto&     patch_gen = module->patch_gen;
-			uintptr_t relay_address {};
-			if (final_relay_slot) {
-				relay_address = *final_relay_slot;
-				patch_gen.reset();
-				patch_gen.setSize(relay_address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-				patch_gen.jmp(site_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
-				std::erase(relay_slots, relay_address);
-				std::erase(short_relay_slots, relay_address);
-			} else {
-				ASSERT(host_span && host_trampoline_offset);
-				const auto* host_trampoline =
-				    module->trampoline_gen.getCode() + *host_trampoline_offset;
-				relay_address = host_span->patch_start + NearJumpSize;
-
-				patch_gen.reset();
-				patch_gen.setSize(host_span->patch_start -
-				                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-				patch_gen.jmp(host_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
-				patch_gen.jmp(site_trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
-				patch_gen.nop(host_span->patch_size - NearJumpSize * 2);
-			}
-
-			uintptr_t jump_target = relay_address;
-			while (final_short_jump != site) {
-				patch_gen.reset();
-				patch_gen.setSize(final_short_jump -
-				                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-				patch_gen.jmp(reinterpret_cast<void*>(jump_target),
-				              Xbyak::CodeGenerator::LabelType::T_SHORT);
-				jump_target       = final_short_jump;
-				const auto parent = relay_parent.find(final_short_jump);
-				ASSERT(parent != relay_parent.end());
-				final_short_jump = parent->second;
-				std::erase(relay_slots, jump_target);
-				std::erase(short_relay_slots, jump_target);
-			}
-
-			patch_gen.reset();
-			patch_gen.setSize(site - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
-			patch_gen.jmp(reinterpret_cast<void*>(jump_target),
-			              Xbyak::CodeGenerator::LabelType::T_SHORT);
-			patch_gen.nop(site_span.patch_size - ShortJumpSize);
-
-			if (host_span) {
-				record_rewrites(*host_span);
-				patched_spans.emplace_back(host_span->patch_start, host_span->continuation);
-				if (host_span->patch_size >= NearJumpSize * 3) {
-					relay_slots.push_back(host_span->patch_start + NearJumpSize * 2);
-				}
-				if (host_span->patch_size >= NearJumpSize * 2 + ShortJumpSize) {
-					short_relay_slots.push_back(host_span->patch_start + NearJumpSize * 2);
-				}
-			}
-			record_rewrites(site_span);
-			patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
+		if (!rewrite_sites.empty()) {
+			RelocateRedZoneInstructions(module, function, rewrite_sites, result);
 		}
+	}
+	// Preserve valid instruction encodings throughout CFG analysis and relocation.
+	// Only now turn reciprocal roots into traps, including the relocated copies.
+	const auto trampoline_addr =
+	    reinterpret_cast<u64>(module->trampoline_gen.getCode()) + trampoline_begin;
+	const auto trampoline_size = module->trampoline_gen.getSize() - trampoline_begin;
+	if (emulate_rsqrt) {
+		result.reciprocal_sqrt_instruction_count = ApplyReciprocalSquareRootPatches(
+		    *module, reciprocal_sqrt_sites, trampoline_addr, trampoline_size);
+	}
+	Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
+	if (trampoline_size != 0) {
+		Common::VirtualMemory::FlushInstructionCache(trampoline_addr, trampoline_size);
 	}
 	return result;
 }
 
 #else
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
+RedZonePatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool) {
 	return {};
 }
 

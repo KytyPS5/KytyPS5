@@ -97,8 +97,11 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 		}
 	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveStep() const {
-		return input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
-		           ? 1u : InputPrimitiveSize();
+		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
+			case Prospero::PrimitiveType::kTriFan:
+			case Prospero::PrimitiveType::kTriStrip: return 1u;
+			default: return InputPrimitiveSize();
+		}
 	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveCount(uint32_t vertices) const {
 		const auto size = InputPrimitiveSize();

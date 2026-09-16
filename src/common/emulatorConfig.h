@@ -48,6 +48,7 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   vr_enabled                  = false;
+	bool                   amd_cpu_enabled             = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -83,6 +84,7 @@ PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     VrEnabled();
+bool     AmdCpuEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();

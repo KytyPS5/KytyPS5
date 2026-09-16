@@ -2,7 +2,13 @@
 
 #include "common/common.h"
 
+#include <Zydis/Zydis.h>
+#include <bit>
 #include <cstring>
+#if !defined(__APPLE__)
+#include <emmintrin.h>
+#include <xmmintrin.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -400,57 +406,89 @@ static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const 
 	}
 }
 
+#if !defined(__APPLE__)
+
+// Keep instruction semantics shared; only access to the saved host context differs.
+struct Context {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PCONTEXT native;
 
-static void LoadXmmWordsWin(const M128A* xmm, XmmWords& out) {
-	out.w[0] = static_cast<uint32_t>(xmm->Low);
-	out.w[1] = static_cast<uint32_t>(xmm->Low >> 32u);
-	out.w[2] = static_cast<uint32_t>(xmm->High);
-	out.w[3] = static_cast<uint32_t>(xmm->High >> 32u);
-}
+	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
+	void                   Advance(size_t length) { native->Rip += length; }
+	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
-static void StoreXmmWordsWin(M128A* xmm, const XmmWords& in) {
-	xmm->Low  = static_cast<uint64_t>(in.w[0]) | (static_cast<uint64_t>(in.w[1]) << 32u);
-	xmm->High = static_cast<uint64_t>(in.w[2]) | (static_cast<uint64_t>(in.w[3]) << 32u);
-}
+	void LoadGprs(uint64_t (&gpr)[16]) const {
+		const uint64_t registers[] = {native->Rax, native->Rcx, native->Rdx, native->Rbx,
+		                              native->Rsp, native->Rbp, native->Rsi, native->Rdi,
+		                              native->R8,  native->R9,  native->R10, native->R11,
+		                              native->R12, native->R13, native->R14, native->R15};
+		std::memcpy(gpr, registers, sizeof(gpr));
+	}
 
+	void ClearUpperYmm(uint8_t index) const {
+		if ((native->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+			return;
+		}
+		DWORD64 features = 0;
+		if (!GetXStateFeaturesMask(native, &features) || (features & XSTATE_MASK_AVX) == 0) {
+			return; // An absent AVX component restores zeroes.
+		}
+		DWORD size = 0;
+		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
+		if (ymm != nullptr && size >= (index + 1u) * sizeof(M128A)) {
+			ymm[index] = {};
+		}
+	}
+#else
+	ucontext_t* native;
+
+	[[nodiscard]] uint64_t Rip() const {
+		return static_cast<uint64_t>(native->uc_mcontext.gregs[REG_RIP]);
+	}
+	void Advance(size_t length) {
+		native->uc_mcontext.gregs[REG_RIP] += static_cast<greg_t>(length);
+	}
+	[[nodiscard]] void* Xmm(uint8_t index) const {
+		if (native->uc_mcontext.fpregs == nullptr) {
+			return nullptr;
+		}
+		return native->uc_mcontext.fpregs->_xmm[index].element;
+	}
+
+	void LoadGprs(uint64_t (&gpr)[16]) const {
+		constexpr int registers[] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
+		                             REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
+		                             REG_R12, REG_R13, REG_R14, REG_R15};
+		for (size_t i = 0; i < 16; ++i) {
+			gpr[i] = static_cast<uint64_t>(native->uc_mcontext.gregs[registers[i]]);
+		}
+	}
+
+	void ClearUpperYmm(uint8_t index) const {
+		// Linux signal frames use the standard XSAVE layout. An absent AVX component
+		// already restores the architectural initial value (all zeroes).
+		auto*    state    = reinterpret_cast<uint8_t*>(native->uc_mcontext.fpregs);
+		uint32_t magic    = 0;
+		uint32_t size     = 0;
+		uint64_t features = 0;
+		std::memcpy(&magic, state + 464, sizeof(magic));
+		if (magic != 0x46505853) {
+			return;
+		}
+		std::memcpy(&size, state + 480, sizeof(size));
+		if (size < 832) {
+			return;
+		}
+		std::memcpy(&features, state + 512, sizeof(features));
+		if ((features & 4) != 0) {
+			std::memset(state + 576 + index * 16, 0, 16);
+		}
+	}
 #endif
+};
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-
-static M128A* GetContextXmm(PCONTEXT context, uint8_t index) {
-	if (context == nullptr || index >= 16) {
-		return nullptr;
-	}
-
-	return &context->Xmm0 + index;
-}
-
-static void LoadContextGprsWin(PCONTEXT context, uint64_t (&gpr)[16]) {
-	gpr[0]  = context->Rax;
-	gpr[1]  = context->Rcx;
-	gpr[2]  = context->Rdx;
-	gpr[3]  = context->Rbx;
-	gpr[4]  = context->Rsp;
-	gpr[5]  = context->Rbp;
-	gpr[6]  = context->Rsi;
-	gpr[7]  = context->Rdi;
-	gpr[8]  = context->R8;
-	gpr[9]  = context->R9;
-	gpr[10] = context->R10;
-	gpr[11] = context->R11;
-	gpr[12] = context->R12;
-	gpr[13] = context->R13;
-	gpr[14] = context->R14;
-	gpr[15] = context->R15;
-}
-
-static bool TryEmulateShaNi(PCONTEXT context) {
-	if (context == nullptr) {
-		return false;
-	}
-
-	const auto* rip = reinterpret_cast<const uint8_t*>(context->Rip);
+static bool TryEmulateShaNi(Context& context) {
+	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	ShaNiInsn   insn {};
 	if (!DecodeShaNiInsn(rip, insn)) {
 		return false;
@@ -458,8 +496,8 @@ static bool TryEmulateShaNi(PCONTEXT context) {
 
 	const uint8_t modrm_byte = rip[insn.modrm_offset];
 	const uint8_t dest_index = ShaNiRegIndex(modrm_byte, insn.rex, true);
-	auto*         dest_xmm   = GetContextXmm(context, dest_index);
-	auto*         xmm0       = GetContextXmm(context, 0);
+	auto*         dest_xmm   = context.Xmm(dest_index);
+	auto*         xmm0       = context.Xmm(0);
 	if (dest_xmm == nullptr || xmm0 == nullptr) {
 		return false;
 	}
@@ -467,20 +505,20 @@ static bool TryEmulateShaNi(PCONTEXT context) {
 	XmmWords dest {};
 	XmmWords src2 {};
 	XmmWords xmm0_words {};
-	LoadXmmWordsWin(dest_xmm, dest);
-	LoadXmmWordsWin(xmm0, xmm0_words);
+	std::memcpy(&dest, dest_xmm, sizeof(dest));
+	std::memcpy(&xmm0_words, xmm0, sizeof(xmm0_words));
 
 	if (ShaNiModrmIsRegister(modrm_byte)) {
 		const uint8_t src_index = ShaNiRegIndex(modrm_byte, insn.rex, false);
-		auto*         src_xmm   = GetContextXmm(context, src_index);
+		auto*         src_xmm   = context.Xmm(src_index);
 		if (src_xmm == nullptr) {
 			return false;
 		}
-		LoadXmmWordsWin(src_xmm, src2);
+		std::memcpy(&src2, src_xmm, sizeof(src2));
 	} else {
 		uint64_t    gpr[16] {};
 		const void* source = nullptr;
-		LoadContextGprsWin(context, gpr);
+		context.LoadGprs(gpr);
 		if (!ResolveShaNiMemoryAddress(rip, insn, gpr, source)) {
 			return false;
 		}
@@ -491,18 +529,13 @@ static bool TryEmulateShaNi(PCONTEXT context) {
 		return false;
 	}
 
-	StoreXmmWordsWin(dest_xmm, dest);
-	context->Rip += insn.length;
+	std::memcpy(dest_xmm, &dest, sizeof(dest));
+	context.Advance(insn.length);
 	return true;
 }
 
-static bool TryEmulateSse4a(PCONTEXT context) {
-	if (context == nullptr) {
-		return false;
-	}
-
-	const auto* rip = reinterpret_cast<const uint8_t*>(context->Rip);
-
+static bool TryEmulateSse4a(Context& context) {
+	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
 	const uint8_t prefix = rip[0];
 	if (prefix != 0x66 && prefix != 0xf2) {
 		return false;
@@ -511,210 +544,13 @@ static bool TryEmulateSse4a(PCONTEXT context) {
 	size_t  offset = 1;
 	uint8_t rex    = 0;
 	if ((rip[offset] & 0xf0u) == 0x40u) {
-		rex = rip[offset];
-		offset++;
+		rex = rip[offset++];
 	}
-
 	if (rip[offset] != 0x0f || rip[offset + 1] != 0x78) {
 		return false;
 	}
 
-	auto modrm = rip[offset + 2];
-	if ((modrm & 0xc0u) != 0xc0u) {
-		return false;
-	}
-
-	const uint8_t reg    = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm     = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
-	const uint8_t length = rip[offset + 3];
-	const uint8_t index  = rip[offset + 4];
-
-	// AMD SSE4a immediate-form EXTRQ/INSERTQ. PS5 code can execute these natively on AMD hardware,
-	// while Intel hosts raise an illegal-instruction exception.
-	if (prefix == 0x66) {
-		auto* dst = GetContextXmm(context, rm);
-		if (dst == nullptr) {
-			return false;
-		}
-
-		dst->Low  = ExtractBitField(dst->Low, length, index);
-		dst->High = 0;
-		context->Rip += offset + 5;
-		return true;
-	}
-
-	auto* dst = GetContextXmm(context, reg);
-	auto* src = GetContextXmm(context, rm);
-	if (dst == nullptr || src == nullptr) {
-		return false;
-	}
-
-	dst->Low = InsertBitField(dst->Low, src->Low, length, index);
-	context->Rip += offset + 5;
-	return true;
-}
-
-static bool TryEmulateMonitorxMwaitx(PCONTEXT context) {
-	if (context == nullptr) {
-		return false;
-	}
-
-	const auto* rip = reinterpret_cast<const uint8_t*>(context->Rip);
-	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
-		return false;
-	}
-
-	// AMD MONITORX/MWAITX are used by PS5 code in wait loops. Intel hosts can raise an illegal-
-	// instruction exception, so approximate them as a no-op/yield pair.
-	if (rip[2] == 0xfb) {
-		SwitchToThread();
-	}
-	context->Rip += 3;
-	return true;
-}
-
-#elif !defined(__APPLE__)
-
-// Linux signal contexts expose registers through ucontext_t.
-
-static uint32_t* GetContextXmm(ucontext_t* context, uint8_t index) {
-	if (context == nullptr || index >= 16) {
-		return nullptr;
-	}
-
-	auto* fpregs = context->uc_mcontext.fpregs;
-	if (fpregs == nullptr) {
-		return nullptr;
-	}
-
-	return static_cast<uint32_t*>(fpregs->_xmm[index].element);
-}
-
-static void LoadContextGprsLin(ucontext_t* context, uint64_t (&gpr)[16]) {
-	gpr[0]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RAX]);
-	gpr[1]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RCX]);
-	gpr[2]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RDX]);
-	gpr[3]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RBX]);
-	gpr[4]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RSP]);
-	gpr[5]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RBP]);
-	gpr[6]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RSI]);
-	gpr[7]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RDI]);
-	gpr[8]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R8]);
-	gpr[9]  = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R9]);
-	gpr[10] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R10]);
-	gpr[11] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R11]);
-	gpr[12] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R12]);
-	gpr[13] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R13]);
-	gpr[14] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R14]);
-	gpr[15] = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_R15]);
-}
-
-static void LoadXmmWordsLin(const uint32_t* xmm, XmmWords& out) {
-	out.w[0] = xmm[0];
-	out.w[1] = xmm[1];
-	out.w[2] = xmm[2];
-	out.w[3] = xmm[3];
-}
-
-static void StoreXmmWordsLin(uint32_t* xmm, const XmmWords& in) {
-	xmm[0] = in.w[0];
-	xmm[1] = in.w[1];
-	xmm[2] = in.w[2];
-	xmm[3] = in.w[3];
-}
-
-static bool TryEmulateShaNi(ucontext_t* context) {
-	if (context == nullptr) {
-		return false;
-	}
-
-	auto&       rip_reg = context->uc_mcontext.gregs[REG_RIP];
-	const auto* rip     = reinterpret_cast<const uint8_t*>(rip_reg);
-	ShaNiInsn   insn {};
-	if (!DecodeShaNiInsn(rip, insn)) {
-		return false;
-	}
-
-	const uint8_t modrm_byte = rip[insn.modrm_offset];
-	const uint8_t dest_index = ShaNiRegIndex(modrm_byte, insn.rex, true);
-	auto*         dest_xmm   = GetContextXmm(context, dest_index);
-	auto*         xmm0       = GetContextXmm(context, 0);
-	if (dest_xmm == nullptr || xmm0 == nullptr) {
-		return false;
-	}
-
-	XmmWords dest {};
-	XmmWords src2 {};
-	XmmWords xmm0_words {};
-	LoadXmmWordsLin(dest_xmm, dest);
-	LoadXmmWordsLin(xmm0, xmm0_words);
-
-	if (ShaNiModrmIsRegister(modrm_byte)) {
-		const uint8_t src_index = ShaNiRegIndex(modrm_byte, insn.rex, false);
-		auto*         src_xmm   = GetContextXmm(context, src_index);
-		if (src_xmm == nullptr) {
-			return false;
-		}
-		LoadXmmWordsLin(src_xmm, src2);
-	} else {
-		uint64_t    gpr[16] {};
-		const void* source = nullptr;
-		LoadContextGprsLin(context, gpr);
-		if (!ResolveShaNiMemoryAddress(rip, insn, gpr, source)) {
-			return false;
-		}
-		std::memcpy(&src2, source, sizeof(src2));
-	}
-
-	if (!ExecuteShaNiInsn(insn, src2, xmm0_words, dest)) {
-		return false;
-	}
-
-	StoreXmmWordsLin(dest_xmm, dest);
-	rip_reg += static_cast<greg_t>(insn.length);
-	return true;
-}
-
-static uint64_t GetXmmLow(const uint32_t* xmm) {
-	return static_cast<uint64_t>(xmm[0]) | (static_cast<uint64_t>(xmm[1]) << 32u);
-}
-
-static void SetXmmLow(uint32_t* xmm, uint64_t value) {
-	xmm[0] = static_cast<uint32_t>(value);
-	xmm[1] = static_cast<uint32_t>(value >> 32u);
-}
-
-static void SetXmmHigh(uint32_t* xmm, uint64_t value) {
-	xmm[2] = static_cast<uint32_t>(value);
-	xmm[3] = static_cast<uint32_t>(value >> 32u);
-}
-
-static bool TryEmulateSse4a(ucontext_t* context) {
-	if (context == nullptr) {
-		return false;
-	}
-
-	auto& rip_reg = context->uc_mcontext.gregs[REG_RIP];
-
-	const auto* rip = reinterpret_cast<const uint8_t*>(rip_reg);
-
-	const uint8_t prefix = rip[0];
-	if (prefix != 0x66 && prefix != 0xf2) {
-		return false;
-	}
-
-	size_t  offset = 1;
-	uint8_t rex    = 0;
-	if ((rip[offset] & 0xf0u) == 0x40u) {
-		rex = rip[offset];
-		offset++;
-	}
-
-	if (rip[offset] != 0x0f || rip[offset + 1] != 0x78) {
-		return false;
-	}
-
-	auto modrm = rip[offset + 2];
+	const uint8_t modrm = rip[offset + 2];
 	if ((modrm & 0xc0u) != 0xc0u) {
 		return false;
 	}
@@ -725,58 +561,170 @@ static bool TryEmulateSse4a(ucontext_t* context) {
 	const uint8_t index  = rip[offset + 4];
 
 	// AMD SSE4a immediate-form EXTRQ/INSERTQ.
+	uint8_t dest_index = reg;
 	if (prefix == 0x66) {
-		auto* dst = GetContextXmm(context, rm);
-		if (dst == nullptr) {
-			return false;
-		}
-
-		SetXmmLow(dst, ExtractBitField(GetXmmLow(dst), length, index));
-		SetXmmHigh(dst, 0);
-		rip_reg += static_cast<greg_t>(offset + 5);
-		return true;
+		dest_index = rm;
 	}
-
-	auto* dst = GetContextXmm(context, reg);
-	auto* src = GetContextXmm(context, rm);
-	if (dst == nullptr || src == nullptr) {
+	auto* dest_xmm = context.Xmm(dest_index);
+	auto* src_xmm  = context.Xmm(rm);
+	if (dest_xmm == nullptr || src_xmm == nullptr) {
 		return false;
 	}
-
-	SetXmmLow(dst, InsertBitField(GetXmmLow(dst), GetXmmLow(src), length, index));
-	rip_reg += static_cast<greg_t>(offset + 5);
+	uint64_t dest[2] {};
+	uint64_t source = 0;
+	std::memcpy(dest, dest_xmm, sizeof(dest));
+	std::memcpy(&source, src_xmm, sizeof(source));
+	if (prefix == 0x66) {
+		dest[0] = ExtractBitField(dest[0], length, index);
+		dest[1] = 0;
+	} else {
+		dest[0] = InsertBitField(dest[0], source, length, index);
+	}
+	std::memcpy(dest_xmm, dest, sizeof(dest));
+	context.Advance(offset + 5);
 	return true;
 }
 
-static bool TryEmulateMonitorxMwaitx(ucontext_t* context) {
-	if (context == nullptr) {
-		return false;
-	}
-
-	auto& rip_reg = context->uc_mcontext.gregs[REG_RIP];
-
-	const auto* rip = reinterpret_cast<const uint8_t*>(rip_reg);
+static bool TryEmulateMonitorxMwaitx(Context& context) {
+	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
 		return false;
 	}
 
 	// Approximate AMD MONITORX/MWAITX as no-op/yield.
 	if (rip[2] == 0xfb) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		SwitchToThread();
+#else
 		::sched_yield();
+#endif
 	}
-	rip_reg += 3;
+	context.Advance(3);
+	return true;
+}
+
+static uint32_t ReciprocalSquareRoot(uint32_t bits) {
+	const uint32_t magnitude = bits & 0x7fffffffu;
+	const uint32_t exponent  = magnitude & 0x7f800000u;
+	if (exponent == 0) {
+		// RSQRT treats denormals as signed zero regardless of MXCSR.DAZ.
+		return (bits & 0x80000000u) | 0x7f800000u;
+	}
+	if (magnitude > 0x7f800000u) {
+		return bits | 0x00400000u; // Quiet NaNs without raising an exception.
+	}
+	if ((bits & 0x80000000u) != 0) {
+		return 0xffc00000u;
+	}
+	if (magnitude == 0x7f800000u) {
+		return 0;
+	}
+
+	// A deterministic accurate estimate meets the instruction's relative-error
+	// bound without relying on the host vendor's approximation table.
+	const __m128d input  = _mm_set_sd(static_cast<double>(std::bit_cast<float>(bits)));
+	const __m128d result = _mm_div_sd(_mm_set_sd(1.0), _mm_sqrt_sd(input, input));
+	return std::bit_cast<uint32_t>(_mm_cvtss_f32(_mm_cvtsd_ss(_mm_setzero_ps(), result)));
+}
+
+static bool TryEmulateReciprocalSquareRoot(Context& context) {
+	const auto* rip            = reinterpret_cast<const uint8_t*>(context.Rip());
+	size_t      prefix_size    = 0;
+	uint8_t     dest_extension = 0;
+	uint8_t     src_extension  = 0;
+	if (rip[0] == 0xc5 && (rip[1] & 0x7fu) == 0x70u) {
+		prefix_size    = 2;
+		dest_extension = (~rip[1] & 0x80u) >> 4u;
+	} else if (rip[0] == 0xc4 && (rip[1] & 0x1fu) == 1 && (rip[2] & 0x7fu) == 0x70u) {
+		prefix_size    = 3;
+		dest_extension = (~rip[1] & 0x80u) >> 4u;
+		src_extension  = (~rip[1] & 0x20u) >> 2u;
+	} else {
+		return false;
+	}
+	if (rip[prefix_size] != 0x52 || (rip[prefix_size + 1] & 0xc0u) != 0xc0u) {
+		return false;
+	}
+
+	const uint8_t modrm    = rip[prefix_size + 1];
+	const uint8_t dest     = ((modrm >> 3u) & 7u) | dest_extension;
+	const uint8_t source   = (modrm & 7u) | src_extension;
+	auto*         dest_xmm = context.Xmm(dest);
+	auto*         src_xmm  = context.Xmm(source);
+	if (dest_xmm == nullptr || src_xmm == nullptr) {
+		return false;
+	}
+	XmmWords result {};
+	std::memcpy(&result, src_xmm, sizeof(result));
+	// RSQRT ignores the rounding mode and never changes guest exception flags.
+	// Mask host exceptions while calculating, then restore the handler's state.
+	const uint32_t mxcsr = _mm_getcsr();
+	_mm_setcsr(0x1f80);
+	for (auto& word: result.w) {
+		word = ReciprocalSquareRoot(word);
+	}
+	_mm_setcsr(mxcsr);
+	std::memcpy(dest_xmm, &result, sizeof(result));
+	context.ClearUpperYmm(dest);
+	context.Advance(prefix_size + 2);
 	return true;
 }
 
 #endif
 
+bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
+                            const ZydisDecodedOperand* operands) {
+	return instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+	       instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
+	       instruction.raw.vex.offset == 0 && operands[0].size == 128 &&
+	       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
+}
+
+uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
+	uint64_t patched = 0;
+#if !defined(__APPLE__)
+	ZydisDecoder decoder {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+		return 0;
+	}
+	for (uint64_t offset = 0; offset < size;) {
+		auto*                   code = reinterpret_cast<uint8_t*>(address + offset);
+		ZydisDecodedInstruction instruction {};
+		ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+		if (!ZYAN_SUCCESS(
+		        ZydisDecoderDecodeFull(&decoder, code, size - offset, &instruction, operands))) {
+			++offset;
+			continue;
+		}
+		if (IsReciprocalSquareRoot(instruction, operands)) {
+			// vvvv is reserved (must be 1111b). Clear one bit to route this
+			// otherwise intact instruction through the illegal-instruction emulator.
+			code[instruction.raw.vex.size - 1] &= ~0x08u;
+			++patched;
+		}
+		offset += instruction.length;
+	}
+#else
+	(void)address;
+	(void)size;
+#endif
+	return patched;
+}
+
 bool TryEmulate(void* native_context) {
+#if !defined(__APPLE__)
+	if (native_context == nullptr) {
+		return false;
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	auto* context = static_cast<PCONTEXT>(native_context);
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
-	       TryEmulateShaNi(context);
-#elif !defined(__APPLE__)
-	auto* context = static_cast<ucontext_t*>(native_context);
+	Context context {static_cast<PCONTEXT>(native_context)};
+#else
+	Context context {static_cast<ucontext_t*>(native_context)};
+#endif
+	if (TryEmulateReciprocalSquareRoot(context)) {
+		return true;
+	}
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
 #else

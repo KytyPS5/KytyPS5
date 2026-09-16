@@ -14,7 +14,7 @@ namespace Loader {
 struct RedZonePatchResult {
 	uint64_t function_count                           = 0;
 	uint64_t instruction_count                        = 0;
-	uint64_t red_zone_function_count                  = 0;
+	uint64_t red_zone_function_count                   = 0;
 	uint64_t memory_instruction_count                 = 0;
 	uint64_t short_memory_instruction_count           = 0;
 	uint64_t patched_memory_instruction_count         = 0;
@@ -22,14 +22,17 @@ struct RedZonePatchResult {
 	uint64_t control_flow_memory_instruction_count    = 0;
 	uint64_t unrelocatable_memory_instruction_count   = 0;
 	uint64_t indirect_red_zone_function_count         = 0;
+	uint64_t reciprocal_sqrt_instruction_count        = 0;
 };
 
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,
                                 uint64_t trampoline_area_size);
 void UnregisterRedZonePatchModule(void* module_ptr);
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(uint64_t segment_addr, uint64_t segment_size,
-                                                  std::span<const uintptr_t> function_starts);
+// Analyze and protect fault sites before replacing reciprocal roots with traps.
+RedZonePatchResult PatchGuestInstructions(uint64_t segment_addr, uint64_t segment_size,
+                                          std::span<const uintptr_t> function_starts,
+                                          bool protect_memory, bool emulate_rsqrt);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);

@@ -9672,6 +9672,15 @@ void TestMergedShaderUserDataSnapshot() {
                          params.user_data.begin() + 8),
           "monolithic NGG shader used stale GS-back state or lost its s8 user data");
   }
+  context.SetMaxOutputPerSubgroup(256);
+  context.SetGsMaxVertOut(8);
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriFan);
+  user_config.SetGeControl({32, 32});
+  ShaderVertexInputInfo fan_input{};
+  PrepareProgram(regs, context, user_config, fan_input);
+  Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
+            fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
+        "captured triangle-fan GS configuration lost its subgroup assembly limits");
 }
 
 void TestEmbeddedFetchPreservesSharedScalarLoad() {
@@ -9857,6 +9866,18 @@ void TestMeshInputAssembly() {
        0x40000305, 1, 2, 3, 0, 15, false},
       {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
        0x40000305, 2, 1, 3, 0, 12, false},
+      {Prospero::PrimitiveType::kTriFan, 32, 6, 0, 3, 2, 0x1002, 0,
+       0x40000406, 0, 4, 5, 8, 0x0123, true},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 0, 2, 0x1002, 0,
+       0x40000305, 0, 1, 2, 0, 0xabcd, true},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 1, 0, 0, 11,
+       0x40000305, 0, 2, 3, 0, 15, false},
+      {Prospero::PrimitiveType::kTriFan, 5, 7, 1, 3, 2, 0x1002, 11,
+       0x40000204, 0, 4, 5, 12, 0xabd8, true},
+      {Prospero::PrimitiveType::kTriFan, 5, 7, 1, 4, 2, 0x1002, 0,
+       0x40000204, 0, 5, 6, 16, 0, false},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 64, 4, 0x1000, 0,
+       0x41000000, 0, 65, 66, 268, 0, false},
       {Prospero::PrimitiveType::kLineList, 5, 17, 3, 0, 0, 0, 11,
        0x40000204, 0, 1, 0, 0, 23, false},
       {Prospero::PrimitiveType::kLineList, 6, 17, 2, 4, 2, 0x1002, 11,

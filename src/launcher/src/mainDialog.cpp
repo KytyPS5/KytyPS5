@@ -254,6 +254,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--profile";
 	}
 	args << "--spirv-debug-printf" << "false";
+	if (info.amd_cpu_enabled) {
+		args << "--amd-cpu";
+	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
 		args << "--redzone";

@@ -169,6 +169,14 @@ private:
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void TransferStencil(Image& image, GuestRange stencil, Buffer& buffer, uint64_t offset,
+	                     TransferDirection direction);
+	void PreserveStencil(ImageId depth);
+public:
+	// Debug: a pass sampled `id`; report when a different image covering the same guest
+	// bytes is the one holding GPU-written contents, i.e. the sampler got the wrong image.
+	void DebugReportStaleBind(ImageId id, uint64_t rt_address);
+private:
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);

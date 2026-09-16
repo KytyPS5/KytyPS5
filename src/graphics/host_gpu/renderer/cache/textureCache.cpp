@@ -270,6 +270,11 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 	    view_info.level_count, view_info.base_layer, view_info.layer_count);
 }
 
+[[nodiscard]] bool CanTransferStencil(const ImageInfo& info) {
+	// Raw buffer copies cannot decode Hi-Stencil or initialize multisampled images.
+	return info.samples == 1 && !info.metadata.stencil_compressed;
+}
+
 [[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
                                                                 uint64_t         slice_stride) {
 	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
@@ -498,6 +503,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	PreserveStencil(id);
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -1301,6 +1307,119 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+void TextureCache::TransferStencil(Image& image, GuestRange stencil, Buffer& buffer,
+                                  uint64_t offset, TransferDirection direction) {
+	auto info            = image.info;
+	info.data            = stencil;
+	info.bytes_per_block = 1;
+	// PS5 stores stencil separately, with its own one-byte depth-tile pitch.
+	if (info.IsTiled()) {
+		info.pitch = TileGetDepthPitch(info.extent.width, 1, 0);
+	}
+	EXIT_IF(info.resources.levels != 1 || info.resources.layers == 0 ||
+	        stencil.size % info.resources.layers != 0);
+	const auto slice_size = stencil.size / info.resources.layers;
+	EXIT_IF(static_cast<uint64_t>(info.pitch) * info.extent.height > slice_size);
+	auto copies = BuildDepthCopies(info, slice_size);
+	for (auto& copy: copies) {
+		copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
+	}
+	const bool          upload = direction == TransferDirection::Upload;
+	TileManager::Result linear {buffer.Handle(), offset, stencil.size};
+	if (info.IsTiled()) {
+		const auto tiles = BuildDepthTiles(info);
+		if (!upload) {
+			m_tiler.TileImage(image, copies, buffer.Handle(), offset, stencil.size, stencil.size,
+			                  tiles);
+			return;
+		}
+		linear = m_tiler.Detile(buffer.Handle(), offset, stencil.size, stencil.size, tiles);
+	}
+	for (auto& copy: copies) {
+		copy.bufferOffset += linear.offset;
+	}
+	if (upload) {
+		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+	} else {
+		image.Download(copies, linear.buffer, linear.offset, linear.size);
+	}
+}
+
+// A depth image about to be retired still owns its stencil plane. Publish those bytes back to
+// the association before the image goes, or the next bind uploads a stale plane over them.
+void TextureCache::PreserveStencil(ImageId depth_id) {
+	auto& depth = m_slot_images[depth_id];
+	if (depth.depth_id || !depth.info.HasStencil() || !CanTransferStencil(depth.info)) {
+		return;
+	}
+	const auto stencil = depth.info.stencil;
+	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
+		auto& record = m_slot_images[id];
+		if (record.depth_id != depth_id || record.info.data != stencil || record.IsCpuDirty() ||
+		    record.IsBufferModified()) {
+			continue;
+		}
+		auto [buffer, offset] =
+		    m_buffer_cache.ObtainBuffer(stencil.address, stencil.size, true, false);
+		EXIT_IF(buffer == nullptr);
+		TransferStencil(depth, stencil, *buffer, offset, TransferDirection::Download);
+		record.MarkBufferModified();
+	}
+}
+
+// A transient render-target pool reuses one guest address for surfaces of different formats. When
+// one of them writes, the others are marked dirty and would re-upload guest memory into
+// themselves, reinterpreting the writer's bytes through their own format. Uploading across
+// formats is never right, so report when some other GPU-owned image of a different shape holds
+// this range.
+// Debug: every guest->image upload of a full-size surface, with the verdict of each guard and
+// the shape currently recorded as owning those bytes. Says whether a stomping upload was even
+// offered to the guards, which a skip counter alone cannot.
+void TextureCache::DebugReportStaleBind(ImageId id, uint64_t rt_address) {
+	// Taking the lock and walking the page table on every bind costs more than the frame it
+	// measures, so spend a fixed budget and then do nothing at all.
+	static std::atomic<uint64_t> budget {0};
+	if (budget.fetch_add(1, std::memory_order_relaxed) >= 20000) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto* bound = m_slot_images.try_get(id);
+	if (bound == nullptr || bound->info.extent.width < 640 || bound->IsGpuModified()) {
+		return;
+	}
+	// The bound image holds no GPU output. If a sibling over the same bytes does, this pass is
+	// reading the wrong one.
+	for (const auto other_id: FindImagesInRegion(bound->info.data.address,
+	                                             bound->info.data.size, false)) {
+		if (other_id == id) {
+			continue;
+		}
+		const auto* other = m_slot_images.try_get(other_id);
+		if (other == nullptr || !other->IsGpuModified() ||
+		    other->info.extent.width != bound->info.extent.width) {
+			continue;
+		}
+		static std::atomic<uint64_t> stale {0};
+		const auto n = stale.fetch_add(1, std::memory_order_relaxed);
+		if (n < 40 || (n % 2048) == 0) {
+			LOGF("STALE BIND #%" PRIu64 ": bound id=%u addr=0x%016" PRIx64 " size=0x%" PRIx64
+			     " %ux%u fmt=%u levels=%u layers=%u tile=%u | owner id=%u addr=0x%016" PRIx64
+			     " size=0x%" PRIx64 " %ux%u fmt=%u levels=%u layers=%u tile=%u | rt=0x%016" PRIx64
+			     "\n",
+			     n, id.index, bound->info.data.address, bound->info.data.size,
+			     bound->info.extent.width, bound->info.extent.height,
+			     static_cast<uint32_t>(bound->backing.format), bound->info.resources.levels,
+			     bound->info.resources.layers, static_cast<uint32_t>(bound->info.tile_mode),
+			     other_id.index, other->info.data.address, other->info.data.size,
+			     other->info.extent.width, other->info.extent.height,
+			     static_cast<uint32_t>(other->backing.format), other->info.resources.levels,
+			     other->info.resources.layers, static_cast<uint32_t>(other->info.tile_mode),
+			     rt_address);
+		}
+		return;
+	}
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -1313,7 +1432,13 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		return;
 	}
-	if (image.info.samples > 1) {
+	const auto& target = image.depth_id ? m_slot_images[image.depth_id] : image;
+	// Multisampled images cannot be initialized with a buffer-to-image copy.
+	if (target.info.samples > 1) {
+		return;
+	}
+	if (image.depth_id &&
+	    (!CanTransferStencil(target.info) || image.info.data != target.info.stencil)) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
@@ -1323,7 +1448,12 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		if (image.depth_id) {
+			TransferStencil(m_slot_images[image.depth_id], image.info.data, *source, source_offset,
+			                TransferDirection::Upload);
+		} else {
+			UploadImage(image, *source, source_offset);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1587,7 +1717,40 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	const bool range_mismatch  = depth.info.stencil != stencil;
+	const bool record_mismatch = record.info.data != stencil;
+	const bool other_depth     = record.depth_id && record.depth_id != depth_id;
+	const bool has_backing     = record.backing.image != nullptr;
+	// has_backing is not disqualifying: a stencil-plane view is redirected onto the depth
+	// image and read through its stencil aspect, so whatever backing the association record
+	// carries is never the thing sampled. Refusing on it blocked 121 of 125 pairings and
+	// left the stencil plane empty, which is what a Custom Stencil mask reads as zero.
+	const bool unsupported_pair = range_mismatch || record_mismatch || other_depth;
 	record.depth_id = depth_id;
+	if (unsupported_pair) {
+		// TODO(stencil): preserve GPU-written contents across pairing changes. Name the reason,
+		// because each of the four needs different handling to lift.
+		static std::atomic<uint64_t> refusals {0};
+		const auto n = refusals.fetch_add(1, std::memory_order_relaxed);
+		if (n < 16 || (n % 512) == 0) {
+			LOGF("STENCIL REFUSED #%" PRIu64 ": depth=0x%016" PRIx64 " stencil=0x%016" PRIx64
+			     " range_mismatch=%d record_mismatch=%d other_depth=%d has_backing=%d\n",
+			     n, depth.info.data.address, stencil.address, range_mismatch ? 1 : 0,
+			     record_mismatch ? 1 : 0, other_depth ? 1 : 0, has_backing ? 1 : 0);
+		}
+		return;
+	}
+	{
+		static std::atomic<uint64_t> accepted {0};
+		const auto n = accepted.fetch_add(1, std::memory_order_relaxed);
+		if (n < 16 || (n % 512) == 0) {
+			LOGF("STENCIL UPLOAD #%" PRIu64 ": depth=0x%016" PRIx64 " stencil=0x%016" PRIx64
+			     " size=0x%" PRIx64 " buffer_modified=%d cpu_dirty=%d\n",
+			     n, depth.info.data.address, stencil.address, stencil.size,
+			     record.IsBufferModified() ? 1 : 0, record.IsCpuDirty() ? 1 : 0);
+		}
+	}
+	RefreshImage(association);
 }
 
 // Binding this memory as something other than a stencil plane proves the guest has repurposed it,
@@ -1991,6 +2154,28 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 			EXIT("TextureCache: image clear retained guest ownership\n");
 		}
 	}
+	// A stencil clear writes the depth image, but the plane's guest bytes live on a separate
+	// association. Settle that association against this clear, or its pending upload lands
+	// afterwards and overwrites what the clear just wrote.
+	std::vector<ImageId> stencil_associations;
+	if ((range.aspectMask & vk::ImageAspectFlagBits::eStencil) && image.info.stencil.Valid()) {
+		const bool full_stencil = range.baseMipLevel == 0 &&
+		                          range.levelCount == image.info.resources.levels &&
+		                          range.baseArrayLayer == 0 && range.layerCount == layers;
+		for (const auto association:
+		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+			auto& stencil = m_slot_images[association];
+			if (stencil.depth_id != id || stencil.info.data != image.info.stencil) {
+				continue;
+			}
+			TrackImage(association);
+			// Partial clears must retain guest writes outside the cleared subresources.
+			if (!full_stencil) {
+				RefreshImage(association);
+			}
+			stencil_associations.push_back(association);
+		}
+	}
 	command.EndRendering();
 	// Transfer clears use the backing format; aliased clears must encode through their view.
 	if (format != image.backing.format || (image.info.IsVolume() && !full_image)) {
@@ -2039,6 +2224,14 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
+	for (const auto association: stencil_associations) {
+		auto& stencil = m_slot_images[association];
+		// The native clear supersedes the pending stencil upload on the next binding.
+		stencil.ClearBufferModified();
+		if (stencil.IsCpuDirty()) {
+			stencil.RefreshComplete();
+		}
+	}
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {

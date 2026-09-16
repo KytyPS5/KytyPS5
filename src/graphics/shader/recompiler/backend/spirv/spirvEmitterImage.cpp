@@ -688,6 +688,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				         coord,
 				         ConstantU32(state, component)};
 			}
+			// SPIR-V has no explicit-LOD gather: the Lod image operand is only valid
+			// on ExplicitLod sampling opcodes and OpImageFetch (and with the AMD
+			// texture-gather-bias-lod extension, which is not portable). image_gather4_l
+			// therefore samples level 0 for now, like the LZ variant, until a proper
+			// fetch-footprint emulation exists.
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(spv::ImageOperandsConstOffsetsMask);
 				words.push_back(HorizontalOffsets(state, dimension));

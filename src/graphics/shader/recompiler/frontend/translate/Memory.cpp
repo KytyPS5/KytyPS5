@@ -1034,6 +1034,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
+		case Decoder::Opcode::IMAGE_GATHER4_L:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:

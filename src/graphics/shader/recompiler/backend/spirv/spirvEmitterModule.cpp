@@ -192,13 +192,29 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Buffers:
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				// Coherent can only decorate a whole variable, so glc needs a second one on this binding.
+				if (state.requirements.coherent_buffers) {
+					state.storage_buffer_coherent_variable =
+					    Define(ArrayType(StorageBufferType(state)), "buffers_coherent");
+					state.builder.AddAnnotation(spv::OpDecorate,
+					                            state.storage_buffer_coherent_variable,
+					                            spv::DecorationCoherent);
+				}
 				if (state.requirements.buffer_int64_atomics) {
 					state.storage_buffer_u64_variable =
 					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
-					                            spv::DecorationAliased);
-					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
-					                            spv::DecorationAliased);
+				}
+				// Every variable reaching the one Buffers binding must declare Aliased, once each.
+				if (state.storage_buffer_coherent_variable != 0 ||
+				    state.storage_buffer_u64_variable != 0) {
+					for (const auto variable:
+					     {state.storage_buffer_variable, state.storage_buffer_coherent_variable,
+					      state.storage_buffer_u64_variable}) {
+						if (variable != 0) {
+							state.builder.AddAnnotation(spv::OpDecorate, variable,
+							                            spv::DecorationAliased);
+						}
+					}
 				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:

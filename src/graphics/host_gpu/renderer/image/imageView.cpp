@@ -110,6 +110,9 @@ enum CompatibilityClass : uint32_t {
 	D32     = 1u << 22,
 	D32S8   = 1u << 23,
 	S8      = 1u << 24,
+	// Vulkan gives each packed float format a class of its own: no 32-bit view shares its texels.
+	B10G11R11 = 1u << 25,
+	E5B9G9R9  = 1u << 26,
 };
 
 [[nodiscard]] uint32_t FormatClass(vk::Format format) noexcept {
@@ -183,7 +186,6 @@ enum CompatibilityClass : uint32_t {
 		case vk::Format::eA8B8G8R8UintPack32:
 		case vk::Format::eA8B8G8R8UnormPack32:
 		case vk::Format::eA8B8G8R8UscaledPack32:
-		case vk::Format::eB10G11R11UfloatPack32:
 		case vk::Format::eB8G8R8A8Sint:
 		case vk::Format::eB8G8R8A8Snorm:
 		case vk::Format::eB8G8R8A8Srgb:
@@ -191,7 +193,6 @@ enum CompatibilityClass : uint32_t {
 		case vk::Format::eB8G8R8A8Uint:
 		case vk::Format::eB8G8R8A8Unorm:
 		case vk::Format::eB8G8R8A8Uscaled:
-		case vk::Format::eE5B9G9R9UfloatPack32:
 		case vk::Format::eR10X6G10X6Unorm2Pack16:
 		case vk::Format::eR12X4G12X4Unorm2Pack16:
 		case vk::Format::eR16G16Sfloat:
@@ -269,6 +270,9 @@ enum CompatibilityClass : uint32_t {
 		case vk::Format::eBc6HUfloatBlock: return Bc6h | Bit128;
 		case vk::Format::eBc7SrgbBlock:
 		case vk::Format::eBc7UnormBlock: return Bc7 | Bit128;
+
+		case vk::Format::eB10G11R11UfloatPack32: return B10G11R11;
+		case vk::Format::eE5B9G9R9UfloatPack32: return E5B9G9R9;
 
 		case vk::Format::eD16Unorm: return D16;
 		case vk::Format::eD16UnormS8Uint: return D16S8;
@@ -361,6 +365,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	usage.usage = image.usage;
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
+	} else if (normalized.format != image.format &&
+	           (image.usage & vk::ImageUsageFlagBits::eStorage)) {
+		usage.usage = vk::ImageUsageFlagBits::eStorage;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {

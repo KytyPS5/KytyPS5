@@ -73,6 +73,26 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
+// Names the instruction the host could not re-execute, so a rejected descriptor dword says which
+// opcode stopped the walk instead of only which dword. ValueOpcodeName is a string_view, so this
+// must stay inside fmt::format and out of any printf-style call.
+std::string DescribeRuntimeFailure(const RuntimeValueFailure& failure) {
+	if (failure.has_entry_opcodes) {
+		const auto operand = [](ValueOpcode opcode) {
+			return opcode == ValueOpcode::Void ? std::string_view("immediate")
+			                                   : ValueOpcodeName(opcode);
+		};
+		return fmt::format("{} {}, entries {} and {}", RuntimeValueRejectName(failure.reason),
+		                   ValueOpcodeName(failure.opcode), operand(failure.entry_opcode),
+		                   operand(failure.other_opcode));
+	}
+	if (failure.has_opcode) {
+		return fmt::format("{} {}", RuntimeValueRejectName(failure.reason),
+		                   ValueOpcodeName(failure.opcode));
+	}
+	return std::string(RuntimeValueRejectName(failure.reason));
+}
+
 uint32_t ByteExtent(const MemoryInfo& memory) {
 	const auto bytes = std::max((memory.data_bits + 7u) / 8u, 1u);
 	const auto count = std::max(memory.data_dwords, 1u);
@@ -87,11 +107,12 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
-		m_shader_writes = HasShaderMemoryWrites(program);
+		m_info.uses_dma   = false;
+		m_info.writes_dma = false;
+		m_shader_writes   = HasShaderMemoryWrites(program);
 	}
 
-	void Run() {
+	ResourceTrackingStatus Run() {
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
@@ -99,9 +120,12 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		PlanIndirectBuffers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
-				Collect(inst);
+				if (!Collect(inst)) {
+					return std::move(m_status);
+				}
 			}
 		}
 		LinkImageAliases();
@@ -137,6 +161,7 @@ public:
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
+		return m_status;
 	}
 
 private:
@@ -161,6 +186,14 @@ private:
 		std::array<const Inst*, 8> reads {};
 	};
 
+	// GetBufferResource is emitted once per access, so one recognized table usually owns several
+	// handles. Each handle carries the interned source; the reads themselves stay in the IR.
+	struct IndirectBufferPlan {
+		Inst*    handle = nullptr;
+		uint32_t source = 0;
+	};
+
+	// An emulator invariant: the IR reached tracking in a shape this pass must never see.
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
@@ -239,6 +272,17 @@ private:
 		return Value(&selected);
 	}
 
+	// A guest shader this pass cannot model. Records the first reason and unwinds, leaving the
+	// program untracked so the caller can drop the draw instead of terminating the process.
+	bool Reject(uint32_t pc, const std::string& reason) const {
+		if (m_status.ok) {
+			m_status.ok     = false;
+			m_status.pc     = pc;
+			m_status.reason = reason;
+		}
+		return false;
+	}
+
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                DescriptorSource& descriptor, uint32_t pc) {
 		if (handle.NumArgs() != width) {
@@ -260,13 +304,21 @@ private:
 		}
 	}
 
-	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword) const {
+	// Reports the first dword that cannot be materialized and, when the caller asks, why. The
+	// reason sink is written only on the rejecting path.
+	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword,
+	                    RuntimeValueFailure* failure = nullptr) const {
 		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
 			bad_dword = i;
 			if (descriptor.dwords[i].Resolve().GetType() != Type::U32) {
+				if (failure != nullptr) {
+					*failure        = {};
+					failure->reason = RuntimeValueReject::NonScalarType;
+				}
 				return false;
 			}
-			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i])) {
+			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i], RuntimeValueType::Any,
+			                          failure)) {
 				return false;
 			}
 		}
@@ -277,7 +329,8 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image != descriptor.indirect_image) {
+			    current.indirect_image != descriptor.indirect_image ||
+			    current.indirect_buffer != descriptor.indirect_buffer) {
 				continue;
 			}
 			bool same = true;
@@ -526,11 +579,115 @@ private:
 		}
 	}
 
-	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
+	// Recognizes a buffer V# assembled from four consecutive scalar reads of one descriptor table
+	// at a wave-uniform record index. Only the index resists host evaluation; the table's own V#
+	// is CPU-derivable, so the host can enumerate the records it may select.
+	bool TryMakeIndirectBuffer(Inst& handle, uint32_t pc, IndirectBufferPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		Inst*    heap_handle   = nullptr;
+		Value    heap_offset;
+		uint32_t record_offset = 0;
+		for (uint32_t dword = 0; dword < 4u; dword++) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr) {
+				return false;
+			}
+			if (dword == 0u) {
+				record_offset = memory->offset;
+				heap_offset   = read->Arg(1).Resolve();
+				if (record_offset > UINT32_MAX - 3u * sizeof(uint32_t)) {
+					return false;
+				}
+			} else if (memory->offset != record_offset + dword * sizeof(uint32_t) ||
+			           !EquivalentValue(m_program, heap_offset, read->Arg(1))) {
+				return false;
+			}
+			auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || (heap_handle != nullptr && current != heap_handle)) {
+				return false;
+			}
+			heap_handle = current;
+		}
+
+		Value    selector;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+		if (!MatchMaterialOffset(heap_offset, selector, selector_stride, selector_offset)) {
+			return false;
+		}
+
+		// A selector the host can re-execute names one record directly, so leave that descriptor
+		// on the ordinary path: recognizing the table must not change a shader that already
+		// materializes.
+		DescriptorSource direct;
+		MakeSource(handle, 4u, false, false, direct, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(direct, bad_dword)) {
+			return false;
+		}
+
+		DescriptorSource heap_source;
+		uint32_t         heap_source_index = 0;
+		if (!MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
+			return false;
+		}
+
+		// The source stands for the table, not for any one record: its dwords are the table V#,
+		// which the host can re-execute, and the record index lives in the indirect description.
+		DescriptorSource buffer_source;
+		buffer_source.dword_count = 4u;
+		std::copy_n(heap_source.dwords.begin(), 4u, buffer_source.dwords.begin());
+		buffer_source.indirect_buffer = DescriptorSource::IndirectBuffer {
+		    heap_source_index, selector_stride, selector_offset, record_offset, 0u};
+
+		plan.handle = &handle;
+		plan.source = InternSource(buffer_source);
+		return true;
+	}
+
+	const IndirectBufferPlan* FindIndirectBuffer(const Inst& handle) const {
+		if (m_indirect_buffers.empty()) {
+			return nullptr;
+		}
+		const auto found = std::find_if(m_indirect_buffers.begin(), m_indirect_buffers.end(),
+		                                [&](const IndirectBufferPlan& plan) {
+			return plan.handle == &handle;
+		});
+		return found == m_indirect_buffers.end() ? nullptr : &*found;
+	}
+
+	void PlanIndirectBuffers() {
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None ||
+				    inst.NumArgs() == 0u) {
+					continue;
+				}
+				auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || FindIndirectBuffer(*handle) != nullptr) {
+					continue;
+				}
+				IndirectBufferPlan plan;
+				if (TryMakeIndirectBuffer(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+					m_indirect_buffers.push_back(plan);
+				}
+			}
+		}
+	}
+
+	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
-			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
+			return Reject(
+			    pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
@@ -539,27 +696,35 @@ private:
 			for (; bad_dword < descriptor.dword_count; bad_dword++) {
 				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
 				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer) {
-					Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-					                     ValueOpcodeName(expected), bad_dword));
+					// An image descriptor dword sourced from a constant buffer is refused here
+					// before the generic walk, so name that read rather than its operands.
+					return Reject(pc, fmt::format("{} dword {} is not a valid runtime value "
+					                              "(unsupported opcode {})",
+					                              ValueOpcodeName(expected), bad_dword,
+					                              ValueOpcodeName(ValueOpcode::ReadConstBuffer)));
 				}
 			}
 			bad_dword = 0;
 		}
-		if (!ValidateSource(descriptor, bad_dword)) {
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+		RuntimeValueFailure failure;
+		if (!ValidateSource(descriptor, bad_dword, &failure)) {
+			return Reject(pc, fmt::format("{} dword {} is not a valid runtime value ({})",
+			                              ValueOpcodeName(expected), bad_dword,
+			                              DescribeRuntimeFailure(failure)));
 		}
 		source = InternSource(descriptor);
+		return true;
 	}
 
-	void ValidateAddressHandle(Value value, uint32_t pc) const {
+	bool ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
-			Fail(pc, "address operation requires GetAddressResource");
+			return Reject(pc, "address operation requires GetAddressResource");
 		}
 		if (handle->NumArgs() != 2) {
 			Fail(pc, "GetAddressResource must have two address dwords");
 		}
+		return true;
 	}
 
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
@@ -596,16 +761,19 @@ private:
 	}
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
-		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
+		const auto info           = ImageOpcodeInfoOf(op);
+		const auto resource_class = info.resource_class;
 		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
 		                       ? ImageMipMode::DynamicStorage
 		                       : ImageMipMode::None;
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
+		const bool wide  = info.atomic_bits == 64u;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.atomic64 == wide) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -627,13 +795,15 @@ private:
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
-		const auto access  = ImageOpcodeInfoOf(op).access;
+		const auto info    = ImageOpcodeInfoOf(op);
+		const auto access  = info.access;
 		const bool atomic  = access == ImageAccess::Atomic;
 		const bool write   = access == ImageAccess::Write || atomic;
 		image.first_use_pc = std::min(image.first_use_pc, pc);
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.atomic64     = image.atomic64 || (atomic && info.atomic_bits == 64u);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {
@@ -650,33 +820,36 @@ private:
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
 	}
 
-	void AddSampledPair(uint32_t image, uint32_t sampler, uint32_t pc) {
+	bool AddSampledPair(uint32_t image, uint32_t sampler, uint32_t pc) {
 		for (auto& pair: m_info.sampled_pairs) {
 			if (pair.image == image && pair.sampler == sampler) {
 				pair.first_use_pc = std::min(pair.first_use_pc, pc);
-				return;
+				return true;
 			}
 		}
 		if (m_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
-			Fail(pc, "sampled image/sampler pair limit exceeded");
+			return Reject(pc, "sampled image/sampler pair limit exceeded");
 		}
 		m_info.sampled_pairs.push_back({image, sampler, pc});
+		return true;
 	}
 
-	void AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
+	bool AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
 		for (const auto& patch: m_handle_patches) {
 			if (patch.handle == handle) {
 				if (patch.resource != resource) {
-					Fail(pc, fmt::format("{} is reused with incompatible resource classes",
-					                     ValueOpcodeName(handle->GetOpcode())));
+					return Reject(pc,
+					              fmt::format("{} is reused with incompatible resource classes",
+					                          ValueOpcodeName(handle->GetOpcode())));
 				}
-				return;
+				return true;
 			}
 		}
 		m_handle_patches.push_back({handle, resource});
+		return true;
 	}
 
-	void AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
+	bool AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
 	                    uint32_t pc) {
 		for (auto& patch: m_memory_patches) {
 			if (patch.index != index) {
@@ -684,25 +857,26 @@ private:
 			}
 			if (patch.resource != resource ||
 			    (has_sampler && patch.has_sampler && patch.sampler != sampler)) {
-				Fail(pc, "memory metadata is reused with incompatible resources");
+				return Reject(pc, "memory metadata is reused with incompatible resources");
 			}
 			if (has_sampler) {
 				patch.sampler     = sampler;
 				patch.has_sampler = true;
 			}
-			return;
+			return true;
 		}
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
+		return true;
 	}
 
-	void Collect(Inst& inst) {
+	bool Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
 		if (buffer == BufferAccess::None && address_info.access == AddressAccess::None &&
 		    image_info.access == ImageAccess::None) {
-			return;
+			return true;
 		}
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
@@ -713,25 +887,31 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
-			return;
+			return true;
 		}
 		Inst*    handle   = nullptr;
 		uint32_t source   = 0;
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
+			handle               = inst.Arg(0).Resolve().TryInstruction();
+			const auto* indirect = handle != nullptr ? FindIndirectBuffer(*handle) : nullptr;
+			if (indirect != nullptr) {
+				source = indirect->source;
+			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
+			                      source)) {
+				return false;
+			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
-				Fail(flags.pc, "buffer resource limit exceeded");
+				return Reject(flags.pc, "buffer resource limit exceeded");
 			}
-			AddHandlePatch(handle, resource, flags.pc);
-			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
-			return;
+			return AddHandlePatch(handle, resource, flags.pc) &&
+			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
 		}
 		if (address_info.access != AddressAccess::None) {
 			if (!IsAddressResourceKind(memory.kind)) {
-				Fail(flags.pc, "address operation has invalid resource kind");
+				return Reject(flags.pc, "address operation has invalid resource kind");
 			}
 			if (memory.kind == ResourceKind::Scratch) {
 				handle = inst.Arg(0).Resolve().TryInstruction();
@@ -740,31 +920,38 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					return Reject(flags.pc,
+					              "scratch operation requires a nonzero AGC per-thread size");
 				}
-				return;
+				return true;
 			}
-			ValidateAddressHandle(inst.Arg(0), flags.pc);
-			m_info.uses_dma = true;
-			return;
+			if (!ValidateAddressHandle(inst.Arg(0), flags.pc)) {
+				return false;
+			}
+			m_info.uses_dma   = true;
+			m_info.writes_dma = m_info.writes_dma || address_info.access == AddressAccess::Write;
+			return true;
 		}
 
 		if (memory.kind != ResourceKind::Image ||
 		    image_info.resource_class == ImageResourceClass::None) {
-			Fail(flags.pc, "image operation has invalid resource kind");
+			return Reject(flags.pc, "image operation has invalid resource kind");
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
-		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
+		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle,
+		                      source)) {
+			return false;
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
+			return Reject(flags.pc, "image resource limit exceeded");
 		}
-		AddHandlePatch(handle, resource, flags.pc);
+		if (!AddHandlePatch(handle, resource, flags.pc)) {
+			return false;
+		}
 		uint32_t sampler = 0;
 		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
@@ -774,16 +961,20 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			               sampler_handle, sampler_source, true, sample_adjust)) {
+				return false;
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
-				Fail(flags.pc, "sampler resource limit exceeded");
+				return Reject(flags.pc, "sampler resource limit exceeded");
 			}
-			AddHandlePatch(sampler_handle, sampler, flags.pc);
-			AddSampledPair(resource, sampler, flags.pc);
+			if (!AddHandlePatch(sampler_handle, sampler, flags.pc) ||
+			    !AddSampledPair(resource, sampler, flags.pc)) {
+				return false;
+			}
 		}
-		AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
+		return AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
 	}
 
 	const DescriptorSource* Source(uint32_t source) const {
@@ -793,7 +984,8 @@ private:
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
+			    buffer_source->indirect_buffer.has_value()) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
@@ -821,14 +1013,16 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::vector<IndirectBufferPlan>            m_indirect_buffers;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	mutable ResourceTrackingStatus             m_status;
 };
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+ResourceTrackingStatus TrackResources(Program& program) {
+	return Tracker(program).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

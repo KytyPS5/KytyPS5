@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cinttypes>
+#include <numeric>
 
 namespace Libs::Graphics {
 namespace {
@@ -370,6 +372,98 @@ bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferI
 	}
 
 	out_tile_infos = std::move(tile_infos);
+	return true;
+}
+
+bool TexturePlanDownloadChunks(std::span<const vk::BufferImageCopy> regions, uint64_t image_size,
+                               const TextureDownloadBlock& block, uint64_t capacity,
+                               uint64_t alignment, std::vector<TextureDownloadChunk>& out_chunks) {
+	out_chunks.clear();
+	if (regions.empty() || image_size == 0 || block.width == 0 || block.height == 0 ||
+	    block.bytes == 0 || !std::has_single_bit(alignment)) {
+		return false;
+	}
+	capacity = Common::AlignDown(capacity, alignment);
+	if (capacity == 0) {
+		return false;
+	}
+
+	struct Piece {
+		vk::BufferImageCopy copy;
+		uint64_t            size = 0;
+	};
+	std::vector<Piece> pieces;
+	pieces.reserve(regions.size());
+	for (const auto& region: regions) {
+		const auto& extent    = region.imageExtent;
+		const auto row_texels = region.bufferRowLength != 0 ? region.bufferRowLength : extent.width;
+		if (extent.width == 0 || extent.height == 0 || extent.depth != 1 ||
+		    row_texels < extent.width || region.imageOffset.y < 0 ||
+		    static_cast<uint64_t>(region.imageOffset.y) + extent.height > INT32_MAX ||
+		    (region.bufferImageHeight != 0 && region.bufferImageHeight < extent.height)) {
+			return false;
+		}
+		const uint64_t row_bytes =
+		    static_cast<uint64_t>((row_texels - 1u) / block.width + 1u) * block.bytes;
+		const uint64_t rows = (static_cast<uint64_t>(extent.height) - 1u) / block.height + 1u;
+		if (row_bytes > capacity || rows > image_size / row_bytes) {
+			return false;
+		}
+		const uint64_t size = rows * row_bytes;
+		if (region.bufferOffset > image_size - size || region.bufferOffset % alignment != 0 ||
+		    size % alignment != 0) {
+			return false;
+		}
+		const uint64_t rows_per_piece = capacity / row_bytes;
+		if (rows <= rows_per_piece) {
+			pieces.push_back({region, size});
+			continue;
+		}
+		// Every piece boundary must stay on the chunk alignment.
+		const uint64_t row_step   = alignment / std::gcd(row_bytes, alignment);
+		const uint64_t piece_rows = Common::AlignDown(rows_per_piece, row_step);
+		if (piece_rows == 0) {
+			return false;
+		}
+		for (uint64_t row = 0; row < rows; row += piece_rows) {
+			const uint64_t count = std::min(piece_rows, rows - row);
+			const uint64_t top   = row * block.height;
+			auto           piece = region;
+			piece.bufferOffset += row * row_bytes;
+			piece.imageOffset.y += static_cast<int32_t>(top);
+			piece.imageExtent.height = static_cast<uint32_t>(
+			    std::min<uint64_t>(count * block.height, extent.height - top));
+			if (region.bufferImageHeight != 0) {
+				piece.bufferImageHeight = static_cast<uint32_t>(count * block.height);
+			}
+			pieces.push_back({piece, count * row_bytes});
+		}
+	}
+
+	std::ranges::stable_sort(pieces, {},
+	                         [](const Piece& piece) { return piece.copy.bufferOffset; });
+	for (size_t index = 1; index < pieces.size(); index++) {
+		const auto& previous = pieces[index - 1];
+		if (previous.copy.bufferOffset + previous.size > pieces[index].copy.bufferOffset) {
+			return false;
+		}
+	}
+
+	for (size_t first = 0; first < pieces.size();) {
+		TextureDownloadChunk chunk;
+		chunk.offset = pieces[first].copy.bufferOffset;
+		for (; first < pieces.size(); first++) {
+			const auto end = pieces[first].copy.bufferOffset + pieces[first].size;
+			if (end - chunk.offset > capacity) {
+				break;
+			}
+			auto copy = pieces[first].copy;
+			copy.bufferOffset -= chunk.offset;
+			chunk.regions.push_back(copy);
+			chunk.size = end - chunk.offset;
+		}
+		out_chunks.push_back(std::move(chunk));
+	}
 	return true;
 }
 

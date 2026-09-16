@@ -120,6 +120,12 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_EQ_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, true, false);
 			return true;
+		case O::V_CMPX_LT_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, true);
+			return true;
+		case O::V_CMPX_EQ_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, true, true);
+			return true;
 		case O::V_CMP_NE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, false, false);
 			return true;
@@ -270,6 +276,9 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_NEQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, true, false);
 			return true;
+		case O::V_CMP_NLT_F16:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, true, false);
+			return true;
 		case O::V_CMPX_NEQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, true, true);
 			return true;
@@ -401,10 +410,13 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MIN_F32: return FloatBinary(inst, IR::ValueOpcode::FPMin32, false);
 		case O::V_MAX_F32: return FloatBinary(inst, IR::ValueOpcode::FPMax32, false);
 		case O::V_LDEXP_F32: return FloatBinary(inst, IR::ValueOpcode::FPLdexp, false);
-		case O::V_MAC_F32: return FloatTernary(inst, IR::ValueOpcode::FPFma32, true, true);
+		case O::V_MAC_F32: return FloatTernary(inst, IR::ValueOpcode::FPMad32, true, true);
 		case O::V_MADMK_F32:
 		case O::V_MADAK_F32:
-		case O::V_MAD_F32:
+		case O::V_MAD_F32: return FloatTernary(inst, IR::ValueOpcode::FPMad32, false, true);
+		case O::V_FMAC_F32: return FloatTernary(inst, IR::ValueOpcode::FPFma32, true, true);
+		case O::V_FMAMK_F32:
+		case O::V_FMAAK_F32:
 		case O::V_FMA_F32: return FloatTernary(inst, IR::ValueOpcode::FPFma32, false, true);
 		case O::V_MIN3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMinTri32, false, false);
 		case O::V_MAX3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMaxTri32, false, false);

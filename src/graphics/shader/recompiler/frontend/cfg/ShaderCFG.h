@@ -64,6 +64,8 @@ struct BasicBlock {
 	std::vector<uint32_t> dominators;
 	std::vector<uint32_t> post_dominators;
 	Terminator            terminator;
+	// The block's only instruction is its S_BRANCH, so translating it emits nothing.
+	bool branch_only = false;
 };
 
 struct BackEdge {
@@ -98,7 +100,14 @@ struct Graph {
 	bool                                    unsupported   = false;
 	FailureKind                             failure_kind  = FailureKind::None;
 	uint32_t                                failure_block = UINT32_MAX;
+	// Guest PC the build rejection was raised at. Only a build failure sets it; a structurizer
+	// failure describes a block, not an instruction.
+	uint32_t                                failure_pc    = UINT32_MAX;
 	std::string                             unsupported_reason;
+	// Structurize analysis work, in cubed block counts.
+	uint64_t                                structurize_work = 0;
+	// Only the last-resort structurize attempt is held to the work budget.
+	bool                                    structurize_work_limited = false;
 
 	const BasicBlock* FindBlock(uint32_t id) const;
 	BasicBlock*       FindBlock(uint32_t id);
@@ -109,6 +118,9 @@ struct Graph {
 	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
+// A guest program the builder cannot model is not fatal: the returned graph then has
+// unsupported set, with failure_kind, failure_pc and unsupported_reason describing why, and an
+// empty block list so nothing downstream can walk a half-built graph. Check unsupported first.
 Graph       BuildGraph(const Decoder::Program& program);
 // Commits structured control flow on success; preserves the original graph with
 // failure diagnostics on failure. failure_block is an original block ID or UINT32_MAX.

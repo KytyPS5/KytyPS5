@@ -207,6 +207,9 @@ enum class Opcode {
 	V_MAC_F32,
 	V_MADMK_F32,
 	V_MADAK_F32,
+	V_FMAC_F32,
+	V_FMAMK_F32,
+	V_FMAAK_F32,
 	V_MIN_F32,
 	V_MAX_F32,
 	V_ADD_F16,
@@ -367,6 +370,8 @@ enum class Opcode {
 	V_CMPX_CLASS_F32,
 	V_CMP_LT_I16,
 	V_CMP_EQ_I16,
+	V_CMPX_LT_I16,
+	V_CMPX_EQ_I16,
 	V_CMP_LE_I16,
 	V_CMP_GT_I16,
 	V_CMP_NE_I16,
@@ -378,6 +383,7 @@ enum class Opcode {
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
 	V_CMP_NEQ_F16,
+	V_CMP_NLT_F16,
 	V_CMPX_LT_F16,
 	V_CMPX_EQ_F16,
 	V_CMPX_LE_F16,
@@ -512,10 +518,12 @@ enum class Opcode {
 	DS_XOR_B32,
 	DS_XOR_RTN_B32,
 	DS_WRXCHG_RTN_B32,
+	DS_MSKOR_B32,
 	DS_MIN_F32,
 	DS_MAX_F32,
 	DS_SWIZZLE_B32,
 	DS_BPERMUTE_B32,
+	DS_PERMUTE_B32,
 	DS_CONSUME,
 	DS_APPEND,
 	DS_READ_I8,
@@ -559,13 +567,8 @@ enum class Opcode {
 	IMAGE_ATOMIC_OR,
 	IMAGE_ATOMIC_XOR,
 	IMAGE_SAMPLE,
-	IMAGE_GATHER4_LZ,
-	IMAGE_GATHER4_C,
-	IMAGE_GATHER4_C_LZ,
-	IMAGE_GATHER4_LZ_O,
-	IMAGE_GATHER4_C_O,
-	IMAGE_GATHER4_C_LZ_O,
-	IMAGE_GATHER4H,
+	IMAGE_GATHER4,
+	IMAGE_BVH_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -737,6 +740,9 @@ void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t wor
 void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const char* reason);
 std::string OperandToString(const Operand& operand);
 const char* ImageDimensionToString(ImageDimension dimension);
+
+// On an atomic, GLC returns the pre-operation value in VDATA and carries no cache meaning.
+bool GlcSelectsAtomicReturnValue(Opcode opcode);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
 

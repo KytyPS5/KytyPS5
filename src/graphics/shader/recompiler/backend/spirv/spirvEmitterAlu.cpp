@@ -201,6 +201,20 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 }
 
 } // namespace
+uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	const auto fused = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
+	state.builder.AddAnnotation(spv::OpDecorate, fused, spv::DecorationNoContraction);
+	return fused;
+}
+
+uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	const auto product = Binary(state, spv::OpFMul, TypeF32(state), a, b);
+	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+	const auto sum = Binary(state, spv::OpFAdd, TypeF32(state), product, c);
+	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	return sum;
+}
+
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
 	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);

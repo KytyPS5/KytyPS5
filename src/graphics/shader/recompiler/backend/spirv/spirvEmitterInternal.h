@@ -67,6 +67,8 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	// A genuine glc buffer load or store is present, so the Coherent alias is declared.
+	bool coherent_buffers             = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -88,11 +90,14 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
+	// Alias of the same set and binding, decorated Coherent; only glc accesses use it.
+	uint32_t                                 storage_buffer_coherent_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         bda_store_pointer_function = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -145,6 +150,7 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
+uint32_t StorageBufferType(EmitterState& state);
 uint32_t TypeStorageBufferPointer(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state);
 uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
@@ -378,7 +384,12 @@ struct MemoryResourceAccess {
 	uint32_t         index_offset     = 0;
 	uint32_t         byte_offset      = 0;
 	bool             add_index_offset = false;
+	// glc=1: only storage buffers and raw pointers have a cache to bypass.
+	bool             coherent         = false;
 };
+
+// True when the guest access asked to bypass the caches that are not device coherent.
+bool CoherentBufferAccess(const IR::MemoryInfo& mem);
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
 
@@ -409,6 +420,10 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
+
+// The inverse of NormalizeFormatComponent: the component's raw bits for a stored value.
+uint32_t EncodeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                               uint32_t component, uint32_t data);
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 

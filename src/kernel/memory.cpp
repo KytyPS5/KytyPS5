@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -876,6 +877,25 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+// A word the GPU itself produced, read for a descriptor the host has to resolve now. The
+// CPU copy is stale by construction, so the clean reader refuses it and the shader that
+// needs it gets dropped. Draining the queue and downloading the range first is safe at
+// this point: the command processor is parsing the packet that consumes the value, every
+// earlier dispatch is already submitted, and the guest must already have ordered the write
+// because the GPU reads it too. Costs one drain, so only reach for it once the cheap read
+// has already refused.
+bool TryReadGpuCoherentBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (TryReadGpuCleanBacking(vaddr, data, size)) {
+		return true;
+	}
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
+	return TryReadGpuCleanBacking(vaddr, data, size);
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

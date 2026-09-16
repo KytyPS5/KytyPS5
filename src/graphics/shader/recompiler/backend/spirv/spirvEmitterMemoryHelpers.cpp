@@ -1,6 +1,13 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstring>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+bool CoherentBufferAccess(const IR::MemoryInfo& mem) {
+	// Not mem.glc: the frontend already dropped the bit on atomics, where it has no cache meaning.
+	return mem.cache_bypass;
+}
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.program.bindings.UsesPushData()) {
@@ -129,11 +136,17 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
+			// glc=1 goes through the Coherent alias; glc=0 traffic stays on the plain variable.
+			const auto coherent =
+			    CoherentBufferAccess(mem) && state.storage_buffer_coherent_variable != 0;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			    state, mem,
+			    coherent ? state.storage_buffer_coherent_variable : state.storage_buffer_variable,
+			    TypeStorageBufferPointer(state));
 			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
 			                                    ConstantU32(state, 2u));
 			access.add_index_offset = true;
+			access.coherent         = CoherentBufferAccess(mem);
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
@@ -278,6 +291,144 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 			}
 			return EmitUFloatToF32Bits(state, raw, bits);
 		default: return raw;
+	}
+}
+
+static uint32_t EmitGlslF32(EmitterState& state, GLSLstd450 op, std::initializer_list<uint32_t> args) {
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> words {spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+	                             static_cast<uint32_t>(op)};
+	words.insert(words.end(), args.begin(), args.end());
+	state.builder.AddFunction(words);
+	return result;
+}
+
+// NaN is written as zero, the D3D rule for float to fixed-point conversion.
+static uint32_t EmitF32NanToZero(EmitterState& state, uint32_t bits) {
+	return EmitTBufferSelectF32(state, EmitClassifyF32Bits(state, bits).nan, ConstantF32(state, 0),
+	                            EmitBitcastU32ToF32(state, bits));
+}
+
+// Positive values round to nearest, overflow saturates to the largest finite value, negative
+// values and -Inf become zero, NaN becomes the all-ones exponent and mantissa.
+static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t bits, uint32_t width) {
+	const auto mantissa_bits = width == 11u ? 6u : 5u;
+	const auto mantissa_mask = (1u << mantissa_bits) - 1u;
+	const auto infinity      = 31u << mantissa_bits;
+	const auto max_finite    = (30u << mantissa_bits) | mantissa_mask;
+	const auto drop          = 23u - mantissa_bits;
+
+	const auto exponent = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 23), 0xffu);
+	const auto mantissa = EmitAndConstant(state, bits, 0x007fffffu);
+	const auto negative = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, bits, 0x80000000u);
+	const auto special  = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 255u);
+	const auto nan = EmitLogicalAndBool(state, special,
+	                                    EmitCompareU32Constant(state, spv::OpINotEqual, mantissa, 0));
+
+	// A carry out of the rounded mantissa lands in the exponent field, which is the correct result.
+	const auto normal_exponent = EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                                           EmitBinaryU32(state, spv::OpISub, exponent,
+	                                                         ConstantU32(state, 127u - 15u)),
+	                                           ConstantU32(state, mantissa_bits));
+	const auto rounded_mantissa =
+	    EmitShiftRightConstant(state, EmitAddU32(state, mantissa, ConstantU32(state, 1u << (drop - 1u))),
+	                           drop);
+	const auto normal     = EmitAddU32(state, normal_exponent, rounded_mantissa);
+	const auto overflow   = EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, normal, infinity);
+	const auto normal_sat = EmitSelectValueU32(state, overflow, ConstantU32(state, max_finite), normal);
+
+	const auto scaled = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpFMul, TypeF32(state), scaled, EmitBitcastU32ToF32(state, bits),
+	    ConstantF32Value(state, std::ldexp(1.0f, 15 - 1 + static_cast<int>(mantissa_bits))));
+	const auto subnormal = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), subnormal,
+	                          EmitGlslF32(state, GLSLstd450RoundEven, {scaled}));
+
+	const auto is_subnormal = EmitCompareU32Constant(state, spv::OpULessThanEqual, exponent, 127u - 15u);
+	const auto finite       = EmitSelectValueU32(state, is_subnormal, subnormal, normal_sat);
+	const auto non_negative = EmitSelectValueU32(state, special, ConstantU32(state, infinity), finite);
+	const auto sign_applied =
+	    EmitSelectValueU32(state, negative, ConstantU32(state, 0), non_negative);
+	return EmitSelectValueU32(state, nan, ConstantU32(state, infinity | mantissa_mask), sign_applied);
+}
+
+uint32_t EncodeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                               uint32_t component, uint32_t data) {
+	const auto bits          = info.component_bits[component];
+	const auto mask          = bits >= 32u ? 0xffffffffu : (1u << bits) - 1u;
+	const auto signed_to_raw = [&](uint32_t value) {
+		const auto raw = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), raw, value);
+		return EmitAndConstant(state, raw, mask);
+	};
+	switch (info.type) {
+		case Format::ComponentType::Uint:
+		case Format::ComponentType::Sint: return data;
+		// Normalized stores round to nearest (ties to even), the D3D and Vulkan conversion rule.
+		case Format::ComponentType::Unorm: {
+			const auto clamped = EmitGlslF32(
+			    state, GLSLstd450FClamp,
+			    {EmitF32NanToZero(state, data), ConstantF32Value(state, 0.0f), ConstantF32Value(state, 1.0f)});
+			const auto scaled = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFMul, TypeF32(state), scaled, clamped,
+			                          ConstantF32Value(state, static_cast<float>(mask)));
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), value,
+			                          EmitGlslF32(state, GLSLstd450RoundEven, {scaled}));
+			return value;
+		}
+		// Clamping to -1 never produces the most negative code, which the load also reads as -1.
+		case Format::ComponentType::Snorm: {
+			const auto clamped = EmitGlslF32(
+			    state, GLSLstd450FClamp,
+			    {EmitF32NanToZero(state, data), ConstantF32Value(state, -1.0f), ConstantF32Value(state, 1.0f)});
+			const auto scaled = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFMul, TypeF32(state), scaled, clamped,
+			                          ConstantF32Value(state, static_cast<float>(mask >> 1u)));
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), value,
+			                          EmitGlslF32(state, GLSLstd450RoundEven, {scaled}));
+			return signed_to_raw(value);
+		}
+		// Scaled stores are a float to integer cast: truncate toward zero and saturate.
+		case Format::ComponentType::Uscaled: {
+			const auto clamped = EmitGlslF32(
+			    state, GLSLstd450FClamp,
+			    {EmitF32NanToZero(state, data), ConstantF32Value(state, 0.0f),
+			     ConstantF32Value(state, static_cast<float>(mask))});
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), value,
+			                          EmitGlslF32(state, GLSLstd450Trunc, {clamped}));
+			return value;
+		}
+		case Format::ComponentType::Sscaled: {
+			const auto max_value = static_cast<float>(mask >> 1u);
+			const auto clamped   = EmitGlslF32(
+			      state, GLSLstd450FClamp,
+			      {EmitF32NanToZero(state, data), ConstantF32Value(state, -max_value - 1.0f),
+			       ConstantF32Value(state, max_value)});
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), value,
+			                          EmitGlslF32(state, GLSLstd450Trunc, {clamped}));
+			return signed_to_raw(value);
+		}
+		case Format::ComponentType::Float: {
+			if (bits == 32u) {
+				return data;
+			}
+			if (bits == 16u) {
+				const auto pair = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+				                          EmitBitcastU32ToF32(state, data), ConstantF32(state, 0));
+				const auto packed = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state),
+				                          GLSLstd450PackHalf2x16, pair);
+				return EmitAndConstant(state, packed, 0xffffu);
+			}
+			return EmitF32ToUFloatBits(state, data, bits);
+		}
+		default: return data;
 	}
 }
 

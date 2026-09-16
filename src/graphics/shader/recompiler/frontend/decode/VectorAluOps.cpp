@@ -65,9 +65,9 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x2au, Opcode::V_SUBREV_CO_CI_U32},
     {0x26u, Opcode::V_SUB_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x27u, Opcode::V_SUBREV_NC_U32, Vop2SdwaProfile::IntegerFullDestination},
-    {0x2bu, Opcode::V_MAC_F32},
-    {0x2cu, Opcode::V_MADMK_F32},
-    {0x2du, Opcode::V_MADAK_F32},
+    {0x2bu, Opcode::V_FMAC_F32},
+    {0x2cu, Opcode::V_FMAMK_F32},
+    {0x2du, Opcode::V_FMAAK_F32},
     {0x2fu, Opcode::V_CVT_PKRTZ_F16_F32, Vop2SdwaProfile::PackedFloat16},
     {0x32u, Opcode::V_ADD_F16, Vop2SdwaProfile::Float16},
     {0x33u, Opcode::V_SUB_F16, Vop2SdwaProfile::Float16},
@@ -255,6 +255,8 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
     {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
     {0xfdu, Opcode::V_CMPX_NEQ_F16},       {0xfeu, Opcode::V_CMPX_NLT_F16},
+    {0x99u, Opcode::V_CMPX_LT_I16},        {0x9au, Opcode::V_CMPX_EQ_I16},
+    {0xeeu, Opcode::V_CMP_NLT_F16},
 };
 
 constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
@@ -731,6 +733,9 @@ bool IsVop2FloatOpcode(Opcode opcode) {
 		case Opcode::V_MAC_F32:
 		case Opcode::V_MADMK_F32:
 		case Opcode::V_MADAK_F32:
+		case Opcode::V_FMAC_F32:
+		case Opcode::V_FMAMK_F32:
+		case Opcode::V_FMAAK_F32:
 		case Opcode::V_CVT_PKRTZ_F16_F32:
 		case Opcode::V_ADD_F16:
 		case Opcode::V_SUB_F16:
@@ -825,6 +830,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_LG_F16:
 		case Opcode::V_CMP_GE_F16:
 		case Opcode::V_CMP_NEQ_F16:
+		case Opcode::V_CMP_NLT_F16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:
@@ -978,6 +984,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
                              Instruction& inst) {
 	switch (inst.opcode) {
 		case Opcode::V_MADMK_F32:
+		case Opcode::V_FMAMK_F32:
 		case Opcode::V_FMAMK_F16:
 			inst.src2      = inst.src1;
 			inst.src1      = {};
@@ -985,6 +992,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count = 3;
 			break;
 		case Opcode::V_MADAK_F32:
+		case Opcode::V_FMAAK_F32:
 		case Opcode::V_FMAAK_F16:
 			inst.src2      = {};
 			inst.src2.kind = OperandKind::LiteralConstant;
@@ -1098,8 +1106,113 @@ VopcSdwaFields DecodeVopcSdwaFields(uint32_t modifier) {
 	return fields;
 }
 
-bool SupportsVopcSdwa(Opcode opcode) {
-	return opcode != Opcode::UNSUPPORTED;
+// SDWA extracts a byte or a word out of each source dword, so which selectors survive translation
+// depends on how wide the compare treats that source. Every encoding in VOPC_OPCODE_LIST pairs
+// equal-width sources apart from V_CMP_CLASS_*, whose second source is an integer mask.
+enum class VopcSdwaSource {
+	Unavailable,
+	Integer32,
+	Integer16,
+	Float32,
+	Float16,
+};
+
+bool IsVopc64BitCompareOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::V_CMP_EQ_I64:
+		case Opcode::V_CMPX_NE_I64:
+		case Opcode::V_CMP_LT_U64:
+		case Opcode::V_CMP_EQ_U64:
+		case Opcode::V_CMP_GT_U64:
+		case Opcode::V_CMP_NE_U64:
+		case Opcode::V_CMPX_NE_U64: return true;
+		default: return false;
+	}
+}
+
+bool IsVopc16BitCompareOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::V_CMP_LT_I16:
+		case Opcode::V_CMP_EQ_I16:
+		case Opcode::V_CMPX_LT_I16:
+		case Opcode::V_CMPX_EQ_I16:
+		case Opcode::V_CMP_LE_I16:
+		case Opcode::V_CMP_GT_I16:
+		case Opcode::V_CMP_NE_I16:
+		case Opcode::V_CMP_GE_I16:
+		case Opcode::V_CMP_LT_U16:
+		case Opcode::V_CMP_EQ_U16:
+		case Opcode::V_CMP_LE_U16:
+		case Opcode::V_CMP_GT_U16:
+		case Opcode::V_CMPX_GT_U16:
+		case Opcode::V_CMP_NE_U16:
+		case Opcode::V_CMP_GE_U16:
+		case Opcode::V_CMP_LT_F16:
+		case Opcode::V_CMP_EQ_F16:
+		case Opcode::V_CMP_LE_F16:
+		case Opcode::V_CMP_GT_F16:
+		case Opcode::V_CMP_LG_F16:
+		case Opcode::V_CMP_GE_F16:
+		case Opcode::V_CMP_NEQ_F16:
+		case Opcode::V_CMP_NLT_F16:
+		case Opcode::V_CMPX_LT_F16:
+		case Opcode::V_CMPX_EQ_F16:
+		case Opcode::V_CMPX_LE_F16:
+		case Opcode::V_CMPX_GT_F16:
+		case Opcode::V_CMPX_GE_F16:
+		case Opcode::V_CMPX_NGT_F16:
+		case Opcode::V_CMPX_NEQ_F16:
+		case Opcode::V_CMPX_NLT_F16: return true;
+		default: return false;
+	}
+}
+
+VopcSdwaSource VopcSdwaSourceClass(Opcode opcode, bool second) {
+	if (IsVopc64BitCompareOpcode(opcode)) {
+		return VopcSdwaSource::Unavailable;
+	}
+	if (second && (opcode == Opcode::V_CMP_CLASS_F32 || opcode == Opcode::V_CMPX_CLASS_F32)) {
+		return VopcSdwaSource::Integer32;
+	}
+	const bool half = IsVopc16BitCompareOpcode(opcode);
+	if (IsVopcFloatCompareOpcode(opcode)) {
+		return half ? VopcSdwaSource::Float16 : VopcSdwaSource::Float32;
+	}
+	return half ? VopcSdwaSource::Integer16 : VopcSdwaSource::Integer32;
+}
+
+// Returns why one SDWA source cannot be translated, or nullptr when it can.
+const char* VopcSdwaSourceRejection(VopcSdwaSource source, uint32_t sel, bool sext, bool negate,
+                                    bool absolute) {
+	switch (source) {
+		case VopcSdwaSource::Unavailable: return "VOPC SDWA is not encodable for 64-bit compares";
+		case VopcSdwaSource::Float32:
+		case VopcSdwaSource::Float16:
+			// SRC_SEXT shares its encoding bit with the float modifiers, so a float source never
+			// carries it and the translator would drop it.
+			if (sext) {
+				return "VOPC SDWA sign extension is not supported for float compares";
+			}
+			break;
+		case VopcSdwaSource::Integer32:
+		case VopcSdwaSource::Integer16:
+			if (negate || absolute) {
+				return "VOPC SDWA float source modifiers are not supported for integer compares";
+			}
+			break;
+	}
+	if (sel > 3u) {
+		return nullptr;
+	}
+	// The 16-bit source readers apply SRC_SEXT from bit 15 and drop byte selectors on half floats
+	// entirely, so a byte selector only stays exact on an unextended 16-bit integer source.
+	if (source == VopcSdwaSource::Float16) {
+		return "VOPC SDWA byte selectors are not supported for 16-bit float compares";
+	}
+	if (source == VopcSdwaSource::Integer16 && sext) {
+		return "VOPC SDWA sign-extended byte selectors are not supported for 16-bit compares";
+	}
+	return nullptr;
 }
 
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
@@ -1111,9 +1224,22 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC SDWA selector is invalid");
 		return;
 	}
-	if (!SupportsVopcSdwa(inst.opcode)) {
-		SetUnsupported(inst, Family::VOPC, opcode,
-		               "VOPC SDWA modifier is not supported for opcode");
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
+		return;
+	}
+	const auto* src0_reason = VopcSdwaSourceRejection(VopcSdwaSourceClass(inst.opcode, false),
+	                                                  fields.src0_sel, fields.src0_sext != 0u,
+	                                                  fields.src0_neg != 0u, fields.src0_abs != 0u);
+	if (src0_reason != nullptr) {
+		SetUnsupported(inst, Family::VOPC, opcode, src0_reason);
+		return;
+	}
+	const auto* src1_reason = VopcSdwaSourceRejection(VopcSdwaSourceClass(inst.opcode, true),
+	                                                  fields.src1_sel, fields.src1_sext != 0u,
+	                                                  fields.src1_neg != 0u, fields.src1_abs != 0u);
+	if (src1_reason != nullptr) {
+		SetUnsupported(inst, Family::VOPC, opcode, src1_reason);
 		return;
 	}
 
@@ -1312,6 +1438,7 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MIN_F32:
 		case Opcode::V_MAX_F32:
 		case Opcode::V_MAC_F32:
+		case Opcode::V_FMAC_F32:
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_PACK_B32_F16:
@@ -1342,6 +1469,7 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 		case Opcode::V_MIN_F32:
 		case Opcode::V_MAX_F32:
 		case Opcode::V_MAC_F32:
+		case Opcode::V_FMAC_F32:
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_FMA_F16:
@@ -1442,6 +1570,8 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NE_I64:
 		case Opcode::V_CMPX_NE_U64:
 		case Opcode::V_CMPX_LT_U16:
+		case Opcode::V_CMPX_LT_I16:
+		case Opcode::V_CMPX_EQ_I16:
 		case Opcode::V_CMPX_GT_U16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:

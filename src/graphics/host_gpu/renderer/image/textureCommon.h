@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -38,6 +39,18 @@ struct TextureUploadLayout {
 	TextureUploadMipLayout mips[16] = {};
 };
 
+struct TextureDownloadBlock {
+	uint32_t width  = 1;
+	uint32_t height = 1;
+	uint32_t bytes  = 0;
+};
+
+struct TextureDownloadChunk {
+	uint64_t                         offset = 0;
+	uint64_t                         size   = 0;
+	std::vector<vk::BufferImageCopy> regions;
+};
+
 vk::ComponentMapping   TextureGetComponentMapping(uint32_t                        swizzle,
                                                   Prospero::ColorComponentMapping host_to_storage);
 SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
@@ -53,6 +66,10 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
                               std::vector<GpuTileInfo>& out_tile_infos);
+// Splits 2D copies by block rows into chunks of at most capacity bytes, offsets chunk-relative.
+bool TexturePlanDownloadChunks(std::span<const vk::BufferImageCopy> regions, uint64_t image_size,
+                               const TextureDownloadBlock& block, uint64_t capacity,
+                               uint64_t alignment, std::vector<TextureDownloadChunk>& out_chunks);
 
 } // namespace Libs::Graphics
 

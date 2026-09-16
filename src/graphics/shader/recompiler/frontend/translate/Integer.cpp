@@ -494,19 +494,16 @@ bool Translator::V_ALIGNBIT_B32(const Decoder::Instruction& inst) {
 	return true;
 }
 
+// SRC2 is a byte address whose (address & -4) dword is LO, so only its low two bits select a byte.
 bool Translator::V_ALIGNBYTE_B32(const Decoder::Instruction& inst) {
 	const auto hi           = ReadU32(inst.src0);
 	const auto lo           = ReadU32(inst.src1);
-	const auto byte_offset  = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(31u)));
+	const auto byte_offset  = ir.BitwiseAnd(ReadU32(inst.src2), IR::U32(IR::Value(3u)));
 	const auto bit_offset   = ir.ShiftLeftLogical(byte_offset, IR::U32(IR::Value(3u)));
 	const auto concatenated = ir.ConstructU64(lo, hi);
 	const auto shifted =
-	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64,
-	                    {concatenated, ir.BitwiseAnd(bit_offset, IR::U32(IR::Value(63u)))}));
-	const auto in_range =
-	    IR::U1(ir.Emit(IR::ValueOpcode::ULessThan32, {byte_offset, IR::Value(8u)}));
-	WriteOperand(DestinationOperand(inst),
-	             ir.Select(in_range, ExtractU64(shifted)[0], IR::U32(IR::Value(0u))));
+	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightLogical64, {concatenated, bit_offset}));
+	WriteOperand(DestinationOperand(inst), ExtractU64(shifted)[0]);
 	return true;
 }
 

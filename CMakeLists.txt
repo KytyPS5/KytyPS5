@@ -315,6 +315,12 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
+# xbyak reports errors by throwing, and the emulator is otherwise built without exceptions.
+if (WIN32)
+	set_source_files_properties("${KYTY_SOURCE_DIR}/loader/redZonePatcher.cpp"
+		PROPERTIES COMPILE_OPTIONS "/EHsc")
+endif()
+
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
 
 # Linux system libraries.
@@ -502,12 +508,14 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+		virtual_memory_allocation_tests)
+	if(KYTY_CLANG_CL)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	else()
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
-	endforeach()
-endif()
+	endif()
+endforeach()
 
 if(BUILD_TESTING)
 	add_test(NAME emulator_user_name_cli
@@ -566,10 +574,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
+	add_test(NAME texture_cache_image_download_plan
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-download-plan-only)
+	add_test(NAME texture_cache_large_image_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --large-image-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_bda_store
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-bda-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.

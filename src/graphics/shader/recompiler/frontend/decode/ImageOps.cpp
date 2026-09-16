@@ -14,9 +14,18 @@ struct MimgSampleInfo {
 };
 
 struct MimgGatherInfo {
-	uint32_t encoding = 0;
-	Opcode   decoded  = Opcode::UNSUPPORTED;
-	uint32_t flags    = 0;
+	uint32_t    encoding = 0;
+	const char* name     = nullptr;
+	uint32_t    flags    = 0;
+};
+
+struct MimgBvhInfo {
+	uint32_t    encoding = 0;
+	const char* name     = nullptr;
+	// Address VGPR counts from the RDNA2 encoding: a 64-bit node pointer costs one register more
+	// than a 32-bit one, and a16 packs the three ray vectors into halves.
+	uint32_t address_count     = 0;
+	uint32_t a16_address_count = 0;
 };
 
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
@@ -175,17 +184,46 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
-    {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
-    {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
-    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
-     ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
-     ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x58u, Opcode::IMAGE_GATHER4_C_O,
-     ImageSampleFlagCompare | ImageSampleFlagOffset},
-    {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
+    {0x40u, "image_gather4", 0},
+    {0x41u, "image_gather4_cl", ImageSampleFlagLodClamp},
+    {0x44u, "image_gather4_l", ImageSampleFlagLod},
+    {0x45u, "image_gather4_b", ImageSampleFlagBias},
+    {0x46u, "image_gather4_b_cl", ImageSampleFlagBias | ImageSampleFlagLodClamp},
+    {0x47u, "image_gather4_lz", ImageSampleFlagLevelZero},
+    {0x48u, "image_gather4_c", ImageSampleFlagCompare},
+    {0x49u, "image_gather4_c_cl", ImageSampleFlagCompare | ImageSampleFlagLodClamp},
+    {0x4cu, "image_gather4_c_l", ImageSampleFlagCompare | ImageSampleFlagLod},
+    {0x4du, "image_gather4_c_b", ImageSampleFlagCompare | ImageSampleFlagBias},
+    {0x4eu, "image_gather4_c_b_cl",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp},
+    {0x4fu, "image_gather4_c_lz", ImageSampleFlagCompare | ImageSampleFlagLevelZero},
+    {0x50u, "image_gather4_o", ImageSampleFlagOffset},
+    {0x51u, "image_gather4_cl_o", ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x54u, "image_gather4_l_o", ImageSampleFlagLod | ImageSampleFlagOffset},
+    {0x55u, "image_gather4_b_o", ImageSampleFlagBias | ImageSampleFlagOffset},
+    {0x56u, "image_gather4_b_cl_o",
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x57u, "image_gather4_lz_o", ImageSampleFlagLevelZero | ImageSampleFlagOffset},
+    {0x58u, "image_gather4_c_o", ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x59u, "image_gather4_c_cl_o",
+     ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset},
+    {0x5cu, "image_gather4_c_l_o",
+     ImageSampleFlagCompare | ImageSampleFlagLod | ImageSampleFlagOffset},
+    {0x5du, "image_gather4_c_b_o",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset},
+    {0x5eu, "image_gather4_c_b_cl_o",
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
+         ImageSampleFlagOffset},
+    {0x5fu, "image_gather4_c_lz_o",
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
+    {0x61u, "image_gather4h", ImageSampleFlagGatherHorizontal},
+};
+
+// The RDNA2 hardware ray-tracing primitive. Both encodings hardwire dmask=0xf, unorm=1, r128=1,
+// dim=0, ssamp=0 and d16=0, and return four dwords. srsrc is a 128-bit BVH descriptor, not a T#.
+constexpr MimgBvhInfo MIMG_BVH_OPCODE_LIST[] = {
+    {0xe6u, "image_bvh_intersect_ray", 11u, 8u},
+    {0xe7u, "image_bvh64_intersect_ray", 12u, 9u},
 };
 
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
@@ -201,6 +239,7 @@ constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
 constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCODE_LIST);
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
+constexpr auto MIMG_BVH_OPS    = Detail::MakeOpcodeTable<0x100>(MIMG_BVH_OPCODE_LIST);
 
 const MimgSampleInfo* LookupSample(uint32_t opcode) {
 	return Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
@@ -214,16 +253,23 @@ const Detail::OpcodeMap* LookupAtomic(uint32_t opcode) {
 	return Detail::FindOpcode(MIMG_ATOMIC_OPS, opcode);
 }
 
+const MimgBvhInfo* LookupBvh(uint32_t opcode) {
+	return Detail::FindOpcode(MIMG_BVH_OPS, opcode);
+}
+
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                        const Detail::OpcodeMap* atomic) {
+                        const Detail::OpcodeMap* atomic, const MimgBvhInfo* bvh) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
 	if (gather != nullptr) {
-		return gather->decoded;
+		return Opcode::IMAGE_GATHER4;
 	}
 	if (atomic != nullptr) {
 		return atomic->decoded;
+	}
+	if (bvh != nullptr) {
+		return Opcode::IMAGE_BVH_INTERSECT_RAY;
 	}
 
 	switch (opcode) {
@@ -249,7 +295,12 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const Detail::OpcodeMap* atomic) {
+                                     const Detail::OpcodeMap* atomic, const MimgBvhInfo* bvh,
+                                     bool a16) {
+	if (bvh != nullptr) {
+		// node pointer + ray extent + origin + direction + inverse direction.
+		return a16 ? bvh->a16_address_count : bvh->address_count;
+	}
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -334,12 +385,13 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const auto*    sample = LookupSample(opcode);
 	const auto*    gather = LookupGather(opcode);
 	const auto*    atomic = LookupAtomic(opcode);
+	const auto*    bvh    = LookupBvh(opcode);
 
 	inst.pc                 = pc;
 	inst.word_count         = word_count;
 	inst.family             = Family::MIMG;
 	inst.opcode_id          = opcode;
-	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic);
+	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic, bvh);
 	inst.dmask              = (word0 >> 8u) & 0xfu;
 	inst.data_components    = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
 	inst.data_bits          = d16 ? 16u : 32u;
@@ -350,6 +402,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;
 	}
+	if (bvh != nullptr) {
+		// Both BVH encodings hardwire dmask=0xf and VDataDwords=4: the result is always v[N:N+3].
+		inst.data_components = 4u;
+		inst.data_dwords     = 4u;
+	}
 	inst.image_dimension  = dimension;
 	inst.image_r128       = r128;
 	inst.image_nsa_dwords = nsa_dwords;
@@ -357,7 +414,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic, bvh, a16);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -383,6 +440,16 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 const char* MimgSampleOpcodeName(uint32_t opcode) {
 	const auto* sample = LookupSample(opcode);
 	return sample != nullptr ? sample->name : nullptr;
+}
+
+const char* MimgGatherOpcodeName(uint32_t opcode) {
+	const auto* gather = LookupGather(opcode);
+	return gather != nullptr ? gather->name : nullptr;
+}
+
+const char* MimgBvhOpcodeName(uint32_t opcode) {
+	const auto* bvh = LookupBvh(opcode);
+	return bvh != nullptr ? bvh->name : nullptr;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

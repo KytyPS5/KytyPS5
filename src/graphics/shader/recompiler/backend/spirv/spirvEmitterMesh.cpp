@@ -24,44 +24,101 @@ uint32_t MeshLoad(EmitterState& state, uint32_t variable, spv::StorageClass stor
 	return value;
 }
 
+bool MeshPerPrimitive(IR::StageOutputKind kind) {
+	return kind == IR::StageOutputKind::Layer || kind == IR::StageOutputKind::ViewportIndex;
+}
+
+bool MeshDistance(IR::StageOutputKind kind) {
+	return kind == IR::StageOutputKind::ClipDistance || kind == IR::StageOutputKind::CullDistance;
+}
+
 uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
-	return kind == IR::StageOutputKind::Layer ? TypeU32(state) : TypeF32Vector(state, 4);
+	if (MeshPerPrimitive(kind)) {
+		return TypeU32(state);
+	}
+	if (MeshDistance(kind) || kind == IR::StageOutputKind::PointSize) {
+		return TypeF32(state);
+	}
+	return TypeF32Vector(state, 4);
+}
+
+spv::BuiltIn MeshOutputBuiltIn(IR::StageOutputKind kind) {
+	switch (kind) {
+		case IR::StageOutputKind::Position: return spv::BuiltInPosition;
+		case IR::StageOutputKind::PointSize: return spv::BuiltInPointSize;
+		case IR::StageOutputKind::ClipDistance: return spv::BuiltInClipDistance;
+		case IR::StageOutputKind::CullDistance: return spv::BuiltInCullDistance;
+		case IR::StageOutputKind::Layer: return spv::BuiltInLayer;
+		case IR::StageOutputKind::ViewportIndex: return spv::BuiltInViewportIndex;
+		default: EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(kind));
+	}
+	return spv::BuiltInMax;
+}
+
+uint32_t* MeshBuiltInVariable(EmitterState& state, IR::StageOutputKind kind) {
+	switch (kind) {
+		case IR::StageOutputKind::PointSize: return &state.point_size_variable;
+		case IR::StageOutputKind::ClipDistance: return &state.clip_distance_variable;
+		case IR::StageOutputKind::CullDistance: return &state.cull_distance_variable;
+		case IR::StageOutputKind::ViewportIndex: return &state.viewport_index_variable;
+		default: return nullptr;
+	}
 }
 
 } // namespace
 
 void DefineMeshOutputs(EmitterState& state) {
 	const auto& mesh = state.input_info.vertex->mesh;
+	uint32_t    clip_count = 0;
+	uint32_t    cull_count = 0;
+	for (const auto& output: state.outputs) {
+		if (output.kind == IR::StageOutputKind::ClipDistance) {
+			clip_count = std::max(clip_count, output.index + 1);
+		} else if (output.kind == IR::StageOutputKind::CullDistance) {
+			cull_count = std::max(cull_count, output.index + 1);
+		}
+	}
 	for (auto& output: state.outputs) {
-		if (output.kind != IR::StageOutputKind::Position &&
-		    output.kind != IR::StageOutputKind::Parameter &&
-		    output.kind != IR::StageOutputKind::Layer) {
-			EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(output.kind));
-		}
+		const auto builtin = output.kind == IR::StageOutputKind::Parameter
+		                         ? spv::BuiltInMax
+		                         : MeshOutputBuiltIn(output.kind);
 		const auto type    = MeshOutputType(state, output.kind);
-		output.variable_id = MeshArray(
-		    state, spv::StorageClassOutput, type,
-		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
-		// Only Layer is read by another invocation, through the primitive's provoking vertex.
-		const bool shared = output.kind == IR::StageOutputKind::Layer;
-		output.mesh_data_variable =
-		    MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
-		              shared ? mesh.max_vertices : state.lane_count);
-		state.interface_variables.push_back(output.variable_id);
-		state.builder.AddName(output.variable_id, output.debug_name.c_str());
-		if (output.kind == IR::StageOutputKind::Parameter) {
-			state.builder.AddAnnotation(spv::OpDecorate, output.variable_id,
-			                            spv::DecorationLocation, output.location);
+		auto*      shared  = MeshBuiltInVariable(state, output.kind);
+		if (shared != nullptr && *shared != 0) {
+			// Clip and cull distances share one per-vertex array builtin across their indices.
+			output.variable_id = *shared;
 		} else {
-			state.builder.AddAnnotation(spv::OpDecorate, output.variable_id, spv::DecorationBuiltIn,
-			                            output.kind == IR::StageOutputKind::Layer
-			                                ? spv::BuiltInLayer
-			                                : spv::BuiltInPosition);
+			auto element = type;
+			if (MeshDistance(output.kind)) {
+				const auto count =
+				    output.kind == IR::StageOutputKind::ClipDistance ? clip_count : cull_count;
+				element = state.builder.Type(spv::OpTypeArray, type, ConstantU32(state, count));
+			}
+			output.variable_id =
+			    MeshArray(state, spv::StorageClassOutput, element,
+			              MeshPerPrimitive(output.kind) ? mesh.max_primitives : mesh.max_vertices);
+			if (shared != nullptr) {
+				*shared = output.variable_id;
+			}
+			state.interface_variables.push_back(output.variable_id);
+			state.builder.AddName(output.variable_id, output.debug_name.c_str());
+			if (output.kind == IR::StageOutputKind::Parameter) {
+				state.builder.AddAnnotation(spv::OpDecorate, output.variable_id,
+				                            spv::DecorationLocation, output.location);
+			} else {
+				state.builder.AddAnnotation(spv::OpDecorate, output.variable_id,
+				                            spv::DecorationBuiltIn, builtin);
+			}
+			if (MeshPerPrimitive(output.kind)) {
+				state.builder.AddAnnotation(spv::OpDecorate, output.variable_id,
+				                            spv::DecorationPerPrimitiveEXT); // PerPrimitiveEXT
+			}
 		}
-		if (output.kind == IR::StageOutputKind::Layer) {
-			state.builder.AddAnnotation(spv::OpDecorate, output.variable_id,
-			                            spv::DecorationPerPrimitiveEXT); // PerPrimitiveEXT
-		}
+		// Per-primitive outputs are read by another invocation, through the provoking vertex.
+		const bool per_primitive = MeshPerPrimitive(output.kind);
+		output.mesh_data_variable =
+		    MeshArray(state, per_primitive ? spv::StorageClassWorkgroup : spv::StorageClassPrivate,
+		              type, per_primitive ? mesh.max_vertices : state.lane_count);
 	}
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
@@ -88,7 +145,7 @@ uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32
 		EXIT("mesh export has no output binding: kind=%u index=%u\n", static_cast<uint32_t>(kind),
 		     index);
 	}
-	const bool shared = kind == IR::StageOutputKind::Layer;
+	const bool shared = MeshPerPrimitive(kind);
 	return MeshElement(
 	    state, output->mesh_data_variable,
 	    shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, MeshOutputType(state, kind),
@@ -144,15 +201,23 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_vertex, index, vertices);
 		EmitIfCondition(state, is_vertex, [&] {
 			for (const auto& output: state.outputs) {
-				if (output.kind == IR::StageOutputKind::Layer) {
+				if (MeshPerPrimitive(output.kind)) {
 					continue;
 				}
 				const auto type  = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));
-				const auto pointer =
-				    MeshElement(state, output.variable_id, spv::StorageClassOutput, type, index);
+				uint32_t pointer = 0;
+				if (MeshDistance(output.kind)) {
+					pointer = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, type),
+					    pointer, output.variable_id, index, ConstantU32(state, output.index));
+				} else {
+					pointer = MeshElement(state, output.variable_id, spv::StorageClassOutput, type,
+					                      index);
+				}
 				state.builder.AddFunction(spv::OpStore, pointer, value);
 			}
 		});
@@ -186,15 +251,15 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			                                      TypeBool(state), index),
 			                          culled);
 			for (const auto& output: state.outputs) {
-				if (output.kind != IR::StageOutputKind::Layer) {
+				if (!MeshPerPrimitive(output.kind)) {
 					continue;
 				}
-				const auto layer = MeshLoad(state, output.mesh_data_variable,
-				                            spv::StorageClassWorkgroup, TypeU32(state),
-				                            vertex[state.input_info.vertex->mesh.provoking_vertex]);
+				const auto value   = MeshLoad(state, output.mesh_data_variable,
+				                              spv::StorageClassWorkgroup, TypeU32(state),
+				                              vertex[state.input_info.vertex->mesh.provoking_vertex]);
 				const auto pointer = MeshElement(state, output.variable_id, spv::StorageClassOutput,
 				                                 TypeU32(state), index);
-				state.builder.AddFunction(spv::OpStore, pointer, layer);
+				state.builder.AddFunction(spv::OpStore, pointer, value);
 			}
 		});
 	}

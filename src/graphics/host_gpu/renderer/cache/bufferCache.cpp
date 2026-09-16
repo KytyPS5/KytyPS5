@@ -43,7 +43,25 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+void BufferCache::ClearDeviceState() {
+	// Buffer::Fill records into the scheduler's current command buffer, so the clear can only run
+	// once one is open. Skipping an earlier accessor only defers it.
+	if (!m_scheduler.Active()) {
+		return;
+	}
+	// Set the flag first: Buffer::Fill acquires the scheduler's command buffer, and a nested
+	// accessor call must not restart the clear.
+	m_device_state_cleared = true;
+	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	auto* fault_buffer = m_fault_manager.GetFaultBuffer();
+	fault_buffer->Fill(0, fault_buffer->Size(), 0);
+	auto& null_buffer = m_slot_buffers[NULL_BUFFER_ID];
+	null_buffer.Fill(0, null_buffer.Size(), 0);
+}
+
 void BufferCache::Register(BufferId id) {
+	// Page-table entries written below must not be undone by a later clear.
+	EnsureDeviceStateCleared();
 	ChangeRegister<true>(id);
 }
 
@@ -75,6 +93,13 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
+		m_bda_tracked_ranges.ForEachInRange(
+		    buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
+			    for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+				    addresses[(page - buffer.CpuAddress()) >> CACHING_PAGEBITS] |=
+				        BDA_STORE_TRACKED_BIT;
+			    }
+		    });
 		WriteDataBuffer(m_bda_pagetable_buffer, pages.first * sizeof(vk::DeviceAddress),
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
@@ -109,27 +134,50 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
+	std::vector<vk::BufferCopy> ranges;
 	const auto                  buffer_address = buffer.CpuAddress();
+	const auto                  capacity = Common::AlignDown(m_download_buffer.Size(), 64);
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Keep packed ranges on separate cache lines, as in shadPS4.
-			    total_size += Common::AlignUp(end - start, 64);
+			    for (auto begin = start; begin < end;) {
+				    const auto part = std::min(end - begin, capacity);
+				    ranges.emplace_back(begin - buffer_address, 0, part);
+				    begin += part;
+			    }
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
-	if (copies.empty()) {
+	if (ranges.empty()) {
 		return false;
 	}
 
+	// Each batch fits the staging buffer; mapping the next one waits for the previous readback.
+	for (size_t first = 0; first < ranges.size();) {
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size = 0;
+		for (; first < ranges.size(); first++) {
+			// Keep packed ranges on separate cache lines, as in shadPS4.
+			const auto packed = Common::AlignUp(ranges[first].size, 64);
+			if (packed > capacity - total_size) {
+				break;
+			}
+			copies.emplace_back(ranges[first].srcOffset, total_size, ranges[first].size);
+			total_size += packed;
+		}
+		DownloadBatch(buffer, std::move(copies), total_size);
+	}
+	return true;
+}
+
+void BufferCache::DownloadBatch(Buffer& buffer, std::vector<vk::BufferCopy>&& copies,
+                                uint64_t total_size) {
+	const auto buffer_address   = buffer.CpuAddress();
 	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 32 MiB staging buffer capacity\n");
+		EXIT("BufferCache: download batch exceeds the staging buffer capacity\n");
 	}
 	m_download_buffer.Commit();
 	for (auto& copy: copies) {
@@ -171,7 +219,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	});
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -634,6 +681,64 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
+	if ((vaddr & (CACHING_PAGESIZE - 1)) != 0 || size == 0 ||
+	    (size & (CACHING_PAGESIZE - 1)) != 0 || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: BDA fault range must be page aligned\n");
+	}
+	RangeSet stored;
+	RangeSet missing;
+	for (auto page = vaddr; page < vaddr + size; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		(owner != nullptr && *owner ? stored : missing).Add(page, CACHING_PAGESIZE);
+	}
+	stored.ForEach([this](uint64_t begin, uint64_t end) {
+		m_bda_tracked_ranges.Add(begin, end - begin);
+		m_bda_unmarked_ranges.Add(begin, end - begin);
+	});
+	missing.ForEach([this](uint64_t begin, uint64_t end) { (void)FindBuffer(begin, end - begin); });
+	stored.ForEach([this](uint64_t begin, uint64_t end) {
+		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				continue;
+			}
+			const auto&             buffer = m_slot_buffers[*owner];
+			const vk::DeviceAddress entry =
+			    (buffer.BufferDeviceAddress() + (page - buffer.CpuAddress())) |
+			    BDA_STORE_TRACKED_BIT;
+			WriteDataBuffer(m_bda_pagetable_buffer,
+			                (page >> CACHING_PAGEBITS) * sizeof(vk::DeviceAddress), &entry,
+			                sizeof(entry));
+		}
+	});
+}
+
+void BufferCache::MarkBdaStoresInRange(uint64_t vaddr, uint64_t size, bool all_tracked) {
+	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
+	ranges.ForEachInRange(
+	    vaddr, size, [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
+}
+
+void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start >= finish) {
+			continue;
+		}
+		TouchBuffer(buffer);
+		(void)SynchronizeBuffer(buffer, start, finish - start, true, false);
+		m_gpu_modified_ranges.Add(start, finish - start);
+	}
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

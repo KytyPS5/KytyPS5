@@ -31,6 +31,7 @@ struct ImageOpcodeInfo {
 	ImageAccess        access         = ImageAccess::None;
 	ImageResourceClass resource_class = ImageResourceClass::None;
 	bool               needs_sampler  = false;
+	uint32_t           atomic_bits    = 0;
 };
 
 struct DppMoveFlags {

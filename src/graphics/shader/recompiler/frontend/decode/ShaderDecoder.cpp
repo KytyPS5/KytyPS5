@@ -127,10 +127,16 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* sample_name =
-	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
+	// The three encoding spaces are disjoint, so a plain first-hit lookup is unambiguous.
+	const char* mimg_name = MimgSampleOpcodeName(inst.opcode_id);
+	if (mimg_name == nullptr) {
+		mimg_name = MimgGatherOpcodeName(inst.opcode_id);
+	}
+	if (mimg_name == nullptr) {
+		mimg_name = MimgBvhOpcodeName(inst.opcode_id);
+	}
 	const std::string_view name =
-	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
+	    mimg_name != nullptr ? mimg_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
 	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
@@ -144,13 +150,8 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
-		case Opcode::IMAGE_GATHER4_LZ:
-		case Opcode::IMAGE_GATHER4_C:
-		case Opcode::IMAGE_GATHER4_C_LZ:
-		case Opcode::IMAGE_GATHER4_LZ_O:
-		case Opcode::IMAGE_GATHER4_C_O:
-		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
@@ -580,13 +581,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
-		case Opcode::IMAGE_GATHER4_LZ:
-		case Opcode::IMAGE_GATHER4_C:
-		case Opcode::IMAGE_GATHER4_C_LZ:
-		case Opcode::IMAGE_GATHER4_LZ_O:
-		case Opcode::IMAGE_GATHER4_C_O:
-		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_GATHER4: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:
@@ -677,10 +672,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
 		case Opcode::DS_WRXCHG_RTN_B32:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
 		case Opcode::DS_BPERMUTE_B32:
+		case Opcode::DS_PERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:
 		case Opcode::DS_READ_I16:

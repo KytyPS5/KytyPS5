@@ -544,12 +544,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features13.pNext = &supported_robustness2;
 	}
 
+	const bool image_atomic_int64_extension =
+	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT supported_image_atomic_int64 {};
+	supported_image_atomic_int64.sType =
+	    vk::StructureType::ePhysicalDeviceShaderImageAtomicInt64FeaturesEXT;
+	void* supported_tail = &supported_features13;
+	if (image_atomic_int64_extension) {
+		supported_image_atomic_int64.pNext = supported_tail;
+		supported_tail                     = &supported_image_atomic_int64;
+	}
+
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
 	vk::PhysicalDeviceMeshShaderFeaturesEXT supported_mesh {};
-	supported_mesh.pNext = &supported_features13;
+	supported_mesh.pNext = supported_tail;
 	vk::PhysicalDeviceFeatures2 supported_features2 {};
-	supported_features2.pNext = mesh_extension ? static_cast<void*>(&supported_mesh)
-	                                           : static_cast<void*>(&supported_features13);
+	supported_features2.pNext =
+	    mesh_extension ? static_cast<void*>(&supported_mesh) : supported_tail;
 	const bool feedback_extensions =
 	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 	    HasExtension(device_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
@@ -663,6 +674,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+
+	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
+	image_atomic_int64.sType =
+	    vk::StructureType::ePhysicalDeviceShaderImageAtomicInt64FeaturesEXT;
+	const bool image_int64_atomics_enabled =
+	    image_atomic_int64_extension && supported_image_atomic_int64.shaderImageInt64Atomics;
+	if (image_int64_atomics_enabled) {
+		image_atomic_int64.shaderImageInt64Atomics = VK_TRUE;
+		image_atomic_int64.pNext                   = features13.pNext;
+		features13.pNext                           = &image_atomic_int64;
+	}
+	LOGF("Vulkan 64-bit image atomics: %s\n", image_int64_atomics_enabled ? "true" : "false");
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -1058,6 +1081,7 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

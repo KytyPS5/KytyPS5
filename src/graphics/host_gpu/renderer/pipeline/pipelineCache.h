@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -99,6 +100,9 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	// Carried for diagnostics only: the guest shader hash and the SPIR-V handed to the driver.
+	uint64_t         hash        = 0;
+	uint32_t         spirv_words = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -211,12 +215,21 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// Identity of the running binary; 0 when it could not be fingerprinted.
+	uint64_t                      m_build_hash = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
+	Common::Mutex                         m_mutex;
+	std::chrono::steady_clock::time_point m_last_save = std::chrono::steady_clock::now();
+
+	// This emulator dies by device loss, abort or a closed window far more often than it exits
+	// cleanly, so the cache is written while the run is still alive.
+	static constexpr std::chrono::seconds DriverCacheSavePeriod {20};
 
 	void InitializeDriverCache();
+	bool WriteDriverCacheLocked();
+	void MaybeSaveDriverCacheLocked();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

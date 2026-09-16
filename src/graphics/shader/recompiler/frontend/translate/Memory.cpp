@@ -120,6 +120,8 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
+	// On an atomic glc selects the pre-operation return value, not a cache policy.
+	memory.cache_bypass  = decoded.glc && !Decoder::GlcSelectsAtomicReturnValue(decoded.opcode);
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
@@ -230,8 +232,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
 			case Decoder::Opcode::DS_MIN_F32:
-			case Decoder::Opcode::DS_MAX_F32:
-				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
+			case Decoder::Opcode::DS_MAX_F32: return index == 0u ? decoded.src1 : decoded.src0;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
 			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
@@ -243,6 +244,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
+			case Decoder::Opcode::DS_MSKOR_B32:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			default:
 				if (decoded.opcode >= Decoder::Opcode::DS_ADD_U32 &&
@@ -537,13 +539,20 @@ bool Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	return true;
 }
 
-bool Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+bool Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
+                              IR::ValueOpcode opcode64) {
+	const bool wide = inst.data_dwords == 2u;
+	if (inst.data_dwords != 1u && !wide) {
+		return false;
+	}
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
-	const auto result =
-	    ir.Emit(opcode, {resource, address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	            AddMemoryInfo(memory, inst.pc));
+	const auto data     = wide ? IR::Value(ReadU64(MemorySourceAt(inst, 0)))
+	                           : IR::Value(ReadU32(MemorySourceAt(inst, 0)));
+	const auto result   = ir.Emit(wide ? opcode64 : opcode32,
+	                              {resource, address, data, ir.GetExec()},
+	                              AddMemoryInfo(memory, inst.pc));
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
 	}
@@ -691,6 +700,34 @@ bool Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	return true;
 }
 
+// APPROXIMATION, NOT AN IMPLEMENTATION. image_bvh_intersect_ray / image_bvh64_intersect_ray are
+// the RDNA2 hardware ray-tracing primitive: each intersects a ray against ONE AMD-format BVH node
+// read from a raw guest address and returns four dwords - the sorted child pointers of a box node,
+// or hit distance and triangle data for a triangle node. Vulkan cannot express that. Ray query
+// (SPV_KHR_ray_query) runs against a driver-built opaque acceleration structure, not a
+// caller-supplied node at a guest address, so a faithful emulation means reimplementing AMD's node
+// layout and its box/triangle intersection math in SPIR-V.
+//
+// Until then every intersection reports a MISS: 0xffffffff in all four result registers. That
+// value is well defined under both readings of the result. As a child pointer it is INVALID_NODE,
+// so the guest traversal loop pushes nothing and drains its stack; as an f32 distance it is a NaN,
+// so every "closer than t_max" compare is false. Traversal therefore terminates and reports no hit
+// instead of spinning or reading uninitialised memory.
+//
+// WHAT IS LOST: every hardware-ray-traced effect renders as if the scene were empty - for UE5 this
+// is Lumen's hardware reflections and GI. The shader still runs and still writes its other
+// outputs, which is why this beats skipping the dispatch outright. The 128-bit srsrc is a BVH
+// descriptor and NOT a T#: it is deliberately never read here, so it can never reach
+// GetImageResource and be bound into a descriptor set.
+bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	program.uses_bvh_intersect_stub = true;
+	// data_dwords is pinned to 4 by the decoder: VDataDwords is 4 in both encodings.
+	for (uint32_t index = 0; index < inst.data_dwords; index++) {
+		WriteOperand(OffsetOperand(inst.dst, index), IR::Value(0xffffffffu));
+	}
+	return true;
+}
+
 IR::Value Translator::LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
                                     uint32_t pc) {
 	IR::ValueOpcode opcode;
@@ -829,8 +866,18 @@ bool Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 }
 
 bool Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+	// ds_min_f32 and ds_max_f32 are single-data-operand atomics: the encoded data1 field is
+	// unused, so only the address and data0 are read.
 	const auto memory = MemoryInfoFromDecoded(inst);
 	ir.Emit(opcode,
+	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
+	        AddMemoryInfo(memory, inst.pc));
+	return true;
+}
+
+bool Translator::DS_MSKOR_B32(const Decoder::Instruction& inst) {
+	const auto memory = MemoryInfoFromDecoded(inst);
+	ir.Emit(IR::ValueOpcode::SharedAtomicMaskedOr32,
 	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
 	         ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
@@ -873,6 +920,13 @@ bool Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
 	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
 	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::BpermuteU32,
+	                               {ReadU32(inst.src1), address, ir.GetExec()}));
+	return true;
+}
+
+bool Translator::DS_PERMUTE_B32(const Decoder::Instruction& inst) {
+	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
+	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::PermuteU32,
 	                               {ReadU32(inst.src1), address, ir.GetExec()}));
 	return true;
 }
@@ -995,21 +1049,29 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
+		case Decoder::Opcode::DS_MSKOR_B32: return DS_MSKOR_B32(inst);
 
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32,
+			                    IR::ValueOpcode::ImageAtomicSwap64);
 		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicIAdd32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicIAdd32,
+			                    IR::ValueOpcode::ImageAtomicIAdd64);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMIN:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMin32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMin32,
+			                    IR::ValueOpcode::ImageAtomicUMin64);
 		case Decoder::Opcode::IMAGE_ATOMIC_UMAX:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMax32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicUMax32,
+			                    IR::ValueOpcode::ImageAtomicUMax64);
 		case Decoder::Opcode::IMAGE_ATOMIC_AND:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicAnd32,
+			                    IR::ValueOpcode::ImageAtomicAnd64);
 		case Decoder::Opcode::IMAGE_ATOMIC_OR:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32,
+			                    IR::ValueOpcode::ImageAtomicOr64);
 		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32);
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32,
+			                    IR::ValueOpcode::ImageAtomicXor64);
 
 		case Decoder::Opcode::FLAT_LOAD_UBYTE:
 		case Decoder::Opcode::FLAT_LOAD_SBYTE:
@@ -1034,13 +1096,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
-		case Decoder::Opcode::IMAGE_GATHER4_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_C:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
-		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_O:
-		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_GATHER4: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);
@@ -1048,6 +1105,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMax32);
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
 		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_BPERMUTE_B32(inst);
+		case Decoder::Opcode::DS_PERMUTE_B32: return DS_PERMUTE_B32(inst);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:

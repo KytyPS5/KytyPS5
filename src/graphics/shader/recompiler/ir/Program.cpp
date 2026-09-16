@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -202,6 +203,105 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out, CyclicPhiFailure* reject) {
+	const auto fail = [&](CyclicPhiReject reason, Value entry = {}, Value other = {}) {
+		if (reject != nullptr) {
+			*reject = {reason, entry, other};
+		}
+		return Value {};
+	};
+	if (reject != nullptr) {
+		*reject = {};
+	}
+	value            = value.Resolve();
+	const auto* root = value.TryInstruction();
+	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+		return {};
+	}
+	std::vector<const Inst*>        web_order {root};
+	std::unordered_set<const Inst*> web {root};
+	for (size_t index = 0; index < web_order.size(); index++) {
+		const auto* inst = web_order[index];
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			const auto* operand = inst->Arg(arg).Resolve().TryInstruction();
+			if (operand != nullptr && operand->GetOpcode() == ValueOpcode::Phi &&
+			    web.insert(operand).second) {
+				web_order.push_back(operand);
+			}
+		}
+	}
+
+	// An operand leading back into the web is the value the loop carries; anything else is a
+	// value the loop was entered with.
+	std::unordered_map<const Inst*, bool> reaches;
+	const auto ReachesWeb = [&](Value operand) {
+		const auto* start = operand.Resolve().TryInstruction();
+		if (start == nullptr) {
+			return false;
+		}
+		if (const auto found = reaches.find(start); found != reaches.end()) {
+			return found->second;
+		}
+		std::vector<const Inst*>        pending {start};
+		std::unordered_set<const Inst*> seen {start};
+		bool                            found = false;
+		while (!pending.empty() && !found) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				const auto* next = inst->Arg(arg).Resolve().TryInstruction();
+				if (next == nullptr) {
+					continue;
+				}
+				if (web.contains(next)) {
+					found = true;
+					break;
+				}
+				if (seen.insert(next).second) {
+					pending.push_back(next);
+				}
+			}
+		}
+		if (!found) {
+			// The walk ran to completion, so nothing it visited reaches the web either.
+			for (const auto* inst: seen) {
+				reaches.emplace(inst, false);
+			}
+		}
+		reaches[start] = found;
+		return found;
+	};
+
+	Value entry;
+	for (const auto* inst: web_order) {
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			const auto operand = inst->Arg(arg).Resolve();
+			const auto* source = operand.TryInstruction();
+			if (source != nullptr && web.contains(source)) {
+				continue;
+			}
+			if (ReachesWeb(operand)) {
+				continue;
+			}
+			if (entry.IsEmpty()) {
+				entry = operand;
+			} else if (!EquivalentValue(program, entry, operand)) {
+				// A merge, not a loop: no single host binding stands for it.
+				return fail(CyclicPhiReject::Merge, entry, operand);
+			}
+		}
+	}
+	if (entry.IsEmpty()) {
+		return fail(CyclicPhiReject::NoEntry);
+	}
+	if (web_out != nullptr) {
+		// The web's phis stand or fall together, so a caller must hold them all to one value.
+		*web_out = web_order;
+	}
+	return entry;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

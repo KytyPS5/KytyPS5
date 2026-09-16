@@ -124,7 +124,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
 			       const auto op = use.user->GetOpcode();
 			       if (op != IR::ValueOpcode::LoadAddressU32 &&
-			           op != IR::ValueOpcode::ReadConstBuffer) {
+			           op != IR::ValueOpcode::ReadConstBuffer &&
+			           op != IR::ValueOpcode::LoadBufferU32) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
@@ -202,8 +203,6 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						Fail(program, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
-				} else if (address_access == IR::AddressAccess::Write) {
-					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
 				}
 			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
@@ -212,6 +211,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
+				// Must match the emitter's predicate, or a module can use the alias undeclared.
+				if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic &&
+				    Emitter::CoherentBufferAccess(memory)) {
+					requirements.coherent_buffers = true;
+				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
@@ -270,6 +274,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					break;
 				}
 				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::PermuteU32:
 				case IR::ValueOpcode::BpermuteU32: {
 					requirements.subgroup_ballot              = true;
 					requirements.subgroup_shuffle             = true;

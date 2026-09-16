@@ -350,7 +350,11 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 				const auto viewport = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), viewport, raw,
 				                          ConstantU32(state, 16), ConstantU32(state, 4));
-				state.builder.AddFunction(spv::OpStore, state.viewport_index_variable, viewport);
+				const auto pointer =
+				    state.program.stage == ShaderType::Mesh
+				        ? MeshOutputPointer(state, IR::StageOutputKind::ViewportIndex)
+				        : state.viewport_index_variable;
+				state.builder.AddFunction(spv::OpStore, pointer, viewport);
 			}
 			continue;
 		}
@@ -362,12 +366,21 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 		const auto raw = ExportRawComponent(ctx, data, component);
 		const auto f32 = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw);
+		const bool mesh = state.program.stage == ShaderType::Mesh;
 		if (output.point_size) {
-			state.builder.AddFunction(spv::OpStore, state.point_size_variable, f32);
+			state.builder.AddFunction(spv::OpStore,
+			                          mesh
+			                              ? MeshOutputPointer(state, IR::StageOutputKind::PointSize)
+			                              : state.point_size_variable,
+			                          f32);
 			continue;
 		}
-		auto StoreDistance = [&](uint32_t variable, uint32_t index) {
+		auto StoreDistance = [&](IR::StageOutputKind kind, uint32_t variable, uint32_t index) {
 			if (index == UINT32_MAX) {
+				return;
+			}
+			if (mesh) {
+				state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, index), f32);
 				return;
 			}
 			const auto pointer = state.builder.AllocateId();
@@ -376,8 +389,10 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			                          pointer, variable, ConstantU32(state, index));
 			state.builder.AddFunction(spv::OpStore, pointer, f32);
 		};
-		StoreDistance(state.clip_distance_variable, output.clip_distance);
-		StoreDistance(state.cull_distance_variable, output.cull_distance);
+		StoreDistance(IR::StageOutputKind::ClipDistance, state.clip_distance_variable,
+		              output.clip_distance);
+		StoreDistance(IR::StageOutputKind::CullDistance, state.cull_distance_variable,
+		              output.cull_distance);
 	}
 }
 
@@ -560,9 +575,11 @@ void EmitVoid(ValueEmitContext&) {}
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	// A guest s_barrier also separates buffer traffic, not just LDS: UniformMemory too.
 	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
 	                                       : spv::MemorySemanticsAcquireReleaseMask |
-	                                             spv::MemorySemanticsWorkgroupMemoryMask;
+	                                             spv::MemorySemanticsWorkgroupMemoryMask |
+	                                             spv::MemorySemanticsUniformMemoryMask;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }

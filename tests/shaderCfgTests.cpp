@@ -9480,6 +9480,46 @@ void TestFusedShaderHandoffPreservesRegisters() {
   Check(allocations == 1u, "fused shader omitted the back shader allocation");
 }
 
+void TestFusedShaderSwapPcHandoff() {
+  // The merged-stage hand-off is normally s_setpc_b64 s[6:7], but compilers
+  // also emit s_swappc_b64 null, s[6:7]; the metadata after it must stay
+  // undecoded in both forms.
+  using namespace ShaderRecompiler;
+  const uint32_t front[] = {
+      EncodeSMovB32(12, 255), 0x1003u, // three vertices and one primitive
+      0xbefd2106u,                     // s_swappc_b64 null, s[6:7]
+      0xffffffffu,                     // front shader metadata must not be decoded
+  };
+  const uint32_t back[] = {
+      EncodeSMovB32(124, 12), // s_mov_b32 m0, s12
+      EncodeSopp(0x10, 9),   // s_sendmsg MSG_GS_ALLOC_REQ
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.mesh.threads_num[0] = 192;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.primitives_per_group = 62;
+  input.mesh.vertices_per_group = 64;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.back_code = back;
+  auto translated = TranslateProgram(front, options);
+  uint32_t allocations = 0;
+  for (const auto* block: translated.program.blocks) {
+    for (const auto& inst: *block) {
+      if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+        continue;
+      }
+      const auto value = inst.Arg(0).Resolve();
+      Check(value.IsImmediate() && value.U32() == 0x1003u,
+            "fused s_swappc hand-off lost the front shader's scalar register value");
+      allocations++;
+    }
+  }
+  Check(allocations == 1u, "fused s_swappc hand-off omitted the back shader allocation");
+}
+
 void TestMeshExportStorage() {
   using ShaderRecompiler::IR::PushData;
   const uint32_t front[] = {
@@ -13566,6 +13606,7 @@ int main() {
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
+  TestFusedShaderSwapPcHandoff();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();

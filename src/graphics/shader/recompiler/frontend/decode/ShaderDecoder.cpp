@@ -401,14 +401,18 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 		auto& inst = result.instructions.emplace_back();
 		DecodeInstruction(front, front_words, inst);
 		front_words += inst.word_count;
-		if (inst.opcode == Opcode::S_SETPC_B64) {
+		// The merged-stage ABI hands the back shader over in s[6:7]; depending on the
+		// compiler this is s_setpc_b64 s[6:7] or s_swappc_b64 null, s[6:7]. Both end the
+		// front program - only stopping on s_setpc walks into the words that follow it.
+		if (inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
 			break;
 		}
 		EXIT_NOT_IMPLEMENTED(inst.opcode == Opcode::S_ENDPGM);
 	}
 	EXIT_IF(result.instructions.empty() ||
-	        result.instructions.back().opcode != Opcode::S_SETPC_B64);
+	        (result.instructions.back().opcode != Opcode::S_SETPC_B64 &&
+	         result.instructions.back().opcode != Opcode::S_SWAPPC_B64));
 	result.code = front.first(front_words);
 	return result;
 }

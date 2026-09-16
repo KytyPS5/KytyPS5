@@ -504,9 +504,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 .count());
 	};
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64
+	     " back_words=%" PRIu64 " decode\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(code.size()));
+	     static_cast<uint64_t>(code.size()), static_cast<uint64_t>(options.back_code.size()));
 
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;

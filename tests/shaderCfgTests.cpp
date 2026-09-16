@@ -1795,6 +1795,39 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
+void TestDisabledSystemDebugBranch() {
+  using namespace ShaderRecompiler;
+  // Relocate PPSA08709 MS pc 0x530 to zero, retaining its displacement to the
+  // system validation helper immediately after the main shader's S_ENDPGM.
+  std::array<uint32_t, 274> shader;
+  shader.fill(EncodeSopp(0x00));
+  shader[0] = 0xbf97010fu;
+  shader[1] = EncodeVop1(0x01, 1, 129);
+  shader[2] = EncodeMubuf0(0x1c, 0, false);
+  shader[3] = EncodeMubuf1(1, 0, 0);
+  shader[271] = EncodeSopp(0x01);
+  shader[272] = 0xffffffffu; // System-only helper must not be decoded.
+  shader[273] = 0xffffffffu;
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.front().opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS &&
+            decoded.instructions.front().branch_target == 0x440u &&
+            decoded.instructions.back().pc == 0x43cu &&
+            decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+        "disabled system debug branch reached its post-ENDPGM validation helper");
+  auto graph = CFG::BuildGraph(decoded);
+  Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
+            graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
+        "disabled system debug branch changed normal shader control flow");
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "S_CBRANCH_CDBGSYS 0x00000440") &&
+            Common::ContainsStr(result.ir_dump, "StoreBufferU32"),
+        "disabled system debug branch lost its identity or fallthrough write");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -13537,6 +13570,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestDisabledSystemDebugBranch();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

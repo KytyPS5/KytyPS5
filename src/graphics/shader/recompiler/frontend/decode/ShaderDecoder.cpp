@@ -189,6 +189,8 @@ std::string FormatExp(const Instruction& inst) {
 
 bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
+		// DevKit NGG should be disabled.
+		case Opcode::S_CBRANCH_CDBGSYS: return false;
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
 		case Opcode::S_CBRANCH_VCCZ:

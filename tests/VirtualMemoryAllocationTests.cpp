@@ -2818,6 +2818,7 @@ void TestPackedReciprocalSquareRoot() {
 
 #if defined(__x86_64__) || defined(_M_X64)
 constexpr int32_t FiberErrorState = -2141650938; // SCE_FIBER_ERROR_STATE
+constexpr int32_t FiberErrorPermission = -2141650939;
 
 struct FiberRoundTrip {
 	Libs::Fiber::FiberObject* first;
@@ -2896,6 +2897,13 @@ void TestSmallFiberStacksAndMigration() {
 		CheckOk(test, Libs::Fiber::FiberInitialize(data.second, "second", SecondFiberEntry,
 		    reinterpret_cast<uint64_t>(&data), second_stack.data() + GuardSize, stack_size,
 		    nullptr, 0x0a000000), "initialize second fiber");
+		const auto thread_context_is_clear = [&] {
+			Libs::Fiber::FiberObject* self = data.first;
+			return Libs::Fiber::FiberGetSelf(&self) == OK && self == nullptr &&
+			       Libs::Fiber::FiberSwitch(data.first, 0, nullptr) == FiberErrorPermission &&
+			       Libs::Fiber::FiberReturnToThread(0, nullptr) == FiberErrorPermission;
+		};
+		Check(test, thread_context_is_clear(), "thread retained a fiber context before its first run");
 		uint64_t first_base = 0;
 		uint64_t second_base = 0;
 		std::memcpy(&first_base, first_stack.data() + GuardSize, sizeof(first_base));
@@ -2916,15 +2924,21 @@ void TestSmallFiberStacksAndMigration() {
 		Check(test, returned == 13 && data.first_visits == 1 && data.second_visits == 1 &&
 		                data.first_arg == 10 && data.second_arg == 11,
 		      "switch/return arguments were not preserved");
+		Check(test, thread_context_is_clear(), "run retained its thread context after returning");
 		check_stacks();
 
 		std::atomic<bool> done {false};
 		int worker_result = -1;
-		int worker_self_result = -1;
-		Libs::Fiber::FiberObject* worker_self = data.first;
+		int worker_repeat_result = -1;
+		bool worker_context_clear = false;
+		uint64_t worker_returned = 0;
+		uint64_t worker_repeat_returned = 0;
 		std::thread worker([&] {
-			worker_result = Libs::Fiber::FiberRun(data.first, 20, &returned);
-			worker_self_result = Libs::Fiber::FiberGetSelf(&worker_self);
+			worker_context_clear = thread_context_is_clear();
+			worker_result = Libs::Fiber::FiberRun(data.first, 20, &worker_returned);
+			worker_context_clear = thread_context_is_clear() && worker_context_clear;
+			worker_repeat_result = Libs::Fiber::FiberRun(data.first, 30, &worker_repeat_returned);
+			worker_context_clear = thread_context_is_clear() && worker_context_clear;
 			done.store(true, std::memory_order_release);
 		});
 		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2939,19 +2953,24 @@ void TestSmallFiberStacksAndMigration() {
 		const int busy_finalize = running ? Libs::Fiber::FiberFinalize(data.first) : 0;
 		data.release.store(true, std::memory_order_release);
 		worker.join();
-		Libs::Fiber::FiberObject* main_self_after = data.first;
-		Check(test, Libs::Fiber::FiberGetSelf(&main_self_after) == OK && main_self_after == nullptr &&
-		                main_self_result == OK && main_self == nullptr,
+		Check(test, thread_context_is_clear() && main_self_result == OK && main_self == nullptr,
 		      "migrated fiber changed the original thread's current fiber");
 		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState,
 		      "running fiber was not exclusively owned");
 		CheckOk(test, worker_result, "resume fiber on another thread");
-		Check(test, worker_self_result == OK && worker_self == nullptr,
-		      "return to thread retained a current fiber");
-		Check(test, returned == 23 && data.first_visits == 2 && data.second_visits == 2 &&
-		                data.first_arg == 20 && data.second_arg == 21 &&
+		CheckOk(test, worker_repeat_result, "repeat run on another thread");
+		Check(test, worker_context_clear, "worker retained a context outside a fiber run");
+		Check(test, worker_returned == 23 && worker_repeat_returned == 33 &&
+		                data.first_visits == 3 && data.second_visits == 3 &&
+		                data.first_arg == 30 && data.second_arg == 31 &&
 		                data.first_errors == 0 && data.second_errors == 0,
 		      "migration lost fiber identity, arguments, or resumable contexts");
+		CheckOk(test, Libs::Fiber::FiberRun(data.first, 40, &returned), "migrate fiber back to original thread");
+		Check(test, returned == 43 && data.first_visits == 4 && data.second_visits == 4 &&
+		                data.first_arg == 40 && data.second_arg == 41 &&
+		                data.first_errors == 0 && data.second_errors == 0,
+		      "return migration reused an expired thread context");
+		Check(test, thread_context_is_clear(), "repeated run retained its thread context after returning");
 		check_stacks();
 		CheckOk(test, Libs::Fiber::FiberFinalize(data.first), "finalize first suspended fiber");
 		CheckOk(test, Libs::Fiber::FiberFinalize(data.second), "finalize second suspended fiber");

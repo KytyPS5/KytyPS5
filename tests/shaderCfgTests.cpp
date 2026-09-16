@@ -9899,6 +9899,77 @@ void TestNewShaderRecompilerSetpcBranch() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestPlainSetpcThroughS6DecodesFollowingCode() {
+  using namespace ShaderRecompiler::Decoder;
+  // Only a merged-stage front half stops at s6; plain code continues.
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 6, 0),      // s_getpc_b64 s[6:7]
+      EncodeSop2(0x00, 6, 6, 140), // s_add_u32 s6, s6, 12
+      EncodeSop1(0x20, 0, 6),      // s_setpc_b64 s[6:7]
+      EncodeSMovB32(0, 129),       0xbf810000u,
+  };
+
+  Program program;
+  DecodeProgram(shader, program);
+  Check(program.instructions.size() == 5u &&
+            program.instructions[2].opcode == Opcode::S_SETPC_B64 &&
+            program.instructions[2].src0.kind == OperandKind::Sgpr &&
+            program.instructions[2].src0.reg == 6u &&
+            program.instructions.back().opcode == Opcode::S_ENDPGM,
+        "plain s_setpc_b64 s6 stopped decoding the code after it");
+  const auto front_half = DecodeFrontProgram(shader);
+  Check(front_half.instructions.size() == 3u,
+        "front half decode did not stop at s_setpc_b64 s6");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "s_endpgm"),
+        "plain s_setpc_b64 s6 lost the code after it");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestFrontHalfDecodeStopsAtHandoff() {
+  using namespace ShaderRecompiler::Decoder;
+  // The dumped front half of ms_da5652193151de2c: s_setpc_b64 s6 at word 103, then padding and
+  // the "sl00" metadata tag at word 112, whose low byte is not a scalar source operand.
+  const uint32_t code[] = {
+      0xbfa00003u, 0x8f6a9003u, 0x94fe6ac1u, 0xbf880062u, 0xd7650007u, 0x000100c1u, 0xf4040607u,
+      0xfa000000u, 0xbf8cc07fu, 0x8f6b8419u, 0x93eaff19u, 0x0001001au, 0x876bff6bu, 0x000001f0u,
+      0xbf066a80u, 0xf4080406u, 0xd6000000u, 0xbe8e03ffu, 0x022c0204u, 0xbe8f03ffu, 0x0fac03acu,
+      0x8594807eu, 0x9396ff19u, 0x00070007u, 0x93ebff19u, 0x00020005u, 0x8f6a8c16u, 0x98ebff6bu,
+      0x000c0000u, 0xbf8cc07fu, 0x8717ff13u, 0xfff80000u, 0xd5010006u, 0x00520b08u, 0x88146a17u,
+      0x94ea6b0eu, 0x9399ff19u, 0x000c000eu, 0x886a6a14u, 0xbf068016u, 0xd7660009u, 0x00020ec1u,
+      0x85136a13u, 0x8f6b8418u, 0x93eaff18u, 0x0001001au, 0x876bff6bu, 0x000001f0u, 0xbf066a80u,
+      0xf4080506u, 0xd6000000u, 0x858c807eu, 0x939aff18u, 0x00070007u, 0x93ebff18u, 0x00020005u,
+      0xbf8cc07fu, 0x871bff17u, 0xfff80000u, 0x8f6a8c1au, 0x98ebff6bu, 0x000c0000u, 0x881b6a1bu,
+      0x94ea6b0eu, 0xe0042000u, 0x19040606u, 0xd501000au, 0x00320b08u, 0x886b6a1bu, 0x9398ff18u,
+      0x000c000eu, 0x93eaff03u, 0x00040018u, 0xbf06801au, 0xd7460005u, 0x04250c6au, 0x85176b17u,
+      0xf4280704u, 0xfa000010u, 0xe0042000u, 0x1805090au, 0xf4201a84u, 0xfa000000u, 0x160a0a9cu,
+      0xbf8cc07fu, 0x4a10106au, 0x7e160280u, 0x7e1802f2u, 0xd8340018u, 0x00000805u, 0xd8380504u,
+      0x000c0b05u, 0xbf8c3f71u, 0xd5410007u, 0x007c3b07u, 0xd5410006u, 0x00783906u, 0xd8380100u,
+      0x00070605u, 0xbf8c3f70u, 0xd8380302u, 0x000a0905u, 0xbf8cc07fu, 0xbe802006u, 0xbf9f0000u,
+      0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0xbf9f0000u, 0x00000000u, 0x00000000u, 0x00000000u,
+      0x30306c73u, 0x000000cdu, 0x000000e8u, 0x00000000u, 0x00102961u, 0x10204900u, 0x10254024u,
+      0x00001041u, 0x100401a6u, 0x40401009u, 0x10462042u, 0x104c104bu, 0x104e104du, 0x1079606fu,
+      0x1085107au, 0x006e0000u, 0x10255700u, 0x0f650000u, 0x22102120u, 0x00402420u, 0x200f6500u,
+      0x40241021u, 0x0f640000u, 0x24102120u, 0x45000040u, 0x00004024u, 0x2b10294du, 0x44000010u,
+      0x00004024u, 0xe00da0c1u, 0x88181000u, 0xd2f2c70fu, 0x00208574u, 0x818f6f04u, 0x85680080u,
+      0x15010901u, 0x8a04018au, 0x63030801u, 0x819e018fu, 0x97150080u, 0x81a81001u, 0x03200080u,
+      0x00019e10u, 0x0501a810u, 0x8518285au, 0x01b05101u, 0x01971017u, 0x0201b546u, 0x01ac0000u,
+      0xbc01ac41u, 0xc43e2001u, 0x01ca2001u, 0x01c40100u, 0xa80b0001u, 0x0404a946u, 0x8a801174u,
+      0xa32040a0u, 0x01c5d985u, 0x00000000u, 0x00000000u, 0x65726162u, 0x746f6f66u, 0xa287d836u,
+      0x00000000u, 0x00000001u, 0x000001b4u, 0x00000000u, 0x000000e8u, 0xa89d1c6eu, 0x18b642a3u,
+      0x00000000u, 0x00000000u,
+  };
+  Check(code[112] == 0x30306c73u, "front half fixture lost its metadata tag");
+  const auto program = DecodeFrontProgram(code);
+  const auto &last = program.instructions.back();
+  Check(last.opcode == Opcode::S_SETPC_B64 && last.src0.kind == OperandKind::Sgpr &&
+            last.src0.reg == 6u && last.pc == 103u * 4u && last.word_count == 1u,
+        "front half decode did not stop at its stage hand-off");
+}
+
 void TestFusedShaderHandoffPreservesRegisters() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -14068,6 +14139,8 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestPlainSetpcThroughS6DecodesFollowingCode();
+  TestFrontHalfDecodeStopsAtHandoff();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMeshAuxiliaryPositionOutputs();

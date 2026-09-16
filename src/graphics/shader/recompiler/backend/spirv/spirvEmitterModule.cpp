@@ -388,6 +388,19 @@ void DefineInputs(EmitterState& state) {
 		}
 	}
 	for (auto& input: state.inputs) {
+		if (state.program.stage == ShaderType::Pixel &&
+		    input.kind == IR::StageInputKind::Parameter) {
+			const auto location = PixelParameterLocation(state, input.location);
+			const auto alias = std::ranges::find_if(state.inputs, [&](const InputBinding& other) {
+				return other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&
+				       PixelParameterLocation(state, other.location) == location;
+			});
+			if (alias != state.inputs.end()) {
+				EXIT_IF(alias->per_vertex != input.per_vertex);
+				input.variable_id = alias->variable_id;
+				continue;
+			}
+		}
 		uint32_t type = TypeU32(state);
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
@@ -475,6 +488,15 @@ void DefineOutputs(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state);
 		return;
+	}
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
+		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
+		state.invalid_position_clip_distance = clip_distance_count++;
+		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
+		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
 	}
 	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
 	                         spv::BuiltIn builtin) {

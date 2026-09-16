@@ -171,6 +171,7 @@ enum class StageInputKind {
 	Layer,
 	SampleId,
 	BaryCoordSmooth,
+	BaryCoordSmoothCentroid,
 	BaryCoordNoPerspective,
 	WorkgroupId,
 	LocalInvocationId,

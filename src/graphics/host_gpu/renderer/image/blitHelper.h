@@ -37,8 +37,7 @@ private:
 		vk::Pipeline handle = nullptr;
 	};
 
-	[[nodiscard]] vk::ShaderModule CreateShader(const uint32_t* code, size_t words) const;
-	[[nodiscard]] vk::Pipeline     GetPipeline(PipelineKey key);
+	[[nodiscard]] vk::Pipeline GetPipeline(PipelineKey key);
 
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;

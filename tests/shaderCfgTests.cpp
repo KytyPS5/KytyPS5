@@ -1795,6 +1795,39 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
+void TestDisabledSystemDebugBranch() {
+  using namespace ShaderRecompiler;
+  // Relocate PPSA08709 MS pc 0x530 to zero, retaining its displacement to the
+  // system validation helper immediately after the main shader's S_ENDPGM.
+  std::array<uint32_t, 274> shader;
+  shader.fill(EncodeSopp(0x00));
+  shader[0] = 0xbf97010fu;
+  shader[1] = EncodeVop1(0x01, 1, 129);
+  shader[2] = EncodeMubuf0(0x1c, 0, false);
+  shader[3] = EncodeMubuf1(1, 0, 0);
+  shader[271] = EncodeSopp(0x01);
+  shader[272] = 0xffffffffu; // System-only helper must not be decoded.
+  shader[273] = 0xffffffffu;
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.front().opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS &&
+            decoded.instructions.front().branch_target == 0x440u &&
+            decoded.instructions.back().pc == 0x43cu &&
+            decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+        "disabled system debug branch reached its post-ENDPGM validation helper");
+  auto graph = CFG::BuildGraph(decoded);
+  Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
+            graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
+        "disabled system debug branch changed normal shader control flow");
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(Common::ContainsStr(result.decoded_dump, "S_CBRANCH_CDBGSYS 0x00000440") &&
+            Common::ContainsStr(result.ir_dump, "StoreBufferU32"),
+        "disabled system debug branch lost its identity or fallthrough write");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -6103,6 +6136,53 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestPerspectiveCentroidInputs() {
+  constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
+                             std::array{5u, UINT32_MAX, 2u},
+                             std::array{6u, 0u, 2u}, std::array{7u, 2u, 4u}};
+  for (const auto &[inputs, center, centroid] : cases) {
+    const uint32_t other = center == UINT32_MAX ? centroid : center;
+    const std::vector<uint32_t> shader = {
+        EncodeExp0(0x00, 0xf), EncodeExp1(centroid, centroid + 1, other, other + 1),
+        EncodeSopp(0x01)};
+    HW::PixelShaderInfo regs{};
+    regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
+    ShaderMappedData mapped{};
+    mapped.code_size_bytes = shader.size() * sizeof(uint32_t);
+    ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+    HW::ShaderRegisters sh{};
+    sh.ps_input_ena = sh.ps_input_addr = inputs;
+    const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+    ShaderPixelInputInfo pixel{};
+    (void)PrepareProgram(regs, sh, mappings, pixel);
+    Check(pixel.ps_perspective_centroid_vgpr == centroid &&
+              pixel.ps_perspective_center_vgpr == center &&
+              pixel.ps_system_input_base == centroid + 2,
+          "perspective-centroid pair did not follow enabled sample/center inputs");
+    const auto key = MakeStageStaticKey(pixel);
+    pixel.ps_perspective_centroid_vgpr = UINT32_MAX;
+    Check(key != MakeStageStaticKey(pixel), "centroid input is missing from shader key");
+    pixel.ps_perspective_centroid_vgpr = centroid;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel;
+    const auto result = RecompileForTest(shader, options);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(SpirvContainsCapability(result.spirv, 52u) &&
+              SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
+              Common::ContainsStr(source, "InterpolateAtCentroid %gl_BaryCoordKHR") &&
+              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
+              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
+          "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+    Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
+          "centroid input changed the shared center builtin's interpolation location");
+    if (center != UINT32_MAX) {
+      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
+            "center pair lost its ordinary barycentric loads when centroid was enabled");
+    }
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestPsInputCountRegisterDecode() {
   HW::Context context;
   // NUM_INTERP is 3 while bit 14 is an independent control flag that must be
@@ -9559,6 +9639,63 @@ void TestMergedShaderUserDataSnapshot() {
                          params.user_data.begin() + 8),
           "monolithic NGG shader used stale GS-back state or lost its s8 user data");
   }
+  context.SetMaxOutputPerSubgroup(256);
+  context.SetGsMaxVertOut(8);
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriFan);
+  user_config.SetGeControl({32, 32});
+  ShaderVertexInputInfo fan_input{};
+  PrepareProgram(regs, context, user_config, fan_input);
+  Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
+            fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
+        "captured triangle-fan GS configuration lost its subgroup assembly limits");
+}
+
+void TestEmbeddedFetchPreservesSharedScalarLoad() {
+  using namespace ShaderRecompiler;
+  const uint32_t code[] = {
+      EncodeSMovB32(5, 255), 0x47f,
+      EncodeSmem0(0x03, 0, 11), (125u << 25u) | 4u, // s_load_dwordx8 s[0:7], s[22:23], 4
+      EncodeSop2(0x1e, 9, 0, 132), // s_lshl_b32 s9, s0, 4
+      EncodeSop2(0x0e, 9, 9, 255), 0x1f0,
+      EncodeSmem0(0x02, 24, 10), 9u << 25u,
+      EncodeVop2(0x01, 0, 256 + 8, 5), // vertex/instance index selection
+      EncodeMubuf0(0x02), EncodeMubuf1(9, 6, 0), // replaced vertex fetch
+      EncodeSop2(0x1e, 9, 5, 132), // another component of the same scalar load
+      EncodeSop2(0x0e, 9, 9, 255), 0x1f0,
+      EncodeSmem0(0x02, 28, 10), 9u << 25u,
+      EncodeMubuf0(0x0c), EncodeMubuf1(12, 7, 1),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01),
+  };
+  std::array<std::array<uint32_t, 4>, 32> buffers{};
+  buffers[2] = {0x12340000, 0, 64, 0x00027000};
+  buffers[31] = {0x56780000, 0, 64, 0x00027000};
+  const std::array<uint32_t, 9> attributes = {0, 0, 0, 0, 0, 0, 2, 0, 0};
+  std::array<uint32_t, 16> user_data{};
+  const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffers.data()),
+                             reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(user_data.data() + 12, tables, sizeof(tables));
+  ShaderVertexInputInfo input{};
+  input.fetch_embedded = true;
+  input.fetch_buffer_reg = 12;
+  input.fetch_attrib_reg = 14;
+  input.resources_num = 1;
+  input.resources_dst[0].attr_id = 1;
+  input.resources[0].fields[1] = 12u << 16u;
+  input.resources[0].fields[2] = 1;
+  input.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32Float) << 12u) |
+      DstSel(4, 5, 6, 7);
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.user_data_base = 8;
+  options.user_data = user_data;
+  options.input_info.vertex = &input;
+  auto result = RecompileForTest(code, options);
+  Check(result.program.info.vertex_fetch_components[0] == 3 &&
+            result.resources.buffers.size() == 1 &&
+            std::equal(buffers[2].begin(), buffers[2].end(),
+                       result.resources.buffers[0].dwords.begin()),
+        "embedded fetch discarded a scalar-load component used by another buffer read");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestEmbeddedVertexFormatSwizzle() {
@@ -9696,6 +9833,18 @@ void TestMeshInputAssembly() {
        0x40000305, 1, 2, 3, 0, 15, false},
       {Prospero::PrimitiveType::kTriStrip, 5, 8, 0, 1, 0, 0, 11,
        0x40000305, 2, 1, 3, 0, 12, false},
+      {Prospero::PrimitiveType::kTriFan, 32, 6, 0, 3, 2, 0x1002, 0,
+       0x40000406, 0, 4, 5, 8, 0x0123, true},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 0, 2, 0x1002, 0,
+       0x40000305, 0, 1, 2, 0, 0xabcd, true},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 1, 0, 0, 11,
+       0x40000305, 0, 2, 3, 0, 15, false},
+      {Prospero::PrimitiveType::kTriFan, 5, 7, 1, 3, 2, 0x1002, 11,
+       0x40000204, 0, 4, 5, 12, 0xabd8, true},
+      {Prospero::PrimitiveType::kTriFan, 5, 7, 1, 4, 2, 0x1002, 0,
+       0x40000204, 0, 5, 6, 16, 0, false},
+      {Prospero::PrimitiveType::kTriFan, 5, 8, 1, 64, 4, 0x1000, 0,
+       0x41000000, 0, 65, 66, 268, 0, false},
       {Prospero::PrimitiveType::kLineList, 5, 17, 3, 0, 0, 0, 11,
        0x40000204, 0, 1, 0, 0, 23, false},
       {Prospero::PrimitiveType::kLineList, 6, 17, 2, 4, 2, 0x1002, 11,
@@ -10058,10 +10207,10 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 std::vector<uint32_t>({UINT32_MAX}),
         "MISC point-size/layer stores are missing");
   Check(SpirvStoredBuiltInElements(all.spirv, 3u) ==
-            std::vector<uint32_t>({0u, 3u}) &&
+            std::vector<uint32_t>({0u, 3u, 4u}) &&
             SpirvStoredBuiltInElements(all.spirv, 4u) ==
                 std::vector<uint32_t>({0u, 1u, 2u}),
-        "partial clip/cull exports used the wrong dense elements");
+        "partial clip/cull exports or the appended clipping-error plane used the wrong elements");
   Check(SpirvHasDecorationValue(all.spirv, 11u, 1u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 3u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 4u) &&
@@ -10095,7 +10244,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
   CheckSpirvBinaryValidates(dense.spirv);
   Check(SpirvStoredBuiltInElements(dense.spirv, 0u).size() == 1u &&
             SpirvStoredBuiltInElements(dense.spirv, 3u) ==
-                std::vector<uint32_t>({1u}) &&
+                std::vector<uint32_t>({1u, 2u}) &&
             SpirvStoredBuiltInElements(dense.spirv, 4u) ==
                 std::vector<uint32_t>({0u}),
         "CCDIST1 was not densely packed into POS1");
@@ -10110,10 +10259,23 @@ void TestNewShaderRecompilerAuxPositionExports() {
   CheckSpirvBinaryValidates(shifted.spirv);
   Check(SpirvStoredBuiltInElements(shifted.spirv, 1u).size() == 1u &&
             SpirvStoredBuiltInElements(shifted.spirv, 3u) ==
-                std::vector<uint32_t>({0u}) &&
+                std::vector<uint32_t>({0u, 1u}) &&
             SpirvStoredBuiltInElements(shifted.spirv, 4u) ==
                 std::vector<uint32_t>({0u}),
         "CCDIST1 did not shift across a disabled CCDIST0 vector");
+
+  const uint32_t full_distances[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0xf, false), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(0x0e, 0xf), EncodeExp1(8, 9, 10, 11), 0xbf810000u,
+  };
+  const auto full = compile(full_distances, 0x00c0f00fu);
+  CheckSpirvBinaryValidates(full.spirv);
+  Check(SpirvStoredBuiltInElements(full.spirv, 3u) ==
+            std::vector<uint32_t>({0u, 1u, 2u, 3u}) &&
+            SpirvStoredBuiltInElements(full.spirv, 4u) ==
+                std::vector<uint32_t>({0u, 1u, 2u, 3u}),
+        "clipping-error plane exceeded eight combined components or replaced a guest distance");
 
   const uint32_t unmapped[] = {
       EncodeExp0(0x0d, 0x4, false), EncodeExp1(0, 0, 8, 0),
@@ -12987,7 +13149,8 @@ void TestRepeatedExportsHaveOneInterface() {
     }
     offset += result.spirv[offset] >> spv::WordCountShift;
   }
-  Check(outputs == 1, "repeated exports produced duplicate output variables");
+  Check(outputs == 2 && SpirvHasDecorationValue(result.spirv, 11u, 3u),
+        "repeated exports duplicated Position or its clipping-error plane");
 }
 
 void TestNewShaderRecompilerSpirvSizeBaselines() {
@@ -13203,10 +13366,10 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   };
   const auto wqm_result = compile("wqm", wqm,
                                   {.words = 407,
-                                   .instructions = 98,
+                                   .instructions = 99,
                                    .variables = 4,
                                    .loads = 3,
-                                   .stores = 1,
+                                   .stores = 2,
                                    .labels = 6,
                                    .selection_merges = 1,
                                    .branches = 4,
@@ -13339,6 +13502,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestDisabledSystemDebugBranch();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
@@ -13346,6 +13510,7 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+  TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
@@ -13381,6 +13546,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestPerspectiveCentroidInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

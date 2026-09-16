@@ -751,7 +751,11 @@ static const int64_t* KYTY_SYSV_ABI JsonValueGetInteger(const JsonValue* self) {
 	PRINT_NAME();
 
 	static const int64_t zero = 0;
-	return (self != nullptr && self->type == JsonValueTypeInteger ? &self->integer : &zero);
+	if (self != nullptr &&
+	    (self->type == JsonValueTypeInteger || self->type == JsonValueTypeUInteger)) {
+		return &self->integer;
+	}
+	return &zero;
 }
 
 static const double* KYTY_SYSV_ABI JsonValueGetReal(const JsonValue* self) {

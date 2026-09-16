@@ -516,7 +516,7 @@ struct Vop1SdwaRule {
 };
 
 constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
-    {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
+    {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},

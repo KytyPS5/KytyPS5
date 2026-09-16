@@ -1495,10 +1495,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.ProcessIndirectBuffer({then_buffer, then_num_dw});
+		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer({else_buffer, else_num_dw});
+		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
 	}
 
 	return payload_dw;
@@ -1959,7 +1959,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
 	return 3;
 }
@@ -3633,6 +3633,11 @@ void GraphicsInitJmpTablesShIndirect() {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	// Toolkit state restoration emits the compiler's GS-front allocation
+	// metadata here. Native GS resource registers already carry that allocation.
+	g_hw_sh_indirect_func[0x0ca] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {

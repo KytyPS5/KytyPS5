@@ -38,7 +38,12 @@
 #endif
 
 extern "C" {
+#include <libavutil/version.h>
+#if LIBAVUTIL_VERSION_MAJOR < 61
 extern const uint8_t avpriv_vga16_font[4096];
+#else
+const uint8_t* avpriv_vga16_font_get(void);
+#endif
 }
 
 namespace Libs {
@@ -950,10 +955,15 @@ static void init_image(std::array<uint8_t, FONT_BITMAP_MAX_DIM * FONT_BITMAP_MAX
 
 	const auto width  = static_cast<uint32_t>(scaled_font_width(font));
 	const auto height = static_cast<uint32_t>(scaled_font_height(font));
+#if LIBAVUTIL_VERSION_MAJOR < 61
+	const auto* vga_font = avpriv_vga16_font;
+#else
+	const auto* vga_font = avpriv_vga16_font_get();
+#endif
 
 	for (uint32_t y = 0; y < height; y++) {
 		const uint32_t src_y = std::min<uint32_t>((y * 16u) / height, 15u);
-		const uint8_t  row   = avpriv_vga16_font[code * 16 + src_y];
+		const uint8_t  row   = vga_font[code * 16 + src_y];
 		for (uint32_t x = 0; x < width; x++) {
 			const uint32_t src_x = std::min<uint32_t>((x * 8u) / width, 7u);
 			if ((row & (0x80u >> src_x)) != 0) {

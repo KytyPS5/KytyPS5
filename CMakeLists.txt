@@ -317,24 +317,10 @@ endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
 
-# Linux system libraries required by the static FFmpeg archive.
+# Linux system libraries.
 if(LINUX)
 	find_package(Threads REQUIRED)
 	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
-
-	# Optional FFmpeg dependencies.
-	find_package(ZLIB)
-	if(ZLIB_FOUND)
-		list(APPEND kyty_emulator_link_libraries ZLIB::ZLIB)
-	endif()
-	find_library(KYTY_BZ2_LIBRARY bz2)
-	if(KYTY_BZ2_LIBRARY)
-		list(APPEND kyty_emulator_link_libraries ${KYTY_BZ2_LIBRARY})
-	endif()
-	find_library(KYTY_LZMA_LIBRARY lzma)
-	if(KYTY_LZMA_LIBRARY)
-		list(APPEND kyty_emulator_link_libraries ${KYTY_LZMA_LIBRARY})
-	endif()
 endif()
 
 set(inc_headers

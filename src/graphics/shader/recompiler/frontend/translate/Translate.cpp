@@ -789,15 +789,6 @@ const EmbeddedFetchLoad* FindEmbeddedFetchLoad(const EmbeddedFetchPlan* plan, ui
 	return found != plan->loads.end() ? &*found : nullptr;
 }
 
-bool IsEmbeddedFetchPrologLoad(const EmbeddedFetchPlan* plan, uint32_t pc) {
-	if (plan == nullptr) {
-		return false;
-	}
-	return std::ranges::any_of(plan->loads, [pc](const auto& load) {
-		return std::ranges::find(load.prolog_loads, pc) != load.prolog_loads.end();
-	});
-}
-
 int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo& input,
                                  const EmbeddedFetchLoad&     load) {
 	if (load.attrib_id >= 0 && load.attrib_id < input.resources_num &&
@@ -817,22 +808,6 @@ int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo& input,
 		}
 	}
 	return -1;
-}
-
-bool IsScalarMemoryLoad(Decoder::Opcode opcode) {
-	switch (opcode) {
-		case Decoder::Opcode::S_LOAD_DWORD:
-		case Decoder::Opcode::S_LOAD_DWORDX2:
-		case Decoder::Opcode::S_LOAD_DWORDX4:
-		case Decoder::Opcode::S_LOAD_DWORDX8:
-		case Decoder::Opcode::S_LOAD_DWORDX16:
-		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
-		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX2:
-		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
-		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
-		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return true;
-		default: return false;
-	}
 }
 
 bool IsBufferDwordLoad(Decoder::Opcode opcode) {
@@ -1127,26 +1102,32 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// GS adjacency addresses local ES records in LDS. Strip winding alternates
-			// with the global primitive number, including across subgroup boundaries.
-			const auto parity = mesh.input_primitive ==
-			                            static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)
-			                        ? entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1))
-			                        : u32(0);
+			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
+			// center in every subgroup; strip winding follows the global primitive.
 			const auto vertex = entry_ir.IMul(local, step);
-			const auto first  = entry_ir.IAdd(vertex, parity);
-			const auto second = mesh.InputPrimitiveSize() >= 2u
-			                        ? entry_ir.ISub(entry_ir.IAdd(vertex, u32(1)), parity)
-			                        : u32(0);
-			const auto third = mesh.InputPrimitiveSize() == 3u
-			                       ? entry_ir.IAdd(vertex, u32(2))
-			                       : u32(0);
+			auto       first  = vertex;
+			auto       second = u32(0);
+			auto       third  = u32(0);
+			if (mesh.InputPrimitiveSize() >= 2u) {
+				second = entry_ir.IAdd(vertex, u32(1));
+			}
+			if (mesh.InputPrimitiveSize() == 3u) {
+				third = entry_ir.IAdd(vertex, u32(2));
+			}
+			auto input_vertex = entry_ir.IAdd(chunk, local);
+			if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
+				first = u32(0);
+				input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
+			} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
+				const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
+				first = entry_ir.IAdd(first, parity);
+				second = entry_ir.ISub(second, parity);
+			}
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
 			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
 			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 			                      entry_ir.ShiftLeftLogical(third, u32(2)));
-			const auto input_vertex = entry_ir.IAdd(chunk, local);
 			const auto index_bytes  = draw(3);
 			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 			const auto index_low    = draw(4);
@@ -1209,13 +1190,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::PrimitiveId));
 		} else if (options.stage == ShaderType::Pixel) {
 			const auto* ps = options.input_info.pixel;
-			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr),
-				                      builtin(IR::StageInputKind::BaryCoordSmooth, 0));
-				entry_ir.SetVectorReg(
-				    static_cast<IR::VectorReg>(ps->ps_perspective_center_vgpr + 1u),
-				    builtin(IR::StageInputKind::BaryCoordSmooth, 1));
-			}
+			const auto barycentric_pair = [&](uint32_t reg, IR::StageInputKind kind) {
+				if (reg != UINT32_MAX) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg), builtin(kind, 0));
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg + 1u), builtin(kind, 1));
+				}
+			};
+			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
+			barycentric_pair(ps->ps_perspective_centroid_vgpr,
+			                 IR::StageInputKind::BaryCoordSmoothCentroid);
 			uint32_t reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),
@@ -1256,10 +1239,6 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
-				continue;
-			}
-			if (IsScalarMemoryLoad(instruction.opcode) &&
-			    IsEmbeddedFetchPrologLoad(options.embedded_fetch, instruction.pc)) {
 				continue;
 			}
 			const auto* embedded = FindEmbeddedFetchLoad(options.embedded_fetch, instruction.pc);

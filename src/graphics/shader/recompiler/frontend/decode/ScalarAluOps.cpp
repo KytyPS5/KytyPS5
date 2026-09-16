@@ -105,6 +105,7 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x10u, Opcode::S_SENDMSG},
     {0x12u, Opcode::S_TRAP},
     {0x16u, Opcode::S_TTRACEDATA},
+    {0x17u, Opcode::S_CBRANCH_CDBGSYS},
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
 };

@@ -22,7 +22,7 @@
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
 [submodule "3rdparty/ffmpeg-core"]
 	path = 3rdparty/ffmpeg-core
-	url = https://github.com/shadps4-emu/ext-ffmpeg-core.git
+	url = https://github.com/KytyPS5/ext-ffmpeg-core.git
 	shallow = true
 [submodule "3rdparty/fmt"]
 	path = 3rdparty/fmt

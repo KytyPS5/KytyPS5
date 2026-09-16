@@ -44,12 +44,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                                &m_fault_process_desc_layout),
 	    "create fault-buffer descriptor layout");
 
-	vk::ShaderModuleCreateInfo module_info {};
-	module_info.codeSize = std::size(FAULT_BUFFER_PROCESS_SPV) * sizeof(uint32_t);
-	module_info.pCode    = FAULT_BUFFER_PROCESS_SPV;
-	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-	                     "create fault-buffer shader module");
+	const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_graphics.device);
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount = 1;

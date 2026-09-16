@@ -227,6 +227,7 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_VCCNZ:
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
+		case O::S_CBRANCH_CDBGSYS:
 		case O::S_ENDPGM: return true;
 		default: return false;
 	}

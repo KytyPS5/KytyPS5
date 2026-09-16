@@ -75,7 +75,25 @@
        </layout>
       </widget>
      </item>
-     <item row="0" column="1" rowspan="2">
+     <item row="2" column="0">
+      <widget class="QGroupBox" name="audio_group">
+       <property name="title"><string>Audio</string></property>
+       <layout class="QFormLayout" name="audioLayout">
+        <property name="fieldGrowthPolicy">
+         <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
+        </property>
+        <item row="0" column="0">
+         <widget class="QLabel" name="label_audio_input_device">
+          <property name="text"><string>Microphone:</string></property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QComboBox" name="comboBox_audio_input_device"/>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="0" column="1" rowspan="3">
       <widget class="QGroupBox" name="graphics_group">
        <property name="title">
         <string>Graphics &amp;&amp; display</string>
@@ -152,7 +170,7 @@
        </layout>
       </widget>
      </item>
-     <item row="2" column="0" colspan="2">
+     <item row="3" column="0" colspan="2">
       <widget class="QGroupBox" name="debug_group">
        <property name="title">
         <string>Debugging &amp;&amp; logs</string>
@@ -253,20 +271,18 @@
        <property name="title">
         <string>Compatibility</string>
        </property>
-       <layout class="QHBoxLayout" name="compatibilityLayout">
+       <layout class="QVBoxLayout" name="compatibilityLayout">
+        <item>
+         <widget class="QCheckBox" name="checkBox_amd_cpu">
+          <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
+          <property name="text"><string>AMD CPU patch (EXPERIMENTAL)</string></property>
+         </widget>
+        </item>
         <item>
          <widget class="QCheckBox" name="checkBox_red_zone_protection">
           <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
           <property name="text"><string>Windows SysV red zone crash protection (Experimental)</string></property>
          </widget>
-        </item>
-        <item>
-         <spacer name="compatibilitySpacer">
-          <property name="orientation"><enum>Qt::Horizontal</enum></property>
-          <property name="sizeHint" stdset="0">
-           <size><width>40</width><height>20</height></size>
-          </property>
-         </spacer>
         </item>
        </layout>
       </widget>

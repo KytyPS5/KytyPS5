@@ -198,16 +198,6 @@ struct CondVarPrivate {
 
 static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
 
-static void WakeCondVar(CondVarPrivate* cond_var) {
-#ifdef KYTY_WIN_CS
-	static auto func = ResolveWakeAllConditionVariable();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	func(&cond_var->m_cv);
-#else
-	cond_var->m_cv.notify_all();
-#endif
-}
-
 struct ThreadPrivate {
 	ThreadPrivate(thread_func_t f, void* a): func(f), arg(a), m_thread(&Run, this) {}
 
@@ -474,13 +464,13 @@ void CondVar::Signal() {
 }
 
 void CondVar::SignalAll() {
-	WakeCondVar(m_cond_var.get());
-}
-
-void CondVar::SignalThread(int /*thread_id*/) {
-	// No-op: waking shared condition variables for thread-directed signals is unsafe
-	// and causes glibc broadcast/cancel deadlocks. Threads sleeping in CondVar::Wait
-	// already poll for signals every 10ms via g_cond_wait_poll_callback.
+#ifdef KYTY_WIN_CS
+	static auto func = ResolveWakeAllConditionVariable();
+	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	func(&m_cond_var->m_cv);
+#else
+	m_cond_var->m_cv.notify_all();
+#endif
 }
 
 int Thread::GetThreadIdUnique() {

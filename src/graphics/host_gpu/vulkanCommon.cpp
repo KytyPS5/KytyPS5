@@ -123,4 +123,14 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	}
 }
 
+vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	vk::ShaderModuleCreateInfo create_info {};
+	create_info.codeSize    = code.size_bytes();
+	create_info.pCode       = code.data();
+	vk::ShaderModule module = nullptr;
+	RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
+	                     "create SPIR-V shader module");
+	return module;
+}
+
 } // namespace Libs::Graphics

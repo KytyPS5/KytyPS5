@@ -2037,10 +2037,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
-	program->mapped_size = program->base_size_aligned + tls_handler_size;
+	program->mapped_size     = program->base_size_aligned + tls_handler_size;
+	const bool emulate_rsqrt = Config::AmdCpuEnabled();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         use_red_zone_protection  = Config::RedZoneProtectionEnabled();
+	const bool         protect_memory_faults    = Config::RedZoneProtectionEnabled();
+	const bool         use_red_zone_protection  = protect_memory_faults || emulate_rsqrt;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -2086,11 +2088,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
 
-	// program->elf->SetBaseVAddr(program->base_vaddr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-	uint64_t                                   eh_frame_header_addr = 0;
-	uint64_t                                   eh_frame_header_size = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uint64_t eh_frame_header_addr = 0;
+	uint64_t eh_frame_header_size = 0;
 #endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -2114,11 +2115,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
 				PatchProgram(program, segment_addr, segment_memory_size);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-				if (use_red_zone_protection) {
-					executable_segments.emplace_back(segment_addr, segment_file_size);
-				}
-#endif
+				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
 
 			if (!skip_protect) {
@@ -2163,16 +2160,21 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::vector<uintptr_t> function_starts;
 	if (use_red_zone_protection) {
-		std::vector<uintptr_t> function_starts;
 		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
 		                                 &function_starts)) {
 			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
 			     Common::PathToString(program->file_name).c_str());
 		}
-		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result =
-			    PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+	}
+#endif
+	for (const auto& [segment_addr, segment_size]: executable_segments) {
+		uint64_t reciprocal_sqrt_count = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (use_red_zone_protection) {
+			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                           protect_memory_faults, emulate_rsqrt);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
@@ -2182,12 +2184,21 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
 			     result.unrelocatable_memory_instruction_count);
+			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
+		}
+#else
+		if (emulate_rsqrt) {
+			reciprocal_sqrt_count =
+			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
-		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,
-		                                             program->red_zone_trampoline_size);
-	}
 #endif
+		if (reciprocal_sqrt_count != 0) {
+			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
+			     Common::PathToString(program->file_name.filename()).c_str(),
+			     reciprocal_sqrt_count);
+		}
+	}
 
 	if (!is_shared) {
 		SetupTlsHandler(program);

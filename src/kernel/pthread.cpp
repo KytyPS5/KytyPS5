@@ -3093,10 +3093,6 @@ Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	return previous;
 }
 
-int PthreadGetUniqueId(Pthread thread) {
-	return thread != nullptr ? thread->unique_id : 0;
-}
-
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }

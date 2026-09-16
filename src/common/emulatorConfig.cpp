@@ -47,6 +47,10 @@ bool IsPrimaryUserId(int32_t user_id) {
 	return user_id == GetUserId() || user_id == 0 || user_id == 1 || user_id == 100;
 }
 
+const std::string& GetAudioInputDevice() {
+	return g_config->audio_input_device;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
@@ -61,6 +65,10 @@ bool FullscreenEnabled() {
 
 bool VrEnabled() {
 	return g_config->vr_enabled;
+}
+
+bool AmdCpuEnabled() {
+	return g_config->amd_cpu_enabled;
 }
 
 uint32_t GetVblankFrequency() {

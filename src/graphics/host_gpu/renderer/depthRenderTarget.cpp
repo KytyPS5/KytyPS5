@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -45,8 +46,12 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 	switch (static_cast<Prospero::StencilOp>(value)) {
 		case Prospero::StencilOp::kKeep: return vk::StencilOp::eKeep;
 		case Prospero::StencilOp::kZero: return vk::StencilOp::eZero;
-		case Prospero::StencilOp::kReplaceTest:
-		case Prospero::StencilOp::kReplaceOp: return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kReplaceTest: return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kReplaceOp:
+			if ((op_value & write_mask) == 0) {
+				return vk::StencilOp::eZero;
+			}
+			return vk::StencilOp::eReplace;
 		case Prospero::StencilOp::kAddClamp: return vk::StencilOp::eIncrementAndClamp;
 		case Prospero::StencilOp::kSubClamp: return vk::StencilOp::eDecrementAndClamp;
 		case Prospero::StencilOp::kInvert: return vk::StencilOp::eInvert;
@@ -66,9 +71,38 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 	}
 }
 
-static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
-	constexpr auto replace_op = static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
-	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
+static vk::StencilOpState ConvertStencilState(
+    uint8_t compare, const std::array<uint8_t, 3>& operations, uint8_t op_value,
+    const vk::StencilOpState& state) {
+	const auto test_value = state.reference;
+	auto reference       = test_value;
+	auto required_bits   = state.compareMask;
+	if (compare == static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	    compare == static_cast<uint8_t>(vk::CompareOp::eNever)) {
+		required_bits = 0;
+	}
+	std::array<vk::StencilOp, 3> converted {};
+	for (size_t i = 0; i < operations.size(); i++) {
+		converted[i] = ConvertStencilOp(operations[i], state.writeMask, op_value);
+		if (converted[i] != vk::StencilOp::eReplace) {
+			continue;
+		}
+		auto replacement = test_value;
+		if (static_cast<Prospero::StencilOp>(operations[i]) == Prospero::StencilOp::kReplaceOp) {
+			replacement = op_value;
+		}
+		if (((reference ^ replacement) & required_bits & state.writeMask) != 0) {
+			DepthFatal("unsupported stencil replacement: compare=%u, compare mask=0x%02" PRIx32
+			           ", write mask=0x%02" PRIx32 ", operation value=0x%02" PRIx8
+			           ", test value=0x%02" PRIx32,
+			           compare, state.compareMask, state.writeMask, op_value, test_value);
+		}
+		// Vulkan shares one reference between comparison and every replacement on this face.
+		reference = (reference & ~state.writeMask) | (replacement & state.writeMask);
+		required_bits |= state.writeMask;
+	}
+	return {converted[0], converted[1], converted[2], static_cast<vk::CompareOp>(compare),
+	        state.compareMask, state.writeMask, reference};
 }
 
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
@@ -296,31 +330,20 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
-		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
-		    (front_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
-		     sm.stencil_opval != sm.stencil_testval) ||
-		    (dc.backface_enable && back_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
-		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
-			DepthFatal("unsupported stencil compare or replacement state");
+		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
+			DepthFatal("unsupported stencil compare state");
 		}
-		r.stencil_static_front = {
-		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval),
-		    ConvertStencilOp(sc.stencil_zpass, front_write_mask, sm.stencil_opval),
-		    ConvertStencilOp(sc.stencil_zfail, front_write_mask, sm.stencil_opval),
-		    static_cast<vk::CompareOp>(dc.stencilfunc)};
-		r.stencil_dynamic_front = {sm.stencil_mask, front_write_mask, sm.stencil_testval};
+		r.stencil_front = ConvertStencilState(
+		    dc.stencilfunc, {sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail},
+		    sm.stencil_opval, {.compareMask = sm.stencil_mask, .writeMask = front_write_mask,
+		                       .reference = sm.stencil_testval});
 		if (dc.backface_enable) {
-			r.stencil_static_back = {
-			    ConvertStencilOp(sc.stencil_fail_bf, back_write_mask, sm.stencil_opval_bf),
-			    ConvertStencilOp(sc.stencil_zpass_bf, back_write_mask, sm.stencil_opval_bf),
-			    ConvertStencilOp(sc.stencil_zfail_bf, back_write_mask, sm.stencil_opval_bf),
-			    static_cast<vk::CompareOp>(dc.stencilfunc_bf)};
-			r.stencil_dynamic_back = {sm.stencil_mask_bf, back_write_mask, sm.stencil_testval_bf};
+			r.stencil_back = ConvertStencilState(
+			    dc.stencilfunc_bf, {sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf},
+			    sm.stencil_opval_bf, {.compareMask = sm.stencil_mask_bf, .writeMask = back_write_mask,
+			                          .reference = sm.stencil_testval_bf});
 		} else {
-			r.stencil_static_back  = r.stencil_static_front;
-			r.stencil_dynamic_back = r.stencil_dynamic_front;
+			r.stencil_back = r.stencil_front;
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
@@ -406,14 +429,13 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		return writes;
 	}
 
-	const auto face_writes = [&](const PipelineStencilStaticState&  state,
-	                             const PipelineStencilDynamicState& dynamic) {
-		if (dynamic.writeMask == 0) {
+	const auto face_writes = [&](const vk::StencilOpState& state) {
+		if (state.writeMask == 0) {
 			return false;
 		}
 		bool can_pass = state.compareOp != vk::CompareOp::eNever;
 		bool can_fail = state.compareOp != vk::CompareOp::eAlways;
-		if (dynamic.compareMask == 0) {
+		if (state.compareMask == 0) {
 			switch (state.compareOp) {
 				case vk::CompareOp::eEqual:
 				case vk::CompareOp::eLessOrEqual:
@@ -439,8 +461,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
 	if (stencil_clear_enable ||
-	    (stencil_test_enable && (face_writes(stencil_static_front, stencil_dynamic_front) ||
-	                             face_writes(stencil_static_back, stencil_dynamic_back)))) {
+	    (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back)))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;
 	}
 	return writes;

@@ -143,6 +143,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							}
 							break;
 						case StageInputKind::BaryCoordSmooth:
+						case StageInputKind::BaryCoordSmoothCentroid:
 						case StageInputKind::BaryCoordNoPerspective:
 							if (component >= 2u) {
 								return Fail("typed barycentric component is out of range");
@@ -225,6 +226,18 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 			}
 		}
 	}
+	// Aliases of a vertex output share one SPIR-V interface variable. If any
+	// alias reads raw vertices, interpolate the other aliases from those too.
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
+			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
+			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
+			    ShaderPixelParameterIsFlat(*pixel, input) ==
+			        ShaderPixelParameterIsFlat(*pixel, alias)) {
+				per_vertex[input] = per_vertex[input] || per_vertex[alias];
+			}
+		}
+	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
 		         per_vertex[input]);
@@ -287,7 +300,8 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 				case StageInputKind::BaryCoordSmooth:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
+				case StageInputKind::BaryCoordSmoothCentroid:
+					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
 					break;
 				case StageInputKind::BaryCoordNoPerspective:
 					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");

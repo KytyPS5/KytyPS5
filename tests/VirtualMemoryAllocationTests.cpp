@@ -10,18 +10,32 @@
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "loader/x64InstructionEmulator.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <csignal>
+#include <immintrin.h>
+#include <xbyak/xbyak.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -34,6 +48,19 @@
 #undef DeleteFile
 #endif
 #endif
+
+namespace Libs::Fiber {
+struct FiberObject;
+struct FiberOptParam;
+using FiberEntry = KYTY_SYSV_ABI void (*)(uint64_t, uint64_t);
+int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject*, const char*, FiberEntry, uint64_t, void*,
+                                     uint64_t, const FiberOptParam*, uint32_t);
+int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject*);
+int32_t KYTY_SYSV_ABI FiberRun(FiberObject*, uint64_t, uint64_t*);
+int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
+int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
+int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
+} // namespace Libs::Fiber
 
 namespace {
 
@@ -209,10 +236,8 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
 	                                   TRAMPOLINE_SIZE);
 	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
-	const auto result = Loader::PatchRedZoneMemoryInstructions(
-	    mapping, code.size(), function_starts);
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
-	      "failed to flush patched test code");
+	const auto result = Loader::PatchGuestInstructions(
+	    mapping, code.size(), function_starts, true, false);
 	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
 
 	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
@@ -2538,15 +2563,449 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+volatile sig_atomic_t g_rsqrt_traps = 0;
+
+bool EmulateReciprocalSquareRootContext(void* context) {
+	const auto host_mxcsr = _mm_getcsr();
+	_mm_setcsr(0x7fe1); // Exercise the handler under a distinct rounding mode and raised flags.
+	const bool emulated        = Loader::X64InstructionEmulator::TryEmulate(context);
+	const bool preserved_mxcsr = _mm_getcsr() == 0x7fe1;
+	_mm_setcsr(host_mxcsr);
+	if (!emulated || !preserved_mxcsr) {
+		return false;
+	}
+	g_rsqrt_traps = g_rsqrt_traps + 1;
+	return true;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+LONG CALLBACK ReciprocalSquareRootHandler(EXCEPTION_POINTERS* exception) {
+	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION ||
+	    !EmulateReciprocalSquareRootContext(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+#else
+void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
+	if (!EmulateReciprocalSquareRootContext(context)) {
+		_exit(190);
+	}
+}
+#endif
+
+void TestPackedReciprocalSquareRoot() {
+	const char* test = "PackedReciprocalSquareRoot";
+	constexpr uint64_t code_size = 0x4000;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t allocation_size = code_size * 2;
+#else
+	constexpr uint64_t allocation_size = code_size;
+#endif
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
+	Check(test, mapping != 0, "failed to allocate instruction test code");
+	struct RestoreState {
+		uint64_t mapping;
+		uint64_t size;
+		uint32_t mxcsr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		void* handler = nullptr;
+#else
+		struct sigaction previous {};
+		bool installed = false;
+#endif
+		~RestoreState() {
+			_mm_setcsr(mxcsr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (handler != nullptr) {
+				RemoveVectoredExceptionHandler(handler);
+			}
+			Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
+#else
+			if (installed) {
+				sigaction(SIGILL, &previous, nullptr);
+			}
+#endif
+			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
+		}
+	} restore {mapping, allocation_size, _mm_getcsr()};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	restore.handler = AddVectoredExceptionHandler(1, ReciprocalSquareRootHandler);
+	Check(test, restore.handler != nullptr, "failed to install instruction handler");
+#else
+	struct sigaction action {};
+	action.sa_sigaction = ReciprocalSquareRootHandler;
+	action.sa_flags = SA_SIGINFO;
+	sigemptyset(&action.sa_mask);
+	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
+	Check(test, restore.installed, "failed to install instruction handler");
+#endif
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const auto refine = [](float estimate) {
+		return (estimate * 0.5f) * std::fma(-estimate, estimate, 3.0f);
+	};
+	constexpr uint64_t red_zone_sentinel = 0x1122334455667788ull;
+	std::array<uint32_t, 16> input {};
+	std::array<uint32_t, 48> output {};
+	input.fill(0x3f800000);
+	for (const auto registers: {std::array {2, 1}, std::array {10, 9}, std::array {1, 1}}) {
+		const auto destination = registers[0];
+		const auto source = registers[1];
+		input[0] = 0x3f800000;
+		uint32_t expected = 0x3f800000;
+		if (source == 9) {
+			input[0] = 0x40800000;
+			expected = 0x3f000000;
+		}
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		if (source == 9) {
+			code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi + 32]);
+		}
+		code.vmovups(Xbyak::Ymm(source), code.ptr[code.rdi]);
+		if (destination != source) {
+			code.vmovups(Xbyak::Ymm(destination), code.ptr[code.rdi + 32]);
+		}
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, red_zone_sentinel ^ offset);
+			code.mov(code.qword[code.rsp - offset], code.rax);
+		}
+		code.vrsqrtps(Xbyak::Xmm(destination), Xbyak::Xmm(source));
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, code.qword[code.rsp - offset]);
+			code.mov(code.qword[code.rsi + 64 + offset - 8], code.rax);
+		}
+		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(destination));
+		code.vmovups(code.ptr[code.rsi + 32], Xbyak::Ymm(source));
+		code.vzeroupper();
+		code.ret();
+#if defined(__linux__)
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+#endif
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated instruction test code");
+		function(input.data(), output.data());
+		const float native = std::bit_cast<float>(output[0]);
+		const auto red_zone_intact = [&] {
+			for (uint32_t offset = 8; offset <= 128; offset += 8) {
+				const auto index = 16 + (offset - 8) / sizeof(uint32_t);
+				const auto value = static_cast<uint64_t>(output[index]) |
+				                   (static_cast<uint64_t>(output[index + 1]) << 32);
+				if (value != (red_zone_sentinel ^ offset)) {
+					return false;
+				}
+			}
+			return true;
+		};
+		Check(test, red_zone_intact(), "native instruction corrupted the guest red zone");
+		Check(test, std::isfinite(native) && std::abs(native - std::bit_cast<float>(expected)) < 0.001f,
+		      "native reciprocal root is outside its error bound");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                   reinterpret_cast<void*>(mapping + code_size), code_size);
+		const std::array<uintptr_t, 1> function_starts {mapping};
+		// The extended-register case also relocates ordinary memory accesses while
+		// red-zone data is live, exercising both enabled patchers in one function.
+		const bool protect_memory = source == 9;
+		const auto patched = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, protect_memory, true);
+		Check(test, patched.reciprocal_sqrt_instruction_count == 1 &&
+		                patched.unrelocatable_memory_instruction_count == 0 &&
+		                (protect_memory ? patched.patched_memory_instruction_count > 0
+		                                : patched.patched_memory_instruction_count == 0),
+		      "instruction pass lost reciprocal root or memory patch coverage");
+#else
+		Check(test, Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(mapping, code.getSize()) == 1,
+		      "instruction pass did not patch exactly one packed reciprocal root");
+		const auto* patched = reinterpret_cast<const uint8_t*>(mapping);
+		size_t changed = 0;
+		for (size_t i = 0; i < original.size(); ++i) {
+			changed += original[i] != patched[i];
+		}
+		Check(test, changed == 1, "instruction pass changed unrelated code bytes");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush patched instruction test code");
+#endif
+		const auto before = g_rsqrt_traps;
+		function(input.data(), output.data());
+		Check(test, g_rsqrt_traps == before + 1, "patched instruction did not execute its handler");
+		Check(test, red_zone_intact(), "patched instruction corrupted the guest red zone");
+		Check(test, output[0] == expected, "patched instruction read or wrote the wrong register");
+		if (destination != source) {
+			Check(test, std::equal(input.begin(), input.begin() + 4, output.begin() + 8),
+			      "source lower XMM lanes were corrupted");
+		}
+		if (source != 9) {
+			Check(test, refine(refine(std::bit_cast<float>(output[0]))) == 1.0f,
+			      "identity quaternion normalization drifted below one");
+		}
+		for (size_t i = 0; i < 4; ++i) {
+			Check(test, output[4 + i] == 0, "128-bit VEX destination retained upper YMM lanes");
+			const auto expected_upper = destination == source ? 0u : input[4 + i];
+			Check(test, output[12 + i] == expected_upper, "source upper YMM lanes were corrupted");
+		}
+		std::printf("[host]    rsqrt xmm%d,xmm%d native=%08x patched=%08x\n",
+		            destination, source, std::bit_cast<uint32_t>(native), output[0]);
+		if (destination != 2) {
+			continue;
+		}
+		constexpr std::array<std::array<uint32_t, 8>, 4> cases {{
+		    {0x00000000, 0x80000000, 0x00000001, 0x80000001,
+		     0x7f800000, 0xff800000, 0x7f800000, 0xff800000},
+		    {0x7f800000, 0xff800000, 0xbf800000, 0x7fc12345,
+		     0x00000000, 0xffc00000, 0xffc00000, 0x7fc12345},
+		    {0x7f812345, 0xff812345, 0x40800000, 0x40000000,
+		     0x7fc12345, 0xffc12345, 0x3f000000, 0x3f3504f3},
+		    {0x00800000, 0x7f7fffff, 0x3f800000, 0x41800000,
+		     0x5f000000, 0x1f800000, 0x3f800000, 0x3e800000},
+		}};
+		for (const auto& values: cases) {
+			std::copy_n(values.begin(), 4, input.begin());
+			for (uint32_t controls = 0; controls < 8; ++controls) {
+				const uint32_t mxcsr = 0x1fa1u | ((controls & 3u) << 13u) | ((controls & 4u) << 4u);
+				_mm_setcsr(mxcsr);
+				function(input.data(), output.data());
+				const auto result_mxcsr = _mm_getcsr();
+				_mm_setcsr(restore.mxcsr);
+				Check(test, red_zone_intact(), "special-value trap corrupted the guest red zone");
+				Check(test, result_mxcsr == mxcsr, "instruction changed MXCSR controls or exception flags");
+				Check(test, std::equal(output.begin(), output.begin() + 4, values.begin() + 4),
+				      "special values or round-independent reciprocal roots differ from ISA semantics");
+			}
+		}
+		input.fill(0x3f800000);
+	}
+#if defined(__linux__)
+	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
+	ucontext_t context {};
+	context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(unknown.data());
+	Check(test, !Loader::X64InstructionEmulator::TryEmulate(&context), "unrecognized UD2 was swallowed");
+	_libc_fpstate fpstate {};
+	context.uc_mcontext.fpregs = &fpstate;
+	const auto emulate = [&](std::array<uint8_t, 16> instruction, size_t length) {
+		context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(instruction.data());
+		Check(test, Loader::X64InstructionEmulator::TryEmulate(&context), "existing instruction emulation was rejected");
+		Check(test, context.uc_mcontext.gregs[REG_RIP] == reinterpret_cast<greg_t>(instruction.data() + length),
+		      "existing instruction emulation advanced RIP incorrectly");
+	};
+	fpstate._xmm[8].element[0] = 0x1234;
+	fpstate._xmm[8].element[2] = 0xdeadbeef;
+	emulate({0x66, 0x41, 0x0f, 0x78, 0xc0, 8, 4}, 7); // extrq xmm8, 8, 4
+	Check(test, fpstate._xmm[8].element[0] == 0x23 && fpstate._xmm[8].element[2] == 0,
+	      "SSE4a extraction lost its extended register or upper-half semantics");
+	fpstate._xmm[8].element[0] = 0x1111;
+	fpstate._xmm[8].element[2] = 0xdeadbeef;
+	fpstate._xmm[9].element[0] = 0xab;
+	emulate({0xf2, 0x45, 0x0f, 0x78, 0xc1, 8, 4}, 7); // insertq xmm8, xmm9, 8, 4
+	Check(test, fpstate._xmm[8].element[0] == 0x1ab1 && fpstate._xmm[8].element[2] == 0xdeadbeef,
+	      "SSE4a insertion corrupted its destination lanes");
+	std::array<uint32_t, 8> sha_source {0, 0, 0, 0, 5, 6, 7, 8};
+	context.uc_mcontext.gregs[REG_RDI] = reinterpret_cast<greg_t>(sha_source.data());
+	for (uint32_t lane = 0; lane < 4; ++lane) {
+		fpstate._xmm[8].element[lane] = lane + 1;
+	}
+	emulate({0x44, 0x0f, 0x38, 0xc9, 0x47, 0x10}, 6); // sha1msg1 xmm8, [rdi+16]
+	constexpr std::array<uint32_t, 4> sha_expected {6, 10, 2, 6};
+	Check(test, std::equal(sha_expected.begin(), sha_expected.end(), fpstate._xmm[8].element),
+	      "SHA emulation lost its memory operand or extended destination register");
+	emulate({0x0f, 0x01, 0xfa}, 3); // monitorx
+#endif
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr int32_t FiberErrorState = -2141650938; // SCE_FIBER_ERROR_STATE
+constexpr int32_t FiberErrorPermission = -2141650939;
+
+struct FiberRoundTrip {
+	Libs::Fiber::FiberObject* first;
+	Libs::Fiber::FiberObject* second;
+	std::atomic<bool> running {false};
+	std::atomic<bool> release {false};
+	int first_errors = 0;
+	int second_errors = 0;
+	uint32_t first_visits = 0;
+	uint32_t second_visits = 0;
+	uint64_t first_arg = 0;
+	uint64_t second_arg = 0;
+};
+
+[[noreturn]] void KYTY_SYSV_ABI FirstFiberEntry(uint64_t initial, uint64_t arg) {
+	auto& data = *reinterpret_cast<FiberRoundTrip*>(initial);
+	for (;;) {
+		Libs::Fiber::FiberObject* self = nullptr;
+		data.first_errors |= Libs::Fiber::FiberGetSelf(&self);
+		data.first_errors |= self != data.first;
+		data.first_errors |= Libs::Fiber::FiberSwitch(self, 0, nullptr) != FiberErrorState;
+		if (data.first_errors != 0) {
+			__builtin_trap();
+		}
+		++data.first_visits;
+		data.first_arg = arg;
+		if (arg == 20) {
+			data.running.store(true, std::memory_order_release);
+			while (!data.release.load(std::memory_order_acquire)) {
+				asm volatile("pause");
+			}
+		}
+		data.first_errors |= Libs::Fiber::FiberSwitch(data.second, arg + 1, &arg);
+		if (data.first_errors != 0) {
+			__builtin_trap();
+		}
+		data.first_errors |= Libs::Fiber::FiberReturnToThread(arg + 1, &arg);
+	}
+}
+
+[[noreturn]] void KYTY_SYSV_ABI SecondFiberEntry(uint64_t initial, uint64_t arg) {
+	auto& data = *reinterpret_cast<FiberRoundTrip*>(initial);
+	for (;;) {
+		Libs::Fiber::FiberObject* self = nullptr;
+		data.second_errors |= Libs::Fiber::FiberGetSelf(&self);
+		data.second_errors |= self != data.second;
+		if (data.second_errors != 0) {
+			__builtin_trap();
+		}
+		++data.second_visits;
+		data.second_arg = arg;
+		data.second_errors |= Libs::Fiber::FiberSwitch(data.first, arg + 1, &arg);
+		if (data.second_errors != 0) {
+			__builtin_trap();
+		}
+	}
+}
+
+void TestSmallFiberStacksAndMigration() {
+	const char* test = "SmallFiberStacksAndMigration";
+	// 256-byte objects, 8-byte object alignment, 16-byte context
+	// alignment, and a 512-byte minimum context. The game supplies 2048 bytes.
+	for (const size_t stack_size: {512u, 2048u}) {
+		alignas(8) std::array<uint8_t, 256> first_object {};
+		alignas(8) std::array<uint8_t, 256> second_object {};
+		constexpr size_t GuardSize = 4096;
+		alignas(16) std::array<uint8_t, GuardSize + 2048 + 64> first_stack;
+		alignas(16) std::array<uint8_t, GuardSize + 2048 + 64> second_stack;
+		first_stack.fill(0xa5);
+		second_stack.fill(0xa5);
+		FiberRoundTrip data {reinterpret_cast<Libs::Fiber::FiberObject*>(first_object.data()),
+		                     reinterpret_cast<Libs::Fiber::FiberObject*>(second_object.data())};
+		CheckOk(test, Libs::Fiber::FiberInitialize(data.first, "first", FirstFiberEntry,
+		    reinterpret_cast<uint64_t>(&data), first_stack.data() + GuardSize, stack_size,
+		    nullptr, 0x0a000000), "initialize first fiber");
+		CheckOk(test, Libs::Fiber::FiberInitialize(data.second, "second", SecondFiberEntry,
+		    reinterpret_cast<uint64_t>(&data), second_stack.data() + GuardSize, stack_size,
+		    nullptr, 0x0a000000), "initialize second fiber");
+		const auto thread_context_is_clear = [&] {
+			Libs::Fiber::FiberObject* self = data.first;
+			return Libs::Fiber::FiberGetSelf(&self) == OK && self == nullptr &&
+			       Libs::Fiber::FiberSwitch(data.first, 0, nullptr) == FiberErrorPermission &&
+			       Libs::Fiber::FiberReturnToThread(0, nullptr) == FiberErrorPermission;
+		};
+		Check(test, thread_context_is_clear(), "thread retained a fiber context before its first run");
+		uint64_t first_base = 0;
+		uint64_t second_base = 0;
+		std::memcpy(&first_base, first_stack.data() + GuardSize, sizeof(first_base));
+		std::memcpy(&second_base, second_stack.data() + GuardSize, sizeof(second_base));
+		const auto check_stacks = [&] {
+			for (const auto* stack: {&first_stack, &second_stack}) {
+				const auto is_guard = [](uint8_t byte) { return byte == 0xa5; };
+				Check(test, std::all_of(stack->begin(), stack->begin() + GuardSize, is_guard) &&
+				                std::all_of(stack->begin() + GuardSize + stack_size, stack->end(), is_guard),
+				      "fiber wrote outside its supplied stack");
+			}
+			Check(test, std::memcmp(&first_base, first_stack.data() + GuardSize, sizeof(first_base)) == 0 &&
+			                std::memcmp(&second_base, second_stack.data() + GuardSize, sizeof(second_base)) == 0,
+			      "fiber overwrote the bottom of its stack");
+		};
+		uint64_t returned = 0;
+		CheckOk(test, Libs::Fiber::FiberRun(data.first, 10, &returned), "run first fiber");
+		Check(test, returned == 13 && data.first_visits == 1 && data.second_visits == 1 &&
+		                data.first_arg == 10 && data.second_arg == 11,
+		      "switch/return arguments were not preserved");
+		Check(test, thread_context_is_clear(), "run retained its thread context after returning");
+		check_stacks();
+
+		std::atomic<bool> done {false};
+		int worker_result = -1;
+		int worker_repeat_result = -1;
+		bool worker_context_clear = false;
+		uint64_t worker_returned = 0;
+		uint64_t worker_repeat_returned = 0;
+		std::thread worker([&] {
+			worker_context_clear = thread_context_is_clear();
+			worker_result = Libs::Fiber::FiberRun(data.first, 20, &worker_returned);
+			worker_context_clear = thread_context_is_clear() && worker_context_clear;
+			worker_repeat_result = Libs::Fiber::FiberRun(data.first, 30, &worker_repeat_returned);
+			worker_context_clear = thread_context_is_clear() && worker_context_clear;
+			done.store(true, std::memory_order_release);
+		});
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!data.running.load(std::memory_order_acquire) &&
+		       !done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+		const bool running = data.running.load(std::memory_order_acquire);
+		Libs::Fiber::FiberObject* main_self = data.first;
+		const int main_self_result = Libs::Fiber::FiberGetSelf(&main_self);
+		const int busy_run = running ? Libs::Fiber::FiberRun(data.first, 30, nullptr) : 0;
+		const int busy_finalize = running ? Libs::Fiber::FiberFinalize(data.first) : 0;
+		data.release.store(true, std::memory_order_release);
+		worker.join();
+		Check(test, thread_context_is_clear() && main_self_result == OK && main_self == nullptr,
+		      "migrated fiber changed the original thread's current fiber");
+		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState,
+		      "running fiber was not exclusively owned");
+		CheckOk(test, worker_result, "resume fiber on another thread");
+		CheckOk(test, worker_repeat_result, "repeat run on another thread");
+		Check(test, worker_context_clear, "worker retained a context outside a fiber run");
+		Check(test, worker_returned == 23 && worker_repeat_returned == 33 &&
+		                data.first_visits == 3 && data.second_visits == 3 &&
+		                data.first_arg == 30 && data.second_arg == 31 &&
+		                data.first_errors == 0 && data.second_errors == 0,
+		      "migration lost fiber identity, arguments, or resumable contexts");
+		CheckOk(test, Libs::Fiber::FiberRun(data.first, 40, &returned), "migrate fiber back to original thread");
+		Check(test, returned == 43 && data.first_visits == 4 && data.second_visits == 4 &&
+		                data.first_arg == 40 && data.second_arg == 41 &&
+		                data.first_errors == 0 && data.second_errors == 0,
+		      "return migration reused an expired thread context");
+		Check(test, thread_context_is_clear(), "repeated run retained its thread context after returning");
+		check_stacks();
+		CheckOk(test, Libs::Fiber::FiberFinalize(data.first), "finalize first suspended fiber");
+		CheckOk(test, Libs::Fiber::FiberFinalize(data.second), "finalize second suspended fiber");
+		std::printf("[host]    %s stack=%zu ok\n", test, stack_size);
+	}
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if defined(__x86_64__) || defined(_M_X64)
+	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
+		RunTest(TestSmallFiberStacksAndMigration);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
+		RunTest(TestPackedReciprocalSquareRoot);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
+#if defined(__x86_64__) || defined(_M_X64)
+	RunTest(TestSmallFiberStacksAndMigration);
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestPackedReciprocalSquareRoot);
+#endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);

@@ -90,6 +90,7 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	void ConfigureGarbageCollectionBudget(uint64_t available_budget);
 
 private:
 	enum class TransferDirection { Upload, Download };

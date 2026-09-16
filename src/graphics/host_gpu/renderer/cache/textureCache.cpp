@@ -323,16 +323,28 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// experiment is active at all.
 	LOGF("READBACK CONFIG: readback_linear_images=%d\n", m_readback_linear_images ? 1 : 0);
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+		ConfigureGarbageCollectionBudget(m_graphics.GetTotalMemoryBudget());
+	}
+}
+
+void TextureCache::ConfigureGarbageCollectionBudget(uint64_t available_budget) {
+	constexpr int64_t GiB       = 1024ll * 1024 * 1024;
+	const auto        budget    = static_cast<int64_t>(std::min<uint64_t>(available_budget, INT64_MAX));
+	const auto        threshold = std::min<int64_t>(budget, 8 * GiB);
+	m_pressure_gc_memory        = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+	m_critical_gc_memory = static_cast<uint64_t>(
+	    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+	// Keep reusable images resident until memory is actually under pressure. The earlier trigger
+	// collected at roughly half the budget, which can reclaim a render target that a later pass
+	// still samples.
+	m_trigger_gc_memory = m_pressure_gc_memory;
+	if (const auto* legacy = std::getenv("KYTY_TEXTURE_CACHE_EARLY_GC");
+	    legacy != nullptr && std::strcmp(legacy, "1") == 0) {
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
+	LOGF("TEXTURE GC BUDGET: trigger=%" PRIu64 " pressure=%" PRIu64 " critical=%" PRIu64 "\n",
+	     m_trigger_gc_memory, m_pressure_gc_memory, m_critical_gc_memory);
 }
 
 TextureCache::~TextureCache() {

@@ -1873,6 +1873,18 @@ static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void*
 	return np_auth_complete_signed_out(request);
 }
 
+// PPSA17221 imports IDX0S5EsEh4 as [NpAuthAuthorizedApp_v1][NpAuth_v1.1].
+// Kyty only registers base NpAuth NIDs, but resolution is NID-only
+// (SymbolDatabase::FindByNid matches "nid[" prefix), so registering the NID
+// here resolves it regardless of library/module strings. Signature unknown,
+// so plain return-OK with no buffer writes preserves current behavior
+// (unresolved stubs return 0) and lets the game fall back to offline auth.
+static int KYTY_SYSV_ABI NpAuthStub_IDX0S5EsEh4() {
+	PRINT_NAME();
+
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpAuth) {
 	LIB_FUNC("6bwFkosYRQg", LibNpAuth::NpAuthCreateRequest);
 	LIB_FUNC("N+mr7GjTvr8", LibNpAuth::NpAuthCreateAsyncRequest);
@@ -1882,6 +1894,7 @@ LIB_DEFINE(InitNet_1_NpAuth) {
 	LIB_FUNC("gjSyfzSsDcE", LibNpAuth::NpAuthPollAsync);
 	LIB_FUNC("KI4dHLlTNl0", LibNpAuth::NpAuthGetAuthorizationCodeV3);
 	LIB_FUNC("RdsFVsgSpZY", LibNpAuth::NpAuthGetIdTokenV3);
+	LIB_FUNC("IDX0S5EsEh4", LibNpAuth::NpAuthStub_IDX0S5EsEh4);
 }
 
 } // namespace LibNpAuth

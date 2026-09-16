@@ -97,11 +97,14 @@ private:
 	struct TextureTransfer;
 	struct ImageDownload;
 
+	// Slices tracked per metadata surface, one bit each in MetaDataInfo::clear_mask.
+	static constexpr uint32_t MetaSliceBits = 64;
+
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
 		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		uint64_t clear_mask = UINT64_MAX;
 	};
 
 	struct OverlapResult {

@@ -2423,10 +2423,20 @@ Image* TextureCache::DebugTryGetImage(uint32_t id_index, uint32_t id_generation)
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	if (slice >= MetaSliceBits) {
+		static std::atomic<bool> warned {false};
+		if (!warned.exchange(true)) {
+			LOGF("TextureCache: metadata slice %" PRIu32 " of 0x%016" PRIx64
+			     " is beyond the %u tracked slices; its clear state is not tracked"
+			     " (further warnings suppressed)\n",
+			     slice, address, MetaSliceBits);
+		}
+		return false;
+	}
+	return (found->second.clear_mask & (UINT64_C(1) << slice)) != 0;
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2435,20 +2445,30 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask = UINT64_MAX;
 	return true;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	if (slice >= MetaSliceBits) {
+		static std::atomic<bool> warned {false};
+		if (!warned.exchange(true)) {
+			LOGF("TextureCache: metadata slice %" PRIu32 " of 0x%016" PRIx64
+			     " is beyond the %u tracked slices; its clear state is not tracked"
+			     " (further warnings suppressed)\n",
+			     slice, address, MetaSliceBits);
+		}
 		return false;
 	}
 	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
+		found->second.clear_mask |= UINT64_C(1) << slice;
 	} else {
-		found->second.clear_mask &= ~(1u << slice);
+		found->second.clear_mask &= ~(UINT64_C(1) << slice);
 	}
 	return true;
 }

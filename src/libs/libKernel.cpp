@@ -2139,6 +2139,7 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
 		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);
 	}
+	return -1;
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
@@ -2369,7 +2370,7 @@ static void FiberStoreState(FiberObject* fiber, uint32_t state) {
 }
 
 // A fiber may resume on another host thread. Do not cache TLS across the switch.
-[[gnu::noinline]] static void FiberCompleteSwitch(FiberObject* current) {
+[[gnu::noinline]] static KYTY_SYSV_ABI void FiberCompleteSwitch(FiberObject* current) {
 	g_current_fiber = current;
 	// Only publish IDLE after switching away from the departing fiber's stack.
 	auto* fiber          = g_pending_idle_fiber;
@@ -2571,7 +2572,8 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	return OK;
 }
 
-int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t* arg_on_return) {
+[[gnu::noinline]] int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run,
+                                                  uint64_t* arg_on_return) {
 	PRINT_NAME();
 
 	if (!FiberIsValid(fiber)) {
@@ -2610,8 +2612,8 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	return return_code;
 }
 
-int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
-                                  uint64_t* arg_on_return) {
+[[gnu::noinline]] int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
+                                                    uint64_t* arg_on_return) {
 	PRINT_NAME();
 
 	if (!FiberIsValid(fiber)) {
@@ -2648,7 +2650,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	return OK;
 }
 
-int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
+[[gnu::noinline]] int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	PRINT_NAME();
 
 	if (fiber == nullptr) {
@@ -2660,7 +2662,8 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	return OK;
 }
 
-int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_on_run) {
+[[gnu::noinline]] int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return,
+                                                            uint64_t* arg_on_run) {
 	PRINT_NAME();
 
 	if (g_current_fiber == nullptr) {

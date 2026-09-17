@@ -258,13 +258,30 @@ static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
 static Common::Mutex             g_mount_mutex;
 
+// Keeps a path component (title id or guest-supplied dir name) to a safe identifier so it
+// cannot escape SAVE_DATA_DIR via separators or ".." components (CWE-22).
+static std::string sanitize_path_component(std::string_view text) {
+	std::string result;
+	result.reserve(text.size());
+	for (char c: text) {
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+		    c == '_' || c == '-') {
+			result += c;
+		}
+	}
+	if (result.empty()) {
+		result = "UNKNOWN";
+	}
+	return result;
+}
+
 static std::string get_title_id() {
 	std::string title_id;
 	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
 		title_id = "UNKNOWN";
 	}
 
-	return title_id;
+	return sanitize_path_component(title_id);
 }
 
 static std::string memory_dir_name(uint32_t slot_id) {
@@ -281,8 +298,17 @@ static bool valid_memory_range(const SaveDataMemoryData& data, size_t size) {
 	       data.buf_size <= size - static_cast<size_t>(data.offset);
 }
 
+// Where the previous copy of `path` gets moved to before it's replaced: a sibling "backups"
+// folder, same filename, no extra suffix - keeps the real save directory free of clutter.
+static std::filesystem::path backup_path_for(const std::filesystem::path& path) {
+	return path.parent_path() / "backups" / path.filename();
+}
+
 // Keep memory.dat as raw guest bytes. Replacing a flushed temporary file protects the
-// previous save if writing fails or the emulator exits partway through an update.
+// previous save if writing fails or the emulator exits partway through an update. Before the
+// replace, the file being replaced (if any) is copied into a "backups" folder so a manual
+// recovery copy of the save from before this write survives even a successful-but-unwanted
+// overwrite.
 static int write_memory_file(const std::filesystem::path& path, const void* data, uint32_t size) {
 	const auto   temporary = std::filesystem::path(path.string() + ".tmp");
 	Common::File file;
@@ -295,6 +321,14 @@ static int write_memory_file(const std::filesystem::path& path, const void* data
 	file.Close();
 	std::error_code error;
 	if (written == size && flushed) {
+		std::error_code exists_error;
+		if (std::filesystem::exists(path, exists_error) && !exists_error) {
+			const auto backup = backup_path_for(path);
+			std::error_code backup_error;
+			std::filesystem::create_directories(backup.parent_path(), backup_error);
+			std::filesystem::copy_file(
+			    path, backup, std::filesystem::copy_options::overwrite_existing, backup_error);
+		}
 		// Common::File::RenameFile deliberately refuses to replace an existing file.
 		std::filesystem::rename(temporary, path, error);
 		if (!error) {
@@ -494,7 +528,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
-			    !Common::StartsWith(entry.name, "sce_")) {
+			    !entry.name.starts_with("sce_")) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -557,9 +591,9 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	*mount_result = {};
 
 	Common::LockGuard lock(g_mount_mutex);
-	const std::string dir_name = mount->dir_name->data;
-	const std::string mount_dir =
-	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + dir_name;
+	const std::string dir_name = sanitize_path_component(mount->dir_name->data);
+	const std::string mount_dir = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
+	                              dir_name + "/" + std::to_string(mount->user_id);
 	const bool create  = ((mount->mount_mode & 4u) != 0);
 	const bool create2 = ((mount->mount_mode & 32u) != 0);
 	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
@@ -599,12 +633,29 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
                                                SaveDataMemorySetupResult*  result) {
 	PRINT_NAME();
 
+	if (setup_param != nullptr) {
+		LOGF("\t [pre-validate] option=0x%08" PRIx32 " user_id=%" PRId32 " memory_size=%" PRIu64
+		     " icon_memory_size=%" PRIu64 " init_icon=0x%016" PRIx64 " slot_id=%" PRIu32 "\n",
+		     setup_param->option, setup_param->user_id,
+		     static_cast<uint64_t>(setup_param->memory_size),
+		     static_cast<uint64_t>(setup_param->icon_memory_size),
+		     reinterpret_cast<uint64_t>(setup_param->init_icon), setup_param->slot_id);
+	} else {
+		LOGF("\t [pre-validate] setup_param = null\n");
+	}
+
+	// NOTE: icon memory (icon_memory_size/init_icon) is intentionally NOT rejected here.
+	// Icon persistence isn't implemented, but a title is allowed to pass one anyway - we just
+	// ignore it, same as SaveDataLoadIcon/SaveDataSaveIcon do elsewhere in this file. Rejecting
+	// the whole setup call over an icon field previously made every real title using icons fail
+	// SaveDataSetupSaveDataMemory2 outright.
 	if (setup_param == nullptr || setup_param->slot_id >= 4 || setup_param->memory_size == 0 ||
-	    setup_param->memory_size > SAVE_DATA_MEMORY_MAX_SIZE || (setup_param->option & ~3u) != 0 ||
-	    setup_param->icon_memory_size != 0 || setup_param->init_icon != nullptr) {
+	    setup_param->memory_size > SAVE_DATA_MEMORY_MAX_SIZE || (setup_param->option & ~3u) != 0) {
+		LOGF("\t -> SAVE_DATA_ERROR_PARAMETER (rejected before setup)\n");
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 	if (setup_param->user_id < 0) {
+		LOGF("\t -> SAVE_DATA_ERROR_INVALID_LOGIN_USER\n");
 		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
 	}
 
@@ -659,10 +710,24 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	PRINT_NAME();
 
-	if (get_param == nullptr || get_param->slot_id >= 4 || get_param->icon != nullptr) {
+	if (get_param != nullptr) {
+		LOGF("\t [pre-validate] user_id=%" PRId32 " data=0x%016" PRIx64 " param=0x%016" PRIx64
+		     " icon=0x%016" PRIx64 " slot_id=%" PRIu32 "\n",
+		     get_param->user_id, reinterpret_cast<uint64_t>(get_param->data),
+		     reinterpret_cast<uint64_t>(get_param->param), reinterpret_cast<uint64_t>(get_param->icon),
+		     get_param->slot_id);
+	} else {
+		LOGF("\t [pre-validate] get_param = null\n");
+	}
+
+	// icon is intentionally not rejected here - see the matching note in
+	// SaveDataSetupSaveDataMemory2. We just never fill it in.
+	if (get_param == nullptr || get_param->slot_id >= 4) {
+		LOGF("\t -> SAVE_DATA_ERROR_PARAMETER (rejected before get)\n");
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 	if (get_param->user_id < 0) {
+		LOGF("\t -> SAVE_DATA_ERROR_INVALID_LOGIN_USER\n");
 		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
 	}
 
@@ -679,11 +744,17 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	const auto        it =
 	    g_save_data_memory.find(memory_directory(get_param->user_id, get_param->slot_id));
 	if (it == g_save_data_memory.end()) {
+		LOGF("\t -> SAVE_DATA_ERROR_MEMORY_NOT_READY (no setup for this user/slot)\n");
 		return SAVE_DATA_ERROR_MEMORY_NOT_READY;
 	}
 	const auto& memory = it->second;
 	if ((get_param->param != nullptr && (memory.option & SAVE_DATA_MEMORY_SET_PARAM) == 0) ||
 	    (get_param->data != nullptr && !valid_memory_range(*get_param->data, memory.data.size()))) {
+		LOGF("\t -> SAVE_DATA_ERROR_PARAMETER (param/data range check failed; option=0x%08" PRIx32
+		     " data_size=%zu offset=%" PRId64 " buf_size=%" PRIu64 "\n",
+		     memory.option, memory.data.size(),
+		     get_param->data != nullptr ? get_param->data->offset : 0,
+		     get_param->data != nullptr ? static_cast<uint64_t>(get_param->data->buf_size) : 0);
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 	if (get_param->data != nullptr) {
@@ -700,11 +771,25 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
 	PRINT_NAME();
 
-	if (set_param == nullptr || set_param->slot_id >= 4 || set_param->icon != nullptr ||
-	    set_param->data_num > 5 || (set_param->data == nullptr && set_param->data_num != 0)) {
+	if (set_param != nullptr) {
+		LOGF("\t [pre-validate] user_id=%" PRId32 " data=0x%016" PRIx64 " param=0x%016" PRIx64
+		     " icon=0x%016" PRIx64 " data_num=%" PRIu32 " slot_id=%" PRIu32 "\n",
+		     set_param->user_id, reinterpret_cast<uint64_t>(set_param->data),
+		     reinterpret_cast<uint64_t>(set_param->param), reinterpret_cast<uint64_t>(set_param->icon),
+		     set_param->data_num, set_param->slot_id);
+	} else {
+		LOGF("\t [pre-validate] set_param = null\n");
+	}
+
+	// icon is intentionally not rejected here - see the matching note in
+	// SaveDataSetupSaveDataMemory2. We just never persist it.
+	if (set_param == nullptr || set_param->slot_id >= 4 || set_param->data_num > 5 ||
+	    (set_param->data == nullptr && set_param->data_num != 0)) {
+		LOGF("\t -> SAVE_DATA_ERROR_PARAMETER (rejected before set)\n");
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 	if (set_param->user_id < 0) {
+		LOGF("\t -> SAVE_DATA_ERROR_INVALID_LOGIN_USER\n");
 		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
 	}
 
@@ -722,23 +807,38 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 	const auto        it =
 	    g_save_data_memory.find(memory_directory(set_param->user_id, set_param->slot_id));
 	if (it == g_save_data_memory.end()) {
+		LOGF("\t -> SAVE_DATA_ERROR_MEMORY_NOT_READY (no setup for this user/slot)\n");
 		return SAVE_DATA_ERROR_MEMORY_NOT_READY;
 	}
 	if (set_param->param != nullptr && (it->second.option & SAVE_DATA_MEMORY_SET_PARAM) == 0) {
+		LOGF("\t -> SAVE_DATA_ERROR_PARAMETER (param set but SET_PARAM option not enabled, "
+		     "option=0x%08" PRIx32 ")\n",
+		     it->second.option);
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
-	for (uint32_t i = 0; i < set_param->data_num; i++) {
+	// A title passing data_num=0 alongside a non-null data pointer means "one entry, at
+	// data[0]" (observed from Astro Bot) - not "no entries". Only treat data_num as truly zero
+	// entries when data itself is null.
+	const uint32_t effective_data_num =
+	    (set_param->data_num == 0 && set_param->data != nullptr) ? 1 : set_param->data_num;
+	LOGF("\t effective_data_num = %" PRIu32 "\n", effective_data_num);
+	for (uint32_t i = 0; i < effective_data_num; i++) {
 		if (!valid_memory_range(set_param->data[i], it->second.data.size())) {
+			LOGF("\t -> SAVE_DATA_ERROR_PARAMETER ([%" PRIu32 "] out of range: offset=%" PRId64
+			     " buf_size=%" PRIu64 " data_size=%zu)\n",
+			     i, set_param->data[i].offset, static_cast<uint64_t>(set_param->data[i].buf_size),
+			     it->second.data.size());
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 	}
-	if (set_param->data_num == 0 && set_param->param == nullptr) {
+	if (effective_data_num == 0 && set_param->param == nullptr) {
+		LOGF("\t -> OK (no-op: no data, no param)\n");
 		return OK;
 	}
 
 	// Save the complete update before publishing it so progress survives process exit.
 	auto updated = it->second;
-	for (uint32_t i = 0; i < set_param->data_num; i++) {
+	for (uint32_t i = 0; i < effective_data_num; i++) {
 		const auto& data = set_param->data[i];
 		std::memcpy(updated.data.data() + data.offset, data.buf, data.buf_size);
 	}
@@ -770,9 +870,10 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 	*mount_result = {};
 
 	Common::LockGuard lock(g_mount_mutex);
-	const std::string dir_name = mount->dir_name->data;
-	const std::string mount_dir =
-	    std::string(SAVE_DATA_DIR) + "/" + mount->title_id->data + "/" + dir_name;
+	const std::string dir_name    = sanitize_path_component(mount->dir_name->data);
+	const std::string transfer_id = sanitize_path_component(mount->title_id->data);
+	const std::string mount_dir   = std::string(SAVE_DATA_DIR) + "/" + transfer_id + "/" +
+	                               dir_name + "/" + std::to_string(mount->user_id);
 	const int slot = g_mount_slots.FindAvailable(dir_name);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
@@ -863,8 +964,9 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	     del->user_id, del->title_id != nullptr ? del->title_id->data : "<default>",
 	     del->dir_name->data);
 
-	std::string dir =
-	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + std::string(del->dir_name->data);
+	std::string dir = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
+	                  sanitize_path_component(del->dir_name->data) + "/" +
+	                  std::to_string(del->user_id);
 	if (Common::File::IsDirectoryExisting(dir)) {
 		Common::File::DeleteDirectory(dir);
 	}

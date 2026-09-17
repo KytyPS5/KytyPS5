@@ -62,6 +62,12 @@ struct File {
 	Common::File                        f;
 	std::string                         name;
 	std::filesystem::path               real_name;
+	// Non-empty when this fd was (re)created under a save-data mount (see
+	// SAVE_DATA_MOUNT_PREFIX below): writes go to this temp path instead of real_name directly,
+	// and KernelClose atomically replaces real_name with it (backing up the previous file into a
+	// sibling "backups" folder first) so a crash or force-close mid-write can never leave a torn
+	// save file.
+	std::filesystem::path               atomic_shadow_path;
 	std::atomic_bool                    opened;
 	std::atomic_bool                    directory;
 	std::atomic_bool                    writable;
@@ -500,7 +506,24 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			return KERNEL_ERROR_EEXIST;
 		}
 
-		if (creat && (!file_exist || trunc)) {
+		// A save-data mount (see SaveDataMountSlots::MountPoint) rewritten from scratch is the
+		// classic "whole file gets recreated" save pattern. Route that write through a .tmp
+		// shadow file, atomically replacing the real one on KernelClose, so a crash / GPU hang /
+		// force-close mid-write can never leave a torn save file on disk. Covers both O_CREAT
+		// (new or truncated file) and a bare O_TRUNC on an existing file.
+		const bool is_save_data_mount  = file->name.starts_with("/savedata");
+		const bool rewrites_whole_file = trunc || (creat && !file_exist);
+
+		if (is_save_data_mount && rewrites_whole_file) {
+			file->atomic_shadow_path =
+			    std::filesystem::path(file->real_name.string() + ".tmp");
+			Common::File::CreateDirectories(file->real_name.parent_path());
+			result = file->f.Create(file->atomic_shadow_path);
+
+			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate (shadow): %s, %s\n",
+			           Common::PathToString(file->atomic_shadow_path).c_str(),
+			           result ? "[ok]" : "[fail]");
+		} else if (creat && (!file_exist || trunc)) {
 			Common::File::CreateDirectories(file->real_name.parent_path());
 			result = file->f.Create(file->real_name);
 
@@ -513,7 +536,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		}
 
-		if (result && trunc) {
+		if (result && trunc && file->atomic_shadow_path.empty()) {
 			result = file->f.Truncate(0);
 		}
 
@@ -553,6 +576,31 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	if (!file->directory && file->special == SpecialFile::None) {
 		file->f.Close();
+	}
+
+	if (!file->atomic_shadow_path.empty()) {
+		std::error_code error;
+		if (std::filesystem::exists(file->real_name, error) && !error) {
+			// Sibling "backups" folder, same filename, no suffix - keeps the save directory
+			// itself free of clutter.
+			const auto backup = file->real_name.parent_path() / "backups" / file->real_name.filename();
+			std::error_code backup_error;
+			std::filesystem::create_directories(backup.parent_path(), backup_error);
+			std::filesystem::copy_file(file->real_name, backup,
+			                           std::filesystem::copy_options::overwrite_existing,
+			                           backup_error);
+		}
+		std::filesystem::rename(file->atomic_shadow_path, file->real_name, error);
+		if (error) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\tfailed to atomically replace %s with shadow write %s: %s\n",
+			           Common::PathToString(file->real_name).c_str(),
+			           Common::PathToString(file->atomic_shadow_path).c_str(),
+			           error.message().c_str());
+		} else {
+			LOGF_COLOR(Log::Color::Green, "\tClose (shadow write published): %s\n",
+			           Common::PathToString(file->real_name).c_str());
+		}
 	}
 
 	file->opened = false;

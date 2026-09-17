@@ -11,6 +11,7 @@
 #include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
+#include <limits>
 #include <magic_enum.hpp>
 
 using namespace Common;
@@ -253,13 +254,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.game_patch = value;
 		} else if (arg == "--screen-width") {
 			if (!ParseUint32(value, options.config.screen_width) ||
-			    options.config.screen_width == 0) {
+			    options.config.screen_width == 0 ||
+			    options.config.screen_width >
+			        static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
 				::printf("invalid screen width: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--screen-height") {
 			if (!ParseUint32(value, options.config.screen_height) ||
-			    options.config.screen_height == 0) {
+			    options.config.screen_height == 0 ||
+			    options.config.screen_height >
+			        static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
 				::printf("invalid screen height: %s\n", value.c_str());
 				return false;
 			}

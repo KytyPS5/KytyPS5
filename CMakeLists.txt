@@ -391,6 +391,12 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+add_executable(push_descriptor_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PushDescriptorPolicyTests.cpp"
+)
+target_include_directories(push_descriptor_policy_tests PRIVATE ${inc_headers})
+target_link_libraries(push_descriptor_policy_tests Vulkan::Headers)
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -544,6 +550,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME push_descriptor_policy COMMAND $<TARGET_FILE:push_descriptor_policy_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -612,6 +619,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		push_descriptor_policy_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

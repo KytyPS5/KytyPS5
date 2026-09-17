@@ -460,6 +460,16 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+# KernelFileSystemTests.cpp defines a classic main(); like kyty_emulator it
+# also needs SDL2main to resolve SDL_main on Windows.
+if(WIN32)
+	target_link_libraries(kernel_file_system_tests SDL2::SDL2main)
+endif()
+# KernelFileSystemTests.cpp defines a classic main(); like kyty_emulator it
+# also needs SDL2main to resolve SDL_main on Windows.
+if(WIN32)
+	target_link_libraries(kernel_file_system_tests SDL2::SDL2main)
+endif()
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -579,6 +589,19 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+
+	# The Vulkan-backed shader_recompiler_compute tests skip (exit code 77) when
+	# no usable Vulkan environment is present, e.g. on machines without a GPU.
+	set_tests_properties(shader_recompiler_compute shader_recompiler_alignbyte
+		graphics_pipeline_rasterization graphics_draw_offsets
+		command_scheduler_timeline stream_buffer_ring gpu_command_lane
+		pm4_context_state gpu_tiler texture_cache_layered_image
+		host_image_allocation texture_cache_image_views
+		texture_cache_storage_sampled texture_cache_depth_readback
+		compute_meta_clear_classification buffer_cache_dirty_gc
+		texture_cache_image_overlap texture_cache_htile_clear
+		buffer_cache_ranges
+		PROPERTIES SKIP_RETURN_CODE 77)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS

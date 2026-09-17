@@ -108,6 +108,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	InitGameDirectories();
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
+	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {

@@ -84,11 +84,29 @@ void UpdateChecker::FetchUpdateInfo(const char* url, bool fallback, bool manual)
 		}
 		reply->deleteLater();
 
-		if (!fallback &&
-		    (!info.error.isEmpty() || info.tag != QString::fromLatin1(KYTY_RELEASE_TAG))) {
-			FetchUpdateInfo(FALLBACK_FEED_URL, true, manual);
-			return;
+		if (!fallback) {
+			const bool up_to_date =
+			    info.error.isEmpty() && info.tag == QString::fromLatin1(KYTY_RELEASE_TAG);
+			if (!up_to_date) {
+				if (info.error.isEmpty()) {
+					// The primary feed is reachable but disagrees with the build tag
+					// (e.g. a stale mirror); remember its answer in case the fallback
+					// request also fails.
+					m_primary_tag      = info.tag;
+					m_primary_page_url = info.page_url;
+				}
+				FetchUpdateInfo(FALLBACK_FEED_URL, true, manual);
+				return;
+			}
 		}
+
+		if (fallback && !info.error.isEmpty() && !m_primary_tag.isEmpty()) {
+			// The fallback feed failed, but the primary feed already returned a
+			// usable answer; prefer it over reporting a network error.
+			info = {m_primary_tag, m_primary_page_url, {}};
+		}
+		m_primary_tag.clear();
+		m_primary_page_url.clear();
 
 		m_checking_updates = false;
 		emit CheckingChanged(false);

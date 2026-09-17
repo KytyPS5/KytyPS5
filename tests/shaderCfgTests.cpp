@@ -6230,6 +6230,18 @@ void TestPerspectiveCentroidInputs() {
             "center pair lost its ordinary barycentric loads when centroid was enabled");
     }
     CheckSpirvBinaryValidates(result.spirv);
+    const auto multisample_key = MakeStageStaticKey(pixel);
+    pixel.ps_single_sample = true;
+    Check(multisample_key != MakeStageStaticKey(pixel), "single-sample centroid specialization missing from shader key");
+    const auto single_sample = RecompileForTest(shader, options);
+    Check(result.program.info.outputs == single_sample.program.info.outputs,
+          "centroid specialization changed the active render targets");
+    const auto single_source = DisassembleSpirvBinary(single_sample.spirv);
+    Check(!SpirvContainsCapability(single_sample.spirv, 52u) &&
+              !Common::ContainsStr(single_source, "InterpolateAtCentroid") &&
+              SpirvHasDecorationValue(single_sample.spirv, 11u, 5286u),
+          "single-sample centroid did not reuse the center barycentric builtin");
+    CheckSpirvBinaryValidates(single_sample.spirv);
   }
 }
 

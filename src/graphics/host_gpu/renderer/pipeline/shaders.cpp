@@ -196,7 +196,8 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.uses_push_descriptors =
+	    UsePushDescriptors(descriptor_count, graphics.max_push_descriptors);
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors

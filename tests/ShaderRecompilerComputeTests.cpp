@@ -87,6 +87,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -31618,7 +31619,89 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+// Structural check for the scalar address path: the guest base must be aligned (low word & ~3) and
+// its upper word masked (high word & 0xffff) before both halves are merged into the device address,
+// exactly what the host scalar path does with SrtWalker's AddressMask. The check starts from every
+// OpBitwiseOr that merges the two halves and follows the operands directly, so a constant-only scan
+// (which would also match the offset alignment that predates this fix) cannot satisfy it.
+bool ScalarAddressMasksBase(const std::vector<uint32_t> &spirv) {
+  constexpr uint32_t OpConstant = static_cast<uint32_t>(spv::OpConstant);
+  constexpr uint32_t OpUConvert = static_cast<uint32_t>(spv::OpUConvert);
+  constexpr uint32_t OpShiftLeftLogical = static_cast<uint32_t>(spv::OpShiftLeftLogical);
+  constexpr uint32_t OpBitwiseOr = static_cast<uint32_t>(spv::OpBitwiseOr);
+  constexpr uint32_t OpBitwiseAnd = static_cast<uint32_t>(spv::OpBitwiseAnd);
+  struct Definition {
+    uint32_t opcode = 0u;
+    uint32_t result = 0u;
+    uint32_t second = 0u;
+    uint32_t third = 0u;
+  };
+  std::unordered_map<uint32_t, Definition> definitions;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  for (size_t word = 5u; word < spirv.size();) {
+    const uint32_t instruction = spirv[word];
+    const uint32_t count = instruction >> 16u;
+    const uint32_t opcode = instruction & 0xffffu;
+    if (count == 0u || word + count > spirv.size()) {
+      return false;
+    }
+    const size_t operands = count - 1u;
+    const auto operand = [&](size_t index) { return index < operands ? spirv[word + 1u + index] : 0u; };
+    if (opcode == OpConstant && operands >= 3u) {
+      constants[operand(1)] = operand(2);
+    } else if (opcode == OpUConvert || opcode == OpShiftLeftLogical || opcode == OpBitwiseOr ||
+               opcode == OpBitwiseAnd) {
+      if (operands < 3u) {
+        return false;
+      }
+      definitions[operand(1)] = Definition {opcode, operand(1), operand(2), operand(3)};
+    }
+    word += count;
+  }
+  const auto is_constant = [&](uint32_t id, uint32_t value) {
+    const auto found = constants.find(id);
+    return found != constants.end() && found->second == value;
+  };
+  const auto is_and_with = [&](uint32_t id, uint32_t mask) {
+    const auto found = definitions.find(id);
+    if (found == definitions.end() || found->second.opcode != OpBitwiseAnd) {
+      return false;
+    }
+    const uint32_t left = found->second.second;
+    const uint32_t right = found->second.third;
+    return (is_constant(right, mask) && left != 0u) || (is_constant(left, mask) && right != 0u);
+  };
+  const auto unconverted = [&](uint32_t id) {
+    const auto found = definitions.find(id);
+    return found != definitions.end() && found->second.opcode == OpUConvert ? found->second.second : id;
+  };
+  for (const auto &entry : definitions) {
+    const auto &definition = entry.second;
+    if (definition.opcode != OpBitwiseOr) {
+      continue;
+    }
+    for (const uint32_t half : {definition.second, definition.third}) {
+      if (!is_and_with(unconverted(half), 0xfffffffcu)) {
+        continue;
+      }
+      for (const uint32_t other : {definition.second, definition.third}) {
+        if (other == half) {
+          continue;
+        }
+        const auto shifted = definitions.find(unconverted(other));
+        if (shifted == definitions.end() || shifted->second.opcode != OpShiftLeftLogical) {
+          continue;
+        }
+        if (is_constant(shifted->second.third, 32u) && is_and_with(unconverted(shifted->second.second), 0x0000ffffu)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
 } // namespace
+
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
@@ -32021,6 +32104,9 @@ int main(int argc, char **argv) {
       Require(test.name, "host scalar memory",
               test.bda_mappings[0].guest_base == 0u && test.bda_mappings[0].backing_offset == 0u,
               "scalar memory guest mapping must be guest 0 to backing 0");
+      const bool base_shape_case = std::strcmp(test.name, "ScalarLoadAlignsComponentsAndMasksAddress") == 0;
+      Require(test.name, "host scalar memory", !base_shape_case || ScalarAddressMasksBase(compiled.spirv),
+              "scalar address path does not align and mask the guest base before combining it");
       std::printf("[host]    %-32s ok\n", test.name);
     }
     return 0;

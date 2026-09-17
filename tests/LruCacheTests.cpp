@@ -90,9 +90,10 @@ void TestTouchReordersAndSkips() {
         "touching an item did not move it to the newest end");
 
   // The touched item now carries its new tick for tick filtering
-  // (a=40, b=20, c=35 after the touches above).
-  const auto below = Collect(cache, 35);
-  Check(below.size() == 2 && below[0] == "b" && below[1] == "c",
+  // (a=40, b=20, c=35 after the touches above). A cutoff of 30 detects
+  // a stale c tick: c is visited only if Touch(c, 35) updated it.
+  const auto below = Collect(cache, 30);
+  Check(below.size() == 1 && below[0] == "b",
         "touched item did not adopt its new tick");
 
   // Touch the middle item.

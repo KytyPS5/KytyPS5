@@ -2,8 +2,8 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_
 
 #include "common/common.h"
-#include "common/magicEnum.h"
 
+#include <magic_enum.hpp>
 #include <span>
 #include <string_view>
 #include <vector>

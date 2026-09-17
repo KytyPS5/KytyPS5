@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -68,10 +69,6 @@ using KernelModule                   = int32_t;
 using get_thread_atexit_count_func_t = KYTY_SYSV_ABI int (*)(KernelModule);
 using thread_atexit_report_func_t    = KYTY_SYSV_ABI void (*)(KernelModule);
 
-static uint32_t sha1_rol(uint32_t value, uint32_t bits) {
-	return (value << bits) | (value >> (32u - bits));
-}
-
 static std::array<uint8_t, 20> sha1_digest(const uint8_t* data, size_t size) {
 	uint32_t h0 = 0x67452301u;
 	uint32_t h1 = 0xefcdab89u;
@@ -99,7 +96,7 @@ static std::array<uint8_t, 20> sha1_digest(const uint8_t* data, size_t size) {
 			       (static_cast<uint32_t>(msg[j + 2]) << 8u) | static_cast<uint32_t>(msg[j + 3]);
 		}
 		for (int i = 16; i < 80; i++) {
-			w[i] = sha1_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+			w[i] = std::rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
 		}
 
 		uint32_t a = h0;
@@ -125,10 +122,10 @@ static std::array<uint8_t, 20> sha1_digest(const uint8_t* data, size_t size) {
 				k = 0xca62c1d6u;
 			}
 
-			const auto temp = sha1_rol(a, 5) + f + e + k + w[i];
+			const auto temp = std::rotl(a, 5) + f + e + k + w[i];
 			e               = d;
 			d               = c;
-			c               = sha1_rol(b, 30);
+			c               = std::rotl(b, 30);
 			b               = a;
 			a               = temp;
 		}

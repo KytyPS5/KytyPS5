@@ -253,10 +253,6 @@ void Thread::Detach() {
 	m_thread->m_thread.detach();
 }
 
-void Thread::Sleep(uint32_t millis) {
-	std::this_thread::sleep_for(std::chrono::milliseconds(millis));
-}
-
 void Thread::SleepMicro(uint32_t micros) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);

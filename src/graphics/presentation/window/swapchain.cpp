@@ -22,9 +22,6 @@
 
 // IWYU pragma: no_include <intrin.h>
 
-#define KYTY_ENABLE_DEBUG_PRINTF
-#define KYTY_DBG_INPUT
-
 namespace Libs::Graphics {
 
 struct Presenter::Frame {

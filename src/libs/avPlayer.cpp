@@ -1,6 +1,5 @@
 #include "common/common.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
@@ -16,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1758,7 +1758,7 @@ static void log_init_common(const AvPlayerMemAllocator& mem, const AvPlayerFileR
 	     "= %d\n\t base_priority                   "
 	     "      = %u\n\t auto_start                            = %u\n\t default_language           "
 	     "           = %s\n",
-	     Common::EnumName(debug_level).c_str(), buffers, priority, auto_start,
+	     magic_enum::enum_name(debug_level), buffers, priority, auto_start,
 	     language == nullptr ? "(null)" : language);
 }
 

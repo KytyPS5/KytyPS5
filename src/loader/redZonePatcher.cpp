@@ -103,11 +103,6 @@ static ZydisDecoder& GetDecoder() {
 	return decoder;
 }
 
-static ZyanStatus DecodeInstruction(ZydisDecodedInstruction& instruction,
-                                    ZydisDecodedOperand* operands, void* data, u64 size) {
-	return ZydisDecoderDecodeFull(&GetDecoder(), data, size, &instruction, operands);
-}
-
 #endif
 #if defined(_WIN32)
 
@@ -177,8 +172,9 @@ uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
 
 DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 	DecodedCodeInstruction decoded {.address = address};
-	const auto status = DecodeInstruction(decoded.instruction, decoded.operands.data(),
-	                                      reinterpret_cast<void*>(address), end - address);
+	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address),
+	                                           end - address, &decoded.instruction,
+	                                           decoded.operands.data());
 	if (!ZYAN_SUCCESS(status)) {
 		decoded.instruction.length = 0;
 		return decoded;

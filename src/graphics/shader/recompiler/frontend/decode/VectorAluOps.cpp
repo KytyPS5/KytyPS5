@@ -83,10 +83,6 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
 
 constexpr auto VOP2_OPS = Detail::MakeOpcodeTable<0x40>(VOP2_OPCODE_LIST);
 
-constexpr Opcode LookupVop2Opcode(uint32_t encoding) {
-	return Detail::LookupOpcode(VOP2_OPS, encoding);
-}
-
 constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::V_NOP},
     {0x01u, Opcode::V_MOV_B32},
@@ -375,7 +371,7 @@ Opcode LookupVop3Opcode(uint32_t opcode) {
 		if (IsUnsupportedVop3EncodedVop2Alias(opcode - 0x100u)) {
 			return Opcode::UNSUPPORTED;
 		}
-		return LookupVop2Opcode(opcode - 0x100u);
+		return Detail::LookupOpcode(VOP2_OPS, opcode - 0x100u);
 	}
 	if (opcode >= 0x180u && opcode <= 0x1ffu) {
 		return Detail::LookupOpcode(VOP3_ENCODED_VOP1_OPS, opcode - 0x180u);
@@ -1470,7 +1466,7 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.pc        = pc;
 	inst.family    = Family::VOP2;
 	inst.opcode_id = opcode;
-	inst.opcode    = LookupVop2Opcode(opcode);
+	inst.opcode    = Detail::LookupOpcode(VOP2_OPS, opcode);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

@@ -926,10 +926,6 @@ std::string Hex(u32 value) {
   return buffer;
 }
 
-std::string VulkanResultName(vk::Result result) {
-  return vk::to_string(result);
-}
-
 [[noreturn]] void Fail(const char *shader_name, const char *stage,
                        const std::string &message) {
   std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n",
@@ -960,7 +956,7 @@ void RequireVk(const char *shader_name, const char *stage, vk::Result result,
                const char *action) {
   if (result != vk::Result::eSuccess) {
     Fail(shader_name, stage,
-         std::string(action) + " returned " + VulkanResultName(result));
+         std::string(action) + " returned " + vk::to_string(result));
   }
 }
 
@@ -15597,15 +15593,11 @@ enum class CoverageClass {
   NeedsGraphicsStageCase,
 };
 
-bool IsCovered(const std::set<ShaderOpcode> &covered, ShaderOpcode opcode) {
-  return covered.find(opcode) != covered.end();
-}
-
 CoverageClass ClassifyOpcode(ShaderOpcode opcode,
                              const std::set<ShaderOpcode> &covered) {
   using ShaderRecompiler::Decoder::Opcode;
 
-  if (IsCovered(covered, opcode)) {
+  if (covered.contains(opcode)) {
     return CoverageClass::Covered;
   }
 
@@ -22386,6 +22378,63 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   return test;
 }
 
+TestCase BufferStoreFormatXyzwSnorm16CapturedSkinningVectors() {
+  using O = ShaderOpcode;
+
+  // Normal and tangent from the character skinning dispatch (eadfd178c07feebd).
+  constexpr std::array<u32, 8> values = {
+      0x3d98f7c5u, 0xbedae712u, 0xbf66a19eu, 0x3f800000u,
+      0x3f7e6baeu, 0xbd339a7du, 0x3dd0a2e2u, 0xbf800000u};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 2; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component, values[record * 4 + component]);
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwSnorm16CapturedSkinningVectors";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(4, 0xdeadbeefu);
+  test.expected = {0xc947098fu, 0x7fff8cb0u, 0xfa637f35u, 0x80010d0au};
+  test.user_data = MakeStructuredStorageBufferData(
+      8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16SNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
+  using O = ShaderOpcode;
+
+  constexpr std::array<float, 9> values = {
+      -2.0f, -1.0f, -0.75f, -0.25f, 0.0f, 0.25f, 0.75f, 1.0f, 2.0f};
+  std::vector<u32> code;
+  for (u32 i = 0; i < values.size(); i++) {
+    AppendVMovLiteral(&code, 0, std::bit_cast<u32>(values[i]));
+    AppendVMovU32(&code, 20, i * 2 + 2);
+    code.push_back(EncodeMubuf0(0x04u));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(6, 0xdeadbeefu);
+  test.expected = {0x8001beefu, 0xa0018001u, 0x0000e000u,
+                   0x5fff2000u, 0x7fff7fffu, 0xdeadbeefu};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 24, false, BufferFormat(Prospero::BufferFormat::k16SNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadFormatXyResource88UintExtractsBytes() {
   using O = ShaderOpcode;
 
@@ -26964,6 +27013,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
+  AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);
@@ -31576,6 +31627,18 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-snorm-store-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
+    RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
+    RunCase(&vulkan, BufferStoreFormatXResource16UintWritesHalfword());
+    RunCase(&vulkan, BufferStoreFormatXResource16UintPreservesAdjacentLanes());
+    RunCase(&vulkan, BufferStoreFormatXyResource88UintWritesBytes());
+    RunCase(&vulkan, BufferStoreFormatXyzwDropsPartialRecord());
+    RunCase(&vulkan, BufferStoreFormatXChecksOnlyTransferredComponent());
+    RunCase(&vulkan, BufferFormatStoreVariants());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--s-ashr-i64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarAshrI64Edges(false));

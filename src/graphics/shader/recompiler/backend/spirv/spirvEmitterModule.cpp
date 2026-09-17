@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -256,14 +257,8 @@ uint32_t ConstantF32(EmitterState& state, uint32_t bits) {
 	return state.builder.Constant(spv::OpConstant, TypeF32(state), bits);
 }
 
-uint32_t FloatBits(float value) {
-	uint32_t bits = 0;
-	std::memcpy(&bits, &value, sizeof(bits));
-	return bits;
-}
-
 uint32_t ConstantF32Value(EmitterState& state, float value) {
-	return ConstantF32(state, FloatBits(value));
+	return ConstantF32(state, std::bit_cast<uint32_t>(value));
 }
 
 uint32_t ConstantBool(EmitterState& state, bool value) {

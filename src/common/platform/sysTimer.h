@@ -151,10 +151,6 @@ inline void SysTimeTToSystem(time_t t, SysTimeStruct& s) {
 	SysFileToSystemTimeUtc(ft, s);
 }
 
-inline time_t SysTimegm(struct tm* tm) {
-	return timegm(tm);
-}
-
 inline void SysSystemToFileTimeUtc(const SysTimeStruct& f, SysFileTimeStruct& t) {
 	struct tm i {};
 
@@ -165,7 +161,7 @@ inline void SysSystemToFileTimeUtc(const SysTimeStruct& f, SysFileTimeStruct& t)
 	i.tm_min  = f.Minute;
 	i.tm_sec  = f.Second;
 
-	t.is_invalid = (f.is_invalid || (t.time = SysTimegm(&i)) == static_cast<time_t>(-1));
+	t.is_invalid = (f.is_invalid || (t.time = ::timegm(&i)) == static_cast<time_t>(-1));
 }
 
 // Retrieves the current local date and time.

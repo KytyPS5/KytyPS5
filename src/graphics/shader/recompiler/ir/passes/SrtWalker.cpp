@@ -521,8 +521,6 @@ private:
 		return std::bit_cast<float>(static_cast<uint32_t>(bits));
 	}
 
-	static uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
-
 	bool EvaluateWide(Value value, uint64_t& result) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
@@ -532,7 +530,7 @@ private:
 				case Type::U16: result = value.U16(); return true;
 				case Type::U32: result = value.U32(); return true;
 				case Type::U64: result = value.U64(); return true;
-				case Type::F32: result = Float32Bits(value.F32Value()); return true;
+				case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
 				default: return false;
 			}
 		}
@@ -775,7 +773,7 @@ private:
 				return false;
 			case ValueOpcode::ConvertF32U32:
 				if (Arg(inst, 0, a)) {
-					result = Float32Bits(static_cast<float>(static_cast<uint32_t>(a)));
+					result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
 					return true;
 				}
 				return false;
@@ -792,13 +790,13 @@ private:
 				return false;
 			case ValueOpcode::FPMul32:
 				if (binary()) {
-					result = Float32Bits(Float32(a) * Float32(b));
+					result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
 					return true;
 				}
 				return false;
 			case ValueOpcode::FPTrunc32:
 				if (Arg(inst, 0, a)) {
-					result = Float32Bits(std::trunc(Float32(a)));
+					result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
 					return true;
 				}
 				return false;

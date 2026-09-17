@@ -4,7 +4,6 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -1004,10 +1003,6 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
-}
-
-bool ShaderAddressValid(uint64_t addr) {
-	return reinterpret_cast<const uint32_t*>(addr) != nullptr;
 }
 
 } // namespace Libs::Graphics

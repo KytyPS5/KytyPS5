@@ -1,16 +1,16 @@
 #include "loader/symbolDatabase.h"
 
 #include "common/file.h"
-#include "common/magicEnum.h"
 
 #include <fmt/format.h>
+#include <magic_enum.hpp>
 
 namespace Loader {
 
 constexpr char LIB_PREFIX[] = "libSce";
 
 static std::string UpdateName(const std::string& str) {
-	return Common::StartsWith(str, LIB_PREFIX) ? Common::RemoveFirst(str, 6) : str;
+	return str.starts_with(LIB_PREFIX) ? Common::RemoveFirst(str, 6) : str;
 }
 
 std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
@@ -18,7 +18,7 @@ std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
 	auto module  = UpdateName(s.module);
 	return fmt::format("{}[{}_v{}][{}_v{}.{}][{}]", s.name.c_str(), library.c_str(),
 	                   s.library_version, module.c_str(), s.module_version_major,
-	                   s.module_version_minor, Common::EnumName(s.type).c_str());
+	                   s.module_version_minor, magic_enum::enum_name(s.type));
 }
 
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr) {
@@ -67,10 +67,10 @@ const SymbolRecord* SymbolDatabase::Find(const SymbolResolve& s) const {
 
 const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType type) const {
 	auto prefix = nid + "[";
-	auto suffix = fmt::format("[{}]", Common::EnumName(type).c_str());
+	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 
 	for (const auto& symbol: m_symbols) {
-		if (Common::StartsWith(symbol.name, prefix) && Common::EndsWith(symbol.name, suffix)) {
+		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
 			return &symbol;
 		}
 	}
@@ -80,10 +80,10 @@ const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType
 
 const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolType type) const {
 	auto prefix = name + "[";
-	auto suffix = fmt::format("[{}]", Common::EnumName(type).c_str());
+	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 
 	for (const auto& symbol: m_symbols) {
-		if (Common::StartsWith(symbol.name, prefix) && Common::EndsWith(symbol.name, suffix)) {
+		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
 			return &symbol;
 		}
 	}

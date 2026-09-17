@@ -303,7 +303,6 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
-bool ShaderAddressValid(uint64_t addr);
 
 } // namespace Libs::Graphics
 

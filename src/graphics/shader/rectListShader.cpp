@@ -60,12 +60,12 @@ public:
 	    : parameters(parameters_) {
 		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
-		void_type       = Type(spv::OpTypeVoid);
-		uint_type       = Type(spv::OpTypeInt, 32u, 0u);
-		int_type        = Type(spv::OpTypeInt, 32u, 1u);
-		float_type      = Type(spv::OpTypeFloat, 32u);
-		vec4_float_type = Type(spv::OpTypeVector, float_type, 4u);
-		function_type   = Type(spv::OpTypeFunction, void_type);
+		void_type       = builder.Type(spv::OpTypeVoid);
+		uint_type       = builder.Type(spv::OpTypeInt, 32u, 0u);
+		int_type        = builder.Type(spv::OpTypeInt, 32u, 1u);
+		float_type      = builder.Type(spv::OpTypeFloat, 32u);
+		vec4_float_type = builder.Type(spv::OpTypeVector, float_type, 4u);
+		function_type   = builder.Type(spv::OpTypeFunction, void_type);
 
 		per_vertex_type = builder.DecoratedType(
 		    spv::OpTypeStruct,
@@ -76,12 +76,12 @@ public:
 		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
 		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
 		if (model == spv::ExecutionModelTessellationControl) {
-			bool_type        = Type(spv::OpTypeBool);
-			vec2_bool_type   = Type(spv::OpTypeVector, bool_type, 2u);
-			vec2_float_type  = Type(spv::OpTypeVector, float_type, 2u);
+			bool_type        = builder.Type(spv::OpTypeBool);
+			vec2_bool_type   = builder.Type(spv::OpTypeVector, bool_type, 2u);
+			vec2_float_type  = builder.Type(spv::OpTypeVector, float_type, 2u);
 			ptr_output_float = Pointer(spv::StorageClassOutput, float_type);
 		} else {
-			vec3_float_type = Type(spv::OpTypeVector, float_type, 3u);
+			vec3_float_type = builder.Type(spv::OpTypeVector, float_type, 3u);
 			ptr_input_float = Pointer(spv::StorageClassInput, float_type);
 		}
 	}
@@ -161,8 +161,8 @@ public:
 			Store(Access(ptr_output_vec4_float, outputs[i], invocation), value);
 		}
 
-		Emit(spv::OpReturn);
-		Emit(spv::OpFunctionEnd);
+		builder.AddFunction(spv::OpReturn);
+		builder.AddFunction(spv::OpFunctionEnd);
 		return builder.Build();
 	}
 
@@ -184,27 +184,22 @@ public:
 			      Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
 		}
 
-		Emit(spv::OpReturn);
-		Emit(spv::OpFunctionEnd);
+		builder.AddFunction(spv::OpReturn);
+		builder.AddFunction(spv::OpFunctionEnd);
 		return builder.Build();
 	}
 
 private:
-	template <typename... Args>
-	uint32_t Type(spv::Op opcode, Args... operands) {
-		return builder.Type(opcode, operands...);
-	}
-
 	uint32_t Constant(uint32_t type, uint32_t value) {
 		return builder.Constant(spv::OpConstant, type, value);
 	}
 
 	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
-		return Type(spv::OpTypePointer, storage, type);
+		return builder.Type(spv::OpTypePointer, storage, type);
 	}
 
 	uint32_t Array(uint32_t type, uint32_t size) {
-		return Type(spv::OpTypeArray, type, Uint(size));
+		return builder.Type(spv::OpTypeArray, type, Uint(size));
 	}
 
 	template <typename... Args>
@@ -222,18 +217,13 @@ private:
 	}
 
 	template <typename... Args>
-	void Emit(spv::Op opcode, Args... operands) {
-		builder.AddFunction(opcode, operands...);
-	}
-
-	template <typename... Args>
 	uint32_t Access(uint32_t pointer_type, uint32_t base, Args... indices) {
 		return Result(spv::OpAccessChain, pointer_type, base, indices...);
 	}
 
 	uint32_t Load(uint32_t type, uint32_t pointer) { return Result(spv::OpLoad, type, pointer); }
 
-	void Store(uint32_t pointer, uint32_t value) { Emit(spv::OpStore, pointer, value); }
+	void Store(uint32_t pointer, uint32_t value) { builder.AddFunction(spv::OpStore, pointer, value); }
 
 	uint32_t Int(uint32_t value) { return Constant(int_type, value); }
 

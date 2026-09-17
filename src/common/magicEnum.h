@@ -14,12 +14,6 @@ inline std::string EnumName(E v) {
 }
 
 template <typename E>
-inline std::string EnumName8(E v) {
-	auto str = magic_enum::enum_name(v);
-	return std::string(str.data(), str.length());
-}
-
-template <typename E>
 inline E EnumValue(const std::string& str, E default_value) {
 	auto v = magic_enum::enum_cast<E>(str.c_str());
 	if (v.has_value()) {
@@ -32,8 +26,8 @@ inline E EnumValue(const std::string& str, E default_value) {
 	namespace magic_enum::customize {                                                              \
 	template <>                                                                                    \
 	struct enum_range<e> {                                                                         \
-		static constexpr int min = (mx);                                                           \
-		static constexpr int max = (mn);                                                           \
+		static constexpr int min = (mn);                                                           \
+		static constexpr int max = (mx);                                                           \
 	};                                                                                             \
 	}
 

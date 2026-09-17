@@ -78,7 +78,7 @@ static_assert(decltype(g_refuse_skip)::is_always_lock_free);
 
 void Check(bool value, const char *text) {
 	if (!value) {
-		std::fprintf(stderr, "MacosSse4aTests: failed: %s\n", text);
+		std::fprintf(stderr, "macosSse4aTests: failed: %s\n", text);
 		std::abort();
 	}
 }
@@ -97,7 +97,7 @@ bool Handler(const ExceptionInfo &info) {
 	// instruction forever, so end the run instead.
 	const size_t skip = g_refuse_skip.load(std::memory_order_relaxed);
 	if (skip == 0) {
-		static const char message[] = "MacosSse4aTests: failed: unexpected emulator refusal\n";
+		static const char message[] = "macosSse4aTests: failed: unexpected emulator refusal\n";
 		::write(STDERR_FILENO, message, sizeof(message) - 1);
 		::_exit(1);
 	}
@@ -214,6 +214,6 @@ int main() {
 	TestRexHighRegisterExtrq();
 	TestRexHighRegisterInsertqWithIndex();
 	TestUnknownInstructionRefused();
-	std::printf("MacosSse4aTests: all passed\n");
+	std::printf("macosSse4aTests: all passed\n");
 	return 0;
 }

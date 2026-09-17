@@ -434,7 +434,7 @@ struct Context {
 			return; // An absent AVX component restores zeroes.
 		}
 		DWORD size = 0;
-		auto* ymm  = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
+		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
 		if (ymm != nullptr && size >= (index + 1u) * sizeof(M128A)) {
 			ymm[index] = {};
 		}
@@ -711,7 +711,7 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 #endif
 
 bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
-                            const ZydisDecodedOperand*     operands) {
+                            const ZydisDecodedOperand* operands) {
 	return instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
 	       instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
 	       instruction.raw.vex.offset == 0 && operands[0].size == 128 &&

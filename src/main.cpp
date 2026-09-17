@@ -131,6 +131,26 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 	return true;
 }
 
+static bool ParseUint32(const std::string& value, uint32_t& out) {
+	uint32_t number   = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+	out = number;
+	return true;
+}
+
+static bool ParseInt32(const std::string& value, int32_t& out) {
+	int32_t number    = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+	out = number;
+	return true;
+}
+
 static bool ParseUserId(const std::string& value, int32_t& out) {
 	int32_t user_id   = 0;
 	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), user_id);
@@ -233,9 +253,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 			options.game_patch = value;
 		} else if (arg == "--screen-width") {
-			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
+			if (!ParseUint32(value, options.config.screen_width) ||
+			    options.config.screen_width == 0) {
+				::printf("invalid screen width: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--screen-height") {
-			options.config.screen_height = static_cast<uint32_t>(Common::ToInt32(value));
+			if (!ParseUint32(value, options.config.screen_height) ||
+			    options.config.screen_height == 0) {
+				::printf("invalid screen height: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--user-name") {
 			if (value.empty() || value.size() > Config::MAX_USER_NAME_LENGTH) {
 				::printf("invalid user name: must contain 1-%zu bytes\n",
@@ -256,11 +284,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--gpu") {
-			options.config.gpu_index = Common::ToInt32(value);
+			if (!ParseInt32(value, options.config.gpu_index)) {
+				::printf("invalid gpu index: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--vblank-frequency") {
-			const int32_t vblank_frequency = Common::ToInt32(value);
-			options.config.vblank_frequency =
-			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+			if (!ParseUint32(value, options.config.vblank_frequency)) {
+				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());

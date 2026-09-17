@@ -12,7 +12,9 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#elif !defined(__APPLE__)
+#elif defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
 #include <sched.h>
 #include <ucontext.h>
 #endif
@@ -406,8 +408,6 @@ static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const 
 	}
 }
 
-#if !defined(__APPLE__)
-
 // Keep instruction semantics shared; only access to the saved host context differs.
 struct Context {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -437,6 +437,38 @@ struct Context {
 		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
 		if (ymm != nullptr && size >= (index + 1u) * sizeof(M128A)) {
 			ymm[index] = {};
+		}
+	}
+#elif defined(__APPLE__)
+	ucontext_t* native;
+
+	[[nodiscard]] uint64_t Rip() const {
+		return static_cast<uint64_t>(native->uc_mcontext->__ss.__rip);
+	}
+	void Advance(size_t length) {
+		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
+	}
+	// Darwin names the XMM file __fpu_xmm0..__fpu_xmm15 instead of exposing an array.
+	[[nodiscard]] void* Xmm(uint8_t index) const {
+		auto* fs = &native->uc_mcontext->__fs;
+		switch (index) {
+			case 0: return &fs->__fpu_xmm0;
+			case 1: return &fs->__fpu_xmm1;
+			case 2: return &fs->__fpu_xmm2;
+			case 3: return &fs->__fpu_xmm3;
+			case 4: return &fs->__fpu_xmm4;
+			case 5: return &fs->__fpu_xmm5;
+			case 6: return &fs->__fpu_xmm6;
+			case 7: return &fs->__fpu_xmm7;
+			case 8: return &fs->__fpu_xmm8;
+			case 9: return &fs->__fpu_xmm9;
+			case 10: return &fs->__fpu_xmm10;
+			case 11: return &fs->__fpu_xmm11;
+			case 12: return &fs->__fpu_xmm12;
+			case 13: return &fs->__fpu_xmm13;
+			case 14: return &fs->__fpu_xmm14;
+			case 15: return &fs->__fpu_xmm15;
+			default: return nullptr;
 		}
 	}
 #else
@@ -487,6 +519,8 @@ struct Context {
 #endif
 };
 
+#if !defined(__APPLE__)
+
 static bool TryEmulateShaNi(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	ShaNiInsn   insn {};
@@ -533,6 +567,8 @@ static bool TryEmulateShaNi(Context& context) {
 	context.Advance(insn.length);
 	return true;
 }
+
+#endif
 
 static bool TryEmulateSse4a(Context& context) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -597,6 +633,8 @@ static bool TryEmulateSse4a(Context& context) {
 	context.Advance(instruction_length);
 	return true;
 }
+
+#if !defined(__APPLE__)
 
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
@@ -726,23 +764,28 @@ uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 }
 
 bool TryEmulate(void* native_context) {
-#if !defined(__APPLE__)
 	if (native_context == nullptr) {
 		return false;
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	Context context {static_cast<PCONTEXT>(native_context)};
+#elif defined(__APPLE__)
+	auto* saved_context = static_cast<ucontext_t*>(native_context);
+	if (saved_context->uc_mcontext == nullptr) {
+		return false;
+	}
+	Context context {saved_context};
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
+#if !defined(__APPLE__)
 	if (TryEmulateReciprocalSquareRoot(context)) {
 		return true;
 	}
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
 #else
-	(void)native_context;
-	return false;
+	return TryEmulateSse4a(context);
 #endif
 }
 

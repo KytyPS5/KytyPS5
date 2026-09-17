@@ -713,6 +713,20 @@ void WindowContext::ProcessEvent(double time_s) {
 			}
 			break;
 
+		case SDL_CONTROLLERSENSORUPDATE: {
+			const auto& sensor = event->csensor;
+			if (sensor.sensor == SDL_SENSOR_ACCEL || sensor.sensor == SDL_SENSOR_GYRO) {
+				Controller::SetSensor(sensor.which,
+				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
+				                                                        : Controller::Sensor::Gyro,
+				                      sensor.data,
+				                      sensor.timestamp_us != 0
+				                          ? sensor.timestamp_us
+				                          : static_cast<uint64_t>(sensor.timestamp) * 1000);
+			}
+			break;
+		}
+
 		case SDL_CONTROLLERDEVICEADDED:
 		case SDL_CONTROLLERDEVICEREMOVED:
 		case SDL_CONTROLLERDEVICEREMAPPED: {

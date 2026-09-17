@@ -3,7 +3,9 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -646,6 +648,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto coord =
 		    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components);
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			if (HasFlag(mem, Decoder::ImageSampleFlagLod)) {
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					std::fputs("Warning: approximating IMAGE_GATHER4_L at mip level 0; explicit LOD is ignored.\n",
+					           stderr);
+				}
+			}
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||

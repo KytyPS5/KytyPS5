@@ -24,7 +24,8 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x1cu, Opcode::S_XNOR_B32},        {0x1du, Opcode::S_XNOR_B64},
     {0x1eu, Opcode::S_LSHL_B32},        {0x1fu, Opcode::S_LSHL_B64},
     {0x20u, Opcode::S_LSHR_B32},        {0x21u, Opcode::S_LSHR_B64},
-    {0x22u, Opcode::S_ASHR_I32},        {0x24u, Opcode::S_BFM_B32},
+    {0x22u, Opcode::S_ASHR_I32},        {0x23u, Opcode::S_ASHR_I64},
+    {0x24u, Opcode::S_BFM_B32},
     {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
     {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
     {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
@@ -137,6 +138,10 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.family    = Family::SOP1;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
+	if (opcode == 0x21u && sdst == 125u) {
+		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump.
+		inst.opcode = Opcode::S_SETPC_B64;
+	}
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

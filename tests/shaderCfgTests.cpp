@@ -4133,6 +4133,55 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
 #endif
 }
 
+void TestScalarAshrI64Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+
+  const uint32_t shader[] = {
+      0x91860204u, // s_ashr_i64 s[6:7], s[4:5], s2
+      EncodeSop2(0x23, 8, 255, 129), 0xfffffffeu,
+      EncodeSop2(0x23, 10, 8, 255), 0xffffffffu,
+      EncodeSop2(0x23, 12, 255, 255), 0xffffffc0u,
+      EncodeSopp(0x01),
+  };
+  Program program;
+  ShaderRecompiler::Decoder::DecodeProgram(shader, program);
+  Check(program.instructions.size() == 5u,
+        "S_ASHR_I64 decoder lost instruction boundaries around literals");
+  const auto &reg = program.instructions[0];
+  Check(reg.family == Family::SOP2 && reg.opcode == Opcode::S_ASHR_I64 &&
+            reg.opcode_id == 0x23u && reg.pc == 0u && reg.word_count == 1u &&
+            reg.src_count == 2u && reg.dst.kind == OperandKind::Sgpr &&
+            reg.dst.reg == 6u && reg.src0.kind == OperandKind::Sgpr &&
+            reg.src0.reg == 4u && reg.src1.kind == OperandKind::Sgpr &&
+            reg.src1.reg == 2u,
+        "S_ASHR_I64 register encoding was decoded incorrectly");
+  const auto &source_literal = program.instructions[1];
+  const auto &count_literal = program.instructions[2];
+  const auto &shared_literal = program.instructions[3];
+  for (const auto *inst : {&source_literal, &count_literal, &shared_literal}) {
+    Check(inst->opcode == Opcode::S_ASHR_I64 && inst->word_count == 2u &&
+              inst->src_count == 2u,
+          "S_ASHR_I64 literal encoding was decoded incorrectly");
+  }
+  Check(source_literal.pc == 4u &&
+            source_literal.src0.kind == OperandKind::LiteralConstant &&
+            source_literal.src0.value == 0xfffffffeu &&
+            source_literal.src1.kind == OperandKind::IntegerInlineConstant &&
+            source_literal.src1.value == 1u && count_literal.pc == 12u &&
+            count_literal.src1.kind == OperandKind::LiteralConstant &&
+            count_literal.src1.value == 0xffffffffu &&
+            shared_literal.pc == 20u &&
+            shared_literal.src0.kind == OperandKind::LiteralConstant &&
+            shared_literal.src1.kind == OperandKind::LiteralConstant &&
+            shared_literal.src0.value == 0xffffffc0u &&
+            shared_literal.src1.value == 0xffffffc0u &&
+            program.instructions[4].pc == 28u &&
+            program.instructions[4].opcode == Opcode::S_ENDPGM,
+        "S_ASHR_I64 decoder mishandled source, count, or shared literals");
+  Check(Common::ContainsStr(ProgramToString(program),
+                            "S_ASHR_I64 s6, s4, s2"),
+        "S_ASHR_I64 is missing from the decoded dump");
+}
 // Execute the emitted instruction IR, so these fixtures exercise the lowering itself.
 void TestBvhIntersections() {
   using namespace ShaderRecompiler;
@@ -9798,7 +9847,7 @@ void TestNewShaderRecompilerSetpcBranch() {
 
 void TestFusedShaderHandoffPreservesRegisters() {
   using namespace ShaderRecompiler;
-  const uint32_t front[] = {
+  uint32_t front[] = {
       EncodeSMovB32(12, 255), 0x1003u, // three vertices and one primitive
       EncodeSop1(0x20, 0, 6), // merged-stage handoff through s[6:7]
       0xffffffffu,            // front shader metadata must not be decoded
@@ -9817,20 +9866,23 @@ void TestFusedShaderHandoffPreservesRegisters() {
   options.stage = ShaderType::Mesh;
   options.input_info.vertex = &input;
   options.back_code = back;
-  auto translated = TranslateProgram(front, options);
-  uint32_t allocations = 0;
-  for (const auto* block: translated.program.blocks) {
-    for (const auto& inst: *block) {
-      if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
-        continue;
+  for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
+    front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
+    auto translated = TranslateProgram(front, options);
+    uint32_t allocations = 0;
+    for (const auto* block: translated.program.blocks) {
+      for (const auto& inst: *block) {
+        if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+          continue;
+        }
+        const auto value = inst.Arg(0).Resolve();
+        Check(value.IsImmediate() && value.U32() == 0x1003u,
+              "fused back shader lost the front shader's scalar register value");
+        allocations++;
       }
-      const auto value = inst.Arg(0).Resolve();
-      Check(value.IsImmediate() && value.U32() == 0x1003u,
-            "fused back shader lost the front shader's scalar register value");
-      allocations++;
     }
+    Check(allocations == 1u, "fused shader omitted the back shader allocation");
   }
-  Check(allocations == 1u, "fused shader omitted the back shader allocation");
 }
 
 void TestMeshExportStorage() {
@@ -13853,6 +13905,7 @@ int main() {
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
+  TestScalarAshrI64Decoder();
   TestNewShaderDecoderArchitecture();
   TestBvhIntersections();
   TestBvhResourceMaterialization();

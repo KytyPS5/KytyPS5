@@ -177,6 +177,7 @@ private:
 	                      bool negate_result);
 	bool    SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
 	                      bool reverse, bool mask_shift_count, bool update_scc);
+	bool    S_ASHR_I64(const Decoder::Instruction& inst);
 	bool    ComposedIntegerBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                              bool negate_rhs, bool negate_result, bool update_scc);
 	bool    V_AND_OR_B32(const Decoder::Instruction& inst);

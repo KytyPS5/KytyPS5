@@ -1237,7 +1237,8 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data.address == stencil.address) {
+		if (owner != nullptr && owner->info.data == stencil &&
+		    owner->info.extent == depth.info.extent) {
 			association = id;
 		}
 	}

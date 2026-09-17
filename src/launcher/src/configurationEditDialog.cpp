@@ -108,6 +108,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	InitGameDirectories();
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
+	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
@@ -213,7 +214,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #endif
 	QVulkanInstance instance;
 	instance.setApiVersion(QVersionNumber(1, 3, 0));
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
 	instance.setFlags(QVulkanInstance::NoPortabilityDrivers);
 #endif
 	if (instance.create()) {

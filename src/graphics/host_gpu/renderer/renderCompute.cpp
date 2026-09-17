@@ -37,7 +37,7 @@
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
-                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+                                GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
 		if (i == output_buffer) continue;
 		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
@@ -125,8 +125,9 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 }
 
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-                                                CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+                                                 CommandBuffer& command, uint32_t group_x,
+                                                 uint32_t group_y, uint32_t group_z,
+                                                 uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -154,7 +155,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			// final workgroup may extend beyond the selected image view.
 			if (threads == 0 || threads != fill.group_stride[axis] ||
 			    groups[axis] != (extents[axis] + threads - 1) / threads ||
-			    groups[axis] * threads > UINT32_MAX) return false;
+			    groups[axis] * threads > UINT32_MAX)
+				return false;
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
@@ -167,10 +169,11 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
 		    view.layer_count > image.backing.layers - view.base_layer ||
 		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
-		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
+		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1])
+			return false;
 		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
 		                                       1, view.base_layer, view.layer_count};
-		vk::ClearValue clear {};
+		vk::ClearValue                  clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
 		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
 		return true;
@@ -251,18 +254,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions      = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (use_thread_dimensions) {
-		input_info.dispatch_threads_num[0]    = thread_group_x;
-		input_info.dispatch_threads_num[1]    = thread_group_y;
-		input_info.dispatch_threads_num[2]    = thread_group_z;
+		input_info.dispatch_threads_num[0] = thread_group_x;
+		input_info.dispatch_threads_num[1] = thread_group_y;
+		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
@@ -359,9 +363,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
-	auto bindings = PrepareBindings(input_info.stage);
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto  bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -393,6 +396,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetCommandScheduler().FlushAndWait();
 }
 
 } // namespace Libs::Graphics

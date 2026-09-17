@@ -66,6 +66,8 @@ struct MemoryInfo {
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    planning_only                                         = false;
+	bool                    dynamic_buffer                                        = false;
+	bool                    glc                                                   = false;
 
 	bool operator==(const MemoryInfo& other) const = default;
 };

@@ -4,6 +4,14 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+// Windows SDK's winnt.h defines MemoryBarrier as a macro (expanding to
+// __faststorefence), which breaks the vk::MemoryBarrier declarations below
+// when windows.h has been included earlier in the translation unit, e.g.
+// through sysTimer.h.
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
+
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;

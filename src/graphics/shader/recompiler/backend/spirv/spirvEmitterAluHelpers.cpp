@@ -178,24 +178,44 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
+// The guest selects a result by bit pattern, so this works on bits throughout. The zero test
+// stays integer: a driver that flushes denormals must not fold two distinct small values into one.
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto lhs_class = EmitClassifyF32(state, lhs);
-	const auto rhs_class = EmitClassifyF32(state, rhs);
+	// NMin and NMax already return the other operand against a NaN and order -0 below +0, which
+	// is the whole of the guest's rule for IEEE_MODE 0.
+	if (state.program.float_controls2) {
+		state.builder.RequireCapability(spv::CapabilityFloatControls2);
+		state.builder.RequireExtension("SPV_KHR_float_controls2");
+		const auto result =
+		    max_value
+		        ? EmitGlsl<GLSLstd450NMax, IR::Type::F32, uint32_t, uint32_t>(state, lhs, rhs)
+		        : EmitGlsl<GLSLstd450NMin, IR::Type::F32, uint32_t, uint32_t>(state, lhs, rhs);
+		// SignedZeroInfNanPreserve does not reach OpExtInst; an empty mask is what binds the
+		// NaN and signed-zero wording of these two instructions.
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationFPFastMathMode,
+		                            static_cast<uint32_t>(spv::FPFastMathModeMaskNone));
+		return result;
+	}
+	const auto lhs_bits = EmitBitcastF32ToU32(state, lhs);
+	const auto rhs_bits = EmitBitcastF32ToU32(state, rhs);
+	const auto lhs_nan  = EmitNative<spv::OpIsNan, IR::Type::U1, uint32_t>(state, lhs);
+	const auto rhs_nan  = EmitNative<spv::OpIsNan, IR::Type::U1, uint32_t>(state, rhs);
 
 	const auto numeric_cond = state.builder.AllocateId();
 	state.builder.AddFunction(max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
 	                          TypeBool(state), numeric_cond, lhs, rhs);
-	const auto ordered_bits =
-	    EmitSelectValueU32(state, numeric_cond, lhs_class.bits, rhs_class.bits);
+	const auto ordered_bits = EmitSelectValueU32(state, numeric_cond, lhs_bits, rhs_bits);
 
-	const auto both_zero    = EmitLogicalAndBool(state, lhs_class.zero, rhs_class.zero);
-	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_class.bits, rhs_class.bits)
-	                                    : EmitOrU32(state, lhs_class.bits, rhs_class.bits);
+	// Both operands are zeros exactly when neither has any bit set outside the sign.
+	const auto both_zero = EmitCompareU32Constant(
+	    state, spv::OpIEqual,
+	    EmitAndConstant(state, EmitOrU32(state, lhs_bits, rhs_bits), 0x7fffffffu), 0);
+	const auto zero_bits    = max_value ? EmitAndU32(state, lhs_bits, rhs_bits)
+	                                    : EmitOrU32(state, lhs_bits, rhs_bits);
 	const auto numeric_bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
 
-	const auto rhs_nan_bits =
-	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
-	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
+	const auto rhs_nan_bits = EmitSelectValueU32(state, rhs_nan, lhs_bits, numeric_bits);
+	const auto result_bits  = EmitSelectValueU32(state, lhs_nan, rhs_bits, rhs_nan_bits);
 	return EmitBitcastU32ToF32(state, result_bits);
 }
 

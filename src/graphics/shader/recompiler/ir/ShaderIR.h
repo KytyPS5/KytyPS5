@@ -118,6 +118,9 @@ struct ImageResource {
 	ImageMipMode                  mip_mode          = ImageMipMode::None;
 	uint32_t                      mip_count         = 1;
 	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
+	// Narrow sRGB formats are stored in the linear format of the same width, so the sRGB decode
+	// the guest texture pipe performs for them has to be emulated while sampling.
+	bool                          srgb_sample_decode         = false;
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
 	bool                          read              = false;
 	bool                          written           = false;

@@ -149,7 +149,7 @@ static uint64_t KernelGetTscFrequencyNative() {
 		}
 
 		KernelReadTscNative();
-		Common::Thread::Sleep(1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		KernelReadTscNative();
 
 		const auto host_start = Common::Timer::QueryPerformanceCounter();
@@ -993,7 +993,7 @@ static void FreeDetachedThreads(void* /*arg*/) {
 	auto* pthread_pool = g_pthread_context->GetPthreadPool();
 
 	while (true) {
-		Common::Thread::Sleep(10000);
+		std::this_thread::sleep_for(std::chrono::milliseconds(10000));
 		pthread_pool->FreeDetachedThreads();
 	}
 }
@@ -1201,13 +1201,6 @@ static int32_t GetDstSeconds() {
 	return (local_tm.tm_isdst > 0 ? 3600 : 0);
 #endif
 }
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-static void sec_to_timeval(KernelTimeval* ts, double sec) {
-	ts->tv_sec  = static_cast<int64_t>(sec);
-	ts->tv_usec = static_cast<int64_t>((sec - static_cast<double>(ts->tv_sec)) * 1000000.0);
-}
-#endif
 
 static bool GetPosixClockId(KernelClockid clock_id, clockid_t* out) {
 	EXIT_IF(out == nullptr);

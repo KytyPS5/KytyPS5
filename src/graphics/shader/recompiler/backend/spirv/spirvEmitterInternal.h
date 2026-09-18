@@ -308,8 +308,6 @@ uint32_t ConstantI32(EmitterState& state, int32_t value);
 
 uint32_t ConstantF32(EmitterState& state, uint32_t bits);
 
-uint32_t FloatBits(float value);
-
 uint32_t ConstantF32Value(EmitterState& state, float value);
 
 uint32_t ConstantBool(EmitterState& state, bool value);

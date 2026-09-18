@@ -136,10 +136,6 @@ bool File::OpenInMem(void* buf, uint32_t buf_size) {
 	return true;
 }
 
-bool File::OpenInMem(ByteBuffer& buf) {
-	return OpenInMem(buf.GetData(), buf.Size());
-}
-
 bool File::CreateInMem() {
 	EXIT_IF(m_p->f != nullptr);
 
@@ -251,8 +247,8 @@ void File::Printf(const char* format, ...) {
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
 	auto path_str = PathToGenericString(path);
-	return SysFileIsDirectoryExisting(
-	    Common::EndsWith(path_str, "/") ? Common::RemoveLast(path_str, 1) : path_str);
+	return SysFileIsDirectoryExisting(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
+	                                                          : path_str);
 }
 
 bool File::IsFileExisting(const std::filesystem::path& name) {
@@ -263,14 +259,14 @@ bool File::CreateDirectory(
     const std::filesystem::path& path) // @suppress("Member declaration not found")
 {
 	auto path_str = PathToGenericString(path);
-	return SysFileCreateDirectory(Common::EndsWith(path_str, "/") ? Common::RemoveLast(path_str, 1)
-	                                                              : path_str);
+	return SysFileCreateDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
+	                                                      : path_str);
 }
 
 bool File::DeleteDirectory(const std::filesystem::path& path) {
 	auto path_str = PathToGenericString(path);
-	return SysFileDeleteDirectory(Common::EndsWith(path_str, "/") ? Common::RemoveLast(path_str, 1)
-	                                                              : path_str);
+	return SysFileDeleteDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
+	                                                      : path_str);
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
@@ -283,7 +279,7 @@ bool File::CreateDirectories(const std::filesystem::path& path) {
 	for (uint32_t si = 0; si < list.size(); si++) {
 		const std::string& s = list[si];
 
-		if (si != 0 || Common::StartsWith(real_path, "/")) {
+		if (si != 0 || real_path.starts_with("/")) {
 			p += "/";
 		}
 
@@ -313,7 +309,7 @@ bool File::DeleteDirectories(const std::filesystem::path& path) {
 	for (uint32_t si = 0; si < list.size(); si++) {
 		const std::string& s = list[si];
 
-		if (si != 0 || Common::StartsWith(real_path, "/")) {
+		if (si != 0 || real_path.starts_with("/")) {
 			p += "/";
 		}
 
@@ -345,7 +341,7 @@ bool File::Flush() {
 	return SysFileFlush(*m_p->f);
 }
 
-ByteBuffer File::ReadWholeBuffer() {
+std::vector<std::byte> File::ReadWholeBuffer() {
 	EXIT_IF(IsInvalid());
 	EXIT_IF(Tell() != 0);
 
@@ -353,23 +349,12 @@ ByteBuffer File::ReadWholeBuffer() {
 
 	EXIT_IF((s >> 32u) != 0);
 
-	ByteBuffer buf(s);
+	const auto            read_size = static_cast<uint32_t>(s);
+	std::vector<std::byte> buf(read_size);
 
-	Read(buf.GetData(), s);
+	Read(buf.data(), read_size);
 
 	return buf;
-}
-
-ByteBuffer File::Read(uint32_t size) {
-	ByteBuffer buf(size);
-	uint32_t   b = 0;
-	Read(buf.GetData(), size, &b);
-	buf.RemoveAt(b, size - b);
-	return buf;
-}
-
-void File::Write(const ByteBuffer& buf, uint32_t* bytes_written) {
-	Write(buf.GetDataConst(), buf.Size(), bytes_written);
 }
 
 DateTime File::GetLastAccessTimeUTC(const std::filesystem::path& name) {
@@ -478,7 +463,7 @@ std::vector<File::FindInfo> File::FindFiles(const std::filesystem::path& path) {
 	auto     path_str = PathToGenericString(path);
 	uint32_t len      = static_cast<uint32_t>(path_str.size());
 
-	if (!Common::EndsWith(path_str, "/") && !Common::EndsWith(path_str, "\\")) {
+	if (!path_str.ends_with("/") && !path_str.ends_with("\\")) {
 		len++;
 	}
 

@@ -168,6 +168,21 @@ bool Translator::SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode
 	return true;
 }
 
+bool Translator::S_ASHR_I64(const Decoder::Instruction& inst) {
+	// Signed 64-bit sources sign-extend literals; generic B64 operands zero-extend them.
+	const auto source =
+	    inst.src0.kind == Decoder::OperandKind::LiteralConstant
+	        ? ir.ConstructU64(
+	              ReadU32(inst.src0),
+	              IR::U32(IR::Value((inst.src0.value & 0x80000000u) ? 0xffffffffu : 0u)))
+	        : ReadU64(inst.src0);
+	const auto result =
+	    ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {source, ReadU32(inst.src1)});
+	WriteOperand(inst.dst, result);
+	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
+	return true;
+}
+
 bool Translator::ComposedIntegerBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                        bool negate_rhs, bool negate_result, bool update_scc) {
 	const auto lhs = ReadU32(inst.src0);

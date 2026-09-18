@@ -46,6 +46,8 @@ enum class Axis {
 	AxisMax
 };
 
+enum class Sensor { Accel, Gyro };
+
 struct PadControllerInformation;
 struct PadData;
 struct PadVibrationParam;
@@ -69,6 +71,7 @@ void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
+void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
 
 int KYTY_SYSV_ABI PadInit();

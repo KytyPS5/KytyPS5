@@ -13,6 +13,8 @@
 #include "libs/padData.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -87,6 +89,9 @@ struct ControllerState {
 	uint32_t buttons                               = 0;
 	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
 	Touch    touch[2];
+	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
+	std::array<float, 3> gyro {};
+	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 class GameController {
@@ -101,6 +106,9 @@ public:
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
 	void TouchPad(int id, int finger, bool down, float x, float y);
+	void Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
+	void SetMotionSensorState(bool enable);
+	void ResetOrientation();
 	void ResetInputState();
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
@@ -121,6 +129,8 @@ private:
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
 	int              m_connected_count = 0;
+	bool             m_motion_enabled  = true;
+	uint64_t         m_gyro_time       = 0;
 	ControllerState  m_state;
 	ControllerState  m_states[STATES_MAX];
 	bool             m_obtained[STATES_MAX] {};
@@ -144,7 +154,16 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
 	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
 	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
-	data->orientation_w     = 1.0f;
+	data->acceleration_x     = state.accel[0];
+	data->acceleration_y     = state.accel[1];
+	data->acceleration_z     = state.accel[2];
+	data->angular_velocity_x = state.gyro[0];
+	data->angular_velocity_y = state.gyro[1];
+	data->angular_velocity_z = state.gyro[2];
+	data->orientation_x      = state.orientation[0];
+	data->orientation_y      = state.orientation[1];
+	data->orientation_z      = state.orientation[2];
+	data->orientation_w      = state.orientation[3];
 	for (const auto& touch: state.touch) {
 		if (touch.down) {
 			auto& output = data->touch_data.touch[data->touch_data.touch_num++];
@@ -273,6 +292,18 @@ void GameController::Connect(int id) {
 
 	m_connected_ids.push_back(id);
 
+	if (id != HOST_INPUT_CONTROLLER_ID) {
+		if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
+		    pad != nullptr) {
+			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
+				if (SDL_GameControllerHasSensor(pad, sensor) &&
+				    SDL_GameControllerSetSensorEnabled(pad, sensor, SDL_TRUE) != 0) {
+					LOGF("\t enabling controller sensor failed: %s\n", SDL_GetError());
+				}
+			}
+		}
+	}
+
 	CheckActive();
 }
 
@@ -311,6 +342,7 @@ void GameController::CheckActive() {
 	m_active_id     = new_active_id;
 	m_connected     = new_connected;
 	m_state         = {};
+	m_gyro_time     = 0;
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
@@ -402,9 +434,81 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	}
 }
 
+void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t time_us) {
+	Common::LockGuard lock(m_mutex);
+	if (id != m_active_id || !m_motion_enabled) {
+		return;
+	}
+
+	// Convert acceleration to G; angular velocity is already in rad/s.
+	if (sensor == Sensor::Accel) {
+		for (int i = 0; i < 3; i++) {
+			m_state.accel[i] = data[i] / SDL_STANDARD_GRAVITY;
+		}
+	} else {
+		std::copy_n(data, 3, m_state.gyro.begin());
+		// Do not extrapolate a single sample across lost reports (e.g. loss of window focus).
+		constexpr uint64_t max_gyro_interval_us = 100000;
+		if (m_gyro_time != 0 && time_us > m_gyro_time &&
+		    time_us - m_gyro_time <= max_gyro_interval_us) {
+			const float dt = static_cast<float>(time_us - m_gyro_time) * 0.000001f;
+			const float speed =
+			    std::sqrt(data[0] * data[0] + data[1] * data[1] + data[2] * data[2]);
+			const float half_angle = speed * dt * 0.5f;
+			const float scale      = speed > 0.0f ? std::sin(half_angle) / speed : 0.0f;
+			const float x          = data[0] * scale;
+			const float y          = data[1] * scale;
+			const float z          = data[2] * scale;
+			const float w          = std::cos(half_angle);
+			const auto  q          = m_state.orientation;
+			// Accumulate body-local rotation relative to connection / orientation reset.
+			m_state.orientation = {q[3] * x + q[0] * w + q[1] * z - q[2] * y,
+			                       q[3] * y - q[0] * z + q[1] * w + q[2] * x,
+			                       q[3] * z + q[0] * y - q[1] * x + q[2] * w,
+			                       q[3] * w - q[0] * x - q[1] * y - q[2] * z};
+			float length        = 0.0f;
+			for (float value: m_state.orientation) {
+				length += value * value;
+			}
+			length = std::sqrt(length);
+			for (float& value: m_state.orientation) {
+				value /= length;
+			}
+		}
+		m_gyro_time = time_us;
+	}
+	m_state.time = LibKernel::KernelGetProcessTime();
+	AddState();
+}
+
+void GameController::SetMotionSensorState(bool enable) {
+	Common::LockGuard lock(m_mutex);
+	if (m_motion_enabled != enable) {
+		m_motion_enabled = enable;
+		m_gyro_time      = 0;
+		m_state.accel    = {0.0f, 1.0f, 0.0f};
+		m_state.gyro     = {};
+		m_state.time     = LibKernel::KernelGetProcessTime();
+		AddState();
+	}
+}
+
+void GameController::ResetOrientation() {
+	Common::LockGuard lock(m_mutex);
+	m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+	m_gyro_time         = 0;
+	m_state.time        = LibKernel::KernelGetProcessTime();
+	AddState();
+}
+
 void GameController::ResetInputState() {
 	Common::LockGuard lock(m_mutex);
-	m_state         = {};
+	m_state.buttons = 0;
+	std::fill_n(m_state.axes, 4, 128);
+	std::fill_n(m_state.axes + 4, 2, 0);
+	for (auto& touch: m_state.touch) {
+		touch = {};
+	}
 	m_state.time    = LibKernel::KernelGetProcessTime();
 	m_states_num    = 0;
 	m_first_state   = 0;
@@ -580,6 +684,10 @@ void SetTouchPad(int id, int finger, bool down, float x, float y) {
 	g_controller->TouchPad(id, finger, down, x, y);
 }
 
+void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us) {
+	g_controller->Motion(id, sensor, data, time_us);
+}
+
 void ResetInputState() {
 	g_controller->ResetInputState();
 }
@@ -646,6 +754,7 @@ int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable) {
 	}
 
 	LOGF("\t enable = %s\n", (enable ? "true" : "false"));
+	g_controller->SetMotionSensorState(enable);
 
 	return OK;
 }
@@ -669,6 +778,7 @@ int KYTY_SYSV_ABI PadResetOrientation(int handle) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 
+	g_controller->ResetOrientation();
 	return OK;
 }
 

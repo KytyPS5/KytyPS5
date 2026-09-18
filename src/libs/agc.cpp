@@ -262,35 +262,25 @@ struct CommandBuffer {
 		     reserved_dw);
 	}
 
-	[[nodiscard]] KYTY_SYSV_ABI uint32_t GetAvailableSizeDW() const {
-		if (cursor_up == nullptr || cursor_down == nullptr || cursor_down <= cursor_up) {
-			return 0;
-		}
-
-		auto available = static_cast<uint64_t>(cursor_down - cursor_up);
+	[[nodiscard]] KYTY_SYSV_ABI uint64_t GetAvailableSizeDW() const {
+		// Interpret the signed cursor distance as an unsigned 64-bit DWORD count.
+		const auto distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor_down) -
+		                                           reinterpret_cast<uintptr_t>(cursor_up));
+		const auto available = static_cast<uint64_t>(distance >> 2);
 		if (available <= reserved_dw) {
 			return 0;
 		}
-		if (available - reserved_dw > UINT32_MAX) {
-			LOGF_COLOR(
-			    Log::Color::Red,
-			    "\t command buffer has suspiciously large free space: cursor_up = 0x%016" PRIx64
-			    ", cursor_down = 0x%016" PRIx64 ", reserved_dw = %" PRIu32 "\n",
-			    reinterpret_cast<uint64_t>(cursor_up), reinterpret_cast<uint64_t>(cursor_down),
-			    reserved_dw);
-			return UINT32_MAX;
-		}
-		return static_cast<uint32_t>(available - reserved_dw);
+		return available - reserved_dw;
 	}
 
 	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
-		uint32_t remaining = GetAvailableSizeDW();
+		const uint64_t remaining = GetAvailableSizeDW();
 		if (num_dw > remaining) {
 			if (callback == nullptr) {
 				LOGF_COLOR(
 				    Log::Color::Red,
 				    "\t command buffer exhausted and has no grow callback: requested = %" PRIu32
-				    ", remaining = %" PRIu32 ", reserved_dw = %" PRIu32 "\n",
+				    ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
 				    num_dw, remaining, reserved_dw);
 				DbgDump();
 				return false;
@@ -300,7 +290,7 @@ struct CommandBuffer {
 			if (!result) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback failed: requested = %" PRIu32
-				           ", remaining = %" PRIu32 ", reserved_dw = %" PRIu32 "\n",
+				           ", remaining = %" PRIu64 ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, remaining, reserved_dw);
 				DbgDump();
 				return false;
@@ -308,7 +298,7 @@ struct CommandBuffer {
 			if (GetAvailableSizeDW() < num_dw) {
 				LOGF_COLOR(Log::Color::Red,
 				           "\t command buffer grow callback did not provide enough space: "
-				           "requested = %" PRIu32 ", remaining = %" PRIu32
+				           "requested = %" PRIu32 ", remaining = %" PRIu64
 				           ", reserved_dw = %" PRIu32 "\n",
 				           num_dw, GetAvailableSizeDW(), reserved_dw);
 				DbgDump();

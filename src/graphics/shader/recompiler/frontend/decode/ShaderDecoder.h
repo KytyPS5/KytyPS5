@@ -2,8 +2,8 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_
 
 #include "common/common.h"
-#include "common/magicEnum.h"
 
+#include <magic_enum.hpp>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -108,6 +108,7 @@ enum class Opcode {
 	S_LSHR_B32,
 	S_LSHR_B64,
 	S_ASHR_I32,
+	S_ASHR_I64,
 	S_MUL_I32,
 	S_MUL_HI_U32,
 	S_MUL_HI_I32,
@@ -379,6 +380,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
 	V_CMPX_LT_F16,
 	V_CMPX_EQ_F16,

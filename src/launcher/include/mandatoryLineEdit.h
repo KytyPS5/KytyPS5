@@ -1,9 +1,8 @@
 #ifndef MANDATORY_LINEEDIT_H
 #define MANDATORY_LINEEDIT_H
 
-#include "common.h"
-
 #include <QLineEdit>
+#include <QObject>
 #include <QString>
 
 class QPaintEvent;

@@ -301,13 +301,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
-	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
-	const auto view_last_level =
-	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
-	        ? descriptor.LastLevel()
-	        : std::min(descriptor.LastLevel(), max_mip);
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
-	       descriptor.BaseLevel() <= view_last_level && view_last_level <= max_mip &&
+	       descriptor.BaseLevel() <= descriptor.LastLevel() &&
 	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
 	       !descriptor.MsaaDepth();
 }
@@ -474,6 +469,14 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = base_level;
 	view.level_count = view_levels;
+	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
+		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
+		     descriptor.MinLod(), descriptor.LastLevel());
+	}
+	const auto base_lod = view.base_level * 256u;
+	if (descriptor.MinLod() > base_lod) {
+		view.min_lod = descriptor.MinLod() - base_lod;
+	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
@@ -524,6 +527,21 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
+static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& description,
+                                          uint32_t                      view_levels) {
+	TileSurfaceLayout physical {};
+	TileSurfaceLayout view {};
+	auto              view_description = description;
+	view_description.levels            = view_levels;
+	return TileGetTiledTextureLayout(description, physical) &&
+	       TileGetTiledTextureLayout(view_description, view) &&
+	       physical.first_tail_level == view.first_tail_level &&
+	       physical.block_slice_size == view.block_slice_size &&
+	       physical.total_size == view.total_size &&
+	       std::equal(std::begin(physical.mips), std::begin(physical.mips) + description.levels,
+	                  std::begin(view.mips));
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -547,7 +565,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto last_level   = descriptor.LastLevel();
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
-	const auto raw_max_mip = resource.r128 ? last_level : descriptor.MaxMip();
+	const auto raw_max_mip  = resource.r128 ? last_level : descriptor.MaxMip();
 	// A descriptor that views a block-compressed surface through an uncompressed format sizes its
 	// extent in 4x4 blocks while MAX_MIP still counts the texel chain. The two disagree only at
 	// the tail: the last texel levels are smaller than a block and have no block-view level at
@@ -560,8 +578,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 		return static_cast<uint32_t>(std::bit_width(std::max(largest, 1u)));
 	}();
-	const auto levels =
+	const auto physical_levels =
 	    multisampled ? 1u : std::min(static_cast<uint32_t>(raw_max_mip) + 1u, extent_levels);
+	// A streamed mip chain names levels the resource count has not caught up with yet: LAST_LEVEL
+	// outruns MAX_MIP while the tail pages in. The view decides how many levels the image carries,
+	// so the count grows to cover it -- never past the levels the extent can hold.
+	const auto levels = multisampled
+	                        ? 1u
+	                        : std::max(physical_levels, std::min(static_cast<uint32_t>(last_level) + 1u,
+	                                                             extent_levels));
 	const auto max_mip = multisampled ? raw_max_mip : static_cast<uint8_t>(levels - 1u);
 	const bool dynamic_storage =
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
@@ -576,10 +601,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto shifted_last_level =
 	    clamp_view_range ? static_cast<uint8_t>(std::min<uint32_t>(last_level, levels - 1u))
 	                     : last_level;
-
-	const auto view_last_level    = !multisampled && !dynamic_storage
-	                                    ? std::min(shifted_last_level, max_mip)
-	                                    : shifted_last_level;
+	const auto view_last_level =
+	    clamp_view_range ? std::min(shifted_last_level, max_mip) : shifted_last_level;
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
@@ -622,7 +645,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DArray ||
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
-	uint32_t      pitch        = 0;
+	if (levels > physical_levels) {
+		const TileSurfaceDescription physical {
+		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+		    width, height, volume ? depth : 1u, physical_levels, image_layers};
+		// Texture mip views take precedence over the resource count, but must keep its storage layout.
+		if (!TextureViewPreservesMipLayout(physical, levels)) {
+			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
+			     "extent=%ux%ux%u tile=%u\n",
+			     base_level, last_level, max_mip, width, height, depth,
+			     static_cast<uint32_t>(tile));
+		}
+	}
+	uint32_t      pitch = 0;
 	TileSizeAlign size {};
 	if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
@@ -635,8 +670,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		size.size *= image_layers;
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels, tile,
-		                        volume, size);
+		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
+		                        physical_levels, tile, volume, size);
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
@@ -681,7 +716,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    !desc.info.IsDepth()) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
-		                     desc.info.bytes_per_block, levels, tile, metadata_size,
+		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
 		                     std::countr_zero(samples));
 		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};

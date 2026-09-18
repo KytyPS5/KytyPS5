@@ -3,6 +3,7 @@
 #include "configuration.h"
 
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
@@ -129,8 +130,11 @@ void PatchesDialog::Save() {
 	document.setObject(root);
 
 	QSaveFile output(path);
-	if (output.open(QIODevice::WriteOnly) && output.write(document.toJson()) >= 0 &&
-	    output.commit()) {
-		m_status->setText(tr("Cheat selection saved."));
+	if (!output.open(QIODevice::WriteOnly) || output.write(document.toJson()) < 0 ||
+	    !output.commit()) {
+		qWarning() << "Could not save cheat file:" << output.errorString();
+		m_status->setText(tr("Could not save cheat file: %1").arg(output.errorString()));
+		return;
 	}
+	m_status->setText(tr("Cheat selection saved."));
 }

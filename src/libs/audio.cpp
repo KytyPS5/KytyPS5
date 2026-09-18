@@ -5,7 +5,6 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -21,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <magic_enum.hpp>
 #include <vector>
 
 #include "libatrac9.h"
@@ -858,8 +858,7 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 		default:;
 	}
 
-	LOGF("\t param   = %u (format=%u, %s)\n", param, format_param,
-	     Common::EnumName(format).c_str());
+	LOGF("\t param   = %u (format=%u, %s)\n", param, format_param, magic_enum::enum_name(format));
 
 	EXIT_NOT_IMPLEMENTED(format == Audio::Format::Unknown);
 
@@ -1024,7 +1023,7 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 		default: return AUDIO_IN_ERROR_INVALID_PARAM;
 	}
 
-	LOGF("\t param   = %u (%s)\n", param, Common::EnumName(format).c_str());
+	LOGF("\t param   = %u (%s)\n", param, magic_enum::enum_name(format));
 
 	EXIT_IF(g_audio == nullptr);
 
@@ -2419,7 +2418,7 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 		default: EXIT("unknown rack_id: 0x%" PRIx32 "\n", rack_id);
 	}
 
-	LOGF("\t type                   = %s\n", Common::EnumName(rack->type).c_str());
+	LOGF("\t type                   = %s\n", magic_enum::enum_name(rack->type));
 
 	rack->allocator   = Ngs2BufferAllocator();
 	rack->buffer_info = *buffer_info;
@@ -3178,7 +3177,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			sampler->waveform_data       = nullptr;
 			break;
 		}
-		default: EXIT("unknown type: %s\n", Common::EnumName(voice->rack->type).c_str());
+		default: EXIT("unknown type: %s\n", magic_enum::enum_name(voice->rack->type));
 	}
 
 	return OK;

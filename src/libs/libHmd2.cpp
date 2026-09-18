@@ -1,3 +1,4 @@
+#include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/tile.h"
 #include "libs/agc.h"

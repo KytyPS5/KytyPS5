@@ -1,10 +1,10 @@
 #ifndef KYTY_COMMON_FILE_H_
 #define KYTY_COMMON_FILE_H_
 
-#include "common/byteBuffer.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -51,7 +51,6 @@ public:
 	bool Create(const std::filesystem::path& name);
 	bool Open(const std::filesystem::path& name, Mode mode);
 	bool OpenInMem(void* buf, uint32_t buf_size);
-	bool OpenInMem(ByteBuffer& buf); // NOLINT(google-runtime-references)
 	bool CreateInMem();
 
 	void Close();
@@ -73,14 +72,12 @@ public:
 
 	void GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write);
 
-	void       Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
-	ByteBuffer Read(uint32_t size);
-	void       Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
-	void       Write(const ByteBuffer& buf, uint32_t* bytes_written = nullptr);
+	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
+	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);
 
-	ByteBuffer ReadWholeBuffer();
+	std::vector<std::byte> ReadWholeBuffer();
 
 	static uint64_t Size(const std::filesystem::path& name);
 

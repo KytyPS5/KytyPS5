@@ -62,23 +62,6 @@ double Timer::GetTimeS() const {
 	return (static_cast<double>(current_time - m_StartTime)) / static_cast<double>(m_Frequency);
 }
 
-// return time in ticks
-uint64_t Timer::GetTicks() const {
-	if (m_is_paused) {
-		return (m_PauseTime - m_StartTime);
-	}
-
-	uint64_t current_time = 0;
-	SysQueryPerformanceCounter(&current_time);
-
-	return (current_time - m_StartTime);
-}
-
-// return ticks frequency
-uint64_t Timer::GetFrequency() const {
-	return m_Frequency;
-}
-
 uint64_t Timer::QueryPerformanceFrequency() {
 	uint64_t ret = 0;
 	SysQueryPerformanceFrequency(&ret);

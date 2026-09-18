@@ -10,7 +10,6 @@
 #include <windows.h> // IWYU pragma: keep
 
 #include "common/assert.h"
-#include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
 // IWYU pragma: no_include <basetsd.h>
@@ -22,33 +21,33 @@
 // IWYU pragma: no_include <winerror.h>
 // IWYU pragma: no_include <wtypes.h>
 
-namespace Common {
+namespace Common::VirtualMemory {
 
-static DWORD GetProtectionFlag(VirtualMemory::Mode mode) {
+static DWORD GetProtectionFlag(Mode mode) {
 	DWORD protect = PAGE_NOACCESS;
 	switch (mode) {
-		case VirtualMemory::Mode::Read: protect = PAGE_READONLY; break;
+		case Mode::Read: protect = PAGE_READONLY; break;
 
-		case VirtualMemory::Mode::Write:
-		case VirtualMemory::Mode::ReadWrite: protect = PAGE_READWRITE; break;
+		case Mode::Write:
+		case Mode::ReadWrite: protect = PAGE_READWRITE; break;
 
-		case VirtualMemory::Mode::Execute: protect = PAGE_EXECUTE; break;
+		case Mode::Execute: protect = PAGE_EXECUTE; break;
 
-		case VirtualMemory::Mode::ExecuteRead: protect = PAGE_EXECUTE_READ; break;
+		case Mode::ExecuteRead: protect = PAGE_EXECUTE_READ; break;
 
-		case VirtualMemory::Mode::ExecuteWrite:
-		case VirtualMemory::Mode::ExecuteReadWrite: protect = PAGE_EXECUTE_READWRITE; break;
+		case Mode::ExecuteWrite:
+		case Mode::ExecuteReadWrite: protect = PAGE_EXECUTE_READWRITE; break;
 
-		case VirtualMemory::Mode::NoAccess:
+		case Mode::NoAccess:
 		default: protect = PAGE_NOACCESS; break;
 	}
 	return protect;
 }
 
-void SysVirtualInit() {}
+void Init() {}
 
-uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
-	auto ptr = (address == 0 ? SysVirtualAllocAligned(address, size, mode, 1)
+uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
+	auto ptr = (address == 0 ? AllocAligned(address, size, mode, 1)
 	                         : reinterpret_cast<uintptr_t>(VirtualAlloc(
 	                               reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                               static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE),
@@ -59,7 +58,7 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 		if (err != ERROR_INVALID_ADDRESS) {
 			printf("VirtualAlloc() failed: 0x%08" PRIx32 "\n", err);
 		} else {
-			return SysVirtualAllocAligned(address, size, mode, 1);
+			return AllocAligned(address, size, mode, 1);
 		}
 	}
 	return ptr;
@@ -80,8 +79,7 @@ static uint64_t AlignUp(uint64_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
 }
 
-uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                                uint64_t alignment) {
+uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment) {
 	if (alignment == 0) {
 		printf("VirtualAlloc2 failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
 		return 0;
@@ -135,13 +133,13 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 			printf("VirtualAlloc2(alignment = 0x%016" PRIx64 ") failed: 0x%08" PRIx32 "\n",
 			       alignment, err);
 		} else {
-			return SysVirtualAllocAligned(address, size, mode, alignment << 1u);
+			return AllocAligned(address, size, mode, alignment << 1u);
 		}
 	}
 	return ptr;
 }
 
-bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+bool AllocFixed(uint64_t address, uint64_t size, Mode mode) {
 	auto ptr = reinterpret_cast<uintptr_t>(VirtualAlloc(
 	    reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	    static_cast<DWORD>(MEM_COMMIT) | static_cast<DWORD>(MEM_RESERVE), GetProtectionFlag(mode)));
@@ -161,7 +159,7 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	return true;
 }
 
-bool SysVirtualCommit(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+bool Commit(uint64_t address, uint64_t size, Mode mode) {
 	auto ptr = reinterpret_cast<uintptr_t>(
 	    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                 static_cast<DWORD>(MEM_COMMIT), GetProtectionFlag(mode)));
@@ -179,8 +177,8 @@ bool SysVirtualCommit(uint64_t address, uint64_t size, VirtualMemory::Mode mode)
 	return true;
 }
 
-uint64_t SysVirtualReserve(uint64_t address, uint64_t size) {
-	auto ptr = (address == 0 ? SysVirtualReserveAligned(address, size, 1)
+uint64_t Reserve(uint64_t address, uint64_t size) {
+	auto ptr = (address == 0 ? ReserveAligned(address, size, 1)
 	                         : reinterpret_cast<uintptr_t>(VirtualAlloc(
 	                               reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                               static_cast<DWORD>(MEM_RESERVE), PAGE_NOACCESS)));
@@ -190,13 +188,13 @@ uint64_t SysVirtualReserve(uint64_t address, uint64_t size) {
 		if (err != ERROR_INVALID_ADDRESS) {
 			printf("VirtualAlloc(MEM_RESERVE) failed: 0x%08" PRIx32 "\n", err);
 		} else {
-			return SysVirtualReserveAligned(address, size, 1);
+			return ReserveAligned(address, size, 1);
 		}
 	}
 	return ptr;
 }
 
-uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
+uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
 	if (alignment == 0) {
 		printf("VirtualAlloc2(MEM_RESERVE) failed: 0x%08" PRIx32 "\n",
 		       static_cast<uint32_t>(GetLastError()));
@@ -250,13 +248,13 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 			       "\n",
 			       alignment, err);
 		} else {
-			return SysVirtualReserveAligned(address, size, alignment << 1u);
+			return ReserveAligned(address, size, alignment << 1u);
 		}
 	}
 	return ptr;
 }
 
-bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
+bool ReserveFixed(uint64_t address, uint64_t size) {
 	auto ptr = reinterpret_cast<uintptr_t>(
 	    VirtualAlloc(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                 static_cast<DWORD>(MEM_RESERVE), PAGE_NOACCESS));
@@ -276,7 +274,7 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool SysVirtualDecommit(uint64_t address, uint64_t size) {
+bool Decommit(uint64_t address, uint64_t size) {
 	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                MEM_DECOMMIT) == 0) {
 		printf("VirtualFree(MEM_DECOMMIT) failed: 0x%08" PRIx32 "\n",
@@ -286,7 +284,7 @@ bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool SysVirtualFree(uint64_t address) {
+bool Free(uint64_t address) {
 	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE) ==
 	    0) {
 		printf("VirtualFree() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
@@ -295,7 +293,7 @@ bool SysVirtualFree(uint64_t address) {
 	return true;
 }
 
-bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
+bool FreeRange(uint64_t address, uint64_t size) {
 	if (address == 0 || size == 0) {
 		return false;
 	}
@@ -313,10 +311,10 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 		}
 		current = next;
 	}
-	return current - address == size && SysVirtualFree(address);
+	return current - address == size && Free(address);
 }
 
-bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {
@@ -326,7 +324,7 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 	return true;
 }
 
-bool SysVirtualFlushInstructionCache(uint64_t address, uint64_t size) {
+bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	if (::FlushInstructionCache(GetCurrentProcess(),
 	                            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),
 	                            size) == 0) {
@@ -337,6 +335,6 @@ bool SysVirtualFlushInstructionCache(uint64_t address, uint64_t size) {
 	return true;
 }
 
-} // namespace Common
+} // namespace Common::VirtualMemory
 
 #endif

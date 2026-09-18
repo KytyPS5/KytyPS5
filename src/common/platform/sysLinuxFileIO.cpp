@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
 #include <filesystem>
@@ -149,10 +150,6 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 			*bytes_written = size;
 		}
 	}
-}
-
-void SysFileWrite(uint32_t n, sys_file_t& f) {
-	SysFileWrite(&n, 4, f);
 }
 
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {

@@ -17,8 +17,6 @@ namespace Ime = Libs::Dialog::ImeDialog;
 
 namespace {
 
-constexpr int Error(uint32_t value) { return static_cast<int32_t>(value); }
-
 int g_filter_calls = 0;
 int g_keyboard_filter_calls = 0;
 bool g_block_keyboard = false;
@@ -110,7 +108,7 @@ void TestAcceptLifecycle() {
   auto param = MakeParam(text.data());
   CHECK(Ime::ImeDialogInit(&param, nullptr) == 0);
   CHECK(Ime::ImeDialogGetStatus() == static_cast<int>(Ime::Status::Running));
-  CHECK(Ime::ImeDialogInit(nullptr, nullptr) == Error(0x80bc0001));
+  CHECK(Ime::ImeDialogInit(nullptr, nullptr) == static_cast<int32_t>(0x80bc0001));
 
   Ime::HostSnapshot snapshot;
   CHECK(Ime::GetHostSnapshot(&snapshot));
@@ -154,16 +152,16 @@ void TestValidation() {
   std::array<char16_t, 32> text{};
   auto param = MakeParam(text.data());
   param.reserved[0] = 1;
-  CHECK(Ime::ImeDialogInit(&param, nullptr) == Error(0x80bc0032));
+  CHECK(Ime::ImeDialogInit(&param, nullptr) == static_cast<int32_t>(0x80bc0032));
   param.reserved[0] = 0;
   param.max_text_length = Ime::IME_DIALOG_MAX_TEXT_LENGTH + 1;
-  CHECK(Ime::ImeDialogInit(&param, nullptr) == Error(0x80bc0016));
-  CHECK(Ime::ImeDialogGetResult(nullptr) == Error(0x80bc0107));
+  CHECK(Ime::ImeDialogInit(&param, nullptr) == static_cast<int32_t>(0x80bc0016));
+  CHECK(Ime::ImeDialogGetResult(nullptr) == static_cast<int32_t>(0x80bc0107));
 
   param = MakeParam(text.data());
   Ime::ExtendedParam extended{};
   extended.ext_keyboard_mode = 0x00000004;
-  CHECK(Ime::ImeDialogInit(&param, &extended) == Error(0x80bc001c));
+  CHECK(Ime::ImeDialogInit(&param, &extended) == static_cast<int32_t>(0x80bc001c));
   extended = {};
   extended.option = 0x00000200;
   extended.disable_device =
@@ -187,8 +185,8 @@ void TestFilteringAndInputPolicy() {
   CHECK(Ime::ImeDialogInit(&param, nullptr) == 0);
   CHECK(Ime::ImeDialogGetStatus() == static_cast<int>(Ime::Status::Running));
   CHECK(g_filter_calls == 0);
-  CHECK(Ime::ImeDialogGetResult(nullptr) == Error(0x80bc0031));
-  CHECK(Ime::ImeDialogTerm() == Error(0x80bc0106));
+  CHECK(Ime::ImeDialogGetResult(nullptr) == static_cast<int32_t>(0x80bc0031));
+  CHECK(Ime::ImeDialogTerm() == static_cast<int32_t>(0x80bc0106));
   CHECK(g_filter_calls == 0);
 
   Ime::HostSnapshot snapshot;

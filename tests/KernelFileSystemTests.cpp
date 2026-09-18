@@ -84,8 +84,8 @@ void CheckSaveRename(const std::filesystem::path &root,
   Check(!result.IsInvalid(), "open renamed save file");
   const auto data = result.ReadWholeBuffer();
   const std::string expected = std::string(payload) + Suffix;
-  Check(data.Size() == expected.size(), "renamed save size");
-  Check(std::memcmp(data.GetData(), expected.data(), expected.size()) == 0,
+  Check(data.size() == expected.size(), "renamed save size");
+  Check(std::memcmp(data.data(), expected.data(), expected.size()) == 0,
         "renamed save contents");
 }
 

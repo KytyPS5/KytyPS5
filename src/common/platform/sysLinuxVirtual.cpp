@@ -5,7 +5,6 @@
 #else
 
 #include "common/assert.h"
-#include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
 #include <atomic>
@@ -28,12 +27,12 @@
 #define KYTY_FIXED_NOREPLACE
 #endif
 
-namespace Common {
+namespace Common::VirtualMemory {
 
 static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs = nullptr;
 
-void SysVirtualInit() {
+void Init() {
 	pthread_mutexattr_t attr {};
 
 	pthread_mutexattr_init(&attr);
@@ -48,19 +47,19 @@ void SysVirtualInit() {
 	g_allocs = new std::map<uintptr_t, size_t>;
 }
 
-static int get_protection_flag(VirtualMemory::Mode mode) {
+static int get_protection_flag(Mode mode) {
 	int protect = PROT_NONE;
 	switch (mode) {
-		case VirtualMemory::Mode::Read: protect = PROT_READ; break;
-		case VirtualMemory::Mode::Write:
-		case VirtualMemory::Mode::ReadWrite: protect = PROT_READ | PROT_WRITE; break; // NOLINT
-		case VirtualMemory::Mode::Execute: protect = PROT_EXEC; break;
-		case VirtualMemory::Mode::ExecuteRead: protect = PROT_EXEC | PROT_READ; break; // NOLINT
-		case VirtualMemory::Mode::ExecuteWrite:
-		case VirtualMemory::Mode::ExecuteReadWrite:
+		case Mode::Read: protect = PROT_READ; break;
+		case Mode::Write:
+		case Mode::ReadWrite: protect = PROT_READ | PROT_WRITE; break; // NOLINT
+		case Mode::Execute: protect = PROT_EXEC; break;
+		case Mode::ExecuteRead: protect = PROT_EXEC | PROT_READ; break; // NOLINT
+		case Mode::ExecuteWrite:
+		case Mode::ExecuteReadWrite:
 			protect = PROT_EXEC | PROT_WRITE | PROT_READ;
 			break; // NOLINT
-		case VirtualMemory::Mode::NoAccess:
+		case Mode::NoAccess:
 		default: protect = PROT_NONE; break;
 	}
 	return protect;
@@ -130,7 +129,7 @@ static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) 
 	return mmap(nullptr, size, protect, flags, -1, 0); // NOLINT
 }
 
-uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
 
 	auto addr = static_cast<uintptr_t>(address);
@@ -154,8 +153,7 @@ static uintptr_t align_up(uintptr_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
 }
 
-uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                                uint64_t alignment) {
+uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment) {
 	if (alignment == 0) {
 		return 0;
 	}
@@ -224,7 +222,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	}
 
 	if (ptr == MAP_FAILED) {
-		return SysVirtualAllocAligned(address, size, mode, alignment << 1u);
+		return AllocAligned(address, size, mode, alignment << 1u);
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
@@ -281,7 +279,7 @@ static bool is_mapped(void* ptr, size_t length) {
 }
 #endif
 
-bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+bool AllocFixed(uint64_t address, uint64_t size, Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
 
 	auto addr    = static_cast<uintptr_t>(address);
@@ -318,15 +316,15 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	return false;
 }
 
-bool SysVirtualCommit(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
-	return SysVirtualProtect(address, size, mode);
+bool Commit(uint64_t address, uint64_t size, Mode mode) {
+	return Protect(address, size, mode);
 }
 
-uint64_t SysVirtualReserve(uint64_t address, uint64_t size) {
-	return SysVirtualReserveAligned(address, size, 1);
+uint64_t Reserve(uint64_t address, uint64_t size) {
+	return ReserveAligned(address, size, 1);
 }
 
-uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
+uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
 	if (alignment == 0) {
 		return 0;
 	}
@@ -395,7 +393,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 	}
 
 	if (ptr == MAP_FAILED) {
-		return SysVirtualReserveAligned(address, size, alignment << 1u);
+		return ReserveAligned(address, size, alignment << 1u);
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
@@ -405,7 +403,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 	return ret_addr;
 }
 
-bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
+bool ReserveFixed(uint64_t address, uint64_t size) {
 	EXIT_IF(g_allocs == nullptr);
 
 	auto addr = static_cast<uintptr_t>(address);
@@ -441,9 +439,9 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 	return false;
 }
 
-bool SysVirtualDecommit(uint64_t address, uint64_t size) {
+bool Decommit(uint64_t address, uint64_t size) {
 	// Drop physical pages while preserving the reservation.
-	if (!SysVirtualProtect(address, size, VirtualMemory::Mode::NoAccess)) {
+	if (!Protect(address, size, Mode::NoAccess)) {
 		return false;
 	}
 
@@ -467,7 +465,7 @@ bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool SysVirtualFree(uint64_t address) {
+bool Free(uint64_t address) {
 	EXIT_IF(g_allocs == nullptr);
 	size_t size = 0;
 
@@ -487,7 +485,7 @@ bool SysVirtualFree(uint64_t address) {
 	return munmap(reinterpret_cast<void*>(addr), size) == 0;
 }
 
-bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
+bool FreeRange(uint64_t address, uint64_t size) {
 	EXIT_IF(g_allocs == nullptr);
 	if (size == 0 || (address & 0xfffu) != 0 || (size & 0xfffu) != 0) {
 		return false;
@@ -543,7 +541,7 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	const auto addr       = static_cast<uintptr_t>(address);
 	const auto page_start = addr >> 12u;
 	const auto page_end   = (addr + size - 1) >> 12u;
@@ -551,10 +549,10 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 	                get_protection_flag(mode)) == 0;
 }
 
-bool SysVirtualFlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
+bool FlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 	return true;
 }
 
-} // namespace Common
+} // namespace Common::VirtualMemory
 
 #endif

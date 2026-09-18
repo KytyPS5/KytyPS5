@@ -52,7 +52,6 @@
 
 // IWYU pragma: no_include <intrin.h>
 
-#define KYTY_ENABLE_DEBUG_PRINTF
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
@@ -180,12 +179,6 @@ struct EventDisplay {
 	DisplayOrientation orientation;
 };
 
-constexpr uint32_t KYTY_SDL_BUTTON_LMASK  = SDL_BUTTON_LMASK;  // NOLINT(hicpp-signed-bitwise)
-constexpr uint32_t KYTY_SDL_BUTTON_MMASK  = SDL_BUTTON_MMASK;  // NOLINT(hicpp-signed-bitwise)
-constexpr uint32_t KYTY_SDL_BUTTON_RMASK  = SDL_BUTTON_RMASK;  // NOLINT(hicpp-signed-bitwise)
-constexpr uint32_t KYTY_SDL_BUTTON_X1MASK = SDL_BUTTON_X1MASK; // NOLINT(hicpp-signed-bitwise)
-constexpr uint32_t KYTY_SDL_BUTTON_X2MASK = SDL_BUTTON_X2MASK; // NOLINT(hicpp-signed-bitwise)
-
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
@@ -193,7 +186,6 @@ std::unique_ptr<WindowContext> g_window;
 } // namespace
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
-constexpr int KYTY_SDL_WINDOWPOS_CENTERED = SDL_WINDOWPOS_CENTERED; /*NOLINT(hicpp-signed-bitwise)*/
 
 static void SetPause(WindowLoopState& game, bool flag) {
 	LOGF("Pause: %s\n", flag ? "true" : "false");
@@ -614,11 +606,11 @@ void WindowContext::ProcessEvent(double time_s) {
 
 			mb.down              = false;
 			mb.up                = false;
-			mb.left              = ((event->motion.state & KYTY_SDL_BUTTON_LMASK) != 0u);
-			mb.middle            = ((event->motion.state & KYTY_SDL_BUTTON_MMASK) != 0u);
-			mb.right             = ((event->motion.state & KYTY_SDL_BUTTON_RMASK) != 0u);
-			mb.x1                = ((event->motion.state & KYTY_SDL_BUTTON_X1MASK) != 0u);
-			mb.x2                = ((event->motion.state & KYTY_SDL_BUTTON_X2MASK) != 0u);
+			mb.left              = ((event->motion.state & SDL_BUTTON_LMASK) != 0u);
+			mb.middle            = ((event->motion.state & SDL_BUTTON_MMASK) != 0u);
+			mb.right             = ((event->motion.state & SDL_BUTTON_RMASK) != 0u);
+			mb.x1                = ((event->motion.state & SDL_BUTTON_X1MASK) != 0u);
+			mb.x2                = ((event->motion.state & SDL_BUTTON_X2MASK) != 0u);
 			mb.touch             = (event->motion.which == SDL_TOUCH_MOUSEID);
 			mb.pressed           = false;
 			mb.released          = false;
@@ -712,6 +704,20 @@ void WindowContext::ProcessEvent(double time_s) {
 				                        event->ctouchpad.x, event->ctouchpad.y);
 			}
 			break;
+
+		case SDL_CONTROLLERSENSORUPDATE: {
+			const auto& sensor = event->csensor;
+			if (sensor.sensor == SDL_SENSOR_ACCEL || sensor.sensor == SDL_SENSOR_GYRO) {
+				Controller::SetSensor(sensor.which,
+				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
+				                                                        : Controller::Sensor::Gyro,
+				                      sensor.data,
+				                      sensor.timestamp_us != 0
+				                          ? sensor.timestamp_us
+				                          : static_cast<uint64_t>(sensor.timestamp) * 1000);
+			}
+			break;
+		}
 
 		case SDL_CONTROLLERDEVICEADDED:
 		case SDL_CONTROLLERDEVICEREMOVED:
@@ -854,8 +860,8 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
-	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
+	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, SDL_WINDOWPOS_CENTERED,
+	                                  SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());

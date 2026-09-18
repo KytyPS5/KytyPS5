@@ -20,6 +20,7 @@
 #include <QLabel>
 #include <QMap>
 #include <QMessageBox>
+#include <QObject>
 #include <QPixmap>
 #include <QRegularExpression>
 #include <QSet>
@@ -32,8 +33,9 @@
 #include <QVBoxLayout>
 #include <QVariant>
 #include <QWidget>
+#include <QtEndian>
 
-#include <limits>
+#include <utility>
 
 namespace {
 
@@ -83,21 +85,6 @@ static bool CanRead(const QByteArray& data, qsizetype offset, qsizetype size) {
 	return offset >= 0 && size >= 0 && offset <= data.size() && size <= data.size() - offset;
 }
 
-static quint32 ReadBe32(const QByteArray& data, qsizetype offset) {
-	const auto* p = reinterpret_cast<const uchar*>(data.constData() + offset);
-	return (static_cast<quint32>(p[0]) << 24u) | (static_cast<quint32>(p[1]) << 16u) |
-	       (static_cast<quint32>(p[2]) << 8u) | static_cast<quint32>(p[3]);
-}
-
-static quint64 ReadBe64(const QByteArray& data, qsizetype offset) {
-	return (static_cast<quint64>(ReadBe32(data, offset)) << 32u) |
-	       static_cast<quint64>(ReadBe32(data, offset + 4));
-}
-
-static bool FitsQSizeType(quint64 value) {
-	return value <= static_cast<quint64>(std::numeric_limits<qsizetype>::max());
-}
-
 static QString ReadFixedString(const QByteArray& data, qsizetype offset, qsizetype max_size) {
 	if (!CanRead(data, offset, max_size)) {
 		return {};
@@ -125,33 +112,33 @@ static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, 
 		return false;
 	}
 
-	const auto magic = ReadBe32(data, 0x00);
+	const auto magic = qFromBigEndian<quint32>(data.constData() + 0x00);
 	if (magic != UCP_MAGIC) {
 		error = QObject::tr("%1 has an invalid trophy package magic.")
 		            .arg(QFileInfo(file_name).fileName());
 		return false;
 	}
 
-	const auto version = ReadBe32(data, 0x04);
+	const auto version = qFromBigEndian<quint32>(data.constData() + 0x04);
 	if (version != UCP_VERSION) {
 		error = QObject::tr("%1 uses unsupported trophy package version %2.")
 		            .arg(QFileInfo(file_name).fileName(), QString::number(version));
 		return false;
 	}
 
-	const auto declared_size = ReadBe64(data, 0x08);
+	const auto declared_size = qFromBigEndian<quint64>(data.constData() + 0x08);
 	if (declared_size > static_cast<quint64>(data.size())) {
 		error = QObject::tr("%1 is truncated.").arg(QFileInfo(file_name).fileName());
 		return false;
 	}
 
-	const auto file_count = ReadBe32(data, 0x10);
-	const auto toc_offset = static_cast<quint64>(ReadBe32(data, 0x14));
+	const auto file_count = qFromBigEndian<quint32>(data.constData() + 0x10);
+	const auto toc_offset = static_cast<quint64>(qFromBigEndian<quint32>(data.constData() + 0x14));
 	const auto data_size  = static_cast<quint64>(data.size());
 
 	const quint64 table_size = UCP_TOC_SKIP + static_cast<quint64>(file_count) * UCP_ENTRY_LEN;
 	if (toc_offset > data_size || table_size > data_size - toc_offset ||
-	    !FitsQSizeType(toc_offset + table_size)) {
+	    !std::in_range<qsizetype>(toc_offset + table_size)) {
 		error = QObject::tr("%1 has an invalid table of contents.")
 		            .arg(QFileInfo(file_name).fileName());
 		return false;
@@ -162,14 +149,14 @@ static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, 
 		                                                 static_cast<quint64>(i) * UCP_ENTRY_LEN);
 		UcpEntry   entry;
 		entry.name   = ReadFixedString(data, entry_offset, UCP_NAME_LEN).trimmed();
-		entry.offset = ReadBe64(data, entry_offset + 0x20);
-		entry.size   = ReadBe64(data, entry_offset + 0x28);
+		entry.offset = qFromBigEndian<quint64>(data.constData() + entry_offset + 0x20);
+		entry.size   = qFromBigEndian<quint64>(data.constData() + entry_offset + 0x28);
 
 		if (entry.name.isEmpty()) {
 			continue;
 		}
 		if (entry.offset > data_size || entry.size > data_size - entry.offset ||
-		    !FitsQSizeType(entry.offset) || !FitsQSizeType(entry.size)) {
+		    !std::in_range<qsizetype>(entry.offset) || !std::in_range<qsizetype>(entry.size)) {
 			error = QObject::tr("%1 has an invalid entry for %2.")
 			            .arg(QFileInfo(file_name).fileName(), entry.name);
 			return false;

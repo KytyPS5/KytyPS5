@@ -20,12 +20,4 @@ Common::Time GetTime() {
 	return Common::Time(static_cast<int>(GetTimeMs()));
 }
 
-uint64_t GetCounter() {
-	return g_timer.GetTicks();
-}
-
-uint64_t GetFrequency() {
-	return g_timer.GetFrequency();
-}
-
 } // namespace Loader::Timer

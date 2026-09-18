@@ -13,15 +13,11 @@ LIB_VERSION("Psml", 1, "Psml", 1, 1);
 
 namespace Psml {
 
-constexpr int Error(uint32_t value) {
-	return static_cast<int>(value);
-}
-
-constexpr int PSML_ERROR_NOT_INITIALIZED = Error(0x8a810001u);
-constexpr int PSML_ERROR_INVALID_OBJECT  = Error(0x8a810005u);
-constexpr int PSML_ERROR_INVALID_POINTER = Error(0x8a810009u);
-constexpr int PSML_ERROR_INVALID_VALUE   = Error(0x8a81000du);
-constexpr int PSML_ERROR_NULL_OBJECT     = Error(0x8a810014u);
+constexpr int PSML_ERROR_NOT_INITIALIZED = static_cast<int>(0x8a810001u);
+constexpr int PSML_ERROR_INVALID_OBJECT  = static_cast<int>(0x8a810005u);
+constexpr int PSML_ERROR_INVALID_POINTER = static_cast<int>(0x8a810009u);
+constexpr int PSML_ERROR_INVALID_VALUE   = static_cast<int>(0x8a81000du);
+constexpr int PSML_ERROR_NULL_OBJECT     = static_cast<int>(0x8a810014u);
 
 constexpr uint32_t SHARED_RESOURCES_MAGIC = 0xa9c4;
 constexpr uint32_t CONTEXT_MAGIC          = 0x9231;

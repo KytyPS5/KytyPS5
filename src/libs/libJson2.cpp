@@ -41,6 +41,10 @@ struct JsonArray {
 	std::vector<JsonValue*>* impl;
 };
 
+struct JsonArrayIterator {
+	JsonValue* const* position;
+};
+
 struct JsonObject {
 	std::map<std::string, JsonValue*>* impl;
 };
@@ -62,6 +66,7 @@ struct JsonValue {
 };
 
 static_assert(sizeof(JsonArray) == 8);
+static_assert(sizeof(JsonArrayIterator) == 8);
 static_assert(sizeof(JsonValue) == 32 && offsetof(JsonValue, type) == 28);
 
 struct JsonInitParameter2 {
@@ -910,6 +915,51 @@ static size_t KYTY_SYSV_ABI JsonArraySize(const JsonArray* self) {
 	return JsonArrayImpl(self)->size();
 }
 
+// The non-trivial guest iterator is returned through an explicit result pointer.
+static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayBegin(JsonArrayIterator* result,
+                                                    const JsonArray* self) {
+	PRINT_NAME();
+
+	result->position = JsonArrayImpl(self)->data();
+	return result;
+}
+
+static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayEnd(JsonArrayIterator* result,
+                                                  const JsonArray* self) {
+	PRINT_NAME();
+
+	const auto* impl = JsonArrayImpl(self);
+	result->position = impl->data();
+	if (!impl->empty()) {
+		result->position += impl->size();
+	}
+	return result;
+}
+
+static bool KYTY_SYSV_ABI JsonArrayIteratorNotEqual(const JsonArrayIterator* self,
+                                                 const JsonArrayIterator* other) {
+	PRINT_NAME();
+
+	return self->position != other->position;
+}
+
+static JsonValue* KYTY_SYSV_ABI JsonArrayIteratorDereference(const JsonArrayIterator* self) {
+	PRINT_NAME();
+
+	return *self->position;
+}
+
+static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayIteratorIncrement(JsonArrayIterator* self) {
+	PRINT_NAME();
+
+	++self->position;
+	return self;
+}
+
+static void KYTY_SYSV_ABI JsonArrayIteratorDtor(JsonArrayIterator*) {
+	PRINT_NAME();
+}
+
 static JsonObject* KYTY_SYSV_ABI JsonObjectCtor(JsonObject* self) {
 	PRINT_NAME();
 
@@ -1084,6 +1134,12 @@ LIB_DEFINE(InitNet_1_Json2) {
 	LIB_FUNC("3qrge7L-AU4", LibJson2::JsonValueGetReal);
 	LIB_FUNC("sOmU4vnx3s0", LibJson2::JsonValueDoubleCtor);
 	LIB_FUNC("rQGJeNjOuUk", LibJson2::JsonArraySize);
+	LIB_FUNC("bcH5EnFE2xY", LibJson2::JsonArrayBegin);
+	LIB_FUNC("WXF2ihRF+B8", LibJson2::JsonArrayEnd);
+	LIB_FUNC("5AZPp99ogrc", LibJson2::JsonArrayIteratorNotEqual);
+	LIB_FUNC("wcgr5mte7T8", LibJson2::JsonArrayIteratorDereference);
+	LIB_FUNC("w5+VCznos5E", LibJson2::JsonArrayIteratorIncrement);
+	LIB_FUNC("9yLjn46Ypfs", LibJson2::JsonArrayIteratorDtor);
 	LIB_FUNC("5yHuiWXo2gg", LibJson2::JsonValueSetBool);
 	LIB_FUNC("QxVVYhP-mvg", LibJson2::JsonValueSetInt);
 	LIB_FUNC("SIe1ZmW7e7s", LibJson2::JsonValueSetUInt);

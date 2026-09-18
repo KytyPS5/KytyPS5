@@ -1208,6 +1208,156 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
+ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
+                                    bool nonuniform = false,
+                                    bool writable = false) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture(ShaderType::Pixel);
+  auto *entry = fixture.block;
+  auto *initial = diamond ? fixture.AddBlock() : entry;
+  auto *alternate = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  const uint32_t alternate_id = diamond ? 2u : 1u;
+  const uint32_t merge_id = alternate_id + 1;
+  const uint32_t initial_target = diamond ? 1u : merge_id;
+  entry->AddBranch(alternate);
+  entry->AddBranch(diamond ? initial : merge);
+  alternate->AddBranch(merge);
+  if (diamond) {
+    initial->AddBranch(merge);
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = merge_id};
+  }
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = reverse ? alternate_id : initial_target,
+      .false_block = reverse ? initial_target : alternate_id};
+  fixture.program.block_info[alternate_id].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = merge_id};
+  fixture.program.block_info[merge_id].terminator.kind =
+      CFG::TerminatorKind::Return;
+  const auto control =
+      fixture.Buffer({Value(0x2000u), Value(0u), Value(200u), Value(0u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(196u)},
+                           fixture.AddMemory(scalar, 0x498));
+  if (nonuniform) {
+    flag = fixture.Emit(ValueOpcode::LaneId);
+  }
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::IEqual32, {flag, Value(0u)});
+  if (writable) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(
+        ValueOpcode::StoreBufferU32,
+        {control, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        fixture.AddMemory(memory, 0x170));
+  }
+
+  std::array<Value, 4> sampler_words;
+  for (uint32_t word = 0; word < sampler_words.size(); ++word) {
+    const auto read = [&](Block *block, uint32_t address, uint32_t pc) {
+      const auto handle = fixture.Emit(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)}, 0, block);
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4;
+      return fixture.Emit(ValueOpcode::LoadAddressU32,
+                          {handle, Value(0u), Value(0u), Value(true)},
+                          fixture.AddMemory(memory, pc), block);
+    };
+    // PS 2190adcc312b2e6e selects SRT+448 or SRT+480 before its sample at
+    // 0x4d4.
+    const auto first = read(initial, 0x1000 + 448, 0x4c8);
+    const auto second = read(alternate, 0x1000 + 480, 0x4bc);
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    if (reverse_phi) {
+      phi.AddPhiOperand(alternate, second);
+      phi.AddPhiOperand(initial, first);
+    } else {
+      phi.AddPhiOperand(initial, first);
+      phi.AddPhiOperand(alternate, second);
+    }
+    sampler_words[word] = Value(&phi);
+  }
+  fixture.block = merge;
+  const auto image =
+      fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                     Value(0u), Value(0u), Value(0u)});
+  const auto address = fixture.ImageAddress();
+  for (uint32_t use = 0; use < 2; ++use) {
+    const auto sampler = fixture.Sampler(sampler_words);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto result =
+        fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+                     fixture.AddMemory(sample, 0x4d4));
+    fixture.Emit(ValueOpcode::ReferenceU32,
+                 {fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                               {result, Value(0u)})});
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.value_storage.size() == 4,
+        "repeated sampler uses retained duplicate planning selections");
+  Check(sampler_words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
+        "host descriptor selection changed the GPU Phi");
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestConditionalSamplerPhi() {
+  for (const bool diamond : {false, true}) {
+    for (const bool reverse : {false, true}) {
+      for (const bool reverse_phi : {false, true}) {
+        auto plan = ConditionalSamplerPlan(diamond, reverse, reverse_phi);
+        const auto source = plan.info.samplers[0].source;
+        LinearTestMemory memory;
+        for (uint32_t word = 448 / 4; word < (480 + 16) / 4; ++word) {
+          memory.words[word] = 0x400u + word;
+        }
+        const SrtRuntime runtime{.read_memory = ReadLinearTestMemory,
+                                 .userdata = &memory,
+                                 .read_specialization_memory =
+                                     ReadLinearTestMemory};
+        for (uint32_t flag = 0; flag < 2; ++flag) {
+          memory.words[(0x1000 + 196) / 4] = flag;
+          const uint32_t first = (flag != 0u) != reverse ? 480 / 4 : 448 / 4;
+          memory.fail_address = 0x1000 + (first == 448 / 4 ? 480u : 448u);
+          DescriptorValue selected;
+          Check(EvaluateDescriptorSource(plan, source, runtime, selected),
+                "conditional sampler did not survive detached plan lifetime");
+          for (uint32_t word = 0; word < 4; ++word) {
+            Check(selected.dwords[word] == memory.words[first + word],
+                  "conditional sampler chose the wrong incoming descriptor");
+          }
+        }
+        DescriptorValue selected;
+        auto no_clean_reader = runtime;
+        no_clean_reader.read_specialization_memory = nullptr;
+        Check(
+            !EvaluateDescriptorSource(plan, source, no_clean_reader, selected),
+            "conditional sampler used unchecked memory for its predicate");
+        memory.fail_address = 0x2000 + 196;
+        Check(!EvaluateDescriptorSource(plan, source, runtime, selected),
+              "conditional sampler ignored unavailable coherent predicate "
+              "memory");
+      }
+    }
+    CheckFatal([&] { ConditionalSamplerPlan(diamond, false, false, true); },
+               "not a valid runtime value",
+               "nonuniform sampler selection was accepted");
+    CheckFatal(
+        [&] { ConditionalSamplerPlan(diamond, false, false, false, true); },
+        "not a valid runtime value",
+        "shader-written sampler predicate was accepted");
+  }
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -1865,6 +2015,7 @@ int main() {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
+    Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

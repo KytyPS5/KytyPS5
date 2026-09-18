@@ -51,17 +51,17 @@ static bool TryGetTitleIdFromContentId(std::string* title_id) {
 		return false;
 	}
 
-	const uint32_t dash = Common::FindIndex(content_id, '-');
-	if (!Common::IndexValid(content_id, dash)) {
+	const auto dash = content_id.find('-');
+	if (dash == std::string::npos) {
 		return false;
 	}
 
-	const uint32_t underscore = Common::FindIndex(content_id, '_', dash + 1);
-	if (!Common::IndexValid(content_id, underscore) || underscore <= dash + 1) {
+	const auto underscore = content_id.find('_', dash + 1);
+	if (underscore == std::string::npos || underscore <= dash + 1) {
 		return false;
 	}
 
-	*title_id = Common::Mid(content_id, dash + 1, underscore - dash - 1);
+	*title_id = content_id.substr(dash + 1, underscore - dash - 1);
 	return !title_id->empty();
 }
 

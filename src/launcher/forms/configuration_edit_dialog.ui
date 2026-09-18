@@ -329,12 +329,4 @@
   </customwidget>
  </customwidgets>
  <resources/>
- <connections>
-  <connection>
-   <sender>cancel_button</sender>
-   <signal>clicked()</signal>
-   <receiver>ConfigurationEditDialog</receiver>
-   <slot>reject()</slot>
-  </connection>
- </connections>
 </ui>

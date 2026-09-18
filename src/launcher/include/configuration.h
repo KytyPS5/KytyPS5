@@ -1,13 +1,13 @@
 #ifndef LAUNCHER_INCLUDE_CONFIGURATION_H_
 #define LAUNCHER_INCLUDE_CONFIGURATION_H_
 
-#include "common.h"
 #include "common/emulatorConfig.h"
 
 #include <QByteArray>
 #include <QChar>
 #include <QMetaEnum>
 #include <QMetaType>
+#include <QObject>
 #include <QSettings>
 #include <QString>
 #include <QStringList>

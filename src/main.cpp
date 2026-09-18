@@ -2,7 +2,6 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
-#include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -12,6 +11,7 @@
 #include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
+#include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;
@@ -27,8 +27,7 @@ static std::string GetBuildString() {
 	std::string type = "????";
 #endif
 
-	std::string compiler =
-	    Debug::GetCompiler() + "-" + Debug::GetLinker() + "-" + Debug::GetBitness();
+	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
 
 	std::string str =
 	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
@@ -191,7 +190,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 #endif
 
-		if (!Common::StartsWith(arg, "--")) {
+		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
 			return false;
 		}

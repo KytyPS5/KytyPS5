@@ -2795,6 +2795,27 @@ void TestPackedReciprocalSquareRoot() {
 	emulate({0x66, 0x41, 0x0f, 0x78, 0xc0, 8, 4}, 7); // extrq xmm8, 8, 4
 	Check(test, fpstate._xmm[8].element[0] == 0x23 && fpstate._xmm[8].element[2] == 0,
 	      "SSE4a extraction lost its extended register or upper-half semantics");
+	fpstate._xmm[1].element[0] = 0x1234;
+	fpstate._xmm[8].element[0] = 0xffffc4c8;
+	emulate({0x66, 0x41, 0x0f, 0x79, 0xc8}, 5); // observed fault: extrq xmm1, xmm8
+	Check(test, fpstate._xmm[1].element[0] == 0x23 && fpstate._xmm[8].element[0] == 0xffffc4c8,
+	      "register EXTRQ lost its source controls, ignored bits, or separate destination");
+	fpstate._xmm[11].element[0] = 0x89abcdef;
+	fpstate._xmm[11].element[1] = 0x01234567;
+	fpstate._xmm[0].element[0] = 0x2010;
+	emulate({0x66, 0x44, 0x0f, 0x79, 0xd8}, 5); // extrq xmm11, xmm0
+	Check(test, fpstate._xmm[11].element[0] == 0x4567 && fpstate._xmm[11].element[1] == 0,
+	      "register EXTRQ lost its extended destination or 64-bit extraction");
+	fpstate._xmm[8].element[0] = 0x89abcdef;
+	fpstate._xmm[8].element[1] = 0x01234567;
+	fpstate._xmm[9].element[0] = 0;
+	emulate({0x66, 0x45, 0x0f, 0x79, 0xc1}, 5); // extrq xmm8, xmm9
+	Check(test, fpstate._xmm[8].element[0] == 0x89abcdef && fpstate._xmm[8].element[1] == 0x01234567,
+	      "register EXTRQ did not interpret zero length as 64 bits");
+	fpstate._xmm[3].element[0] = 0xab0408;
+	emulate({0x66, 0x0f, 0x79, 0xdb}, 4); // extrq xmm3, xmm3
+	Check(test, fpstate._xmm[3].element[0] == 0x40,
+	      "register EXTRQ overwrote aliased controls before reading them");
 	fpstate._xmm[8].element[0] = 0x1111;
 	fpstate._xmm[8].element[2] = 0xdeadbeef;
 	fpstate._xmm[9].element[0] = 0xab;

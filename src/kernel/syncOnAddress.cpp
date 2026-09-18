@@ -262,7 +262,11 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, deadline, signal_poll);
+	if constexpr (sizeof(T) > 4) {
+		result = WaitPortable(address, expected, deadline, signal_poll);
+	} else {
+		result = WaitLinux(address, expected, deadline, signal_poll);
+	}
 #else
 	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif

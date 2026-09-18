@@ -50,7 +50,8 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 		return ShaderError::Fail(error, "vertex attribute table requires a vertex buffer table");
 	}
 	if (next.vertex_buffer_reg < 0) {
-		metadata = next;
+		next.vertex_attrib_reg = -1;
+		metadata               = next;
 		return true;
 	}
 	if (static_cast<uint32_t>(next.vertex_buffer_reg) + 1u >= max_user_sgprs) {

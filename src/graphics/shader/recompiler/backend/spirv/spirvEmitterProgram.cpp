@@ -266,7 +266,76 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+// U8, U16, U32 and F16 share one SPIR-V type, so these casts reinterpret a value that already
+// has the target's representation. The caller guards on the types actually coinciding.
+bool IsSameRepresentationCast(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::BitCastU16F16:
+		case IR::ValueOpcode::BitCastF16U16:
+		case IR::ValueOpcode::ConvertU32U16:
+		case IR::ValueOpcode::ConvertU32U8: return true;
+		default: return false;
+	}
+}
+
+uint32_t ImmediateU32(IR::Value value, uint32_t fallback) {
+	return value.IsImmediate() && value.GetType() == IR::Type::U32 ? value.U32() : fallback;
+}
+
+// Which low bits a value can still have set, or all of them where that is not known.
+uint32_t PossibleBits(IR::Value value, uint32_t depth = 0) {
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth >= 8u) {
+		return 0xffffffffu;
+	}
+	switch (inst->GetOpcode()) {
+		case IR::ValueOpcode::ConvertU16U32:
+		case IR::ValueOpcode::ConvertF16F32:
+		case IR::ValueOpcode::BitCastU16F16:
+		case IR::ValueOpcode::BitCastF16U16: return 0xffffu;
+		case IR::ValueOpcode::ConvertU32U8:
+		case IR::ValueOpcode::ConvertU8U32: return 0xffu;
+		case IR::ValueOpcode::ConvertU32U16:
+			return inst->NumArgs() == 1 ? PossibleBits(inst->Arg(0), depth + 1) : 0xffffffffu;
+		case IR::ValueOpcode::BitFieldUExtract: {
+			if (inst->NumArgs() != 3) {
+				return 0xffffffffu;
+			}
+			const auto width = ImmediateU32(inst->Arg(2), 32u);
+			return width >= 32u ? 0xffffffffu : (1u << width) - 1u;
+		}
+		case IR::ValueOpcode::BitwiseAnd32:
+			return inst->NumArgs() == 2
+			           ? ImmediateU32(inst->Arg(1), 0xffffffffu) & PossibleBits(inst->Arg(0), depth + 1)
+			           : 0xffffffffu;
+		default: return 0xffffffffu;
+	}
+}
+
+// A mask that cannot clear any bit the value might still have set.
+bool NarrowingMaskIsRedundant(const IR::Inst& inst) {
+	if (inst.GetOpcode() == IR::ValueOpcode::ConvertU16U32 && inst.NumArgs() == 1) {
+		return (PossibleBits(inst.Arg(0)) & ~0xffffu) == 0;
+	}
+	if (inst.GetOpcode() == IR::ValueOpcode::BitwiseAnd32 && inst.NumArgs() == 2) {
+		const auto mask = ImmediateU32(inst.Arg(1), 0xffffffffu);
+		return mask != 0xffffffffu && (PossibleBits(inst.Arg(0)) & ~mask) == 0;
+	}
+	return false;
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (NarrowingMaskIsRedundant(inst)) {
+		ctx.Define(inst, ctx.Arg(inst, 0));
+		return;
+	}
+	if (IsSameRepresentationCast(inst.GetOpcode()) && inst.NumArgs() == 1) {
+		const auto result_type = TypeId(ctx.state, inst.GetType());
+		if (result_type != 0 && result_type == TypeId(ctx.state, inst.Arg(0).GetType())) {
+			ctx.Define(inst, ctx.Arg(inst, 0));
+			return;
+		}
+	}
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);

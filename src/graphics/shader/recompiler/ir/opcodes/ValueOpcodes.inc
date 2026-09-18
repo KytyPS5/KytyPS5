@@ -169,6 +169,11 @@ VALUE_OPCODE(FPMad32, F32, F32, F32, F32)
 VALUE_OPCODE(FPMul32, F32, F32, F32)
 VALUE_OPCODE(FPMin32, F32, F32, F32)
 VALUE_OPCODE(FPMax32, F32, F32, F32)
+// Packed 16-bit float ALU. Operands and results stay in the guest's packed U32 register pair;
+// the backend bitcasts to a two-component half vector so one native op covers both lanes.
+VALUE_OPCODE(PackedFPAdd16, U32, U32, U32)
+VALUE_OPCODE(PackedFPMul16, U32, U32, U32)
+VALUE_OPCODE(PackedFPFma16, U32, U32, U32, U32)
 VALUE_OPCODE(FPMinTri32, F32, F32, F32, F32)
 VALUE_OPCODE(FPMaxTri32, F32, F32, F32, F32)
 VALUE_OPCODE(FPMedTri32, F32, F32, F32, F32)

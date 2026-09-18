@@ -63,6 +63,15 @@ uint32_t TypeF32Vector(EmitterState& state, uint32_t components) {
 	return state.builder.Type(spv::OpTypeVector, TypeF32(state), components);
 }
 
+uint32_t TypeF16(EmitterState& state) {
+	state.builder.RequireCapability(spv::CapabilityFloat16);
+	return state.builder.Type(spv::OpTypeFloat, 16);
+}
+
+uint32_t TypeF16Vector(EmitterState& state, uint32_t components) {
+	return state.builder.Type(spv::OpTypeVector, TypeF16(state), components);
+}
+
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee) {
 	return state.builder.Type(spv::OpTypePointer, storage_class, pointee);
 }

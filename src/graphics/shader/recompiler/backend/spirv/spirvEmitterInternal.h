@@ -148,6 +148,8 @@ uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
+uint32_t TypeF16(EmitterState& state);
+uint32_t TypeF16Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
 uint32_t StorageBufferType(EmitterState& state);

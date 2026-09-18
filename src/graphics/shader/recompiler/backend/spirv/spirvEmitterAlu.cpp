@@ -201,6 +201,43 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 }
 
 } // namespace
+namespace {
+
+// A packed F16 pair lives in one U32 guest register; a half vector covers both lanes at once.
+uint32_t PackedHalves(EmitterState& state, uint32_t value) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeF16Vector(state, 2), result, value);
+	return result;
+}
+
+uint32_t PackHalves(EmitterState& state, uint32_t halves) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), result, halves);
+	return result;
+}
+
+} // namespace
+
+uint32_t EmitPackedFPAdd16(EmitterState& state, uint32_t a, uint32_t b) {
+	return PackHalves(state, Binary(state, spv::OpFAdd, TypeF16Vector(state, 2),
+	                                PackedHalves(state, a), PackedHalves(state, b)));
+}
+
+uint32_t EmitPackedFPMul16(EmitterState& state, uint32_t a, uint32_t b) {
+	return PackHalves(state, Binary(state, spv::OpFMul, TypeF16Vector(state, 2),
+	                                PackedHalves(state, a), PackedHalves(state, b)));
+}
+
+uint32_t EmitPackedFPFma16(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	const auto type  = TypeF16Vector(state, 2);
+	const auto fused = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, type, fused, GlslStd450(state), GLSLstd450Fma,
+	                          PackedHalves(state, a), PackedHalves(state, b),
+	                          PackedHalves(state, c));
+	state.builder.AddAnnotation(spv::OpDecorate, fused, spv::DecorationNoContraction);
+	return PackHalves(state, fused);
+}
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto fused = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
 	state.builder.AddAnnotation(spv::OpDecorate, fused, spv::DecorationNoContraction);

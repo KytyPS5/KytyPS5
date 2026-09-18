@@ -5,8 +5,62 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+namespace {
+
+// One half vector holds both lanes, so it only stands in where every modifier leaves the lanes
+// in place: a swizzle, per-lane negate, inline constant, SDWA or DPP falls back to the expansion.
+bool PackedLanesAreStraight(const Decoder::Operand& operand) {
+	return operand.kind != Decoder::OperandKind::FloatInlineConstant && !operand.op_sel &&
+	       operand.op_sel_hi && !operand.negate && !operand.negate_hi && !operand.absolute &&
+	       !operand.dpp && operand.sdwa_sel == 6u;
+}
+
+// Void where there is no packed equivalent, which keeps min and max on the expansion that
+// carries their NaN and signed-zero rules.
+IR::ValueOpcode NativePackedFloat16Opcode(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::FPAdd32: return IR::ValueOpcode::PackedFPAdd16;
+		case IR::ValueOpcode::FPMul32: return IR::ValueOpcode::PackedFPMul16;
+		case IR::ValueOpcode::FPFma32: return IR::ValueOpcode::PackedFPFma16;
+		default: return IR::ValueOpcode::Void;
+	}
+}
+
+} // namespace
+
+bool Translator::PackedFloat16Native(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                     bool accumulator) {
+	const auto dst = DestinationOperand(inst);
+	if (dst.omod != 0u || dst.clamp) {
+		return false;
+	}
+	const auto third = accumulator ? dst : inst.src2;
+	if (!PackedLanesAreStraight(inst.src0) || !PackedLanesAreStraight(inst.src1)) {
+		return false;
+	}
+	const bool ternary = accumulator || inst.src_count == 3u;
+	if (ternary && !PackedLanesAreStraight(third)) {
+		return false;
+	}
+	IR::Value result;
+	if (ternary) {
+		result = ir.Emit(opcode, {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(third)});
+	} else {
+		result = ir.Emit(opcode, {ReadU32(inst.src0), ReadU32(inst.src1)});
+	}
+	WriteOperand(dst, result);
+	return true;
+}
+
 bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	if (program.float16 && !quiet_snan) {
+		const auto native = NativePackedFloat16Opcode(opcode);
+		if (native != IR::ValueOpcode::Void &&
+		    PackedFloat16Native(inst, native, accumulator)) {
+			return true;
+		}
+	}
 	const auto translate_lane = [&](bool high) {
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
 		const auto rhs = ReadF16LaneAsF32(inst.src1, high, true);

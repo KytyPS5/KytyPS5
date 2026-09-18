@@ -147,6 +147,8 @@ private:
 	void V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
+	bool PackedFloat16Native(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+	                         bool accumulator);
 	bool PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
 	bool Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

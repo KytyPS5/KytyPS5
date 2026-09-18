@@ -199,12 +199,8 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
 
 	while (ReadWord(address) == expected && !waiter.wake_requested) {
 		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
-		if (slice_micros == UINT32_MAX) {
-			result = KERNEL_ERROR_ETIMEDOUT;
-			break;
-		}
-		if (slice_micros == 0) {
-			result = KERNEL_ERROR_ETIMEDOUT;
+		if (slice_micros == UINT32_MAX || slice_micros == 0) {
+			result = ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
 			break;
 		}
 
@@ -297,7 +293,9 @@ int Wake(volatile void* address, int32_t count) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	return WakeLinux(address, count);
+	const int futex_result    = WakeLinux(address, count);
+	const int portable_result = WakePortable(address, count);
+	return futex_result != OK ? futex_result : portable_result;
 #endif
 	return WakePortable(address, count);
 }

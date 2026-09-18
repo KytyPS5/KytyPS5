@@ -15,8 +15,9 @@
 #endif
 
 namespace {
-std::string g_test_title = "PPSA21564";
-}
+std::string           g_test_title = "PPSA21564";
+std::filesystem::path g_mounted_directory;
+} // namespace
 
 namespace Loader {
 bool SystemContentParamSfoGetString(const char*, std::string* value) {
@@ -32,7 +33,9 @@ Common::Time GetTime() {
 } // namespace Loader
 
 namespace Libs::LibKernel::FileSystem {
-void Mount(const std::filesystem::path&, const std::string&) {}
+void Mount(const std::filesystem::path& directory, const std::string&) {
+	g_mounted_directory = directory;
+}
 void Umount(const std::string&) {}
 } // namespace Libs::LibKernel::FileSystem
 
@@ -131,6 +134,10 @@ void TestValidationAndScatter() {
 	byte         = 0xaa;
 	set.data_num = 0;
 	CHECK(SaveDataSetSaveDataMemory2(&set) == OK);
+	original[2] = byte;
+	CHECK(Get() == std::vector<uint8_t>(original.begin(), original.end()));
+	set.data = nullptr;
+	CHECK(SaveDataSetSaveDataMemory2(&set) == OK);
 	CHECK(Get() == std::vector<uint8_t>(original.begin(), original.end()));
 	set.data_num = 6;
 	CHECK(SaveDataSetSaveDataMemory2(&set) == SAVE_DATA_ERROR_PARAMETER);
@@ -190,6 +197,29 @@ void TestIsolationAndSync() {
 	CHECK(Setup(2) == 16);
 	CHECK(Setup(1, 1) == 16);
 	CHECK(Get()[0] == 11 && Get(16, 2)[0] == 22 && Get(16, 1, 1)[0] == 33);
+	Reset("OTHER");
+	SceSaveDataTitleId title {};
+	std::strcpy(title.data, "ISOLATE");
+	SceSaveDataDirName name {};
+	std::strcpy(name.data, "sce_sdmemory");
+	struct SaveDataTransferringMount mount {};
+	mount.user_id  = 2;
+	mount.title_id = &title;
+	mount.dir_name = &name;
+	SaveDataMountResult result {};
+	CHECK(SaveDataTransferringMount(&mount, &result) == OK);
+	CHECK(g_mounted_directory == fs::path("_SaveData/ISOLATE/sce_sdmemory/2"));
+	CHECK(std::ifstream(g_mounted_directory / "memory.dat", std::ios::binary).get() == 22);
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	struct SaveDataDelete del {};
+	del.user_id  = 1;
+	del.title_id = &title;
+	del.dir_name = &name;
+	CHECK(SaveDataDelete(&del) == OK);
+	Reset("ISOLATE");
+	CHECK(Setup() == 0);
+	CHECK(Setup(2) == 16);
+	CHECK(Get(16, 2)[0] == 22);
 }
 
 void TestFailedWritePreservesSave() {
@@ -215,16 +245,24 @@ void TestFailedWritePreservesSave() {
 void WriteRestartFixture() {
 	auto setup   = SetupParam(7, 3);
 	setup.option = 1;
+	std::array<uint8_t, 4> icon_bytes {1, 2, 3, 4};
+	SaveDataIcon           icon {icon_bytes.data(), icon_bytes.size(), icon_bytes.size(), {}};
+	setup.init_icon        = &icon;
+	setup.icon_memory_size = icon_bytes.size();
 	SaveDataParam param {};
 	std::strcpy(param.title, "Astro progress");
 	param.user_param = 17;
 	setup.init_param = &param;
 	CHECK(SaveDataSetupSaveDataMemory2(&setup, nullptr) == OK);
 	std::array<uint8_t, 4> progress {11, 22, 33, 44};
-	CHECK(Set(progress.data(), progress.size(), 4, 7, 3) == OK);
-	SaveDataMemorySet2 set {};
-	set.user_id      = 7;
-	set.slot_id      = 3;
+	SaveDataMemoryData     data {progress.data(), progress.size(), 4, {}};
+	SaveDataMemorySet2     set {};
+	set.user_id = 7;
+	set.slot_id = 3;
+	set.data    = &data;
+	set.icon    = &icon;
+	CHECK(SaveDataSetSaveDataMemory2(&set) == OK);
+	set.data         = nullptr;
 	param.user_param = 18;
 	std::strcpy(param.detail, "Coins, level state, rescued bots");
 	set.param = &param;
@@ -240,12 +278,18 @@ void ReadRestartFixture() {
 	expected[6]   = 33;
 	expected[7]   = 44;
 	CHECK(Get(24, 7, 3) == expected);
-	SaveDataParam      param {};
-	SaveDataMemoryGet2 get {};
+	SaveDataParam          param {};
+	std::array<uint8_t, 4> icon_bytes {9, 9, 9, 9};
+	SaveDataIcon           icon {icon_bytes.data(), icon_bytes.size(), icon_bytes.size(), {}};
+	SaveDataMemoryGet2     get {};
 	get.user_id = 7;
 	get.slot_id = 3;
 	get.param   = &param;
+	get.icon    = &icon;
 	CHECK(SaveDataGetSaveDataMemory2(&get) == OK);
+	CHECK(icon.data_size == 0);
+	CHECK(
+	    std::all_of(icon_bytes.begin(), icon_bytes.end(), [](uint8_t byte) { return byte == 9; }));
 	CHECK(std::string(param.title) == "Astro progress");
 	CHECK(std::string(param.detail) == "Coins, level state, rescued bots");
 	CHECK(param.user_param == 18);
@@ -253,6 +297,92 @@ void ReadRestartFixture() {
 	CHECK(Setup(7, 3, 6) == 16);
 	expected.resize(6);
 	CHECK(Get(6, 7, 3) == expected);
+}
+
+SceSaveDataDirName DirName(const char* text) {
+	SceSaveDataDirName name {};
+	std::snprintf(name.data, sizeof(name.data), "%s", text);
+	return name;
+}
+
+std::vector<std::string> Search(int32_t user, const SceSaveDataTitleId* title = nullptr) {
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id  = user;
+	cond.title_id = title;
+	std::array<SceSaveDataDirName, 8> names {};
+	SaveDataDirNameSearchResult       result {};
+	result.dir_names     = names.data();
+	result.dir_names_num = names.size();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK);
+	CHECK(result.hit_num == result.set_num && result.set_num <= names.size());
+	std::vector<std::string> found;
+	for (uint32_t i = 0; i < result.set_num; ++i) {
+		found.emplace_back(names[i].data);
+	}
+	return found;
+}
+
+void TestClassicSavePaths() {
+	Reset("CLASSIC");
+	const std::vector<std::string> names {"save.1", "save1", "slot@A", "slotA"};
+	fs::create_directories("_SaveData/CLASSIC/save.1");
+	{
+		std::ofstream saved("_SaveData/CLASSIC/save.1/progress");
+		saved << "save.1";
+	}
+	CHECK(Search(1) == std::vector<std::string> {"save.1"});
+	for (const auto& text: names) {
+		auto                  name = DirName(text.c_str());
+		struct SaveDataMount3 mount {};
+		mount.user_id    = 1;
+		mount.dir_name   = &name;
+		mount.mount_mode = text == "save.1" ? 1 : 4;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		CHECK(g_mounted_directory == fs::path("_SaveData") / "CLASSIC" / text);
+		if (text != "save.1") {
+			std::ofstream saved(g_mounted_directory / "progress");
+			saved << text;
+		}
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	CHECK(Search(1) == names);
+	SceSaveDataTitleId title {};
+	std::strcpy(title.data, "CLASSIC");
+	Reset("OTHER");
+	CHECK(Search(1).empty());
+	CHECK(Search(1, &title) == names);
+	for (const auto& text: names) {
+		auto                             name = DirName(text.c_str());
+		struct SaveDataTransferringMount mount {};
+		mount.user_id  = 1;
+		mount.title_id = &title;
+		mount.dir_name = &name;
+		SaveDataMountResult result {};
+		CHECK(SaveDataTransferringMount(&mount, &result) == OK);
+		std::ifstream saved(g_mounted_directory / "progress");
+		std::string   progress;
+		saved >> progress;
+		CHECK(progress == text);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	Reset("CLASSIC");
+	for (const char* text: {"", ".", "..", "../save1", "save/1", "save\\1"}) {
+		auto                  name = DirName(text);
+		struct SaveDataMount3 mount {};
+		mount.user_id    = 1;
+		mount.dir_name   = &name;
+		mount.mount_mode = 32;
+		SaveDataMountResult result {};
+		g_mounted_directory.clear();
+		CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_PARAMETER);
+		CHECK(g_mounted_directory.empty());
+		struct SaveDataDelete del {};
+		del.user_id  = 1;
+		del.dir_name = &name;
+		CHECK(SaveDataDelete(&del) == SAVE_DATA_ERROR_PARAMETER);
+	}
+	CHECK(Search(1) == names);
 }
 
 void RunChild(const fs::path& executable, const char* mode) {
@@ -294,6 +424,7 @@ int main(int argc, char** argv) {
 	TestValidationAndScatter();
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
+	TestClassicSavePaths();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

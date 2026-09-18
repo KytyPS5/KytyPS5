@@ -89,6 +89,33 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void TestSaveOpenVisibility() {
+  constexpr char Path[] = "/savedata0/visible-save.dat";
+  constexpr char Payload[] = "saved progress";
+
+  const int fd = FileSystem::KernelOpen(Path, 0xa01, 0777);
+  Check(fd >= 3, "create save file exclusively");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
+        "created save file is visible before close");
+  Check(FileSystem::KernelOpen(Path, 0xa01, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_EEXIST,
+        "exclusive creation detects an open save file");
+  Check(FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+            sizeof(Payload) - 1,
+        "populate save file before truncation");
+  Check(FileSystem::KernelClose(fd) == OK, "close populated save file");
+  Check(FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_size == sizeof(Payload) - 1,
+        "save file contains the truncation fixture");
+
+  const int truncated = FileSystem::KernelOpen(Path, 0x401, 0777);
+  Check(truncated >= 3, "truncate existing save file");
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
+        "save truncation is visible before close");
+  Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
 void CheckMountRoot(const std::filesystem::path &root) {
   Common::File cache;
   Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
@@ -390,6 +417,7 @@ int main() {
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
+  TestSaveOpenVisibility();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();

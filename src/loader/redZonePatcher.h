@@ -15,7 +15,10 @@ struct RedZonePatchResult {
 	uint64_t function_count                           = 0;
 	uint64_t instruction_count                        = 0;
 	uint64_t red_zone_function_count                   = 0;
+	// Legacy memory counters include all faultable sites, including emulated #UDs.
 	uint64_t memory_instruction_count                 = 0;
+	uint64_t emulated_instruction_count               = 0;
+	uint64_t patched_emulated_instruction_count       = 0;
 	uint64_t short_memory_instruction_count           = 0;
 	uint64_t patched_memory_instruction_count         = 0;
 	uint64_t stack_dependent_memory_instruction_count = 0;

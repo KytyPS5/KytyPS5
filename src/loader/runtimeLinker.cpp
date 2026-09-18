@@ -779,6 +779,27 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void PrintHostModule(uint64_t address) {
+	MEMORY_BASIC_INFORMATION memory_info {};
+	if (::VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), &memory_info,
+	                   sizeof(memory_info)) == 0 || memory_info.AllocationBase == nullptr) {
+		return;
+	}
+
+	char module_path[32768] {};
+	const auto module = static_cast<HMODULE>(memory_info.AllocationBase);
+	const auto length = ::GetModuleFileNameA(module, module_path, sizeof(module_path));
+	if (length == 0) {
+		return;
+	}
+
+	const auto base = reinterpret_cast<uint64_t>(memory_info.AllocationBase);
+	std::printf("host module: %s base=0x%016" PRIx64 " rva=0x%016" PRIx64 "\n", module_path,
+	            base, address >= base ? address - base : 0);
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -804,6 +825,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
+	#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		PrintHostModule(info->exception_address);
+	#endif
 		char thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
@@ -2154,13 +2178,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                           protect_memory_faults, emulate_rsqrt);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64
+			     ", emulated=%" PRIu64 ", protected_emulated=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			     result.red_zone_function_count, result.memory_instruction_count,
 			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count);
+			     result.unrelocatable_memory_instruction_count,
+			     result.emulated_instruction_count, result.patched_emulated_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
 		}
 #else

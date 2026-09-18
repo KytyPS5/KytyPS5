@@ -8,6 +8,7 @@
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
@@ -46,6 +47,14 @@ static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
 	       type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_AUDIO3D ||
 	       type == AUDIO_OUT_PORT_TYPE_AUX;
+}
+
+static bool host_audio_disabled() {
+	static const bool disabled = [] {
+		const char* value = std::getenv("KYTY_DISABLE_HOST_AUDIO");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return disabled;
 }
 
 } // namespace
@@ -245,6 +254,13 @@ SDL_AudioFormat Audio::SdlFormat(Format format) {
 bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
+	// Keep the emulated port alive while allowing Astro Bot's guest audio path to run without
+	// creating the host audio worker. This is an opt-in compatibility switch for diagnostics.
+	if (host_audio_disabled()) {
+		LOGF("AudioOut: host audio disabled by KYTY_DISABLE_HOST_AUDIO\n");
+		return false;
+	}
+
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
 		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
 		return false;
@@ -362,6 +378,29 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	EXIT_IF(port == nullptr);
 
 	if (port->audio_device == 0 || data == nullptr) {
+		return false;
+	}
+
+	// AudioOut2 receives PCM pointers owned by the guest. They may be stale when a guest audio
+	// worker races a port update/destroy. Validate the complete source span before SDL or the
+	// conversion path dereferences it; AudioOutOutputs holds m_mutex while reaching this point.
+	const auto frames           = static_cast<uint64_t>(port->samples_num);
+	const auto channels         = static_cast<uint64_t>(port->channels_num);
+	const auto bytes_per_sample = static_cast<uint64_t>(BytesPerSample(port->format));
+	if (frames == 0 || channels == 0 || bytes_per_sample == 0 ||
+	    channels > UINT64_MAX / bytes_per_sample ||
+	    frames > UINT64_MAX / (channels * bytes_per_sample)) {
+		return false;
+	}
+	const auto source_size = frames * channels * bytes_per_sample;
+	if (!Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(data), source_size)) {
+		static std::atomic<uint64_t> invalid_pcm_count {0};
+		const auto count = invalid_pcm_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 4 || (count & (count - 1)) == 0) {
+			LOGF("AudioOut: ignoring unreadable PCM buffer=0x%016" PRIx64 " size=%" PRIu64
+			     " (count=%" PRIu64 ")\n",
+			     reinterpret_cast<uint64_t>(data), source_size, count);
+		}
 		return false;
 	}
 
@@ -537,7 +576,19 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0);
-	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
+
+	// Keep PortOut records stable while QueueSdlAudio reads them. AudioOut2 can submit audio from
+	// one guest worker while another worker destroys/recreates a port; validating first and then
+	// releasing m_mutex leaves a use-after-close window around SDL and the PCM pointer.
+	Common::LockGuard lock(m_mutex);
+	const auto         is_valid = [this](Id handle) {
+		const auto id = handle.GetId();
+		return id >= 0 && id < OUT_PORTS_MAX && m_out_ports[id].used;
+	};
+	EXIT_NOT_IMPLEMENTED(!is_valid(params[0].handle));
+	for (uint32_t i = 1; i < num; i++) {
+		EXIT_NOT_IMPLEMENTED(!is_valid(params[i].handle));
+	}
 
 	const auto& first_port = m_out_ports[params[0].handle.GetId()];
 

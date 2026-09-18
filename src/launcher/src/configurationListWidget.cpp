@@ -575,6 +575,16 @@ bool ConfigurationListWidget::HasValidGameDirectory() const {
 }
 
 void ConfigurationListWidget::ScanGameDirectory() {
+	// Clearing the list destroys the running game's item, so a rescan must not
+	// run while a game is active: the replacement items would lose the running
+	// state and allow editing or deleting a game that is still in use.
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item->IsRunning()) {
+			return;
+		}
+	}
+
 	m_selected_item = nullptr;
 	m_ui->cfgs_list->clear();
 	m_ui->cfgs_list->SetBackgroundImage({});

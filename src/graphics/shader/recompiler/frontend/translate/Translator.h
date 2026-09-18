@@ -123,10 +123,13 @@ private:
 	                        bool scalar, bool cmpx);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
+	void EmitInteger64Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool swap,
+	                          bool negate, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered);
-	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool half,
+	                             bool cmpx);
+	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool half, bool cmpx);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
 	void V_CVT_F32_I32(const Decoder::Instruction& inst);
@@ -143,6 +146,9 @@ private:
 	void V_CVT_PKRTZ_F16_F32(const Decoder::Instruction& inst);
 	void V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
+	void V_CVT_NORM_16_F16(const Decoder::Instruction& inst, bool signed_value);
+	void V_SAT_PK_U8_I16(const Decoder::Instruction& inst);
+	void V_CVT_PKNORM_F16(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
 	bool PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
@@ -157,6 +163,17 @@ private:
 	bool FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                  bool mix);
 	bool V_FREXP_MANT_F32(const Decoder::Instruction& inst);
+	bool V_FREXP_MANT_F16(const Decoder::Instruction& inst);
+	bool V_FREXP_EXP_I16_F16(const Decoder::Instruction& inst);
+	IR::F32 FloatMulLegacy(IR::F32 lhs, IR::F32 rhs);
+	bool    FloatLegacy(const Decoder::Instruction& inst, bool add, bool accumulator);
+	bool    V_LDEXP_F16(const Decoder::Instruction& inst);
+	bool    V_DIV_FIXUP(const Decoder::Instruction& inst, bool half);
+	bool    V_DIV_SCALE_F32(const Decoder::Instruction& inst);
+	bool    V_DIV_FMAS_F32(const Decoder::Instruction& inst);
+	bool    V_DOT2_F32_F16(const Decoder::Instruction& inst);
+	bool    DotProductInteger(const Decoder::Instruction& inst, uint32_t element_bits, bool sign,
+	                          bool accumulate_destination);
 	bool V_DOT2C_F32_F16(const Decoder::Instruction& inst);
 	bool V_CUBEID_F32(const Decoder::Instruction& inst);
 	bool V_CUBESC_F32(const Decoder::Instruction& inst);
@@ -165,7 +182,9 @@ private:
 	bool FloatCube(const Decoder::Instruction& inst, uint32_t result_kind);
 	bool Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	bool Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
-	bool V_MED3_I16(const Decoder::Instruction& inst);
+	bool Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
+	bool Integer16Mad(const Decoder::Instruction& inst, bool sign);
+	bool Integer16Mad32(const Decoder::Instruction& inst, bool sign);
 	bool PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	bool PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
@@ -188,23 +207,39 @@ private:
 	bool S_FLBIT_I32_B64(const Decoder::Instruction& inst);
 	bool Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
 	bool V_MAD_U64_U32(const Decoder::Instruction& inst);
+	bool V_MAD_I64_I32(const Decoder::Instruction& inst);
+	bool Integer24Hi(const Decoder::Instruction& inst, bool sign);
 	bool V_SAD_U32(const Decoder::Instruction& inst);
+	bool V_SAD_U8(const Decoder::Instruction& inst, bool high);
+	bool V_SAD_U16(const Decoder::Instruction& inst);
+	bool V_MSAD_U8(const Decoder::Instruction& inst);
+	bool V_LERP_U8(const Decoder::Instruction& inst);
+	bool V_PERM_B32(const Decoder::Instruction& inst);
 	bool V_ADD3_U32(const Decoder::Instruction& inst);
 	bool S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	bool S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	bool V_BCNT_U32_B32(const Decoder::Instruction& inst);
 	bool V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low);
 	bool S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst);
+	IR::U32 QuadMask32(IR::U32 value);
+	bool S_QUADMASK_B32(const Decoder::Instruction& inst);
 	bool S_QUADMASK_B64(const Decoder::Instruction& inst);
+	bool S_BREV_B64(const Decoder::Instruction& inst);
+	bool S_SEXT_I32(const Decoder::Instruction& inst, uint32_t bits);
+	bool S_BCNT0(const Decoder::Instruction& inst, bool wide);
+	bool S_FF0(const Decoder::Instruction& inst, bool wide);
+	bool S_FLBIT_I32_I64(const Decoder::Instruction& inst);
 	bool BFM_B32(const Decoder::Instruction& inst);
 	IR::U32 RightMask32(IR::U32 count);
 	IR::U64 RightMask64(IR::U32 count);
 	bool    S_BFM_B64(const Decoder::Instruction& inst);
 	bool    S_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	bool    S_BFE_U64(const Decoder::Instruction& inst);
+	bool    S_BFE_I64(const Decoder::Instruction& inst);
 	bool    V_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	bool    V_BFI_B32(const Decoder::Instruction& inst);
 	bool    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
+	bool    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	bool    V_ALIGNBIT_B32(const Decoder::Instruction& inst);
 	bool    V_ALIGNBYTE_B32(const Decoder::Instruction& inst);
 	bool    V_LSHL_ADD_U32(const Decoder::Instruction& inst);
@@ -216,7 +251,9 @@ private:
 
 	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
-	                bool negate_source, bool write_64);
+	                bool negate_source, bool write_64, bool negate_result = false,
+	                bool write_result = false);
+	void S_GETREG_B32(const Decoder::Instruction& inst);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
 	void SUB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
 	void SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
@@ -239,12 +276,14 @@ private:
 	void S_WQM(const Decoder::Instruction& inst, bool wide);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
+	void V_SWAP_B32(const Decoder::Instruction& inst);
 	void V_READFIRSTLANE_B32(const Decoder::Instruction& inst);
 	void V_READLANE_B32(const Decoder::Instruction& inst);
 	void V_WRITELANE_B32(const Decoder::Instruction& inst);
 	void V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16);
 	void V_INTERP_P1_F32();
 	void V_INTERP_P2_F32(const Decoder::Instruction& inst);
+	void V_INTERP_P2_F16(const Decoder::Instruction& inst);
 	void V_INTERP_MOV_F32(const Decoder::Instruction& inst);
 	void EXP(const Decoder::Instruction& inst);
 

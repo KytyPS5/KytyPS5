@@ -239,6 +239,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
+			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B32:
 			case Decoder::Opcode::DS_WRITE_B64:
@@ -900,6 +901,21 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
 
+		// Scalar cache maintenance has no counterpart once every memory access goes through the
+		// host allocation directly.
+		case Decoder::Opcode::S_DCACHE_INV:
+		case Decoder::Opcode::S_DCACHE_WB:
+		case Decoder::Opcode::S_GL1_INV: EmitControlNop(); return true;
+		// No wave clock or workgroup wave identity is modelled, so both read back as zero.
+		case Decoder::Opcode::S_MEMTIME:
+		case Decoder::Opcode::S_MEMREALTIME:
+			WriteOperand(inst.dst,
+			             ir.ConstructU64(IR::U32(IR::Value(0u)), IR::U32(IR::Value(0u))));
+			return true;
+		case Decoder::Opcode::S_GET_WAVEID_IN_WORKGROUP:
+			WriteOperand(inst.dst, IR::Value(0u));
+			return true;
+
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
@@ -938,6 +954,26 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicCmpSwap32);
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP_X2:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap64);
+		case Decoder::Opcode::BUFFER_ATOMIC_INC:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicInc32);
+		case Decoder::Opcode::BUFFER_ATOMIC_DEC:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicDec32);
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
+		case Decoder::Opcode::BUFFER_ATOMIC_SUB_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicISub64);
+		case Decoder::Opcode::BUFFER_ATOMIC_SMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMin64);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin64);
+		case Decoder::Opcode::BUFFER_ATOMIC_SMAX_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMax64);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMAX_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMax64);
+		case Decoder::Opcode::BUFFER_ATOMIC_AND_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicAnd64);
+		case Decoder::Opcode::BUFFER_ATOMIC_XOR_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicXor64);
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd32);
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
@@ -969,6 +1005,11 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd32, true);
 		case Decoder::Opcode::DS_SUB_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, false);
+		case Decoder::Opcode::DS_INC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, false);
+		case Decoder::Opcode::DS_DEC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, false);
+		case Decoder::Opcode::DS_NOP: EmitControlNop(); return true;
 		case Decoder::Opcode::DS_SUB_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, true);
 		case Decoder::Opcode::DS_INC_RTN_U32:
@@ -1009,6 +1050,15 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32,
 			                    IR::ValueOpcode::ImageAtomicSwap64);
+		case Decoder::Opcode::IMAGE_ATOMIC_SUB:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicISub32,
+			                    IR::ValueOpcode::ImageAtomicISub64);
+		case Decoder::Opcode::IMAGE_ATOMIC_SMIN:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMin32,
+			                    IR::ValueOpcode::ImageAtomicSMin64);
+		case Decoder::Opcode::IMAGE_ATOMIC_SMAX:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMax32,
+			                    IR::ValueOpcode::ImageAtomicSMax64);
 		case Decoder::Opcode::IMAGE_ATOMIC_ADD:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicIAdd32,
 			                    IR::ValueOpcode::ImageAtomicIAdd64);
@@ -1051,6 +1101,23 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
+		case Decoder::Opcode::IMAGE_GATHER4:
+		case Decoder::Opcode::IMAGE_GATHER4_CL:
+		case Decoder::Opcode::IMAGE_GATHER4_B:
+		case Decoder::Opcode::IMAGE_GATHER4_B_CL:
+		case Decoder::Opcode::IMAGE_GATHER4_O:
+		case Decoder::Opcode::IMAGE_GATHER4_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_L_O:
+		case Decoder::Opcode::IMAGE_GATHER4_B_O:
+		case Decoder::Opcode::IMAGE_GATHER4_B_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_CL:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_CL:
+		case Decoder::Opcode::IMAGE_GATHER4_C_CL_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Decoder::Opcode::IMAGE_GATHER4_L:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
@@ -1080,6 +1147,10 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_READ_U8:
 		case Decoder::Opcode::DS_READ_I16:
 		case Decoder::Opcode::DS_READ_U16:
+		case Decoder::Opcode::DS_READ_U8_D16:
+		case Decoder::Opcode::DS_READ_U8_D16_HI:
+		case Decoder::Opcode::DS_READ_I8_D16:
+		case Decoder::Opcode::DS_READ_I8_D16_HI:
 		case Decoder::Opcode::DS_READ_U16_D16:
 		case Decoder::Opcode::DS_READ_U16_D16_HI:
 		case Decoder::Opcode::DS_READ_B32:
@@ -1092,6 +1163,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRITE2ST64_B64: return DS_WRITE2(inst);
 		case Decoder::Opcode::DS_WRITE_B8:
 		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B32:
 		case Decoder::Opcode::DS_WRITE_B64:

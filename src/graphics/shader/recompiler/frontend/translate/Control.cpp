@@ -49,8 +49,11 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 	}
 }
 
+// WREXEC opcodes write the new mask instead of the saved one; the N-suffixed opcodes negate the
+// operation's result, the EXEC operand, or the scalar source before combining them.
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
-                            bool negate_exec, bool negate_source, bool write_64) {
+                            bool negate_exec, bool negate_source, bool write_64,
+                            bool negate_result, bool write_result) {
 	if (!write_64) {
 		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
 		const auto old = ir.GetExecLo();
@@ -61,19 +64,26 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		switch (operation) {
 			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
+			case IR::ValueOpcode::LogicalXor: result = ir.BitwiseXor(lhs, rhs); break;
 			default: EXIT("unsupported SAVEEXEC operation");
 		}
-		WriteRawU32(inst.dst, old);
+		if (negate_result) {
+			result = ir.BitwiseNot(result);
+		}
+		WriteRawU32(inst.dst, write_result ? result : old);
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo), result);
 		ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 		return;
 	}
-	const auto old    = ir.GetExec();
-	const auto src    = ReadMask(inst.src0);
-	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
-	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
-	WriteMask(inst.dst, old, true);
+	const auto old = ir.GetExec();
+	const auto src = ReadMask(inst.src0);
+	const auto lhs = negate_exec ? ir.LogicalNot(old) : old;
+	const auto rhs = negate_source ? ir.LogicalNot(src) : src;
+	auto       result = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	if (negate_result) {
+		result = ir.LogicalNot(result);
+	}
+	WriteMask(inst.dst, write_result ? result : old, true);
 	const auto mask = BallotMask(result);
 	ir.SetExec(result);
 	ir.SetExecLo(mask[0]);
@@ -372,6 +382,24 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
 		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
 	}
+}
+
+// The hardware registers the ISA exposes here carry mode, status and trap state that this
+// translation never models, so every field reads back as zero.
+void Translator::S_GETREG_B32(const Decoder::Instruction& inst) {
+	WriteOperand(DestinationOperand(inst), IR::Value(0u));
+}
+
+void Translator::V_SWAP_B32(const Decoder::Instruction& inst) {
+	if (inst.dst.kind != Decoder::OperandKind::Vgpr ||
+	    inst.src0.kind != Decoder::OperandKind::Vgpr) {
+		EXIT("V_SWAP_B32 requires VGPR source and destination at pc 0x%08x", inst.pc);
+	}
+	const auto destination = DestinationOperand(inst);
+	const auto source      = ReadU32(inst.src0);
+	const auto previous    = ReadU32(destination);
+	WriteOperand(destination, source);
+	WriteOperand(inst.src0, previous);
 }
 
 void Translator::V_READFIRSTLANE_B32(const Decoder::Instruction& inst) {

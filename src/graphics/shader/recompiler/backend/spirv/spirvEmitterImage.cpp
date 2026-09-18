@@ -705,6 +705,9 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
 		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicISub32: return spv::OpAtomicISub;
+		case IR::ValueOpcode::ImageAtomicSMin32: return spv::OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicSMax32: return spv::OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicUMin32: return spv::OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicUMax32: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
@@ -712,6 +715,9 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
 		case IR::ValueOpcode::ImageAtomicSwap64: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd64: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicISub64: return spv::OpAtomicISub;
+		case IR::ValueOpcode::ImageAtomicSMin64: return spv::OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicSMax64: return spv::OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicUMin64: return spv::OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicUMax64: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::ImageAtomicAnd64: return spv::OpAtomicAnd;
@@ -879,12 +885,23 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				         coord,
 				         ConstantU32(state, component)};
 			}
+			// Image operands are encoded in ascending bit order, so the bias precedes any offset.
+			uint32_t              gather_mask = 0;
+			std::vector<uint32_t> gather_operands;
+			if (layout.bias != NoImageComponent) {
+				gather_mask |= spv::ImageOperandsBiasMask;
+				gather_operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
+			}
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-				words.push_back(spv::ImageOperandsConstOffsetsMask);
-				words.push_back(HorizontalOffsets(state, dimension));
+				gather_mask |= spv::ImageOperandsConstOffsetsMask;
+				gather_operands.push_back(HorizontalOffsets(state, dimension));
 			} else if (layout.offset != NoImageComponent) {
-				words.push_back(spv::ImageOperandsOffsetMask);
-				words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
+				gather_mask |= spv::ImageOperandsOffsetMask;
+				gather_operands.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
+			}
+			if (gather_mask != 0u) {
+				words.push_back(gather_mask);
+				words.insert(words.end(), gather_operands.begin(), gather_operands.end());
 			}
 			state.builder.AddFunction(words);
 			auto result_numeric_class = numeric_class;

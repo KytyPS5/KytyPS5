@@ -21,6 +21,9 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
+    {0x1fu, Opcode::S_GL1_INV},                    {0x20u, Opcode::S_DCACHE_INV},
+    {0x21u, Opcode::S_DCACHE_WB},                  {0x24u, Opcode::S_MEMTIME, 2, 32},
+    {0x25u, Opcode::S_MEMREALTIME, 2, 32},         {0x2au, Opcode::S_GET_WAVEID_IN_WORKGROUP},
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
@@ -59,8 +62,18 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x3bu, Opcode::BUFFER_ATOMIC_XOR, 1, 32},
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
+    {0x3cu, Opcode::BUFFER_ATOMIC_INC, 1, 32},
+    {0x3du, Opcode::BUFFER_ATOMIC_DEC, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
+    {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
+    {0x53u, Opcode::BUFFER_ATOMIC_SUB_X2, 2, 32},
+    {0x55u, Opcode::BUFFER_ATOMIC_SMIN_X2, 2, 32},
+    {0x56u, Opcode::BUFFER_ATOMIC_UMIN_X2, 2, 32},
+    {0x57u, Opcode::BUFFER_ATOMIC_SMAX_X2, 2, 32},
+    {0x58u, Opcode::BUFFER_ATOMIC_UMAX_X2, 2, 32},
+    {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
+    {0x5bu, Opcode::BUFFER_ATOMIC_XOR_X2, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -86,6 +99,8 @@ constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x00u, Opcode::DS_ADD_U32, 1, 32},          {0x01u, Opcode::DS_SUB_U32, 1, 32},
+    {0x03u, Opcode::DS_INC_U32, 1, 32},          {0x04u, Opcode::DS_DEC_U32, 1, 32},
+    {0x14u, Opcode::DS_NOP, 1, 32},
     {0x05u, Opcode::DS_MIN_I32, 1, 32},          {0x06u, Opcode::DS_MAX_I32, 1, 32},
     {0x07u, Opcode::DS_MIN_U32, 1, 32},          {0x08u, Opcode::DS_MAX_U32, 1, 32},
     {0x09u, Opcode::DS_AND_B32, 1, 32},          {0x0au, Opcode::DS_OR_B32, 1, 32},
@@ -107,7 +122,12 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
+    {0xa0u, Opcode::DS_WRITE_B8_D16_HI, 1, 8},
     {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
+    {0xa2u, Opcode::DS_READ_U8_D16, 1, 8},
+    {0xa3u, Opcode::DS_READ_U8_D16_HI, 1, 8},
+    {0xa4u, Opcode::DS_READ_I8_D16, 1, 8, true},
+    {0xa5u, Opcode::DS_READ_I8_D16_HI, 1, 8, true},
     {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
     {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
@@ -147,6 +167,7 @@ bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B8_D16_HI:
 		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
@@ -166,6 +187,8 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_U32:
+		case Opcode::DS_DEC_U32:
 		case Opcode::DS_INC_RTN_U32:
 		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
@@ -421,15 +444,19 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
-	if (inst.opcode == Opcode::DS_READ_U16_D16 ||
-	    inst.opcode == Opcode::DS_READ_U16_D16_HI) {
+	if (inst.opcode == Opcode::DS_READ_U8_D16 || inst.opcode == Opcode::DS_READ_I8_D16 ||
+	    inst.opcode == Opcode::DS_READ_U16_D16) {
 		// Native D16 reads update only the selected destination half. Reuse the partial
 		// destination representation so typed IR translation preserves the other half.
-		inst.dst.sdwa_sel = inst.opcode == Opcode::DS_READ_U16_D16 ? 4u : 5u;
+		inst.dst.sdwa_sel = 4u;
+	}
+	if (inst.opcode == Opcode::DS_READ_U8_D16_HI || inst.opcode == Opcode::DS_READ_I8_D16_HI ||
+	    inst.opcode == Opcode::DS_READ_U16_D16_HI) {
+		inst.dst.sdwa_sel = 5u;
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	DecodeVectorGpr(data0, inst.src1);
-	if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI) {
+	if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI || inst.opcode == Opcode::DS_WRITE_B8_D16_HI) {
 		inst.src1.sdwa_sel = 5u;
 	}
 	DecodeVectorGpr(data1, inst.src2);

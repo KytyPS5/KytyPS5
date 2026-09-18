@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <limits>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -242,6 +243,173 @@ bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 		default: EXIT("invalid cube result kind");
 	}
 	WriteOperand(DestinationOperand(inst), result);
+	return true;
+}
+
+// Half-precision frexp works on the raw 16-bit encoding: the mantissa keeps its bits and the
+// exponent is replaced by the one that puts the value in [0.5, 1).
+bool Translator::V_FREXP_MANT_F16(const Decoder::Instruction& inst) {
+	const auto bits = ReadF16LaneBits(inst.src0, false);
+	const auto exponent =
+	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(10u), IR::Value(5u)}));
+	const auto mantissa = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x03ffu)));
+	const auto sign     = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x8000u)));
+	const auto base     = ir.BitwiseOr(sign, IR::U32(IR::Value(0x3800u)));
+	const auto normal   = ir.BitwiseOr(base, mantissa);
+	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {mantissa}));
+	const auto shift    = ir.ISub(IR::U32(IR::Value(10u)), msb);
+	const auto fraction =
+	    ir.BitwiseAnd(ir.ShiftLeftLogical(mantissa, shift), IR::U32(IR::Value(0x03ffu)));
+	const auto subnormal = ir.BitwiseOr(base, fraction);
+	const auto zero      = ir.IEqual(mantissa, IR::U32(IR::Value(0u)));
+	const auto finite    = ir.Select(ir.INotEqual(exponent, IR::U32(IR::Value(0u))), normal,
+	                                 ir.Select(zero, bits, subnormal));
+	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0x1fu))), bits, finite);
+	Write16Bits(DestinationOperand(inst), result);
+	return true;
+}
+
+bool Translator::V_FREXP_EXP_I16_F16(const Decoder::Instruction& inst) {
+	const auto bits = ReadF16LaneBits(inst.src0, false);
+	const auto exponent =
+	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(10u), IR::Value(5u)}));
+	const auto mantissa  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x03ffu)));
+	const auto normal    = ir.ISub(exponent, IR::U32(IR::Value(14u)));
+	const auto msb       = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {mantissa}));
+	const auto subnormal = ir.ISub(msb, IR::U32(IR::Value(23u)));
+	const auto denormal  = ir.Select(ir.INotEqual(mantissa, IR::U32(IR::Value(0u))), subnormal,
+	                                 IR::U32(IR::Value(0u)));
+	const auto finite    = ir.Select(ir.INotEqual(exponent, IR::U32(IR::Value(0u))), normal,
+	                                 denormal);
+	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0x1fu))),
+	                                 IR::U32(IR::Value(0u)), finite);
+	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+	return true;
+}
+
+// The legacy multiply returns +0.0 whenever either operand is zero, even against NaN or infinity.
+IR::F32 Translator::FloatMulLegacy(IR::F32 lhs, IR::F32 rhs) {
+	const auto zero    = IR::F32(IR::Value::F32(0.0f));
+	const auto product = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {lhs, rhs}));
+	const auto either_zero =
+	    ir.LogicalOr(IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {lhs, zero})),
+	                 IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {rhs, zero})));
+	return SelectF32(either_zero, zero, product);
+}
+
+bool Translator::FloatLegacy(const Decoder::Instruction& inst, bool add, bool accumulator) {
+	const auto lhs = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
+	const auto rhs = IR::F32(ReadOperand(inst.src1, IR::Type::F32));
+	auto       result = FloatMulLegacy(lhs, rhs);
+	if (add) {
+		const auto& addend_operand = accumulator ? inst.dst : inst.src2;
+		const auto  addend         = IR::F32(ReadOperand(addend_operand, IR::Type::F32));
+		result = IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {result, addend}));
+	}
+	WriteOperand(DestinationOperand(inst), result);
+	return true;
+}
+
+bool Translator::V_LDEXP_F16(const Decoder::Instruction& inst) {
+	const auto value = ReadF16AsF32(inst.src0);
+	WriteF16(DestinationOperand(inst),
+	         IR::F32(ir.Emit(IR::ValueOpcode::FPLdexp, {value, ReadU32(inst.src1)})));
+	return true;
+}
+
+// Division fix-up applies the special-case numerics of a divide to the quotient the reciprocal
+// sequence produced. S0 is that quotient, S1 the denominator and S2 the numerator.
+bool Translator::V_DIV_FIXUP(const Decoder::Instruction& inst, bool half) {
+	const auto read = [&](const Decoder::Operand& operand) {
+		return half ? ReadF16AsF32(operand) : IR::F32(ReadOperand(operand, IR::Type::F32));
+	};
+	const auto quotient    = read(inst.src0);
+	const auto denominator = read(inst.src1);
+	const auto numerator   = read(inst.src2);
+	const auto zero        = IR::F32(IR::Value::F32(0.0f));
+	const auto infinity    = IR::F32(IR::Value::F32(std::numeric_limits<float>::infinity()));
+	const auto quiet_nan =
+	    ir.BitCastF32(IR::U32(IR::Value(0xffc00000u)));
+	const auto is_nan = [&](IR::F32 value) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {value}));
+	};
+	const auto is_zero = [&](IR::F32 value) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {value, zero}));
+	};
+	const auto is_infinite = [&](IR::F32 value) {
+		return IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32,
+		                      {IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value})), infinity}));
+	};
+	const auto sign_bit = [&](IR::F32 value) {
+		return ir.ShiftRightLogical(ir.BitCastU32(value), IR::U32(IR::Value(31u)));
+	};
+	const auto negative_result =
+	    ir.INotEqual(ir.BitwiseXor(sign_bit(denominator), sign_bit(numerator)),
+	                 IR::U32(IR::Value(0u)));
+	const auto magnitude    = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {quotient}));
+	const auto signed_value = SelectF32(negative_result,
+	                                    IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {magnitude})),
+	                                    magnitude);
+	const auto signed_infinity =
+	    SelectF32(negative_result, IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {infinity})),
+	              infinity);
+	const auto signed_zero =
+	    SelectF32(negative_result, IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {zero})), zero);
+	auto result = signed_value;
+	result      = SelectF32(ir.LogicalOr(is_infinite(denominator), is_zero(numerator)), signed_zero,
+	                        result);
+	result = SelectF32(ir.LogicalOr(is_zero(denominator), is_infinite(numerator)), signed_infinity,
+	                   result);
+	result = SelectF32(ir.LogicalAnd(is_infinite(denominator), is_infinite(numerator)), quiet_nan,
+	                   result);
+	result = SelectF32(ir.LogicalAnd(is_zero(denominator), is_zero(numerator)), quiet_nan, result);
+	result = SelectF32(is_nan(denominator), quiet_nan, result);
+	result = SelectF32(is_nan(numerator), quiet_nan, result);
+	if (half) {
+		WriteF16(DestinationOperand(inst), result);
+	} else {
+		WriteOperand(DestinationOperand(inst), result);
+	}
+	return true;
+}
+
+// The architectural scaling only protects the Newton-Raphson iteration from exponents that would
+// make the intermediate reciprocal overflow or flush to zero. Passing the operand through unscaled
+// keeps every other quotient exact and leaves the post-scale flag clear for V_DIV_FMAS_F32.
+bool Translator::V_DIV_SCALE_F32(const Decoder::Instruction& inst) {
+	WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));
+	if (inst.dst2.kind != Decoder::OperandKind::Null &&
+	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
+		WriteMask(inst.dst2, IR::U1(IR::Value(false)));
+	}
+	return true;
+}
+
+bool Translator::V_DIV_FMAS_F32(const Decoder::Instruction& inst) {
+	const auto value = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32,
+	                                   {ReadOperand(inst.src0, IR::Type::F32),
+	                                    ReadOperand(inst.src1, IR::Type::F32),
+	                                    ReadOperand(inst.src2, IR::Type::F32)}));
+	// VCC carries the post-scale request produced by V_DIV_SCALE_F32.
+	const auto scaled = IR::F32(
+	    ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(4294967296.0f)}));
+	WriteOperand(DestinationOperand(inst), SelectF32(ir.GetVcc(), scaled, value));
+	return true;
+}
+
+bool Translator::V_DOT2_F32_F16(const Decoder::Instruction& inst) {
+	auto a      = inst.src0;
+	a.op_sel    = false;
+	a.op_sel_hi = true;
+	auto b      = inst.src1;
+	b.op_sel    = false;
+	b.op_sel_hi = true;
+	const auto low = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32,
+	                                 {ReadF16LaneAsF32(a, false), ReadF16LaneAsF32(b, false),
+	                                  ReadOperand(inst.src2, IR::Type::F32)}));
+	WriteOperand(DestinationOperand(inst),
+	             ir.Emit(IR::ValueOpcode::FPFma32,
+	                     {ReadF16LaneAsF32(a, true), ReadF16LaneAsF32(b, true), low}));
 	return true;
 }
 

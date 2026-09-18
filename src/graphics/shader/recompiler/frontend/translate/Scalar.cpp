@@ -17,13 +17,71 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return true;
 		case O::S_CSELECT_B32: ScalarSelect32(inst, inst.src1); return true;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return true;
-		case O::S_CMOV_B32: ScalarSelect32(inst, inst.dst); return true;
+		case O::S_CMOV_B32:
+		case O::S_CMOVK_I32: ScalarSelect32(inst, inst.dst); return true;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return true;
-		case O::S_SETREG_B32: EmitControlNop(); return true;
+		case O::S_SETREG_B32:
+		case O::S_SETREG_IMM32_B32:
+		case O::S_VERSION: EmitControlNop(); return true;
+		case O::S_GETREG_B32: S_GETREG_B32(inst); return true;
 		case O::S_WAITCNT: EmitWaitcnt(); return true;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
+			return true;
+		case O::S_OR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false);
+			return true;
+		case O::S_XOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false);
+			return true;
+		case O::S_ANDN2_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false);
+			return true;
+		case O::S_NAND_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false, true);
+			return true;
+		case O::S_NOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false, true);
+			return true;
+		case O::S_XNOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false, true);
+			return true;
+		case O::S_ORN1_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, false);
+			return true;
+		case O::S_ANDN1_WREXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false, false, true);
+			return true;
+		case O::S_ANDN2_WREXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false, false, true);
+			return true;
+		case O::S_OR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true);
+			return true;
+		case O::S_XOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true);
+			return true;
+		case O::S_ANDN2_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true);
+			return true;
+		case O::S_NAND_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true, true);
+			return true;
+		case O::S_NOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true, true);
+			return true;
+		case O::S_XNOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true, true);
+			return true;
+		case O::S_ORN1_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, true);
+			return true;
+		case O::S_ANDN1_WREXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true, false, true);
+			return true;
+		case O::S_ANDN2_WREXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true, false, true);
 			return true;
 		case O::S_ANDN1_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
@@ -194,35 +252,63 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_XNOR_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseXor32, false, true, true);
 		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst);
+		case O::S_FF0_I32_B32: return S_FF0(inst, false);
+		case O::S_FF0_I32_B64: return S_FF0(inst, true);
+		case O::S_BCNT0_I32_B32: return S_BCNT0(inst, false);
+		case O::S_BCNT0_I32_B64: return S_BCNT0(inst, true);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
 		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
+		case O::S_FLBIT_I32: return V_FFBH_32(inst, true);
+		case O::S_FLBIT_I32_I64: return S_FLBIT_I32_I64(inst);
+		case O::S_SEXT_I32_I8: return S_SEXT_I32(inst, 8u);
+		case O::S_SEXT_I32_I16: return S_SEXT_I32(inst, 16u);
+		case O::S_BREV_B64: return S_BREV_B64(inst);
 
 		case O::S_BITSET0_B32: return S_BITSET_B32(inst, false);
 		case O::S_BITSET1_B32: return S_BITSET_B32(inst, true);
 		case O::S_BITSET0_B64: return S_BITSET_B64(inst, false);
 		case O::S_BITSET1_B64: return S_BITSET_B64(inst, true);
 		case O::S_BITREPLICATE_B64_B32: return S_BITREPLICATE_B64_B32(inst);
+		case O::S_QUADMASK_B32: return S_QUADMASK_B32(inst);
 		case O::S_QUADMASK_B64: return S_QUADMASK_B64(inst);
 		case O::S_BFM_B32: return BFM_B32(inst);
 		case O::S_BFM_B64: return S_BFM_B64(inst);
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);
 		case O::S_BFE_I32: return S_BFE_U32(inst, true);
 		case O::S_BFE_U64: return S_BFE_U64(inst);
+		case O::S_BFE_I64: return S_BFE_I64(inst);
 		case O::S_BITCMP0_B32: return S_BITCMP_B32(inst, false);
 		case O::S_BITCMP1_B32: return S_BITCMP_B32(inst, true);
+		case O::S_BITCMP0_B64: return S_BITCMP_B64(inst, false);
+		case O::S_BITCMP1_B64: return S_BITCMP_B64(inst, true);
 		case O::S_PACK_LL_B32_B16: return PackB16(inst, false, false);
 		case O::S_PACK_LH_B32_B16: return PackB16(inst, false, true);
 		case O::S_PACK_HH_B32_B16: return PackB16(inst, true, true);
 
 		case O::S_NOP:
 		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGUSER:
+		case O::S_CBRANCH_CDBGSYS_OR_USER:
+		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
+		case O::S_WAKEUP:
+		case O::S_SETKILL:
+		case O::S_SETHALT:
+		case O::S_ICACHE_INV:
+		case O::S_INCPERFLEVEL:
+		case O::S_DECPERFLEVEL:
+		case O::S_CLAUSE:
+		case O::S_ROUND_MODE:
+		case O::S_DENORM_MODE:
 		case O::S_TRAP: EmitControlNop(); return true;
-		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return true;
+		case O::S_WAITCNT_DEPCTR:
+		case O::S_WAIT_IDLE: EmitWaitcnt(); return true;
 		case O::S_BARRIER: S_BARRIER(); return true;
-		case O::S_SENDMSG: S_SENDMSG(inst); return true;
-		case O::S_TTRACEDATA: S_TTRACEDATA(); return true;
+		case O::S_SENDMSG:
+		case O::S_SENDMSGHALT: S_SENDMSG(inst); return true;
+		case O::S_TTRACEDATA:
+		case O::S_TTRACEDATA_IMM: S_TTRACEDATA(); return true;
 		case O::S_INST_PREFETCH: S_INST_PREFETCH(); return true;
 		case O::S_BRANCH:
 		case O::S_CBRANCH_SCC0:

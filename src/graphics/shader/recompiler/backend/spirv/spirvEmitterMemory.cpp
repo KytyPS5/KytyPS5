@@ -521,23 +521,31 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
+		case IR::ValueOpcode::BufferAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
+		case IR::ValueOpcode::BufferAtomicISub64:
 		case IR::ValueOpcode::SharedAtomicISub32: return spv::OpAtomicISub;
 		case IR::ValueOpcode::BufferAtomicSMin32:
+		case IR::ValueOpcode::BufferAtomicSMin64:
 		case IR::ValueOpcode::SharedAtomicSMin32: return spv::OpAtomicSMin;
 		case IR::ValueOpcode::BufferAtomicUMin32:
+		case IR::ValueOpcode::BufferAtomicUMin64:
 		case IR::ValueOpcode::SharedAtomicUMin32: return spv::OpAtomicUMin;
 		case IR::ValueOpcode::BufferAtomicSMax32:
+		case IR::ValueOpcode::BufferAtomicSMax64:
 		case IR::ValueOpcode::SharedAtomicSMax32: return spv::OpAtomicSMax;
 		case IR::ValueOpcode::BufferAtomicUMax32:
+		case IR::ValueOpcode::BufferAtomicUMax64:
 		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
 		case IR::ValueOpcode::BufferAtomicAnd32:
+		case IR::ValueOpcode::BufferAtomicAnd64:
 		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
+		case IR::ValueOpcode::BufferAtomicXor64:
 		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
 		default: return spv::OpNop;
 	}
@@ -1120,9 +1128,13 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		StoreWord(ctx, inst, mem);
 }
 
+// The wrapping increment and decrement have no single SPIR-V atomic, so both shared and buffer
+// memory go through the read-modify-write loop.
 uint32_t EmitSharedIncDec(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto replacement =
-	    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicInc32 ? AtomicIncrement : AtomicDecrement;
+	const auto opcode      = inst.GetOpcode();
+	const bool increment   = opcode == IR::ValueOpcode::SharedAtomicInc32 ||
+	                       opcode == IR::ValueOpcode::BufferAtomicInc32;
+	const auto replacement = increment ? AtomicIncrement : AtomicDecrement;
 	return EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement);
 }
 

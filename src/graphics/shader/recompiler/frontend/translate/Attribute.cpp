@@ -81,6 +81,15 @@ void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {
 	WriteOperand(inst.dst, value);
 }
 
+// The half-precision pair splits interpolation the same way the 32-bit one does: the P1 halves
+// only build the partial product this translation never needs, and P2 reads the finished
+// attribute.
+void Translator::V_INTERP_P2_F16(const Decoder::Instruction& inst) {
+	const auto value = IR::U32(ir.Emit(IR::ValueOpcode::GetAttribute,
+	                                   {IR::Value(inst.src1.value), IR::Value(inst.src2.value)}));
+	WriteF16(inst.dst, ir.BitCastF32(value));
+}
+
 void Translator::V_INTERP_MOV_F32(const Decoder::Instruction& inst) {
 	if (inst.src0.value >= 3u) {
 		EXIT("v_interp_mov_f32 mode %u is reserved at pc 0x%08x", inst.src0.value, inst.pc);
@@ -108,7 +117,10 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 
 bool Translator::EmitInterpolation(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::V_INTERP_P1_F32: V_INTERP_P1_F32(); return true;
+		case Decoder::Opcode::V_INTERP_P1_F32:
+		case Decoder::Opcode::V_INTERP_P1LL_F16:
+		case Decoder::Opcode::V_INTERP_P1LV_F16: V_INTERP_P1_F32(); return true;
+		case Decoder::Opcode::V_INTERP_P2_F16: V_INTERP_P2_F16(inst); return true;
 		case Decoder::Opcode::V_INTERP_P2_F32: V_INTERP_P2_F32(inst); return true;
 		case Decoder::Opcode::V_INTERP_MOV_F32: V_INTERP_MOV_F32(inst); return true;
 		default: return false;

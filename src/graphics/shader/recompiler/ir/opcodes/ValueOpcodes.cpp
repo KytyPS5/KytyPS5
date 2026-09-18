@@ -115,6 +115,16 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicSwap32:
 		case ValueOpcode::BufferAtomicCmpSwap32:
 		case ValueOpcode::BufferAtomicSwap64:
+		case ValueOpcode::BufferAtomicIAdd64:
+		case ValueOpcode::BufferAtomicISub64:
+		case ValueOpcode::BufferAtomicSMin64:
+		case ValueOpcode::BufferAtomicUMin64:
+		case ValueOpcode::BufferAtomicSMax64:
+		case ValueOpcode::BufferAtomicUMax64:
+		case ValueOpcode::BufferAtomicAnd64:
+		case ValueOpcode::BufferAtomicXor64:
+		case ValueOpcode::BufferAtomicInc32:
+		case ValueOpcode::BufferAtomicDec32:
 		case ValueOpcode::BufferAtomicIAdd32:
 		case ValueOpcode::BufferAtomicISub32:
 		case ValueOpcode::BufferAtomicSMin32:
@@ -135,6 +145,14 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::BufferAtomicSwap64:
 		case ValueOpcode::BufferAtomicOr64:
+		case ValueOpcode::BufferAtomicIAdd64:
+		case ValueOpcode::BufferAtomicISub64:
+		case ValueOpcode::BufferAtomicSMin64:
+		case ValueOpcode::BufferAtomicUMin64:
+		case ValueOpcode::BufferAtomicSMax64:
+		case ValueOpcode::BufferAtomicUMax64:
+		case ValueOpcode::BufferAtomicAnd64:
+		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
 		case ValueOpcode::LoadBufferU32x3:
@@ -215,6 +233,9 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
 		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicIAdd32:
+		case ValueOpcode::ImageAtomicISub32:
+		case ValueOpcode::ImageAtomicSMin32:
+		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicUMin32:
 		case ValueOpcode::ImageAtomicUMax32:
 		case ValueOpcode::ImageAtomicAnd32:
@@ -222,6 +243,9 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicXor32:
 		case ValueOpcode::ImageAtomicSwap64:
 		case ValueOpcode::ImageAtomicIAdd64:
+		case ValueOpcode::ImageAtomicISub64:
+		case ValueOpcode::ImageAtomicSMin64:
+		case ValueOpcode::ImageAtomicSMax64:
 		case ValueOpcode::ImageAtomicUMin64:
 		case ValueOpcode::ImageAtomicUMax64:
 		case ValueOpcode::ImageAtomicAnd64:

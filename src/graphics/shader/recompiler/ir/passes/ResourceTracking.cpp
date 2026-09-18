@@ -630,6 +630,9 @@ private:
 		switch (op) {
 			case ValueOpcode::ImageAtomicSwap64:
 			case ValueOpcode::ImageAtomicIAdd64:
+			case ValueOpcode::ImageAtomicISub64:
+			case ValueOpcode::ImageAtomicSMin64:
+			case ValueOpcode::ImageAtomicSMax64:
 			case ValueOpcode::ImageAtomicUMin64:
 			case ValueOpcode::ImageAtomicUMax64:
 			case ValueOpcode::ImageAtomicAnd64:

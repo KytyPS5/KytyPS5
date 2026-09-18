@@ -172,6 +172,43 @@ void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(low, high));
 }
 
+// Normalized conversions scale the clamped half-precision value into the 16-bit integer range.
+void Translator::V_CVT_NORM_16_F16(const Decoder::Instruction& inst, bool signed_value) {
+	const auto value = ReadF16AsF32(inst.src0);
+	const auto lower = IR::F32(IR::Value::F32(signed_value ? -1.0f : 0.0f));
+	const auto upper = IR::F32(IR::Value::F32(1.0f));
+	const auto clamped =
+	    IR::F32(ir.Emit(IR::ValueOpcode::FPMin32,
+	                    {IR::F32(ir.Emit(IR::ValueOpcode::FPMax32, {value, lower})), upper}));
+	const auto scaled = IR::F32(
+	    ir.Emit(IR::ValueOpcode::FPMul32,
+	            {clamped, IR::Value::F32(signed_value ? 32767.0f : 65535.0f)}));
+	const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPRoundEven32, {scaled}));
+	const auto nan     = IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {value}));
+	const auto integer = IR::U32(ir.Emit(signed_value ? IR::ValueOpcode::ConvertS32F32
+	                                                  : IR::ValueOpcode::ConvertU32F32,
+	                                     {SelectF32(nan, IR::F32(IR::Value::F32(0.0f)), rounded)}));
+	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(integer, IR::U32(IR::Value(0xffffu))));
+}
+
+// Both signed 16-bit halves saturate into the unsigned byte range and pack into the low word.
+void Translator::V_SAT_PK_U8_I16(const Decoder::Instruction& inst) {
+	const auto saturate = [&](bool high) {
+		const auto value = ReadU16LaneAsU32(inst.src0, high, true);
+		const auto low   = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {value, IR::Value(0u)}));
+		return IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(255u)}));
+	};
+	const auto result = ir.BitwiseOr(saturate(false),
+	                                 ir.ShiftLeftLogical(saturate(true), IR::U32(IR::Value(8u))));
+	Write16Bits(DestinationOperand(inst), result);
+}
+
+void Translator::V_CVT_PKNORM_F16(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+	const auto pair = ir.Emit(IR::ValueOpcode::CompositeConstructF32x2,
+	                          {ReadF16AsF32(inst.src0), ReadF16AsF32(inst.src1)});
+	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {pair}));
+}
+
 IR::U32 Translator::PackU16Lanes(IR::U32 low, IR::U32 high) {
 	const auto mask = IR::U32(IR::Value(0xffffu));
 	return ir.BitwiseOr(ir.BitwiseAnd(low, mask),

@@ -141,6 +141,23 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_GATHER4_CL:
+		case Opcode::IMAGE_GATHER4_B:
+		case Opcode::IMAGE_GATHER4_B_CL:
+		case Opcode::IMAGE_GATHER4_O:
+		case Opcode::IMAGE_GATHER4_CL_O:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_B_O:
+		case Opcode::IMAGE_GATHER4_B_CL_O:
+		case Opcode::IMAGE_GATHER4_C_CL:
+		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_B:
+		case Opcode::IMAGE_GATHER4_C_B_CL:
+		case Opcode::IMAGE_GATHER4_C_CL_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
+		case Opcode::IMAGE_GATHER4_C_B_O:
+		case Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
@@ -571,13 +588,42 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_NOT_B64:
 		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
+		case Opcode::S_QUADMASK_B32:
 		case Opcode::S_QUADMASK_B64:
+		case Opcode::S_BREV_B64:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_FF0_I32_B32:
+		case Opcode::S_FF0_I32_B64:
+		case Opcode::S_FLBIT_I32:
+		case Opcode::S_FLBIT_I32_I64:
+		case Opcode::S_SEXT_I32_I8:
+		case Opcode::S_SEXT_I32_I16:
+		case Opcode::S_GETREG_B32:
 		case Opcode::S_AND_SAVEEXEC_B32:
+		case Opcode::S_OR_SAVEEXEC_B32:
+		case Opcode::S_XOR_SAVEEXEC_B32:
+		case Opcode::S_ANDN2_SAVEEXEC_B32:
 		case Opcode::S_ORN2_SAVEEXEC_B32:
+		case Opcode::S_NAND_SAVEEXEC_B32:
+		case Opcode::S_NOR_SAVEEXEC_B32:
+		case Opcode::S_XNOR_SAVEEXEC_B32:
 		case Opcode::S_ANDN1_SAVEEXEC_B32:
+		case Opcode::S_ORN1_SAVEEXEC_B32:
+		case Opcode::S_ANDN1_WREXEC_B32:
+		case Opcode::S_ANDN2_WREXEC_B32:
 		case Opcode::S_AND_SAVEEXEC_B64:
+		case Opcode::S_OR_SAVEEXEC_B64:
+		case Opcode::S_XOR_SAVEEXEC_B64:
+		case Opcode::S_ANDN2_SAVEEXEC_B64:
 		case Opcode::S_ORN2_SAVEEXEC_B64:
+		case Opcode::S_NAND_SAVEEXEC_B64:
+		case Opcode::S_NOR_SAVEEXEC_B64:
+		case Opcode::S_XNOR_SAVEEXEC_B64:
 		case Opcode::S_ANDN1_SAVEEXEC_B64:
+		case Opcode::S_ORN1_SAVEEXEC_B64:
+		case Opcode::S_ANDN1_WREXEC_B64:
+		case Opcode::S_ANDN2_WREXEC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.dst).c_str(),
@@ -605,8 +651,17 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SETPRIO:
 		case Opcode::S_TRAP:
 		case Opcode::S_SENDMSG:
+		case Opcode::S_SENDMSGHALT:
 		case Opcode::S_TTRACEDATA:
+		case Opcode::S_TTRACEDATA_IMM:
 		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_SETKILL:
+		case Opcode::S_SETHALT:
+		case Opcode::S_INCPERFLEVEL:
+		case Opcode::S_DECPERFLEVEL:
+		case Opcode::S_CLAUSE:
+		case Opcode::S_ROUND_MODE:
+		case Opcode::S_DENORM_MODE:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.src0).c_str()));
@@ -617,9 +672,18 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_ENDPGM:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_endpgm", inst.pc));
 		case Opcode::S_CBRANCH_CDBGSYS:
-			return WithUnsupportedReason(
-			    inst, fmt::format("0x{:08x}: s_cbranch_cdbgsys 0x{:08x}", inst.pc,
-			                      inst.branch_target));
+		case Opcode::S_CBRANCH_CDBGUSER:
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBGSYS_AND_USER:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               inst.branch_target));
+		case Opcode::S_WAKEUP:
+		case Opcode::S_ICACHE_INV:
+		case Opcode::S_WAIT_IDLE:
+		case Opcode::S_VERSION:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode)));
 		case Opcode::S_BRANCH:
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
@@ -641,6 +705,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_STORE_MIP:
 		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_ADD:
+		case Opcode::IMAGE_ATOMIC_SUB:
+		case Opcode::IMAGE_ATOMIC_SMIN:
+		case Opcode::IMAGE_ATOMIC_SMAX:
 		case Opcode::IMAGE_ATOMIC_UMIN:
 		case Opcode::IMAGE_ATOMIC_UMAX:
 		case Opcode::IMAGE_ATOMIC_AND:
@@ -650,6 +717,23 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_GATHER4_CL:
+		case Opcode::IMAGE_GATHER4_B:
+		case Opcode::IMAGE_GATHER4_B_CL:
+		case Opcode::IMAGE_GATHER4_O:
+		case Opcode::IMAGE_GATHER4_CL_O:
+		case Opcode::IMAGE_GATHER4_L_O:
+		case Opcode::IMAGE_GATHER4_B_O:
+		case Opcode::IMAGE_GATHER4_B_CL_O:
+		case Opcode::IMAGE_GATHER4_C_CL:
+		case Opcode::IMAGE_GATHER4_C_L:
+		case Opcode::IMAGE_GATHER4_C_B:
+		case Opcode::IMAGE_GATHER4_C_B_CL:
+		case Opcode::IMAGE_GATHER4_C_CL_O:
+		case Opcode::IMAGE_GATHER4_C_L_O:
+		case Opcode::IMAGE_GATHER4_C_B_O:
+		case Opcode::IMAGE_GATHER4_C_B_CL_O:
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:

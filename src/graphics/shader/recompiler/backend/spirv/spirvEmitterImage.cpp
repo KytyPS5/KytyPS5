@@ -86,6 +86,40 @@ uint32_t ZeroF32(EmitterState& state) {
 	return ConstantF32(state, 0);
 }
 
+// sRGB -> linear decode of one channel, as the guest texture pipe applies it to the samples of the
+// narrow sRGB formats (which the host stores linearly, see NeedsSrgbSampleDecode). The value is
+// clamped to [0, 1] first because the stored texels are limited-range UNORM data.
+uint32_t SrgbDecodedChannel(EmitterState& state, uint32_t value) {
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FMax, value, ZeroF32(state));
+	const auto low =
+	    Binary(state, spv::OpFMul, TypeF32(state), clamped, ConstantF32Value(state, 1.0f / 12.92f));
+	const auto base =
+	    Binary(state, spv::OpFMul, TypeF32(state),
+	           Binary(state, spv::OpFAdd, TypeF32(state), clamped, ConstantF32Value(state, 0.055f)),
+	           ConstantF32Value(state, 1.0f / 1.055f));
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), high, GlslStd450(state),
+	                          GLSLstd450Pow, base, ConstantF32Value(state, 2.4f));
+	const auto is_low = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), clamped,
+	                           ConstantF32Value(state, 0.04045f));
+	return Select(state, TypeF32(state), is_low, low, high);
+}
+
+uint32_t SrgbDecodedVector(EmitterState& state, uint32_t value) {
+	uint32_t channels[4] {};
+	for (uint32_t index = 0; index < 4u; index++) {
+		const auto channel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), channel, value, index);
+		channels[index] = SrgbDecodedChannel(state, channel);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), result,
+	                          channels[0], channels[1], channels[2], channels[3]);
+	return result;
+}
+
 uint32_t CubeAxis(EmitterState& state, uint32_t value) {
 	return Binary(state, spv::OpFSub, TypeF32(state), value, ConstantF32(state, 0x3f800000u));
 }
@@ -188,6 +222,9 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 	}
 	const bool integer = value_class == Prospero::TextureNumericClass::Uint ||
 	                     value_class == Prospero::TextureNumericClass::Sint;
+	if (!integer && !dref && ctx.state.program.info.images[mem.resource].srgb_sample_decode) {
+		value = SrgbDecodedVector(ctx.state, value);
+	}
 	if (mem.data_bits == 16u) {
 		uint32_t   packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
 		                        ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};

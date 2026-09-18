@@ -740,6 +740,7 @@ public:
 	FlexibleMemory() {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		m_free.emplace(PhysicalMemory::Size(), Size());
+		m_fresh.emplace(PhysicalMemory::Size(), Size());
 	}
 	virtual ~FlexibleMemory() = default;
 
@@ -767,9 +768,14 @@ private:
 	void ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator range, uint64_t start,
 	                      uint64_t size);
 	void AddFreeRange(uint64_t start, uint64_t size);
+	// Backing ranges never handed out are already zero from ftruncate; freed ranges are
+	// dirty and need ZeroBacking on reuse. Caller holds m_mutex.
+	bool IsFreshRangeUnlocked(uint64_t start, uint64_t size) const;
+	void EraseFreshRangeUnlocked(uint64_t start, uint64_t size);
 
 	std::vector<AllocatedBlock>  m_allocated;
 	std::map<uint64_t, uint64_t> m_free;
+	std::map<uint64_t, uint64_t> m_fresh;
 	uint64_t                     m_allocated_total = 0;
 	Common::Mutex                m_mutex;
 };
@@ -1677,22 +1683,40 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
 		return false;
 	}
 
-	std::vector<AllocatedBlock> mapped;
+	// Merge contiguous same-flag blocks into one mmap (all blocks here share
+	// prot/mode by construction; contiguity is in both vaddr and backing offset).
+	std::vector<AllocatedBlock> runs;
+	runs.reserve(blocks.size());
 	for (const auto& block: blocks) {
-		if (!g_guest_address_space->ZeroBacking(block.backing_offset, block.map_size)) {
+		if (!runs.empty()) {
+			auto& last = runs.back();
+			if (last.map_vaddr + last.map_size == block.map_vaddr &&
+			    last.backing_offset + last.map_size == block.backing_offset) {
+				last.map_size += block.map_size;
+				continue;
+			}
+		}
+		runs.push_back(block);
+	}
+
+	std::vector<AllocatedBlock> mapped;
+	for (const auto& run: runs) {
+		// Fresh ftruncate backing is already zero; keep memset for reuse.
+		if (!IsFreshRangeUnlocked(run.backing_offset, run.map_size) &&
+		    !g_guest_address_space->ZeroBacking(run.backing_offset, run.map_size)) {
 			for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
 				EXIT_IF(!g_guest_address_space->UnmapBacking(it->map_vaddr, it->map_size));
 			}
 			return false;
 		}
-		if (!g_guest_address_space->MapBacking(block.map_vaddr, block.map_size,
-		                                       block.backing_offset, block.mode)) {
+		if (!g_guest_address_space->MapBacking(run.map_vaddr, run.map_size, run.backing_offset,
+		                                       run.mode)) {
 			for (auto it = mapped.rbegin(); it != mapped.rend(); ++it) {
 				EXIT_IF(!g_guest_address_space->UnmapBacking(it->map_vaddr, it->map_size));
 			}
 			return false;
 		}
-		mapped.push_back(block);
+		mapped.push_back(run);
 	}
 
 	for (const auto& block: blocks) {
@@ -1702,6 +1726,7 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
 		EXIT_IF(block.backing_offset < range->first ||
 		        block.map_size > range->first + range->second - block.backing_offset);
 		ConsumeFreeRange(range, block.backing_offset, block.map_size);
+		EraseFreshRangeUnlocked(block.backing_offset, block.map_size);
 		m_allocated.push_back(block);
 	}
 	std::sort(m_allocated.begin(), m_allocated.end(),
@@ -1759,7 +1784,10 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 		const auto overlap_start = std::max(vaddr, block.map_vaddr);
 		const auto overlap_end   = std::min(end, block_end);
 		const auto overlap_size  = overlap_end - overlap_start;
-		AddFreeRange(block.backing_offset + overlap_start - block.map_vaddr, overlap_size);
+		const auto freed_backing = block.backing_offset + overlap_start - block.map_vaddr;
+		AddFreeRange(freed_backing, overlap_size);
+		// Freed backing is dirty from here on: reuse must memset even if it was fresh.
+		EraseFreshRangeUnlocked(freed_backing, overlap_size);
 		removed += overlap_size;
 
 		if (block.map_vaddr < overlap_start) {
@@ -1791,6 +1819,50 @@ void FlexibleMemory::ConsumeFreeRange(std::map<uint64_t, uint64_t>::iterator ran
 	}
 	if (start + size < range_end) {
 		m_free.emplace(start + size, range_end - start - size);
+	}
+}
+
+bool FlexibleMemory::IsFreshRangeUnlocked(uint64_t start, uint64_t size) const {
+	if (size == 0 || UINT64_MAX - start < size) {
+		return false;
+	}
+	auto next = m_fresh.upper_bound(start);
+	if (next == m_fresh.begin()) {
+		return false;
+	}
+	const auto it = std::prev(next);
+	return start >= it->first && size <= it->first + it->second - start;
+}
+
+void FlexibleMemory::EraseFreshRangeUnlocked(uint64_t start, uint64_t size) {
+	if (size == 0 || UINT64_MAX - start < size) {
+		return;
+	}
+	const auto end = start + size;
+	auto       next = m_fresh.upper_bound(start);
+	if (next != m_fresh.begin()) {
+		auto       it     = std::prev(next);
+		const auto rstart = it->first;
+		const auto rend   = rstart + it->second;
+		if (rstart < end && start < rend) {
+			m_fresh.erase(it);
+			if (rstart < start) {
+				m_fresh.emplace(rstart, start - rstart);
+			}
+			if (end < rend) {
+				m_fresh.emplace(end, rend - end);
+				return;
+			}
+		}
+	}
+	auto it = m_fresh.lower_bound(start);
+	while (it != m_fresh.end() && it->first < end) {
+		const auto rend = it->first + it->second;
+		it              = m_fresh.erase(it);
+		if (end < rend) {
+			m_fresh.emplace(end, rend - end);
+			break;
+		}
 	}
 }
 
@@ -4037,7 +4109,22 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 		g_virtual_ranges->Add(vaddr, len, 0, 0, 0, VirtualRangeType::PoolReserved, old_range.name);
 	};
 
+	// Merge contiguous mappings into one mmap (same mode by construction).
+	std::vector<PooledMemory::Mapping> runs;
+	runs.reserve(mappings.size());
 	for (const auto& mapping: mappings) {
+		if (!runs.empty()) {
+			auto& last = runs.back();
+			if (last.vaddr + last.size == mapping.vaddr &&
+			    last.phys_addr + last.size == mapping.phys_addr) {
+				last.size += mapping.size;
+				continue;
+			}
+		}
+		runs.push_back(mapping);
+	}
+
+	for (const auto& mapping: runs) {
 		auto       failure_reason = GuestBackingStore::FailureReason::None;
 		const bool ok = g_guest_address_space->MapBacking(mapping.vaddr, mapping.size,
 		                                                  mapping.phys_addr, mode, &failure_reason);
@@ -4068,51 +4155,70 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 }
 
 static int DecommitMemoryPoolRange(uint64_t vaddr, size_t len) {
-	VirtualRanges::Range old_range {};
-	if (!g_virtual_ranges->Query(vaddr, 0, &old_range)) {
-		return KERNEL_ERROR_EACCES;
-	}
-	const auto chunk_len = std::min<uint64_t>(len, old_range.size - (vaddr - old_range.start));
-	if (old_range.type == VirtualRangeType::PoolReserved) {
-		return chunk_len < len ? DecommitMemoryPoolRange(vaddr + chunk_len, len - chunk_len) : OK;
-	}
-	if (old_range.type != VirtualRangeType::Pooled) {
-		return KERNEL_ERROR_EACCES;
-	}
-	if (chunk_len < len) {
-		const int ret = DecommitMemoryPoolRange(vaddr, chunk_len);
-		return ret == OK ? DecommitMemoryPoolRange(vaddr + chunk_len, len - chunk_len) : ret;
-	}
+	uint64_t cursor    = vaddr;
+	uint64_t remaining = len;
+	while (remaining > 0) {
+		VirtualRanges::Range old_range {};
+		if (!g_virtual_ranges->Query(cursor, 0, &old_range)) {
+			return KERNEL_ERROR_EACCES;
+		}
+		const auto chunk_len =
+		    std::min<uint64_t>(remaining, old_range.size - (cursor - old_range.start));
+		if (old_range.type == VirtualRangeType::PoolReserved) {
+			cursor += chunk_len;
+			remaining -= chunk_len;
+			continue;
+		}
+		if (old_range.type != VirtualRangeType::Pooled) {
+			return KERNEL_ERROR_EACCES;
+		}
+		// Batch one backing transaction per contiguous same-protection, same-name
+		// Pooled run instead of recursing per virtual-range chunk.
+		uint64_t run_len = chunk_len;
+		while (run_len < remaining) {
+			VirtualRanges::Range next {};
+			if (!g_virtual_ranges->Query(cursor + run_len, 0, &next) ||
+			    next.type != VirtualRangeType::Pooled || next.start != cursor + run_len ||
+			    next.protection != old_range.protection ||
+			    std::strncmp(next.name, old_range.name, KERNEL_MAXIMUM_NAME_LENGTH) != 0) {
+				break;
+			}
+			run_len += std::min<uint64_t>(remaining - run_len, next.size);
+		}
 
-	std::vector<PooledMemory::Mapping> mappings;
-	if (!g_pooled_memory->Query(vaddr, len, &mappings)) {
-		return KERNEL_ERROR_EACCES;
-	}
+		std::vector<PooledMemory::Mapping> mappings;
+		if (!g_pooled_memory->Query(cursor, run_len, &mappings)) {
+			return KERNEL_ERROR_EACCES;
+		}
 
-	VirtualMemory::Mode mode        = VirtualMemory::Mode::NoAccess;
-	GpuAccessMode       decoded_gpu = GpuAccessMode::NoAccess;
-	if (!DecodeMemoryProtection(old_range.protection, &mode, &decoded_gpu)) {
-		return KERNEL_ERROR_EACCES;
-	}
-	if (!UnmapPooledBackingTransactional(mappings, mode)) {
-		EXIT("pooled-memory backing transaction failed after GPU unmap: addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, len);
-	}
+		VirtualMemory::Mode mode        = VirtualMemory::Mode::NoAccess;
+		GpuAccessMode       decoded_gpu = GpuAccessMode::NoAccess;
+		if (!DecodeMemoryProtection(old_range.protection, &mode, &decoded_gpu)) {
+			return KERNEL_ERROR_EACCES;
+		}
+		if (!UnmapPooledBackingTransactional(mappings, mode)) {
+			EXIT("pooled-memory backing transaction failed after GPU unmap: addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     cursor, run_len);
+		}
 
-	GpuAccessMode gpu_mode = GpuAccessMode::NoAccess;
-	if (!g_pooled_memory->Release(vaddr, len, &gpu_mode)) {
-		EXIT("failed to release decommitted pooled-memory range\n");
+		GpuAccessMode gpu_mode = GpuAccessMode::NoAccess;
+		if (!g_pooled_memory->Release(cursor, run_len, &gpu_mode)) {
+			EXIT("failed to release decommitted pooled-memory range\n");
+		}
+
+		g_virtual_ranges->Remove(cursor, run_len);
+		g_virtual_ranges->Add(cursor, run_len, 0, 0, 0, VirtualRangeType::PoolReserved,
+		                      old_range.name);
+
+		if (g_free_callback != nullptr) {
+			g_free_callback(cursor, run_len);
+		}
+
+		MemoryPoolSubtractCommitted(run_len);
+		cursor += run_len;
+		remaining -= run_len;
 	}
-
-	g_virtual_ranges->Remove(vaddr, len);
-	g_virtual_ranges->Add(vaddr, len, 0, 0, 0, VirtualRangeType::PoolReserved, old_range.name);
-
-	if (g_free_callback != nullptr) {
-		g_free_callback(vaddr, len);
-	}
-
-	MemoryPoolSubtractCommitted(len);
 	return OK;
 }
 

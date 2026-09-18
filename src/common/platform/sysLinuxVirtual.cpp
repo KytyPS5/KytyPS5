@@ -542,6 +542,9 @@ bool FreeRange(uint64_t address, uint64_t size) {
 }
 
 bool Protect(uint64_t address, uint64_t size, Mode mode) {
+	if (size == 0 || UINT64_MAX - address < size) {
+		return false;
+	}
 	const auto addr       = static_cast<uintptr_t>(address);
 	const auto page_start = addr >> 12u;
 	const auto page_end   = (addr + size - 1) >> 12u;

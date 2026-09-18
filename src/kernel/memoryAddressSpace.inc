@@ -968,16 +968,29 @@ private:
 		if (it != m_mapped.begin()) {
 			--it;
 		}
+		// Batch contiguous intersections into one mprotect: m_mapped fragments from
+		// multi-block maps sit adjacent, and one syscall covers the whole run.
+		uint64_t run_start = 0;
+		uint64_t run_end   = 0;
 		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start < range_end &&
-			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			if (range_start >= range_end) {
+				continue;
+			}
+			if (run_end != 0 && range_start == run_end) {
+				run_end = range_end;
+				continue;
+			}
+			if (run_end != 0 &&
+			    !VirtualMemory::Protect(run_start, run_end - run_start, mode)) {
 				return false;
 			}
+			run_start = range_start;
+			run_end   = range_end;
 		}
-		return true;
+		return run_end == 0 || VirtualMemory::Protect(run_start, run_end - run_start, mode);
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {

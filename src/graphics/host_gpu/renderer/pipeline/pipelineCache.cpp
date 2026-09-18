@@ -999,9 +999,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
+		auto& mesh = vertex_info[0].mesh;
+		// A driver may run a mesh stage at any width between min and max, and RDNA runs graphics
+		// stages narrower than its compute default, so the width is pinned rather than assumed.
+		mesh.host_subgroup_size = m_graphics.CanPinMeshSubgroupSize(mesh.wave_size)
+		                              ? mesh.wave_size
+		                              : std::max(m_graphics.min_subgroup_size, 32u);
+		const auto& limits = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *

@@ -252,11 +252,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
+	// Outlives the pipeline creation call below, which reads it through the stage's pNext.
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo mesh_subgroup_size {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           NativeShaderStage(vertex_info[i].logical_stage),
 		                                       .module = programs.vertex[i].module,
 		                                       .pName  = "main"};
+		if (mesh && vertex_info[i].logical_stage == ShaderType::Mesh &&
+		    graphics.CanPinMeshSubgroupSize(vertex_info[i].mesh.wave_size) &&
+		    vertex_info[i].mesh.host_subgroup_size == vertex_info[i].mesh.wave_size) {
+			const auto wave  = vertex_info[i].mesh.wave_size;
+			auto&      stage = shader_stages[shader_stage_count - 1];
+			mesh_subgroup_size.requiredSubgroupSize = wave;
+			stage.pNext                             = &mesh_subgroup_size;
+			// Full subgroups are only legal when the workgroup divides into whole ones.
+			const auto local_x = std::max(vertex_info[i].mesh.threads_num[0], 1u);
+			if (graphics.full_subgroups_enabled && local_x % wave == 0) {
+				stage.flags |= vk::PipelineShaderStageCreateFlagBits::eRequireFullSubgroups;
+			}
+		}
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =

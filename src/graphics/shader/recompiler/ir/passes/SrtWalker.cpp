@@ -624,7 +624,7 @@ private:
 				return false;
 			}
 		} else {
-			return false;
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
 		return true;

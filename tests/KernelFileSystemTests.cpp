@@ -1,3 +1,4 @@
+#define SDL_MAIN_HANDLED
 #include "SDL.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -375,6 +376,7 @@ int main() {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
+  SDL_SetMainReady();
   Check(SDL_InitSubSystem(SDL_INIT_VIDEO) == 0, "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
   graphics->graphic_ctx.screen_width = 64;

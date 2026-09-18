@@ -968,29 +968,21 @@ private:
 		if (it != m_mapped.begin()) {
 			--it;
 		}
-		// Batch contiguous intersections into one mprotect: m_mapped fragments from
-		// multi-block maps sit adjacent, and one syscall covers the whole run.
-		uint64_t run_start = 0;
-		uint64_t run_end   = 0;
+		// NOTE: one Protect per mapped intersection (not batched across regions).
+		// Guest-adjacent regions are not necessarily one uniform host mapping
+		// (separate placeholders/views); a single VirtualProtect/mprotect over the
+		// merged span fails (Windows 0x1e7) where per-region calls succeed.
+		// See VirtualMemoryAllocationTests.MunmapAcrossAdjacentFlexibleMappings.
 		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start >= range_end) {
-				continue;
-			}
-			if (run_end != 0 && range_start == run_end) {
-				run_end = range_end;
-				continue;
-			}
-			if (run_end != 0 &&
-			    !VirtualMemory::Protect(run_start, run_end - run_start, mode)) {
+			if (range_start < range_end &&
+			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
-			run_start = range_start;
-			run_end   = range_end;
 		}
-		return run_end == 0 || VirtualMemory::Protect(run_start, run_end - run_start, mode);
+		return true;
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {

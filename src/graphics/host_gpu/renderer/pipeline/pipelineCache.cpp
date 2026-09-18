@@ -687,6 +687,8 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
 		options.back_code      = params.back_code;
+		options.float16     = float16;
+		options.float_controls2 = float_controls2;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
@@ -758,7 +760,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool float16, bool float_controls2)
+	    : device(device), float16(float16), float_controls2(float_controls2) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -778,11 +781,16 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	bool                                                        float16 = false;
+	bool                                                        float_controls2 = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(graphics.device,
+                                                     graphics.shader_float16_enabled,
+                                                     graphics.shader_float_controls2_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();

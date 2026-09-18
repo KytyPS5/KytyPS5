@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -533,6 +534,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12  = WindowContext::RequiredVulkan12Features();
 	features12.pNext = &depth_clip_control;
+	vk::PhysicalDeviceShaderFloatControls2FeaturesKHR float_controls2 {};
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 
@@ -549,7 +551,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT supported_image_atomic_int64 {};
 	supported_image_atomic_int64.sType =
 	    vk::StructureType::ePhysicalDeviceShaderImageAtomicInt64FeaturesEXT;
-	void* supported_tail = &supported_features13;
+	vk::PhysicalDeviceVulkan12Features supported_features12 {};
+	supported_features12.pNext = &supported_features13;
+	void* supported_tail       = &supported_features12;
+	const bool float_controls2_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderFloatControls2FeaturesKHR supported_float_controls2 {};
+	if (float_controls2_extension) {
+		supported_float_controls2.pNext = supported_tail;
+		supported_tail                  = &supported_float_controls2;
+	}
 	if (image_atomic_int64_extension) {
 		supported_image_atomic_int64.pNext = supported_tail;
 		supported_tail                     = &supported_image_atomic_int64;
@@ -580,11 +591,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Each shader path below changes the emitted SPIR-V, so each carries a switch.
+	graphics.shader_float16_enabled =
+	    supported_features12.shaderFloat16 == VK_TRUE && std::getenv("KYTY_NO_SHADER_FLOAT16") == nullptr;
+	features12.shaderFloat16        = graphics.shader_float16_enabled ? VK_TRUE : VK_FALSE;
+	LOGF("Vulkan 16-bit floats: %s\n", graphics.shader_float16_enabled ? "true" : "false");
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
-	properties11.pNext = &subgroup_size_control;
+	vk::PhysicalDeviceVulkan12Properties properties12 {};
+	properties11.pNext = &properties12;
+	properties12.pNext = &subgroup_size_control;
 
 	vk::PhysicalDeviceProperties2 properties2 {};
 	properties2.pNext = &properties11;
@@ -593,6 +611,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
 	physical_device.getProperties2(&properties2);
+
+	// An empty FPFastMathMode mask is only legal where 32-bit signed zero, Inf and NaN are
+	// preserved, which is a property rather than a feature.
+	graphics.shader_float_controls2_enabled =
+	    float_controls2_extension && supported_float_controls2.shaderFloatControls2 == VK_TRUE &&
+	    properties12.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE &&
+	    std::getenv("KYTY_NO_SHADER_FLOAT_CONTROLS2") == nullptr;
+	LOGF("Vulkan float controls2: %s\n",
+	     graphics.shader_float_controls2_enabled ? "true" : "false");
+	if (graphics.shader_float_controls2_enabled) {
+		float_controls2.shaderFloatControls2 = VK_TRUE;
+		float_controls2.pNext                = features12.pNext;
+		features12.pNext                     = &float_controls2;
+	}
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -603,12 +635,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
+	graphics.mesh_subgroup_size_control_enabled =
+	    supported_features13.subgroupSizeControl == VK_TRUE &&
+	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eMeshEXT) &&
+	    std::getenv("KYTY_NO_MESH_SUBGROUP_SIZE") == nullptr;
+	// A pinned width may still launch with only some lanes active; full subgroups are implicit
+	// only from SPIR-V 1.6, and mesh modules here are 1.4.
+	graphics.full_subgroups_enabled = supported_features13.computeFullSubgroups == VK_TRUE;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s "
+	     "mesh_size_control=%s full_subgroups=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
-	     graphics.SupportsComputeWave64() ? "true" : "false");
+	     graphics.SupportsComputeWave64() ? "true" : "false",
+	     graphics.mesh_subgroup_size_control_enabled ? "true" : "false",
+	     graphics.full_subgroups_enabled ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -672,8 +714,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                           : static_cast<void*>(&fragment_barycentric);
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
-	features13.subgroupSizeControl =
-	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.subgroupSizeControl = graphics.compute_subgroup_size_control_enabled ||
+	                                         graphics.mesh_subgroup_size_control_enabled
+	                                     ? VK_TRUE
+	                                     : VK_FALSE;
+	features13.computeFullSubgroups = graphics.full_subgroups_enabled ? VK_TRUE : VK_FALSE;
 
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
 	image_atomic_int64.sType =
@@ -1082,6 +1127,7 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+		                             VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

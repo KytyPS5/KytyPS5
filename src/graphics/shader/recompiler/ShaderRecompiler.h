@@ -17,6 +17,10 @@ struct CompileOptions {
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
+	// Both off by default, so an offline caller that does not know the device still gets the
+	// portable expansion.
+	bool                        float16                    = false;
+	bool                        float_controls2            = false;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;

@@ -594,6 +594,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .shader_hash      = options.shader_hash,
 	    .user_data_base   = options.user_data_base,
 	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
+	    .float16          = options.float16,
+	    .float_controls2  = options.float_controls2,
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};

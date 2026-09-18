@@ -572,6 +572,8 @@ struct Program: ResourcePlan {
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	uint32_t                      scratch_dwords = 0;
+	bool                          float16             = false;
+	bool                          float_controls2     = false;
 	bool                          dispatcher_fallback = false;
 	// Set when a hardware ray-tracing intersect was lowered to a constant miss. Purely
 	// diagnostic: the caller reports the shader once so the log shows which output is a lie.

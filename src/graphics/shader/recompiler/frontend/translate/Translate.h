@@ -27,6 +27,8 @@ struct TranslateOptions {
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;
+	bool                          float16             = false;
+	bool                          float_controls2     = false;
 	ShaderStageInputInfo          input_info;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
 };

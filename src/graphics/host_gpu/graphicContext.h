@@ -28,10 +28,14 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	bool                               mesh_subgroup_size_control_enabled    = false;
+	bool                               full_subgroups_enabled                = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	bool                               shader_float16_enabled                = false;
+	bool                               shader_float_controls2_enabled        = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
@@ -83,6 +87,12 @@ struct GraphicContext {
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	// subgroupSize is the device default and describes no particular stage.
+	[[nodiscard]] bool CanPinMeshSubgroupSize(uint32_t size) const noexcept {
+		return mesh_subgroup_size_control_enabled && size >= min_subgroup_size &&
+		       size <= max_subgroup_size;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

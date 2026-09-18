@@ -274,6 +274,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                thread_group_z, mode)) {
 		ResetBindings();
+		m_context.GetCommandScheduler().FlushAndWait();
 		return;
 	}
 	const bool large_workgroup =

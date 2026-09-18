@@ -268,7 +268,57 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t data,
 }
 
 void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uint32_t data) {
-	auto&      state   = ctx.state;
+	auto& state = ctx.state;
+	if (bits == 16u) {
+		const auto byte =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+		const auto unaligned =
+		    Binary(state, spv::OpIEqual, TypeBool(state), byte, ConstantU32(state, 3));
+		EmitIfElseCondition(
+		    state, unaligned,
+		    [&]() {
+			    StoreBdaSubword(ctx, address, 8u, data);
+			    const auto next_addr = Binary(state, spv::OpIAdd, TypeScalarU64(state), address,
+			                                  ConstantDeviceAddress(state, 1));
+			    const auto high_byte = Binary(state, spv::OpShiftRightLogical, TypeU32(state), data,
+			                                  ConstantU32(state, 8));
+			    StoreBdaSubword(ctx, next_addr, 8u, high_byte);
+		    },
+		    [&]() {
+			    const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
+			                                ConstantDeviceAddress(state, ~uint64_t {3}));
+			    const auto bda     = GetBdaPointer(ctx, aligned);
+			    const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+			                                ConstantDeviceAddress(state, 0));
+			    EmitIfCondition(state, present, [&]() {
+				    const auto pointer = state.builder.AllocateId();
+				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+				                              pointer, bda);
+				    constexpr uint32_t alignment = sizeof(uint32_t);
+				    const auto         old       = state.builder.AllocateId();
+				    state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer,
+				                              spv::MemoryAccessAlignedMask, alignment);
+				    const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
+				                              ConstantU32(state, 3));
+				    const auto mask  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+				                              ConstantU32(state, 0xffffu), shift);
+				    const auto value = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+				                              Binary(state, spv::OpBitwiseAnd, TypeU32(state), data,
+				                                     ConstantU32(state, 0xffffu)),
+				                              shift);
+				    const auto merged =
+				        Binary(state, spv::OpBitwiseOr, TypeU32(state),
+				               Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+				                      Unary(state, spv::OpNot, TypeU32(state), mask)),
+				               value);
+				    state.builder.AddFunction(spv::OpStore, pointer, merged,
+				                              spv::MemoryAccessAlignedMask, alignment);
+			    });
+		    });
+		return;
+	}
+
 	const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
 	                            ConstantDeviceAddress(state, ~uint64_t {3}));
 	const auto bda     = GetBdaPointer(ctx, aligned);
@@ -287,12 +337,12 @@ void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uin
 		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
-		const auto mask   = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		                           ConstantU32(state, bits == 8u ? 0xffu : 0xffffu), shift);
-		const auto value  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), data,
-		                                  ConstantU32(state, bits == 8u ? 0xffu : 0xffffu)),
-		                           shift);
+		const auto mask  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                          ConstantU32(state, 0xffu), shift);
+		const auto value = Binary(
+		    state, spv::OpShiftLeftLogical, TypeU32(state),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), data, ConstantU32(state, 0xffu)),
+		    shift);
 		const auto merged = Binary(state, spv::OpBitwiseOr, TypeU32(state),
 		                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
 		                                  Unary(state, spv::OpNot, TypeU32(state), mask)),
@@ -1113,8 +1163,11 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto& mem   = ctx.Memory(inst);
-	auto&       state = ctx.state;
+	const auto& mem = ctx.Memory(inst);
+	if (mem.dynamic_buffer) {
+		ctx.Fail(inst, "dynamic_buffer is not supported for 64-bit buffer atomics");
+	}
+	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource = PrepareStorageBufferResourceAccess(
@@ -1142,8 +1195,11 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto& mem       = ctx.Memory(inst);
-	const bool  max_value = inst.GetOpcode() == IR::ValueOpcode::BufferAtomicFMax32;
+	const auto& mem = ctx.Memory(inst);
+	if (mem.dynamic_buffer) {
+		ctx.Fail(inst, "dynamic_buffer is not supported for float buffer atomics");
+	}
+	const bool max_value = inst.GetOpcode() == IR::ValueOpcode::BufferAtomicFMax32;
 	return EmitAtomicUpdate(ctx, inst, mem,
 	                        [max_value](EmitterState& state, uint32_t old, uint32_t value) {
 		                        return EmitFloatAtomicReplacement(state, old, value, max_value);
@@ -1260,6 +1316,9 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
+	if (mem.dynamic_buffer) {
+		ctx.Fail(inst, "dynamic_buffer is not supported for constant buffer reads");
+	}
 	auto& state        = ctx.state;
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),

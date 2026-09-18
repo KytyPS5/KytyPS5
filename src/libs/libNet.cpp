@@ -3118,16 +3118,6 @@ static std::map<int64_t, NpWebApi2Request>& NpWebApi2Requests() {
 	return requests;
 }
 
-[[maybe_unused]] static std::string NpWebApi2MakeResponse(const NpWebApi2Request& request) {
-	if (request.api_group.find("sessionManager") != std::string::npos ||
-	    request.path.find("sessions") != std::string::npos ||
-	    request.path.find("Sessions") != std::string::npos) {
-		return R"({"gameSessions":[],"playerSessions":[]})";
-	}
-
-	return "{}";
-}
-
 static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_size) {
 	PRINT_NAME();
 
@@ -3224,12 +3214,10 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 		return NP_WEBAPI2_ERROR_REQUEST_NOT_FOUND;
 	}
 
-	// request->second.response    = NpWebApi2MakeResponse(request->second);
 	request->second.response.clear();
 	request->second.read_offset = 0;
 
 	if (response_info_option != nullptr) {
-		// response_info_option->http_status        = 200;
 		response_info_option->http_status        = 0;
 		response_info_option->response_data_size = request->second.response.size();
 		if (response_info_option->error_object != nullptr &&
@@ -3238,7 +3226,6 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 		}
 	}
 
-	// return 0;
 	return NP_WEBAPI2_ERROR_NOT_SIGNED_IN;
 }
 

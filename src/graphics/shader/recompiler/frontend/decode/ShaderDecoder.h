@@ -2,8 +2,8 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_
 
 #include "common/common.h"
-#include "common/magicEnum.h"
 
+#include <magic_enum.hpp>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -378,6 +378,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
 	V_CMPX_LT_F16,
 	V_CMPX_EQ_F16,

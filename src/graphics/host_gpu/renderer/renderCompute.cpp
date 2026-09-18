@@ -228,7 +228,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (!ShaderAddressValid(sh_ctx.GetCs().cs_regs.data_addr)) {
+	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		return;
 	}
 

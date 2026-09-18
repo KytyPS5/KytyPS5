@@ -14,6 +14,7 @@
 #include "common/stringUtils.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -133,10 +134,6 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 			*bytes_written = size;
 		}
 	}
-}
-
-void SysFileWrite(uint32_t n, sys_file_t& f) {
-	SysFileWrite(&n, 4, f);
 }
 
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
@@ -481,7 +478,7 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 
 void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
 	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
-	if (!Common::EndsWith(real_path, "/")) {
+	if (!real_path.ends_with("/")) {
 		real_path += "/";
 	}
 
@@ -528,7 +525,7 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
 	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
-	if (!Common::EndsWith(real_path, "/")) {
+	if (!real_path.ends_with("/")) {
 		real_path += "/";
 	}
 

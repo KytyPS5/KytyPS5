@@ -70,16 +70,6 @@ struct XmmWords {
 	uint32_t w[4];
 };
 
-static uint32_t Rol32(uint32_t value, unsigned int shift) {
-	shift &= 31u;
-	return (value << shift) | (value >> (32u - shift));
-}
-
-static uint32_t Rotr32(uint32_t value, unsigned int shift) {
-	shift &= 31u;
-	return (value >> shift) | (value << (32u - shift));
-}
-
 static void Sha1Msg1(XmmWords& dest, const XmmWords& src2) {
 	const uint32_t w0 = dest.w[3];
 	const uint32_t w1 = dest.w[2];
@@ -97,10 +87,10 @@ static void Sha1Msg2(XmmWords& dest, const XmmWords& src2) {
 	const uint32_t w13 = src2.w[2];
 	const uint32_t w14 = src2.w[1];
 	const uint32_t w15 = src2.w[0];
-	const uint32_t w16 = Rol32(dest.w[3] ^ w13, 1u);
-	const uint32_t w17 = Rol32(dest.w[2] ^ w14, 1u);
-	const uint32_t w18 = Rol32(dest.w[1] ^ w15, 1u);
-	const uint32_t w19 = Rol32(dest.w[0] ^ w16, 1u);
+	const uint32_t w16 = std::rotl(dest.w[3] ^ w13, 1);
+	const uint32_t w17 = std::rotl(dest.w[2] ^ w14, 1);
+	const uint32_t w18 = std::rotl(dest.w[1] ^ w15, 1);
+	const uint32_t w19 = std::rotl(dest.w[0] ^ w16, 1);
 	dest.w[3]          = w16;
 	dest.w[2]          = w17;
 	dest.w[1]          = w18;
@@ -108,7 +98,7 @@ static void Sha1Msg2(XmmWords& dest, const XmmWords& src2) {
 }
 
 static void Sha1Nexte(XmmWords& dest, const XmmWords& src2) {
-	const uint32_t tmp = Rol32(dest.w[3], 30u);
+	const uint32_t tmp = std::rotl(dest.w[3], 30);
 	dest.w[3]          = src2.w[3] + tmp;
 	dest.w[2]          = src2.w[2];
 	dest.w[1]          = src2.w[1];
@@ -145,14 +135,14 @@ static void Sha1Rnds4(XmmWords& dest, const XmmWords& src2, uint8_t imm8) {
 	uint32_t e = 0;
 
 	for (unsigned int round = 0; round < 4u; round++) {
-		uint32_t term = Sha1RoundFunc(group, b, c, d) + Rol32(a, 5u) + w[round] + k;
+		uint32_t term = Sha1RoundFunc(group, b, c, d) + std::rotl(a, 5) + w[round] + k;
 		if (round > 0u) {
 			term += e;
 		}
 		const uint32_t a1 = term;
 		e                 = d;
 		d                 = c;
-		c                 = Rol32(b, 30u);
+		c                 = std::rotl(b, 30);
 		b                 = a;
 		a                 = a1;
 	}
@@ -164,19 +154,19 @@ static void Sha1Rnds4(XmmWords& dest, const XmmWords& src2, uint8_t imm8) {
 }
 
 static uint32_t Sha256Sigma0(uint32_t x) {
-	return Rotr32(x, 7u) ^ Rotr32(x, 18u) ^ (x >> 3u);
+	return std::rotr(x, 7) ^ std::rotr(x, 18) ^ (x >> 3u);
 }
 
 static uint32_t Sha256Sigma1(uint32_t x) {
-	return Rotr32(x, 17u) ^ Rotr32(x, 19u) ^ (x >> 10u);
+	return std::rotr(x, 17) ^ std::rotr(x, 19) ^ (x >> 10u);
 }
 
 static uint32_t Sha256Sum0(uint32_t x) {
-	return Rotr32(x, 2u) ^ Rotr32(x, 13u) ^ Rotr32(x, 22u);
+	return std::rotr(x, 2) ^ std::rotr(x, 13) ^ std::rotr(x, 22);
 }
 
 static uint32_t Sha256Sum1(uint32_t x) {
-	return Rotr32(x, 6u) ^ Rotr32(x, 11u) ^ Rotr32(x, 25u);
+	return std::rotr(x, 6) ^ std::rotr(x, 11) ^ std::rotr(x, 25);
 }
 
 static uint32_t Sha256Ch(uint32_t e, uint32_t f, uint32_t g) {

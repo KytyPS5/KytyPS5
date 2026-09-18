@@ -22,10 +22,8 @@
 #endif
 
 #include "common/assert.h"
-#include "common/byteBuffer.h"
 #include "common/common.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -40,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -3103,17 +3102,10 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 #endif
 }
 
-[[maybe_unused]] static bool HostNetworkConnected() {
-	return QueryHostNetworkInfo().connected;
-}
-
 static bool NetCtlConnected() {
 	if (!g_net_ctl_status_initialized.load()) {
-		// g_net_ctl_connected          = HostNetworkConnected();
 		g_net_ctl_connected          = false;
 		g_net_ctl_status_initialized = true;
-		// LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true" :
-		// "false"));
 		LOGF("\t host network connected = false (forced offline)\n");
 	}
 
@@ -3123,10 +3115,8 @@ static bool NetCtlConnected() {
 int KYTY_SYSV_ABI NetCtlInit() {
 	PRINT_NAME();
 
-	// g_net_ctl_connected = HostNetworkConnected();
 	g_net_ctl_connected          = false;
 	g_net_ctl_status_initialized = true;
-	// LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true" : "false"));
 	LOGF("\t host network connected = false (forced offline)\n");
 
 	return OK;
@@ -3469,7 +3459,7 @@ int KYTY_SYSV_ABI NpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret*
 
 	LOGF("\t title_id = %.12s\n"
 	     "\t title_secret = %s\n",
-	     title_id->id, Common::HexFromBin(Common::ByteBuffer(title_secret->data, 128)).c_str());
+	     title_id->id, fmt::format("{:02X}", fmt::join(title_secret->data, "")));
 
 	return OK;
 }

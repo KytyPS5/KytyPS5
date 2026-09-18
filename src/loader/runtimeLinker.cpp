@@ -6,7 +6,6 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -29,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <magic_enum.hpp>
 #include <memory>
 #include <vector>
 
@@ -301,9 +301,9 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	if (record_id < g_stubbed_imports.size()) {
 		auto& record = g_stubbed_imports[record_id];
 		auto  nid    = record.name;
-		auto  pos    = Common::FindIndex(nid, "[");
-		if (Common::IndexValid(nid, pos)) {
-			nid = Common::Left(nid, pos);
+		auto  pos    = nid.find('[');
+		if (pos != std::string::npos) {
+			nid.resize(pos);
 		}
 
 		SymbolRecord resolved {};
@@ -330,7 +330,7 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
-			     Common::EnumName(record.type).c_str(), Common::EnumName(record.bind).c_str(),
+			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
 		} else {
 			printf("Unresolved import stub called: <bad-record>\n");
@@ -1046,8 +1046,8 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			patched = PatchGuestMemory64(ri.vaddr, value);
 		} else {
 			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
-			                           ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-			                           Common::EnumName(ri.bind).c_str(), ri.dbg_name.c_str());
+			                           ri.name.c_str(), magic_enum::enum_name(ri.type),
+			                           magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
 
 			if (unresolved != nullptr) {
 				unresolved->push_back(dbg_str);
@@ -1077,23 +1077,23 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		const auto thunk = RegisterStubbedImport(index, program, ri);
 		LOGF("Relocate: unresolved PLT import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
-		     index, ri.vaddr, thunk, ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-		     Common::EnumName(ri.bind).c_str(), Common::PathToString(program->file_name).c_str());
+		     index, ri.vaddr, thunk, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
 	} else if (patched && stubbed_func) {
 		const auto thunk = RegisterStubbedImport(index, program, ri);
 		LOGF("Relocate: unresolved non-PLT function patched to stub [%u] [%016" PRIx64
 		     "] <- %016" PRIx64 ", %s, %s, %s, %s\n",
-		     index, ri.vaddr, thunk, ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-		     Common::EnumName(ri.bind).c_str(), Common::PathToString(program->file_name).c_str());
+		     index, ri.vaddr, thunk, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), Common::PathToString(program->file_name).c_str());
 	}
 
 	if (program->dbg_print_reloc) {
-		if (/* !dbg_str.ContainsStr("libc_") && */ patched && !ri.bind_self &&
+		if (patched && !ri.bind_self &&
 		    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
 		     ri.type == SymbolType::TlsModule)) {
 			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
-			                           ri.name.c_str(), Common::EnumName(ri.type).c_str(),
-			                           Common::EnumName(ri.bind).c_str(), ri.dbg_name.c_str());
+			                           ri.name.c_str(), magic_enum::enum_name(ri.type),
+			                           magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
 
 			LOGF("Relocate: %s\n", dbg_str.c_str());
 		}
@@ -1390,9 +1390,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		Libs::LibKernel::SetProgName(elf_name.filename().string());
 	}
 
-	if (Common::EndsWith(Common::ToLower(Common::DirectoryWithoutFilename(
-	                         Common::PathToGenericString(elf_name))),
-	                     "_module/")) {
+	if (Common::ToLower(Common::DirectoryWithoutFilename(Common::PathToGenericString(elf_name)))
+	        .ends_with("_module/")) {
 		program->fail_if_global_not_resolved = false;
 	}
 
@@ -1818,7 +1817,7 @@ void RuntimeLinker::StopAllModules() {
 
 static bool IsAdjacentModuleFile(const std::string& name) {
 	auto lower = Common::ToLower(name);
-	return Common::EndsWith(lower, ".prx") || Common::EndsWith(lower, ".sprx");
+	return lower.ends_with(".prx") || lower.ends_with(".sprx");
 }
 
 static bool SkipAdjacentModuleFile(const std::string& name) {
@@ -2082,7 +2081,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     "[%d] memory_size = %" PRIu64 "\n"
 			     "[%d] mode        = %s\n",
 			     i, segment_addr, i, segment_file_size, i, segment_memory_size, i,
-			     Common::EnumName(mode).c_str());
+			     magic_enum::enum_name(mode));
 
 			program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size);
 

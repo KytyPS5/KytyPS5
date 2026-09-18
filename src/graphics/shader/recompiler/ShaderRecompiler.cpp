@@ -105,8 +105,6 @@ void ClearEmbeddedFetchVectorLanes(EmbeddedFetchVectorLanes* lanes, uint32_t reg
 	lanes->erase(first, last);
 }
 
-using EmbeddedFetchData = Frontend::EmbeddedFetchPlan;
-
 bool IsDecodedSgpr(const Decoder::Operand& op) {
 	return op.kind == Decoder::OperandKind::Sgpr || op.kind == Decoder::OperandKind::VccLo ||
 	       op.kind == Decoder::OperandKind::VccHi;
@@ -210,13 +208,12 @@ int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
 }
 
-EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded,
-                                            const ShaderVertexInputInfo* input_info,
-                                            uint32_t user_data_base, uint32_t user_data_count,
-                                            uint32_t wave_size) {
+Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
+    const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
+    uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
 	const uint32_t    vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
 	const uint32_t    instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
-	EmbeddedFetchData data;
+	Frontend::EmbeddedFetchPlan data;
 	data.loads.reserve(input_info->resources_num);
 	int32_t vertex_offset_candidate   = -1;
 	int32_t instance_offset_candidate = -1;
@@ -560,7 +557,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
 	}
 
-	EmbeddedFetchData embedded_fetch;
+	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
 		embedded_fetch = DetectEmbeddedVertexFetch(

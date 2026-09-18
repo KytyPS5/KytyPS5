@@ -10,7 +10,6 @@ namespace Common {
 namespace Debug {
 std::string GetCompiler();
 std::string GetLinker();
-std::string GetBitness();
 } // namespace Debug
 
 } // namespace Common

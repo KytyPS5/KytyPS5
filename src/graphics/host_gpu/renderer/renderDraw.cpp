@@ -421,7 +421,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
-	return ShaderAddressValid(vs.es_regs.data_addr);
+	return vs.es_regs.data_addr != 0;
 }
 
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
@@ -608,7 +608,7 @@ static bool DrawHasActivePixelShader(const CommandBuffer& buffer) {
 	const auto& ctx              = buffer.GetRegisters();
 	const auto& sh_regs          = ctx.GetShaderRegisters();
 	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
-	return ShaderAddressValid(buffer.GetShaders().GetPs().ps_regs.data_addr) &&
+	return buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	       (has_color_output || PixelShaderHasDepthOrCoverageSideEffects(sh_regs));
 }
 

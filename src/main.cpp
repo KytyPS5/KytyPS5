@@ -7,6 +7,7 @@
 #include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
+#include "launcher/discordRpcConfig.h"
 
 #include <charconv>
 #include <cstdio>
@@ -40,46 +41,47 @@ static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf("  --game <dir|elf>                      Game directory or ELF to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
-	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
-	::printf("  --screen-height <num>                Window height. Default: 720.\n");
+	::printf("  --screen-width <num>                  Window width. Default: 1280.\n");
+	::printf("  --screen-height <num>                 Window height. Default: 720.\n");
 	::printf(
-	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
+	    "  --user-name <name>                    Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
-	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --mic <name>                         Capture from this microphone; omit for silence.\n");
 	::printf(
-	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	    "  --present-mode <value>                Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
-	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
-	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
-	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
-	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
-	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
+	::printf("  --fullscreen                          Run in borderless desktop fullscreen.\n");
+	::printf("  --vr                                  Enable the virtual VR headset.\n");
+	::printf("  --amd-cpu                             Apply AMD CPU instruction patches.\n");
+	::printf("  --vblank-frequency <num>              Virtual vblank frequency. Default: 60.\n");
+	::printf("  --console-language <0-29>             Console language. Default: 1 (English US).\n");
+	::printf("  --vulkan-validation <true|false>      Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
-	         "                                       Implies --vulkan-validation; very slow.\n");
-	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
-	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
-	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
-	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
-	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
-	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
-	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
-	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
-	::printf("  --printf-output-file <path>          Guest printf output file.\n");
-	::printf("  --profile                            Enable the Tracy profiler.\n");
-	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
+	         "                                        Implies --vulkan-validation; very slow.\n");
+	::printf("  --shader-validation <true|false>      Enable shader validation.\n");
+	::printf("  --shader-optimization-type <value>    None, Size, or Performance.\n");
+	::printf("  --shader-log-direction <value>        Silent, Console, or File.\n");
+	::printf("  --shader-log-folder <path>            Shader log output folder.\n");
+	::printf("  --command-buffer-dump <true|false>    Enable command buffer dumps.\n");
+	::printf("  --command-buffer-dump-folder <path>   Command buffer dump folder.\n");
+	::printf("  --graphics-debug-dump <true|false>    Enable graphics debug dumps.\n");
+	::printf("  --printf-direction <value>            Silent, Console, or File.\n");
+	::printf("  --printf-output-file <path>           Guest printf output file.\n");
+	::printf("  --profile                             Enable the Tracy profiler.\n");
+	::printf("  --spirv-debug-printf <true|false>     Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                        Use the supplied PlayGo stub fallback.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                             Protect the guest SysV red zone.\n");
 #endif
-	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
-	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --keymap <Control=Input>              DualSense mapping; may be repeated.\n");
+	::printf("  --discord-rpc                         Show current game as Discord Rich Presence.\n");
+	::printf("  --rd                                  Enable RenderDoc capture.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -180,6 +182,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--profile") {
 			options.config.profiler_enabled = true;
+			continue;
+		}
+
+		if (arg == "--discord-rpc") {
+			Loader::SetDiscordRpcEnabled(true);
 			continue;
 		}
 

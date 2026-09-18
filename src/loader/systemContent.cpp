@@ -6,6 +6,8 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/threads.h"
+#include "launcher/discord_rpc.h"
+#include "launcher/discordRpcConfig.h"
 
 #include <algorithm>
 #include <charconv>
@@ -608,6 +610,19 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 
 	if (sc->playgo.IsValid()) {
 		sc->playgo.DbgPrint();
+	}
+
+	// Update Discord Rich Presence now that TITLE / TITLE_ID are available,
+	// but only if the user opted in via --discord-rpc.
+	if (Loader::IsDiscordRpcEnabled()) {
+		std::string gameTitle;
+		std::string titleId;
+		sc->psf.GetParamString("TITLE", &gameTitle);
+		sc->psf.GetParamString("TITLE_ID", &titleId);
+
+		if (!gameTitle.empty() || !titleId.empty()) {
+			DiscordRPC::UpdatePresence(gameTitle, titleId);
+		}
 	}
 }
 

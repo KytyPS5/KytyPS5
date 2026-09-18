@@ -3,7 +3,12 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
+      - 'codex/**'
+    tags:
+      - 'astrobot-*'
   pull_request:
 
 concurrency:
@@ -426,13 +431,14 @@ jobs:
 
   release:
     name: Release KytyPS5
-    if: >-
-      always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
-      (needs.windows.result == 'success' ||
-       needs.macos.result == 'success' ||
-       needs.linux.result == 'success')
+  if: >-
+  always() &&
+  github.event_name == 'push' &&
+  startsWith(github.ref, 'refs/tags/astrobot-') &&
+  github.repository == 'nomolao2-cell/KytyPS5' &&
+  (needs.windows.result == 'success' ||
+   needs.macos.result == 'success' ||
+   needs.linux.result == 'success')
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:

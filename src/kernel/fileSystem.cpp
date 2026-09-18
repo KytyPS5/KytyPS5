@@ -201,10 +201,10 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	// Close host files opened before a failed descriptor setup.
-	m_files[index]->f.Close();
-#endif
+	if (!m_files[index]->f.IsInvalid()) {
+		m_files[index]->f.Close();
+	}
 
 	delete m_files[index];
 	m_files[index] = nullptr;
@@ -336,7 +336,11 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
 	const auto it           = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
-	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
+	    [&mounted_path](const MountPair& p) {
+		    return mounted_path.size() >= p.point.size() &&
+		           Common::EqualNoCase(std::string_view(mounted_path).substr(0, p.point.size()),
+		                               p.point);
+	    });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
 		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
@@ -428,11 +432,16 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		case 0: rw_mode = Common::File::Mode::Read; break;
 		case 1: rw_mode = Common::File::Mode::Write; break;
 		case 2: rw_mode = Common::File::Mode::ReadWrite; break;
-		default: EXIT("invalid flag_u: %u\n", flags_u);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(directory && rw_mode != Common::File::Mode::Read);
-	EXIT_NOT_IMPLEMENTED(directory && (trunc || creat));
+	if (directory && rw_mode != Common::File::Mode::Read) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (directory && (trunc || creat)) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	int   descriptor = g_files->CreateDescriptor();
 	auto* file       = g_files->GetFile(descriptor);
@@ -477,8 +486,15 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			return KERNEL_ERROR_ENOTDIR;
 		}
 
-		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
-		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
+		if (!directory && rw_mode != Common::File::Mode::Read) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENOTDIR;
+		}
+
+		if (!directory && (trunc || creat)) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENOTDIR;
+		}
 
 		const auto entries = Common::File::GetDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);

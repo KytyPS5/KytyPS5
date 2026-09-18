@@ -305,8 +305,11 @@ static uint32_t EmitGlslF32(EmitterState& state, GLSLstd450 op, std::initializer
 
 // NaN is written as zero, the D3D rule for float to fixed-point conversion.
 static uint32_t EmitF32NanToZero(EmitterState& state, uint32_t bits) {
-	return EmitTBufferSelectF32(state, EmitClassifyF32Bits(state, bits).nan, ConstantF32(state, 0),
-	                            EmitBitcastU32ToF32(state, bits));
+	// Only the NaN bit is read, so ask for it directly rather than classifying the whole value.
+	const auto value = EmitBitcastU32ToF32(state, bits);
+	return EmitTBufferSelectF32(state,
+	                            EmitNative<spv::OpIsNan, IR::Type::U1, uint32_t>(state, value),
+	                            ConstantF32(state, 0), value);
 }
 
 // Positive values round to nearest, overflow saturates to the largest finite value, negative

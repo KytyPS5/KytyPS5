@@ -221,10 +221,13 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
 	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
 	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
-	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
+	// Only the NaN bit is read; a full classification also builds a zero flag nothing uses.
+	const auto is_nan = [&](uint32_t value) {
+		return EmitNative<spv::OpIsNan, IR::Type::U1, uint32_t>(state, value);
+	};
+	const auto nan_ab =
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), is_nan(a), is_nan(b));
+	const auto any_nan = Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, is_nan(c));
 	return Select(state, TypeF32(state), any_nan, min3, median);
 }
 

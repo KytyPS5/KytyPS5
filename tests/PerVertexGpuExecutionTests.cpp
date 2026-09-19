@@ -704,6 +704,13 @@ OpMemberDecorate %gl_PerVertex 0 BuiltIn Position
 OpDecorate %gl_PerVertex Block
 OpDecorate %out_param_0 Location 0
 OpDecorate %gl_ClipDistance BuiltIn ClipDistance
+OpDecorate %resource_array ArrayStride 4
+OpMemberDecorate %resource_block 0 Offset 0
+OpDecorate %resource_block Block
+OpDecorate %buffers DescriptorSet 0
+OpDecorate %buffers Binding 0
+OpMemberDecorate %push_block 0 Offset 0
+OpDecorate %push_block Block
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
 %float = OpTypeFloat 32
@@ -731,14 +738,37 @@ OpDecorate %gl_ClipDistance BuiltIn ClipDistance
 %uint_0 = OpConstant %uint 0
 %int_0 = OpConstant %int 0
 %float_1 = OpConstant %float 1.0
+%uint_2 = OpConstant %uint 2
+%uint_4 = OpConstant %uint 4
+%bool = OpTypeBool
+%resource_array = OpTypeRuntimeArray %float
+%resource_block = OpTypeStruct %resource_array
+%resource_descriptors = OpTypeArray %resource_block %uint_2
+%resource_pointer = OpTypePointer StorageBuffer %resource_descriptors
+%resource_block_pointer = OpTypePointer StorageBuffer %resource_block
+%resource_float_pointer = OpTypePointer StorageBuffer %float
+%buffers = OpVariable %resource_pointer StorageBuffer
+%push_block = OpTypeStruct %float
+%push_pointer = OpTypePointer PushConstant %push_block
+%push_float_pointer = OpTypePointer PushConstant %float
+%push = OpVariable %push_pointer PushConstant
 %main = OpFunction %void None %fn
 %label = OpLabel
+%resource = OpAccessChain %resource_block_pointer %buffers %uint_1
+%length = OpArrayLength %uint %resource 0
+%length_ok = OpIEqual %bool %length %uint_4
+%resource_value_ptr = OpAccessChain %resource_float_pointer %buffers %uint_1 %uint_0 %uint_0
+%resource_value = OpLoad %float %resource_value_ptr
+%scale_ptr = OpAccessChain %push_float_pointer %push %uint_0
+%scale = OpLoad %float %scale_ptr
+%scaled_value = OpFMul %float %resource_value %scale
+%resource_w = OpSelect %float %length_ok %scaled_value %scale
 %pos3 = OpLoad %v3float %in_attr_0
 %col = OpLoad %v4float %in_attr_1
 %px = OpCompositeExtract %float %pos3 0
 %py = OpCompositeExtract %float %pos3 1
 %pz = OpCompositeExtract %float %pos3 2
-%pos4 = OpCompositeConstruct %v4float %px %py %pz %float_1
+%pos4 = OpCompositeConstruct %v4float %px %py %pz %resource_w
 %pos_dst = OpAccessChain %_ptr_Output_v4float %outPerVertex %int_0
 OpStore %pos_dst %pos4
 OpStore %out_param_0 %col
@@ -806,10 +836,14 @@ OpFunctionEnd
     std::string frag_dis = Libs::Graphics::LowerFragmentToBufferReplay(kPsSource, layout);
 
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    tools.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t& position, const char* message) { std::fprintf(stderr, "SPIR-V line %zu: %s\n", position.index, message); });
     std::vector<uint32_t> cap_spv, replay_spv, frag_spv;
     if (!tools.Assemble(cap_dis, &cap_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble capture compute");
     if (!tools.Assemble(replay_dis, &replay_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble replay vertex");
     if (!tools.Assemble(frag_dis, &frag_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble replay fragment");
+    if (!tools.Validate(cap_spv)) Fail("validate capture compute resource interface");
+    if (!tools.Validate(replay_spv)) Fail("validate replay vertex");
+    if (!tools.Validate(frag_spv)) Fail("validate replay fragment");
     std::printf("PASS: Native lowering and SPIR-V assembly successful for Capture, Replay, Fragment\n");
 
     // 1. Create Captured Buffer for 3 vertices (1 triangle)
@@ -836,9 +870,9 @@ OpFunctionEnd
     VkDescriptorSetLayout extra_set_layout = VK_NULL_HANDLE;
     Check(vk_create_descriptor_set_layout(dev.device, &extra_dsl_info, nullptr, &extra_set_layout), "vkCreateDescriptorSetLayout extra");
 
-    // Capture compute pipeline layout (Set 0 empty dummy, Set 1 extra)
+    // Set 0 retains the original VS descriptor array and push constants.
     VkDescriptorSetLayout dummy_dsl = VK_NULL_HANDLE;
-    VkDescriptorSetLayoutBinding dummy_b {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutBinding dummy_b {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dummy_info {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dummy_info.bindingCount = 1;
     dummy_info.pBindings = &dummy_b;
@@ -848,6 +882,9 @@ OpFunctionEnd
     VkPipelineLayoutCreateInfo cap_pl_info {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     cap_pl_info.setLayoutCount = 2;
     cap_pl_info.pSetLayouts = cap_dsls;
+    const VkPushConstantRange capture_push {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float)};
+    cap_pl_info.pushConstantRangeCount = 1;
+    cap_pl_info.pPushConstantRanges = &capture_push;
     VkPipelineLayout cap_pipeline_layout = VK_NULL_HANDLE;
     Check(vk_create_pipeline_layout(dev.device, &cap_pl_info, nullptr, &cap_pipeline_layout), "cap pipeline layout");
 
@@ -883,6 +920,23 @@ OpFunctionEnd
         extra_writes[i].pBufferInfo = &extra_dbi[i];
     }
     vk_update_descriptor_sets(dev.device, 3, extra_writes, 0, nullptr);
+    GpuBuffer resource_buf = CreateBuffer(dev, 4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const float resource_values[4] {2.0f, 0.0f, 0.0f, 0.0f};
+    std::memcpy(resource_buf.mapped, resource_values, sizeof(resource_values));
+    VkDescriptorSet resource_set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo resource_alloc {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    resource_alloc.descriptorPool = desc_pool;
+    resource_alloc.descriptorSetCount = 1;
+    resource_alloc.pSetLayouts = &dummy_dsl;
+    Check(vk_allocate_descriptor_sets(dev.device, &resource_alloc, &resource_set), "allocate original VS resources");
+    const VkDescriptorBufferInfo resource_dbi[2] {{resource_buf.buffer, 0, resource_buf.size}, {resource_buf.buffer, 0, resource_buf.size}};
+    VkWriteDescriptorSet resource_write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    resource_write.dstSet = resource_set;
+    resource_write.dstBinding = 0;
+    resource_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    resource_write.descriptorCount = 2;
+    resource_write.pBufferInfo = resource_dbi;
+    vk_update_descriptor_sets(dev.device, 1, &resource_write, 0, nullptr);
 
     // First, run Unpack on 3 vertices (triangle vertices 0, 1, 2)
     {
@@ -908,6 +962,9 @@ OpFunctionEnd
 
         // Dispatch Capture compute
         vk_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cap_pipeline);
+        vk_cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cap_pipeline_layout, 0, 1, &resource_set, 0, nullptr);
+        const float capture_scale = 0.5f;
+        vk_cmd_push_constants(cmd, cap_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(capture_scale), &capture_scale);
         vk_cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cap_pipeline_layout, 1, 1, &extra_set, 0, nullptr);
         vk_cmd_dispatch(cmd, 3, 1, 1);
 
@@ -1632,6 +1689,7 @@ OpFunctionEnd
             if (!tools.Assemble(cap_dis, &cap_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble real game capture compute");
             if (!tools.Assemble(frag_dis, &frag_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble real game replay fragment");
             if (!tools.Assemble(replay_dis, &replay_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble real game replay vertex");
+            if (!tools.Validate(cap_spv) || !tools.Validate(frag_spv) || !tools.Validate(replay_spv)) Fail("validate real game transformed interfaces");
 
             const auto t_cold_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_cold_start).count();
 

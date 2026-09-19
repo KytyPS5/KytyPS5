@@ -20,6 +20,23 @@
 
 namespace Libs::Graphics {
 
+// The transformed modules are assembled as SPIR-V 1.5. Since 1.4, the entry
+// interface must include all used globals, including resources and Private I/O.
+// Source shaders can be 1.3, whose interfaces only list Input/Output variables.
+static std::string CompleteEntryPointInterface(const std::string& source) {
+	std::istringstream lines(source);
+	std::string        line, interfaces;
+	while (std::getline(lines, line)) {
+		std::istringstream tokens(line);
+		std::string        id, equals, opcode;
+		tokens >> id >> equals >> opcode;
+		if (opcode == "OpFunction") break;
+		if (equals == "=" && opcode == "OpVariable") interfaces += " " + id;
+	}
+	const std::regex entry_re(R"((OpEntryPoint\s+\S+\s+%\S+\s+"[^"]*")[^\r\n]*)");
+	return std::regex_replace(source, entry_re, "$1" + interfaces);
+}
+
 bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_source,
                            PerVertexLayout&                 layout,
                            std::map<uint32_t, std::string>& vs_param_vars) {
@@ -485,7 +502,7 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 			res = std::regex_replace(res, use_re, orig_id);
 		}
 	}
-	return res;
+	return CompleteEntryPointInterface(res);
 }
 
 std::string LowerFragmentToBufferReplay(const std::string& source, const PerVertexLayout& layout) {
@@ -661,7 +678,7 @@ std::string LowerFragmentToBufferReplay(const std::string& source, const PerVert
 	std::ostringstream oss;
 	for (const auto& l: out_lines)
 		oss << l << "\n";
-	return oss.str();
+	return CompleteEntryPointInterface(oss.str());
 }
 
 static std::atomic<uint64_t> s_pv_temp_counter = 0;

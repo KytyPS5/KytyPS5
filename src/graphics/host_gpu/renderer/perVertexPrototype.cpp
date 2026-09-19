@@ -190,7 +190,11 @@ const PerVertexPrototypePrograms* GetPerVertexPrototypePrograms(
 		     static_cast<long long>(load_us));
 	} else {
 		spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
-		std::string          vs_dis, ps_dis;
+		tools.SetMessageConsumer([](spv_message_level_t, const char*,
+		                            const spv_position_t& position, const char* message) {
+			LOGF("PerVertexPrototype SPIR-V word %zu: %s\n", position.index, message);
+		});
+		std::string vs_dis, ps_dis;
 		EXIT_IF(!tools.Disassemble(vs->second.words.data(), vs->second.words.size(), &vs_dis,
 		                           SPV_BINARY_TO_TEXT_OPTION_INDENT |
 		                               SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES));
@@ -217,6 +221,9 @@ const PerVertexPrototypePrograms* GetPerVertexPrototypePrograms(
 		    !tools.Assemble(frag_dis, &frag_words, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
 		EXIT_IF(!tools.Assemble(replay_dis, &replay_words,
 		                        SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
+		EXIT_IF(!tools.Validate(cap_words));
+		EXIT_IF(!tools.Validate(frag_words));
+		EXIT_IF(!tools.Validate(replay_words));
 
 		SaveTransformedShadersToDisk(effective_title_id, vs_hash, ps_hash, layout, cap_words,
 		                             frag_words, replay_words);

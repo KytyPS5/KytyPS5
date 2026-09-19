@@ -36,6 +36,14 @@ uint32_t GetScreenHeight() {
 	return g_config->screen_height;
 }
 
+uint32_t GetRenderWidth() {
+	return g_config->render_width != 0 ? g_config->render_width : g_config->screen_width;
+}
+
+uint32_t GetRenderHeight() {
+	return g_config->render_height != 0 ? g_config->render_height : g_config->screen_height;
+}
+
 const std::string& GetUserName() {
 	return g_config->user_name;
 }

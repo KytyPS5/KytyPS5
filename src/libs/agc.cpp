@@ -77,8 +77,12 @@ void Initialize() {
 	auto width  = Config::GetScreenWidth();
 	auto height = Config::GetScreenHeight();
 
+	// The window is the host's; the video-out extent is what the guest renders for. Keeping them
+	// separate is the difference between a title drawing a 720p frame because the window is 720p
+	// and drawing its native frame and letting the present blit fit it to the window.
 	auto& presenter = WindowInit(width, height);
-	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
+	auto& video_out =
+	    VideoOut::VideoOutInit(Config::GetRenderWidth(), Config::GetRenderHeight(), presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
 	// Native driver module startup reserves its DMEM before the guest can allocate it.

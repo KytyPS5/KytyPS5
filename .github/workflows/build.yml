@@ -14,6 +14,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   metadata:
@@ -45,6 +46,11 @@ jobs:
 
       - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.16.0"
 
       - name: Locate vcpkg
         id: vcpkg
@@ -115,12 +121,12 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests --parallel
+          cmake --build _Build/windows --target launcher kyty_cpu_tests --parallel
 
-      - name: Test
+      - name: Test CPU regressions
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -L "^cpu$"
 
       - name: Install
         shell: cmd
@@ -156,6 +162,11 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: brew install glslang ninja
+
+      - name: Setup compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.16.0"
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -201,14 +212,14 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --target launcher kyty_cpu_tests \
             --parallel
 
-      - name: Test
+      - name: Test CPU regressions
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|virtual_memory_allocation)$'
+            --no-tests=error -L '^cpu$'
 
       - name: Install
         shell: bash
@@ -322,6 +333,11 @@ jobs:
             pkg-config \
             wayland-protocols
 
+      - name: Setup compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.16.0"
+
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
         with:
@@ -381,15 +397,14 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --target launcher kyty_cpu_tests \
             --parallel
 
-      - name: Test
+      - name: Test CPU regressions
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+            --no-tests=error -L '^cpu$'
 
       - name: Install
         shell: bash

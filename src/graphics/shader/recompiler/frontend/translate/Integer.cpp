@@ -22,6 +22,18 @@ bool Translator::Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpco
 	return true;
 }
 
+bool Translator::V_MAD_I16(const Decoder::Instruction& inst) {
+	const auto lhs    = ReadU16AsU32(inst.src0, true);
+	const auto rhs    = ReadU16AsU32(inst.src1, true);
+	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, true));
+	if (inst.dst.clamp) {
+		result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
+		result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
+	}
+	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+	return true;
+}
+
 bool Translator::V_MED3_I16(const Decoder::Instruction& inst) {
 	const auto result = IR::U32(ir.Emit(
 	    IR::ValueOpcode::SMedTri32, {ReadU16AsU32(inst.src0, true), ReadU16AsU32(inst.src1, true),

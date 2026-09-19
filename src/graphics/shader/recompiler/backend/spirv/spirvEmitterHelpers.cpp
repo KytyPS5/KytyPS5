@@ -2,24 +2,26 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-DppTargetLane EmitDppQuadPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control) {
-	const auto quad_base = state.builder.AllocateId();
+DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
+                                    uint32_t lane_bits) {
+	const auto lane_mask  = (1u << lane_bits) - 1u;
+	const auto group_base = state.builder.AllocateId();
 	const auto lane      = state.builder.AllocateId();
 	const auto shift     = state.builder.AllocateId();
 	const auto selected0 = state.builder.AllocateId();
 	const auto selected  = state.builder.AllocateId();
 	const auto target    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), quad_base, subid,
-	                          ConstantU32(state, 0xfffffffcu));
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), group_base, subid,
+	                          ConstantU32(state, ~lane_mask));
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane, subid,
-	                          ConstantU32(state, 3));
-	state.builder.AddFunction(spv::OpShiftLeftLogical, TypeU32(state), shift, lane,
-	                          ConstantU32(state, 1));
+	                          ConstantU32(state, lane_mask));
+	state.builder.AddFunction(spv::OpIMul, TypeU32(state), shift, lane,
+	                          ConstantU32(state, lane_bits));
 	state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), selected0,
 	                          ConstantU32(state, control), shift);
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), selected, selected0,
-	                          ConstantU32(state, 3));
-	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, quad_base, selected);
+	                          ConstantU32(state, lane_mask));
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, group_base, selected);
 	return {target, ConstantBool(state, true)};
 }
 
@@ -89,10 +91,14 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	return {target, ConstantBool(state, true)};
 }
 
-DppTargetLane EmitDppTargetLane(EmitterState& state, uint32_t control) {
+DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);
+	const auto control = flags.control;
+	if (flags.dpp8) {
+		return EmitDppPermTargetLane(state, subid, control, 3u);
+	}
 	if (control <= 0xffu) {
-		return EmitDppQuadPermTargetLane(state, subid, control);
+		return EmitDppPermTargetLane(state, subid, control, 2u);
 	}
 	if (control >= 0x101u && control <= 0x10fu) {
 		return EmitDppRowShiftTargetLane(state, subid, control & 0xfu, true);

@@ -247,7 +247,7 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xcau, Opcode::V_CMP_EQ_F16},         {0xcbu, Opcode::V_CMP_LE_F16},
     {0xccu, Opcode::V_CMP_GT_F16},         {0xcdu, Opcode::V_CMP_LG_F16},
     {0xceu, Opcode::V_CMP_GE_F16},         {0xebu, Opcode::V_CMP_NGT_F16},
-    {0xedu, Opcode::V_CMP_NEQ_F16},
+    {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
     {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
     {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
@@ -295,6 +295,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x300u, Opcode::V_LSHRREV_B64},
     {0x303u, Opcode::V_ADD_NC_U16},
     {0x304u, Opcode::V_SUB_NC_U16},
+    {0x305u, Opcode::V_MUL_LO_U16},
     {0x307u, Opcode::V_LSHRREV_B16},
     {0x308u, Opcode::V_ASHRREV_I16},
     {0x309u, Opcode::V_MAX_U16},
@@ -311,6 +312,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},
+    {0x35eu, Opcode::V_MAD_I16},
     {0x360u, Opcode::V_READLANE_B32},
     {0x361u, Opcode::V_WRITELANE_B32},
     {0x362u, Opcode::V_LDEXP_F32},
@@ -423,13 +425,14 @@ bool IsNativeVop3F16TernaryOpcode(Opcode opcode) {
 }
 
 bool IsNativeVop3I16TernaryOpcode(Opcode opcode) {
-	return opcode == Opcode::V_MED3_I16;
+	return opcode == Opcode::V_MED3_I16 || opcode == Opcode::V_MAD_I16;
 }
 
 bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_NC_U16:
 		case Opcode::V_SUB_NC_U16:
+		case Opcode::V_MUL_LO_U16:
 		case Opcode::V_MAX_U16:
 		case Opcode::V_MAX_I16:
 		case Opcode::V_MIN_U16:
@@ -682,10 +685,15 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	ReadLiteralOperands(code, word_index, inst);
 }
 
-void ApplyDppModifier(Operand& operand, uint32_t modifier) {
+void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
+	operand.dpp = true;
+	if (encoding == 233u) {
+		operand.dpp8     = true;
+		operand.dpp_ctrl = modifier >> 8u;
+		return;
+	}
 	operand.negate             = ((modifier >> 20u) & 0x1u) != 0u;
 	operand.absolute           = ((modifier >> 21u) & 0x1u) != 0u;
-	operand.dpp                = true;
 	operand.dpp_ctrl           = (modifier >> 8u) & 0x1ffu;
 	operand.dpp_fetch_inactive = ((modifier >> 18u) & 0x1u) != 0u;
 	operand.dpp_bound_ctrl     = ((modifier >> 19u) & 0x1u) != 0u;
@@ -706,7 +714,7 @@ void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 		DecodeVectorGpr(vdst, inst.dst);
 	}
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
-	ApplyDppModifier(inst.src0, modifier);
+	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src_count = 1;
 
 	if (!IsVop1FloatSourceOpcode(inst.opcode) && (inst.src0.negate || inst.src0.absolute)) {
@@ -823,6 +831,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_GE_F16:
 		case Opcode::V_CMP_NGT_F16:
 		case Opcode::V_CMP_NEQ_F16:
+		case Opcode::V_CMP_NLT_F16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:
@@ -1044,7 +1053,7 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vdst, inst.dst);
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
-	ApplyDppModifier(inst.src0, modifier);
+	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src1.negate       = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute     = ((modifier >> 23u) & 0x1u) != 0u;
 	const bool packed_fmac = inst.opcode == Opcode::V_PK_FMAC_F16;
@@ -1153,7 +1162,7 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
-	ApplyDppModifier(inst.src0, modifier);
+	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
 	inst.src_count     = 2;
@@ -1169,6 +1178,7 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::V_MUL_I32_I24:
 		case Opcode::V_ADD_NC_U16:
 		case Opcode::V_SUB_NC_U16:
+		case Opcode::V_MUL_LO_U16:
 		case Opcode::V_MAX_U16:
 		case Opcode::V_MAX_I16:
 		case Opcode::V_MIN_U16:
@@ -1353,7 +1363,8 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 }
 
 bool SupportsNativeVop3Clamp(Opcode opcode) {
-	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode);
+	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
+	       opcode == Opcode::V_MAD_I16;
 }
 
 bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,
@@ -1374,7 +1385,7 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return opcode != Opcode::V_FMA_F16 && (clamp != 0u || omod != 0u);
 	}
 	if (IsNativeVop3I16TernaryOpcode(opcode)) {
-		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
+		return abs != 0u || (clamp != 0u && !clamp_modifier) || omod != 0u || neg != 0u;
 	}
 	if (IsNativeVop3B16BinaryOpcode(opcode)) {
 		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
@@ -1508,6 +1519,7 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
+		case 233u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
 		case 249u: DecodeVop1Sdwa(pc, code, word_index, opcode, vdst, inst); return;
 		case 250u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
 		default: break;

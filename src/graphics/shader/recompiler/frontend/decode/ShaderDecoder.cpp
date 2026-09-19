@@ -472,8 +472,9 @@ std::string OperandToString(const Operand& operand) {
 		text += ".clamp";
 	}
 	if (operand.dpp) {
-		text += fmt::format(".dpp(ctrl=0x{:x},fi={},bc={})", operand.dpp_ctrl,
-		                    operand.dpp_fetch_inactive ? 1u : 0u, operand.dpp_bound_ctrl ? 1u : 0u);
+		text += fmt::format(".{}(ctrl=0x{:x},fi={},bc={})", operand.dpp8 ? "dpp8" : "dpp",
+		                    operand.dpp_ctrl, operand.dpp_fetch_inactive ? 1u : 0u,
+		                    operand.dpp_bound_ctrl ? 1u : 0u);
 	}
 	return text;
 }

@@ -24,8 +24,8 @@
 
 namespace Libs::Graphics {
 
-vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
-void        RequireVulkanSuccess(vk::Result result, const char* operation);
+vk::Format       VulkanFormat(Prospero::BufferFormat guest_format);
+void             RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 
 template <typename Handle, typename... Args>
@@ -64,6 +64,20 @@ template <typename T, typename Enumerator>
 			RequireVulkanSuccess(result, operation);
 		}
 	}
+}
+
+// MoltenVK 1.4.3 misreports the storage buffer length of push descriptors: OpArrayLength answers
+// 0 there, the bounds check drops the load and the video conversion pipeline writes black. Use
+// descriptor sets on that driver so the length reaches the shader.
+[[nodiscard]] constexpr inline uint32_t SelectMaxPushDescriptors(vk::DriverId driver_id,
+                                                                 uint32_t max_push_descriptors) {
+	return driver_id == vk::DriverId::eMoltenvk ? 0 : max_push_descriptors;
+}
+
+// A device that reports no push descriptor support must stay on descriptor sets.
+[[nodiscard]] constexpr inline bool UsePushDescriptors(uint32_t descriptor_count,
+                                                       uint32_t max_push_descriptors) {
+	return max_push_descriptors > 0 && descriptor_count <= max_push_descriptors;
 }
 
 } // namespace Libs::Graphics

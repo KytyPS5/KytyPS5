@@ -17,7 +17,11 @@ double GetTimeMs() {
 }
 
 Common::Time GetTime() {
-	return Common::Time(static_cast<int>(GetTimeMs()));
+	// Time is a time-of-day value capped at TIME_MS_IN_DAY; wrap the elapsed
+	// milliseconds so log timestamps keep formatting after 24h of uptime
+	// (and after the 32-bit cast would overflow, ~24.8 days).
+	const auto ms = static_cast<uint64_t>(GetTimeMs());
+	return Common::Time(static_cast<int>(ms % Common::TIME_MS_IN_DAY));
 }
 
 } // namespace Loader::Timer

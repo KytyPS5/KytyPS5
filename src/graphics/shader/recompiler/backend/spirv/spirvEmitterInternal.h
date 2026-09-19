@@ -490,6 +490,23 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	EmitLabel(state, merge_label);
 }
 
+template <typename ThenFn, typename ElseFn>
+void EmitIfElseCondition(EmitterState& state, uint32_t condition, ThenFn&& then_fn,
+                         ElseFn&& else_fn) {
+	const auto then_label  = state.builder.AllocateId();
+	const auto else_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, else_label);
+	EmitLabel(state, then_label);
+	then_fn();
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, else_label);
+	else_fn();
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+}
+
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {

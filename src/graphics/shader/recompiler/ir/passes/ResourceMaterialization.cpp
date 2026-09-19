@@ -692,7 +692,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 				continue;
 			}
 			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
-			if (memory.planning_only) {
+			if (memory.planning_only || memory.dynamic_buffer) {
 				continue;
 			}
 			if (buffer != BufferAccess::None) {
@@ -1081,7 +1081,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 	for (auto& memory: memory_info) {
 		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
-			memory.resource = image_remap.indices.at(memory.resource);
+			if (memory.resource < image_remap.indices.size()) {
+				memory.resource = image_remap.indices.at(memory.resource);
+			}
 		}
 	}
 	for (auto& buffer: buffers) {

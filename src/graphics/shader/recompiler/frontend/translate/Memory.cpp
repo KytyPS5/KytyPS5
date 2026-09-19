@@ -123,6 +123,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_r128    = decoded.image_r128;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
+	memory.glc           = decoded.glc;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {

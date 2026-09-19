@@ -492,7 +492,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	return {&m_staging_buffer, stage_offset};
 }
 
-void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+void BufferCache::ValidateFillRange(uint64_t vaddr, uint64_t size, bool is_gds) const {
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -500,11 +500,18 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		if (vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - vaddr) {
 			EXIT("BufferCache: GDS fill range is out of bounds\n");
 		}
-		m_gds_buffer.Fill(vaddr, size, value);
 		return;
 	}
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
+	}
+}
+
+void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	ValidateFillRange(vaddr, size, is_gds);
+	if (is_gds) {
+		m_gds_buffer.Fill(vaddr, size, value);
+		return;
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {

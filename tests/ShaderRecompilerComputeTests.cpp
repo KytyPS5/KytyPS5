@@ -2348,6 +2348,8 @@ public:
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
   }
 
+  /// Exercises serialized GPU command submission, memory ownership, and PM4
+  /// data movement.
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -2965,6 +2967,7 @@ public:
     constexpr uint64_t memory_dst = fault_base + 0x8000;
     constexpr uint64_t l2_copy_dst = fault_base + 0xa000;
     constexpr uint64_t nowhere_dst = fault_base + 0xc000;
+    constexpr uint64_t copy_data_dst = fault_base + 0xf000;
     constexpr uint64_t clean_cached_fill = fault_base + 0x3000;
     constexpr uint64_t clean_cached_copy = fault_base + 0x3008;
     constexpr uint64_t clean_cached_source = fault_base + 0x3010;
@@ -3015,6 +3018,21 @@ public:
             "DMA_DATA packet stream has the wrong size");
     gpu.Submit(dma_commands, {});
     gpu.Done();
+    constexpr uint64_t copy_data_immediate = 0xfedcba9876543210ull;
+    constexpr uint32_t copy_data_control = 5u | (2u << 8u) | (1u << 16u);
+    gpu.SendCommandSync([&] {
+      (void)resources.GetBufferCache().ObtainBuffer(
+          copy_data_dst, sizeof(copy_data_immediate), true);
+    });
+    const std::array<uint32_t, 6> copy_data_commands{
+        KYTY_PM4(6, Pm4::IT_COPY_DATA, 0),
+        copy_data_control,
+        static_cast<uint32_t>(copy_data_immediate),
+        static_cast<uint32_t>(copy_data_immediate >> 32u),
+        static_cast<uint32_t>(copy_data_dst),
+        static_cast<uint32_t>(copy_data_dst >> 32u)};
+    gpu.Submit(copy_data_commands, {});
+    gpu.Done();
     constexpr uint32_t clean_fill_value = 0xdecafbad;
     gpu.SendCommandSync([&] {
       auto &buffer_cache = resources.GetBufferCache();
@@ -3063,6 +3081,9 @@ public:
     Require("GpuCommandLane", "DMA_DATA L2 readback",
             resources.HandleFault(PageFaultAccess::Read, l2_copy_dst),
             "MemoryUsingL2 copy did not publish GPU bytes");
+    Require("GpuCommandLane", "COPY_DATA immediate readback",
+            resources.HandleFault(PageFaultAccess::Read, copy_data_dst),
+            "64-bit immediate COPY_DATA did not publish GPU bytes");
     Require("GpuCommandLane", "clean cached mirror readback",
             resources.HandleFault(PageFaultAccess::Read, clean_cached_readback),
             "clean host DMA was not reflected in the cached buffer");
@@ -3072,6 +3093,7 @@ public:
     std::array<uint32_t, 2> memory_copy_words{};
     std::array<uint32_t, 2> l2_copy_words{};
     std::array<uint32_t, 4> clean_cached_words{};
+    uint64_t copy_data_value = 0;
     std::memcpy(immediate_words.data(),
                 reinterpret_cast<const void *>(immediate_dst),
                 sizeof(immediate_words));
@@ -3089,6 +3111,8 @@ public:
     std::memcpy(clean_cached_words.data(),
                 reinterpret_cast<const void *>(clean_cached_readback),
                 sizeof(clean_cached_words));
+    std::memcpy(&copy_data_value, reinterpret_cast<const void *>(copy_data_dst),
+                sizeof(copy_data_value));
     Require("GpuCommandLane", "DMA_DATA immediate GDS contents",
             immediate_words ==
                 std::array<uint32_t, 2>{immediate_value, immediate_value},
@@ -3105,6 +3129,9 @@ public:
             "memory-to-memory bytes do not match");
     Require("GpuCommandLane", "DMA_DATA L2 contents",
             l2_copy_words == source_words, "MemoryUsingL2 bytes do not match");
+    Require("GpuCommandLane", "COPY_DATA immediate contents",
+            copy_data_value == copy_data_immediate,
+            "COPY_DATA discarded the upper half of a 64-bit immediate");
     Require("GpuCommandLane", "DMA_DATA nowhere contents",
             std::memcmp(reinterpret_cast<const void *>(nowhere_dst),
                         nowhere_words.data(), sizeof(nowhere_words)) == 0,

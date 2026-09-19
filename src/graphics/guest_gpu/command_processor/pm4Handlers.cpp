@@ -1504,6 +1504,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	return payload_dw;
 }
 
+/// Converts a COPY_DATA destination selector to the equivalent DMA_DATA selector.
 static uint8_t CopyDataDstToDma(uint32_t dst) {
 	switch (dst) {
 		case 2:
@@ -1518,6 +1519,7 @@ static uint8_t CopyDataDstToDma(uint32_t dst) {
 	EXIT("unsupported copyData destination selector 0x%02" PRIx32 "\n", dst);
 }
 
+/// Converts a COPY_DATA source selector to the equivalent DMA_DATA selector.
 static uint8_t CopyDataSrcToDma(uint32_t src) {
 	switch (src) {
 		case 2:
@@ -1534,6 +1536,7 @@ static uint8_t CopyDataSrcToDma(uint32_t src) {
 	EXIT("unsupported copyData source selector 0x%02" PRIx32 "\n", src);
 }
 
+/// Executes a COPY_DATA packet, including full-width immediate values and reference clocks.
 KYTY_CP_OP_PARSER(CpOpCopyData) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1565,7 +1568,12 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 	}
 	const auto dma_src = CopyDataSrcToDma(src_sel);
 	if (dma_src == 2 && num_bytes == 8) {
-		EXIT("unsupported 64-bit immediate copyData\n");
+		// COPY_DATA carries the complete 64-bit immediate in its two source dwords, while
+		// DMA_DATA's immediate source is a repeated 32-bit fill value. Hand the full value to
+		// the command processor, which preserves both halves and validates the eight-byte
+		// destination as a single write.
+		cp.DmaDataImmediate64(CopyDataDstToDma(dst_sel), dst_cache, dst, src, write_confirm);
+		return 5;
 	}
 
 	cp.DmaData(0, CopyDataDstToDma(dst_sel), dst_cache, dst, dma_src, src_cache, src, num_bytes, 1,

@@ -59,6 +59,10 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// Rejects a fill range that is misaligned or out of bounds. Callers that split one guest
+	// write into several fills validate the whole range up front so a rejected tail cannot
+	// leave a partially written value behind.
+	void ValidateFillRange(uint64_t vaddr, uint64_t size, bool is_gds) const;
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);

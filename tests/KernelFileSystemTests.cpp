@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
@@ -125,6 +126,44 @@ void CheckMountRoot(const std::filesystem::path &root) {
       Check(FileSystem::KernelClose(fd) == OK, "close mounted root");
     }
   }
+  FileSystem::Umount("/app0");
+}
+
+void CheckUnicodePaths(const std::filesystem::path &root) {
+  constexpr std::string_view HostDirectory =
+      "Test\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
+  constexpr std::string_view GuestFilename =
+      "asset-\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.bin";
+
+  const auto unicode_root =
+      root / Common::PathFromUtf8(HostDirectory);
+  const auto nested_root = unicode_root / "nested";
+
+  Check(Common::File::CreateDirectories(nested_root),
+        "create nested Unicode host directory");
+
+  CheckMountRoot(nested_root);
+
+  const auto native_file =
+      nested_root / Common::PathFromUtf8(GuestFilename);
+
+  Common::File fixture;
+  Check(fixture.Create(native_file), "create Unicode filename");
+  fixture.Close();
+
+  FileSystem::Mount(nested_root, "/app0");
+
+  const auto guest_file =
+      std::string("/app0/") + std::string(GuestFilename);
+
+  Check(FileSystem::GetRealFilename(guest_file) == native_file,
+        "resolve Unicode guest path");
+
+  const int fd = FileSystem::KernelOpen(guest_file.c_str(), 0, 0);
+  Check(fd >= 3, "open Unicode guest path");
+  Check(FileSystem::KernelClose(fd) == OK,
+        "close Unicode guest path");
+
   FileSystem::Umount("/app0");
 }
 
@@ -387,6 +426,7 @@ int main() {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnicodePaths(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");

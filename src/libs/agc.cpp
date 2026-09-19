@@ -78,7 +78,8 @@ void Initialize() {
 	auto height = Config::GetScreenHeight();
 
 	auto& presenter = WindowInit(width, height);
-	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
+	auto& video_out =
+	    VideoOut::VideoOutInit(Config::GetRenderWidth(), Config::GetRenderHeight(), presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
 	// Native driver module startup reserves its DMEM before the guest can allocate it.

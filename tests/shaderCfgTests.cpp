@@ -4013,6 +4013,78 @@ void TestNewShaderRecompilerScalarBitfieldAlu() {
         "SPIR-V binary does not contain OpLogicalOr");
   Check(SpirvContainsOpcode(result.spirv, 204),
         "SPIR-V binary does not contain OpBitReverse");
+
+  {
+    using namespace ShaderRecompiler::Decoder;
+    const uint32_t bitcmp_b64_shader[] = {
+        EncodeSopc(0x0e, 20, 22), // s_bitcmp0_b64 s[20:21], s22
+        EncodeSopc(0x0f, 24, 26), // s_bitcmp1_b64 s[24:25], s26
+        EncodeSopp(0x01),
+    };
+    Program program;
+    DecodeProgram(bitcmp_b64_shader, program);
+    Check(program.instructions.size() == 3u,
+          "S_BITCMP_B64 decoder changed instruction boundaries");
+    const auto &cmp0 = program.instructions[0];
+    const auto &cmp1 = program.instructions[1];
+    Check(cmp0.family == Family::SOPC &&
+              cmp0.opcode == Opcode::S_BITCMP0_B64 &&
+              cmp0.opcode_id == 0x0eu && cmp0.src_count == 2u &&
+              cmp0.dst.kind == OperandKind::Scc &&
+              cmp0.src0.kind == OperandKind::Sgpr && cmp0.src0.reg == 20u &&
+              cmp0.src1.kind == OperandKind::Sgpr && cmp0.src1.reg == 22u,
+          "S_BITCMP0_B64 register operands were decoded incorrectly");
+    Check(cmp1.family == Family::SOPC &&
+              cmp1.opcode == Opcode::S_BITCMP1_B64 &&
+              cmp1.opcode_id == 0x0fu && cmp1.src_count == 2u &&
+              cmp1.dst.kind == OperandKind::Scc &&
+              cmp1.src0.kind == OperandKind::Sgpr && cmp1.src0.reg == 24u &&
+              cmp1.src1.kind == OperandKind::Sgpr && cmp1.src1.reg == 26u,
+          "S_BITCMP1_B64 register operands were decoded incorrectly");
+  }
+
+  struct BitcmpB64Case {
+    uint32_t low;
+    uint32_t high;
+    uint32_t index;
+    uint32_t opcode;
+    bool scc;
+  };
+  const BitcmpB64Case bitcmp_b64_cases[] = {
+      {0x00000001u, 0x00000000u, 0u, 0x0fu, true},
+      {0x00000001u, 0x00000000u, 0u, 0x0eu, false},
+      {0x80000000u, 0x00000000u, 31u, 0x0fu, true},
+      {0x00000000u, 0x00000001u, 32u, 0x0fu, true},
+      {0x00000000u, 0x80000000u, 63u, 0x0fu, true},
+      {0x00000001u, 0x00000000u, 64u, 0x0fu, true},
+      {0x00000000u, 0x80000000u, 127u, 0x0fu, true},
+      {0x00000000u, 0x00000000u, 17u, 0x0eu, true},
+      {0x00000000u, 0x00000000u, 17u, 0x0fu, false},
+  };
+  for (const auto &test : bitcmp_b64_cases) {
+    const std::vector<uint32_t> bitcmp_shader = {
+        EncodeSMovB32(20, 255), test.low,
+        EncodeSMovB32(21, 255), test.high,
+        EncodeSMovB32(22, 255), test.index,
+        EncodeSopc(test.opcode, 20, 22),
+        EncodeSopp(0x05, 1), // s_cbranch_scc1 to second endpgm
+        EncodeSopp(0x01),
+        EncodeSopp(0x01),
+    };
+    auto translated =
+        TranslateProgram(bitcmp_shader, MakeCompileOptions(ShaderType::Compute));
+    const auto branch = std::ranges::find_if(
+        translated.program.block_info, [](const auto &block) {
+          return block.terminator.condition ==
+                 ShaderRecompiler::CFG::BranchCondition::SccNonZero;
+        });
+    Check(branch != translated.program.block_info.end(),
+          "S_BITCMP_B64 semantic fixture lost its SCC branch");
+    const auto condition = branch->condition.Resolve();
+    Check(condition.IsImmediate() && condition.U1() == test.scc,
+          "S_BITCMP_B64 SCC result does not match the selected bit");
+  }
+
   CheckSpirvBinaryValidates(result.spirv);
 }
 

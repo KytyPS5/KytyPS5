@@ -507,6 +507,18 @@ bool Translator::S_BITCMP_B32(const Decoder::Instruction& inst, bool expected) {
 	return true;
 }
 
+bool Translator::S_BITCMP_B64(const Decoder::Instruction& inst, bool expected) {
+	const auto value    = ReadU32Pair(inst.src0);
+	const auto offset   = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(63u)));
+	const auto word_bit = ir.BitwiseAnd(offset, IR::U32(IR::Value(31u)));
+	const auto word =
+	    ir.Select(ir.ULessThan(offset, IR::U32(IR::Value(32u))), value[0], value[1]);
+	const auto bit =
+	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {word, word_bit, IR::Value(1u)}));
+	WriteCompareResult(inst.dst, ir.IEqual(bit, IR::U32(IR::Value(expected ? 1u : 0u))));
+	return true;
+}
+
 bool Translator::V_ALIGNBIT_B32(const Decoder::Instruction& inst) {
 	const auto hi      = ReadU32(inst.src0);
 	const auto lo      = ReadU32(inst.src1);

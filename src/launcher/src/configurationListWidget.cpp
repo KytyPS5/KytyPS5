@@ -26,6 +26,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QKeySequence>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
@@ -202,6 +203,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	ConfigureGameList(m_ui);
 
 	UpdateToolbarIcons();
+	m_ui->refresh_button->setToolTip(tr("Rescan game folders for new games"));
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
 
@@ -222,6 +224,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
 
+	connect(m_ui->refresh_button, &QToolButton::clicked, this,
+	        &ConfigurationListWidget::ScanGameDirectory);
 	connect(m_ui->global_settings_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_global_settings);
 	connect(m_ui->input_mapping_button, &QToolButton::clicked, this,
@@ -240,6 +244,12 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::filter_configurations);
 	connect(m_compatibility, &CompatibilityDatabase::Updated, this,
 	        &ConfigurationListWidget::ApplyCompatibility);
+
+	auto* refresh_action = new QAction(this);
+	refresh_action->setShortcut(QKeySequence::Refresh);
+	connect(refresh_action, &QAction::triggered, this,
+	        &ConfigurationListWidget::ScanGameDirectory);
+	addAction(refresh_action);
 
 	m_ui->cfgs_list->setDragDropMode(QAbstractItemView::NoDragDrop);
 
@@ -276,6 +286,7 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 		button->setIcon(QIcon(pixmap));
 	};
 
+	set_icon(m_ui->refresh_button, QStringLiteral(":/icons/refresh.svg"));
 	set_icon(m_ui->global_settings_button, QStringLiteral(":/icons/global-settings.svg"));
 	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
 	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
@@ -564,6 +575,16 @@ bool ConfigurationListWidget::HasValidGameDirectory() const {
 }
 
 void ConfigurationListWidget::ScanGameDirectory() {
+	// Clearing the list destroys the running game's item, so a rescan must not
+	// run while a game is active: the replacement items would lose the running
+	// state and allow editing or deleting a game that is still in use.
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item->IsRunning()) {
+			return;
+		}
+	}
+
 	m_selected_item = nullptr;
 	m_ui->cfgs_list->clear();
 	m_ui->cfgs_list->SetBackgroundImage({});
@@ -858,6 +879,9 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	}
 
 	QMenu      menu;
+	menu.addAction(tr("Refresh game list"), this,
+	               &ConfigurationListWidget::ScanGameDirectory);
+	menu.addSeparator();
 	const auto save_data_dirs = item != nullptr ? GetSaveDataDirs(item->GetInfo()) : QStringList();
 	const bool has_trophy_data =
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());

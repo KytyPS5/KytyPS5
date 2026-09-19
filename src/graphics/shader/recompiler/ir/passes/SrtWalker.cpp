@@ -12,6 +12,30 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+uint32_t PossibleU32Bits(Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 ? value.U32() : UINT32_MAX;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return UINT32_MAX;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::BitwiseAnd32:
+			return PossibleU32Bits(inst->Arg(0)) & PossibleU32Bits(inst->Arg(1));
+		case ValueOpcode::BitwiseOr32:
+			return PossibleU32Bits(inst->Arg(0)) | PossibleU32Bits(inst->Arg(1));
+		case ValueOpcode::ShiftLeftLogical32: {
+			const auto shift = inst->Arg(1).Resolve();
+			return shift.IsImmediate() && shift.GetType() == Type::U32
+			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
+			           : UINT32_MAX;
+		}
+		default: return UINT32_MAX;
+	}
+}
+
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
@@ -74,12 +98,30 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
 	switch (opcode) {
+		case ValueOpcode::ValidateBvhDescriptor:
 		case ValueOpcode::GetBufferResource:
 		case ValueOpcode::GetAddressResource:
 		case ValueOpcode::GetImageResource:
 		case ValueOpcode::GetSamplerResource: return true;
 		default: return false;
 	}
+}
+
+bool BvhFlagsAreSupported(Value value) {
+	constexpr uint32_t mask     = 0xf1000000u;
+	constexpr uint32_t required = 0x81000000u;
+	value                       = value.Resolve();
+	if (value.IsImmediate())
+		return value.GetType() == Type::U32 && (value.U32() & mask) == required;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32) return false;
+	for (size_t i = 0; i < 2; ++i) {
+		const auto fixed = inst->Arg(i).Resolve();
+		if (fixed.IsImmediate() && fixed.GetType() == Type::U32 &&
+		    (fixed.U32() & mask) == required && (PossibleU32Bits(inst->Arg(1 - i)) & mask) == 0)
+			return true;
+	}
+	return false;
 }
 
 bool IsRuntimeSelect(ValueOpcode op) {
@@ -321,6 +363,12 @@ public:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				const auto op = inst.GetOpcode();
+				// Discharge proven BVH flags before collecting any descriptor dependencies.
+				if (op == ValueOpcode::ValidateBvhDescriptor && inst.NumArgs() == 4u &&
+				    BvhFlagsAreSupported(inst.Arg(3))) {
+					inst.Invalidate();
+					continue;
+				}
 				if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
 					const auto flags = inst.Flags<MemoryFlags>();
 					if (flags.index < m_program.memory_info.size()) {
@@ -330,25 +378,16 @@ public:
 						                        (op == ValueOpcode::ReadConstBuffer &&
 						                         kind == ResourceKind::ScalarAddress);
 						if (crosswired) {
-							Fail(flags.pc,
-							     fmt::format("{} has incompatible scalar memory metadata",
-							                 ValueOpcodeName(op)));
+							Fail(flags.pc, fmt::format("{} has incompatible scalar memory metadata",
+							                           ValueOpcodeName(op)));
 						}
 					}
 				}
-				if (IsDescriptorHandle(inst.GetOpcode())) {
+				// BDA addresses are GPU data; only CPU descriptors start SRT collection.
+				if (IsDescriptorHandle(op) && op != ValueOpcode::GetAddressResource) {
 					for (size_t index = 0; index < inst.NumArgs(); index++) {
 						Collect(inst.Arg(index), 0);
 					}
-				}
-			}
-		}
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
-				    inst.Arg(1).Resolve().IsImmediate() &&
-				    ValidateRuntimeValue(m_program, Value(&inst))) {
-					Collect(Value(&inst), inst.Flags<MemoryFlags>().pc);
 				}
 			}
 		}
@@ -401,7 +440,10 @@ private:
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+		// A loop-carried base only exists once the draw runs, so the load has no pre-draw value
+		// to flatten: keep it on the GPU.
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+		    !ValidateRuntimeValue(m_program, value)) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
 			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);
@@ -513,7 +555,7 @@ private:
 			return false;
 		}
 		m_visiting.push_back(inst);
-		uint64_t out = 0;
+		uint64_t   out       = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
@@ -1060,7 +1102,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
-	results = std::move(evaluated);
+	results        = std::move(evaluated);
 	active_sources = std::move(active);
 	if (evaluate_flat) {
 		flat = std::move(flattened);
@@ -1084,7 +1126,7 @@ void BuildSrtPlan(Program& program) {
 }
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results) {
+                           const SrtRuntime& runtime, std::span<uint32_t> results) {
 	if (values.size() != results.size()) {
 		return false;
 	}

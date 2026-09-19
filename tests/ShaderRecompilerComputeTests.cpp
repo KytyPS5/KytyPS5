@@ -87,6 +87,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -9249,7 +9250,7 @@ public:
       std::memset(mapped, 0, allocation_size);
       for (uint32_t face = 0; face < layers; face++) {
         const auto depth = depth_at(face, false);
-        for (const auto address : {base, ordinary_address}) {
+        for (const auto address : std::array<uint64_t, 2>{base, ordinary_address}) {
           std::memcpy(reinterpret_cast<void *>(address + face * 0x100),
                       &depth, sizeof(depth));
         }
@@ -21833,15 +21834,17 @@ TestCase ScalarMemoryLoadVariants() {
   std::vector<u32> expected = initial;
   expected.insert(expected.end(), initial.begin(), initial.end());
 
-  return {"ScalarMemoryLoadVariants",
-          code,
-          initial,
-          expected,
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
-           O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
-           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
-           O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemoryLoadVariants",
+              code,
+              initial,
+              expected,
+              {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
+               O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
+               O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
+               O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
+               O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  return test;
 }
 
 TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
@@ -21856,11 +21859,13 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  return {"ScalarLoadSignedImmediateOffsetAddsSoffset",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x22222222u, 0x22222222u},
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarLoadSignedImmediateOffsetAddsSoffset",
+              code,
+              {0x11111111u, 0x22222222u},
+              {0x22222222u, 0x22222222u},
+              {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  return test;
 }
 
 TestCase BufferLoadStore() {
@@ -23587,11 +23592,13 @@ TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  return {"ScalarLoadAlignsComponentsAndMasksAddress",
-          code,
-          {0x11111111u, 0x22222222u},
-          {0x11111111u, 0x22222222u},
-          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarLoadAlignsComponentsAndMasksAddress",
+              code,
+              {0x11111111u, 0x22222222u},
+              {0x11111111u, 0x22222222u},
+              {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  return test;
 }
 
 TestCase FlatVirtualAddressRebasesGuestAllocation() {
@@ -27025,6 +27032,63 @@ TestCase DispatcherIrreducibleControlFlow() {
   return test;
 }
 
+// Exercise the captured BVH instruction through the GPU BDA path and compare its four outputs.
+TestCase MimgBvhIntersectRayTriangle() {
+  using O = ShaderOpcode;
+
+  // MIMG 0xe6, NSA, dmask 0xf, vdata/vaddr v5, T# s16, three NSA dwords.
+  constexpr std::array<u32, 5> image{0xf1989f07u, 0x00040505u, 0x4442413du,
+                                    0x4543403eu, 0x00004746u};
+  constexpr uint64_t guest_base = 0x12ffffc000ull;
+  constexpr uint32_t node = 8u; // triangle node, index 1
+  constexpr size_t node_offset = (node & ~7u) << 3u;
+  constexpr size_t backing = 64u;
+
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 16, static_cast<u32>(guest_base >> 8u));
+  AppendSMovLiteral(&code, 17, static_cast<u32>(guest_base >> 40u));
+  AppendSMovLiteral(&code, 18, 1u); // last node index
+  AppendSMovLiteral(&code, 19, 0x81000000u);
+  AppendVMovU32(&code, 5, node);
+  AppendVMovU32(&code, 61, 0x42c80000u); // ray extent
+  AppendVMovU32(&code, 65, 0x3e800000u); // ray origin
+  AppendVMovU32(&code, 66, 0x3e800000u);
+  AppendVMovU32(&code, 68, 0xbf800000u);
+  AppendVMovU32(&code, 62, 0x00000000u); // ray direction
+  AppendVMovU32(&code, 64, 0x00000000u);
+  AppendVMovU32(&code, 67, 0x3f800000u);
+  AppendVMovU32(&code, 69, 0x7f800000u); // ray inverse direction
+  AppendVMovU32(&code, 70, 0x7f800000u);
+  AppendVMovU32(&code, 71, 0x3f800000u);
+  code.insert(code.end(), image.begin(), image.end());
+  AppendStoreVgpr(&code, 5, 0);
+  AppendStoreVgpr(&code, 6, 1);
+  AppendStoreVgpr(&code, 7, 2);
+  AppendStoreVgpr(&code, 8, 3);
+  AppendEnd(&code);
+
+  std::vector<u32> node_data(16u, 0u);
+  node_data[3] = 0x3f800000u; // (0,0,0), (1,0,0), (0,1,0) triangle quad
+  node_data[7] = 0x3f800000u;
+  node_data[9] = 0x3f800000u;
+  node_data[10] = 0x3f800000u;
+  node_data[15] = 0x00000909u; // I/J barycentric selectors
+
+  const auto node_dword = (backing + node_offset) / sizeof(u32);
+  std::vector<u32> initial(node_dword + node_data.size(), 0u);
+  std::copy(node_data.begin(), node_data.end(), initial.begin() + node_dword);
+
+  TestCase test;
+  test.name = "MimgBvhIntersectRayTriangle";
+  test.code = std::move(code);
+  test.initial = std::move(initial);
+  test.expected = {0xbf800000u, 0xbf800000u, 0xbe800000u, 0xbe800000u};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::IMAGE_BVH_INTERSECT_RAY,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.bda_mappings = {{guest_base, static_cast<u32>(backing)}};
+  return test;
+}
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -27356,6 +27420,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
   AddCase(DispatcherIrreducibleControlFlow);
+  AddCase(MimgBvhIntersectRayTriangle);
 
   return cases;
 }
@@ -31833,7 +31898,89 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+// Structural check for the scalar address path: the guest base must be aligned (low word & ~3) and
+// its upper word masked (high word & 0xffff) before both halves are merged into the device address,
+// exactly what the host scalar path does with SrtWalker's AddressMask. The check starts from every
+// OpBitwiseOr that merges the two halves and follows the operands directly, so a constant-only scan
+// (which would also match the offset alignment that predates this fix) cannot satisfy it.
+bool ScalarAddressMasksBase(const std::vector<uint32_t> &spirv) {
+  constexpr uint32_t OpConstant = static_cast<uint32_t>(spv::OpConstant);
+  constexpr uint32_t OpUConvert = static_cast<uint32_t>(spv::OpUConvert);
+  constexpr uint32_t OpShiftLeftLogical = static_cast<uint32_t>(spv::OpShiftLeftLogical);
+  constexpr uint32_t OpBitwiseOr = static_cast<uint32_t>(spv::OpBitwiseOr);
+  constexpr uint32_t OpBitwiseAnd = static_cast<uint32_t>(spv::OpBitwiseAnd);
+  struct Definition {
+    uint32_t opcode = 0u;
+    uint32_t result = 0u;
+    uint32_t second = 0u;
+    uint32_t third = 0u;
+  };
+  std::unordered_map<uint32_t, Definition> definitions;
+  std::unordered_map<uint32_t, uint32_t> constants;
+  for (size_t word = 5u; word < spirv.size();) {
+    const uint32_t instruction = spirv[word];
+    const uint32_t count = instruction >> 16u;
+    const uint32_t opcode = instruction & 0xffffu;
+    if (count == 0u || word + count > spirv.size()) {
+      return false;
+    }
+    const size_t operands = count - 1u;
+    const auto operand = [&](size_t index) { return index < operands ? spirv[word + 1u + index] : 0u; };
+    if (opcode == OpConstant && operands >= 3u) {
+      constants[operand(1)] = operand(2);
+    } else if (opcode == OpUConvert || opcode == OpShiftLeftLogical || opcode == OpBitwiseOr ||
+               opcode == OpBitwiseAnd) {
+      if (operands < 3u) {
+        return false;
+      }
+      definitions[operand(1)] = Definition {opcode, operand(1), operand(2), operand(3)};
+    }
+    word += count;
+  }
+  const auto is_constant = [&](uint32_t id, uint32_t value) {
+    const auto found = constants.find(id);
+    return found != constants.end() && found->second == value;
+  };
+  const auto is_and_with = [&](uint32_t id, uint32_t mask) {
+    const auto found = definitions.find(id);
+    if (found == definitions.end() || found->second.opcode != OpBitwiseAnd) {
+      return false;
+    }
+    const uint32_t left = found->second.second;
+    const uint32_t right = found->second.third;
+    return (is_constant(right, mask) && left != 0u) || (is_constant(left, mask) && right != 0u);
+  };
+  const auto unconverted = [&](uint32_t id) {
+    const auto found = definitions.find(id);
+    return found != definitions.end() && found->second.opcode == OpUConvert ? found->second.second : id;
+  };
+  for (const auto &entry : definitions) {
+    const auto &definition = entry.second;
+    if (definition.opcode != OpBitwiseOr) {
+      continue;
+    }
+    for (const uint32_t half : {definition.second, definition.third}) {
+      if (!is_and_with(unconverted(half), 0xfffffffcu)) {
+        continue;
+      }
+      for (const uint32_t other : {definition.second, definition.third}) {
+        if (other == half) {
+          continue;
+        }
+        const auto shifted = definitions.find(unconverted(other));
+        if (shifted == definitions.end() || shifted->second.opcode != OpShiftLeftLogical) {
+          continue;
+        }
+        if (is_constant(shifted->second.third, 32u) && is_and_with(unconverted(shifted->second.second), 0x0000ffffu)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
 } // namespace
+
 } // namespace Libs::Graphics
 
 int main(int argc, char **argv) {
@@ -32237,6 +32384,40 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, MimgBvhIntersectRayTriangle());
+    return 0;
+  }
+  const auto scalar_memory_cases = [] {
+    return std::vector<TestCase>{ScalarMemoryLoadVariants(),
+                                  ScalarLoadSignedImmediateOffsetAddsSoffset(),
+                                  ScalarLoadAlignsComponentsAndMasksAddress()};
+  };
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-memory-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : scalar_memory_cases()) {
+      RunCase(&vulkan, test);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-memory-host-only") == 0) {
+    for (const auto &test : scalar_memory_cases()) {
+      const auto compiled = CompileCase(test);
+      Require(test.name, "host scalar memory", compiled.program.info.uses_dma,
+              "scalar memory case did not use the GPU address path");
+      Require(test.name, "host scalar memory", test.bda_mappings.size() == 1u,
+              "scalar memory case did not declare exactly one guest mapping");
+      Require(test.name, "host scalar memory",
+              test.bda_mappings[0].guest_base == 0u && test.bda_mappings[0].backing_offset == 0u,
+              "scalar memory guest mapping must be guest 0 to backing 0");
+      const bool base_shape_case = std::strcmp(test.name, "ScalarLoadAlignsComponentsAndMasksAddress") == 0;
+      Require(test.name, "host scalar memory", !base_shape_case || ScalarAddressMasksBase(compiled.spirv),
+              "scalar address path does not align and mask the guest base before combining it");
+      std::printf("[host]    %-32s ok\n", test.name);
+    }
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

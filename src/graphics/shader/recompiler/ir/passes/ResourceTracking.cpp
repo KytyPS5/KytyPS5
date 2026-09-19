@@ -15,30 +15,6 @@ namespace {
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
-uint32_t PossibleU32Bits(Value value) {
-	value = value.Resolve();
-	if (value.IsImmediate()) {
-		return value.GetType() == Type::U32 ? value.U32() : UINT32_MAX;
-	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) {
-		return UINT32_MAX;
-	}
-	switch (inst->GetOpcode()) {
-		case ValueOpcode::BitwiseAnd32:
-			return PossibleU32Bits(inst->Arg(0)) & PossibleU32Bits(inst->Arg(1));
-		case ValueOpcode::BitwiseOr32:
-			return PossibleU32Bits(inst->Arg(0)) | PossibleU32Bits(inst->Arg(1));
-		case ValueOpcode::ShiftLeftLogical32: {
-			const auto shift = inst->Arg(1).Resolve();
-			return shift.IsImmediate() && shift.GetType() == Type::U32
-			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
-			           : UINT32_MAX;
-		}
-		default: return UINT32_MAX;
-	}
-}
-
 Value CanonicalizeSampleAdjustDword3(Value value) {
 	for (;;) {
 		value            = value.Resolve();
@@ -131,8 +107,8 @@ public:
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			});
+				                   return std::ranges::find(plan.reads, inst) != plan.reads.end();
+			                   });
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -201,11 +177,10 @@ private:
 		for (uint32_t arm = 0; arm < 2; arm++) {
 			const auto* incoming = phi->PhiBlock(arm);
 			if (incoming == merge ||
-			    (incoming != branch &&
-			     (incoming->ImmPredecessors().size() != 1u ||
-			      incoming->ImmPredecessors()[0] != branch ||
-			      incoming->ImmSuccessors().size() != 1u ||
-			      incoming->ImmSuccessors()[0] != merge))) {
+			    (incoming != branch && (incoming->ImmPredecessors().size() != 1u ||
+			                            incoming->ImmPredecessors()[0] != branch ||
+			                            incoming->ImmSuccessors().size() != 1u ||
+			                            incoming->ImmSuccessors()[0] != merge))) {
 				return value;
 			}
 			const auto* target = incoming == branch ? merge : incoming;
@@ -494,17 +469,15 @@ private:
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
-		                 [&](const IndirectImagePlan& plan) {
-			    return plan.handle == &handle;
-		    });
+		                 [&](const IndirectImagePlan& plan) { return plan.handle == &handle; });
 		return found == m_indirect_images.end() ? nullptr : &*found;
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
+			                   return std::ranges::find(plan.memory, index) != plan.memory.end();
+		                   });
 	}
 
 	void PlanIndirectImages() {
@@ -696,6 +669,18 @@ private:
 	}
 
 	void Collect(Inst& inst) {
+		if (inst.GetOpcode() == ValueOpcode::ValidateBvhDescriptor) {
+			DescriptorSource descriptor;
+			const auto       pc = inst.Flags<uint32_t>();
+			MakeSource(inst, 4, false, false, descriptor, pc);
+			uint32_t bad_dword = 0;
+			if (!ValidateSource(descriptor, bad_dword))
+				Fail(pc, "BVH descriptor is not a uniform runtime value");
+			const auto source = InternSource(descriptor);
+			m_program.bvh_sources.push_back(source);
+			inst.SetFlags<uint32_t>(source);
+			return;
+		}
 		const auto op           = inst.GetOpcode();
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);

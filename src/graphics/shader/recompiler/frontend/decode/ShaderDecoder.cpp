@@ -128,10 +128,11 @@ std::string FormatMimg(const Instruction& inst) {
 	const std::string_view name =
 	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
-	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
-	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
-	                OperandToString(inst.src1).c_str(), OperandToString(inst.src2).c_str(),
-	                inst.dmask, ImageDimensionToString(inst.image_dimension));
+	    fmt::format("0x{:08x}: {} {}, {}, {}", inst.pc, name, OperandToString(inst.dst),
+	                OperandToString(inst.src0), OperandToString(inst.src1));
+	if (inst.src_count > 2) text += fmt::format(", {}", OperandToString(inst.src2));
+	text += fmt::format(" ; dmask=0x{:x} image_dim={}", inst.dmask,
+	                    ImageDimensionToString(inst.image_dimension));
 	if (inst.data_bits == 16u) {
 		text += " d16=1";
 	}
@@ -148,6 +149,8 @@ std::string FormatMimg(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_C_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Opcode::IMAGE_BVH64_INTERSECT_RAY:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
@@ -560,9 +563,10 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               inst.branch_target));
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
-			return WithUnsupportedReason(inst, fmt::format(
-			    "0x{:08x}: {} {}, 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
-			    OperandToString(inst.dst), inst.branch_target));
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, 0x{:08x}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.dst),
+			                                               inst.branch_target));
 		case Opcode::EXP: return WithUnsupportedReason(inst, FormatExp(inst));
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
@@ -585,7 +589,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
 		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Opcode::IMAGE_BVH64_INTERSECT_RAY:
+			return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:

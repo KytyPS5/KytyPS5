@@ -1369,6 +1369,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg + 1u), builtin(kind, 1));
 				}
 			};
+			// No sample-rate barycentric builtin exists; BaryCoordKHR already interpolates at the
+			// sample when sample shading is on, which is exactly when PERSP_SAMPLE is enabled.
+			barycentric_pair(ps->ps_perspective_sample_vgpr, IR::StageInputKind::BaryCoordSmooth);
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
 			barycentric_pair(ps->ps_perspective_sample_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothSample);

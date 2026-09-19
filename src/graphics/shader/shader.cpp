@@ -527,8 +527,11 @@ static void ShaderGetStaticInputInfoPS(
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
+	// SPI_PS_INPUT_ENA allocates two VGPRs per enabled interpolation set, in the fixed order
+	// PERSP_SAMPLE, PERSP_CENTER, PERSP_CENTROID. Every enabled set needs its pair seeded, not
+	// just the ones with a builtin of their own.
 	if ((active_inputs & 0x00000001u) != 0) {
-		ps_info.ps_perspective_sample_vgpr = 0;
+		ps_info.ps_perspective_sample_vgpr = 0u;
 	}
 	if ((active_inputs & 0x00000002u) != 0) {
 		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
@@ -661,6 +664,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.ps_perspective_center_vgpr);
 	key.push_back(info.ps_perspective_sample_vgpr);
 	key.push_back(info.ps_perspective_centroid_vgpr);
+	key.push_back(info.ps_perspective_sample_vgpr);
 	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
